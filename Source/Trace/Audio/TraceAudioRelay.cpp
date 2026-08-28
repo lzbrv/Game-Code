@@ -4,6 +4,7 @@
 
 #include "Engine/World.h"
 #include "EngineUtils.h"
+#include "GameFramework/Pawn.h"
 
 #include "Audio/TraceAudio.h"
 #include "Trace.h"
@@ -39,6 +40,22 @@ void ATraceAudioRelay::MulticastPlaySound_Implementation(FName Event, FVector_Ne
 	// Runs on EVERY machine, the authority included. The whole point of routing through here rather
 	// than "play locally and also multicast" is that there is one code path and therefore no way for
 	// a listen server to hear a game-side sound twice.
+	TraceAudio::PlayResolvedAtLocation(this, Event, FVector(Where));
+}
+
+void ATraceAudioRelay::MulticastPlaySoundExcluding_Implementation(FName Event, FVector_NetQuantize Where,
+                                                                  APawn* Excluded)
+{
+	// Runs on EVERY machine, exactly like MulticastPlaySound — and then ONE of them declines. The
+	// test is "is that pawn a player on THIS machine", which is the same question the client-side
+	// route asks (TraceAudio::IsLocalPlayerActor) and therefore also excludes the bot case: a bot's
+	// pawn is locally controlled on a listen server but predicted nothing, so the host must still
+	// hear the bot's shot.
+	if (TraceAudio::IsLocalPlayerActor(Excluded))
+	{
+		return;
+	}
+
 	TraceAudio::PlayResolvedAtLocation(this, Event, FVector(Where));
 }
 

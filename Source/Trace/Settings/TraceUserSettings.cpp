@@ -2,6 +2,10 @@
 
 #include "Settings/TraceUserSettings.h"
 
+#include "Engine/Engine.h"              // GEngine->GetCurrentPlayWorld, for the WP2 console hook
+#include "Engine/World.h"
+#include "GameFramework/PlayerController.h"  // ServerChangeName - the engine's own rename path
+#include "GameFramework/PlayerState.h"
 #include "HAL/IConsoleManager.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Trace.h"                      // LogTraceGame
@@ -613,6 +617,26 @@ namespace TraceCrosshairPalette
 	 * they stay findable over a lit strip. RED is the convention and is kept even though it is the
 	 * worst choice against this arena's amber, because a player who wants red wants red.
 	 *
+	 * *** RELEASE ART BIBLE §2.4 — THE DEFAULT IS THE INTERFACE'S OWN INK, NOT PAPER WHITE. ***
+	 *
+	 * The guard rail the bible states is a COLLISION rule: "the crosshair default must not be magenta
+	 * while goal-slot markers are magenta ... leave the crosshair user-configurable with default Ink
+	 * white". MAGENTA stays in the list (a player who wants it can still pick it — the same argument
+	 * RED gets above); what changed is that entry 0 is now the exact `Ink` this game's interface is
+	 * drawn in — sRGB-linear (0.90, 0.97, 1.00), the value carried by TraceMenuStyle::Ink and
+	 * TraceOptionsStyle::Ink — rather than a flat (1,1,1) that belongs to no system.
+	 *
+	 * THE LITERALS AND NOT THE TOKEN, on purpose. Settings/ does not include UI/: this class is read
+	 * by the HUD, the options page and the player controller, and making the player's own settings
+	 * depend on a menu palette header would invert the layering for three floats. The numbers are
+	 * repeated with their source named, which is the same trade the two UI copies of Ink already make
+	 * with each other (see the palette note in UI/TraceOptionsMenu.cpp).
+	 *
+	 * MEASURED COST: 10% less red and 3% less green than the pre-bible (1,1,1) at the same alpha —
+	 * below the threshold at which the reticle reads as tinted, and it is the same off-white every
+	 * other piece of text on screen is set in. See the header's "shipped defaults" block, which
+	 * records this as the one deliberate departure from pixel-identity.
+	 *
 	 * NO TEAM-COLOUR ENTRY. The crosshair already lifts toward the team colour when a pass target is
 	 * under it (ATraceHUD::DrawCrosshair), and a base colour that also moved with the team would make
 	 * that state change unreadable — the one thing on this reticle that MEANS something by its colour.
@@ -624,7 +648,8 @@ namespace TraceCrosshairPalette
 	{
 		static const FEntry Entries[] =
 		{
-			{ TEXT("WHITE"),   FLinearColor(1.00f, 1.00f, 1.00f) },
+			// Release art bible §2.4 — the interface's Ink, not paper white. See the block above.
+			{ TEXT("WHITE"),   FLinearColor(0.90f, 0.97f, 1.00f) },
 			{ TEXT("CYAN"),    FLinearColor(0.16f, 0.88f, 1.00f) },
 			{ TEXT("LIME"),    FLinearColor(0.55f, 1.00f, 0.15f) },
 			{ TEXT("GREEN"),   FLinearColor(0.10f, 1.00f, 0.35f) },
@@ -805,6 +830,92 @@ void UTraceUserSettings::ResetCrosshairToDefaults()
 	Save();
 }
 
+// =================================================================================================
+// UI PLAN WP2 — the call sign
+// =================================================================================================
+
+FString UTraceUserSettings::SanitizeCallSign(const FString& Raw)
+{
+	// Trim first, so "  ROXIE  " is a sixteen-character budget spent on five letters rather than on
+	// nine spaces. ToUpper second, so the filter below only ever sees the case that will be stored.
+	const FString Trimmed = Raw.TrimStartAndEnd().ToUpper();
+
+	FString Clean;
+	Clean.Reserve(FMath::Min(Trimmed.Len(), MaxCallSignLength));
+
+	for (const TCHAR Char : Trimmed)
+	{
+		if (Clean.Len() >= MaxCallSignLength)
+		{
+			break;
+		}
+
+		// The WP2.3 alphabet, written here rather than asked of FTraceTextEntry: this class is the
+		// STORAGE and must not depend on the UI to be correct — the .ini can be hand-edited with no
+		// text field involved at all. The two lists are identical and each says so.
+		const bool bLegal = FChar::IsAlnum(Char)
+			|| Char == TEXT(' ') || Char == TEXT('-') || Char == TEXT('_') || Char == TEXT('.');
+		if (bLegal)
+		{
+			Clean.AppendChar(Char);
+		}
+	}
+
+	// Trimmed AGAIN, because the filter can strip the middle out of "A ~ B" and leave "A  B", and
+	// because a name whose only surviving characters were spaces is not a name.
+	Clean.TrimStartAndEndInline();
+	return Clean;
+}
+
+FString UTraceUserSettings::GetCallSignOrDefault() const
+{
+	const FString Clean = SanitizeCallSign(CallSign);
+	return Clean.IsEmpty() ? FString(DefaultCallSign) : Clean;
+}
+
+// =================================================================================================
+// UI PLAN WP3 — player volume
+// =================================================================================================
+
+float UTraceUserSettings::GetAudioMasterVolume() const
+{
+	return FMath::Clamp(AudioMasterVolume, MinAudioVolume, MaxAudioVolume);
+}
+
+float UTraceUserSettings::GetAudioSfxVolume() const
+{
+	return FMath::Clamp(AudioSfxVolume, MinAudioVolume, MaxAudioVolume);
+}
+
+float UTraceUserSettings::GetAudioMusicVolume() const
+{
+	return FMath::Clamp(AudioMusicVolume, MinAudioVolume, MaxAudioVolume);
+}
+
+float UTraceUserSettings::GetUserGainForFamily(bool bIsMusic) const
+{
+	return GetAudioMasterVolume() * (bIsMusic ? GetAudioMusicVolume() : GetAudioSfxVolume());
+}
+
+void UTraceUserSettings::ResetAudioToDefaults()
+{
+	// The three faders and NOTHING else — not the crosshair, not the bindings, not the mouse. Third
+	// instance of the rule the video and crosshair resets already state: a reset row belongs to the
+	// page it is drawn on.
+	AudioMasterVolume = DefaultAudioMasterVolume;
+	AudioSfxVolume    = DefaultAudioSfxVolume;
+	AudioMusicVolume  = DefaultAudioMusicVolume;
+
+	Save();
+}
+
+bool UTraceUserSettings::IsAudioAtDefaults() const
+{
+	return FMath::IsNearlyEqual(AudioMasterVolume, DefaultAudioMasterVolume)
+		&& FMath::IsNearlyEqual(AudioSfxVolume, DefaultAudioSfxVolume)
+		&& FMath::IsNearlyEqual(AudioMusicVolume, DefaultAudioMusicVolume);
+}
+
 bool UTraceUserSettings::IsCrosshairAtDefaults() const
 {
 	return FMath::IsNearlyEqual(CrosshairSize, DefaultCrosshairSize)
@@ -849,6 +960,15 @@ namespace TraceCrosshairConsole
 			TEXT("[Crosshair]   raw ini values: size=%.2f thickness=%.2f gap=%.2f opacity=%.2f -> %s"),
 			S.CrosshairSize, S.CrosshairThickness, S.CrosshairGap, S.CrosshairOpacity,
 			*S.GetClass()->GetConfigName());
+
+		// RELEASE ART BIBLE §2.4 — the actual RGB, so "the default is not magenta" is a fact in the
+		// log rather than an inference from a screenshot of a small white cross. At the shipped
+		// default this prints entry 0 = the interface's Ink (0.900, 0.970, 1.000).
+		const FLinearColor Ink = UTraceUserSettings::CrosshairPaletteColor(S.CrosshairColorIndex);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Crosshair]   ink rgb = (%.3f, %.3f, %.3f)  default index = %d (%s)"),
+			Ink.R, Ink.G, Ink.B, UTraceUserSettings::DefaultCrosshairColor,
+			*UTraceUserSettings::DescribeCrosshairColor(UTraceUserSettings::DefaultCrosshairColor));
 	}
 
 	FAutoConsoleCommand CmdCrosshairStatus(
@@ -857,6 +977,158 @@ namespace TraceCrosshairConsole
 		TEXT("values that came out of TraceUserSettings.ini and the derived arm reach the pass brackets ")
 		TEXT("and both throw rings are laid out against."),
 		FConsoleCommandDelegate::CreateStatic(&Status));
+}
+
+// =================================================================================================
+// UI PLAN WP2 / WP3 — the headless hooks for the call sign and the three faders
+//
+// A headless run has no keyboard, so there is no way to TYPE a call sign and no way to DRAG a
+// fader — and a setting nobody can drive from a script is a setting nobody can be shown to have
+// checked. These are the same class of hole Trace.Menu.Settings and Trace.Menu.Crosshair fill for
+// the pages themselves, and they are deliberately thin: each one writes through the SAME public
+// entry points the settings rows use, so a run that passes here is evidence about the storage and
+// the application path rather than about the harness.
+//
+// NAMED namespace, not anonymous: this module is a unity/jumbo build and two files that each open
+// an anonymous namespace become one namespace with two definitions.
+// Scripts/check-jumbo-build-collisions.py gates the build on exactly that.
+// =================================================================================================
+
+namespace TraceUserSettingsConsole
+{
+	/** The local player's controller in whatever world is actually playing, or null on the title screen. */
+	APlayerController* LocalController()
+	{
+		UWorld* const World = (GEngine != nullptr) ? GEngine->GetCurrentPlayWorld() : nullptr;
+		return (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+	}
+
+	/** Whatever this machine currently calls the local player, for the before/after halves of a log line. */
+	FString LiveName()
+	{
+		const APlayerController* const PC = LocalController();
+		const APlayerState* const State = (PC != nullptr) ? PC->PlayerState : nullptr;
+		return (State != nullptr) ? State->GetPlayerName() : FString(TEXT("<no player state>"));
+	}
+
+	void CallSignStatus()
+	{
+		const UTraceUserSettings& S = UTraceUserSettings::Get();
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CallSign] stored='%s'  effective='%s'  live player state='%s'  -> %s"),
+			*S.CallSign, *S.GetCallSignOrDefault(), *LiveName(), *S.GetClass()->GetConfigName());
+	}
+
+	/**
+	 * `Trace.CallSign.Set <name>` — write it, save it, and push it at the live match if there is one.
+	 *
+	 * The push goes through APlayerController::ServerChangeName, which is the engine's own rename
+	 * path (-> AGameModeBase::ChangeName -> APlayerState::SetPlayerName, replicated). NOT a direct
+	 * SetPlayerName on the local state: that would be a client lying to itself, and the thing this
+	 * command exists to prove is precisely that the name reaches every machine's PlayerState.
+	 */
+	void CallSignSet(const TArray<FString>& Args)
+	{
+		if (Args.Num() == 0)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[CallSign] Trace.CallSign.Set <name>"));
+			return;
+		}
+
+		// Rejoined with spaces: a call sign may legally contain them (WP2.3) and the console splits
+		// on whitespace, so "Trace.CallSign.Set MAIN CHARACTER" must not arrive as one word.
+		const FString Requested = FString::Join(Args, TEXT(" "));
+
+		UTraceUserSettings& S = UTraceUserSettings::Get();
+		const FString Before = LiveName();
+
+		S.CallSign = UTraceUserSettings::SanitizeCallSign(Requested);
+		S.Save();
+
+		const FString Effective = S.GetCallSignOrDefault();
+
+		if (APlayerController* const PC = LocalController())
+		{
+			PC->ServerChangeName(Effective);
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CallSign] requested='%s' -> stored='%s' -> effective='%s'. Player state was '%s'; ")
+			TEXT("ServerChangeName %s."),
+			*Requested, *S.CallSign, *Effective, *Before,
+			(LocalController() != nullptr) ? TEXT("sent") : TEXT("SKIPPED (no local controller — title screen)"));
+	}
+
+	/**
+	 * `Trace.Audio.UserGain` — the three faders and the gain they produce, named.
+	 *
+	 * Trace.Audio.Loudness already REPORTS the user gain (it reads VolumeFor, which these multiply
+	 * into), but it reports it folded into one number per event. This prints the three terms, so a
+	 * before/after pair of runs says WHICH fader moved rather than only that something did.
+	 */
+	void AudioUserGain()
+	{
+		const UTraceUserSettings& S = UTraceUserSettings::Get();
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[UserGain] master=%.3f  sfx=%.3f  music=%.3f  -> effects x%.4f, music x%.4f  ")
+			TEXT("atDefaults=%s  raw ini: %.3f/%.3f/%.3f -> %s"),
+			S.GetAudioMasterVolume(), S.GetAudioSfxVolume(), S.GetAudioMusicVolume(),
+			S.GetUserGainForFamily(/*bIsMusic=*/false), S.GetUserGainForFamily(/*bIsMusic=*/true),
+			S.IsAudioAtDefaults() ? TEXT("yes") : TEXT("no"),
+			S.AudioMasterVolume, S.AudioSfxVolume, S.AudioMusicVolume,
+			*S.GetClass()->GetConfigName());
+	}
+
+	/**
+	 * `Trace.Audio.SetUserGain <master> [sfx] [music]` — drive the three faders from a script.
+	 *
+	 * Writes through the same fields the sliders write and calls the same Save(), so "settings
+	 * survive relaunch" is provable without a human touching a mouse. Omitted arguments are left
+	 * alone rather than defaulted, so a run can move ONE fader and prove the other two did not move.
+	 */
+	void AudioSetUserGain(const TArray<FString>& Args)
+	{
+		if (Args.Num() == 0)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[UserGain] Trace.Audio.SetUserGain <master> [sfx] [music]   (0..1 each)"));
+			return;
+		}
+
+		UTraceUserSettings& S = UTraceUserSettings::Get();
+		S.AudioMasterVolume = FCString::Atof(*Args[0]);
+		if (Args.Num() > 1) { S.AudioSfxVolume   = FCString::Atof(*Args[1]); }
+		if (Args.Num() > 2) { S.AudioMusicVolume = FCString::Atof(*Args[2]); }
+		S.Save();
+
+		AudioUserGain();
+	}
+
+	FAutoConsoleCommand CmdCallSignStatus(
+		TEXT("Trace.CallSign.Status"),
+		TEXT("UI plan WP2. Prints the stored call sign, the sanitised name the game will use, and what ")
+		TEXT("the local APlayerState is actually called right now."),
+		FConsoleCommandDelegate::CreateStatic(&CallSignStatus));
+
+	FAutoConsoleCommand CmdCallSignSet(
+		TEXT("Trace.CallSign.Set"),
+		TEXT("UI plan WP2. Trace.CallSign.Set <name>. Sanitises, stores, saves and pushes it at the live ")
+		TEXT("match through ServerChangeName - the same path the settings row's submit takes. The only ")
+		TEXT("way a headless run can set a name, since the row needs a keyboard."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&CallSignSet));
+
+	FAutoConsoleCommand CmdAudioUserGain(
+		TEXT("Trace.Audio.UserGain"),
+		TEXT("UI plan WP3. Prints the player's three volume faders and the gain each family gets from ")
+		TEXT("them - the three terms Trace.Audio.Loudness reports folded together."),
+		FConsoleCommandDelegate::CreateStatic(&AudioUserGain));
+
+	FAutoConsoleCommand CmdAudioSetUserGain(
+		TEXT("Trace.Audio.SetUserGain"),
+		TEXT("UI plan WP3. Trace.Audio.SetUserGain <master> [sfx] [music]. Writes the faders through the ")
+		TEXT("same fields and the same Save() the sliders use, so a headless run can prove Loudness ")
+		TEXT("scales and that the values survive a relaunch."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&AudioSetUserGain));
 }
 #endif
 
@@ -1027,8 +1299,19 @@ FString UTraceUserSettings::DescribeBinding(ETraceInputAction Action) const
  * reproduction of "it will not let me bind throw core to the same button as fire" — and it exists
  * because this project's standing rule is that a harness which cannot go red is not evidence.
  *
- * Not ECVF_Cheat: it changes no gameplay rule, only which of the player's own binds survive an
- * edit, and a playtester who preferred the old behaviour should be able to have it back.
+ * *** ECVF_Cheat SINCE W9-SHIPGUARD, AND THE PARAGRAPH THAT USED TO BE HERE HAD THE COST WRONG. ***
+ * It read "Not ECVF_Cheat: it changes no gameplay rule, only which of the player's own binds survive
+ * an edit, and a playtester who preferred the old behaviour should be able to have it back". The
+ * first half is still true and is why this arm is harmless; the second half assumed the flag takes
+ * the switch away from a playtester, and it does not. ECVF_Cheat is INERT wherever
+ * DISABLE_CHEAT_CVARS is 0 — that is every configuration except Shipping and Test — so the console,
+ * -ExecCmds and ConsoleVariables.ini [Startup] all still reach it on any build a playtester runs.
+ * The ONE thing the flag closes is the last injection path into a SHIPPED build:
+ * FConfigCacheIni::LoadConsoleVariablesFromINI applies Engine.ini's [ConsoleVariables] section with
+ * bAllowCheating = false in every configuration, and in a packaged game that ini is player-writable.
+ * A switch whose own help text calls one of its values "the RED arm" does not belong there, and the
+ * consistency matters more than the individual verdict: W8-BATTERY found twenty such arms shipping
+ * unflagged next to siblings that were flagged, and a rule with twenty exceptions is not a rule.
  */
 static int32 GTraceKeysLegacySteal = 0;
 static FAutoConsoleVariableRef CVarTraceKeysLegacySteal(
@@ -1037,7 +1320,7 @@ static FAutoConsoleVariableRef CVarTraceKeysLegacySteal(
 	TEXT("Spec v28 sec 3b. 0 (default): a key is taken from another action ONLY when the two can both "
 	     "be legal at the same instant, so throw-core and fire may share a button. 1 is the RED arm - "
 	     "the pre-v28 rule where any other action holding the key loses it unconditionally."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 void UTraceUserSettings::SetKey(ETraceInputAction Action, const FKey& Key)
 {
@@ -1347,6 +1630,8 @@ void UTraceUserSettings::Save()
 		MouseSensitivity, MouseSensitivityYScale, bInvertMouseY ? 1 : 0,
 		*GetClass()->GetConfigName());
 }
+
+#if !UE_BUILD_SHIPPING
 
 // =================================================================================================
 // Shared verification plumbing
@@ -2364,3 +2649,5 @@ namespace
 		TEXT("touches."),
 		FConsoleCommandDelegate::CreateStatic(&VerifyBindableKeys));
 }
+
+#endif // !UE_BUILD_SHIPPING

@@ -78,7 +78,9 @@
 // which walks the whole id space, so appending to ETraceCharacterId was enough — and a red-arm match
 // on the build before this pass confirmed bots holding ROXIE and SLIMEBALL while pressing nothing.
 // USED is PlanRoxie / PlanElle / PlanSlimeball below, and Trace.Bot.NewCharacterAbilities 0 removes
-// exactly those three and nothing else, which is what makes their counts a measurement.
+// exactly the post-v17 planners and nothing else, which is what makes their counts a measurement.
+// (Since the spec v19 §3 append — RESTRUCTURE tranche E — that red arm also covers PlanLily and
+// PlanMortimer: "the new characters" now means all five appended after the original roster of five.)
 //
 // THE ONE THING THAT CHANGED SHAPE IS V. Spec v18 §2 gave it to three characters at once — Mace's
 // suspend (hold), Slimeball's wall stick (hold) and Roxie's rocket (press) — so the single V LEVEL
@@ -383,6 +385,10 @@ private:
 	void PlanElle(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out);
 	void PlanSlimeball(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out);
 
+	// --- spec v19 §3, the two appended characters (RESTRUCTURE tranche E) ------------------------
+	void PlanLily(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out);
+	void PlanMortimer(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out);
+
 	/**
 	 * Watches the three new sets for the state transitions that prove the ability LANDED — see
 	 * TraceBotAbilityStats::NoteRocketFired. Called once per Plan(), before any decision, because a
@@ -551,4 +557,21 @@ private:
 	float StickApproachUntilTime = 0.f;
 	/** Last tick's stuck flag, so "he actually got hold of the wall" is a transition. */
 	bool bWasStuck = false;
+
+	// --- Lily (spec v19 §3, RESTRUCTURE tranche E) ---
+	/** Hesitation after a DECLINED Zip. Firing throttles itself on Zip's own 30 s cooldown. */
+	float NextZipTime = 0.f;
+	/**
+	 * Earliest world time the climb re-press may be delivered while she is flying.
+	 *
+	 * The climb key is a LEVEL behind a 0.25 s staleness watchdog (UTraceCharacterMovementComponent::
+	 * SetJumpHeld), so a bot "holds" it by re-pressing inside that window. This throttle keeps the
+	 * cadence at ~7 Hz rather than one press per tick — enough to keep the level fresh, without
+	 * drowning the [BotAbility] jump counters in climb re-asserts.
+	 */
+	float NextZipClimbPressTime = 0.f;
+
+	// --- Mortimer (spec v19 §3, RESTRUCTURE tranche E) ---
+	/** Hesitation after a DECLINED Quake. Firing throttles itself on the blast's own cooldown. */
+	float NextQuakeTime = 0.f;
 };

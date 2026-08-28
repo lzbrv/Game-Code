@@ -2,10 +2,12 @@
 
 #include "Abilities/TraceAbilityTypes.h"
 
-// The one provider of TraceAbilityDebuff::GetMoveSpeedMultiplier today (spec v14 §6, Oyster). At the
-// top of the file rather than beside the function: this module builds in unity blobs, and an
-// #include halfway down a .cpp lands in the middle of whatever else the blob concatenated.
+// The TWO providers of TraceAbilityDebuff::GetMoveSpeedMultiplier: spec v14 §6 (Oyster's poison,
+// -30%) and spec v18 §2 (Slimeball's slime wall, -35%). At the top of the file rather than beside
+// the function: this module builds in unity blobs, and an #include halfway down a .cpp lands in the
+// middle of whatever else the blob concatenated.
 #include "Abilities/Characters/TraceOysterPoison.h"
+#include "Abilities/Characters/TraceSlimewall.h"
 #include "GameFramework/Actor.h"
 
 // The providers of TraceAbilityTraits, spec v19 §3. Same placement rule as the include above: this
@@ -99,10 +101,26 @@ const TCHAR* TraceAbilityBlockReasonToString(ETraceAbilityBlockReason Reason)
 // =================================================================================================
 // SPEC v14 §6 — the external-debuff aggregator. See the header for why it is not a character hook.
 //
-// One provider today: Oyster's poison. Its component is attached to the VICTIM's pawn and already
-// re-asks the §4 choke point every frame for the slow (bSlowActive), so a victim who picks up the
-// Core stops being slowed within a frame and resumes if they drop it — that gate is not duplicated
-// here, it is read.
+// TWO PROVIDERS. Both are components attached to the VICTIM's pawn, and both already re-ask the §4
+// choke point every tick for their own slow (bSlowActive), so a victim who picks up the Core stops
+// being slowed within a frame and resumes if they drop it — that gate is not duplicated here, it is
+// read. A provider with nothing in force returns exactly 1.0, so the common case (no component at
+// all) is two FindComponentByClass calls that find nothing.
+//
+//   Oyster's poison    -30%   UTraceOysterPoisonComponent      spec v14 §6
+//   Slimeball's wall   -35%   UTraceSlimewallSlowComponent     spec v18 §2, FX_AUDIO_PLAN §7.3 (F7)
+//
+// *** THE SLIMEWALL LINE IS THE HALF OF A PAIRED EDIT. *** Until it landed, the slime slow was
+// applied ONLY by UTraceSlimewallSlowComponent::ApplySlowClamp multiplying the movement component's
+// ceiling by GetSpeedMultiplier() by hand — a post-hoc clip that acceleration still aimed past. That
+// file carried a standing instruction to delete its own `* GetSpeedMultiplier()` the moment this line
+// appeared, because with both in place the fraction is applied TWICE and 0.65 compounds into 0.42 (a
+// -58% slow wearing a -35% label). The clamp there has been reduced to Oyster's shape in the same
+// pass; the two edits are one change and must never be split.
+//
+// THEY MULTIPLY rather than take the strongest. A player who is both poisoned and slimed is carrying
+// two independent debuffs from two different players, and 0.70 x 0.65 = 0.455 is what "both landed"
+// means. The Max(0.05) floor below is what stops any future stack of these becoming a stun.
 // =================================================================================================
 
 float TraceAbilityDebuff::GetMoveSpeedMultiplier(const AActor* Target)
@@ -117,6 +135,12 @@ float TraceAbilityDebuff::GetMoveSpeedMultiplier(const AActor* Target)
 	if (const UTraceOysterPoisonComponent* Poison = Target->FindComponentByClass<UTraceOysterPoisonComponent>())
 	{
 		Multiplier *= Poison->GetSpeedMultiplier();
+	}
+
+	// FX_AUDIO_PLAN §7.3 (F7). See the block above for the clamp that was deleted in the same pass.
+	if (const UTraceSlimewallSlowComponent* Slime = Target->FindComponentByClass<UTraceSlimewallSlowComponent>())
+	{
+		Multiplier *= Slime->GetSpeedMultiplier();
 	}
 
 	return FMath::Max(0.05f, Multiplier);

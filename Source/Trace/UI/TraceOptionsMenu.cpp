@@ -27,6 +27,10 @@
 #include "UI/TraceMatchOptions.h"        // TraceCharacters - the spec v14 §3 toggle's storage
 #include "UI/Text/TraceCanvasText.h" // spec v22 §A1 - this page types in the artist's face
 #include "Audio/TraceAudio.h"           // spec v26 §9 - ButtonPress on the submenu rows too
+#include "Audio/TraceMusicPlayer.h"     // UI plan WP3 - RefreshVolume, so a MUSIC drag is heard live
+#include "GameFramework/PlayerState.h"  // UI plan WP2.4 - the name the submit path is replacing
+#include "UI/Widgets/Menu/TraceMenuArtStyle.h"  // WP11.1 - AmberLifted() for the slider thumb
+#include "UI/TraceHardwareCursor.h"        // UI QA finding 6 - one pointer, drawn in one place
 #include "Gameplay/TraceMelee.h"       // kept for the transitive gameplay types; the v28 §10 row-label override it fed is deleted (v29 §5)
 
 // =================================================================================================
@@ -327,11 +331,9 @@ namespace TraceOptionsMenuArt
 		PlateHover,
 		PlateDisabled,
 		SliderTrack,
-		SliderHandle,
 		ValueBox,
 		WordKeybind,
 		WordKey,
-		Cursor,
 		Chevron,
 		Count
 	};
@@ -342,11 +344,9 @@ namespace TraceOptionsMenuArt
 		TEXT("/Game/Trace/UI/Art/T_MenuBtn_Hover.T_MenuBtn_Hover"),
 		TEXT("/Game/Trace/UI/Art/T_MenuBtn_Disabled.T_MenuBtn_Disabled"),
 		TEXT("/Game/Trace/UI/Art/T_MenuSliderTrack.T_MenuSliderTrack"),
-		TEXT("/Game/Trace/UI/Art/T_MenuSliderHandle.T_MenuSliderHandle"),
 		TEXT("/Game/Trace/UI/Art/T_MenuValueBox.T_MenuValueBox"),
 		TEXT("/Game/Trace/UI/Art/T_MenuWord_Keybind.T_MenuWord_Keybind"),
 		TEXT("/Game/Trace/UI/Art/T_MenuWord_Key.T_MenuWord_Key"),
-		TEXT("/Game/Trace/UI/Art/T_MenuCursor.T_MenuCursor"),
 		TEXT("/Game/Trace/UI/Art/T_MenuBack.T_MenuBack"),
 	};
 
@@ -509,22 +509,16 @@ namespace TraceOptionsMenuArt
 	}
 
 	// Sprite aspects, measured off the PNGs rather than guessed, so nothing here is stretched.
-	static constexpr float CursorAspect  = 64.f / 87.f;
-	static constexpr float HandleAspect  = 64.f / 87.f;
+	//
+	// TWO ENTRIES ARE GONE FROM THIS LIST, and their absence is the finding rather than a tidy-up.
+	// `CursorAspect` and the tip fractions `CursorTipU/V` were a third copy of numbers TraceMenuArtStyle
+	// already derives from the sprite's own pixel size; UI/TraceHardwareCursor.h now owns the whole
+	// pointer — sprite, size, anchor and tint — and this page calls it. `HandleAspect` was 64/87, the
+	// SAME aspect, because T_MenuSliderHandle is the same blade as T_MenuCursor; the thumb is drawn as
+	// a fader cap now and needs no sprite aspect at all. See DrawSliderRow.
 	static constexpr float ChevronAspect = 96.f / 125.f;
 	static constexpr float KeybindAspect = 256.f / 42.f;
 	static constexpr float KeyAspect     = 128.f / 47.f;
-
-	/**
-	 * The tip of T_MenuCursor, as a fraction of the sprite, measured from its alpha: the arrow's point
-	 * is at about (11.5, 6.5) of 64x87.
-	 *
-	 * It matters because PollMouse hit-tests at CursorPos. A centre-anchored arrow would draw its
-	 * point about eleven pixels away from the pixel it is about to click, and every click in every
-	 * screenshot would look like it landed on the wrong row.
-	 */
-	static constexpr float CursorTipU = 0.180f;
-	static constexpr float CursorTipV = 0.075f;
 
 	/** The slider sprite is a trough: its solid rail occupies rows 6..17 of its 23. */
 	static constexpr float TrackRailTopV = 6.f / 23.f;
@@ -779,6 +773,24 @@ namespace
 			else
 			{
 				UE_LOG(LogTraceGame, Warning, TEXT("[Options] Trace.Menu.Crosshair: no HUD is drawing an overlay yet."));
+			}
+		}));
+
+	FAutoConsoleCommand CmdMenuAudio(
+		TEXT("Trace.Menu.Audio"),
+		TEXT("UI plan WP3. Opens the AUDIO settings page on whichever HUD is up. Works on the title ")
+		TEXT("screen and in a match. Triplet of Trace.Menu.Video and Trace.Menu.Crosshair, and it exists ")
+		TEXT("for the same reason: a headless run has no keyboard, so without it there is no way to ")
+		TEXT("photograph this page at all. -TraceExec=Trace.Menu.Audio."),
+		FConsoleCommandDelegate::CreateLambda([]()
+		{
+			if (GActiveOptionsMenu != nullptr)
+			{
+				GActiveOptionsMenu->OpenAudio();
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Options] Trace.Menu.Audio: no HUD is drawing an overlay yet."));
 			}
 		}));
 
@@ -1397,7 +1409,15 @@ bool FTraceOptionsMenu::DebugGetRowRect(const TCHAR* Label, FBox2D& OutRect) con
  * harness which cannot go red is not evidence. Trace.Keys.RebindProof prints the viewport's verdict
  * beside every click, so the two arms are distinguishable in one line of log.
  *
- * Not ECVF_Cheat: it changes no gameplay rule, only whether a menu click is delivered.
+ * *** ECVF_Cheat SINCE W9-SHIPGUARD. *** This line used to read "Not ECVF_Cheat: it changes no
+ * gameplay rule, only whether a menu click is delivered", which is still an accurate description of
+ * what the arm does and was the wrong reason to leave it unflagged. The flag is inert wherever
+ * DISABLE_CHEAT_CVARS is 0 (every configuration except Shipping and Test), so the console and
+ * -ExecCmds still reach this switch on every build the §3a harness runs on. What it closes is the
+ * one path left into a SHIPPED build — Engine.ini's [ConsoleVariables] section, which
+ * LoadConsoleVariablesFromINI applies with bAllowCheating = false and which is player-writable in a
+ * packaged game. See Trace.Keys.LegacySteal in TraceUserSettings.cpp for the full argument; the two
+ * v28 §3 arms are flagged together because they are one feature's A/B.
  */
 static int32 GTraceMenuPressDelivery = 1;
 static FAutoConsoleVariableRef CVarTraceMenuPressDelivery(
@@ -1407,7 +1427,7 @@ static FAutoConsoleVariableRef CVarTraceMenuPressDelivery(
 	     "put in CaptureDuringMouseDown so a mouse PRESS reaches the game, and the previous mode is "
 	     "restored on close. 0 is the RED arm - the pre-v28 behaviour, where the title screen's "
 	     "NoCapture mode swallows the first press of every click."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 void FTraceOptionsMenu::SetPressDeliveryOverride(bool bEnable)
 {
@@ -1546,6 +1566,28 @@ void FTraceOptionsMenu::OpenCrosshair()
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Crosshair settings opened."));
 }
 
+void FTraceOptionsMenu::OpenAudio()
+{
+	Page = EPage::Audio;
+	bCapturingKey = false;
+
+	// Closed, not Settings: this entry point IS the top of the stack, so BACK has to close rather than
+	// drop the player onto a settings page they never asked for. Same contract as OpenVideo.
+	AudioReturnPage = EPage::Closed;
+	IgnoreInputBeforeFrame = GFrameCounter + 1;
+
+#if !UE_BUILD_SHIPPING
+	// See TickAutoActivate: the capture hook is armed per opening, not per process.
+	DrawsSinceOpen = 0;
+	bAutoActivateDone = false;
+#endif
+	// SPEC v28 §3a — before the first frame the player can click on. See SetPressDeliveryOverride.
+	SetPressDeliveryOverride(true);
+
+	RebuildRows();
+	UE_LOG(LogTraceGame, Display, TEXT("[Options] Audio settings opened."));
+}
+
 void FTraceOptionsMenu::Close()
 {
 	if (Page == EPage::Closed)
@@ -1564,6 +1606,12 @@ void FTraceOptionsMenu::Close()
 	Page = EPage::Closed;
 	bCapturingKey = false;
 	CapturingAction = ETraceInputAction::Count;
+
+	// UI PLAN WP2.2 — an abandoned edit is an abandoned edit. Ending the field rather than committing
+	// it is deliberate: the player closed the menu, which is not the gesture that means "save this
+	// name". Nothing is lost that was not lost by the same rule for a half-finished rebind two lines
+	// up, and the stored call sign is untouched.
+	CallSignEntry.End();
 	// SPEC v28 §3c — the chip column is part of "where the player was", so it resets with everything
 	// else. Re-opening the page on the second chip of a row nobody is looking at would be a surprise.
 	CapturingSlot = 0;
@@ -1739,8 +1787,46 @@ void FTraceOptionsMenu::RebuildRows()
 		AddAction(TEXT("RESET TO DEFAULTS"), EAction::ResetCrosshairDefaults);
 		AddAction(TEXT("BACK"), EAction::Back);
 	}
+	else if (Page == EPage::Audio)
+	{
+		// ---- UI PLAN WP3 — LOUD TO QUIET, MASTER FIRST ------------------------------------------
+		//
+		// The order is the order a player decides in and the order the values compose in: MASTER
+		// multiplies both of the two under it, so it reads as the parent it is. EFFECTS before MUSIC
+		// because effects are the game — a player who cannot hear the shot that killed them has a
+		// problem, a player who finds the bed loud has a preference.
+		AddHeader(TEXT("VOLUME"));
+		AddValue(ERowKind::Slider, TEXT("MASTER VOLUME"), ESetting::MasterVolume);
+		AddValue(ERowKind::Slider, TEXT("SOUND EFFECTS"), ESetting::SfxVolume);
+		AddValue(ERowKind::Slider, TEXT("MUSIC"), ESetting::MusicVolume);
+
+		// NO "NO MUSIC YET" NOTE. The UI plan's draft carried one — deliberate honesty about a silent
+		// slider — and the integration pass struck it, because music DOES ship this release: the
+		// title loop, the match ambience bed and the two end stingers all exist as imported assets
+		// (FX_AUDIO_PLAN §5.7). A note explaining an absence that is not there would be the exact
+		// mistake the original note was written to avoid, one release later.
+
+		AddHeader(TEXT(""));
+		AddAction(TEXT("RESET TO DEFAULTS"), EAction::ResetAudioDefaults);
+		AddAction(TEXT("BACK"), EAction::Back);
+	}
 	else if (Page == EPage::Settings)
 	{
+		// ---- UI PLAN WP2 — THE PLAYER'S OWN NAME, FIRST ON THE PAGE -----------------------------
+		//
+		// ABOVE DISPLAY, and that placement is the argument. Until this row existed the scoreboard
+		// called the human "Mac-3249D6BCCE489DF8" — the engine's fallback, because only bots ever got
+		// a SetPlayerName. The first thing a player opening SETTINGS for the first time should be
+		// able to fix is the thing with their name on it, and a row buried under two display doors and
+		// a match toggle is a row nobody finds before their first match.
+		AddHeader(TEXT("PLAYER"));
+		AddValue(ERowKind::TextEntry, TEXT("CALL SIGN"), ESetting::CallSign);
+
+		// The note is not decoration: this row is the only control on any of these pages that takes
+		// free text, so it is the only one where a player can be refused a character and not know why.
+		// It names the alphabet AND the cap, which are the two refusals the field can make.
+		AddNote(TEXT("SHOWN ON THE SCOREBOARD AND IN THE KILL FEED. A-Z, 0-9, SPACE, - _ . MAX 16."));
+
 		// First row on the page, above the mouse. Same reasoning as the pause root's VIDEO entry —
 		// and this is the ONLY route to the video page from the title screen, where there is no
 		// pause root at all, so it cannot be buried at the bottom next to RESET.
@@ -1751,6 +1837,12 @@ void FTraceOptionsMenu::RebuildRows()
 		// to a page about how the game LOOKS, and this is the only route the title screen has to
 		// either of them — there is no pause root there to hang a shortcut on.
 		AddAction(TEXT("CROSSHAIR"), EAction::OpenCrosshair);
+
+		// UI PLAN WP3. Its own header rather than a third door under DISPLAY, because it is not one:
+		// DISPLAY is how the game LOOKS and this is how it SOUNDS, and a page about the crosshair and
+		// a page about the master volume have nothing to say to each other.
+		AddHeader(TEXT("SOUND"));
+		AddAction(TEXT("AUDIO"), EAction::OpenAudio);
 
 		// ---- Match rules (spec v14 §3) ----------------------------------------------------------
 		//
@@ -1919,10 +2011,22 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	// Before input, so a click cannot land on a row that stopped being meaningful last frame.
 	RefreshRowStates();
 
-	// Input first, then draw, so a value changed this frame is the value the player sees this frame.
-	// The row rects the mouse tests against are from the PREVIOUS draw, which is correct: they are
-	// where the player was actually looking when they clicked.
-	PollInput(PC);
+	// UI PLAN WP2.2 — THE FIELD GETS THE KEYBOARD BEFORE THIS CLASS DOES.
+	//
+	// FTraceTextEntry's header states the rule for its hosts — "the host must not route its own
+	// bindings while IsActive()" — and this class is a host exactly as the title screen is. It is not
+	// a nicety here: the arrows are the caret's, Enter is submit, Escape is cancel and Backspace is a
+	// deletion, and every one of those four is ALSO a control on this page. Both readers would fire.
+	//
+	// It returns true for the whole edit, including the frame that ends it, so the Enter that
+	// committed the name cannot also activate the row underneath it.
+	if (!TickCallSignEntry(PC))
+	{
+		// Input first, then draw, so a value changed this frame is the value the player sees this
+		// frame. The row rects the mouse tests against are from the PREVIOUS draw, which is correct:
+		// they are where the player was actually looking when they clicked.
+		PollInput(PC);
+	}
 
 	// PollInput can close us (Escape, RESUME, QUIT). Drawing a closed overlay would leave a frame of
 	// dimmed screen over a game that has already resumed.
@@ -2272,6 +2376,14 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 	// selects regardless — that path reads HoverRow directly below.
 	if (HoverRow != INDEX_NONE && !bDraggingSlider && bCursorMoved)
 	{
+		// FX_AUDIO_PLAN §5.1 — the pointer's half of "menu row focus change". Guarded on the row
+		// ACTUALLY changing, or every 2 px of mouse travel across one row would re-announce it.
+		if (Selected != HoverRow)
+		{
+			TraceAudio::PlayLocal2D(GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr,
+				TraceSoundEvents::UIHover);
+		}
+
 		Selected = HoverRow;
 	}
 
@@ -2373,6 +2485,19 @@ void FTraceOptionsMenu::MoveSelection(int32 Delta)
 		}
 		if (Rows[Index].IsSelectable())
 		{
+			// FX_AUDIO_PLAN §5.1 — "UIHover: menu row focus change". On the CHANGE, never on the
+			// press: this function is reached from a held arrow key's repeat as well as from a single
+			// tap, and the guard below is what keeps a held key from firing sixty hovers a second at
+			// the ends of the list, where Selected does not actually move.
+			//
+			// The pointer's own focus changes are voiced by PollMouse, which is the other place
+			// Selected moves. Both of them are one keystroke-or-gesture per sound.
+			if (Selected != Index)
+			{
+				TraceAudio::PlayLocal2D(GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr,
+					TraceSoundEvents::UIHover);
+			}
+
 			Selected = Index;
 			// SPEC v28 §3c — the chip column is the CURSOR's, not the row's. Landing on a keybind row
 			// always starts on its first chip, so "down, enter" means the same thing on every row.
@@ -2498,6 +2623,43 @@ void FTraceOptionsMenu::GetSettingValue(ESetting Setting, float& OutValue, float
 		OutStep = 1.f;
 		break;
 
+	// ---- UI PLAN WP3 — the three faders ------------------------------------------------------
+	//
+	// IN PERCENT, NOT IN THE 0..1 THE SETTING STORES — the same conversion CROSSHAIR OPACITY makes
+	// four cases up, and for the same reason: "0.65" is a number a player cannot report back or
+	// reproduce, "65%" is. The twin divide is in SetSettingNormalised and neither may move without
+	// the other. That is now TWO rows on these pages whose display unit differs from their storage
+	// unit, so the rule is stated once here and once there rather than four times.
+	//
+	// STEP 5 (i.e. 0.05 of the stored value), and the range starts at a real 0: silence has to be
+	// reachable from the slider, and 21 stops is a fader a player can put anywhere without holding
+	// the key down for a second.
+	case ESetting::MasterVolume:
+		OutValue = Settings.GetAudioMasterVolume() * 100.f;
+		OutMin = UTraceUserSettings::MinAudioVolume * 100.f;
+		OutMax = UTraceUserSettings::MaxAudioVolume * 100.f;
+		OutStep = 5.f;
+		break;
+
+	case ESetting::SfxVolume:
+		OutValue = Settings.GetAudioSfxVolume() * 100.f;
+		OutMin = UTraceUserSettings::MinAudioVolume * 100.f;
+		OutMax = UTraceUserSettings::MaxAudioVolume * 100.f;
+		OutStep = 5.f;
+		break;
+
+	case ESetting::MusicVolume:
+		OutValue = Settings.GetAudioMusicVolume() * 100.f;
+		OutMin = UTraceUserSettings::MinAudioVolume * 100.f;
+		OutMax = UTraceUserSettings::MaxAudioVolume * 100.f;
+		OutStep = 5.f;
+		break;
+
+	// UI PLAN WP2.2 — CallSign is a TextEntry row and has no numeric value. It never reaches here
+	// (DrawRow and ActivateSelected both branch on the row KIND, and AdjustSelected returns before
+	// this is called), and it is named rather than left to `default:` so a reader can see that the
+	// omission was decided rather than forgotten.
+	case ESetting::CallSign:
 	default:
 		break;
 	}
@@ -2702,8 +2864,20 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 		return UTraceUserSettings::DescribeCrosshairColor(FMath::RoundToInt(Value));
 
 	case ESetting::CrosshairOpacity:
+	// UI PLAN WP3 — the three faders are already in percent too, for the same reason and by the same
+	// conversion. Sharing this case is what stops one page printing "65%" while another prints "0.65".
+	case ESetting::MasterVolume:
+	case ESetting::SfxVolume:
+	case ESetting::MusicVolume:
 		// Already in percent — see GetSettingValue, which is the only place the conversion happens.
 		return FString::Printf(TEXT("%d%%"), FMath::RoundToInt(Value));
+
+	case ESetting::CallSign:
+		// UI PLAN WP2.2 — the row draws the name through the clamped accessor, so an empty stored
+		// value reads PLAYER rather than as a blank chip that looks like a broken row. DrawRow calls
+		// this for the un-edited state only; while the field is active it draws CallSignEntry's live
+		// text and caret instead.
+		return UTraceUserSettings::Get().GetCallSignOrDefault();
 
 	case ESetting::FrameRateLimit:
 	{
@@ -2855,8 +3029,42 @@ void FTraceOptionsMenu::SetSettingNormalised(ESetting Setting, float Alpha)
 	case ESetting::CrosshairDot:       Settings.bCrosshairCenterDot = (Snapped >= 0.5f); break;
 	case ESetting::CrosshairOutline:   Settings.bCrosshairOutline = (Snapped >= 0.5f); break;
 
+	// ---- UI PLAN WP3 --------------------------------------------------------------------------
+	//
+	// Back out of the row's percent into the 0..1 the setting stores — the twin of the multiply in
+	// GetSettingValue, exactly as CROSSHAIR OPACITY's is three lines up. And they must be HERE or the
+	// `default: return` below eats them: the trapdoor this switch's own comment describes, which this
+	// page has already fallen through once.
+	case ESetting::MasterVolume:       Settings.AudioMasterVolume = Snapped * 0.01f; break;
+	case ESetting::SfxVolume:          Settings.AudioSfxVolume    = Snapped * 0.01f; break;
+	case ESetting::MusicVolume:        Settings.AudioMusicVolume  = Snapped * 0.01f; break;
+
 	default: return;
 	}
+
+	// ---- UI PLAN WP3 — THE BED IS RE-GAINED ON THE FRAME THE FADER MOVES ------------------------
+	//
+	// Every one-shot picks the new gain up by itself: it is chosen at PLAY time, in VolumeFor, and
+	// nothing is holding an old one. The music bed is the exception and it is the exception by design
+	// — it is a persistent component created once and left running across the menu->match travel, so
+	// its VolumeMultiplier was set minutes ago and will not move on its own. RefreshVolume() re-runs
+	// the gain arithmetic on the playing component, which is what makes a DRAG on the MUSIC row
+	// audible while the pointer is still down instead of on the next track change.
+	//
+	// Called for MASTER as well as for MUSIC, because master multiplies the bed too.
+	if (Setting == ESetting::MasterVolume || Setting == ESetting::MusicVolume)
+	{
+		if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(
+			GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr))
+		{
+			Music->RefreshVolume();
+		}
+	}
+
+	// UI PLAN WP3 — the audible half of a volume control. See PreviewAudioChange; it is a no-op for
+	// every row that is not a fader, and it is called from HERE rather than from AdjustSelected so
+	// that a DRAG is audible too — a drag never goes through AdjustSelected at all.
+	PreviewAudioChange(Setting);
 
 	// Deliberately no Save() here: a drag would otherwise write and flush the .ini every frame. The
 	// mouse-up path saves once, and the keyboard path in AdjustSelected saves per press.
@@ -2940,7 +3148,14 @@ void FTraceOptionsMenu::ActivateSelected()
 	// PlayLocal2D rather than Play(Actor): this page has no actor and no world member - the HUD is a
 	// draw-time parameter - and a menu click has no world position to be attenuated from anyway. The
 	// call is silent-safe against a null world.
-	if (Row.Kind != ERowKind::Slider)
+	//
+	// FX_AUDIO_PLAN §5.1 — AND *BACK* IS NOT A BUTTON PRESS, IT IS A BACK. The palette carries a
+	// separate UIBack for exactly this edge, and it is played by GoBack() rather than here, because
+	// Escape reaches GoBack() without passing through this function at all. Playing ButtonPress here
+	// as well would put two sounds on one keystroke for a player who clicked the row instead.
+	const bool bIsBackRow = (Row.Kind == ERowKind::Action && Row.Action == EAction::Back);
+
+	if (Row.Kind != ERowKind::Slider && !bIsBackRow)
 	{
 		TraceAudio::PlayLocal2D(GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr,
 			TraceSoundEvents::ButtonPress);
@@ -2989,6 +3204,12 @@ void FTraceOptionsMenu::ActivateSelected()
 
 	case ERowKind::Slider:
 		// Nothing sensible for Enter to do to a continuous value. Left/right and the mouse own it.
+		return;
+
+	case ERowKind::TextEntry:
+		// UI PLAN WP2.2 — hand the keyboard over. Every key from here until Enter or Escape belongs to
+		// the field; see TickCallSignEntry, which is what enforces that.
+		BeginCallSignEntry();
 		return;
 
 	case ERowKind::Binding:
@@ -3049,6 +3270,31 @@ void FTraceOptionsMenu::ActivateSelected()
 		RebuildRows();
 		break;
 
+	case EAction::OpenAudio:
+		// Remember where we came from, exactly as OpenVideo and OpenCrosshair do. Only the settings
+		// page carries this row today, but "back" must mean the place the player actually came from
+		// rather than one hardcoded parent — Trace.Menu.Audio can also land them here from nowhere.
+		AudioReturnPage = Page;
+		Page = EPage::Audio;
+		IgnoreInputBeforeFrame = GFrameCounter + 1;
+		RebuildRows();
+		break;
+
+	case EAction::ResetAudioDefaults:
+		// The three faders and nothing else — not the crosshair, not the bindings, not the mouse.
+		// See EAction::ResetAudioDefaults in the header.
+		UTraceUserSettings::Get().ResetAudioToDefaults();
+
+		// The bed is a persistent component and does not re-read its gain on its own; the reset has to
+		// reach it for the same reason a drag does. See SetSettingNormalised.
+		if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(
+			GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr))
+		{
+			Music->RefreshVolume();
+		}
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] Audio volumes reset to defaults."));
+		break;
+
 	case EAction::ResetCrosshairDefaults:
 		// The crosshair's SEVEN fields and nothing else — not the mouse, not the bindings, not the
 		// resolution. See EAction::ResetCrosshairDefaults in the header.
@@ -3093,6 +3339,38 @@ void FTraceOptionsMenu::ActivateSelected()
 
 void FTraceOptionsMenu::GoBack()
 {
+	// FX_AUDIO_PLAN §5.1 — "UIBack: back/cancel activation", client-side 2D.
+	//
+	// THE ONE CHOKE POINT for going back: the BACK row's activation, Escape on any page, and the
+	// pause root's Escape-means-resume all pass through here and nowhere else. Playing it in
+	// ActivateSelected instead would miss Escape entirely, which is the way most players actually
+	// leave a page.
+	//
+	// Before the branches, not inside them, because every branch below IS a back — including the one
+	// that closes the overlay outright.
+	TraceAudio::PlayLocal2D(GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr,
+		TraceSoundEvents::UIBack);
+
+	if (Page == EPage::Audio)
+	{
+		// UI PLAN WP3 — "Save() on page close, same as every other page." The keyboard path already
+		// saves per press and the mouse path saves per release, so this is the belt-and-braces for a
+		// value changed by any route this class grows later. It is cheap and it is the difference
+		// between a fader that persists and one that persists usually.
+		UTraceUserSettings::Get().Save();
+
+		if (AudioReturnPage == EPage::Root || AudioReturnPage == EPage::Settings)
+		{
+			Page = AudioReturnPage;
+			IgnoreInputBeforeFrame = GFrameCounter + 1;
+			RebuildRows();
+			return;
+		}
+
+		Close();
+		return;
+	}
+
 	if (Page == EPage::Video)
 	{
 		// A queued resize must not be able to outlive the page that queued it. Leaving the page is
@@ -3459,6 +3737,13 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 		// than the whitespace it costs.
 		PanelW = FMath::Min(ViewW * 0.50f, 560.f * UIScale);
 	}
+	else if (Page == EPage::Audio)
+	{
+		// UI PLAN WP3 — six rows of short labels and percentages. Same width as the crosshair page
+		// minus its preview allowance: wide enough that "SOUND EFFECTS" and "100%" cannot meet in the
+		// middle at 720p, narrow enough that three sliders do not read as three stranded lines.
+		PanelW = FMath::Min(ViewW * 0.56f, 620.f * UIScale);
+	}
 
 	// ---- SPEC v29 §3 — the live preview, BESIDE the panel ---------------------------------------
 	//
@@ -3506,6 +3791,7 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	if (Page == EPage::Root)            { Title = TEXT("PAUSED"); }
 	else if (Page == EPage::Video)      { Title = TEXT("VIDEO"); }
 	else if (Page == EPage::Crosshair)  { Title = TEXT("CROSSHAIR"); }
+	else if (Page == EPage::Audio)      { Title = TEXT("AUDIO"); }
 
 	// SOFACHROME, and the spec names this string: "the word SETTINGS at the top of the settings page
 	// stays Sofachrome while the rows beneath it become Erbaum" (v26 §2). PAUSED and VIDEO are the
@@ -3548,10 +3834,18 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	{
 		Hint = TEXT("W / S  OR  ARROWS   MOVE          ENTER   SELECT          ESC   RESUME");
 	}
-	else if (Page == EPage::Video || Page == EPage::Crosshair)
+	else if (CallSignEntry.IsActive())
 	{
-		// No BKSP/UNBIND on either page — there is nothing to unbind — and the hint says so rather
-		// than offering a key that does nothing.
+		// UI PLAN WP2.2 — while the field owns the keyboard the page's own legend is a lie: ESC is
+		// cancel-the-edit rather than back-a-page, and the arrows move a caret rather than a
+		// selection. The footer says what the keys do RIGHT NOW, exactly as the rebind capture's does
+		// three branches up.
+		Hint = TEXT("TYPE YOUR CALL SIGN          ENTER   SAVE          ESC   CANCEL");
+	}
+	else if (Page == EPage::Video || Page == EPage::Crosshair || Page == EPage::Audio)
+	{
+		// No BKSP/UNBIND on any of these three — there is nothing to unbind — and the hint says so
+		// rather than offering a key that does nothing.
 		Hint = TEXT("ARROWS  MOVE / ADJUST          ENTER  SELECT          ESC  BACK");
 	}
 	else
@@ -3803,6 +4097,13 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 
 			FString ValueText;
 			FLinearColor ValueColor;
+
+			/**
+			 * WP6.3 — set for the ONE case that is a sentence rather than a key: the PASS row's empty
+			 * first slot. A sentence does not go in a key chip. See the branch below.
+			 */
+			bool bPassNote = false;
+
 			if (bWaiting)
 			{
 				ValueText = TEXT("PRESS A KEY");
@@ -3812,6 +4113,32 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 			{
 				ValueText = UTraceUserSettings::DescribeKey(Key);
 				ValueColor = TraceOptionsStyle::Ink;
+			}
+			else if (Slot == 0 && Row.Binding == ETraceInputAction::Pass)
+			{
+				// ---- UI PLAN WP6.3 — THE PASS ROW IS NOT UNBOUND, IT IS ALREADY BOUND -------------
+				//
+				// Spec v25 §7 deliberately left this action with no default key, because mouse 1
+				// ALREADY throws (at a goal) and passes (in an endzone) while you are carrying the
+				// Core — see ETraceInputAction::Pass in Settings/TraceUserSettings.h. This row is the
+				// OPTIONAL second route to a verb the player already has.
+				//
+				// Drawn as amber UNBOUND, that read as "the central mechanic of this game is broken",
+				// which is precisely what the release audit reported (§4.3). So the row states the
+				// truth instead, in INK-DIM: informational, not alarm. The second slot's "+" is
+				// untouched below, so an optional extra bind is still one click away.
+				//
+				// EVERY OTHER unbound action keeps the amber UNBOUND, because there it really is a
+				// problem — this is one action's fact, not a change to what "unbound" means.
+				//
+				// AND IT IS NOT PUT IN A CHIP. A key chip is a plate around a KEY NAME, sized to it;
+				// this string is four times the width of "LEFT SHIFT" and a chip stretched to hold it
+				// would eat the row's label at 720p — and would also make the sentence look like a
+				// bindable thing, which is the opposite of what it says. It is set as right-aligned
+				// prose, in the same column, at the same baseline.
+				ValueText = TEXT("LMB  (WHILE CARRYING)");
+				ValueColor = TraceOptionsStyle::InkDim;
+				bPassNote = true;
 			}
 			else if (Slot == 0)
 			{
@@ -3837,11 +4164,15 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 			// measuring "LEFT SHIFT" in Sofachrome and setting it in Erbaum would leave a chip a third
 			// wider than the word inside it on every keybind row on the page.
 			const float MinChipW = (Slot == 0 && !Row.KeyChip[1].bIsValid) ? (120.f * UIScale) : (84.f * UIScale);
-			const float PlateW = FMath::Max(MeasureWidth(HUD, ValueText, FontMedium, LabelScale,
-				TraceOptionsMenuType::BodyFace) + (16.f * UIScale), MinChipW);
+			const float TextW = MeasureWidth(HUD, ValueText, FontMedium, LabelScale,
+				TraceOptionsMenuType::BodyFace);
+
+			// WP6.3: the note is sized to its own text with no plate padding and no floor, because it
+			// is not a plate. Everything else keeps the arithmetic it has always had.
+			const float PlateW = bPassNote ? TextW : FMath::Max(TextW + (16.f * UIScale), MinChipW);
 			const float ChipX = NextRight - PlateW;
 
-			const bool bChipDrawn = DrawValueChip(HUD, ChipX, ChipY, PlateW, ChipH);
+			const bool bChipDrawn = !bPassNote && DrawValueChip(HUD, ChipX, ChipY, PlateW, ChipH);
 
 			// The cyan wash the chip used to BE, kept on top of the sprite at a whisper. The artist's chip
 			// is the same navy as the plate it sits on — its amber ring is what separates them, and a
@@ -3851,19 +4182,91 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 			// difference is the only thing telling the player which of the two Enter and Backspace are
 			// about, so it is not decoration.
 			const bool bActiveChip = bSelected && (Slot == ActiveSlot);
-			const float Wash = bWaiting ? 0.22f : (bActiveChip ? 0.16f : (bChipDrawn ? 0.05f : 0.10f));
-			HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, Wash), ChipX, ChipY, PlateW, ChipH);
+			if (!bPassNote)
+			{
+				const float Wash = bWaiting ? 0.22f : (bActiveChip ? 0.16f : (bChipDrawn ? 0.05f : 0.10f));
+				HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, Wash), ChipX, ChipY, PlateW, ChipH);
+			}
 
 			// THE KEYBIND ROW'S KEY NAME. Erbaum Bold — "keybind rows" is one of the three surfaces §2
-			// names, and this is the string on them a player actually reads.
+			// names, and this is the string on them a player actually reads. The WP6.3 note is set in
+			// the same face at the same baseline, measured by the same call that draws it.
 			DrawTextCentered(HUD, ValueText, ValueColor, ChipX + PlateW * 0.5f, TextY, FontMedium, LabelScale,
 				TraceOptionsMenuType::BodyFace);
 
-			// The rect PollMouse hit-tests against. Written after the draw so it is exactly what was drawn.
+			// The rect PollMouse hit-tests against. Written after the draw so it is exactly what was
+			// drawn — including for the WP6.3 note, which is still a live target: clicking it opens
+			// the rebind capture, because the row IS bindable and the note only says it does not have
+			// to be.
 			Row.KeyChip[Slot] = FBox2D(FVector2D(ChipX, ChipY), FVector2D(ChipX + PlateW, ChipY + ChipH));
 
 			NextRight = ChipX - ChipGap;
 		}
+		return;
+	}
+
+	// ---- UI PLAN WP2.2 — the CALL SIGN row -----------------------------------------------------
+	//
+	// Two states in one branch, because they are one row: the value the game is using, and — while
+	// the player is typing — the live text with a caret in it. The field itself is drawn as the JOIN
+	// prompt draws its own (ATraceMenuHUD::DrawJoinPrompt): a chip, the text left-aligned inside it,
+	// and a caret measured off the SUBSTRING LEFT OF THE CARET rather than off a fixed advance —
+	// these faces are proportional, and a caret that drifts off the character it is editing is worse
+	// than no caret at all.
+	if (Row.Kind == ERowKind::TextEntry)
+	{
+		const bool bEditing = CallSignEntry.IsActive() && bSelected;
+
+		// A WIDER CHIP THAN A VALUE COLUMN. Sixteen characters is the cap (WP2.1) and the row has to
+		// be able to show all sixteen without eliding — a name the player cannot read back is a name
+		// they cannot check they typed correctly. Measured in the face it is drawn in (v26 §2), with
+		// the SLIDER's chip width as the floor so the column lines up with the rows above and below.
+		const FString Shown = bEditing ? CallSignEntry.GetText() : FormatSettingValue(Row.Setting, 0.f);
+		const float PadInside = 18.f * UIScale;
+		const float ChipW = FMath::Max(ValueColW * 1.6f,
+			MeasureWidth(HUD, Shown, FontMedium, LabelScale, TraceOptionsMenuType::BodyFace) + PadInside * 2.f);
+		const float ChipX = ValueRight - ChipW;
+		const float ChipY = Y + H * 0.14f;
+		const float ChipH = H * 0.72f;
+
+		const bool bChipDrawn = DrawValueChip(HUD, ChipX, ChipY, ChipW, ChipH);
+
+		// Washed HARDER while editing, exactly as a rebind capture's chip is (spec v28 §3c): the
+		// difference is the only thing on screen telling the player the keyboard now belongs to this
+		// field rather than to the list.
+		const float Wash = bEditing ? 0.22f : (bSelected ? 0.16f : (bChipDrawn ? 0.05f : 0.10f));
+		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, Wash), ChipX, ChipY, ChipW, ChipH);
+
+		const float TextX = ChipX + PadInside;
+
+		if (bEditing && Shown.IsEmpty())
+		{
+			// Ghost text, dim enough that nobody mistakes it for a value they can press Enter on —
+			// the JOIN prompt's own answer to the same empty-field problem.
+			TraceOptionsMenuType::Draw(HUD, FString(UTraceUserSettings::DefaultCallSign),
+				TraceOptionsStyle::WithAlpha(TraceOptionsStyle::InkDim, 0.35f),
+				TextX, TextY, FontMedium, LabelScale, TraceOptionsMenuType::BodyFace);
+		}
+		else
+		{
+			TraceOptionsMenuType::Draw(HUD, Shown,
+				bSelected ? TraceOptionsStyle::Ink : TraceOptionsStyle::InkDim,
+				TextX, TextY, FontMedium, LabelScale, TraceOptionsMenuType::BodyFace);
+		}
+
+		if (bEditing && CallSignEntry.IsCaretVisible(Now))
+		{
+			const FString LeftOfCaret = Shown.Left(CallSignEntry.GetCaret());
+			const float CaretX = TextX + MeasureWidth(HUD, LeftOfCaret, FontMedium, LabelScale,
+				TraceOptionsMenuType::BodyFace);
+			HUD->DrawRect(TraceOptionsStyle::Cyan, CaretX, ChipY + (4.f * UIScale),
+				FMath::Max(2.f, 2.f * UIScale), ChipH - (8.f * UIScale));
+		}
+
+		// NO Row.Track. A TextEntry row has nothing to drag, and Track is the SLIDER's rect — writing
+		// one here would be a rectangle no code reads and the next reader has to prove is dead. The
+		// click target is Row.Rect, set at the top of this function, which is how every non-slider row
+		// on this page is already hit-tested.
 		return;
 	}
 
@@ -3985,26 +4388,66 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 			TrackLeft, TrackY, TrackW * Alpha, TrackH);
 	}
 
-	// Handle, so the value has a thing to grab as well as a bar to read.
-	const float HandleW = FMath::Max(4.f, 6.f * UIScale);
-	const float HandleH = H * 0.56f;
-	bool bHandleDrawn = false;
-	if (UTexture2D* HandleTex = TraceOptionsMenuArt::Sprite(TraceOptionsMenuArt::ESprite::SliderHandle))
+	// ---- THE THUMB — A FADER CAP, NOT THE POINTER SPRITE (UI QA finding 6b) ---------------------
+	//
+	// WHAT THIS REPLACES, AND WHY RE-TINTING WAS NOT ENOUGH.
+	//
+	// The release audit read the thumb as "a stray mouse cursor stuck on the bar". WP11.1 answered
+	// that by tinting it — amber when the row is selected, cyan otherwise — on the argument that
+	// "nothing was wrong with the sprite; what was wrong was that it wore the CURSOR's colour". The
+	// QA pass re-photographed it and disagreed, and the pixels are with the QA pass: T_MenuSliderHandle
+	// and T_MenuCursor are the SAME PICTURE. Both are 64x87, both are a diagonal blade running from
+	// upper-left to lower-right, and the slider one is the cursor with the rail subtracted from under
+	// it. Colour cannot separate two objects that are the same shape at the same angle — move the real
+	// pointer onto a slider and you still get two identical blades on one bar, which is exactly what
+	// `crop_cursor_vs_sliderthumb.png` shows.
+	//
+	// So the thumb is now a real thumb: a vertical fader cap, drawn from rectangles, which is a shape
+	// no pointer in this project has. Three properties do the work, and none of them is the colour:
+	//
+	//   * IT IS VERTICAL AND THE POINTER IS DIAGONAL. That difference survives at 12 px, in
+	//     peripheral vision, and in a screenshot at 720p.
+	//   * IT CROSSES THE RAIL SQUARELY, so it reads as riding the track rather than lying on top of
+	//     it. The blade's tip pointed off the bar; a cap's edges are parallel to the trough's.
+	//   * IT HAS A GRIP NOTCH. One dark band across its waist is what every physical fader has and
+	//     what says "drag me" without a word. It is also the detail that stops the cap reading as a
+	//     plain bright rectangle, which is what a progress bar's end cap looks like.
+	//
+	// The keyline underneath it is not decoration either: the cap sits on the rail's own cyan at 0.95
+	// when the row is selected, and without a dark edge a cyan cap on a cyan rail is invisible at the
+	// one value that matters most (100 %, where the fill reaches the cap).
+	//
+	// COLOURS ARE WP11.1's, UNCHANGED AND FOR ITS REASONS: AmberLifted() when the row is selected,
+	// because the selection language on this page is amber (the plate's hover ring, the row rail) and
+	// the sheet's flat amber ships as a dim brown smear; cyan at 0.85 otherwise.
+	//
+	// T_MenuSliderHandle IS NO LONGER DRAWN ANYWHERE. It is left in Content as the artist's record. If
+	// a re-cut ever produces a vertical thumb sprite, this block becomes one Draw call again.
 	{
-		// The artist subtracted the rail from underneath the blade, so this composites over the trough
-		// with no stub showing through. It is a white alpha mask, so the tint is the whole state.
-		const float SpriteHandleH = FMath::Min(H * 0.92f, 26.f * UIScale);
-		const float SpriteHandleW = SpriteHandleH * TraceOptionsMenuArt::HandleAspect;
-		TraceOptionsMenuArt::Draw(HUD, HandleTex,
-			TrackLeft + TrackW * Alpha - SpriteHandleW * 0.5f, Y + (H - SpriteHandleH) * 0.5f,
-			SpriteHandleW, SpriteHandleH,
-			bSelected ? FLinearColor::White : TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.85f));
-		bHandleDrawn = true;
-	}
-	if (!bHandleDrawn)
-	{
-		HUD->DrawRect(bSelected ? FLinearColor::White : TraceOptionsStyle::Cyan,
-			TrackLeft + TrackW * Alpha - HandleW * 0.5f, Y + (H - HandleH) * 0.5f, HandleW, HandleH);
+		const float T = FMath::Max(1.f, 1.f * UIScale);
+		const float CapW = FMath::Max(6.f, 12.f * UIScale);
+		const float CapH = FMath::Clamp(H * 0.68f, 12.f, 40.f * UIScale);
+		const float CapX = FMath::RoundToFloat(TrackLeft + TrackW * Alpha - CapW * 0.5f);
+		const float CapY = FMath::RoundToFloat(Y + (H - CapH) * 0.5f);
+
+		const FLinearColor Face = bSelected
+			? TraceMenuArtStyle::AmberLifted()
+			: TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.85f);
+
+		// The keyline, one pixel proud on every side. Drawn as a full rectangle so the chamfer below
+		// leaves it showing at the four corners, which is what cuts them.
+		HUD->DrawRect(FLinearColor(0.01f, 0.02f, 0.04f, 0.92f),
+			CapX - T, CapY - T, CapW + T * 2.f, CapH + T * 2.f);
+
+		// The cap: a middle band at full width with a narrower row top and bottom. Three rectangles,
+		// and the one-pixel step at each end is the chamfer.
+		HUD->DrawRect(Face, CapX + T, CapY, CapW - T * 2.f, T);
+		HUD->DrawRect(Face, CapX, CapY + T, CapW, CapH - T * 2.f);
+		HUD->DrawRect(Face, CapX + T, CapY + CapH - T, CapW - T * 2.f, T);
+
+		// The grip notch across its waist.
+		HUD->DrawRect(FLinearColor(0.01f, 0.02f, 0.04f, 0.72f),
+			CapX + T * 2.f, FMath::RoundToFloat(CapY + (CapH - T * 2.f) * 0.5f), CapW - T * 4.f, T * 2.f);
 	}
 
 	// Stored AFTER drawing so the poll on the next frame drags against exactly what was on screen.
@@ -4112,6 +4555,135 @@ void FTraceOptionsMenu::DrawCrosshairPreview(AHUD* HUD, float X, float Y, float 
 		FontSmall, CaptionScale, TraceOptionsMenuType::BodyFace);
 }
 
+// =================================================================================================
+// UI PLAN WP2 — the call sign
+// =================================================================================================
+
+void FTraceOptionsMenu::BeginCallSignEntry()
+{
+	const UTraceUserSettings& Settings = UTraceUserSettings::Get();
+
+	// SEEDED WITH THE RAW STORED VALUE, not with GetCallSignOrDefault(). A player who has never set a
+	// name sees the row read PLAYER and then opens an EMPTY field — because PLAYER is what the game
+	// calls them, not what they typed, and pre-filling it would make their first keystroke a
+	// correction of a word they never chose. A player who HAS set a name gets it back to edit.
+	CallSignEntry.Begin(UTraceUserSettings::SanitizeCallSign(Settings.CallSign),
+		ETraceTextCharset::CallSign, UTraceUserSettings::MaxCallSignLength);
+
+	UE_LOG(LogTraceGame, Display, TEXT("[Options] Call sign entry opened (current '%s')."),
+		*Settings.GetCallSignOrDefault());
+}
+
+bool FTraceOptionsMenu::TickCallSignEntry(APlayerController* PC)
+{
+	if (!CallSignEntry.IsActive())
+	{
+		return false;
+	}
+
+	// The field reads the keyboard itself — the reasons are in FTraceTextEntry's header — and it has
+	// to be serviced BEFORE anything is drawn so the caret and the text on screen are this frame's.
+	// ATraceMenuHUD does exactly this with its JOIN field, one line of its DrawHUD.
+	CallSignEntry.Poll(PC, Now);
+
+	if (CallSignEntry.ConsumeSubmit())
+	{
+		CommitCallSign();
+		CallSignEntry.End();
+		return true;
+	}
+
+	if (CallSignEntry.ConsumeCancel())
+	{
+		// Discarded, not written. Escape means "forget what I typed" everywhere else in this overlay
+		// (a rebind capture, a page), and a field that saved on Escape would be the one control here
+		// where it meant the opposite.
+		CallSignEntry.End();
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] Call sign entry cancelled."));
+		return true;
+	}
+
+	// STILL ACTIVE: this class must not route its own bindings this frame. The arrow keys are the
+	// caret's, Enter is submit, Escape is cancel and Backspace is a deletion — every one of them is
+	// also a control on this page, and both readers would fire without this.
+	return true;
+}
+
+void FTraceOptionsMenu::CommitCallSign()
+{
+	UTraceUserSettings& Settings = UTraceUserSettings::Get();
+
+	// Sanitised on the way in even though the field enforced the same alphabet while typing. The
+	// field is the UI and the accessor is the contract, and a commit path that trusted the UI would
+	// be the one place a pasted string could get past the rules — see SanitizeCallSign.
+	Settings.CallSign = UTraceUserSettings::SanitizeCallSign(CallSignEntry.GetText());
+	Settings.Save();
+
+	const FString Effective = Settings.GetCallSignOrDefault();
+
+	// ---- UI PLAN WP2.4 — THE LIVE HALF ----------------------------------------------------------
+	//
+	// The other half is one line in ATracePlayerController::BeginPlay (owned by the restructure
+	// tranche), which is what makes a name apply to a match you JOIN. This is what makes it apply to
+	// the match you are already IN: a player who opens the pause menu mid-match, sets a name and gets
+	// it on the scoreboard only after a re-travel has been given a setting that appears not to work.
+	//
+	// ServerChangeName, not SetPlayerName. It is the engine's own rename path — APlayerController ->
+	// AGameModeBase::ChangeName -> APlayerState::SetPlayerName, replicated to everybody — where a
+	// local SetPlayerName would be this client lying to itself and to nobody else. On the title
+	// screen there is no controller with a PlayerState to rename and this is simply skipped; the
+	// stored value is what the next match reads.
+	APlayerController* const LocalPC = (GEngine != nullptr && GEngine->GetCurrentPlayWorld() != nullptr)
+		? GEngine->GetCurrentPlayWorld()->GetFirstPlayerController()
+		: nullptr;
+
+	const APlayerState* const State = (LocalPC != nullptr) ? LocalPC->PlayerState : nullptr;
+	const FString Was = (State != nullptr) ? State->GetPlayerName() : FString(TEXT("<none>"));
+
+	if (LocalPC != nullptr && Was != Effective)
+	{
+		LocalPC->ServerChangeName(Effective);
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Options] Call sign committed: typed='%s' stored='%s' effective='%s' (player state was '%s')."),
+		*CallSignEntry.GetText(), *Settings.CallSign, *Effective, *Was);
+}
+
+// =================================================================================================
+// UI PLAN WP3 — the fader's own click
+// =================================================================================================
+
+void FTraceOptionsMenu::PreviewAudioChange(ESetting Setting)
+{
+	// MASTER and EFFECTS only. The MUSIC row is answered by the music itself: RefreshVolume() has
+	// already moved the playing bed by the time this runs, so a one-shot on top of it would be a
+	// second sound answering a question the first one is answering better.
+	if (Setting != ESetting::MasterVolume && Setting != ESetting::SfxVolume)
+	{
+		return;
+	}
+
+	// REAL time. The in-match pause menu stops the world, so a throttle measured against world time
+	// would never expire there — the first click would be the only one a paused player ever heard.
+	const double RealNow = FPlatformTime::Seconds();
+	if ((RealNow - LastAudioPreviewRealTime) < AudioPreviewMinInterval)
+	{
+		return;
+	}
+	LastAudioPreviewRealTime = RealNow;
+
+	// PlayLocalNow rather than TraceAudio::PlayLocal2D, because this one call wants the COMPONENT
+	// discarded rather than the convenience: the point is that it goes through
+	// UTraceAudioSubsystem::VolumeFor, i.e. through the very fader the player is dragging, so what
+	// they hear IS the level they are choosing rather than a fixed-level preview of it.
+	if (UTraceAudioSubsystem* Audio = UTraceAudioSubsystem::Get(
+		GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr))
+	{
+		Audio->PlayLocalNow(TraceSoundEvents::ButtonPress);
+	}
+}
+
 bool FTraceOptionsMenu::DrawValueChip(AHUD* HUD, float X, float Y, float W, float H) const
 {
 	UTexture2D* Chip = TraceOptionsMenuArt::Sprite(TraceOptionsMenuArt::ESprite::ValueBox);
@@ -4162,17 +4734,20 @@ void FTraceOptionsMenu::DrawCursor(AHUD* HUD)
 	// The artist's pointer, everywhere this overlay is — which is the title screen's SETTINGS page AND
 	// the in-match pause menu. Spec v20 §0.8: until now it existed only on the UMG title screen.
 	//
-	// TIP-ANCHORED, NOT CENTRED. PollMouse hit-tests at CursorPos, so an arrow whose middle sat on the
-	// hit point would draw its point about eleven pixels away from the pixel it is about to click, and
-	// every click in every screenshot would look like it landed on the wrong row.
-	if (UTexture2D* Arrow = TraceOptionsMenuArt::Sprite(TraceOptionsMenuArt::ESprite::Cursor))
+	// DRAWN THROUGH TraceHardwareCursor, not here, since the UI QA pass. This function used to load
+	// the sprite out of this page's own table and carry its own copy of the geometry —
+	// `CursorAspect = 64.f / 87.f`, `CursorTipU = 0.180f`, `CursorTipV = 0.075f` — which is a third
+	// copy of numbers TraceMenuArtStyle already derives from the sprite's own dimensions, and which
+	// disagreed with character select's copy in the fourth decimal place. Worse, the Canvas title
+	// screen underneath this overlay was drawing a completely different picture. One function draws
+	// the pointer now and decides its colour; see UI/TraceHardwareCursor.h.
+	//
+	// Still TIP-ANCHORED, NOT CENTRED — that is DrawPointer's contract. PollMouse hit-tests at
+	// CursorPos, so an arrow whose middle sat on the hit point would draw its point about eleven
+	// pixels away from the pixel it is about to click, and every click in every screenshot would look
+	// like it landed on the wrong row.
+	if (TraceHardwareCursor::DrawPointer(HUD, CursorPos, UIScale))
 	{
-		const float CursorH = 30.f * UIScale;
-		const float CursorW = CursorH * TraceOptionsMenuArt::CursorAspect;
-		TraceOptionsMenuArt::Draw(HUD, Arrow,
-			CursorPos.X - CursorW * TraceOptionsMenuArt::CursorTipU,
-			CursorPos.Y - CursorH * TraceOptionsMenuArt::CursorTipV,
-			CursorW, CursorH, FLinearColor::White);
 		return;
 	}
 

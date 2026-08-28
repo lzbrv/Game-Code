@@ -15,7 +15,9 @@
 #include "Abilities/TraceAbilityComponent.h"
 #include "Abilities/Characters/TraceAbilitySetChut.h"
 #include "Abilities/Characters/TraceAbilitySetElle.h"
+#include "Abilities/Characters/TraceAbilitySetLily.h"
 #include "Abilities/Characters/TraceAbilitySetMace.h"
+#include "Abilities/Characters/TraceAbilitySetMortimer.h"
 #include "Abilities/Characters/TraceAbilitySetOyster.h"
 #include "Abilities/Characters/TraceAbilitySetRocco.h"
 #include "Abilities/Characters/TraceAbilitySetRoxie.h"
@@ -48,7 +50,7 @@ namespace TraceBotAbilityBrainLocal
 		TEXT("   behave exactly as they did before this pass — they never press E, V or an ability\n")
 		TEXT("   jump, whatever character they are holding. This is the state the project shipped in,\n")
 		TEXT("   and it is what makes the [BotAbility] counts evidence rather than an assertion."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	static TAutoConsoleVariable<float> CVarBotAbilityUseScale(
 		TEXT("Trace.Bot.AbilityUseScale"),
@@ -91,13 +93,15 @@ namespace TraceBotAbilityBrainLocal
 	static TAutoConsoleVariable<int32> CVarBotNewCharacterAbilities(
 		TEXT("Trace.Bot.NewCharacterAbilities"),
 		1,
-		TEXT("1 (default): bots play Roxie, Elle and Slimeball with their abilities (spec v18 §3).\n")
-		TEXT("0: THE RED ARM FOR THIS PASS, and it is narrower than Trace.Bot.Abilities on purpose.\n")
-		TEXT("   It removes ONLY the three new planners, so a measurement run shows Rocco, Chut, Mace,\n")
-		TEXT("   Oyster and X still using their abilities in the same match while a bot Roxie never\n")
-		TEXT("   fires a rocket, a bot Elle never places a gate and a bot Slimeball never sticks —\n")
-		TEXT("   which is exactly the state spec v18 §3 calls \"reads as broken\", reproduced on demand."),
-		ECVF_Default);
+		TEXT("1 (default): bots play Roxie, Elle, Slimeball (spec v18 §3) and Lily, Mortimer (spec\n")
+		TEXT("   v19 §3, RESTRUCTURE tranche E) with their abilities.\n")
+		TEXT("0: THE RED ARM FOR THE APPENDED ROSTER, and it is narrower than Trace.Bot.Abilities on\n")
+		TEXT("   purpose. It removes ONLY the five appended planners, so a measurement run shows\n")
+		TEXT("   Rocco, Chut, Mace, Oyster and X still using their abilities in the same match while\n")
+		TEXT("   a bot Roxie never fires a rocket, a bot Elle never places a gate, a bot Slimeball\n")
+		TEXT("   never sticks, a bot Lily never Zips and a bot Mortimer never Quakes — which is\n")
+		TEXT("   exactly the state spec v18 §3 calls \"reads as broken\", reproduced on demand."),
+		ECVF_Cheat);
 
 	static TAutoConsoleVariable<float> CVarBotRoxieRocketRoomBehind(
 		TEXT("Trace.Bot.RoxieRocketRoomBehindUU"),
@@ -455,6 +459,11 @@ void FTraceBotAbilityBrain::OnPossessed(float Now, float InPersonalityBias)
 	NextStickTime = 0.f;
 	StickApproachUntilTime = 0.f;
 	bWasStuck = false;
+
+	// --- spec v19 §3, RESTRUCTURE tranche E ---
+	NextZipTime = 0.f;
+	NextZipClimbPressTime = 0.f;
+	NextQuakeTime = 0.f;
 }
 
 void FTraceBotAbilityBrain::OnUnPossessed()
@@ -847,6 +856,16 @@ void FTraceBotAbilityBrain::Plan(const FTraceBotAbilitySituation& Situation, flo
 		break;
 	case ETraceCharacterId::Slimeball:
 		if (TraceBotAbilityBrainLocal::NewCharacterAbilitiesEnabled()) { PlanSlimeball(Situation, Out); }
+		break;
+
+	// --- spec v19 §3, RESTRUCTURE tranche E. Same gate and same argument as the three above: the
+	//     red arm reproduces "a bot Lily that never Zips" with the default: break; this switch had
+	//     before the planner existed. -------------------------------------------------------------
+	case ETraceCharacterId::Lily:
+		if (TraceBotAbilityBrainLocal::NewCharacterAbilitiesEnabled()) { PlanLily(Situation, Out); }
+		break;
+	case ETraceCharacterId::Mortimer:
+		if (TraceBotAbilityBrainLocal::NewCharacterAbilitiesEnabled()) { PlanMortimer(Situation, Out); }
 		break;
 
 	default: break;
@@ -2095,9 +2114,23 @@ void FTraceBotAbilityBrain::PlanSlimeball(const FTraceBotAbilitySituation& Situa
 	// one is latched, and the stick is offered on nearly every tick a wall is nearby, so with the
 	// blocks the other way round the 25 s ability would go unused for whole matches.
 	//
-	// The aim point is where the wall GOES, near enough: it is thrown 400 uu along his planar aim, so
-	// aiming at a knot of enemies drops it between him and them. Aim error is applied like every other
-	// aimed ability here — a bot that sprays with a rifle does not place a wall to the millimetre.
+	// The aim point is the DIRECTION the wall goes, not the spot it lands on, and PATCH 28 ITEM 2 made
+	// that distinction matter. The wall used to be a 1100 uu barrier CENTRED 400 uu along his planar
+	// aim, so aiming at a knot of enemies genuinely dropped it between him and them — 400 uu out, 488
+	// uu to its far edge, facing them. It now runs ALONG his aim: SlimewallRangeUU (400) is the NEAR
+	// end and SlimewallLengthUU (1100) is the run, so the slab occupies 400..1500 uu ahead and is only
+	// SlimewallWidthUU (176) across. Aiming at a knot 800 uu away no longer walls it off — it drives a
+	// 176 uu divider THROUGH it, splitting the knot's approach lane rather than capping it.
+	//
+	// THAT IS STILL A REASONABLE ACT AND THE RULES BELOW ARE LEFT ALONE, but it is a different act
+	// from the one they were written for, and the numbers they pick aim points with have not been
+	// re-derived for it. If Slimeball's walls start reading as badly placed, this is the cause: the
+	// SlowRadius below is still half the wall's LONG axis, which was its lateral span before the patch
+	// and is its forward reach after it.
+	//
+	// Aim error is applied like every other aimed ability here — a bot that sprays with a rifle does
+	// not place a wall to the millimetre. It now costs more than it did: an error that used to slide a
+	// broadside wall sideways now swings a 1100 uu lance.
 	//
 	// NO PRE-CHECK AGAINST ResolveSlimewallPlacement(), deliberately. That query reads his CURRENT aim,
 	// and during the reaction delay his aim is still slewing toward the point below — so a pre-check
@@ -2272,5 +2305,202 @@ void FTraceBotAbilityBrain::PlanSlimeball(const FTraceBotAbilitySituation& Situa
 	if (Result == ETraceBotWantResult::Declined)
 	{
 		NextStickTime = Situation.Now + 2.f;
+	}
+}
+
+// =================================================================================================
+// LILY (spec v19 §3, RESTRUCTURE tranche E) — "Zip out of trouble; climb toward the objective."
+// =================================================================================================
+
+void FTraceBotAbilityBrain::PlanLily(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& Out)
+{
+	ATraceCharacter* BotPawn = Situation.Self;
+	const UTraceAbilitySetLily* Lily = Situation.Abilities->GetAbilitySetAs<UTraceAbilitySetLily>();
+	if (Lily == nullptr)
+	{
+		return;
+	}
+
+	const FVector MyLocation = BotPawn->GetActorLocation();
+
+	// --- WHILE SHE IS FLYING: climb toward the objective, or drift --------------------------------
+	//
+	// The kit signals flight through the shared EffectActive flag (TraceLilyFlags::Zipping), so
+	// IsZipping() is correct on the authority this brain runs on. The climb key is a LEVEL behind a
+	// 0.25 s staleness watchdog (UTraceCharacterMovementComponent::SetJumpHeld — a bot has no
+	// keyboard for SampleClimbIntent to poll, which is exactly why that watchdog exists), so "hold
+	// jump" from a bot is a re-press on a cadence inside the window: each press reaches Lily's
+	// OnJumpPressed through the same ability-first hook a human's key does and re-asserts the level;
+	// letting the cadence lapse IS the release.
+	//
+	// Deliberately NOT routed through the intent latch: the reaction delay was paid by the E press
+	// that started the flight, and steering a flight is continuous control, not a new decision —
+	// the same argument PlanElle makes for the cloak escape being pure steering.
+	if (Lily->IsZipping())
+	{
+		// Climb while the objective is at or above her (with 100 uu of slack so she does not bounce
+		// on the boundary); otherwise leave both climb and descend unpressed and drift at height.
+		if (Situation.AttackGoal.Z > MyLocation.Z - 100.f)
+		{
+			if (Situation.Now >= NextZipClimbPressTime)
+			{
+				Out.bJump = true;
+				Out.Reason = TEXT("Lily: climbing toward the objective (Zip)");
+				NextZipClimbPressTime = Situation.Now + 0.15f;
+			}
+		}
+		return;
+	}
+
+	NextZipClimbPressTime = 0.f;
+
+	// --- THE CAST ---------------------------------------------------------------------------------
+	if (Situation.Abilities->GetActivatedCooldownRemaining() > 0.f || Situation.Now < NextZipTime)
+	{
+		return;
+	}
+
+	// Plain proximity, deliberately NOT line of sight: the chaser she cannot see is exactly the one
+	// worth flying away from, and both plays below are about the distance to trouble, not about a
+	// target for anything.
+	float NearestEnemyDist = TNumericLimits<float>::Max();
+	if (Situation.Enemies != nullptr)
+	{
+		for (const ATraceCharacter* Other : *Situation.Enemies)
+		{
+			if (Other == nullptr || !Other->IsAlive())
+			{
+				continue;
+			}
+			NearestEnemyDist = FMath::Min(NearestEnemyDist,
+				static_cast<float>(FVector::Dist(MyLocation, Other->GetActorLocation())));
+		}
+	}
+
+	const TCHAR* Why = nullptr;
+
+	if (Situation.bIAmCarrier)
+	{
+		// (a) ESCAPE WITH THE CORE. Zip while carrying costs the canon 50% of the duration and it is
+		// accepted: 2.5 s of flight nobody on the ground can follow is worth more to a pressured
+		// carrier than 5 s would be to a free runner.
+		constexpr float CarrierEscapeRadiusUU = 2000.f;
+		if (NearestEnemyDist <= CarrierEscapeRadiusUU)
+		{
+			Why = TEXT("Lily: Zip to escape with the Core");
+		}
+	}
+	else
+	{
+		// (b) DISENGAGE. Hurt with somebody close: fly out of the fight she is losing.
+		constexpr float DisengageRadiusUU = 1200.f;
+		constexpr float DisengageHealthFraction = 0.45f;
+		if (NearestEnemyDist <= DisengageRadiusUU
+			&& BotPawn->Health != nullptr
+			&& BotPawn->Health->GetHealthPercent() < DisengageHealthFraction)
+		{
+			Why = TEXT("Lily: Zip out of a losing fight");
+		}
+	}
+
+	if (Why == nullptr)
+	{
+		return;
+	}
+
+	// Through the humanizer latch like every other planner — frame-one casts are forbidden by house
+	// style, and the latch's re-assert/decay rules mean a chaser who breaks off cancels the Zip
+	// before it fires.
+	const ETraceBotWantResult Result = Want(Situation, ETraceBotAbilityAct::Activate, Why);
+	if (Result == ETraceBotWantResult::Declined)
+	{
+		NextZipTime = Situation.Now + 1.5f;
+	}
+}
+
+// =================================================================================================
+// MORTIMER (spec v19 §3, RESTRUCTURE tranche E) — "Quake when the pack closes on the carrier."
+// =================================================================================================
+
+void FTraceBotAbilityBrain::PlanMortimer(const FTraceBotAbilitySituation& Situation, FTraceBotAbilityOrders& /*Out*/)
+{
+	ATraceCharacter* BotPawn = Situation.Self;
+	const UTraceAbilitySetMortimer* Mortimer = Situation.Abilities->GetAbilitySetAs<UTraceAbilitySetMortimer>();
+	if (Mortimer == nullptr)
+	{
+		return;
+	}
+
+	if (Situation.Abilities->GetActivatedCooldownRemaining() > 0.f || Situation.Now < NextQuakeTime)
+	{
+		return;
+	}
+
+	if (!Situation.bIAmCarrier)
+	{
+		return;
+	}
+
+	// THE KIT'S OWN POSTURE GATE, ASKED RATHER THAN MIRRORED — but only for a NEW latch.
+	// CheckBlastPosture() is the exact pair of §3 conditions the press will be judged by — carrying
+	// the Core, and grounded as the ABILITY layer defines it (IsGroundedForAbilities' ledge-lip
+	// hysteresis included, which a raw IsMovingOnGround test here would lack) — so asking it before
+	// latching is what makes refusals rare. The explicit bIAmCarrier test above keeps the plan
+	// honest under the posture red arm: Trace.Mortimer.BlastPosture 0 removes the kit's gate, and a
+	// bot must not start quaking empty-handed the moment a harness disarms it.
+	//
+	// A PENDING intent is deliberately NOT re-gated on posture. A fleeing carrier slide-jumps
+	// constantly (measured: ~250 slide-jumps per 6-minute match), and the intent latch decays after
+	// 0.35 s without a re-assert — so a rule that stopped asserting for every hop could never
+	// survive the ~1 s reaction delay, and a bot Mortimer would never Quake (measured: zero casts
+	// in the first soak). The press itself is still judged by the kit: ActivateAbility re-runs
+	// CheckBlastPosture, so a press that happens to land mid-air is refused there, charges nothing,
+	// and the [BotAbility] line records it — rare, because a carrier is grounded for most of a carry.
+	const bool bReasserting = (Pending == ETraceBotAbilityAct::Activate);
+	if (!bReasserting && Mortimer->CheckBlastPosture() != ETraceMortimerBlastRefusal::Allowed)
+	{
+		return;
+	}
+
+	// The REAL blast radius, from the same UTraceSettings knob ApplyBlastTo measures with — derive,
+	// never copy (the Demo-21 rule). Counted through the §4 choke point with the blast's own effect
+	// class (Control), so an enemy the rules would make the launch skip is not a reason to cast.
+	const float BlastRadius = FMath::Max(1.f, UTraceSettings::Get().MortimerBlastRadiusUU);
+
+	FVector Centroid = FVector::ZeroVector;
+	const FVector MyLocation = BotPawn->GetActorLocation();
+	const int32 InBlast = CountAffectableEnemiesNear(Situation, MyLocation, BlastRadius,
+		ETraceAbilityEffect::Control, Centroid);
+
+	const TCHAR* Why = nullptr;
+
+	if (InBlast >= 2)
+	{
+		// The pack has closed on the carrier: one press throws all of them off him at once.
+		Why = TEXT("Mortimer: Quake — two or more inside the blast");
+	}
+	else if (InBlast >= 1)
+	{
+		// One enemy at point blank also qualifies — self-defence for a carrier being run down.
+		// Clamped to the real radius so a shrunken retune cannot leave this asking past the blast.
+		constexpr float PointBlankRadiusUU = 600.f;
+		const int32 PointBlank = CountAffectableEnemiesNear(Situation, MyLocation,
+			FMath::Min(PointBlankRadiusUU, BlastRadius), ETraceAbilityEffect::Control, Centroid);
+		if (PointBlank >= 1)
+		{
+			Why = TEXT("Mortimer: Quake — point-blank self-defence");
+		}
+	}
+
+	if (Why == nullptr)
+	{
+		return;
+	}
+
+	// Latency latch as E1 (and as every planner above): no frame-one casts.
+	const ETraceBotWantResult Result = Want(Situation, ETraceBotAbilityAct::Activate, Why);
+	if (Result == ETraceBotWantResult::Declined)
+	{
+		NextQuakeTime = Situation.Now + 1.5f;
 	}
 }

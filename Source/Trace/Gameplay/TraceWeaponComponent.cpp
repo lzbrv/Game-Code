@@ -20,6 +20,7 @@
 #include "GameFramework/Controller.h"
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/WorldSettings.h"       // Trace.Fx.ImpactShots dilates the clock for the capture
 #include "GameFramework/SpringArmComponent.h"   // recoil: the camera boom's tick order
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
@@ -42,6 +43,10 @@
 #include "Gameplay/TraceMeleeArc.h"
 #include "Gameplay/TraceTracer.h"
 #include "Net/TraceLagCompensationComponent.h"
+#include "Audio/TraceAudio.h"          // FX_AUDIO_PLAN §5.1/§6: the predicted local shot, swing and reload
+#include "Audio/TraceAudioWatch.h"     // IsPredictedShotEnabled + FTracePistolLadder
+#include "Audio/TraceSoundBank.h"      // UTraceAudioSettings::GetPistolLadderResetSeconds
+#include "Audio/TraceSoundEvents.h"    // the event names
 #include "Trace.h"
 #include "TraceSettings.h"
 #include "TraceTypes.h"
@@ -142,7 +147,7 @@ static TAutoConsoleVariable<int32> CVarAmmoEnabled(
 	TEXT("Trace.Ammo.Enabled"), 1,
 	TEXT("1 (shipped, spec v16 §1): 30 rounds per clip, auto-reload on empty, 0.5 s reload. "
 	     "0: the RED arm — the clip is infinite and nothing ever reloads."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /**
  * THE RELOAD GATE ARM. 0 lets a player fire straight through a reload.
@@ -156,7 +161,7 @@ static TAutoConsoleVariable<int32> CVarAmmoReloadBlocksFire(
 	TEXT("Trace.Ammo.ReloadBlocksFire"), 1,
 	TEXT("1 (shipped): firing is refused for the whole 0.5 s reload. 0: the RED arm — the reload still "
 	     "runs and still refills, but the trigger works through it."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /**
  * THE PREDICTION ARM. 0 makes an owning client WAIT for the server's count instead of predicting it.
@@ -174,7 +179,7 @@ static TAutoConsoleVariable<int32> CVarAmmoPredict(
 	TEXT("1 (shipped): an owning client decrements its own clip on its own shot, before the server has "
 	     "heard about it. 0: the RED arm — the client waits for replication, so its count lags its own "
 	     "muzzle flash by a round trip."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /**
  * THE CARRIER ARM. 0 removes the carrier guard inside UTraceWeaponComponent::ConsumeRound.
@@ -190,7 +195,7 @@ static TAutoConsoleVariable<int32> CVarAmmoCarrierGuard(
 	TEXT("1 (shipped): a Core carrier's clip can never lose a round, even if something calls the "
 	     "consumption path directly. 0: the RED arm — the guard is removed and "
 	     "TraceAmmo::GetCarrierRoundsConsumed() moves."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /**
  * The ammo counters. File-static for the same reason UTraceHealthComponent's vulnerable alarms are:
@@ -964,6 +969,32 @@ void UTraceWeaponComponent::StartFire()
 	if (CanFire())
 	{
 		FireOnce();
+		return;
+	}
+
+	// --- FX_AUDIO_PLAN §5.1 (DryFire) — THE CLICK THAT SAYS "EMPTY", AND ONLY THAT ---------------
+	//
+	// CLIENT-SIDE AND UNCONDITIONALLY LOCAL: this is feedback about YOUR trigger, and a room full of
+	// other people's empty clicks would be noise with no information in it. TraceAudio::Play routes
+	// it by the table (DryFire is declared Client) and refuses to do anything for a bot, so a listen
+	// host does not click for every dry bot.
+	//
+	// *** ONLY FOR THE EMPTY CLIP, NOT FOR EVERY REFUSAL. *** CanFire() says no for eight different
+	// reasons — dashing, carrying the Core, deploying, dead, mid-reload, the fire-rate gate — and
+	// seven of them are not "the gun is empty". A click on the fire-rate gate in particular would
+	// fire on every frame of every burst, which is how a feedback sound becomes a bug report. The
+	// test below is the same pair CanFire() itself uses for the ammo branch, read in the same order.
+	//
+	// The 0.15 s limiter is §5.1's, and it is about the TRIGGER rather than the sound: a held trigger
+	// on an empty gun re-enters this function every frame, and an unlimited click there is a buzz.
+	if (TraceAmmo::IsEnabled() && GetClipAmmo() <= 0 && Character->IsAlive() && !Character->IsCarrier())
+	{
+		const double DryNow = GetLocalTimeSeconds();
+		if ((DryNow - LastDryFireLocalTime) >= DryFireRepeatSeconds)
+		{
+			LastDryFireLocalTime = DryNow;
+			TraceAudio::Play(Character, TraceSoundEvents::DryFire);
+		}
 	}
 }
 
@@ -1179,8 +1210,55 @@ void UTraceWeaponComponent::BeginReload(double AnchorSharedTime)
 	// SPEC v28 §9 — the weapon in hand decides: 0.5 s for the pistol, 0.8 s for the SMG. Both ends
 	// anchor at the same stamped instant AND read the same selector (EquippedWeapon is replicated),
 	// so the client's predicted deadline and the server's are still one number rather than two.
+	// A RELOAD THAT WAS ALREADY RUNNING IS NOT A NEW RELOAD. Both ends call this function — the
+	// client predicts one at the shot that emptied the clip, the authority anchors its own at the
+	// same stamp — and RequestReload can arrive on top of either. Sampling the state BEFORE the
+	// deadline is written is what makes the sound below fire once per magazine instead of once per
+	// caller.
+	const bool bWasReloading = IsReloading();
+
 	ReloadEndServerTime = static_cast<float>(Anchor + static_cast<double>(GetReloadSeconds()));
 	bPredictedRefillPending = false;
+
+	if (bWasReloading)
+	{
+		return;
+	}
+
+	// --- FX_AUDIO_PLAN §5.1 (Reload) — THE §6 PAIR, ON A SOUND THAT IS NOT A GUNSHOT ------------
+	//
+	// A reload is the second sound whose delay a player consciously feels: the whole point of hearing
+	// it is knowing your own gun is busy, and hearing that half a round trip after the count hit zero
+	// is worse than not hearing it. Same shape as the shot, and it is a PAIR — the predicted copy on
+	// the owning machine, the multicast for everybody else with that machine excluded. On a listen
+	// host both branches run on the same frame and the exclusion cancels the multicast's local copy,
+	// so the host hears exactly one.
+	ATraceCharacter* ReloadCharacter = GetTraceCharacter();
+	if (ReloadCharacter == nullptr)
+	{
+		return;
+	}
+
+	const FVector Where = ReloadCharacter->GetActorLocation();
+	const bool bPredictAudio = TraceAudioWatch::IsPredictedShotEnabled();
+
+	if (bPredictAudio && ReloadCharacter->IsLocallyControlled() && ReloadCharacter->IsPlayerControlled())
+	{
+		TraceAudio::PlayPredictedLocal(ReloadCharacter, TraceSoundEvents::Reload, Where);
+	}
+
+	const AActor* ReloadOwner = GetOwner();
+	if (ReloadOwner != nullptr && ReloadOwner->HasAuthority())
+	{
+		if (bPredictAudio)
+		{
+			TraceAudio::PlayAtExcluding(ReloadCharacter, TraceSoundEvents::Reload, Where, ReloadCharacter);
+		}
+		else
+		{
+			TraceAudio::PlayAt(ReloadCharacter, TraceSoundEvents::Reload, Where);
+		}
+	}
 }
 
 void UTraceWeaponComponent::CancelReload()
@@ -1513,7 +1591,6 @@ void UTraceWeaponComponent::TickComponent(float DeltaTime, ELevelTick TickType, 
 	if (OwnerActor != nullptr && OwnerActor->HasAuthority())
 	{
 		RecordFacingSample(static_cast<float>(GetServerTimeSeconds()));
-		TickBotKnife();
 	}
 
 	// --- AMMO: the reload state machine (spec v16 §1) ---------------------------------------------
@@ -1974,7 +2051,57 @@ void UTraceWeaponComponent::FireOnce()
 	// world geometry) terminated it, and that is where the impact flash belongs.
 	const bool bImpacted = FVector::DistSquared(Origin, TracerEnd) < static_cast<double>(Range) * Range * 0.998;
 
-	PlayLocalTracer(Origin, TracerEnd, bImpacted);
+	// GEOMETRY, NOT A BODY. The local resolve above already answered "who did this beam stop on", so
+	// a shot that stopped short of full range with nobody in the way stopped on the world — which is
+	// the exact test FX_AUDIO_PLAN §3 names for the impact plane ("LastPredictedVictim == nullptr on
+	// the shooter"). Never on a victim: spec v4 §4 deleted the on-body sphere because it covered up
+	// the point the shooter was reading, and a 26 uu plane there would be the same mistake, flatter.
+	const bool bWorldHit = bImpacted && (LastPredictedVictim.Get() == nullptr);
+
+	PlayLocalTracer(Origin, TracerEnd, bImpacted, bWorldHit);
+
+	// --- FX_AUDIO_PLAN §6.1 — THE SHOOTER'S OWN REPORT, WITH NO ROUND TRIP IN IT -----------------
+	//
+	// Audio/TraceAudioWatch.h stated the cost of the observer-only design plainly and named the fix:
+	// "Closing that gap needs the one line in ServerFire's caller." This is that line. Until now a
+	// remote client heard its own gunshot half a round trip after pulling the trigger, because the
+	// sound was decided on the server by watching the authoritative clip; the observer still owns
+	// what everybody ELSE hears, and its multicast now excludes this pawn's machine so the shot is
+	// still exactly one sound per listener.
+	//
+	// *** BOTH GUARDS ARE LOAD-BEARING AND NEITHER IS REDUNDANT. *** IsLocallyControlled() alone is
+	// true for every bot on the server, and IsPlayerControlled() alone is true for a remote player's
+	// pawn as the server sees it. Together they mean "a human is playing this pawn ON THIS MACHINE",
+	// which is the only case that has a speaker to play into and the only case the exclusion is going
+	// to skip. Without the second one a listen host would hear every bot's shot at point-blank range
+	// — the documented bot trap in TraceAudio.cpp's client-side gate, and the reason
+	// PlayPredictedLocal re-tests it internally as well.
+	if (TraceAudioWatch::IsPredictedShotEnabled()
+		&& Character->IsLocallyControlled() && Character->IsPlayerControlled())
+	{
+		// §1d: the SMG has no ladder — "smg shoot 1 should play on every bullet" — so the ladder is
+		// asked only for the pistol, exactly as the observer does it, and for the same reason it does
+		// not reset the ladder on an SMG round.
+		const FName Clip = (EquippedWeapon == ETraceEquippedWeapon::Smg)
+			? TraceSoundEvents::SmgShoot1
+			: LocalShotLadder.NextShot(FireServerTime, UTraceAudioSettings::Get().GetPistolLadderResetSeconds());
+
+		// At the muzzle, spatialised, with the same gain and attenuation curve the multicast would
+		// have carried — PlayPredictedLocal goes through the same PlayWorldNow. So this is not a
+		// second, differently-mixed gunshot; it is the same one, on time.
+		TraceAudio::PlayPredictedLocal(Character, Clip, Origin);
+
+		// THE OTHER HALF OF THE TWO-PROCESS AUDIT'S LEDGER, off the same switch the observer's line
+		// uses (Trace.Audio.ShotLog, default 0). A remote shooter's log must show this line and NO
+		// observer line for its own pawn; the server's log must show the observer line for that pawn
+		// and none of these. Both name the shooter, so a match full of bots cannot blur the count.
+		if (TraceAudioWatch::IsShotLogEnabled())
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ShotAudio] PREDICTED %-18s %-6s -> %-12s   (local, no round trip)"),
+				*GetNameSafe(Character), LexToString(EquippedWeapon), *Clip.ToString());
+		}
+	}
 
 	// Viewmodel recoil, once per ROUND. This is the only place that knows a round actually left the
 	// gun, so a held burst kicks per shot instead of once on the trigger press. Cosmetic only,
@@ -2011,7 +2138,7 @@ void UTraceWeaponComponent::FireOnce()
 	ApplyRecoilKick();
 }
 
-void UTraceWeaponComponent::PlayLocalTracer(const FVector& From, const FVector& To, bool bImpacted) const
+void UTraceWeaponComponent::PlayLocalTracer(const FVector& From, const FVector& To, bool bImpacted, bool bWorldHit) const
 {
 	UWorld* World = GetWorld();
 	ATraceCharacter* Character = GetTraceCharacter();
@@ -2020,7 +2147,44 @@ void UTraceWeaponComponent::PlayLocalTracer(const FVector& From, const FVector& 
 		return;
 	}
 
-	ATraceTracer::Spawn(World, From, To, TraceTeamColor(Character->GetTeam()), bImpacted);
+	// FX_AUDIO_PLAN §2.7's seam, consumed at the ONE place a beam is asked for. The ordinary answer
+	// is the shot's team hue, exactly as it has always been (the halo is the piece that carries it —
+	// see ATraceTracer's HotColorWhiteMix note on why a beam that went white stopped being able to
+	// say whose shot it was). Bee rounds are the single canonical override.
+	FLinearColor BeamColor = TraceTeamColor(Character->GetTeam());
+	FLinearColor Tint = BeamColor;
+	const bool bTinted = GetTracerTintOverride(Tint);
+	if (bTinted)
+	{
+		BeamColor = Tint;
+	}
+
+	// The impact plane's hue is the TRACER FAMILY's pale cyan and not the beam's team colour (§3):
+	// a mark left on a wall says "a shot landed here", which is a fact about the weapon rather than
+	// about the shooter, and the arena is already saturated with team colour. The override moves it
+	// with the beam, so a bee round leaves an amber scuff.
+	FTraceTracerImpact Impact;
+	Impact.bDraw = bWorldHit;
+	Impact.Hue = bTinted ? Tint : ATraceTracer::TracerFamilyHue();
+
+	ATraceTracer::Spawn(World, From, To, BeamColor, bImpacted, Impact);
+}
+
+bool UTraceWeaponComponent::GetTracerTintOverride(FLinearColor& OutTint) const
+{
+	// One state, asked once: the clip holds rounds an ability put there. GetAbilityRoundsInClip()
+	// reads the replicated counter on a client and the authoritative one on the server, so the
+	// shooter's own machine and the server agree without this function knowing which it is on.
+	if (GetAbilityRoundsInClip() <= 0)
+	{
+		return false;
+	}
+
+	// FX_AUDIO_PLAN's BeeRounds amber, linear. The one colour in this file, because the one exception
+	// the bible grants is X's; if a second ability ever loads a clip, this is where its hue joins and
+	// the seam's shape does not change.
+	OutTint = FLinearColor(1.00f, 0.78f, 0.10f, 1.f);
+	return true;
 }
 
 void UTraceWeaponComponent::AccumulateShotStats(ETraceHitZone ServerZone, const ATraceCharacter* Victim,
@@ -2335,6 +2499,9 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 	}
 
 	bool bKilled = false;
+	// C5. Set from the victim's OWN IsInvulnerable() below — the same derived fact ApplyDamage
+	// consults, never a second opinion about who is carrying the Core (guardrail 1).
+	bool bShieldBlocked = false;
 	if (Victim != nullptr)
 	{
 		if (UTraceHealthComponent* VictimHealth = Victim->FindComponentByClass<UTraceHealthComponent>())
@@ -2393,6 +2560,28 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 			AbilityContext.bFromAbility = false;
 			Damage = UTraceAbilityComponent::ModifyDamageThroughPassives(Damage, AbilityContext);
 
+			// C5 — ASKED OF THE VICTIM, WITH THE EXACT PREDICATE ApplyDamage IS ABOUT TO NO-OP ON, so
+			// "the shot was blocked" and "the damage did nothing" cannot disagree. No second carrier
+			// test is invented here (guardrail 1/2): this is IsInvulnerable() and nothing else.
+			//
+			// *** MEASURED 2026-08-24 — HOW OFTEN THIS IS TRUE TODAY, AND WHY THAT IS NOT A BUG HERE.
+			// *** UTraceLagCompensationComponent::ResolveHitscan (:323) SKIPS a shielded carrier as a
+			// candidate outright — "do not even resolve them" — using the SAME expression
+			// IsInvulnerable() evaluates. So a shielded carrier does not normally reach this line at
+			// all: the shooter currently gets SILENCE on the gun path, not the lying white marker the
+			// code-gameplay F2 audit described (that reading predates the resolver's carrier skip).
+			// What is left is the race — the victim taking the Core, or a pass window closing, between
+			// the resolve and the damage — and in that race this flag is the difference between a
+			// marker that lies and one that tells the truth. Trace.Weapon.ShieldBlockTest measures all
+			// of it: the live shielded shot (no notification), an ordinary hit (normal marker), and the
+			// blocked flag end to end.
+			//
+			// IF THE BLOCKED MARKER IS EVER TO DRAW FOR ORDINARY FIRE (ART_BIBLE §2.4 / FX plan §7.4),
+			// THE FACT HAS TO BE PRODUCED WHERE THE SHOT IS REFUSED, i.e. at that skip in the lag
+			// compensation component — which is a file this tranche does not own and a rule
+			// (carrier-immune-to-bullets) nothing in this plan may change. Named in the C report.
+			bShieldBlocked = VictimHealth->IsInvulnerable();
+
 			VictimHealth->ApplyDamage(Damage, Character->GetController(), DamageCause);
 
 			// ApplyDamage no-ops against an invulnerable target, so read the result rather than
@@ -2413,7 +2602,10 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 		{
 			// The zone rides along so the shooter's hitmarker can say WHICH zone paid out. Positional
 			// damage is only learnable if the feedback is positional too.
-			ShooterController->ClientNotifyHit(bKilled, Zone);
+			//
+			// C5: and so does whether it was stopped by the carrier's shield, so the marker can stop
+			// claiming damage that never happened (ART_BIBLE §2.4; the HUD draw is FX plan §7.4).
+			ShooterController->ClientNotifyHit(bKilled, Zone, bShieldBlocked);
 		}
 	}
 
@@ -2440,11 +2632,17 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 	}
 
 	// Unreliable and cosmetic: everyone but the shooter draws the railgun beam.
+	//
+	// bWorldHit is the SERVER'S resolve of the same question the shooter answered locally (FireOnce):
+	// did this beam stop on geometry rather than on a player? It rides along because the machines
+	// that draw this beam did not run the trace and have no other way to know — and FX_AUDIO_PLAN §3
+	// draws its impact plane on geometry ONLY, honouring spec v4 §4's deletion of the on-victim pop.
 	const bool bImpacted = FVector::DistSquared(ShotOrigin, ImpactPoint) < static_cast<double>(ShotRange) * ShotRange * 0.998;
-	MulticastFireEffects(FVector_NetQuantize(ShotOrigin), FVector_NetQuantize(ImpactPoint), bImpacted);
+	MulticastFireEffects(FVector_NetQuantize(ShotOrigin), FVector_NetQuantize(ImpactPoint), bImpacted,
+		/*bWorldHit=*/bImpacted && (Victim == nullptr));
 }
 
-void UTraceWeaponComponent::MulticastFireEffects_Implementation(FVector_NetQuantize Origin, FVector_NetQuantize Impact, bool bImpacted)
+void UTraceWeaponComponent::MulticastFireEffects_Implementation(FVector_NetQuantize Origin, FVector_NetQuantize Impact, bool bImpacted, bool bWorldHit)
 {
 	if (GetNetMode() == NM_DedicatedServer)
 	{
@@ -2466,7 +2664,7 @@ void UTraceWeaponComponent::MulticastFireEffects_Implementation(FVector_NetQuant
 		return;
 	}
 
-	PlayLocalTracer(Origin, Impact, bImpacted);
+	PlayLocalTracer(Origin, Impact, bImpacted, bWorldHit);
 }
 
 // =================================================================================================
@@ -2598,6 +2796,22 @@ bool UTraceWeaponComponent::StartSwing(ETraceMeleeRefusal* OutRefusal)
 	SwingAnimStartLocalTime = Now;
 	SwingResolveAtLocalTime = Now + static_cast<double>(TraceMelee::GetSwingWindupSeconds());
 	bSwingPendingResolve = true;
+
+	// --- FX_AUDIO_PLAN §5.1 (MeleeSwing) — THE PREDICTED HALF OF THE §6 PAIR --------------------
+	//
+	// AT THE PRESS, WHICH IS WHERE THE MOTION STARTS. A whoosh is the sound of the arm moving, and
+	// the arm starts moving here; the blade does not resolve for another GetSwingWindupSeconds() and
+	// the server does not accept until a further upstream lag after that. The world copy is played at
+	// ServerSwing's accept (see there) and every machine but this one hears it, so the ~0.1 s the two
+	// are apart is never audible to anybody — no listener ever hears both.
+	//
+	// The two guards are FireOnce's, for FireOnce's reasons: IsLocallyControlled() is already true
+	// above (a proxy cannot swing), and IsPlayerControlled() is what keeps a listen host from hearing
+	// every bot's swing at point-blank range.
+	if (TraceAudioWatch::IsPredictedShotEnabled() && Character->IsPlayerControlled())
+	{
+		TraceAudio::PlayPredictedLocal(Character, TraceSoundEvents::MeleeSwing, Character->GetActorLocation());
+	}
 
 	if (TraceMelee::IsDebugLoggingEnabled())
 	{
@@ -2981,6 +3195,32 @@ void UTraceWeaponComponent::OnRep_EquippedWeapon()
 		LocallyAppliedWeapon = EquippedWeapon;
 	}
 
+	// --- FX_AUDIO_PLAN §5.1 (WeaponSwitch) — REPLICATED-LOCAL, WHICH IS WHY THERE IS NO RPC -------
+	//
+	// This function already runs on every machine exactly once per swap: on the clients because the
+	// selector replicated, and on the authority because ApplyEquip calls it by hand for precisely
+	// that reason. So the replication IS the multicast, and TraceAudio::PlayReplicatedLocal plays it
+	// spatialised, locally, with no packet of its own. WeaponSwitch is declared CLIENT-side in
+	// Audio/TraceSoundEvents.h so that a stray TraceAudio::Play() on it can never multicast on top
+	// (§1.6.3's doctrine) — the side declaration and this call site are one design, not two.
+	//
+	// The seed-then-change test is LastSoundedWeapon's whole job; see its comment for the join-time
+	// burst it prevents.
+	if (!bSoundedWeaponValid)
+	{
+		bSoundedWeaponValid = true;
+		LastSoundedWeapon = EquippedWeapon;
+	}
+	else if (LastSoundedWeapon != EquippedWeapon)
+	{
+		LastSoundedWeapon = EquippedWeapon;
+		if (const ATraceCharacter* SwitchCharacter = GetTraceCharacter())
+		{
+			TraceAudio::PlayReplicatedLocal(this, TraceSoundEvents::WeaponSwitch,
+				SwitchCharacter->GetActorLocation());
+		}
+	}
+
 	// The movement profile, on the very frame the selector changed rather than on the next tick. On
 	// a simulated proxy that is what keeps the pawn's simulated speed matching the one the server
 	// moved it at; on the owning client the predicted equip already called this, so it is a no-op.
@@ -3220,6 +3460,23 @@ void UTraceWeaponComponent::ServerSwing_Implementation(FVector_NetQuantize Origi
 		SwingOrigin = ReferencePoint;
 	}
 
+	// --- FX_AUDIO_PLAN §5.1 (MeleeSwing) — THE WORLD HALF OF THE §6 PAIR ------------------------
+	//
+	// THE ACCEPT, not the request: every gate above this line can refuse the swing, and a whoosh for
+	// a swing that never happened is the melee version of a phantom gunshot. Excluding the swinger's
+	// own pawn is what stops the machine that already played its predicted copy (StartSwing) from
+	// hearing a second one — on a listen host both run in this process and the exclusion cancels the
+	// local play. A BOT excludes nobody, because no machine player-controls one, so a bot's swing is
+	// heard by everyone exactly as it would be through PlayAt.
+	if (TraceAudioWatch::IsPredictedShotEnabled())
+	{
+		TraceAudio::PlayAtExcluding(Character, TraceSoundEvents::MeleeSwing, SwingOrigin, Character);
+	}
+	else
+	{
+		TraceAudio::PlayAt(Character, TraceSoundEvents::MeleeSwing, SwingOrigin);
+	}
+
 	// ---- resolve -------------------------------------------------------------------------
 	FTraceMeleeHit Hit;
 	TraceMelee::ResolveSwing(World, Character, SwingOrigin, Dir, static_cast<float>(RewindTime), Hit);
@@ -3261,6 +3518,24 @@ void UTraceWeaponComponent::ServerSwing_Implementation(FVector_NetQuantize Origi
 			// ApplyDamage no-ops against an invulnerable target, so read the result rather than
 			// assuming the hit landed.
 			bKilled = !VictimHealth->IsAlive();
+
+			// --- FX_AUDIO_PLAN §5.1 (MeleeHit / MeleeBackstab) ----------------------------------
+			//
+			// *** HERE AND NOT IN TraceMelee::ResolveSwing, WHICH IS WHERE THE PLAN'S LINE REFERENCE
+			// POINTS. *** The plan calls that site "damage application"; it is not. ResolveSwing is a
+			// pure resolver and it runs TWICE in this process on a listen host — once as the
+			// swinger's own cosmetic prediction in TickSwing, and again here on the authority — so a
+			// PlayAt inside it would announce every host swing twice. This is the one place a knife
+			// hit is a fact: the damage has been applied and the verdict is known.
+			//
+			// TWO EVENTS AND NOT ONE PLUS A FLAG, matching the two kill causes immediately above:
+			// a back-stab is a different thing happening to you than a front cut (a hundred damage
+			// against forty) and the sound is most of how the victim learns which they just took.
+			// World-side, at the IMPACT POINT rather than at either pawn, so a bystander hears where
+			// the blade landed.
+			TraceAudio::PlayAt(Character,
+				Hit.bBackstab ? TraceSoundEvents::MeleeBackstab : TraceSoundEvents::MeleeHit,
+				Hit.ImpactPoint);
 		}
 
 		if (ATracePlayerController* AttackerController = Cast<ATracePlayerController>(Character->GetController()))
@@ -3268,7 +3543,17 @@ void UTraceWeaponComponent::ServerSwing_Implementation(FVector_NetQuantize Origi
 			// The zone rides along so the hitmarker stays positional, exactly as it does for a shot.
 			// The knife's damage does NOT come from the zone — back or front decides that — but a
 			// player reading their own hitmarker learns where the blade landed either way.
-			AttackerController->ClientNotifyHit(bKilled, Hit.Zone);
+			//
+			// C5 — THE MELEE PATH PASSES ITS OWN SHIELD FACT, and here it is always false BY
+			// CONSTRUCTION: TraceMelee::ResolveSwing refuses to return a carrier as a victim, so a
+			// blocked swing has no Hit.Victim and never reaches this branch at all — it lands in the
+			// `else if (Hit.bBlockedByCarrierShield)` below, which deliberately notifies NOTHING.
+			// A blocked knife draws no marker today and C5 does not add one: the shooter's lying
+			// white marker was a hitscan defect (code-gameplay F2), and inventing melee feedback for
+			// a rule the design states as "carriers are immune to melee" is the UI plan's call, not
+			// this tranche's. The flag is passed rather than hard-coded false so that a future
+			// ResolveSwing which DOES return a shielded victim carries the truth without an edit here.
+			AttackerController->ClientNotifyHit(bKilled, Hit.Zone, Hit.bBlockedByCarrierShield);
 		}
 
 		UE_LOG(LogTraceGame, Verbose,
@@ -3422,164 +3707,6 @@ bool UTraceWeaponComponent::GetFacingYawAtTime(const ATraceCharacter* Character,
 
 	OutYaw = History[0].Yaw;
 	return true;
-}
-
-// -------------------------------------------------------------------------------------------------
-// Bots. TEMPORARY AND HONESTLY SO — see the declaration's comment and the pass report.
-// -------------------------------------------------------------------------------------------------
-
-void UTraceWeaponComponent::TickBotKnife()
-{
-	// *** DEMO 19 ITEM 2: "Don't let the bots attack." ***
-	//
-	// FIRST, before the cvar and before anything is measured, because this is a statement about the
-	// BODY rather than about the feature. A practice-range target is possessed by a controller that
-	// steers nothing and presses nothing — but this function never asked the controller what it
-	// wanted. It fires for every pawn that is not player-controlled, so the range's five stationary
-	// targets were drawing the blade and swinging it at anyone who came within 153 uu: which is
-	// exactly the distance you have to close to knife one. See SetAutonomousAttacksAllowed.
-	if (!bAutonomousAttacksAllowed)
-	{
-		return;
-	}
-
-	if (!TraceMelee::IsBotAutoKnifeEnabled())
-	{
-		return;
-	}
-
-	ATraceCharacter* Character = GetTraceCharacter();
-	if (Character == nullptr || !Character->IsAlive() || Character->IsCarrier())
-	{
-		return;
-	}
-
-	// Bots only. A human's weapon choice is theirs; a server-side proxy of a remote human has no
-	// controller of its own to consult here either way.
-	AController* BotController = Character->GetController();
-	if (BotController == nullptr || Cast<APlayerController>(BotController) != nullptr)
-	{
-		return;
-	}
-
-	// Four decisions a second, not sixty. The pullout is 0.2 s, so a bot re-deciding every frame at
-	// a range boundary would live permanently inside a swap and never hold either weapon.
-	const double Now = GetLocalTimeSeconds();
-	if ((Now - LastBotSwapDecisionTime) < 0.25)
-	{
-		return;
-	}
-	LastBotSwapDecisionTime = Now;
-
-	if (IsDeploying())
-	{
-		return;
-	}
-
-	UWorld* World = GetWorld();
-	if (World == nullptr)
-	{
-		return;
-	}
-
-	// Nearest living enemy who is not the carrier. Carriers are excluded because they are immune to
-	// the knife — chasing one with a blade out would be a bot committing to a weapon that cannot
-	// touch its target, which is worse than not using the knife at all.
-	const ETraceTeam MyTeam = Character->GetTeam();
-	double NearestDistanceSq = TNumericLimits<double>::Max();
-	ATraceCharacter* Nearest = nullptr;
-
-	for (TActorIterator<ATraceCharacter> It(World); It; ++It)
-	{
-		ATraceCharacter* Candidate = *It;
-		if (Candidate == nullptr || Candidate == Character || !Candidate->IsAlive() || Candidate->IsCarrier())
-		{
-			continue;
-		}
-		if (MyTeam != ETraceTeam::None && Candidate->GetTeam() == MyTeam)
-		{
-			continue;
-		}
-
-		const double DistanceSq = FVector::DistSquared(Candidate->GetActorLocation(), Character->GetActorLocation());
-		if (DistanceSq < NearestDistanceSq)
-		{
-			NearestDistanceSq = DistanceSq;
-			Nearest = Candidate;
-		}
-	}
-
-	const double Engage = TraceMelee::GetBotEngageRangeUU();
-	const double Disengage = TraceMelee::GetBotDisengageRangeUU();
-
-	// =============================================================================================
-	// [DUALWIELD] SPEC v28 §10 — A BOT NO LONGER TRADES ITS GUN FOR A KNIFE, BECAUSE IT DOES NOT
-	// HAVE TO.
-	// =============================================================================================
-	//
-	// The whole of the v10 §1 range band below exists to answer one question: is it worth being
-	// unarmed for a moment in exchange for the knife's +22% and its 100-damage back-stab? Under the
-	// switch that trade does not exist — the blade is always in the off hand, the speed bonus is
-	// deliberately not paid (see ShouldUseKnifeMovementProfile), and putting the gun away would be a
-	// pure loss. So the rule collapses to its second half: keep shooting, and stab whatever walks
-	// into reach.
-	//
-	// THIS IS ALSO WHAT KEEPS THE BOTS PLAYTESTING THE FEATURE, which is the standing requirement on
-	// this function ("Bots must use it, or it will not be playtested"). It runs on the same
-	// four-times-a-second authority tick and the same IsInSwingRange predicate, so the melee half of
-	// dual-wield is exercised by every bot match without one line of ATraceBotController changing.
-	// Trace.Knife.BotAuto 0 still switches it off, and Trace.Knife.DualWield 0 restores the band.
-	if (TraceMelee::IsDualWieldEnabled())
-	{
-		if (Nearest != nullptr && TraceMelee::IsInSwingRange(Character, Nearest))
-		{
-			// StartSwing re-checks every gate, so this is a request rather than an assertion — and the
-			// 0.5 s cooldown paces it with no timer here. Note the shooting lockout in CanFire() means
-			// a bot that swings genuinely stops shooting for the animation, exactly as a player does,
-			// so the rule is measured on bots too rather than only on the local human.
-			StartSwing();
-		}
-		return;
-	}
-
-	// The band IS the rule: inside Engage the +22% makes the knife the correct chase tool, outside
-	// Disengage it is not, and the gap between them is what stops a bot at the boundary thrashing.
-	if (!IsKnifeEquipped())
-	{
-		if (NearestDistanceSq <= Engage * Engage)
-		{
-			RequestEquip(ETraceEquippedWeapon::Knife);
-		}
-		return;
-	}
-
-	if (NearestDistanceSq > Disengage * Disengage)
-	{
-		RequestEquip(ETraceEquippedWeapon::Gun);
-		return;
-	}
-
-	// AND THEN ACTUALLY SWING IT. Spec v10 §1: "Bots must use it, or it will not be playtested" —
-	// "at minimum swap to the knife to close distance AND swing in range".
-	//
-	// THIS BRANCH IS WHY THE FEATURE GETS PLAYTESTED AT ALL, and it was missing on the first
-	// measured pass: bots swapped to the knife 7 times in a 45 s headless match and swung ZERO
-	// times, with no refusals logged because StartSwing was simply never reached. The swap half of
-	// the rule was implemented and the swing half was not, which reads in-game as bots jogging at
-	// people with a blade out and politely declining to use it.
-	//
-	// A bot cannot inherit the human path here. A human swings because DoFirePressed routes a held
-	// trigger into StartSwing; a bot's trigger is driven by ATraceBotController's shooting logic,
-	// which reasons about GUN range and line of sight and has no reason to hold fire at 150 uu. So
-	// the melee slice drives its own swing, exactly as it drives its own swap, and the bot
-	// controller stays untouched — it is another agent's file and needs no knowledge of the knife.
-	//
-	// StartSwing re-checks every gate (alive, not carrying, not dashing, deployed, off cooldown), so
-	// this is a request and not an assertion; the 0.5 s cooldown paces it without a timer here.
-	if (Nearest != nullptr && TraceMelee::IsInSwingRange(Character, Nearest))
-	{
-		StartSwing();
-	}
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -3863,8 +3990,9 @@ UStaticMeshComponent* UTraceWeaponComponent::AddKnifePart(USceneComponent* Attac
 	// Reuse the material the viewmodel gun is already wearing where one exists, so the knife is made
 	// of the same stuff as the gun it replaced AND inherits ApplyTeamColors' pushes for free — the
 	// MIDs are shared objects owned by the character. Where there is no gun to borrow from (a
-	// simulated proxy, which never builds a viewmodel) fall back to the generated Tron materials and
-	// finally to BasicShapeMaterial, exactly as everything else in this project degrades.
+	// simulated proxy, which never builds a viewmodel) fall back to the COMMITTED Tron parents at
+	// /Game/Trace/Materials/Parents and finally to BasicShapeMaterial, exactly as everything else in
+	// this project degrades.
 	UMaterialInterface* Material = nullptr;
 	if (const ATraceCharacter* Character = GetTraceCharacter())
 	{
@@ -3902,9 +4030,18 @@ UStaticMeshComponent* UTraceWeaponComponent::AddKnifePart(USceneComponent* Attac
 
 	if (Material == nullptr)
 	{
+		// MAP_PLAN §9, the tenth and last load site (conflict #8: the other nine were migrated by the
+		// FX tranche, this one was carved out for RESTRUCTURE C). It used to ask
+		// /Game/Generated/Materials, which was generator output that is no longer even on disk —
+		// Content/Generated/ was deleted in the same pass — so this fallback resolved to null and the
+		// knife dropped straight to engine grey. The committed parents are the ONE path (bible §3.1).
+		//
+		// NO LEGACY SECOND ARM: the precedent that kept one (TraceCharacter.cpp) was written while
+		// the legacy copy still existed, and a second LoadObject at a deleted path only buys a
+		// warning per knife build. BasicShapeMaterial below remains the honest last resort.
 		Material = LoadObject<UMaterialInterface>(nullptr, bNeon
-			? TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon")
-			: TEXT("/Game/Generated/Materials/M_TraceSurface.M_TraceSurface"));
+			? TEXT("/Game/Trace/Materials/Parents/M_TraceNeon.M_TraceNeon")
+			: TEXT("/Game/Trace/Materials/Parents/M_TraceSurface.M_TraceSurface"));
 	}
 	if (Material == nullptr)
 	{
@@ -5774,9 +5911,10 @@ namespace TraceAmmoTest
 	 * CONTROLLED (StartFire refuses anything else — input is a local concept) and authoritative.
 	 *
 	 * The local human first, then any bot. A human is the better subject in a headless run because
-	 * nothing else is steering them: a bot's own TickBotKnife would draw the blade the moment an
-	 * enemy came within BotEngageRangeUU and quietly turn "the clip did not fall" into a true
-	 * statement about a pawn holding a knife.
+	 * nothing else is steering them: a bot's own knife band (ATraceBotController::UpdateKnifeBand,
+	 * on the controller since RESTRUCTURE D5) would draw the blade the moment an enemy came within
+	 * BotEngageRangeUU and quietly turn "the clip did not fall" into a true statement about a pawn
+	 * holding a knife.
 	 */
 	ATraceCharacter* FindDrivableSubject(UWorld* World)
 	{
@@ -8339,4 +8477,972 @@ static FAutoConsoleCommand GTraceWeaponsV29Cmd(
 	     "MODDED (RED arm: RoxieModdedRecoilScale 0)."),
 	FConsoleCommandDelegate::CreateStatic(&TraceWeaponsV29::Run));
 
+// =================================================================================================
+// RESTRUCTURE C5 — THE SHIELD-BLOCKED HIT, MEASURED ON A REAL BULLET
+//
+//   Trace.Weapon.ShieldBlockTest   Three arms, one match, seconds apart. The first two shoot the
+//   SAME enemy with the real fire key; the third drives the RPC this tranche extended.
+//
+//     SHIELDED  the enemy is given the Core (ETraceCoreGrantReason::Debug), stood on the floor in
+//               front of the local player, and shot. *** THE MEASURED TRUTH IS THAT NO HIT IS
+//               CONFIRMED AT ALL: *** UTraceLagCompensationComponent::ResolveHitscan skips a
+//               shielded carrier as a candidate ("do not even resolve them", :323), so the shooter
+//               gets silence rather than the lying white marker the F2 audit described. This arm
+//               ASSERTS that silence, so the day the resolver changes, this test says so.
+//     CONTROL   the Core is handed to somebody else and the same enemy is shot again. The hit must
+//               confirm NORMALLY: health falls and the blocked counter does NOT move. Without this
+//               arm "no hit was confirmed" and "the fixture never fired a bullet" are the same
+//               reading, which is the failure mode this project has shipped before.
+//     PLUMBING  ClientNotifyHit(bKilled=false, Zone, bShieldBlocked=true) is driven directly at the
+//               local controller — the RPC C5 extended — and the controller must record the blocked
+//               fact: the counter moves, WasLastHitMarkerShieldBlocked() reads true (the seam FX
+//               plan §7.4 draws from) and the [ShieldBlock] line lands in the log.
+//
+//   In arms 1 and 2 only where the enemy STANDS and where the shooter LOOKS are staged — the key,
+//   ServerFire, the lag-compensated resolver and ClientNotifyHit are all the shipping path. The
+//   target is re-placed every frame for half a second before the shot, because the server resolves
+//   against its RECORDED pose history and a target teleported and shot in the same tick is missed.
+// =================================================================================================
+
+namespace TraceShieldBlockTest
+{
+	/** Where the enemy is stood, in uu ahead of the shooter. Well inside the pistol's range. */
+	constexpr double StagedDistanceUU = 500.0;
+
+	struct FRun
+	{
+		TWeakObjectPtr<UWorld> World;
+		TWeakObjectPtr<ATraceCharacter> Shooter;
+		TWeakObjectPtr<ATraceCharacter> Target;
+		TWeakObjectPtr<ATracePlayerController> ShooterPC;
+
+		double StartTime = 0.0;
+		int32 Phase = 0;
+
+		int32 HitsBefore = 0;
+		int32 BlockedBefore = 0;
+		float TargetHealthBefore = 0.f;
+
+		bool bBlockedArmOk = false;
+		bool bControlArmOk = false;
+		bool bPlumbingArmOk = false;
+		FString BlockedLine;
+		FString ControlLine;
+		FString PlumbingLine;
+	};
+
+	static void PlaceAndAim(FRun& Run)
+	{
+		ATraceCharacter* Me = Run.Shooter.Get();
+		ATraceCharacter* Target = Run.Target.Get();
+		if (Me == nullptr || Target == nullptr)
+		{
+			return;
+		}
+
+		const FVector Forward = Me->GetActorForwardVector().GetSafeNormal2D();
+		if (Forward.IsNearlyZero())
+		{
+			return;
+		}
+
+		FVector Spot = Me->GetActorLocation() + Forward * StagedDistanceUU;
+		Spot.Z = Me->GetActorLocation().Z;   // the same floor the shooter is on, so nothing snaps
+		Target->TeleportTo(Spot, (-Forward).Rotation(), /*bIsATest=*/false, /*bNoCheck=*/true);
+
+		if (ATracePlayerController* PC = Run.ShooterPC.Get())
+		{
+			const FVector ToChest = Target->GetActorLocation() - Me->GetMuzzleLocation();
+			if (!ToChest.IsNearlyZero())
+			{
+				PC->SetControlRotation(ToChest.Rotation());
+			}
+		}
+	}
+
+	static void Fire(FRun& Run)
+	{
+		if (ATracePlayerController* PC = Run.ShooterPC.Get())
+		{
+			// The real key, through the same injection path every other harness here uses.
+			PC->ConsoleCommand(TEXT("Trace.SimInput LeftMouseButton 0.12 controller"), /*bWriteToLog=*/false);
+		}
+	}
+
+	static float HealthOf(const ATraceCharacter* Who)
+	{
+		return (Who != nullptr && Who->Health != nullptr) ? Who->Health->Health : -1.f;
+	}
+
+	static void Run()
+	{
+		UWorld* World = nullptr;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (Context.World() != nullptr && Context.World()->IsGameWorld())
+				{
+					World = Context.World();
+					break;
+				}
+			}
+		}
+		if (World == nullptr || World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[ShieldBlockTest] Server only, and needs a game world."));
+			return;
+		}
+
+		APlayerController* PC = World->GetFirstPlayerController();
+		ATraceCharacter* Me = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+		ATracePlayerController* TracePC = Cast<ATracePlayerController>(PC);
+		if (Me == nullptr || TracePC == nullptr || !Me->IsAlive())
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[ShieldBlockTest] no live local pawn."));
+			return;
+		}
+
+		ATraceCharacter* Target = nullptr;
+		double BestDistSq = TNumericLimits<double>::Max();
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			ATraceCharacter* Other = *It;
+			if (Other == nullptr || Other == Me || !Other->IsAlive() || Other->GetTeam() == Me->GetTeam())
+			{
+				continue;
+			}
+			const double DistSq = FVector::DistSquared(Me->GetActorLocation(), Other->GetActorLocation());
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				Target = Other;
+			}
+		}
+
+		ATraceCore* TheCore = ATraceCore::Get(World);
+		if (Target == nullptr || TheCore == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[ShieldBlockTest] need a living ENEMY and a Core (enemy=%s, core=%s). Run this in a "
+				     "bot match."), *GetNameSafe(Target), *GetNameSafe(TheCore));
+			return;
+		}
+
+		TSharedRef<FRun> Run = MakeShared<FRun>();
+		Run->World = World;
+		Run->Shooter = Me;
+		Run->Target = Target;
+		Run->ShooterPC = TracePC;
+		Run->StartTime = FPlatformTime::Seconds();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ShieldBlockTest] ===== shooter %s vs enemy %s; the Core goes to the enemy for arm 1 ====="),
+			*GetNameSafe(Me), *GetNameSafe(Target));
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Run](float) -> bool
+		{
+			UWorld* PollWorld = Run->World.Get();
+			ATraceCharacter* Shooter = Run->Shooter.Get();
+			ATraceCharacter* Target = Run->Target.Get();
+			ATracePlayerController* PC = Run->ShooterPC.Get();
+			ATraceCore* TheCore = (PollWorld != nullptr) ? ATraceCore::Get(PollWorld) : nullptr;
+			if (PollWorld == nullptr || Shooter == nullptr || Target == nullptr || PC == nullptr || TheCore == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[ShieldBlockTest] a participant vanished mid-run; ABORTED."));
+				return false;
+			}
+
+			const double Elapsed = FPlatformTime::Seconds() - Run->StartTime;
+
+			switch (Run->Phase)
+			{
+			case 0:   // stage the CARRIER arm
+				if (TheCore->GetCarrier() != Target)
+				{
+					TheCore->GrantTo(Target, ETraceCoreGrantReason::Debug);
+				}
+				PlaceAndAim(*Run);
+				if (Elapsed > 0.6)
+				{
+					Run->HitsBefore = PC->DebugHitConfirmCount;
+					Run->BlockedBefore = PC->DebugShieldBlockedHitCount;
+					Run->TargetHealthBefore = HealthOf(Target);
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[ShieldBlockTest] arm 1 FIRE: canFire=%d clip=%d dist=%.0f targetHealth=%.1f."),
+						(Shooter->Weapon != nullptr && Shooter->Weapon->CanFire()) ? 1 : 0,
+						(Shooter->Weapon != nullptr) ? Shooter->Weapon->GetClipAmmo() : -1,
+						FVector::Dist(Shooter->GetActorLocation(), Target->GetActorLocation()),
+						Run->TargetHealthBefore);
+					Fire(*Run);
+					Run->Phase = 1;
+				}
+				return true;
+
+			case 1:   // let the shot resolve, keeping the target on the ray
+				PlaceAndAim(*Run);
+				if (Elapsed > 1.8)
+				{
+					const int32 Hits = PC->DebugHitConfirmCount - Run->HitsBefore;
+					const int32 Blocked = PC->DebugShieldBlockedHitCount - Run->BlockedBefore;
+					const float HealthNow = HealthOf(Target);
+					const bool bCarrierStill = (TheCore->GetCarrier() == Target);
+					// THE ASSERTION IS SILENCE: a shielded carrier is not a hitscan candidate, so the
+					// shot must confirm NOTHING and must take no health. A hit here would mean the
+					// resolver's carrier skip has changed — at which point the blocked flag beside it
+					// becomes the live path and this expectation must be inverted deliberately.
+					Run->bBlockedArmOk = bCarrierStill && Hits == 0 && Blocked == 0
+						&& FMath::IsNearlyEqual(HealthNow, Run->TargetHealthBefore, 0.01f);
+					Run->BlockedLine = FString::Printf(
+						TEXT("carrier=%d hits=+%d blocked=+%d health %.1f -> %.1f (expected: no confirmation "
+						     "at all — the resolver refuses a shielded carrier as a candidate)"),
+						bCarrierStill ? 1 : 0, Hits, Blocked, Run->TargetHealthBefore, HealthNow);
+					UE_LOG(LogTraceGame, Display, TEXT("[ShieldBlockTest] SHIELDED ARM: %s"), *Run->BlockedLine);
+
+					// Take the Core away for the control arm — by GIVING IT TO SOMEBODY ELSE, never by
+					// dropping it. ATraceCore::DropAt hands possession to the opposing team, which here
+					// is the SHOOTER'S team: the shooter could end up carrying it, and a carrier cannot
+					// fire (spec v16 §1), which would make the control arm fail for a reason that has
+					// nothing to do with what is being measured.
+					ATraceCharacter* Elsewhere = nullptr;
+					for (TActorIterator<ATraceCharacter> It(PollWorld); It; ++It)
+					{
+						ATraceCharacter* Other = *It;
+						if (Other != nullptr && Other != Shooter && Other != Target && Other->IsAlive())
+						{
+							Elsewhere = Other;
+							break;
+						}
+					}
+					if (Elsewhere != nullptr)
+					{
+						TheCore->GrantTo(Elsewhere, ETraceCoreGrantReason::Debug);
+					}
+					Run->Phase = 2;
+				}
+				return true;
+
+			case 2:   // stage the CONTROL arm on the same enemy, now unshielded
+				PlaceAndAim(*Run);
+				if (Elapsed > 2.6)
+				{
+					Run->HitsBefore = PC->DebugHitConfirmCount;
+					Run->BlockedBefore = PC->DebugShieldBlockedHitCount;
+					Run->TargetHealthBefore = HealthOf(Target);
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[ShieldBlockTest] arm 2 FIRE: canFire=%d clip=%d dist=%.0f targetHealth=%.1f carrier=%s."),
+						(Shooter->Weapon != nullptr && Shooter->Weapon->CanFire()) ? 1 : 0,
+						(Shooter->Weapon != nullptr) ? Shooter->Weapon->GetClipAmmo() : -1,
+						FVector::Dist(Shooter->GetActorLocation(), Target->GetActorLocation()),
+						Run->TargetHealthBefore, *GetNameSafe(TheCore->GetCarrier()));
+					Fire(*Run);
+					Run->Phase = 3;
+				}
+				return true;
+
+			case 3:
+				PlaceAndAim(*Run);
+				if (Elapsed > 3.8)
+				{
+					const int32 Hits = PC->DebugHitConfirmCount - Run->HitsBefore;
+					const int32 Blocked = PC->DebugShieldBlockedHitCount - Run->BlockedBefore;
+					const float HealthNow = HealthOf(Target);
+					const bool bNotCarrier = (TheCore->GetCarrier() != Target);
+					Run->bControlArmOk = bNotCarrier && Hits >= 1 && Blocked == 0
+						&& HealthNow < Run->TargetHealthBefore - 0.01f;
+					Run->ControlLine = FString::Printf(
+						TEXT("carrier=%d hits=+%d blocked=+%d health %.1f -> %.1f"),
+						bNotCarrier ? 0 : 1, Hits, Blocked, Run->TargetHealthBefore, HealthNow);
+					UE_LOG(LogTraceGame, Display, TEXT("[ShieldBlockTest] CONTROL ARM: %s"), *Run->ControlLine);
+
+					// ---- ARM 3: the RPC this tranche extended, driven directly ---------------------
+					const int32 BlockedBeforePlumbing = PC->DebugShieldBlockedHitCount;
+					const bool bFlagBefore = PC->WasLastHitMarkerShieldBlocked();
+					PC->ClientNotifyHit(/*bKilled=*/false, ETraceHitZone::Body, /*bShieldBlocked=*/true);
+					const bool bFlagAfter = PC->WasLastHitMarkerShieldBlocked();
+					const int32 BlockedAfterPlumbing = PC->DebugShieldBlockedHitCount;
+					Run->bPlumbingArmOk = !bFlagBefore && bFlagAfter
+						&& (BlockedAfterPlumbing == BlockedBeforePlumbing + 1);
+					Run->PlumbingLine = FString::Printf(
+						TEXT("blockedCount %d -> %d, WasLastHitMarkerShieldBlocked %d -> %d"),
+						BlockedBeforePlumbing, BlockedAfterPlumbing, bFlagBefore ? 1 : 0, bFlagAfter ? 1 : 0);
+					UE_LOG(LogTraceGame, Display, TEXT("[ShieldBlockTest] PLUMBING ARM: %s"), *Run->PlumbingLine);
+
+					const bool bPass = Run->bBlockedArmOk && Run->bControlArmOk && Run->bPlumbingArmOk;
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[ShieldBlockTest] VERDICT: %s — shieldedArm=%d (%s) | controlArm=%d (%s) | ")
+						TEXT("plumbingArm=%d (%s). Totals: %d blocked of %d confirmed hits."),
+						bPass ? TEXT("PASS") : TEXT("FAIL"),
+						Run->bBlockedArmOk ? 1 : 0, *Run->BlockedLine,
+						Run->bControlArmOk ? 1 : 0, *Run->ControlLine,
+						Run->bPlumbingArmOk ? 1 : 0, *Run->PlumbingLine,
+						PC->DebugShieldBlockedHitCount, PC->DebugHitConfirmCount);
+					return false;
+				}
+				return true;
+
+			default:
+				return false;
+			}
+		}), 0.f);
+	}
+}
+
+static FAutoConsoleCommand GTraceShieldBlockTestCmd(
+	TEXT("Trace.Weapon.ShieldBlockTest"),
+	TEXT("Dev only, SERVER. RESTRUCTURE C5 / code-gameplay F2. Shoots the SAME enemy twice — once "
+	     "holding the Core (MEASURED: no hit is confirmed at all, because the lag-compensated resolver "
+	     "refuses a shielded carrier as a candidate) and once without it (the hit must confirm normally "
+	     "and take health) — then drives ClientNotifyHit's new bShieldBlocked directly to prove the "
+	     "controller records it. Real key, real ServerFire, real ClientNotifyHit."),
+	FConsoleCommandDelegate::CreateStatic(&TraceShieldBlockTest::Run));
+
+#endif // !UE_BUILD_SHIPPING
+
+#if !UE_BUILD_SHIPPING
+// =================================================================================================
+// Trace.Fx.ImpactShots — the staging for FX_AUDIO_PLAN §3's acceptance shot
+//
+// "5-shot repeat frames showing the travelling bolt AND an impact plane on world hits only."
+//
+// The frames come from -TraceAutoShot / -TraceAutoShotRepeat; what this command does is make the
+// pawn FIRE, at something chosen rather than at whatever happens to be in front of it, and then say
+// in the log which shots were entitled to a mark. Both halves matter:
+//
+//   * A capture harness that fires at "forward" is photographing the map's furniture, not the rule.
+//     `world` pitches the aim down at the FLOOR — geometry, guaranteed, with no pawn in the way —
+//     and `body` snaps it onto the nearest other character's chest. Those are the two arms of §3's
+//     "geometry hits ONLY", and the second one must produce NO plane.
+//   * A frame nobody can grade is not evidence. Each shot logs the victim the resolve found and
+//     whether the tracer armed a plane (ATraceTracer::IsImpactPlaneArmed), so the screenshots have a
+//     ledger beside them instead of an eyeball verdict on a 26 uu quad.
+//
+// It drives StartFire(), the trigger's own verb, so the whole real path runs: CanFire, FireOnce, the
+// predicted audio, the local tracer, ServerFire, the multicast. Nothing here is a shortcut past the
+// code under test.
+//
+// Named for this file; internal linkage; inside !UE_BUILD_SHIPPING like every other command here.
+// =================================================================================================
+namespace TraceImpactShots
+{
+	FTSTicker::FDelegateHandle GTicker;
+	int32 GRemaining = 0;
+	float GInterval = 0.55f;
+	float GWait = 0.f;
+	int32 GIndex = 0;
+	bool GAimBody = false;
+
+	/**
+	 * When true, the run switches to the BODY arm once the WORLD arm is spent, in one command.
+	 *
+	 * *** IT EXISTS BECAUSE -TraceExec HAS EXACTLY TWO ROUNDS AND THE CAPTURE NEEDS THREE THINGS. ***
+	 * A headless capture must pick a character (the select screen has no timeout in the practice
+	 * range), fire at the floor, and fire at a body. Round 1 is the pick, round 2 is this command, and
+	 * there is no round 3 — so the two arms live in one verb with a pause between them rather than in
+	 * two commands that cannot both be scheduled.
+	 */
+	bool GBodyAfter = false;
+	int32 GBodyCount = 0;
+
+	/**
+	 * *** TIME IS DILATED FOR THE CAPTURE, AND THAT IS ABOUT THE CAMERA, NOT THE EFFECT. ***
+	 *
+	 * A bolt lives 0.10..0.30 s (ATraceTracer::BoltMinLifeSeconds/BoltMaxLifeSeconds) and the
+	 * off-screen screenshot pipeline delivers about one frame every 0.12 s of REAL time however
+	 * often -TraceAutoShotRepeat asks — 245 requests produced 78 files in the run that established
+	 * this. So at normal speed the capture samples at roughly one age per shot and lands either side
+	 * of the flight: measured over two runs, every frame came out at age 0.001 s (bolt still on the
+	 * muzzle) or 0.12 s and later (bolt already swallowed).
+	 *
+	 * Dilating the world clock changes NOTHING about the effect. Every duration in ATraceTracer is a
+	 * pure function of UWorld::GetTimeSeconds() — the class comment on SpawnTimeSeconds is explicit
+	 * that age is sampled from the absolute world clock and never accumulated — so the bolt travels
+	 * exactly the same distance at exactly the same fraction of its life. What changes is how many
+	 * real-time frames fit inside that life, which is a property of the observer and is the whole
+	 * problem. Restored on the way out so nothing else in the session inherits it.
+	 */
+	static constexpr float CaptureDilation = 0.25f;
+	bool GDilated = false;
+
+	/**
+	 * The beam from the shot just fired, and how long until its mark is read back.
+	 *
+	 * *** THE LEDGER LINE CANNOT BE WRITTEN AT THE MOMENT OF FIRING, AND THE FIRST DRAFT WROTE IT
+	 * THERE. *** At the instant the trigger breaks, the plane is ARMED but not SHOWN: §3 reveals it
+	 * when the bolt HEAD ARRIVES, which for a floor shot is about 0.06 s later. So a line printed at
+	 * fire time can only say what the shot decided, not what ended up on screen — and "what ended up
+	 * on screen" is precisely what a screenshot has to be graded against. The readback therefore
+	 * waits, and prints the plane's own live transform: visible, where, how wide, how opaque.
+	 *
+	 * WORLD SECONDS, not real ones, so the capture's time dilation moves it with the effect.
+	 */
+	TWeakObjectPtr<const ATraceTracer> GBeam;
+	float GReadbackIn = -1.f;
+	int32 GReadbackIndex = 0;
+	bool GReadbackBody = false;
+	FString GReadbackVictim;
+
+	void SetDilation(UWorld* World, float Value)
+	{
+		if (World != nullptr)
+		{
+			if (AWorldSettings* Settings = World->GetWorldSettings())
+			{
+				Settings->SetTimeDilation(Value);
+			}
+		}
+	}
+
+	/**
+	 * How long after the trigger the plane is read back, in seconds of the (dilated) world clock.
+	 *
+	 * Comfortably after a floor shot's arrival (~0.06 s) and comfortably inside the mark's 0.18 s
+	 * life, so the readback lands on a frame where there is something to read.
+	 */
+	static constexpr float ReadbackDelaySeconds = 0.10f;
+
+	UWorld* ShotWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			if (Context.World() != nullptr && Context.World()->IsGameWorld())
+			{
+				return Context.World();
+			}
+		}
+		return nullptr;
+	}
+
+	ATracePlayerController* LocalController(UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return nullptr;
+		}
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* PC = It->Get();
+			if (PC != nullptr && PC->IsLocalController())
+			{
+				return Cast<ATracePlayerController>(PC);
+			}
+		}
+		return nullptr;
+	}
+
+	/** Points the control rotation at the floor, or at the nearest other character's chest. */
+	void Aim(ATracePlayerController* PC, ATraceCharacter* Pawn)
+	{
+		if (PC == nullptr || Pawn == nullptr)
+		{
+			return;
+		}
+
+		if (!GAimBody)
+		{
+			// *** TWO PITCHES, ALTERNATING, AND THE REASON IS THE PHYSICS OF THE EFFECT ITSELF. ***
+			// The two things §3 and §4 have to be photographed doing are in tension, because the
+			// bolt's life is SOLVED from the shot's length (ATraceTracer::ResolveBoltTravel):
+			//
+			//   a NEAR shot   (-35 deg, floor a few metres ahead)  the impact is close, so the mark
+			//                 is large on screen — but the flight is under the 0.10 s life floor and
+			//                 no realistic capture cadence catches the bolt in the air.
+			//   a FAR shot    (-3 deg, down the length of the arena) takes the full 0.30 s, so the
+			//                 bolt is photographable mid-flight — but its mark is tens of metres away
+			//                 and a 26 uu quad there is a handful of pixels.
+			//
+			// Measured, not guessed: at -35 the mark reads as a ~48 px square and no frame of a 5-shot
+			// burst contained a travelling bolt; at -18 the bolt was still gone and the mark was down
+			// to a max channel delta of 18. So the arm alternates, odd shots near and even shots far,
+			// and one five-shot burst produces both frames. Every one of them is still a WORLD hit —
+			// the floor either way — which is what the arm is for.
+			FRotator Aimed = PC->GetControlRotation();
+			Aimed.Pitch = ((GIndex % 2) == 0) ? -35.f : -3.f;
+			Aimed.Roll = 0.f;
+			PC->SetControlRotation(Aimed);
+			return;
+		}
+
+		ATraceCharacter* Nearest = nullptr;
+		double BestSq = TNumericLimits<double>::Max();
+		for (TActorIterator<ATraceCharacter> It(Pawn->GetWorld()); It; ++It)
+		{
+			ATraceCharacter* Other = *It;
+			if (!IsValid(Other) || Other == Pawn || !Other->IsAlive())
+			{
+				continue;
+			}
+			const double DistSq = FVector::DistSquared(Other->GetActorLocation(), Pawn->GetActorLocation());
+			if (DistSq < BestSq)
+			{
+				BestSq = DistSq;
+				Nearest = Other;
+			}
+		}
+
+		if (Nearest == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ImpactShots] `body` arm asked for, but there is nobody else alive to shoot at. "
+				     "Falling back to the floor, which will draw a plane — that is NOT the body arm."));
+			GAimBody = false;
+			Aim(PC, Pawn);
+			return;
+		}
+
+		const FVector Eye = Pawn->GetPawnViewLocation();
+		PC->SetControlRotation((Nearest->GetActorLocation() - Eye).Rotation());
+	}
+
+	bool Tick(float Delta)
+	{
+		UWorld* World = ShotWorld();
+		ATracePlayerController* PC = LocalController(World);
+		ATraceCharacter* Pawn = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+		UTraceWeaponComponent* Weapon = (Pawn != nullptr) ? Pawn->Weapon : nullptr;
+
+		if (Weapon == nullptr || GRemaining <= 0)
+		{
+			if (Weapon == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[ImpactShots] no local pawn with a weapon — run this inside a match."));
+			}
+			else if (GBodyAfter)
+			{
+				// THE SECOND ARM, IN THE SAME RUN. A pause first, so the last world bolt has been
+				// swallowed and the last mark has faded before the body frames start — otherwise a
+				// frame from the body arm could contain a plane that belongs to the world arm, which
+				// is exactly the confusion the two arms exist to rule out.
+				GBodyAfter = false;
+				GAimBody = true;
+				GRemaining = GBodyCount;
+				GIndex = 0;
+				GWait = 2.0f;
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[ImpactShots] world arm done: %d shot(s). Switching to the BODY arm in 2.0s — "
+					     "every shot of it must report `impact plane none`."), GBodyCount);
+				return true;
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[ImpactShots] done: %d shot(s) fired."), GIndex);
+			}
+			if (GDilated)
+			{
+				SetDilation(World, 1.f);
+				GDilated = false;
+			}
+			FTSTicker::GetCoreTicker().RemoveTicker(GTicker);
+			GTicker.Reset();
+			return false;
+		}
+
+		// THE READBACK IS ON ITS OWN CLOCK, ahead of the next shot, because the mark it grades is up
+		// for 0.18 s and the next trigger pull is 0.55 s away.
+		if (GReadbackIn >= 0.f)
+		{
+			GReadbackIn -= Delta;
+			if (GReadbackIn < 0.f)
+			{
+				const ATraceTracer* Beam = GBeam.Get();
+				FVector Where = FVector::ZeroVector;
+				float WidthUU = 0.f;
+				float Opacity = 0.f;
+				const bool bArmed = (Beam != nullptr) && Beam->IsImpactPlaneArmed();
+				const bool bOnScreen = (Beam != nullptr) && Beam->DescribeImpactPlane(Where, WidthUU, Opacity);
+
+				// THE SHOT'S OWN LENGTH, off the beam that drew it. It is here because there are
+				// THREE outcomes and two of them look identical without it: a shot that hit geometry
+				// (mark), a shot that hit a player (no mark, by the §3 ruling) and a shot that hit
+				// NOTHING and died at HitscanRange (no mark either, because there is no surface).
+				// The third is not a defect and a ledger that could not tell it from the second would
+				// invite somebody to go looking for one.
+				FTraceTracerShotDebug Shot;
+				const bool bDescribed = (Beam != nullptr) && Beam->DescribeShot(Shot);
+				const float Range = FMath::Max(1.f, UTraceSettings::Get().HitscanRange);
+				const bool bStopped = bDescribed && (Shot.ShotLengthUU < Range * 0.99f);
+
+				// THREE LABELS AND NOT TWO, because "the beam is gone" is a fourth state and printing
+				// it as "hit NOTHING" would invent a fact about the shot out of a fact about the
+				// readback's timing. A recycled or expired tracer describes nothing at all.
+				const TCHAR* const Outcome = !bDescribed ? TEXT("(beam gone)")
+					: (bStopped ? TEXT("(hit a surface)") : TEXT("(hit NOTHING)"));
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[ImpactShots] shot %d (%s arm): victim=%-18s shot=%7.0fuu %-15s | plane %s | %s"),
+					GReadbackIndex, GReadbackBody ? TEXT("BODY") : TEXT("WORLD"), *GReadbackVictim,
+					bDescribed ? Shot.ShotLengthUU : -1.f, Outcome,
+					bArmed ? TEXT("ARMED") : TEXT("none "),
+					bOnScreen
+						? *FString::Printf(TEXT("ON SCREEN at %s, %.1fuu wide, opacity %.3f (recomputed)"),
+							*Where.ToCompactString(), WidthUU, Opacity)
+						: TEXT("nothing drawn"));
+				GBeam.Reset();
+			}
+		}
+
+		GWait -= Delta;
+		if (GWait > 0.f)
+		{
+			return true;
+		}
+		GWait = GInterval;
+
+		Aim(PC, Pawn);
+		Weapon->StartFire();
+		Weapon->StopFire();
+		++GIndex;
+		--GRemaining;
+
+		// READ BACK OFF THE BEAM THAT WAS JUST DRAWN, not off the intent. GetNewestTracer with
+		// bFirstPersonOnly is the local shooter's own beam — the same filter Trace.Fx.Beam uses, and
+		// for the same reason: in a populated world "the newest tracer" is very often somebody else's.
+		GBeam = ATraceTracer::GetNewestTracer(World, /*bFirstPersonOnly=*/true);
+		GReadbackIndex = GIndex;
+		GReadbackBody = GAimBody;
+		GReadbackVictim = GetNameSafe(Weapon->DebugGetLastPredictedVictim());
+		GReadbackIn = ReadbackDelaySeconds;
+
+		return true;
+	}
+
+	void Arm(int32 Count, bool bBody, float Interval)
+	{
+		if (GTicker.IsValid())
+		{
+			FTSTicker::GetCoreTicker().RemoveTicker(GTicker);
+			GTicker.Reset();
+		}
+		GRemaining = FMath::Clamp(Count, 1, 60);
+		GInterval = FMath::Clamp(Interval, 0.35f, 5.f);
+		GWait = 0.f;
+		GIndex = 0;
+		GAimBody = bBody;
+		GBodyAfter = false;
+		GBodyCount = 0;
+
+		SetDilation(ShotWorld(), CaptureDilation);
+		GDilated = true;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ImpactShots] arming %d shot(s) every %.2fs at the %s (world clock dilated to 0.25 so "
+			     "the capture can sample inside a 0.10..0.30s bolt). A WORLD shot must arm a plane; "
+			     "a BODY shot must not (FX_AUDIO_PLAN §3, honouring spec v4 §4's deleted on-victim pop)."),
+			GRemaining, GInterval, bBody ? TEXT("nearest character") : TEXT("floor, near and far alternately"));
+
+		GTicker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateStatic(&Tick), 0.f);
+	}
+} // namespace TraceImpactShots
+
+static FAutoConsoleCommand GTraceFxImpactShotsBothCmd(
+	TEXT("Trace.Fx.ImpactShots.Both"),
+	TEXT("The capture run in ONE verb: five shots at the floor, a two-second pause, then five at the "
+	     "nearest character. -TraceExec has two rounds and a headless capture needs three things "
+	     "(pick a character, world arm, body arm), so the two arms share a command."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		TraceImpactShots::Arm(5, /*bBody=*/false, 0.55f);
+		TraceImpactShots::GBodyAfter = true;
+		TraceImpactShots::GBodyCount = 5;
+	}));
+
+static FAutoConsoleCommand GTraceFxImpactShotsBodyCmd(
+	TEXT("Trace.Fx.ImpactShots.Body"),
+	TEXT("The BODY arm of Trace.Fx.ImpactShots, as its own verb because -TraceExec must be ONE "
+	     "unquoted argv token and therefore cannot carry an argument. Fires 5 shots at the nearest "
+	     "character; every one of them must report `impact plane none`."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		TraceImpactShots::Arm(5, /*bBody=*/true, 0.55f);
+	}));
+
+static FAutoConsoleCommand GTraceFxImpactShotsCmd(
+	TEXT("Trace.Fx.ImpactShots"),
+	TEXT("Trace.Fx.ImpactShots [count] [world|body] [interval] — fire `count` real shots (default 5) "
+	     "at the floor (default) or at the nearest character, `interval` seconds apart (default "
+	     "0.55), and log per shot whether the tracer armed an FX_AUDIO_PLAN s3 impact plane. Pair it "
+	     "with -TraceAutoShot/-TraceAutoShotRepeat for the frames: the WORLD arm must show a mark on "
+	     "the floor and the BODY arm must show none."),
+	FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+	{
+		const int32 Count = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 5;
+		const bool bBody = (Args.Num() > 1) && Args[1].Equals(TEXT("body"), ESearchCase::IgnoreCase);
+		const float Interval = (Args.Num() > 2) ? FCString::Atof(*Args[2]) : 0.55f;
+		TraceImpactShots::Arm(Count, bBody, Interval);
+	}));
+#endif // !UE_BUILD_SHIPPING
+
+#if !UE_BUILD_SHIPPING
+// =================================================================================================
+// Trace.Audio.CoreRows — the three FX_AUDIO_PLAN §5.1 ★ rows a staged bot match does not reach
+//
+// A 150 s eight-bot match on Arena_Baked exercised most of the ★ set by itself (MeleeSwing, MeleeHit,
+// Reload, WeaponSwitch, DeathBurst, Respawn, CountdownTick, CountdownGo all appear in
+// Trace.Audio.EventPlays afterwards). Three do not, and each for a structural reason rather than
+// because the match was short:
+//
+//   DryFire         a bot never holds a trigger on an empty gun — the automatic reload fires at the
+//                   shot that empties the clip, so the refusal branch is unreachable by ordinary play.
+//   MeleeBackstab   requires an attacker standing INSIDE the back arc of a victim who is not looking,
+//                   which the bots' approach does not reliably produce.
+//   DamageTaken     is client-side and only the LOCAL player's own pawn can sound it; a headless
+//                   host's pawn stands at its spawn and is not necessarily shot.
+//
+// So this drives all three, deliberately, through the real paths: the real trigger for the dry fire,
+// a real StartSwing from a real position behind a real victim for the back-stab, and a real
+// ApplyDamage for the damage cue. Nothing here calls TraceAudio:: directly — if a call site were
+// missing, this command would be silent and Trace.Audio.EventPlays would say so.
+// =================================================================================================
+namespace TraceCoreRowsTest
+{
+	FTSTicker::FDelegateHandle GTicker;
+	int32 GStep = 0;
+	float GWait = 0.f;
+
+	/**
+	 * The four rows' play counts when the command armed, so the verdict measures THIS run.
+	 *
+	 * A bare count would be a fact about the whole session — a knife kill from ten seconds earlier
+	 * would make the back-stab row read green without this command having driven anything. The
+	 * baseline is what turns "the row has a count" into "this command made the row move".
+	 */
+	int32 GBase[4] = { 0, 0, 0, 0 };
+
+	/**
+	 * How far behind the victim the attacker is placed, in uu.
+	 *
+	 * Inside UTraceMeleeSettings::SwingRangeUU (180) with room for the blade's origin being at the
+	 * attacker's own muzzle rather than at their feet, and far enough that the two capsules are not
+	 * interpenetrating when the swing resolves.
+	 */
+	static constexpr double BackstabStandoffUU = 80.0;
+
+	const FName* RowNames()
+	{
+		static const FName Names[4] = { TraceSoundEvents::DryFire, TraceSoundEvents::MeleeBackstab,
+			TraceSoundEvents::MeleeHit, TraceSoundEvents::DamageTaken };
+		return Names;
+	}
+
+	int32 PlaysOf(const UWorld* World, FName Event)
+	{
+		const UTraceAudioSubsystem* Audio = UTraceAudioSubsystem::Get(World);
+		if (Audio == nullptr)
+		{
+			return 0;
+		}
+		const int32* Found = Audio->GetPlaysByEvent().Find(Event);
+		return (Found != nullptr) ? *Found : 0;
+	}
+
+	UWorld* RowsWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			if (Context.World() != nullptr && Context.World()->IsGameWorld())
+			{
+				return Context.World();
+			}
+		}
+		return nullptr;
+	}
+
+	ATracePlayerController* RowsController(UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return nullptr;
+		}
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* PC = It->Get();
+			if (PC != nullptr && PC->IsLocalController())
+			{
+				return Cast<ATracePlayerController>(PC);
+			}
+		}
+		return nullptr;
+	}
+
+	ATraceCharacter* NearestOther(ATraceCharacter* Mine)
+	{
+		ATraceCharacter* Best = nullptr;
+		double BestSq = TNumericLimits<double>::Max();
+		for (TActorIterator<ATraceCharacter> It(Mine->GetWorld()); It; ++It)
+		{
+			ATraceCharacter* Other = *It;
+			if (!IsValid(Other) || Other == Mine || !Other->IsAlive())
+			{
+				continue;
+			}
+			const double DistSq = FVector::DistSquared(Other->GetActorLocation(), Mine->GetActorLocation());
+			if (DistSq < BestSq)
+			{
+				BestSq = DistSq;
+				Best = Other;
+			}
+		}
+		return Best;
+	}
+
+	bool Tick(float Delta)
+	{
+		UWorld* World = RowsWorld();
+		ATracePlayerController* PC = RowsController(World);
+		ATraceCharacter* Pawn = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+		UTraceWeaponComponent* Weapon = (Pawn != nullptr) ? Pawn->Weapon : nullptr;
+
+		if (Weapon == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[CoreRows] no local pawn with a weapon — run this inside a match."));
+			FTSTicker::GetCoreTicker().RemoveTicker(GTicker);
+			GTicker.Reset();
+			return false;
+		}
+
+		GWait -= Delta;
+		if (GWait > 0.f)
+		{
+			return true;
+		}
+
+		switch (GStep)
+		{
+		case 0:
+			// DRY FIRE. LoadAbilityClip(0) is the authority's own "replace the magazine" verb and it
+			// is the shortest honest way to an empty gun; the trigger below is the real one, so the
+			// refusal that follows is CanFire()'s real refusal and not a simulated one.
+			Weapon->LoadAbilityClip(0);
+			UE_LOG(LogTraceGame, Display, TEXT("[CoreRows] clip emptied (%d rounds); pulling the trigger."),
+				Weapon->GetClipAmmo());
+			GWait = 0.2f;
+			break;
+
+		case 1:
+			Weapon->StartFire();
+			Weapon->StopFire();
+			UE_LOG(LogTraceGame, Display, TEXT("[CoreRows] dry trigger pulled (CanFire=%d)."), Weapon->CanFire() ? 1 : 0);
+			GWait = 0.4f;
+			break;
+
+		case 2:
+		{
+			// BACK-STAB. Placed INSIDE the victim's back arc and facing them, then swung with the
+			// real StartSwing — so TraceMelee::ResolveSwing makes the real angle judgement and
+			// ServerSwing applies the real damage, which is where the sound is.
+			ATraceCharacter* Victim = NearestOther(Pawn);
+			if (Victim == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[CoreRows] nobody to back-stab; skipping that row."));
+				GStep += 2;
+				GWait = 0.1f;
+				return true;
+			}
+			const FVector Behind = Victim->GetActorLocation() - Victim->GetActorForwardVector() * BackstabStandoffUU;
+			Pawn->SetActorLocation(Behind, /*bSweep=*/false);
+			PC->SetControlRotation((Victim->GetActorLocation() - Pawn->GetPawnViewLocation()).Rotation());
+			TraceMelee::RequestEquipIfDifferent(Pawn, ETraceEquippedWeapon::Knife, nullptr);
+			UE_LOG(LogTraceGame, Display, TEXT("[CoreRows] placed behind %s; drawing the knife."), *GetNameSafe(Victim));
+			GWait = 0.6f;   // the knife's pullout
+			break;
+		}
+
+		case 3:
+			Weapon->StartSwing(nullptr);
+			UE_LOG(LogTraceGame, Display, TEXT("[CoreRows] swung from behind."));
+			GWait = 0.5f;   // the wind-up, then ServerSwing
+			break;
+
+		case 4:
+			// DAMAGE TAKEN. The real ApplyDamage, on the local player's own health component, which
+			// is what OnRep_Health hangs the cue off.
+			if (UTraceHealthComponent* Health = Pawn->FindComponentByClass<UTraceHealthComponent>())
+			{
+				Health->ApplyDamage(20.f, nullptr, TEXT("Trace.Audio.CoreRows"));
+				UE_LOG(LogTraceGame, Display, TEXT("[CoreRows] took 20 damage (health now %.0f%%)."),
+					Health->GetHealthPercent() * 100.f);
+			}
+			GWait = 0.3f;
+			break;
+
+		default:
+		{
+			// THE VERDICT, against the baseline taken at arm — see GBase. MeleeHit rides along
+			// because the back-stab and the front cut are the two branches of ONE ternary at ONE call
+			// site: if the swing landed but came out as a front cut, the row that moved says so and
+			// the failure is "the placement missed the back arc", not "the sound is unwired".
+			const int32 Dry  = PlaysOf(World, RowNames()[0]) - GBase[0];
+			const int32 Back = PlaysOf(World, RowNames()[1]) - GBase[1];
+			const int32 Front= PlaysOf(World, RowNames()[2]) - GBase[2];
+			const int32 Hurt = PlaysOf(World, RowNames()[3]) - GBase[3];
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CoreRows] this run played: DryFire %d, MeleeBackstab %d, MeleeHit %d, DamageTaken %d."),
+				Dry, Back, Front, Hurt);
+
+			const bool bPass = (Dry > 0) && (Hurt > 0) && (Back > 0);
+			if (bPass)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[CoreRows] VERDICT: PASS — all three rows an ordinary match cannot reach fired "
+					     "through their real trigger sites."));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[CoreRows] VERDICT: FAIL — %s%s%s"),
+					(Dry > 0) ? TEXT("") : TEXT("DryFire silent. "),
+					(Hurt > 0) ? TEXT("") : TEXT("DamageTaken silent. "),
+					(Back > 0) ? TEXT("")
+						: (Front > 0 ? TEXT("The swing landed but resolved as a FRONT cut — the placement missed the back arc, not the wiring. ")
+						             : TEXT("The swing landed on nobody at all (a moving victim: run this on the practice range). ")));
+			}
+
+			FTSTicker::GetCoreTicker().RemoveTicker(GTicker);
+			GTicker.Reset();
+			return false;
+		}
+		}
+
+		++GStep;
+		return true;
+	}
+
+	void Arm()
+	{
+		if (GTicker.IsValid())
+		{
+			FTSTicker::GetCoreTicker().RemoveTicker(GTicker);
+			GTicker.Reset();
+		}
+		GStep = 0;
+		GWait = 0.f;
+		UWorld* World = RowsWorld();
+		for (int32 Index = 0; Index < 4; ++Index)
+		{
+			GBase[Index] = PlaysOf(World, RowNames()[Index]);
+		}
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CoreRows] driving the three FX_AUDIO_PLAN s5.1 rows an ordinary match cannot reach: "
+			     "DryFire, MeleeBackstab, DamageTaken."));
+		GTicker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateStatic(&Tick), 0.f);
+	}
+} // namespace TraceCoreRowsTest
+
+static FAutoConsoleCommand GTraceAudioCoreRowsCmd(
+	TEXT("Trace.Audio.CoreRows"),
+	TEXT("Drive the three FX_AUDIO_PLAN s5.1 core-combat rows a staged bot match does not reach on "
+	     "its own — DryFire (empty the clip and pull the real trigger), MeleeBackstab (stand inside "
+	     "a victim's back arc and swing) and DamageTaken (apply real damage to the local pawn). "
+	     "Follow it with Trace.Audio.EventPlays; all three must then have a count."),
+	FConsoleCommandDelegate::CreateStatic(&TraceCoreRowsTest::Arm));
 #endif // !UE_BUILD_SHIPPING

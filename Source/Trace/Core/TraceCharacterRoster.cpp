@@ -97,20 +97,46 @@ namespace TraceCharacterRosterFile
 				TEXT("DASH ON ITS OWN COOLDOWN, LEAVING A RIPPLE FOR 4S. ANYONE ON EITHER TEAM CAN RIDE IT, "
 				     "INCLUDING THE CORE CARRIER, AND YOU CAN SHOOT WHILE RIDING."),
 				20.f,
-				FLinearColor(1.00f, 0.86f, 0.25f, 1.f),   // amber
-				// *** THE ONLY ROW WITH A BODY OF ITS OWN. *** Imported by Scripts/import-rocco.sh from
-				// Art/Characters/Rocco/RoccoTest.fbx. Absent on a clone that has not run it, which is
-				// why this is a path and not a hard reference — see FTraceCharacterEntry::BodyMeshPath.
+				FLinearColor(0.80f, 1.00f, 0.25f, 1.f),   // acid gold #E7FF89, sRGB hue 72.2
+				// *** NO LONGER THE ONLY ROW WITH A BODY OF ITS OWN, AND NO LONGER THE FBX. *** All ten
+				// rows name a generated body now (PIPELINE_DESIGN.md §9.1). Rocco keeps his asset NAME
+				// and nothing else about the old row: SK_Rocco is re-imported by
+				// Scripts/import-characters.sh from Intermediate/Characters/rocco.glb, on the shared
+				// SK_TraceBody_Skeleton, in place of the hand-modelled RoccoTest.fbx that
+				// Scripts/import-rocco.sh used to land here. Absent on a clone that has not run the
+				// import, which is why this is a path and not a hard reference — see
+				// FTraceCharacterEntry::BodyMeshPath.
 				TEXT("/Game/Trace/Characters/Rocco/SK_Rocco.SK_Rocco"),
-				// MEASURED off the imported asset, not copied from the Mannequin: this rig is authored
-				// facing +X, so it needs no correction at all. See BodyMeshYaw's declaration.
-				0.f,
-				// EPIC'S OWN ABP_Unarmed, RETARGETED ONTO THIS RIG by Scripts/retarget-rocco.sh — the
-				// same blend space the Mannequin runs, baked onto SK_Rocco_Skeleton so that a Rocco
-				// player walks instead of gliding in his bind pose. Absent on a clone that has not run
-				// the retarget, which is why this is a path; see FTraceCharacterEntry::BodyAnimClassPath.
-				TEXT("/Game/Trace/Characters/Rocco/Anims/ABP_Unarmed_Rocco.ABP_Unarmed_Rocco_C")
+				// *** 0 WAS TRUE OF THE FBX AND IS FALSE OF THE GENERATED BODY. *** The old rig was
+				// authored facing +X and needed no correction; every generated body authors facing +Y
+				// and needs the Mannequin's own -90. STILL MEASURED, not copied: import_characters.py's
+				// facing_heading() runs `Z x (LeftHand - RightHand)` on each imported asset and FAILS
+				// the import outside -90 +/- 2, and the same harness reproduces -90 on Manny as its
+				// self-check. See BodyMeshYaw's declaration for why this is measured per rig.
+				-90.f,
+				// EPIC'S OWN ABP_Unarmed, RETARGETED ONTO THE SHARED BODY SKELETON by
+				// Scripts/retarget_body.py — the same blend space the Mannequin runs, baked once onto
+				// SK_TraceBody_Skeleton rather than once per character, which is the whole reason the
+				// ten bodies share a skeleton (PIPELINE_DESIGN.md §3.3). ABP_Unarmed_Rocco is gone with
+				// the FBX. Absent on a clone that has not run the retarget, which is why this is a
+				// path; see FTraceCharacterEntry::BodyAnimClassPath.
+				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
 			},
+			// ---------------------------------------------------------------------------------
+			// AND THE OTHER NINE BODIES (PIPELINE_DESIGN.md §9.1).
+			//
+			// Every row below ends in the same three fields for the same reason Rocco's does, so the
+			// argument is made once, there, and not nine times here. The short version: one generated
+			// GLB per character, all ten bound to the ONE shared SK_TraceBody_Skeleton, so all ten
+			// take the same -90 facing correction (measured per rig by import_characters.py, which
+			// fails the import outside -90 +/- 2) and all ten run the ONE retargeted anim class.
+			//
+			// *** THREE IDENTICAL-LOOKING VALUES ARE NOT A COPY-PASTE SMELL HERE — THEY ARE THE
+			//     DESIGN. *** Ten skeletons would have meant ten retargets and ten yaws to keep in
+			//     step; the pipeline pays for the shared skeleton precisely so these rows can be
+			//     boring. If one row ever needs a different yaw, that is the measurement telling you
+			//     its GLB was authored wrong, not a licence to hand-tune the number.
+			// ---------------------------------------------------------------------------------
 			{
 				2, TEXT("CHUT"),
 				TEXT("BASH. HITTING A PLAYER WITH THE END OF A STANDARD DASH KNOCKS THEM ALONG YOUR TRAVEL. "
@@ -120,7 +146,10 @@ namespace TraceCharacterRosterFile
 				TEXT("TAKE 30% LESS DAMAGE FROM BODY SHOTS AND MELEES FOR 10S. A KNIFE KILL REFRESHES THE "
 				     "TIMER. DOES NOT STACK."),
 				20.f,
-				FLinearColor(0.35f, 0.95f, 0.55f, 1.f)    // green
+				FLinearColor(0.35f, 0.95f, 0.37f, 1.f),   // signal green #A0F9A4, sRGB hue 122.7
+				TEXT("/Game/Trace/Characters/Chut/SK_Chut.SK_Chut"),
+				-90.f,
+				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
 			},
 			{
 				3, TEXT("MACE"),
@@ -131,7 +160,10 @@ namespace TraceCharacterRosterFile
 				TEXT("THROW A ROPED SPIKE. IT EMBEDS IN A WALL FOR 2S; PRESS AGAIN TO BE PULLED TO IT AT THE "
 				     "MOMENTUM CEILING. ANY MOVEMENT INPUT CANCELS. YOU CAN SHOOT AND BE SHOT WHILE PULLED."),
 				20.f,
-				FLinearColor(0.65f, 0.55f, 1.00f, 1.f)    // violet
+				FLinearColor(0.74f, 0.55f, 0.99f, 1.f),   // violet #DFC4FE, sRGB hue 267.9
+				TEXT("/Game/Trace/Characters/Mace/SK_Mace.SK_Mace"),
+				-90.f,
+				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
 			},
 			{
 				4, TEXT("OYSTER"),
@@ -153,7 +185,10 @@ namespace TraceCharacterRosterFile
 				     "EXPLODES INTO POISON THE MOMENT THE PULL ENDS. ANY POISON YOU LAND HANDS E STRAIGHT "
 				     "BACK, SO THE 20S IS A CEILING, NOT A WAIT."),
 				20.f,
-				FLinearColor(0.30f, 0.85f, 0.95f, 1.f)    // cyan
+				FLinearColor(0.16f, 0.78f, 0.36f, 1.f),   // deep sea green #6FE5A2, sRGB hue 145.9
+				TEXT("/Game/Trace/Characters/Oyster/SK_Oyster.SK_Oyster"),
+				-90.f,
+				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
 			},
 			{
 				5, TEXT("X"),
@@ -175,7 +210,10 @@ namespace TraceCharacterRosterFile
 				TEXT("LOAD THE 5 BEES INTO YOUR GUN. YOUR NEXT FIVE BULLETS APPLY VULNERABLE AT NORMAL "
 				     "DAMAGE. THE BEES RESUME ORBITING ONCE ALL FIVE ARE FIRED."),
 				25.f,
-				FLinearColor(1.00f, 0.40f, 0.55f, 1.f)    // rose
+				FLinearColor(1.00f, 0.40f, 0.72f, 1.f),   // rose #FFAADD, sRGB hue 324.0
+				TEXT("/Game/Trace/Characters/X/SK_X.SK_X"),
+				-90.f,
+				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
 			},
 
 			// ---------------------------------------------------------------------------------
@@ -188,7 +226,10 @@ namespace TraceCharacterRosterFile
 			//
 			// THE ACCENTS ARE ALL NEW HUES. There are eight cards on one screen now and the stripe is
 			// how a player finds theirs at a glance, so none of the three below is a near-neighbour of
-			// amber / mint / violet / cyan / rose.
+			// the five above it. *** WAVE 5 RE-SPACED THE WHOLE RING and this sentence now means more
+			// than card-vs-card separation: see the block at the top of GetCppTable()'s accent notes
+			// (and Scripts/character_bodies.py's CHARACTERS table) — every accent is now also >= 40 deg
+			// of sRGB hue away from BOTH TEAM colours, which the original ten were not.
 			// ---------------------------------------------------------------------------------
 			{
 				6, TEXT("ROXIE"),
@@ -199,18 +240,34 @@ namespace TraceCharacterRosterFile
 				TEXT("LOAD A MODDED CLIP: THE GUN GOES FULL AUTO AND FIRES 1.65X FASTER. ENDS AFTER ONE "
 				     "CLIP OR 5S, WHICHEVER COMES FIRST."),
 				25.f,
-				FLinearColor(1.00f, 0.45f, 0.12f, 1.f)    // ember
+				FLinearColor(1.00f, 0.12f, 0.20f, 1.f),   // ember #FF617C, sRGB hue 349.7
+				TEXT("/Game/Trace/Characters/Roxie/SK_Roxie.SK_Roxie"),
+				-90.f,
+				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
 			},
 			{
 				7, TEXT("ELLE"),
-				TEXT("WELL-TIMED SLIDE JUMPS GIVE HER 40% MORE OF THE MOMENTUM BOOST THAN ANYONE ELSE."),
+				// *** 30, NOT 40, AND THE NUMBER IS UTraceSettings::ElleSlideJumpGainBonus (0.30). ***
+				// Patch 28 §3 cut her slide-jump bonus from 40% to 30% and this string was not moved
+				// with it, so for two passes the card told the player a number the game did not give.
+				// Trace.VerifyCharacterData stayed GREEN throughout, and that is the part worth
+				// remembering: section D compares this table to the generated asset, and the asset is
+				// generated FROM this table, so the two agreed with each other about the wrong number.
+				// Nothing in the build compares either of them to the knob. Retune the knob and you
+				// must retune this line by hand — see W9-UIFIX.md §1 for the check that would close
+				// the class, and TraceSettings.h's Elle banner and DefaultGame.ini's Elle block, which
+				// both carry a pointer back here.
+				TEXT("WELL-TIMED SLIDE JUMPS GIVE HER 30% MORE OF THE MOMENTUM BOOST THAN ANYONE ELSE."),
 				TEXT("PASSING OR THROWING THE CORE CLOAKS HER FOR 3S - SEMI-TRANSPARENT AND HARD TO SEE "
 				     "OR AIM AT."),
 				TEXT("SNAP"),
 				TEXT("PLACE A GATE, THEN PRESS AGAIN WITHIN 4S TO PLACE ITS PAIR. PLAYERS ON EITHER TEAM "
 				     "CAN TELEPORT BETWEEN THEM. BOTH VANISH AFTER 8S."),
 				35.f,
-				FLinearColor(0.85f, 0.42f, 1.00f, 1.f)    // orchid
+				FLinearColor(0.96f, 0.42f, 1.00f, 1.f),   // orchid #FAADFF, sRGB hue 296.3
+				TEXT("/Game/Trace/Characters/Elle/SK_Elle.SK_Elle"),
+				-90.f,
+				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
 			},
 			{
 				8, TEXT("SLIMEBALL"),
@@ -221,7 +278,10 @@ namespace TraceCharacterRosterFile
 				TEXT("THROW UP A WALL WHERE YOU ARE AIMING, FOR 4S. BULLETS PASS STRAIGHT THROUGH IT BUT "
 				     "NOBODY CAN SEE THROUGH IT, AND ENEMIES WALKING THROUGH ARE SLOWED 35%."),
 				25.f,
-				FLinearColor(0.66f, 0.92f, 0.16f, 1.f)    // slime
+				FLinearColor(0.33f, 0.92f, 0.16f, 1.f),   // slime #9BF66F, sRGB hue 100.4
+				TEXT("/Game/Trace/Characters/Slimeball/SK_Slimeball.SK_Slimeball"),
+				-90.f,
+				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
 			},
 
 			// ---------------------------------------------------------------------------------
@@ -232,9 +292,19 @@ namespace TraceCharacterRosterFile
 			// that says 30% while the game does 20% is a card that lied.
 			//
 			// TWO ACCENTS THAT ARE NOT NEIGHBOURS OF THE EIGHT ABOVE. Ten cards now share one screen
-			// across two rows, so the stripe is doing more work than ever: slate is the only strongly
-			// desaturated blue in the set (cyan is far greener, violet far redder) and ice is the only
-			// near-white.
+			// across two rows, so the stripe is doing more work than ever.
+			//
+			// *** THE ORIGINAL TWO WERE A DESATURATED BLUE AND A NEAR-WHITE, AND MEASUREMENT KILLED
+			//     BOTH. *** W4-CENSUS photographed the ten in the arena and measured hue over the lit
+			// body pixels: Mortimer's slate #A6BFED sat 7.2 deg from team Blue #5B81FF, so 83.4% of his
+			// lit body read "in his own hue" for the trivial reason that his own hue WAS the team's,
+			// and on Blue he had no colour identity at all. Lily's ice #E1F6FF carried a saturation of
+			// 0.118, below which a hue is not perceptible — W4-PORTRAITS had to grant her a near-white
+			// EXEMPTION from the portrait accent-discrimination check for exactly that reason. So
+			// Mortimer is now a dark, saturated patinated steel (167.0 deg, 59.1 from Blue) and Lily a
+			// pale glacier ice with saturation 0.278 (185.9 deg, 40.2 from Blue). Lily is still the
+			// palest accent on the roster and Mortimer still the coldest and heaviest; what changed is
+			// that both are now nameable next to a team panel.
 			//
 			// *** BOTH ACTIVATED NAMES ARE [ASSUMPTION] AND ARE FLAGGED IN THE REPORT. *** Demo 18
 			// names Lily's ability ("Zip") and does NOT name Mortimer's blast; "QUAKE" is ours, chosen
@@ -265,7 +335,10 @@ namespace TraceCharacterRosterFile
 				     "BLAST THAT KNOCKS EVERY NEARBY ENEMY AWAY FROM HIM. IT CANNOT MOVE A CORE "
 				     "CARRIER."),
 				20.f,
-				FLinearColor(0.38f, 0.52f, 0.85f, 1.f)    // slate
+				FLinearColor(0.11f, 0.46f, 0.36f, 1.f),   // patinated steel #5DB5A2, sRGB hue 167.0
+				TEXT("/Game/Trace/Characters/Mortimer/SK_Mortimer.SK_Mortimer"),
+				-90.f,
+				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
 			},
 			{
 				// DEMO 19 ITEMS 8 AND 4 MADE BOTH OF LILY'S FIRST TWO STRINGS UNTRUE, so both moved.
@@ -282,7 +355,10 @@ namespace TraceCharacterRosterFile
 				     "EVERYTHING ELSE PLAYS AS NORMAL. CARRYING THE CORE HALVES IT - AND PICKING THE "
 				     "CORE UP MID-FLIGHT HALVES WHATEVER IS LEFT."),
 				30.f,
-				FLinearColor(0.75f, 0.92f, 1.00f, 1.f)    // ice
+				FLinearColor(0.48f, 0.94f, 1.00f, 1.f),   // glacier ice #B8F8FF, sRGB hue 185.9
+				TEXT("/Game/Trace/Characters/Lily/SK_Lily.SK_Lily"),
+				-90.f,
+				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
 			}
 		};
 
@@ -418,9 +494,10 @@ namespace TraceCharacterRosterFile
 			const int32 ActivatedNameIndex = Storage.Strings.Add(Definition->ActivatedSlot.DisplayName);
 			const int32 ActivatedIndex = Storage.Strings.Add(Definition->ActivatedSlot.Description);
 
-			// EMPTY WHEN THE ASSET NAMES NO MESH, which is the normal case for nine of the ten — and
-			// it is stored anyway rather than skipped, because the reserve above counts seven strings
-			// a row and an Add that only sometimes happens is an Add nobody can count.
+			// EMPTY WHEN THE ASSET NAMES NO MESH — no longer the normal case (all ten rows name a body
+			// since PIPELINE_DESIGN.md §9.1), but still a legal one, and it is stored anyway rather than
+			// skipped, because the reserve above counts seven strings a row and an Add that only
+			// sometimes happens is an Add nobody can count.
 			const int32 BodyMeshIndex = Storage.Strings.Add(
 				Definition->BodyMesh.IsNull() ? FString() : Definition->BodyMesh.ToSoftObjectPath().ToString());
 			const int32 BodyAnimIndex = Storage.Strings.Add(

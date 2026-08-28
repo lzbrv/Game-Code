@@ -52,6 +52,8 @@
 #include "Trace.h"
 #include "TraceTypes.h"
 
+#if !UE_BUILD_SHIPPING
+
 // Named after the file. Two anonymous namespaces in one unity translation unit are one namespace —
 // see Scripts/check-jumbo-build-collisions.py and the four Windows-only breaks it exists to stop.
 namespace TraceAudioVerify
@@ -824,3 +826,5 @@ namespace TraceAudioVerify
 		TEXT("Set Trace.Audio.TurnoverEdge 0 first for the RED arm, which must FAIL."),
 		FConsoleCommandDelegate::CreateStatic(&TurnoverArm));
 }
+
+#endif // !UE_BUILD_SHIPPING

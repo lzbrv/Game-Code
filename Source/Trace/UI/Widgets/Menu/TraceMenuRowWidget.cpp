@@ -37,7 +37,9 @@ namespace TraceMenuRowWidgetLocal
 	// measurement is in TraceMenuArtStyle.h. So spec v20 §0.5 — which found the value here illegible
 	// at 1.9:1 and replaced it with white — was reacting to a bad number, and the row has drawn a
 	// white word ever since. That departure is now retired: §0.5's reasoning was sound and its input
-	// was wrong.
+	// was wrong. (Since the release pass the word draws in WordHoverLifted() — the same hue,
+	// byte-normalised to full brightness per the art bible §2.5, because the raw sheet value is
+	// 2.34:1 against the plate on a screen. The artist record itself is untouched.)
 	//
 	// WHY IT COULD DRIFT FROM THE OUTLINE AT ALL. The plate brush and the word colour used to be two
 	// separate expressions over the same three booleans, a dozen lines apart. Nothing forced them to
@@ -279,16 +281,18 @@ namespace TraceMenuRowWidgetLocal
 			// plate — ring and all — knocked down. Marked as the stand-in it is; a fourth sprite
 			// would replace this case and nothing else.
 			Out.Plate = FRowVisuals::EPlate::Hover;
-			Out.Label = TraceMenuArtStyle::WordHover;
+			Out.Label = TraceMenuArtStyle::WordHoverLifted();
 			Out.Furniture = FurnitureSelected;
 			Out.FlatTint = TraceMenuArtStyle::PressedTint;
 			break;
 
 		case ERowState::Hovered:
 			// THE TWO HALVES OF §3, ON ADJACENT LINES. The ring comes from the plate; the green comes
-			// from the artist's palette; neither can be true without the other.
+			// from the artist's palette; neither can be true without the other. Lifted, not raw:
+			// WordHoverLifted() is the artist's hue byte-normalised to read on the plate (release art
+			// bible §2.5 — the same transformation precedent as AmberLifted, stated in the palette).
 			Out.Plate = FRowVisuals::EPlate::Hover;
-			Out.Label = TraceMenuArtStyle::WordHover;
+			Out.Label = TraceMenuArtStyle::WordHoverLifted();
 			Out.Furniture = FurnitureSelected;
 			Out.bPulses = true;
 			break;
@@ -403,13 +407,14 @@ namespace TraceMenuRowWidgetLocal
 	// edges and 1.10 px up the two short vertical ones. Both read as one pixel; a corner that misses
 	// by 0.9 local units does not read as hugging.
 	//
-	// THE ASSET THAT WOULD REMOVE EVEN THAT. The ellipse exists only because the plate's 9-slice does
-	// not fit in the height it is drawn at: 44 texture px of vertical slice into 36.24 local units.
-	// A default plate re-imported at roughly half its present size — 256 x 77 rather than 512 x 153,
-	// same art — would put the slice at 22 px, inside the 36.24 that is available, and Slate would
-	// then draw the artist's corner as the circle they drew. Squash() becomes 1, this file's ellipse
-	// handling collapses to a no-op, and the stroke is a uniform 1.00 px everywhere with no code
-	// change. It is a re-import, not new art.
+	// THE ASSET FIX THAT REMOVES EVEN THAT — TAKEN, in the release pass (UI plan WP7). The ellipse
+	// existed only because the plate's 9-slice did not fit in the height it is drawn at: 44 texture
+	// px of vertical slice into 36.24 local units at the original 512 x 153 cut. The plates are now
+	// cut 256 wide (Scripts/slice-ui-assets.py TARGETS), the slice is 22 px, inside the available
+	// height, and Slate draws the artist's corner as the circle they drew. Squash() returns 1, this
+	// file's ellipse handling collapses to the no-op it was designed to become, and the stroke is a
+	// uniform 1.00 px everywhere — with no code change here, which is why the handling stays: it is
+	// the proof, and the tripwire if a future re-cut brings the squash back.
 
 	/** White. §1 says white, and the label's default state is the same white (WordDefault). */
 	static const FLinearColor& OutlineColor()

@@ -558,6 +558,12 @@ namespace
 	 * ':' is produced by the SEMICOLON key whether or not shift is held. On a US layout ':' *is*
 	 * shift+';', and ';' has no meaning in an address, so mapping the unshifted key to ':' as well
 	 * costs nothing and quietly rescues anyone on a layout where shift is not detected.
+	 *
+	 * WP2.3 — THE TABLE IS SHARED; THE FILTER IS PER-CHARSET. The space bar is appended here (it is
+	 * meaningless in an address and legal in a name) and the CallSign filter below is what decides
+	 * which of these rows a given opening will actually accept. One table, so a key added for one
+	 * alphabet cannot be missing from the other by accident, and one predicate, so the typed path and
+	 * the pasted path cannot disagree about what a legal character is.
 	 */
 	const TArray<FTraceTextKey>& TextKeyTable()
 	{
@@ -619,8 +625,35 @@ namespace
 			{ []{ return EKeys::Hyphen;     }, TEXT('-'), TEXT('_') },
 			{ []{ return EKeys::Subtract;   }, TEXT('-'), TEXT('_') },
 			{ []{ return EKeys::Underscore; }, TEXT('_'), TEXT('_') },
+
+			// WP2.3 — legal in a CALL SIGN only; IsLegalChar refuses it in Address mode, where a
+			// space in a travel URL is a silent connection failure.
+			{ []{ return EKeys::SpaceBar;   }, TEXT(' '), TEXT(' ') },
 		};
 		return Table;
+	}
+
+	/**
+	 * WP2.3 — THE ONE definition of "legal character", asked by the typed path AND the pasted one.
+	 *
+	 * Two filters would be two answers: the shipped paste filter already listed its own five
+	 * punctuation marks by hand, and a charset added later would have had to be remembered in both
+	 * places. It is not remembered in both places — it is asked here.
+	 */
+	bool IsLegalChar(ETraceTextCharset Charset, TCHAR Char)
+	{
+		if (FChar::IsAlnum(Char))
+		{
+			return true;
+		}
+
+		if (Charset == ETraceTextCharset::CallSign)
+		{
+			// SPACE, '-', '_', '.'. ':' and ';' are refused — see ETraceTextCharset in the header.
+			return Char == TEXT(' ') || Char == TEXT('-') || Char == TEXT('_') || Char == TEXT('.');
+		}
+
+		return Char == TEXT('.') || Char == TEXT(':') || Char == TEXT('-') || Char == TEXT('_');
 	}
 
 	bool IsShiftDown(const APlayerController* PC)
@@ -636,11 +669,17 @@ namespace
 	}
 }
 
-void FTraceTextEntry::Begin(const FString& InitialText)
+void FTraceTextEntry::Begin(const FString& InitialText, ETraceTextCharset InCharset, int32 InMaxLength)
 {
 	bActive = true;
 	bSubmitted = false;
 	bCancelled = false;
+
+	// Set BEFORE the Left() below, or the very first thing this field does is apply the PREVIOUS
+	// opening's cap to the new opening's text.
+	Charset = InCharset;
+	MaxLength = FMath::Max(1, InMaxLength);
+
 	Text = InitialText.Left(MaxLength);
 	Caret = Text.Len();
 	LastEditTime = 0.f;
@@ -686,15 +725,25 @@ bool FTraceTextEntry::IsCaretVisible(float Now) const
 	return FMath::Fmod(FMath::Max(0.f, Now - LastEditTime), 1.0f) < 0.62f;
 }
 
-void FTraceTextEntry::InsertChar(TCHAR Char)
+bool FTraceTextEntry::InsertChar(TCHAR Char)
 {
 	if (Text.Len() >= MaxLength)
 	{
-		return;
+		return false;
+	}
+
+	// WP2.3 — the charset gate, at the ONE point every character enters the string. Both callers
+	// (the key table and the paste loop) funnel here, so a key that is illegal for this opening
+	// cannot arrive by either route. The space bar is in the shared table and is refused here for an
+	// address; ':' is in the table and is refused here for a call sign.
+	if (!IsLegalChar(Charset, Char))
+	{
+		return false;
 	}
 
 	Text.InsertAt(Caret, Char);
 	++Caret;
+	return true;
 }
 
 void FTraceTextEntry::Backspace()
@@ -763,8 +812,7 @@ void FTraceTextEntry::Poll(APlayerController* PC, float Now)
 			FString Cleaned;
 			for (const TCHAR Char : Clipboard)
 			{
-				if (FChar::IsAlnum(Char) || Char == TEXT('.') || Char == TEXT(':')
-					|| Char == TEXT('-') || Char == TEXT('_'))
+				if (IsLegalChar(Charset, Char))
 				{
 					Cleaned.AppendChar(Char);
 				}
@@ -844,8 +892,13 @@ void FTraceTextEntry::Poll(APlayerController* PC, float Now)
 	{
 		if (PC->WasInputKeyJustPressed(Entry.Key()))
 		{
-			InsertChar(bShift ? Entry.Shifted : Entry.Plain);
-			LastEditTime = Now;
+			// Only a key that actually LANDED restarts the caret's blink phase. A space bar pressed
+			// into an address field is refused (WP2.3), and a refused key that still froze the caret
+			// solid would look exactly like a key that had been accepted.
+			if (InsertChar(bShift ? Entry.Shifted : Entry.Plain))
+			{
+				LastEditTime = Now;
+			}
 		}
 	}
 }

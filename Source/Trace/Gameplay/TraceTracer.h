@@ -91,6 +91,37 @@ struct FTraceTracerBoltTravel
 };
 
 /**
+ * FX_AUDIO_PLAN §3 — WHAT, IF ANYTHING, THIS SHOT LEAVES ON THE WALL.
+ *
+ * Two facts the tracer cannot work out for itself, because it is handed two points and a colour
+ * and is deliberately never told who fired or what was hit (see the profile note in InitTracer).
+ *
+ * *** GEOMETRY ONLY, AND THE RULING BEHIND THAT IS OLDER THAN THIS FEATURE. *** Spec v4 §4
+ * deleted the impact SPHERE from the end of every beam because it sat exactly on the point the
+ * shooter was trying to read: "so it's just a bullet trace, which makes it easier to see where
+ * your shots are going". FX_AUDIO_PLAN §3 re-opens the impact beat and honours that ruling by
+ * splitting it — the ruling was about obscuring a BODY you are shooting at, and a miss has
+ * nothing to obscure. So a plane is drawn where the shot hit the world and NEVER where it hit a
+ * player. bDraw is that decision, made by the machine that ran the trace (the shooter's own
+ * resolve locally, the server's resolve over the multicast) and carried here as a fact.
+ */
+struct FTraceTracerImpact
+{
+	/** True only when this shot stopped on WORLD GEOMETRY. Never true for a hit on a pawn. */
+	bool bDraw = false;
+
+	/**
+	 * The mark's hue. Defaults to the tracer family's pale cyan (TracerFamilyHue) rather than to
+	 * the shot's team colour, on purpose: a scar on a wall says "a shot landed here", which is a
+	 * fact about the weapon and not about who fired it, and this arena is already carrying as
+	 * much team colour as it can read. X's bee rounds move it to amber through the weapon
+	 * component's GetTracerTintOverride seam (§2.7) — the one canonical exception.
+	 */
+	FLinearColor Hue = FLinearColor(0.40f, 0.78f, 0.99f, 1.f);
+};
+
+
+/**
  * SPEC v32 §2 — ONE LIVE BEAM, MEASURED OFF ITS OWN COMPONENTS.
  *
  * Nearly everything a verifier is told to check — "the beam's resolved length, the taper radii in
@@ -459,24 +490,92 @@ public:
 	ATraceTracer();
 
 	virtual void Tick(float DeltaSeconds) override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	/**
-	 * Spawns and configures one railgun shot.
+	 * The tracer family's pale cyan, LINEAR: (0.40, 0.78, 0.99).
+	 *
+	 * Measured rather than chosen — it is the family sRGB (169, 229, 254) recorded in this file's
+	 * muzzle-flash argument, converted once. Public because the weapon component builds an
+	 * FTraceTracerImpact and must not carry a second copy of the number.
+	 */
+	static FLinearColor TracerFamilyHue();
+
+	/**
+	 * Spawns (or recycles) and configures one railgun shot.
 	 *
 	 * @param From      Muzzle position.
 	 * @param To        Impact position (or the far end of the ray if nothing was hit).
-	 * @param Color     Shooter's team colour.
-	 * @param bImpacted RETAINED AND NOW UNUSED. It used to gate the impact pop, which spec v4 §4
-	 *                  deleted. The parameter is kept, with its default, so that every existing call
-	 *                  site (UTraceWeaponComponent's predicted and multicast paths, the input
-	 *                  harness) keeps compiling untouched — removing it would be a change to files
-	 *                  this slice does not own, for no behavioural gain. If a future beat ever needs
-	 *                  to know whether the shot connected, it is already plumbed.
+	 * @param Color     Shooter's team colour, or the §2.7 bee-round override.
+	 * @param bImpacted RETAINED. It used to gate the impact pop, which spec v4 §4 deleted, and it was
+	 *                  unused between that pass and this one. It is READ AGAIN NOW, as one half of
+	 *                  the §3 impact plane's gate: a beam that died at maximum range hit nothing at
+	 *                  all and leaves no mark. The other half is Impact.bDraw, which is the part that
+	 *                  says the thing it stopped on was not a person.
+	 * @param Impact    the §3 impact-plane decision. Defaulted, so every existing call site — the
+	 *                  input harness, Trace.TestBeam — keeps compiling and simply draws no mark.
 	 *
 	 * Returns nullptr on a dedicated server (no visuals), for a degenerate/non-finite segment, or
 	 * when the world is invalid. Callers may ignore the return value.
 	 */
-	static ATraceTracer* Spawn(UWorld* World, const FVector& From, const FVector& To, const FLinearColor& Color, bool bImpacted = true);
+	static ATraceTracer* Spawn(UWorld* World, const FVector& From, const FVector& To, const FLinearColor& Color,
+		bool bImpacted = true, const FTraceTracerImpact& Impact = FTraceTracerImpact());
+
+	/**
+	 * FX_AUDIO_PLAN §4.1 — what the pool has actually done in this world, for the soak's evidence.
+	 *
+	 * Read by Trace.Fx.TracerPool.Report. Counters, not assertions: "spawns 24, reuses 976" is the
+	 * measurement that says a burst of a thousand shots cost twenty-four actors.
+	 */
+	struct FPoolStats
+	{
+		/** Actors this pool has asked the world to create. */
+		int32 Spawns = 0;
+		/** Acquisitions served from the free list instead — the whole point of the pool. */
+		int32 Reuses = 0;
+		/** Tracers parked on the free list when their shot ended. */
+		int32 Releases = 0;
+		/** Tracers destroyed instead of parked, because the free list was already full. */
+		int32 Overflows = 0;
+		/** Tracers destroyed by the idle drain after sitting unused. See TracerPoolIdleSeconds. */
+		int32 Drains = 0;
+		/** Live tracer actors this pool believes exist right now (active + parked). */
+		int32 Live = 0;
+		/** Parked and available right now. */
+		int32 Free = 0;
+	};
+
+	/** The pool's counters for @p World. All zero when nothing has fired. */
+	static FPoolStats GetPoolStats(const UWorld* World);
+
+	/**
+	 * True when this shot resolved a §3 impact plane and has not finished fading it.
+	 *
+	 * The one bit a capture harness needs and cannot see any other way: "did this beam decide it was
+	 * entitled to a mark". Trace.Fx.ImpactShots reads it per shot, so the screenshots it takes come
+	 * with a log line that says which frames should contain a plane and which must not — a frame that
+	 * is merely LOOKED at is not evidence, and the plane is 26 uu across.
+	 */
+	bool IsImpactPlaneArmed() const { return bImpactArmed; }
+
+	/**
+	 * The §3 impact plane AS IT IS ON SCREEN, read back off the live components.
+	 *
+	 * *** A READBACK, IN THE SENSE THIS FILE MEANS THE WORD. *** Everything below comes out of the
+	 * component transforms that were actually written — the visibility flag the renderer obeys, the
+	 * component's world location, and the width recovered from its live scale through the same
+	 * UTraceFxShapes conversion SizePlane used. It is deliberately NOT a restatement of
+	 * ImpactPlaneSizeUU: this file already carries three harnesses' worth of scar tissue about probes
+	 * that recompute the constant they are checking (see FTraceTracerShotDebug), and a 100x
+	 * metres/centimetres error in the placement would be invisible to one that did.
+	 *
+	 * The one exception is the OPACITY, which is recomputed rather than measured for the same reason
+	 * the halo's is: a material instance will not hand back a scalar that was written into it.
+	 *
+	 * @return false when this shot armed no plane at all, or when it has not been revealed yet (the
+	 *         bolt has not arrived) — the two states a capture harness has to be able to tell apart.
+	 */
+	bool DescribeImpactPlane(FVector& OutWorldLocation, float& OutWidthUU, float& OutOpacity) const;
 
 	/**
 	 * SPEC v30 §5 — where a beam fired by @p Shooter would leave the gun that is ON SCREEN.
@@ -717,20 +816,110 @@ public:
 	static constexpr float MuzzleFlashEndScale = 3.2f;
 
 	/**
-	 * The longest this actor can ever be on screen: the slowest bolt or the whole flash, whichever
-	 * outlasts the other. The CONSTRUCTOR's InitialLifeSpan, and a ceiling rather than the answer —
-	 * InitTracer calls SetLifeSpan with THIS shot's own figure the moment it knows it.
+	 * FX_AUDIO_PLAN §3's numbers for the impact quad, verbatim, in uu and seconds.
+	 *
+	 * The 1.5 uu stand-off is a Z-FIGHT GUARD and nothing else: a quad laid exactly on a surface
+	 * flickers against it as the camera moves, and the fix is to lift it by more than the depth
+	 * buffer's precision at arena distances and less than anybody can see. The size is deliberately
+	 * small — 26 uu is about a hand span, against the deleted impact sphere's 52 uu DIAMETER of
+	 * unlit emissive — because this is a scuff and not an explosion.
+	 */
+	static constexpr float ImpactPlaneSizeUU = 26.0f;
+	static constexpr float ImpactPlaneOffsetUU = 1.5f;
+	static constexpr float ImpactPlaneOpacity = 0.6f;
+	static constexpr float ImpactPlaneSeconds = 0.18f;
+
+	/** How far either side of the impact point the normal probe looks, in uu. See ResolveImpactPlane. */
+	static constexpr float ImpactProbeUU = 8.0f;
+
+	/**
+	 * The longest this actor can ever be on screen: the slowest bolt, the whole muzzle flash, or the
+	 * bolt's arrival plus §3's impact fade — whichever outlasts the others. The CONSTRUCTOR's
+	 * InitialLifeSpan, and a ceiling rather than the answer — InitTracer computes THIS shot's own
+	 * figure the moment it knows it.
 	 *
 	 * It exists because the constructor runs before there is a shot to measure, and an actor that
 	 * somehow never reached InitTracer (it cannot today, but a spawn that fails halfway could) must
 	 * still expire rather than sit in the world for ever. Down from 0.85 s: at 600 RPM a held SMG
-	 * trigger now keeps at most ~2.8 tracers alive per shooter instead of ~8.5, and typically ~1.7.
+	 * trigger keeps at most ~2.8 tracers alive per shooter instead of ~8.5, and typically ~1.7.
 	 * The two harnesses that COUNT live ATraceTracer actors — the input harness's shots-emitted set
 	 * and Trace.Smg.Verify's before/after delta — both sample inside a window far shorter than this,
-	 * so a shorter-lived actor does not change what they can see.
+	 * so a shorter-lived actor does not change what they can see. (What COULD change what they see is
+	 * the pool; read the pool block below, which is written around exactly that hazard.)
 	 */
 	static constexpr float MaxTracerLifeSeconds =
-		(BoltMaxLifeSeconds > MuzzleFlashSeconds) ? BoltMaxLifeSeconds : MuzzleFlashSeconds;
+		((BoltMaxLifeSeconds + ImpactPlaneSeconds) > MuzzleFlashSeconds)
+			? (BoltMaxLifeSeconds + ImpactPlaneSeconds) : MuzzleFlashSeconds;
+
+	// =============================================================================================
+	// FX_AUDIO_PLAN §4.1 — THE POOL, AND THE ONE HAZARD IT HAD TO BE DESIGNED AROUND
+	//
+	// The ask: "fixed pool of 24 per world (10-player SMG ceiling ~100 rounds/s x 0.2 s visible
+	// life), acquire/release instead of spawn/SetLifeSpan. Pooling changes nothing visual."
+	// Nothing visual changed: a recycled tracer is re-initialised by the same InitTracer that a fresh
+	// one is, every component is re-placed and every MID re-made, and Trace.Fx.Beam grades a reused
+	// beam identically to a new one.
+	//
+	// *** THE HAZARD, STATED BEFORE THE SOLUTION, BECAUSE IT IS WHY THIS IS NOT A NAIVE FREE LIST. ***
+	// Two harnesses in OTHER files count live ATraceTracer ACTORS and read them as SHOTS:
+	//
+	//     Debug/TraceInputHarness.cpp   unions GetUniqueID() over a held burst and asserts Shots > 1
+	//     Debug/TraceSmgVerify.cpp      asserts the world's tracer count grew across one DoFirePressed
+	//
+	// A pool that recycles eagerly turns twenty shots into one actor id and no count change, and both
+	// of those go red — silently measuring the pool instead of the gun. Neither file is this pass's
+	// to edit, and neither assertion is wrong about the thing it was written to check.
+	//
+	// SO THE POOL ENGAGES UNDER LOAD AND NOWHERE ELSE, which is also where it is worth anything:
+	//
+	//   * Below TracerPoolSize live tracers in the world, an acquisition SPAWNS, exactly as before
+	//     this pass. One shot is one new actor; both harnesses see what they have always seen.
+	//   * At or above it — i.e. the sustained-fire case the pool exists for, which is the only case
+	//     where per-shot spawn/destroy churn is measurable at all — an acquisition REUSES.
+	//   * A released tracer is parked, not destroyed, and carries a TracerPoolIdleSeconds drain: if
+	//     nothing reclaims it within that window it destroys itself on the engine's own life-span
+	//     timer. So a quiet world empties its pool and returns to zero tracer actors with no sweeper,
+	//     no ticker and no extra state — which is what keeps the two harnesses honest in the quiet
+	//     single-shooter worlds they actually run in.
+	//   * Trace.Fx.TracerPool 2 forces the pure form (reuse whenever a free tracer exists) for
+	//     measurement, and 0 disables pooling entirely as the red arm.
+	//
+	// A recycled actor also has its AActor::CreationTime re-stamped on acquisition, so every
+	// age-based reader in the project — Trace.Smg.Verify's NewestTracer(), anything using
+	// GetGameTimeSinceCreation() — sees a reused tracer as exactly as old as its shot is.
+	// =============================================================================================
+
+	/** §4.1's figure: 24 parked tracers per world, which is the 10-player SMG ceiling with slack. */
+	static constexpr int32 TracerPoolSize = 24;
+
+	/**
+	 * How many tracers must be IN FLIGHT AT ONCE before recycling engages at all (mode 1).
+	 *
+	 * *** IT IS DELIBERATELY NOT TracerPoolSize, AND THE FIRST DRAFT'S BUG WAS EXACTLY THAT. ***
+	 * §4.1's own arithmetic puts the ten-player SMG ceiling at "~100 rounds/s x 0.2 s visible life",
+	 * i.e. about TWENTY concurrent tracers — so a threshold at 24 would have sat just ABOVE the
+	 * heaviest load the pool was written for and the pool would never have engaged in the one case it
+	 * exists for. The threshold and the capacity are answers to different questions: capacity is "how
+	 * many parked tracers is it reasonable to keep", and this is "how busy does the world have to be
+	 * before recycling is worth the harness cost described in the pool block above".
+	 *
+	 * EIGHT, MEASURED. A logged eight-bot match on Arena_Baked (release-impl/logs-W4-SHOTS) created
+	 * 53 tracers in ~75 s and had ZERO live at the moment the pool was sampled — bots fire in short
+	 * bursts and a tracer lives a fifth of a second, so concurrency in ordinary play is nought to two.
+	 * Eight is comfortably above that (so Trace.Smg.Verify's one-shot count delta and the input
+	 * harness's per-shot actor ids keep working in a normal match) and far below the twenty a real
+	 * firefight produces (so the pool engages when it matters).
+	 */
+	static constexpr int32 TracerPoolEngageLive = 8;
+
+	/**
+	 * How long a parked tracer waits to be reclaimed before it destroys itself, in seconds.
+	 *
+	 * Long enough to span any gap inside sustained fire (the SMG's interval is 0.1 s and the slowest
+	 * pistol cadence 0.32 s), short enough that a lull returns the world to a clean slate well inside
+	 * the ~0.35 s steps a verification command paces itself at.
+	 */
+	static constexpr float TracerPoolIdleSeconds = 1.0f;
 
 protected:
 	/** Positioned at the beam start and rotated so local +Z runs down the shot. */
@@ -771,6 +960,26 @@ protected:
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Tracer")
 	TObjectPtr<UStaticMeshComponent> MuzzleFlash;
 
+	/**
+	 * FX_AUDIO_PLAN §3 — the mark a MISS leaves on the wall it hit. TWO components, one quad.
+	 *
+	 * *** WHY TWO, AND IT IS NOT A MISTAKE. *** /Engine/BasicShapes/Plane is a single quad facing its
+	 * own local +Z, and a single-sided additive quad laid flat on a surface is invisible from one
+	 * half of the arena — including, quite often, from behind the shooter's own shoulder as they
+	 * strafe past their miss. The second component is the same quad rotated 180 degrees about local
+	 * X, so the pair reads from either side. They share one MID (like the beam's three core
+	 * segments) so the two faces cannot disagree about colour or fade, and they are DEFAULT
+	 * subobjects on this actor, which is what makes §3's "the impact planes are two components owned
+	 * by the tracer actor itself" true — pooling the tracer (§4.1) pools them for free.
+	 *
+	 * Additive, 26 uu square, 1.5 uu off the surface along its normal, 0.6 opacity, 0.18 s. It is
+	 * NOT the deleted impact sphere wearing a different shape: the sphere was 52 uu of unlit emissive
+	 * sitting ON a victim, and this is a flat scuff on architecture at the one place a shot did not
+	 * connect. See FTraceTracerImpact for the ruling that separates the two cases.
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Trace|Tracer")
+	TObjectPtr<UStaticMeshComponent> ImpactPlanes[2];
+
 	// ImpactFlash DELETED (spec v4 §4). See "THE FOURTH BEAT, AND WHY IT IS GONE" in the class
 	// comment. The component, its MID, its two diameter constants, its intensity, its visibility flag
 	// and the camera-proximity dimming that existed solely to stop it whiting out the screen at
@@ -783,7 +992,47 @@ protected:
 	// re-implementing the fallback rule slightly differently.
 
 private:
-	void InitTracer(const FVector& From, const FVector& To, const FLinearColor& Color, bool bImpacted);
+	void InitTracer(const FVector& From, const FVector& To, const FLinearColor& Color, bool bImpacted,
+		const FTraceTracerImpact& Impact);
+
+	/**
+	 * FX_AUDIO_PLAN §3 — resolves and places the impact quad, once, at InitTracer time.
+	 *
+	 * *** THE NORMAL IS PROBED, NOT ASSUMED. *** §3 asks for the plane to be "oriented to the hit
+	 * normal", and neither the predicted resolve nor the multicast carries one:
+	 * UTraceLagCompensationComponent::ResolveHitscan reports a POINT and a zone, and widening its
+	 * signature would be a change to a file this pass does not own. So the normal is fetched with one
+	 * very short line trace across the impact point on ECC_Visibility — 16 uu, once per impacting
+	 * shot, on the machine that is drawing it.
+	 *
+	 * That channel is exactly the right one and for a documented reason: a character capsule uses the
+	 * stock Pawn profile whose one custom response is Visibility = Ignore (the fact
+	 * UTraceWeaponComponent::FireOnce's comment is built on), so this probe can only ever return
+	 * world geometry. It cannot accidentally orient the plane to a body, and a shot whose probe finds
+	 * nothing falls back to facing straight back down the beam.
+	 */
+	void ResolveImpactPlane(const FVector& ImpactPoint, const FVector& BeamDir, const FTraceTracerImpact& Impact);
+
+	/** Reveals the impact quad at the frame the bolt head arrives, and fades it out over 0.18 s. */
+	void UpdateImpactPlane(float AgeSeconds);
+
+	/**
+	 * §4.1 — this shot is over: hide everything, stop ticking and park on the world's free list.
+	 *
+	 * Called from Tick when the actor's own computed life is up, INSTEAD of the SetLifeSpan-driven
+	 * destruction the effect used before. A parked tracer keeps a drain life-span so a world that
+	 * stops shooting cleans itself up; see the pool block above.
+	 */
+	void ReleaseToPool();
+
+	/** §4.1 — put a parked tracer back into the state a freshly spawned one is in. */
+	void RestoreForReuse();
+
+	/** True while this actor is parked on the free list: hidden, not ticking, drawing nothing. */
+	bool bPooledDormant = false;
+
+	/** This shot's own life in seconds, computed by InitTracer. Drives the release, not SetLifeSpan. */
+	float ShotLifeSeconds = 0.f;
 
 	/**
 	 * Applies the whole look for an absolute age in seconds.
@@ -894,6 +1143,28 @@ private:
 	 * live knob in this effect.
 	 */
 	FTraceTracerBoltTravel BoltTravel;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> ImpactMID;
+
+	/** The blend the impact quad actually got. Additive or it is not drawn at all — see InitTracer. */
+	ETraceFxBlend ImpactBlend = ETraceFxBlend::None;
+
+	/** §3's hue for this shot's mark: the family cyan, or the bee-round amber. */
+	FLinearColor ImpactColor = FLinearColor::White;
+
+	/**
+	 * ARMED means "this shot is entitled to a mark and the geometry is already placed"; SHOWN means
+	 * the bolt has arrived and it is on screen. Two flags rather than one because the plane is laid
+	 * at InitTracer (where the probe and the world transform are cheap and correct) and revealed a
+	 * few frames later, at the arrival — which is the beat §3 asks for and is also the only moment at
+	 * which a mark appearing reads as caused by the shot rather than as predicting it.
+	 */
+	bool bImpactArmed = false;
+	bool bImpactShown = false;
+
+	/** World seconds at which the plane was revealed. Its 0.18 s fade is measured from here. */
+	double ImpactShownTimeSeconds = 0.0;
 
 	/** Set false once the muzzle flash has been retired, so it is only hidden once. */
 	bool bMuzzleVisible = false;

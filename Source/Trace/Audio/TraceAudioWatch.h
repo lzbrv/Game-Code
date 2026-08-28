@@ -37,16 +37,46 @@
 //     frames at 60 Hz), but if it ever did, the ladder advances once per round and the shots are
 //     played at the same instant — which is what actually happened.
 //
-// THE COST OF DOING IT THIS WAY, STATED PLAINLY: the sound is decided on the SERVER, so a remote
-// client hears its own gunshot after half a round trip rather than on the frame it pulled the
-// trigger. §1e asks for a global sound at the muzzle and that is what this delivers, but a shooter's
-// own report is normally predicted locally. Closing that gap needs the one line in ServerFire's
-// caller, and the switch is ready for it: Trace.Audio.ShotWatch 0 turns this observer off without a
-// rebuild, so whoever adds that call site does not have to unpick this one.
+// THAT COST HAS NOW BEEN PAID — FX_AUDIO_PLAN §6, AND THE PARAGRAPH THAT USED TO BE HERE IS WRONG.
 //
-// Footsteps have no such caveat. There is no existing footstep call site anywhere in the project, no
-// animation notify to hang one on, and a stride accumulated from the pawn's own ground speed is the
-// mechanism a footstep system would want regardless of who owns which file.
+// What it said was: "the sound is decided on the SERVER, so a remote client hears its own gunshot
+// after half a round trip... Closing that gap needs the one line in ServerFire's caller, and the
+// switch is ready for it." That line now exists. UTraceWeaponComponent::FireOnce plays the shooter's
+// OWN copy locally, on the frame the trigger broke, with no round trip in it
+// (TraceAudio::PlayPredictedLocal), and this observer's two announce sites went from PlayAt to
+// PlayAtExcluding(the shooter's pawn) so that the one machine which already heard a predicted copy
+// skips the multicast. One shot is still exactly one sound on every machine; only the shooter's own
+// arrives on time now.
+//
+//   * The observer is NOT off. It is still what everybody ELSE hears, it still owns the pistol
+//     ladder for those listeners, and Trace.Audio.ShotWatch 0 still silences the lot.
+//   * Trace.Audio.PredictedShot (default 1) is the A/B against the pure-observer behaviour for
+//     GUNSHOTS, MELEE SWINGS AND RELOADS, and it gates both of those halves off ONE read at the
+//     announce site — see TraceAudioWatchFile::CVarPredictedShot and
+//     TraceAudioWatch::IsPredictedShotEnabled(). At 0 the exclusion has to disarm too, or the
+//     shooter is the one person who hears nothing. At 0 a shooter hears its own round exactly once,
+//     half a round trip late; that arm was measured on a real client and it works.
+//   * Bots exclude nobody: no machine locally PLAYER-controls a bot, so PlayAtExcluding degrades to
+//     PlayAt for them and a bot's shot is heard exactly as it was before this pass.
+//
+// FOOTSTEPS GOT THE SAME TREATMENT, AND THE OLD "no such caveat" HERE WAS SIMPLY UNEXAMINED. A remote
+// client heard its own footsteps at round-trip latency for the same reason its gunshots arrived late,
+// and under load the multicast could drop one outright — so a player's own gait, which is the sound
+// they hear most often in this game, was the least reliable thing in the mix. The stride accumulator
+// is a pure function of the pawn's own ground speed, so it runs perfectly well on the machine that
+// owns the pawn: this subsystem now also ticks on a CLIENT, over that machine's own player pawns and
+// nothing else, and plays their steps locally while the authority excludes them from the multicast.
+// See Tick() and AnnounceFootstep() for the split, and IsTickable() for what a client actually pays.
+//
+// *** W6 §F-1: "under load the multicast could drop one outright" WAS THE UNDERSTATEMENT OF THE PASS,
+// AND FOOTSTEPS NOW HAVE THEIR OWN SWITCH. *** Measured on a listen host and a real client, both
+// ledgers Verbose, matched position by position for the client's own pawn: with the prediction armed
+// it hears 17 of its own 17 steps and sends zero RPCs; with it disarmed the authority announces and
+// multicasts all 16 and THREE arrive. Not "could drop one" — drops thirteen. A gait asks the relay
+// for a sound five times a second and the relay's multicast is unreliable by design, so the observer
+// route is a working fallback for a gun and is not one for feet. Trace.Audio.PredictedShot therefore
+// no longer carries footsteps: Trace.Audio.PredictedFootstep does, its 0 is a RED ARM rather than a
+// fallback, and both switches' help text now says which it is.
 // ===================================================================================================
 
 #pragma once
@@ -63,6 +93,52 @@
 #include "TraceAudioWatch.generated.h"
 
 class ATraceCharacter;
+
+/**
+ * FX_AUDIO_PLAN §6.4 — the predicted-shot switch, read through ONE function.
+ *
+ * The switch has to be legible from two files at once: this one, which decides whether the multicast
+ * EXCLUDES the shooter, and UTraceWeaponComponent::FireOnce, which decides whether the shooter plays
+ * a predicted copy at all. §6.4 is explicit that those two must be gated on the same read — "while
+ * PredictedShot=0, the exclusion must also disarm (or the shooter hears nothing)" — so the CVar is
+ * declared exactly once, in TraceAudioWatch.cpp, and every reader comes through here.
+ *
+ * A free function rather than a static on the subsystem because the weapon component must be able to
+ * ask without a world, a subsystem or a pawn: the answer is a console variable, not per-world state.
+ */
+namespace TraceAudioWatch
+{
+	/** True when the shooter's own machine plays its own gunshot/swing/reload and the multicast skips it. */
+	TRACE_API bool IsPredictedShotEnabled();
+
+	/**
+	 * The same question for FOOTSTEPS, and it is a SEPARATE question since W6 §F-1.
+	 *
+	 * §6.4's rule — the predicted copy and the multicast exclusion must come off one read — is
+	 * unchanged and is now applied per family, because the two families do not have the same
+	 * fallback. Turning the gunshot prediction off leaves a shooter hearing exactly one shot, late.
+	 * Turning the footstep prediction off leaves a remote player hearing three of their own sixteen
+	 * steps: the observer's route for footsteps is an unreliable multicast asked for a sound five
+	 * times a second, and it drops most of them. So Trace.Audio.PredictedShot 0 is a supported
+	 * fallback and Trace.Audio.PredictedFootstep 0 is a red arm, and they are different variables.
+	 *
+	 * Everything inside Source/Trace/Audio that decides a FOOTSTEP's route asks this; the weapon
+	 * component and the clip watch still ask IsPredictedShotEnabled(). No caller may mix them.
+	 */
+	TRACE_API bool IsPredictedFootstepEnabled();
+
+	/**
+	 * True while Trace.Audio.ShotLog is on — one printed line per gunshot, from BOTH announcers.
+	 *
+	 * Shared for the same reason the switch above is: after §6 there are two places a gunshot is
+	 * announced from, on two different machines, and a per-shot log that only covered one of them
+	 * would make a two-process audit unreadable in exactly the case it is for. The observer's line
+	 * says "this pawn's round left the clip and I multicast it, excluding their machine"; the
+	 * predicted line says "I am that machine and I played it myself". Each names its shooter, so a
+	 * match full of bots cannot confuse the count.
+	 */
+	TRACE_API bool IsShotLogEnabled();
+}
 
 /**
  * SPEC v29 §1c — THE PISTOL'S FOUR-SHOT SEQUENCE, as a value type with no engine dependency.
@@ -159,11 +235,18 @@ struct FTraceShotAudioRecord
 };
 
 /**
- * The authority-side watcher. See the file header for why it exists in this shape.
+ * The watcher. See the file header for why it exists in this shape.
  *
  * A TICKABLE world subsystem and not an actor: it owns no state that replicates, it must not appear in
- * a level, and it has to die with the world it is watching. It ticks only on the authority and only
- * while there is something to watch, so a client pays nothing for it at all.
+ * a level, and it has to die with the world it is watching.
+ *
+ * *** IT IS NO LONGER AUTHORITY-ONLY, AND THE SPLIT IS NARROW ON PURPOSE (FX_AUDIO_PLAN §6). ***
+ * On the authority it does what it always did: watches every pawn's clip and every pawn's stride and
+ * announces both to the world. On a CLIENT it watches exactly one thing — the stride of the player
+ * pawns this machine locally controls — so that a player's own footsteps are heard on the frame they
+ * happen instead of half a round trip later, and are not at the mercy of an unreliable multicast. A
+ * client runs no clip watch at all (the shooter's own gunshot is predicted at the trigger, in
+ * UTraceWeaponComponent::FireOnce) and never looks at anybody else's pawn.
  */
 UCLASS()
 class TRACE_API UTraceAudioWatchSubsystem : public UTickableWorldSubsystem
@@ -224,11 +307,35 @@ public:
 	 *
 	 * The stride accumulator's own call, exposed so Trace.Audio.Footsteps can drive a hundred steps
 	 * without walking a pawn a hundred strides — the RANDOMNESS is what that harness measures, and
-	 * the walk is not the part under test. Authority only, like everything else here.
+	 * the walk is not the part under test.
+	 *
+	 * WHICH ROUTE THE STEP TAKES IS DECIDED IN HERE, not by the caller, because the caller (a stride
+	 * accumulator) has no business knowing about netmodes. Three cases, and the pair of them adds up
+	 * to exactly one play per machine per step:
+	 *
+	 *   this machine's own player pawn   predicted local (no RPC) — and, if we are also the
+	 *                                    authority, PlayAtExcluding(this pawn) for everybody else
+	 *   a remote player's pawn, on the   PlayAtExcluding(that pawn): every machine but theirs, because
+	 *   authority                        theirs is playing its own predicted copy
+	 *   a bot, on the authority          plain PlayAt — there is no machine to exclude
+	 *
+	 * All three read Trace.Audio.PredictedFootstep, and ONLY that (W6 §F-1) — never the gunshot
+	 * switch. At 0 the first two collapse into the third and the walker loses most of its own steps,
+	 * which is what makes that value a red arm rather than a fallback.
 	 */
 	void AnnounceFootstep(ATraceCharacter* Pawn);
 
 private:
+	/**
+	 * The client half of Tick: the stride accumulator, over this machine's own player pawns only.
+	 *
+	 * Separate from Tick's authority loop rather than folded into it with a flag, because the two are
+	 * different jobs on different populations — "every pawn in the world, clip and stride" against
+	 * "my pawn, stride" — and a shared loop with two netmode tests inside it is how the bot trap gets
+	 * reintroduced.
+	 */
+	void TickLocalPlayerFootsteps(UWorld* World, float DeltaSeconds);
+
 	/** What the watcher remembers about one pawn, between frames. */
 	struct FWatchedPawn
 	{

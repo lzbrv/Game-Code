@@ -201,6 +201,37 @@ public:
 	virtual void OnHalfTime() override;
 	virtual void TickAbilities(float DeltaSeconds) override;
 
+	// ---- FX_AUDIO_PLAN §1.2's client FX router, for MODDED's third-person tell -----------------------
+	virtual void OnClientStateEdge(const FTraceAbilityNetState& Old, const FTraceAbilityNetState& New) override;
+	virtual void SyncClientFx(const FTraceAbilityNetState& Current) override;
+
+	/**
+	 * *** THE V ROW'S PRODUCER — FX_AUDIO_PLAN §7.2, and it closes finding F2. ***
+	 *
+	 * Roxie is one of exactly two characters for whom the base class's default `return false` is the
+	 * wrong answer, and she is the only one for whom it is a BUG rather than a design decision (Mace
+	 * returns false on purpose — Demo 17 hides her suspend cooldown). AuxEndMatchTime has been
+	 * replicated since spec v18 *expressly* "so a client can grey its own V", and until this override
+	 * existed nothing read it: a replicated field with no consumer, which is the whole of F2.
+	 *
+	 * It answers from the SAME two published accessors the rest of the feature uses —
+	 * GetRocketCooldownRemaining() and TraceRoxieRocket::GetCooldownSeconds() — and never from a
+	 * second copy of either number. That matters twice over:
+	 *
+	 *   * the REMAINING is GetRocketCooldownRemaining(), which is the MAX of the replicated deadline
+	 *     and the predicted local mirror, so the row greys on the press rather than a round trip
+	 *     later and can never be more permissive than the server's truth;
+	 *   * the DURATION is the live clamped knob read (TraceRoxieRocket::GetCooldownSeconds()), not
+	 *     UTraceSettings::RoxieRocketCooldownSeconds dereferenced here and not the DataAsset's
+	 *     snapshot of it — the F6 dual-source trap. Retune the cooldown mid-PIE and the meter's
+	 *     denominator moves with the ability in the same frame.
+	 *
+	 * It returns TRUE while the rocket is on cooldown AND while it is ready: 0 remaining is a drawn
+	 * state, not a reason to draw nothing. The row is how a player learns the key exists.
+	 */
+	virtual bool GetSecondaryCooldownDisplay(float& OutRemaining, float& OutDuration,
+	                                         FString& OutLabel) const override;
+
 	// =============================================================================================
 	// PASSIVE — "jumps 15% higher"
 	// =============================================================================================
@@ -409,6 +440,36 @@ private:
 
 	/** SERVER ONLY. Ends MODDED and says why, once, at Log. */
 	void EndModded(const TCHAR* Why);
+
+	// ---- MODDED's tell (FX_AUDIO_PLAN §2.3, the "MODDED gun tell" row) ------------------------------
+	//
+	// TWO HALVES, ON DIFFERENT MACHINES, AND NEITHER IS THE OTHER'S FALLBACK:
+	//
+	//   third person   her body ACCENT STRIPES lift from bible Glow 1.7 to 2.6, so everybody in the
+	//                  arena can see that the Roxie shooting at them is the fast one. Driven from the
+	//                  §1.2 router, which runs on EVERY machine off the replicated ModdedActive bit —
+	//                  it is the only hook that does, and a tell only the owner could see would be a
+	//                  tell for the one player who already knows.
+	//   first person   the VIEWMODEL gun's own MIDs get an ember emissive lift, owner only, because
+	//                  the viewmodel exists on exactly one machine and nobody else can see it anyway.
+	//
+	// Both are applied by the same pair of functions and both are torn down by the same clear, so
+	// there is no state either half can be left in that the other is not.
+
+	/** Lifts the accent stripes (every machine) and the viewmodel (owner only). IDEMPOTENT. */
+	void ApplyModdedTell();
+
+	/** Puts both halves back. Safe to call when the tell was never up. */
+	void ClearModdedTell();
+
+	/**
+	 * True while ApplyModdedTell has written something that ClearModdedTell has not yet taken back.
+	 *
+	 * Purely a "do I have anything to undo" latch — the restore goes through ApplyTeamColors(), which
+	 * recomputes the correct accent for the pawn's CURRENT state, so this never has to remember a
+	 * brightness. See ClearModdedTell for why remembering one would be wrong.
+	 */
+	bool bModdedTellUp = false;
 
 	/** The live rocket, server side. Weak: the actor may expire or be destroyed under us. */
 	TWeakObjectPtr<ATraceRoxieRocket> LiveRocket;

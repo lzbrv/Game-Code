@@ -126,6 +126,7 @@ namespace TraceKillFeedCauses
 		case ETraceKillIcon::Knife:    return TEXT("KNIFE");
 		case ETraceKillIcon::Backstab: return TEXT("BACKSTAB");
 		case ETraceKillIcon::Ability:  return TEXT("ROCKET");
+		case ETraceKillIcon::Smg:      return TEXT("SMG");
 		default:                       return TEXT("BULLET");
 		}
 	}
@@ -399,6 +400,23 @@ void ATraceKillFeedRelay::HandleDeath(AActor* DeadActor, AController* KillerCont
 
 	const float PreviousHealth = (Record != nullptr) ? Record->PreviousHealth : 0.f;
 	Entry.Icon = TraceKillFeedCauses::IconForCause(Cause, Entry.bHasKiller, PreviousHealth);
+
+	// WP6.4 — WHICH gun. The weapon component sends one "Bullet" cause for both firearms, but the
+	// guns are hitscan: this handler runs synchronously inside the same ApplyDamage call stack as
+	// the shot, so the killer's equipped weapon at this instant IS the weapon that fired. Read it
+	// off the pawn rather than widening the cause plumbing (that would be an edit in another
+	// slice's file). A killer with no pawn (died first, projectile leftovers) keeps the pistol
+	// glyph — the harmless direction, exactly like the head-shot inference above.
+	if (Entry.Icon == ETraceKillIcon::Bullet && Entry.bHasKiller && KillerController != nullptr)
+	{
+		if (const APawn* const KillerPawn = KillerController->GetPawn())
+		{
+			if (TraceMelee::IsWeaponEquipped(KillerPawn, ETraceEquippedWeapon::Smg))
+			{
+				Entry.Icon = ETraceKillIcon::Smg;
+			}
+		}
+	}
 
 	UE_LOG(LogTraceGame, Display, TEXT("[KillFeed] %s %s %s  (cause '%s', victim health before the hit %.0f)"),
 		Entry.bHasKiller ? *Entry.KillerName : TEXT("<world>"),
@@ -766,6 +784,59 @@ namespace
 			}),
 			/*Delay=*/0.6f);
 	}
+
+	/**
+	 * Trace.KillFeed.StageIconsA / B — SERVER ONLY, capture staging for the WP6.4 stroke glyphs.
+	 *
+	 * Publishes SYNTHETIC feed rows straight through ServerAnnounceKill — the same replicated
+	 * path a real kill takes, so a client screenshot of a staged row is also a replication
+	 * proof — one row per glyph, split A/B because the HUD draws at most MaxDrawnEntries (5)
+	 * rows at once and there are nine causes. Unlike Trace.KillFeed.Test this stages the DRAWING
+	 * of every glyph (including the three no scripted death can conveniently produce: SMG,
+	 * backstab, rocket) rather than the death funnel, which .Test already proves.
+	 */
+	static void StageIconRows(std::initializer_list<ETraceKillIcon> Icons)
+	{
+		UWorld* const TheWorld = FindKillFeedWorld();
+		ATraceKillFeedRelay* const Relay = ATraceKillFeedRelay::Find(TheWorld);
+		if (Relay == nullptr || !Relay->HasAuthority())
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[KillFeed] StageIcons: no authoritative relay here (run it on the server)."));
+			return;
+		}
+		for (const ETraceKillIcon Icon : Icons)
+		{
+			FTraceKillFeedEntry Entry;
+			Entry.bHasKiller = (Icon != ETraceKillIcon::World);
+			Entry.KillerName = TEXT("GLYPH");
+			Entry.VictimName = TraceKillFeedCauses::IconToString(Icon);
+			Entry.KillerTeam = ETraceTeam::Blue;
+			Entry.VictimTeam = ETraceTeam::Orange;
+			Entry.Icon = Icon;
+			Relay->ServerAnnounceKill(Entry);
+		}
+		UE_LOG(LogTraceGame, Display, TEXT("[KillFeed] StageIcons: %d synthetic row(s) announced."),
+			static_cast<int32>(Icons.size()));
+	}
+
+	FAutoConsoleCommand CmdKillFeedStageIconsA(
+		TEXT("Trace.KillFeed.StageIconsA"),
+		TEXT("Server only. Stage synthetic feed rows for glyphs PISTOL/SMG/KNIFE/BACKSTAB/DASH."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			StageIconRows({ ETraceKillIcon::Bullet, ETraceKillIcon::Smg, ETraceKillIcon::Knife,
+				ETraceKillIcon::Backstab, ETraceKillIcon::Dash });
+		}));
+
+	FAutoConsoleCommand CmdKillFeedStageIconsB(
+		TEXT("Trace.KillFeed.StageIconsB"),
+		TEXT("Server only. Stage synthetic feed rows for glyphs PARRY/HEADSHOT/ROCKET/WORLD."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			StageIconRows({ ETraceKillIcon::Parry, ETraceKillIcon::Headshot,
+				ETraceKillIcon::Ability, ETraceKillIcon::World });
+		}));
 
 	FAutoConsoleCommand CmdKillFeedTest(
 		TEXT("Trace.KillFeed.Test"),

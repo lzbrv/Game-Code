@@ -26,6 +26,7 @@
 #include "GameFramework/Controller.h"          // spec v7 §5: the aim rotation the dash is composed from
 #include "Math/RotationMatrix.h"               // spec v7 §5: the yaw basis the input is decomposed in
 #include "Math/UnrealMathUtility.h"
+#include "EngineUtils.h"                       // TActorIterator: the dash bash sweep (ships) and the spec v8 §5 carrier harness (dev)
 #include "Trace.h"                             // LogTraceGame
 #include "TraceSettings.h"
 #include "UObject/UnrealType.h"                // FProperty, for the name-bound spec v5 knobs
@@ -33,7 +34,6 @@
 #if !UE_BUILD_SHIPPING
 #include "Components/StaticMeshComponent.h"    // ledge test: the block it builds for itself
 #include "Engine/Engine.h"
-#include "EngineUtils.h"                       // TActorIterator, for the spec v8 §5 carrier harness
 #include "Gameplay/TraceCore.h"                // spec v8 §5: the real pickup funnel, ATraceCore::TryPickup
 #include "Core/TracePlayerController.h"        // spec v9 §2: the REAL HUD feed, GetDashHudState
 #include "Engine/StaticMesh.h"
@@ -190,6 +190,64 @@ namespace TraceMoveKnob
 int32 GTraceV9LegacyTuning = 0;
 
 /**
+ * PATCH 28 §5 — THE A/B ARM FOR THE AIR-CONTROL LIMITER OVERRIDE.
+ *
+ * 1 restores UCharacterMovementComponent::LimitAirControl on surf planes, i.e. the engine's stock
+ * behaviour, in the SAME BINARY. That is not an approximation of "before": it IS before, because the
+ * override is the only thing this patch changes about air control.
+ *
+ * It exists because the override was not deduced, it was MEASURED — the first -TraceSurfTest run had
+ * an ideal-strafe arm and a no-input arm that agreed to 1 uu/s — and a fix found by measurement has to
+ * stay falsifiable by the same measurement. Defined here rather than in the dev block, in the same
+ * shape as GTraceV9LegacyTuning above: the definition costs nothing (the Shipping link finds no
+ * reference to it and strips it — measured, `_GTraceSurfLegacyAirLimit` is gone from the relinked
+ * artefact), and a global that is defined unconditionally cannot become the "Shipping build compiles
+ * a reader and finds no definition" link failure the block above records this file already having
+ * had. Only the console REGISTRATION is dev-only.
+ *
+ * *** THE CONSOLE REGISTRATION BEING DEV-ONLY IS NOT ENOUGH, AND THIS COMMENT USED TO SAY IT WAS. ***
+ * It read "Only the console registration is dev-only, so the arm is unreachable in a shipped build
+ * exactly as intended", and that was false: the reader below ALSO carried a bare
+ * FParse::Param(TEXT("TraceSurfLegacyAirLimit")) with no build guard on it, so the command-line half
+ * of the arm shipped. A UTF-16LE search of the linked Trace-Mac-Shipping found the switch literal
+ * present while every guarded sibling (-TraceLegacyTuning, -TraceLegacyWallJump,
+ * -TraceV24LegacySlide, -TraceV26LegacySlideJump, -TraceLegacyAirReverse) was absent. W9-SHIPGUARD
+ * closed it the same way the siblings are closed — the reader is IsSurfLegacyAirLimit() below, whose
+ * Shipping branch returns false and compiles both paths away.
+ */
+int32 GTraceSurfLegacyAirLimit = 0;
+
+/**
+ * True while the legacy (stock-engine) air-control limiter is in force on surf planes.
+ *
+ * BOTH A CVAR AND A COMMAND-LINE SWITCH outside Shipping, for the reason GetDashCooldownRemaining()
+ * spells out at length and IsV9LegacyTuning() repeats: -ExecCmds fires at PostEngineInit and an
+ * ECVF_Cheat variable set that early does not reliably survive into a session, while FParse of the
+ * command line cannot miss. It matters more here than usual because the rig this arm exists for
+ * (-TraceSurfTest) starts six seconds into the map — an arm that failed to apply would look exactly
+ * like an arm that applied and changed nothing.
+ *
+ * Read on both machines and on every replayed frame, and a pure function of config either way, so it
+ * needs no saved-move state and cannot rubber-band. It must never be flipped mid-session on one end
+ * of a live connection — that is a config change, not a prediction input.
+ */
+static bool IsSurfLegacyAirLimit()
+{
+#if UE_BUILD_SHIPPING
+	// Same rule as IsV9LegacyTuning: the legacy arm is Development A/B evidence only. A
+	// spec-archaeology switch must not let one machine run a different simulation than its peers,
+	// and this one is worse than most — LimitAirControl feeds PhysFalling on EVERY machine, so a
+	// listen host launched with -TraceSurfLegacyAirLimit would simulate every pawn's surf air
+	// control with the stock limiter while each joined client predicted the patched one, i.e. a
+	// correction on every ride for every client, from one command-line token.
+	return false;
+#else
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfLegacyAirLimit"));
+	return GTraceSurfLegacyAirLimit != 0 || bFromCommandLine;
+#endif
+}
+
+/**
  * True while the pre-v9 tuning is in force.
  *
  * BOTH A CVAR AND A COMMAND-LINE SWITCH, for the reason GetDashCooldownRemaining() spells out at
@@ -205,8 +263,15 @@ int32 GTraceV9LegacyTuning = 0;
  */
 static bool IsV9LegacyTuning()
 {
+#if UE_BUILD_SHIPPING
+	// Legacy arms are A/B evidence, not a player option: a spec-archaeology switch must not let one
+	// machine run a different simulation than its peers. The CVar registration already lives in the
+	// dev block; this closes the -TraceLegacyTuning command-line path too.
+	return false;
+#else
 	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyTuning"));
 	return GTraceV9LegacyTuning != 0 || bFromCommandLine;
+#endif
 }
 
 // =================================================================================================
@@ -231,8 +296,13 @@ int32 GTraceV10LegacyWallJump = 0;
 
 static bool IsV10LegacyWallJump()
 {
+#if UE_BUILD_SHIPPING
+	// Same rule as IsV9LegacyTuning: the legacy arm is Development A/B evidence only.
+	return false;
+#else
 	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyWallJump"));
 	return GTraceV10LegacyWallJump != 0 || bFromCommandLine || IsV9LegacyTuning();
+#endif
 }
 
 // =================================================================================================
@@ -285,8 +355,13 @@ int32 GTraceV24LegacySlide = 0;
 
 static bool IsV24LegacySlide()
 {
+#if UE_BUILD_SHIPPING
+	// Same rule as IsV9LegacyTuning: the legacy arm is Development A/B evidence only.
+	return false;
+#else
 	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceV24LegacySlide"));
 	return GTraceV24LegacySlide != 0 || bFromCommandLine;
+#endif
 }
 
 // =================================================================================================
@@ -320,8 +395,13 @@ int32 GTraceV26LegacySlideJump = 0;
 
 static bool IsV26LegacySlideJump()
 {
+#if UE_BUILD_SHIPPING
+	// Same rule as IsV9LegacyTuning: the legacy arm is Development A/B evidence only.
+	return false;
+#else
 	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceV26LegacySlideJump"));
 	return GTraceV26LegacySlideJump != 0 || bFromCommandLine || IsV9LegacyTuning();
+#endif
 }
 
 // =================================================================================================
@@ -352,8 +432,13 @@ float GTraceAirOpposingDecel = -1.f;
 
 static bool IsV18LegacyAirReverse()
 {
+#if UE_BUILD_SHIPPING
+	// Same rule as IsV9LegacyTuning: the legacy arm is Development A/B evidence only.
+	return false;
+#else
 	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyAirReverse"));
 	return GTraceV18LegacyAirReverse != 0 || bFromCommandLine;
+#endif
 }
 
 
@@ -509,6 +594,13 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	WallJumpControlLockoutRemaining = 0.f;
 	WallJumpInputBufferRemaining = 0.f;
 	bKnifeMovementProfile = 0;
+
+	// Patch 28 §5. Saved-move state like everything above it: a fresh pawn is not mid-surf.
+	SurfPlaneNormal = FVector::ZeroVector;
+	SurfContactRemaining = 0.f;
+	SurfEntrySpeed = 0.f;
+	SurfElapsedSeconds = 0.f;
+	SurfPeakSpeed = 0.f;
 
 #if !UE_BUILD_SHIPPING
 	bLedgeTestWasGrounded = 0;
@@ -702,6 +794,36 @@ void UTraceCharacterMovementComponent::BeginPlay()
 				GetAirStrafeOpposingDeceleration(), GTraceAirOpposingDecel,
 				IsV18LegacyAirReverse() ? 1 : 0,
 				1000.f / FMath::Max(1.f, GetAirStrafeOpposingDeceleration()));
+
+			// --- PATCH 28 §5, AND THE SAME BIND-REPORT ARGUMENT ONCE MORE -------------------------
+			//
+			// Every surf knob is READ HERE EXPLICITLY, for the reason the knife multipliers above are:
+			// nothing resolves them until a player is actually on a ramp, so without this call they
+			// would be absent from the MOVEKNOB report for the whole of a headless run and a rename
+			// would kill all five in silence.
+			//
+			// The derived line next to them is the one a designer actually wants, and it is derived
+			// from the live getters rather than eyeballed: the surf BAND (which faces this build will
+			// and will not surf) is stated as the two normal-Z bounds AND as the two slope angles they
+			// correspond to, and the ceiling is printed next to the air cap it is a multiple of, so a
+			// reader can check the arithmetic and see at a glance that it TRACKS rather than copies.
+			{
+				const float MinZ = GetSurfMinNormalZ();
+				const float MaxZ = GetWalkableFloorZ();
+				UE_LOG(LogTraceGame, Display,
+					TEXT("MOVECFG-P28 SURF on=%d band Nz (%.3f..%.3f) = slope (%.1f..%.1f deg) "
+					     "[upper bound IS GetWalkableFloorZ(), read live - a walkable face can never be "
+					     "surfed] | overbounce=%.3f grace=%.3fs | ceiling=%.0f uu/s = airHardCap %.0f x "
+					     "%.2f (DERIVED - retune the air cap and this moves with it) | "
+					     "wall band |Nz|<=%.2f is the wall jump's and cannot overlap"),
+					IsSurfEnabled() ? 1 : 0, MinZ, MaxZ,
+					FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(MaxZ, -1.f, 1.f))),
+					FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(MinZ, -1.f, 1.f))),
+					GetSurfOverbounce(), GetSurfContactGraceSeconds(),
+					GetAirStrafeHardCapSpeed() * GetSurfSpeedCeilingMultiplier(),
+					GetAirStrafeHardCapSpeed(), GetSurfSpeedCeilingMultiplier(),
+					GetWallJumpMaxNormalZ());
+			}
 
 			// The knob hygiene check the project's own history demands. A name-bound knob that does
 			// not resolve is not a build error and not a runtime error — it is a setting that
@@ -1036,7 +1158,7 @@ float UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus() const
 	// decision would silently delete or double this one. That failure has happened in this file
 	// before — see SlideJumpWindowSeconds' note on the 0.2 s that must not be applied twice.
 	//
-	// BEFORE THE CHARACTER SEAM, deliberately. Elle's +40% scales the reduced gain rather than being
+	// BEFORE THE CHARACTER SEAM, deliberately. Elle's +30% scales the reduced gain rather than being
 	// computed against a number the game no longer ships, which is the same ordering rule the seam's
 	// own comment states: every global knob, every legacy arm and both readings of "the bonus" are
 	// resolved first, and the ability layer only ever gets to scale the finished number.
@@ -1046,8 +1168,9 @@ float UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus() const
 		Global = FMath::Max(1.f, 1.f + (Global - 1.f) * MomentumScale);
 	}
 
-	// SPEC v18 §2 — Elle's second passive, "+40% on well-timed slide-jump momentum boosts", and the
-	// ONE place a character is allowed to change this number.
+	// SPEC v18 §2 — Elle's second passive, "+30% on well-timed slide-jump momentum boosts" (v18 §2 asked
+	// for +40%; PATCH 28 §3 cut it to +30%, and UTraceSettings::ElleSlideJumpGainBonus ships at 0.30),
+	// and the ONE place a character is allowed to change this number.
 	//
 	// THE GLOBAL IS COMPUTED FIRST AND HANDED OVER, which is what keeps §4's "slide-jump 1.446875
 	// (Elle changes only her own)" true: every knob, every legacy arm and both readings of "the bonus"
@@ -1605,6 +1728,204 @@ float UTraceCharacterMovementComponent::GetWallJumpMaxNormalZ() const
 	// leaves a clear band between "wall" and "slope you could have walked up" and stops a ramp from
 	// being a trampoline.
 	return FMath::Clamp(TraceMoveKnob::Float(TEXT("WallJumpMaxNormalZ"), 0.4f), 0.f, 0.9f);
+}
+
+// --- PATCH 28 §5: surf tuning -------------------------------------------------------------------
+//
+// Name-bound against UTraceSettings like every knob added since spec v5, for the reason the block at
+// the top of this file gives: the UPROPERTYs live in a file this slice does not own, and shipping a
+// movement feature with nothing to tune is worse than shipping it name-bound. Every default below is
+// the shipped value and BeginPlay's MOVEKNOB report says BOUND or FALLBACK for each one, so a missing
+// property can never be silent.
+
+bool UTraceCharacterMovementComponent::IsSurfEnabled() const
+{
+	return TraceMoveKnob::Bool(TEXT("bSurfEnabled"), true);
+}
+
+float UTraceCharacterMovementComponent::GetSurfMinNormalZ() const
+{
+	// FLOOR OF THE SURF BAND, and it is deliberately ABOVE GetWallJumpMaxNormalZ()'s 0.4 so the two
+	// bands cannot overlap. A face is a wall (|Nz| <= 0.4, the wall jump's), a surf plane
+	// (0.45 < Nz < WalkableFloorZ) or a floor (Nz >= WalkableFloorZ), and never two of those at once —
+	// which matters because the wall jump wants HandleSlopeBoosting left ON (it is what stops a player
+	// climbing a corner) and surf wants it off.
+	//
+	// Clamped strictly below the walkable limit so a bad ini can only ever make the band narrower,
+	// never turn the floor into a surf plane.
+	const float Requested = TraceMoveKnob::Float(TEXT("SurfMinNormalZ"), 0.45f);
+	return FMath::Clamp(Requested, 0.05f, GetWalkableFloorZ() - 0.01f);
+}
+
+float UTraceCharacterMovementComponent::GetSurfOverbounce() const
+{
+	// Source uses 1.0 for the player, which makes ClipVelocity a pure plane projection: the pawn is
+	// neither pushed off the ramp nor allowed to sink into it. Above 1 it bounces, below 1 it sinks
+	// and the next sweep has to dig it out. Clamped to a band either side of 1 so a typo cannot turn a
+	// ramp into a trampoline or into glue.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("SurfOverbounce"), 1.0f), 0.9f, 1.2f);
+}
+
+float UTraceCharacterMovementComponent::GetSurfContactGraceSeconds() const
+{
+	// 0.10 s ~ six frames at 60 Hz. A curved rail is a FAN OF FACETS and a fast pawn genuinely leaves
+	// the surface for a frame or two crossing from one facet to the next; without a grace the state
+	// would flicker off and on at every joint, and the ceiling that hangs off it would flicker with
+	// it. Long enough to bridge a joint, far short of the time it takes to fall clear of a ramp.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("SurfContactGraceSeconds"), 0.10f), 0.f, 0.5f);
+}
+
+float UTraceCharacterMovementComponent::GetSurfSpeedCeilingMultiplier() const
+{
+	// 1.25x the air-strafe hard cap. The surf is meant to be the fastest thing in the kit — that is
+	// the whole request — but "fastest" has to be a number and not an asymptote, because gravity along
+	// the plane is a constant acceleration the clip never removes and a long enough ramp would grow
+	// the vector without limit. See GetSurfSpeedCeiling() for why this is a MULTIPLIER on a value this
+	// file already ships rather than a speed of its own.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("SurfSpeedCeilingMultiplier"), 1.25f), 1.f, 3.f);
+}
+
+float UTraceCharacterMovementComponent::GetSurfSpeedCeiling() const
+{
+	// DERIVED, NOT TYPED (the project's DEMO 21 rule). The base is GetAirStrafeHardCapSpeed(), which
+	// already folds in the knife profile's multiplier, so a knife surfer gets the same 30% the rest of
+	// their kit gets and a retune of the air ceiling moves this with it — there is no second literal
+	// to forget.
+	//
+	// FLOORED AT THE ENTRY SPEED, exactly like every other ceiling in this file. A player who arrives
+	// on a rail above the cap (out of a dash, off a slide-jump chain) keeps every unit of what they
+	// brought; the ceiling only ever refuses to let the RAMP make more.
+	return FMath::Max(SurfEntrySpeed, GetAirStrafeHardCapSpeed() * GetSurfSpeedCeilingMultiplier());
+}
+
+// --- PATCH 28 §5: the clip, the plane test, and the state ---------------------------------------
+
+FVector UTraceCharacterMovementComponent::ClipVelocityAgainstPlane(const FVector& In, const FVector& Normal,
+	const float Overbounce)
+{
+	// SOURCE'S PM_ClipVelocity, line for line:
+	//
+	//     backoff = dot(in, normal) * overbounce
+	//     out[i]  = in[i] - normal[i] * backoff
+	//     if (|out[i]| < STOP_EPSILON) out[i] = 0
+	//
+	// The epsilon snap is not decoration. Without it the component that should be exactly zero comes
+	// back as a few thousandths of a uu/s of residual drift into (or out of) the plane, and a pawn
+	// riding a rail for four seconds at 120 Hz integrates that into a visible detach or a visible
+	// sink. Source carries the same line for the same reason.
+	static constexpr float StopEpsilon = 0.1f;
+
+	FVector Unit = Normal;
+	if (!Unit.Normalize())
+	{
+		return In;
+	}
+
+	const float Backoff = static_cast<float>(FVector::DotProduct(In, Unit)) * Overbounce;
+	FVector Out = In - Unit * Backoff;
+
+	if (FMath::Abs(Out.X) < StopEpsilon) { Out.X = 0.f; }
+	if (FMath::Abs(Out.Y) < StopEpsilon) { Out.Y = 0.f; }
+	if (FMath::Abs(Out.Z) < StopEpsilon) { Out.Z = 0.f; }
+
+	return Out;
+}
+
+bool UTraceCharacterMovementComponent::IsSurfPlane(const FVector& Normal) const
+{
+	if (!IsSurfEnabled())
+	{
+		return false;
+	}
+
+	// THE UPPER BOUND IS THE ENGINE'S OWN WALKABLE LIMIT, read live. That is what makes "a player
+	// cannot surf ordinary walkable geometry" a proof instead of a hope: the number that decides the
+	// pawn is standing on a surface is the same number that refuses to surf it, so the two can never
+	// disagree, and a designer who changes the slope limit moves both at once. A copied 0.71 here
+	// would be a second opinion about what walkable means — which is exactly the shape of bug this
+	// project keeps paying for.
+	const float NormalZ = static_cast<float>(Normal.Z);
+	return NormalZ > GetSurfMinNormalZ() && NormalZ < GetWalkableFloorZ();
+}
+
+void UTraceCharacterMovementComponent::GetSurfSlopeBandDegrees(float& OutMinDegrees, float& OutMaxDegrees) const
+{
+	// Both ends read the SAME two numbers IsSurfPlane() tests, converted once. A face is surfable when
+	// GetSurfMinNormalZ() < Nz < GetWalkableFloorZ(), and Nz = cos(slope), so the shallow end is the
+	// walkable limit and the steep end is where the wall band begins. Nothing here is typed.
+	OutMinDegrees = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(GetWalkableFloorZ(), -1.f, 1.f)));
+	OutMaxDegrees = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(GetSurfMinNormalZ(), -1.f, 1.f)));
+}
+
+bool UTraceCharacterMovementComponent::IsSurfing() const
+{
+	// The zero-normal test mirrors IsWallJumpAvailable()'s: a cleared normal means there is no surface
+	// under the clock, whatever the clock says.
+	return IsSurfEnabled()
+		&& SurfContactRemaining > 0.f
+		&& !SurfPlaneNormal.IsNearlyZero();
+}
+
+FVector UTraceCharacterMovementComponent::ComputeSlideVector(const FVector& Delta, const float Time,
+	const FVector& Normal, const FHitResult& Hit) const
+{
+	// FALLING ONLY, and that is not a convenience test. UCharacterMovementComponent::ComputeSlideVector
+	// only applies HandleSlopeBoosting() while IsFalling(), so on the ground Super is ALREADY the pure
+	// projection and there would be nothing to subtract; taking the branch there would change nothing
+	// except which code a walking pawn runs through. PhysWalking also calls this for ledge moves, where
+	// the "normal" is a synthetic ledge normal and has no business being classified as terrain.
+	if (IsFalling() && IsSurfPlane(Normal))
+	{
+		// THE HONEST PROJECTION. Super would compute this and then hand it to HandleSlopeBoosting(),
+		// whose "we were heading down but were going to deflect upwards, just make the deflection
+		// horizontal" branch is every surf contact there is: a pawn falling onto a steep face is
+		// deflected up-and-along, and flattening that is what turns a ramp into sandpaper.
+		//
+		// PhysFalling re-derives Velocity from what this returns, so this line IS the velocity clip.
+		return ClipVelocityAgainstPlane(Delta, Normal, GetSurfOverbounce()) * Time;
+	}
+
+	return Super::ComputeSlideVector(Delta, Time, Normal, Hit);
+}
+
+FVector UTraceCharacterMovementComponent::LimitAirControl(float DeltaTime, const FVector& FallAcceleration,
+	const FHitResult& HitResult, bool bCheckForValidLandingSpot)
+{
+	// See the header note. On a surf plane the acceleration is handed back untouched and the clip a few
+	// lines later in PhysFalling removes whatever genuinely pointed into the surface — Source's own
+	// order of operations. The engine's rule stays in force for every other surface, walls included.
+	//
+	// Classified on ImpactNormal, the same field HandleImpact() and CanStepUp() classify on, so all
+	// three agree about what a face is. (On a box sweep it equals Hit.Normal, which is what the engine
+	// tests; they diverge only on a penetrating start, where the branch below is not taken anyway.)
+	//
+	// THE LEGACY ARM IS ASKED FOR THROUGH IsSurfLegacyAirLimit(), NOT READ HERE. Both halves of it —
+	// the cvar and the -TraceSurfLegacyAirLimit command-line switch — live in that one function, whose
+	// Shipping branch is a plain `return false`, so neither half reaches a shipped binary. This used
+	// to be a bare FParse::Param on this line with no guard on it, which is how the switch literal
+	// ended up in the linked Trace-Mac-Shipping; see GTraceSurfLegacyAirLimit's block at the top of
+	// the file for the measurement and the fix.
+	if (!IsSurfLegacyAirLimit()
+		&& IsFalling() && HitResult.IsValidBlockingHit() && IsSurfPlane(HitResult.ImpactNormal))
+	{
+		return FallAcceleration;
+	}
+
+	return Super::LimitAirControl(DeltaTime, FallAcceleration, HitResult, bCheckForValidLandingSpot);
+}
+
+bool UTraceCharacterMovementComponent::CanStepUp(const FHitResult& Hit) const
+{
+	// NO STAIR-STEPPING ONTO A SURF FACE. See the header note: StepUp() would reject it anyway, but
+	// only after a multi-sweep round trip taken every frame a runner leans on the toe of a rail, and
+	// on faceted geometry one mis-sized facet is all it takes for one of those probes to find a
+	// walkable ledge and hand a player a staircase up a surf ramp.
+	if (Hit.IsValidBlockingHit() && IsSurfPlane(Hit.ImpactNormal))
+	{
+		return false;
+	}
+
+	return Super::CanStepUp(Hit);
 }
 
 int32 UTraceCharacterMovementComponent::GetMaxDashCharges() const
@@ -2816,7 +3137,74 @@ void UTraceCharacterMovementComponent::HandleImpact(const FHitResult& Hit, float
 {
 	Super::HandleImpact(Hit, TimeSlice, MoveDelta);
 
-	if (!IsWallJumpEnabled() || CharacterOwner == nullptr || UpdatedComponent == nullptr)
+	if (CharacterOwner == nullptr || UpdatedComponent == nullptr)
+	{
+		return;
+	}
+
+	// =============================================================================================
+	// PATCH 28 §5 — THE SURF SENSOR, AND IT IS THE SAME ONE THE WALL JUMP USES.
+	//
+	// PhysFalling calls HandleImpact for every blocking hit that was NOT a valid landing spot — which
+	// is exactly the set of hits a steep face produces, because IsValidLandingSpot() refuses anything
+	// IsWalkable() refuses. So the contact frame is delivered here for free, on the client, on the
+	// server and on every replayed move, from inside a sweep the engine was already doing. A
+	// hand-rolled per-frame probe would have been a second, differently-timed source of truth for the
+	// same fact, and this file already records why that is the bug it is.
+	//
+	// ORDERED BEFORE THE WALL-JUMP BLOCK ON PURPOSE. The two bands do not overlap (GetSurfMinNormalZ()
+	// is above GetWallJumpMaxNormalZ()), so no hit can be both — but the wall-jump block returns early
+	// when the wall jump is switched off, and surf must not be hostage to another mechanic's switch.
+	// =============================================================================================
+	if (Hit.bBlockingHit && IsFalling() && MovementMode != MOVE_None && IsSurfPlane(Hit.ImpactNormal))
+	{
+		FVector PlaneNormal = Hit.ImpactNormal;
+		if (PlaneNormal.Normalize())
+		{
+			// A FRESH SURF is one that starts with no clock running. Everything captured here is
+			// captured once per ride, so a curved rail's facet joints extend the ride rather than
+			// restarting it — which is what makes "preserved speed on transitions between ramp faces"
+			// true of the CEILING as well as of the velocity: the entry speed the ceiling is floored
+			// at is the speed the RIDE began with, not the speed at the last joint.
+			if (!IsSurfing())
+			{
+				SurfEntrySpeed = GetPlanarSpeed();
+				SurfElapsedSeconds = 0.f;
+				SurfPeakSpeed = static_cast<float>(Velocity.Size());
+
+#if !UE_BUILD_SHIPPING
+				++SurfCount;
+				SurfEntrySpeedSum += SurfEntrySpeed;
+				if (const UWorld* SurfWorld = GetWorld())
+				{
+					// The correction-attribution window, on the same terms as the dash's and the wall
+					// jump's: a correction that lands while a player is riding a ramp is the number
+					// that falsifies "surf is predicted", and it can only be read on a client.
+					SurfAttributionUntil = static_cast<float>(SurfWorld->GetTimeSeconds()) + 2.f;
+				}
+#endif
+			}
+
+			// Overwriting an older normal is deliberate and is the curved-ramp case: the facet you are
+			// touching NOW is the plane your velocity is being clipped against.
+			SurfPlaneNormal = PlaneNormal;
+			SurfContactRemaining = GetSurfContactGraceSeconds();
+		}
+	}
+#if !UE_BUILD_SHIPPING
+	else if (Hit.bBlockingHit && IsFalling() && MovementMode != MOVE_None)
+	{
+		// THE NEGATIVE CONTROL, COUNTED. Every airborne contact this component saw and did NOT turn into
+		// a surf — a walkable face, a wall, a ceiling — is one this build refused, and the count is what
+		// turns "you cannot surf ordinary geometry" into a number in Trace.Move.SurfReport rather than
+		// an assertion in a comment. Counted here rather than only for walkable faces because
+		// PhysFalling does not deliver a landing spot to HandleImpact at all, so a walkable-only counter
+		// would be structurally near-zero and would look like a passing test for the wrong reason.
+		++SurfContactsRefused;
+	}
+#endif
+
+	if (!IsWallJumpEnabled())
 	{
 		return;
 	}
@@ -3652,6 +4040,81 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		}
 	}
 
+	// =============================================================================================
+	// 1a-vi. PATCH 28 §5 — THE SURF CLOCK, THE BOUND, AND THE EXIT.
+	//
+	// Ticked here with every other clock so a replayed move advances it by exactly the amount the
+	// original did. Nothing in this block is the surf itself: the ride happens inside PhysFalling,
+	// through ComputeSlideVector(), on the frame it happens. This is the bookkeeping around it.
+	// =============================================================================================
+	if (IsSurfing())
+	{
+		SurfElapsedSeconds += DeltaSeconds;
+
+		// THE BOUND. Gravity along the plane is a constant acceleration and the clip never removes any
+		// of it, so a long enough ramp would grow the vector without limit — which spec v5 §1 already
+		// ruled out for the air model in as many words ("too powerful with how much momentum can be
+		// gained"). GetSurfSpeedCeiling() is max(entry speed, air hard cap x multiplier): DERIVED from
+		// a number this file already ships, and floored at what the player brought so arriving fast is
+		// never punished.
+		//
+		// SCALED, NOT COMPONENT-CLAMPED, and on the FULL 3D vector. Clamping components would bend the
+		// trajectory into the ramp; scaling keeps the direction the clip produced and only shortens it.
+		// 3D rather than planar because on a steep face a large part of the speed is vertical, and a
+		// planar-only bound would leave the one axis a ramp is best at growing completely unbounded.
+		const float SurfSpeed = static_cast<float>(Velocity.Size());
+		const float SurfCeiling = GetSurfSpeedCeiling();
+		if (SurfSpeed > SurfCeiling + TraceMoveCfg::SpeedEpsilon && SurfSpeed > UE_KINDA_SMALL_NUMBER)
+		{
+			Velocity *= (SurfCeiling / SurfSpeed);
+#if !UE_BUILD_SHIPPING
+			++SurfCeilingBinds;
+#endif
+		}
+
+		SurfPeakSpeed = FMath::Max(SurfPeakSpeed, static_cast<float>(Velocity.Size()));
+	}
+
+	if (SurfContactRemaining > 0.f)
+	{
+		SurfContactRemaining = FMath::Max(0.f, SurfContactRemaining - DeltaSeconds);
+
+		// THE GROUND ENDS IT, and through IsGroundedForAbilities() like every other ground test in this
+		// function. Two reasons, and the second is the load-bearing one:
+		//   * a rail that flattens into walkable ground is the CLEAN EXIT, and the pawn is a walker
+		//     again the instant it lands — leaving a surf clock running over a landing would apply the
+		//     surf ceiling to a grounded frame, which is a different mechanic's business;
+		//   * it is what keeps "surf is live" implying "this move is airborne", which is what lets
+		//     CanCombineWith's existing momentum test cover the whole of surf for free.
+		if (SurfContactRemaining <= 0.f || IsGroundedForAbilities())
+		{
+#if !UE_BUILD_SHIPPING
+			// THE SAMPLE CLOSES HERE, and the exit speed is read before anything else touches Velocity.
+			// "Accelerate using curved ramps" is entry -> exit, and this is the only place both ends of
+			// that pair exist. Never on a replayed move: a correction replays several frames and would
+			// close the same ride several times, which is how a ledger invents rides that never
+			// happened.
+			if (CharacterOwner != nullptr && !CharacterOwner->bClientUpdating && SurfCount > 0)
+			{
+				const float ExitSpeed = GetPlanarSpeed();
+				const float Gain = ExitSpeed - SurfEntrySpeed;
+				SurfExitSpeedSum += ExitSpeed;
+				SurfBestGain = (SurfClosedCount == 0) ? Gain : FMath::Max(SurfBestGain, Gain);
+				SurfWorstGain = (SurfClosedCount == 0) ? Gain : FMath::Min(SurfWorstGain, Gain);
+				SurfLongestSeconds = FMath::Max(SurfLongestSeconds, SurfElapsedSeconds);
+				++SurfClosedCount;
+			}
+#endif
+			SurfContactRemaining = 0.f;
+			SurfPlaneNormal = FVector::ZeroVector;
+			SurfElapsedSeconds = 0.f;
+			SurfEntrySpeed = 0.f;
+
+			// SurfPeakSpeed is deliberately NOT cleared here: it is the ride's own high-water mark and
+			// the report reads it after the ride is over. It is re-seeded by the next entry.
+		}
+	}
+
 	// 1a-ii. The mantle clock and its cooldown were advanced here (spec v5 §7). Gone in v12 §5.
 
 	// 1b. Resize the charge pool from the TRANSITION in GetMaxDashCharges(), never from its value.
@@ -4074,6 +4537,7 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	TickWallJumpTest(DeltaSeconds);
 	TickCarrierChargeTest(DeltaSeconds);
 	TickSingleDashTest(DeltaSeconds);
+	TickSurfTest(DeltaSeconds);
 #endif
 }
 
@@ -4367,6 +4831,18 @@ static FAutoConsoleVariableRef CVarTraceV10LegacyWallJump(
 // because GetAirStrafeOpposingDeceleration() reads them and that is shipping code. Only the console
 // registration belongs here. See the note above IsV18LegacyAirReverse() for why the v9/v10 arms above
 // do it the other way round and why that is a latent Shipping-link bug rather than a pattern to copy.
+/**
+ * PATCH 28 §5. See GTraceSurfLegacyAirLimit's definition for what the arm is and why it exists.
+ * ECVF_Cheat like every other legacy arm here: it is A/B evidence, not a player option.
+ */
+static FAutoConsoleVariableRef CVarTraceSurfLegacyAirLimit(
+	TEXT("Trace.Move.SurfLegacyAirLimit"),
+	GTraceSurfLegacyAirLimit,
+	TEXT("Patch 28 sec 5 A/B. 1 puts UE's stock LimitAirControl back on surf planes, which deletes the "
+	     "up-slope half of the player's input and is the behaviour the override replaces. Run "
+	     "-TraceSurfTest with it on and off and diff the ideal-strafe column."),
+	ECVF_Cheat);
+
 static FAutoConsoleVariableRef CVarTraceV18LegacyAirReverse(
 	TEXT("Trace.Move.V18.LegacyAirReverse"),
 	GTraceV18LegacyAirReverse,
@@ -4383,7 +4859,7 @@ static FAutoConsoleVariableRef CVarTraceAirOpposingDecel(
 	     "0 at 90 degrees and inside it and the air strafe is untouched. NEGATIVE (the default) means "
 	     "'use the AirStrafeOpposingDeceleration knob'. This is the number the spec expects to be "
 	     "tuned by feel."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 {
@@ -5070,6 +5546,16 @@ void UTraceCharacterMovementComponent::OnClientCorrectionReceived(
 		&& static_cast<float>(CorrectionWorld->GetTimeSeconds()) <= WallJumpAttributionUntil)
 	{
 		++WallJumpCorrectionsInWindow;
+	}
+
+	// PATCH 28 §5. The same attribution for surf: "zero prediction corrections while surfing" is the
+	// competitive-integrity claim, and a correction landing inside a ride is what falsifies it. Read
+	// on a CLIENT — an authoritative pawn cannot be corrected and reports zero for a reason that has
+	// nothing to do with ramps.
+	if (CorrectionWorld != nullptr
+		&& static_cast<float>(CorrectionWorld->GetTimeSeconds()) <= SurfAttributionUntil)
+	{
+		++SurfCorrectionsInWindow;
 	}
 
 	if (AreMoveCorrectionsLogged())
@@ -7558,6 +8044,11 @@ FSavedMove_Trace::FSavedMove_Trace()
 	, SavedWallJumpLaunchNormal(FVector::ZeroVector)
 	, SavedWallJumpControlLockoutRemaining(0.f)
 	, SavedWallJumpInputBufferRemaining(0.f)
+	, SavedSurfPlaneNormal(FVector::ZeroVector)
+	, SavedSurfContactRemaining(0.f)
+	, SavedSurfEntrySpeed(0.f)
+	, SavedSurfElapsedSeconds(0.f)
+	, SavedSurfPeakSpeed(0.f)
 	, bSavedKnifeMovementProfile(0)
 {
 }
@@ -7614,6 +8105,15 @@ void FSavedMove_Trace::Clear()
 	SavedWallJumpLaunchNormal = FVector::ZeroVector;
 	SavedWallJumpControlLockoutRemaining = 0.f;
 	SavedWallJumpInputBufferRemaining = 0.f;
+
+	// PATCH 28 §5. Same pooling argument as everything above: a stale surf clock left in a recycled
+	// move would tell a replay it was riding a ramp in the middle of open air, and the surf ceiling
+	// would clamp a frame the server never clamped.
+	SavedSurfPlaneNormal = FVector::ZeroVector;
+	SavedSurfContactRemaining = 0.f;
+	SavedSurfEntrySpeed = 0.f;
+	SavedSurfElapsedSeconds = 0.f;
+	SavedSurfPeakSpeed = 0.f;
 
 	// Spec v10 §1. A stale knife bit would replay a move at 130% speed with the gun in hand.
 	bSavedKnifeMovementProfile = 0;
@@ -7723,12 +8223,21 @@ bool FSavedMove_Trace::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 	// It costs very close to nothing: every AIRBORNE move in a chain is already refused by
 	// bSavedMomentumActive below, so the only moves this newly refuses are the handful of grounded
 	// ones between a landing and the next slide — which is exactly the window the threshold lives in.
+	//
+	// PATCH 28 §5 ADDS ONE MORE, AND IT COSTS EXACTLY ZERO EXTRA REFUSALS. The surf ceiling is a
+	// per-sub-step clamp (min against max(entry, cap)), so f(2dt) != f(dt) twice the moment it binds,
+	// which is this list's founding reason. It is free because OnMovementUpdated clears the surf on
+	// the frame the pawn is grounded, so "surf is live" implies "this move is airborne" implies
+	// bSavedMomentumActive is already set — every move this clause could refuse is refused two tests
+	// below. It is written out anyway because the day somebody lets a surf clock survive a landing,
+	// this is the line that stops the merge from silently becoming a desync.
 	if (SavedDashTimeRemaining > 0.f || Other->SavedDashTimeRemaining > 0.f
 		|| SavedSlideTimeRemaining > 0.f || Other->SavedSlideTimeRemaining > 0.f
 		|| SavedSlideJumpGraceRemaining > 0.f || Other->SavedSlideJumpGraceRemaining > 0.f
 		|| SavedSlideJumpChainBoosts > 0 || Other->SavedSlideJumpChainBoosts > 0
 		|| SavedWallJumpControlLockoutRemaining > 0.f || Other->SavedWallJumpControlLockoutRemaining > 0.f
-		|| SavedWallJumpInputBufferRemaining > 0.f || Other->SavedWallJumpInputBufferRemaining > 0.f)
+		|| SavedWallJumpInputBufferRemaining > 0.f || Other->SavedWallJumpInputBufferRemaining > 0.f
+		|| SavedSurfContactRemaining > 0.f || Other->SavedSurfContactRemaining > 0.f)
 	{
 		return false;
 	}
@@ -7924,6 +8433,16 @@ void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 			SavedWallJumpControlLockoutRemaining = Movement->WallJumpControlLockoutRemaining;
 			SavedWallJumpInputBufferRemaining    = Movement->WallJumpInputBufferRemaining;
 
+			// PATCH 28 §5. HandleImpact re-runs on a replay (PhysFalling re-sweeps the same static
+			// geometry), so the NORMAL is partly self-healing — but the CLOCK and the ENTRY SPEED are
+			// not: nothing in a replay can re-derive "this ride began 0.4 s ago at 1180 uu/s", and both
+			// of them decide what the surf ceiling clamps to on the very next frame.
+			SavedSurfPlaneNormal      = Movement->SurfPlaneNormal;
+			SavedSurfContactRemaining = Movement->SurfContactRemaining;
+			SavedSurfEntrySpeed       = Movement->SurfEntrySpeed;
+			SavedSurfElapsedSeconds   = Movement->SurfElapsedSeconds;
+			SavedSurfPeakSpeed        = Movement->SurfPeakSpeed;
+
 			// SPEC v10 §1. The weapon in hand at the START of this move, which is the profile the
 			// move was actually simulated under.
 			bSavedKnifeMovementProfile = Movement->bKnifeMovementProfile;
@@ -8052,6 +8571,16 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 			Movement->WallJumpLaunchNormal            = SavedWallJumpLaunchNormal;
 			Movement->WallJumpControlLockoutRemaining = SavedWallJumpControlLockoutRemaining;
 			Movement->WallJumpInputBufferRemaining    = SavedWallJumpInputBufferRemaining;
+
+			// PATCH 28 §5. Rewind the ride to where it stood before this move ran. Without the clock a
+			// replayed frame would run UNCAPPED where the server ran capped; without the entry speed it
+			// would clamp a fast entry down to the shared ceiling on the client only. Both are several
+			// hundred uu/s on the frames a surfing player is watching hardest.
+			Movement->SurfPlaneNormal      = SavedSurfPlaneNormal;
+			Movement->SurfContactRemaining = SavedSurfContactRemaining;
+			Movement->SurfEntrySpeed       = SavedSurfEntrySpeed;
+			Movement->SurfElapsedSeconds   = SavedSurfElapsedSeconds;
+			Movement->SurfPeakSpeed        = SavedSurfPeakSpeed;
 
 			// SPEC v10 §1. Put the right weapon back in the pawn's hand before the move is replayed:
 			// GetMaxSpeed() and all three air ceilings read this bit, so a replay under the wrong one

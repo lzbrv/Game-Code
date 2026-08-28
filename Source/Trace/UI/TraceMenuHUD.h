@@ -231,6 +231,10 @@ protected:
 
 	void DrawMenuRows();
 	void DrawFooter();
+
+	/** WP8.2 — "V 0.1.0" bottom-right, read once from ProjectVersion. The widget mirrors it. */
+	void DrawVersionString();
+
 	void DrawCursor();
 	void DrawTravelOverlay();
 

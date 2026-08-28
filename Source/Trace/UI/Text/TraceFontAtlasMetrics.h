@@ -3,6 +3,7 @@
 //   Content/Trace/UI/Fonts/Source/T_FontAtlas.json   (Light, sha1 2c02bf95f91e4c71efce5a3e684d8d7b03f17af1)
 //   Content/Trace/UI/Fonts/Source/T_FontAtlasBold.json   (Bold, sha1 33bc4c364550c974efe6132585f37947cb1c24ee)
 //   Content/Trace/UI/Fonts/Source/T_FontAtlasHud.json   (Hud, sha1 d84c43da61a35c2590988dfc35c7811065df739c)
+//   Content/Trace/UI/Fonts/Source/T_FontAtlasNames.json   (Names, the FALLBACK face, sha1 bc2f94f389ef7d76779a085c61a660d02fc391c7)
 //
 // THE ONE METRICS SOURCE (spec v22 §A1, two weights by v23 §A3, a third face by v25 §4). Both
 // renderers — the Canvas blitter in TraceCanvasText.cpp and the Slate leaf in
@@ -24,7 +25,10 @@
 //   *** WHAT ONE LAYOUT PASS ACTUALLY REQUIRES, and it is only this: *** the em, the LINE
 //   HEIGHT and the charset. Those three are emitted once, below, and enforced by
 //   import_font_atlas.py's check_weights_agree(), which refuses to write this file if the
-//   sheets ever disagree about them.
+//   WEIGHTS ever disagree about them. *** THE FALLBACK FACE AT THE BOTTOM OF THIS FILE IS
+//   NOT A WEIGHT AND IS NOT BOUND BY THOSE THREE *** — it is never laid out, only dropped
+//   into a line one glyph at a time, so it shares the em and nothing else. See its own
+//   section for what replaces the other two guarantees.
 //
 //   *** ADVANCES ARE NOT SHARED. *** Each face has its own cell table below and its own
 //   widths, because each is rasterised from its own font file. An earlier pass synthesised
@@ -68,7 +72,8 @@ namespace TraceFontAtlasMetrics
 	inline constexpr int32 DefaultWeight = 0;   // Light
 
 	// =============================================================================
-	// SHARED BY EVERY FACE — enforced by the generator, so layout can rely on it
+	// SHARED BY EVERY WEIGHT — enforced by the generator, so layout can rely on it
+	// (the FALLBACK face at the bottom shares only EmSize; see its own banner)
 	// =============================================================================
 
 	/** Em size the sheets were rasterised at. Everything below is in these pixels. */
@@ -82,11 +87,15 @@ namespace TraceFontAtlasMetrics
 	inline constexpr float Ascent     = 95.f;
 	inline constexpr float Descent    = 21.f;
 
+	/** The WEIGHTS' charset — one contiguous block, which is what lets them be indexed by
+	  * subtraction. The fallback face's charset is wider and has holes; it carries its own
+	  * range table rather than a First/Last pair. */
 	inline constexpr int32 FirstCode = 32;
 	inline constexpr int32 LastCode  = 126;
 	inline constexpr int32 NumGlyphs = 95;
 
-	/** One cell, in atlas pixels. Index by (code - FirstCode); the charset is contiguous. */
+	/** One cell, in atlas pixels. For a WEIGHT, index by (code - FirstCode); the weights'
+	  * charset is contiguous. The fallback face uses FallbackCell() instead. */
 	struct FCell
 	{
 		uint16 U;
@@ -398,7 +407,9 @@ namespace TraceFontAtlasMetrics
 
 	struct FFace
 	{
-		/** "Light" / "Bold" / "Hud". The name TraceText::WeightFromName() matches. */
+		/** "Light" / "Bold" / "Hud". The name TraceText::WeightFromName() matches. The
+		  * fallback face reuses this struct and calls itself "Names", but it is NOT in Faces[]
+		  * and WeightFromName() must never return it — nothing may ASK to draw in it. */
 		const TCHAR* Name;
 
 		/** The font file this face was rasterised from. This is what a screenshot caption has to
@@ -416,8 +427,11 @@ namespace TraceFontAtlasMetrics
 		int32 AtlasWidth;
 		int32 AtlasHeight;
 
-		/** THIS face's split of the shared line box. Baseline and CapTop alignment read these;
-		  * Ascent + Descent == LineHeight for every face, which is what the guard enforces. */
+		/** THIS face's split of ITS line box. Baseline and CapTop alignment read these.
+		  * For every WEIGHT, Ascent + Descent == LineHeight — that is what check_weights_agree()
+		  * enforces. THE FALLBACK FACE IS THE EXCEPTION: its box is taller (137 px against 116),
+		  * so its Ascent + Descent does NOT equal LineHeight, and the difference in Ascent is
+		  * exactly the shift that puts a fallback glyph on the drawing face's baseline. */
 		float Ascent;
 		float Descent;
 
@@ -442,5 +456,296 @@ namespace TraceFontAtlasMetrics
 	inline constexpr const FFace& Face(int32 WeightIndex)
 	{
 		return Faces[(WeightIndex >= 0 && WeightIndex < NumWeights) ? WeightIndex : DefaultWeight];
+	}
+
+	// =============================================================================
+	// THE FALLBACK FACE — one glyph at a time, and NOT a weight (UI plan WP12)
+	// =============================================================================
+	//
+	// THE PROBLEM IT SOLVES. The three sheets above are printable ASCII. Every string this
+	// game AUTHORS is inside that set; the one class of string it does not author is a PLAYER
+	// NAME, and a "Björn" arriving over the network used to draw a hole where its ö should be
+	// (it advanced by a space, so at least the row's box stayed honest — but a hole is a hole).
+	//
+	// WHY THE FIX IS A FOURTH SHEET AND NOT MORE CELLS IN THE FIRST THREE. Sofachrome and
+	// Erbaum are licensed for desktop use and this repository is public; rasterising ANOTHER
+	// 96 codepoints of them would deepen exactly the licensing exposure docs/FONTS.md flags.
+	// Lato-Regular.ttf is OFL, its .ttf is already committed, and so is this sheet.
+	//
+	// WHY IT IS NOT A FOURTH ETraceTextWeight. A weight is something a CALLER ASKS FOR, and
+	// nothing should ever ask for this one — it is reached per GLYPH by a codepoint the chosen
+	// face has no cell for. Putting it in the enum would put "Lato" in a UMG dropdown and in
+	// WeightFromName(), which is the two-typefaces defect spec v23 §A4 removed.
+	//
+	// WHAT IT SHARES WITH THE WEIGHTS, AND WHAT IT DOES NOT:
+	//   SHARED:      EmSize. Everything is scaled by (Size / EmSize) and there is one EmSize,
+	//                so a fallback glyph in a correct line comes out the correct size. Enforced
+	//                by import_font_atlas.py's check_fallback().
+	//   NOT SHARED:  the LINE BOX. Lato-Regular.ttf splits 137 px at this em where the weights split 116.
+	//                A fallback glyph is therefore drawn at (weight ascent - fallback ascent)
+	//                px from the line top, which puts its baseline on the line's baseline.
+	//   NOT SHARED:  the CHARSET. 199 codepoints in 9 runs — the C1 block, U+00AD and the
+	//                gaps before the typographic marks are all skipped on purpose. That is why
+	//                this face has a RANGE TABLE and the weights have a FirstCode.
+	//
+	// AND THE ONE THING THAT COULD GO WRONG, MEASURED RATHER THAN ARGUED: a dropped-in glyph
+	// whose ink left the shared line box would collide with the line above or below it in a
+	// multi-line label, silently. This sheet's ink spans rows 17..126 of its own 137 px cell
+	// (MEASURED across all 199 cells), so after the baseline shift it occupies:
+	//     in a Light line (ascent 95): shift -13 px  ->  ink 4..113  inside 0..116
+	//     in a Bold  line (ascent 95): shift -13 px  ->  ink 4..113  inside 0..116
+	//     in a Hud   line (ascent 93): shift -15 px  ->  ink 2..111  inside 0..116
+	// import_font_atlas.py refuses to write this file if any of those rows leaves the box.
+
+	inline constexpr int32 NumFallbackGlyphs = 199;
+	inline constexpr int32 NumFallbackRanges = 9;
+
+	/** One contiguous run of the fallback charset. Cells[FirstIndex + (Code - First)] is the
+	  * cell for Code, for any Code in [First, Last]. */
+	struct FCodeRange
+	{
+		int32 First;
+		int32 Last;
+		int32 FirstIndex;
+	};
+
+	inline constexpr FCodeRange FallbackRanges[NumFallbackRanges] =
+	{
+		{     32,    126,    0 },   // U+0020..U+007E, 95 glyph(s)
+		{    160,    172,   95 },   // U+00A0..U+00AC, 13 glyph(s)
+		{    174,    255,  108 },   // U+00AE..U+00FF, 82 glyph(s)
+		{   8211,   8212,  190 },   // U+2013..U+2014, 2 glyph(s)
+		{   8216,   8217,  192 },   // U+2018..U+2019, 2 glyph(s)
+		{   8220,   8221,  194 },   // U+201C..U+201D, 2 glyph(s)
+		{   8226,   8226,  196 },   // U+2022..U+2022, 1 glyph(s)
+		{   8230,   8230,  197 },   // U+2026..U+2026, 1 glyph(s)
+		{   8364,   8364,  198 },   // U+20AC..U+20AC, 1 glyph(s)
+	};
+
+	inline constexpr FCell FallbackCells[NumFallbackGlyphs] =
+	{
+		{   16,   16,   25,  137 },   //    32  space
+		{   73,   16,   26,  137 },   //    33  !
+		{  131,   16,   36,  137 },   //    34  "
+		{  199,   16,   56,  137 },   //    35  #
+		{  287,   16,   56,  137 },   //    36  $
+		{  375,   16,   77,  137 },   //    37  %
+		{  484,   16,   68,  137 },   //    38  &
+		{  584,   16,   20,  137 },   //    39  '
+		{  636,   16,   26,  137 },   //    40  (
+		{  694,   16,   26,  137 },   //    41  )
+		{  752,   16,   41,  137 },   //    42  *
+		{  825,   16,   56,  137 },   //    43  +
+		{  913,   16,   22,  137 },   //    44  ,
+		{  967,   16,   36,  137 },   //    45  -
+		{ 1035,   16,   23,  137 },   //    46  .
+		{ 1090,   16,   43,  137 },   //    47  /
+		{ 1165,   16,   56,  137 },   //    48  0
+		{ 1253,   16,   56,  137 },   //    49  1
+		{ 1341,   16,   56,  137 },   //    50  2
+		{ 1429,   16,   56,  137 },   //    51  3
+		{ 1517,   16,   56,  137 },   //    52  4
+		{ 1605,   16,   56,  137 },   //    53  5
+		{ 1693,   16,   56,  137 },   //    54  6
+		{ 1781,   16,   56,  137 },   //    55  7
+		{ 1869,   16,   56,  137 },   //    56  8
+		{ 1957,   16,   56,  137 },   //    57  9
+		{   16,  185,   24,  137 },   //    58  :
+		{   72,  185,   25,  137 },   //    59  ;
+		{  129,  185,   56,  137 },   //    60  <
+		{  217,  185,   56,  137 },   //    61  =
+		{  305,  185,   56,  137 },   //    62  >
+		{  393,  185,   43,  137 },   //    63  ?
+		{  468,  185,   80,  137 },   //    64  @
+		{  580,  185,   65,  137 },   //    65  A
+		{  677,  185,   62,  137 },   //    66  B
+		{  771,  185,   64,  137 },   //    67  C
+		{  867,  185,   73,  137 },   //    68  D
+		{  972,  185,   55,  137 },   //    69  E
+		{ 1059,  185,   54,  137 },   //    70  F
+		{ 1145,  185,   70,  137 },   //    71  G
+		{ 1247,  185,   73,  137 },   //    72  H
+		{ 1352,  185,   27,  137 },   //    73  I
+		{ 1411,  185,   41,  137 },   //    74  J
+		{ 1484,  185,   64,  137 },   //    75  K
+		{ 1580,  185,   49,  137 },   //    76  L
+		{ 1661,  185,   89,  137 },   //    77  M
+		{ 1782,  185,   73,  137 },   //    78  N
+		{ 1887,  185,   77,  137 },   //    79  O
+		{   16,  354,   58,  137 },   //    80  P
+		{  106,  354,   77,  137 },   //    81  Q
+		{  215,  354,   60,  137 },   //    82  R
+		{  307,  354,   52,  137 },   //    83  S
+		{  391,  354,   57,  137 },   //    84  T
+		{  480,  354,   71,  137 },   //    85  U
+		{  583,  354,   65,  137 },   //    86  V
+		{  680,  354,   99,  137 },   //    87  W
+		{  811,  354,   62,  137 },   //    88  X
+		{  905,  354,   60,  137 },   //    89  Y
+		{  997,  354,   58,  137 },   //    90  Z
+		{ 1087,  354,   29,  137 },   //    91  [
+		{ 1148,  354,   43,  137 },   //    92  backslash
+		{ 1223,  354,   29,  137 },   //    93  ]
+		{ 1284,  354,   56,  137 },   //    94  ^
+		{ 1372,  354,   44,  137 },   //    95  _
+		{ 1448,  354,   38,  137 },   //    96  `
+		{ 1518,  354,   48,  137 },   //    97  a
+		{ 1598,  354,   54,  137 },   //    98  b
+		{ 1684,  354,   46,  137 },   //    99  c
+		{ 1762,  354,   54,  137 },   //   100  d
+		{ 1848,  354,   51,  137 },   //   101  e
+		{ 1931,  354,   34,  137 },   //   102  f
+		{   16,  523,   50,  137 },   //   103  g
+		{   98,  523,   54,  137 },   //   104  h
+		{  184,  523,   23,  137 },   //   105  i
+		{  239,  523,   23,  137 },   //   106  j
+		{  294,  523,   49,  137 },   //   107  k
+		{  375,  523,   23,  137 },   //   108  l
+		{  430,  523,   79,  137 },   //   109  m
+		{  541,  523,   54,  137 },   //   110  n
+		{  627,  523,   54,  137 },   //   111  o
+		{  713,  523,   54,  137 },   //   112  p
+		{  799,  523,   54,  137 },   //   113  q
+		{  885,  523,   35,  137 },   //   114  r
+		{  952,  523,   42,  137 },   //   115  s
+		{ 1026,  523,   34,  137 },   //   116  t
+		{ 1092,  523,   54,  137 },   //   117  u
+		{ 1178,  523,   50,  137 },   //   118  v
+		{ 1260,  523,   75,  137 },   //   119  w
+		{ 1367,  523,   48,  137 },   //   120  x
+		{ 1447,  523,   49,  137 },   //   121  y
+		{ 1528,  523,   43,  137 },   //   122  z
+		{ 1603,  523,   29,  137 },   //   123  {
+		{ 1664,  523,   24,  137 },   //   124  |
+		{ 1720,  523,   29,  137 },   //   125  }
+		{ 1781,  523,   56,  137 },   //   126  ~
+		{ 1869,  523,   25,  137 },   //   160  no-break space
+		{ 1926,  523,   24,  137 },   //   161  U+00A1  ¡
+		{   16,  692,   56,  137 },   //   162  U+00A2  ¢
+		{  104,  692,   56,  137 },   //   163  U+00A3  £
+		{  192,  692,   56,  137 },   //   164  U+00A4  ¤
+		{  280,  692,   56,  137 },   //   165  U+00A5  ¥
+		{  368,  692,   24,  137 },   //   166  U+00A6  ¦
+		{  424,  692,   48,  137 },   //   167  U+00A7  §
+		{  504,  692,   38,  137 },   //   168  U+00A8  ¨
+		{  574,  692,   80,  137 },   //   169  U+00A9  ©
+		{  686,  692,   35,  137 },   //   170  U+00AA  ª
+		{  753,  692,   41,  137 },   //   171  U+00AB  «
+		{  826,  692,   56,  137 },   //   172  U+00AC  ¬
+		{  914,  692,   80,  137 },   //   174  U+00AE  ®
+		{ 1026,  692,   38,  137 },   //   175  U+00AF  ¯
+		{ 1096,  692,   40,  137 },   //   176  U+00B0  °
+		{ 1168,  692,   56,  137 },   //   177  U+00B1  ±
+		{ 1256,  692,   32,  137 },   //   178  U+00B2  ²
+		{ 1320,  692,   32,  137 },   //   179  U+00B3  ³
+		{ 1384,  692,   38,  137 },   //   180  U+00B4  ´
+		{ 1454,  692,   62,  137 },   //   181  U+00B5  µ
+		{ 1548,  692,   67,  137 },   //   182  U+00B6  ¶
+		{ 1647,  692,   25,  137 },   //   183  U+00B7  ·
+		{ 1704,  692,   38,  137 },   //   184  U+00B8  ¸
+		{ 1774,  692,   32,  137 },   //   185  U+00B9  ¹
+		{ 1838,  692,   39,  137 },   //   186  U+00BA  º
+		{ 1909,  692,   41,  137 },   //   187  U+00BB  »
+		{   16,  861,   70,  137 },   //   188  U+00BC  ¼
+		{  118,  861,   70,  137 },   //   189  U+00BD  ½
+		{  220,  861,   71,  137 },   //   190  U+00BE  ¾
+		{  323,  861,   42,  137 },   //   191  U+00BF  ¿
+		{  397,  861,   65,  137 },   //   192  U+00C0  À
+		{  494,  861,   65,  137 },   //   193  U+00C1  Á
+		{  591,  861,   65,  137 },   //   194  U+00C2  Â
+		{  688,  861,   65,  137 },   //   195  U+00C3  Ã
+		{  785,  861,   65,  137 },   //   196  U+00C4  Ä
+		{  882,  861,   65,  137 },   //   197  U+00C5  Å
+		{  979,  861,   89,  137 },   //   198  U+00C6  Æ
+		{ 1100,  861,   64,  137 },   //   199  U+00C7  Ç
+		{ 1196,  861,   55,  137 },   //   200  U+00C8  È
+		{ 1283,  861,   55,  137 },   //   201  U+00C9  É
+		{ 1370,  861,   55,  137 },   //   202  U+00CA  Ê
+		{ 1457,  861,   55,  137 },   //   203  U+00CB  Ë
+		{ 1544,  861,   27,  137 },   //   204  U+00CC  Ì
+		{ 1603,  861,   27,  137 },   //   205  U+00CD  Í
+		{ 1662,  861,   27,  137 },   //   206  U+00CE  Î
+		{ 1721,  861,   27,  137 },   //   207  U+00CF  Ï
+		{ 1780,  861,   74,  137 },   //   208  U+00D0  Ð
+		{ 1886,  861,   73,  137 },   //   209  U+00D1  Ñ
+		{   16, 1030,   77,  137 },   //   210  U+00D2  Ò
+		{  125, 1030,   77,  137 },   //   211  U+00D3  Ó
+		{  234, 1030,   77,  137 },   //   212  U+00D4  Ô
+		{  343, 1030,   77,  137 },   //   213  U+00D5  Õ
+		{  452, 1030,   77,  137 },   //   214  U+00D6  Ö
+		{  561, 1030,   56,  137 },   //   215  U+00D7  ×
+		{  649, 1030,   77,  137 },   //   216  U+00D8  Ø
+		{  758, 1030,   71,  137 },   //   217  U+00D9  Ù
+		{  861, 1030,   71,  137 },   //   218  U+00DA  Ú
+		{  964, 1030,   71,  137 },   //   219  U+00DB  Û
+		{ 1067, 1030,   71,  137 },   //   220  U+00DC  Ü
+		{ 1170, 1030,   60,  137 },   //   221  U+00DD  Ý
+		{ 1262, 1030,   57,  137 },   //   222  U+00DE  Þ
+		{ 1351, 1030,   56,  137 },   //   223  U+00DF  ß
+		{ 1439, 1030,   48,  137 },   //   224  U+00E0  à
+		{ 1519, 1030,   48,  137 },   //   225  U+00E1  á
+		{ 1599, 1030,   48,  137 },   //   226  U+00E2  â
+		{ 1679, 1030,   48,  137 },   //   227  U+00E3  ã
+		{ 1759, 1030,   48,  137 },   //   228  U+00E4  ä
+		{ 1839, 1030,   48,  137 },   //   229  U+00E5  å
+		{ 1919, 1030,   77,  137 },   //   230  U+00E6  æ
+		{   16, 1199,   46,  137 },   //   231  U+00E7  ç
+		{   94, 1199,   51,  137 },   //   232  U+00E8  è
+		{  177, 1199,   51,  137 },   //   233  U+00E9  é
+		{  260, 1199,   51,  137 },   //   234  U+00EA  ê
+		{  343, 1199,   51,  137 },   //   235  U+00EB  ë
+		{  426, 1199,   23,  137 },   //   236  U+00EC  ì
+		{  481, 1199,   23,  137 },   //   237  U+00ED  í
+		{  536, 1199,   23,  137 },   //   238  U+00EE  î
+		{  591, 1199,   23,  137 },   //   239  U+00EF  ï
+		{  646, 1199,   54,  137 },   //   240  U+00F0  ð
+		{  732, 1199,   54,  137 },   //   241  U+00F1  ñ
+		{  818, 1199,   54,  137 },   //   242  U+00F2  ò
+		{  904, 1199,   54,  137 },   //   243  U+00F3  ó
+		{  990, 1199,   54,  137 },   //   244  U+00F4  ô
+		{ 1076, 1199,   54,  137 },   //   245  U+00F5  õ
+		{ 1162, 1199,   54,  137 },   //   246  U+00F6  ö
+		{ 1248, 1199,   56,  137 },   //   247  U+00F7  ÷
+		{ 1336, 1199,   54,  137 },   //   248  U+00F8  ø
+		{ 1422, 1199,   54,  137 },   //   249  U+00F9  ù
+		{ 1508, 1199,   54,  137 },   //   250  U+00FA  ú
+		{ 1594, 1199,   54,  137 },   //   251  U+00FB  û
+		{ 1680, 1199,   54,  137 },   //   252  U+00FC  ü
+		{ 1766, 1199,   49,  137 },   //   253  U+00FD  ý
+		{ 1847, 1199,   54,  137 },   //   254  U+00FE  þ
+		{ 1933, 1199,   49,  137 },   //   255  U+00FF  ÿ
+		{   16, 1368,   56,  137 },   //  8211  U+2013  –
+		{  104, 1368,   76,  137 },   //  8212  U+2014  —
+		{  212, 1368,   21,  137 },   //  8216  U+2018  ‘
+		{  265, 1368,   20,  137 },   //  8217  U+2019  ’
+		{  317, 1368,   35,  137 },   //  8220  U+201C  “
+		{  384, 1368,   35,  137 },   //  8221  U+201D  ”
+		{  451, 1368,   56,  137 },   //  8226  U+2022  •
+		{  539, 1368,   72,  137 },   //  8230  U+2026  …
+		{  643, 1368,   56,  137 },   //  8364  U+20AC  €
+	};
+
+	/** '?' in the table above — what a codepoint MISSING FROM BOTH sheets draws. A visible
+	  * question mark is the honest answer there; advancing silently is what produced the hole
+	  * this face exists to remove. */
+	inline constexpr int32 FallbackQuestionIndex = 31;
+
+	// Names — Lato-Regular.ttf, ascent 108/descent 29, cap 70 px MEASURED off the 'H' cell's ink rows
+	inline constexpr FFace FallbackFace =
+		{ TEXT("Names"), TEXT("Lato-Regular.ttf"), TEXT("/Game/Trace/UI/Fonts/T_FontAtlasNames.T_FontAtlasNames"), 0.0f, 2048, 2048, 108.f, 29.f, 70.f, FallbackCells };
+
+	/** The index into FallbackCells for @p Code, or INDEX_NONE. Linear over 9 ranges — it
+	  * is only ever reached for a codepoint the DRAWING face already failed to supply, which
+	  * is a handful of glyphs in a player name and never a whole authored string. */
+	inline constexpr int32 FallbackIndexOf(int32 Code)
+	{
+		for (const FCodeRange& Range : FallbackRanges)
+		{
+			if (Code >= Range.First && Code <= Range.Last)
+			{
+				return Range.FirstIndex + (Code - Range.First);
+			}
+		}
+		return INDEX_NONE;
 	}
 }

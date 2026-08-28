@@ -8,12 +8,19 @@
 #include "Engine/World.h"
 #include "EngineUtils.h"                 // TActorIterator
 #include "GameFramework/GameStateBase.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Net/UnrealNetwork.h"
 #include "UObject/ConstructorHelpers.h"
 
 #include "Abilities/TraceAbilityComponent.h"
+#include "Abilities/TraceAbilityTypes.h"   // ETraceCharacterId::Oyster — the id, not the colour
 #include "Abilities/Characters/TraceOysterPoison.h"
+#include "Audio/TraceAudio.h"
+#include "Audio/TraceSoundEvents.h"
 #include "Core/TraceCharacter.h"
+#include "Core/TraceCharacterRoster.h"     // THE accent. See JarColor() below.
+#include "Gameplay/TraceFxBurst.h"
+#include "Gameplay/TraceFxShapes.h"
 #include "HAL/IConsoleManager.h"
 #include "Trace.h"
 #include "TraceSettings.h"
@@ -51,6 +58,20 @@ static TAutoConsoleVariable<int32> CVarOysterLegacyE(
 	     "and poisoning an enemy resets Oyster's E cooldown. 1: restores the pre-v26 behaviour of "
 	     "both, so Trace.Oyster.ETest can be shown failing. Never ship 1."),
 	ECVF_Cheat);
+
+#if !UE_BUILD_SHIPPING
+/**
+ * DEV ONLY. Overrides the jar body's Glow so the value above can be MEASURED off frames rather than
+ * argued about. 0 = use the shipped constant. Latched per jar at build, exactly as ATraceFxBurst
+ * latches its hue headroom — read every frame instead, four jars staged at four values would all
+ * re-write themselves to whatever the CVar said last and produce four identical rungs.
+ */
+static TAutoConsoleVariable<float> CVarOysterJarGlow(
+	TEXT("Trace.Oyster.JarGlow"), 0.f,
+	TEXT("DEV ONLY. >0 overrides the Glow a NEWLY BUILT Oyster jar is tinted at (the collar follows by "
+	     "the fixed lip-to-face ratio). 0 = the shipped, measured value. Used by Trace.Oyster.JarLadder."),
+	ECVF_Cheat);
+#endif
 
 namespace TraceOysterJar
 {
@@ -93,6 +114,145 @@ namespace TraceOysterJar
 	 * not be able to produce that.
 	 */
 	constexpr float MinDetonateDelaySeconds = 1.f / 60.f;
+
+	// =============================================================================================
+	// FX_AUDIO_PLAN §2.6 — THE JAR'S LOOK. Four numbers, and every one of them is argued.
+	// =============================================================================================
+
+	/**
+	 * Oyster's accent — READ FROM THE ROSTER, NOT COPIED, AND THAT IS A BUG FIX AND NOT A REFACTOR.
+	 *
+	 * THE JAR WEARS THE ACCENT AND THE CLOUD WEARS THE SEMANTIC HUE, and they are different colours on
+	 * purpose. §6.2's hue priority is "semantic beats team beats accent": an intact jar is Oyster's
+	 * object and says so in HIS colour; the moment it breaks, what is standing there is POISON and it
+	 * is poison green (ATraceOysterPoisonCloud::CloudColor). One hue per effect, two effects.
+	 *
+	 * *** THIS LINE READ `const FLinearColor JarColor(0.30f, 0.85f, 0.95f, 1.f)` AND CALLED ITSELF
+	 * "Oyster's accent, cyan". IT HAD NOT BEEN HIS ACCENT FOR A WHOLE WAVE. *** When the ten accents
+	 * were re-spaced away from the two team hues, Oyster moved from cyan #95EDF9 (sRGB hue 187.1) to
+	 * deep sea green #6FE5A2 (hue 145.8) — 41.3 degrees — and this copy did not move with him. His
+	 * body wore the green and the object with his name on it lay on the floor in last palette's cyan.
+	 * The sentence that claimed otherwise is the reason nobody noticed: a constant that "is" a fact
+	 * goes stale silently, because nothing is watching it. So the answer is not a better literal, it
+	 * is no literal. Same rule and same shape as the drawn-vs-lethal rule — never a second copy of a
+	 * number something else owns.
+	 *
+	 * TraceCharacterRoster is the owner: it is the table the ten UTraceCharacterDefinition assets are
+	 * generated from and the table the body materials are stamped from, so "equals the roster row" is
+	 * literally "equals Oyster's body". Falls back to white on a roster that did not resolve, which is
+	 * loud rather than subtly wrong. Called twice per jar build, never per frame.
+	 */
+	FLinearColor JarColor()
+	{
+		if (const TraceCharacterRoster::FTraceCharacterEntry* Row =
+			TraceCharacterRoster::Find(static_cast<uint8>(ETraceCharacterId::Oyster)))
+		{
+			return FLinearColor(Row->Accent.R, Row->Accent.G, Row->Accent.B, 1.f);
+		}
+		return FLinearColor::White;
+	}
+
+	/**
+	 * The hue headroom, mirrored from TraceFxBurstFile::EmissiveHueHeadroom.
+	 *
+	 * *** A SECOND COPY OF A NUMBER, AND IT IS DELIBERATE BECAUSE C++ LEAVES NO ALTERNATIVE HERE. ***
+	 * The constant lives in a file-local namespace inside TraceFxBurst.cpp and there is no accessor on
+	 * TraceFxBurst.h, so the jar cannot read it; adding one would put a new symbol on a header half the
+	 * module includes for the sake of one float. What guards it instead is MECHANISED, not a promise:
+	 * release-impl scratch tool w7-looseends/verify_sync.py asserts this constant equals
+	 * TraceFxBurstFile::EmissiveHueHeadroom, and goes red the moment the two drift. If the accessor
+	 * ever appears, delete this and call it.
+	 */
+	constexpr float FxBurstHueHeadroom = 0.70f;
+
+	/**
+	 * T0/T1 border — the jar is an object you range-find against on the floor, not wayfinding.
+	 *
+	 * CONSTANT PER JAR. It never shimmers and it never pulses, and that is the ART_BIBLE §6.3 ruling
+	 * quoted in the header on HasCollarBuilt(): a jar is a lethal volume and §3.3 forbids brightness
+	 * animation on every one of those. Nothing in this file writes Glow twice.
+	 *
+	 * *** IT IS DERIVED FROM THE ACCENT, NOT A LITERAL, AND THAT IS THE FIX FOR A REAL DEFECT. ***
+	 * This was `constexpr float JarGlowShipped = 0.74f`, and the comment below already stated the rule
+	 * the number came from: ATraceFxBurst caps an emissive piece at 0.70 on its BRIGHTEST CHANNEL, so
+	 * the right glow is 0.70 / brightest. It then wrote down the ANSWER for the palette of the day
+	 * (0.70 / 0.95 = 0.737, shipped as 0.74) instead of the arithmetic — the copied-literal bug this
+	 * project keeps being bitten by. When Oyster's accent moved from cyan (brightest 0.95) to deep sea
+	 * green (brightest 0.78), the literal stopped meaning what its own comment said it meant:
+	 *
+	 *     accent x glow, the product the tonemapper actually sees
+	 *       shipped, old accent :  0.95 x 0.74   = 0.703      <- what the ladder below was shot at
+	 *       stale literal, new accent : 0.78 x 0.74 = 0.577   <- 82% of it; by the ladder, val ~0.904
+	 *       DERIVED, new accent : 0.78 x 0.897    = 0.700     <- val ~0.932, the shipped read restored
+	 *
+	 * The arena floor beside a jar measured val 0.916, so at the stale literal the jar would have been
+	 * DIMMER THAN THE FLOOR IT LIES ON — which is the exact rung (0.50) the ladder rejected. Deriving
+	 * it moves the glow 0.74 -> 0.897 and puts the product back on the cap, to three decimals.
+	 *
+	 * THE LADDER, all four rungs in ONE frame on the blue end of the arena — the brightest surface in
+	 * the game, i.e. the worst case for any emissive. HSV, sampled off the jar bodies. *** SHOT ON THE
+	 * PRE-RE-SPACE PALETTE (cyan #95EDF9), AND STILL THE GOVERNING MEASUREMENT, *** for exactly the
+	 * reason TraceFxBurst.cpp gives about its own ladder: what it measures is not a colour, it is the
+	 * rate at which SATURATION is spent as the brightest channel is pushed, and that rate is a property
+	 * of the tonemapper. Read the left column as the product 0.95 x Glow, not as a glow:
+	 *
+	 *     Glow 1.40  (product 1.330)  hue 182.9  sat 0.100  val 0.969   white with a cast; no identity
+	 *     Glow 1.00  (product 0.950)  hue 183.2  sat 0.133  val 0.955
+	 *     Glow 0.74  (product 0.703)  hue 184.1  sat 0.178  val 0.933   <- the product that ships
+	 *     Glow 0.50  (product 0.475)  hue 183.6  sat 0.259  val 0.881   most colour, dimmer than floor
+	 *
+	 * The HUE is right at every rung — it was never the hue that was wrong. The trade is the one
+	 * ATraceFxBurst measured for its own pieces: every step up buys a little brightness and costs a lot
+	 * of COLOUR. Holding the PRODUCT at the cap keeps a readable accent while the jar is still brighter
+	 * than everything around it, whichever accent Oyster is wearing — including a dark one, where a
+	 * fixed glow would have gone invisible. Re-run Trace.Oyster.JarLadder if the HEADROOM is retuned;
+	 * do not re-run it because an accent moved.
+	 *
+	 * FX_AUDIO_PLAN §2.6 says 1.4. It is not 1.4 and never was: at 1.4 the brightest channels are
+	 * pushed past the point where M_TraceNeon's emissive clips in every channel and the jar photographs
+	 * as a WHITE cylinder with a faint cast — the first parade frame sampled at saturation 0.094, i.e.
+	 * the shape perfect and the identity gone. A jar has no MASS carrying the hue the way the slime
+	 * wall's slab does, so if the glow clips there is nothing left that says "Oyster".
+	 */
+	float JarGlowShipped()
+	{
+		const FLinearColor Accent = JarColor();
+		const float Brightest = FMath::Max3(Accent.R, Accent.G, Accent.B);
+		return (Brightest > UE_KINDA_SMALL_NUMBER) ? (FxBurstHueHeadroom / Brightest) : 1.f;
+	}
+
+	/** The collar outranks the body by the arena's own lip-to-face ratio (ART_BIBLE §3.2), preserved
+	  * as a RATIO so a retune of the body's glow carries the collar with it instead of inverting them. */
+	constexpr float CollarGlowRatio = 2.2f / 1.4f;
+
+	/** The bible's ceiling for an FX emissive: 4.2, the smear-head precedent (§3.2). */
+	constexpr float MaxJarGlow = 4.2f;
+
+	/** The Glow a jar built RIGHT NOW gets. The dev override exists only outside Shipping. */
+	float BodyGlowNow()
+	{
+#if !UE_BUILD_SHIPPING
+		const float Override = CVarOysterJarGlow.GetValueOnAnyThread();
+		if (Override > 0.f)
+		{
+			return FMath::Min(Override, MaxJarGlow);
+		}
+#endif
+		return JarGlowShipped();
+	}
+
+	/** §2.6: "thin cylinder r x1.25 of jar" — the flange's radius, as a multiple of the body's. */
+	constexpr float CollarRadiusScale = 1.25f;
+
+	/**
+	 * §2.6 asks for h 6 uu. It is drawn at 8.
+	 *
+	 * ART_BIBLE §3.4: a world-space emissive under 8 uu ACROSS dissolves into dashes under TSR at any
+	 * useful range, and the collar's height is the dimension that carries its read from a player's eye
+	 * (which is above a jar lying on the floor, so the flange is seen edge-on). 6 uu would have been a
+	 * flicker. Same call, same floor, and the same reason as ATraceFxBurst's MinEmissiveRadiusUU.
+	 */
+	constexpr float CollarHeightUU = 8.f;
 }
 
 ATraceOysterJar::ATraceOysterJar()
@@ -130,6 +290,22 @@ ATraceOysterJar::ATraceOysterJar()
 	{
 		Mesh->SetStaticMesh(CylinderFinder.Object);
 	}
+
+	// FX_AUDIO_PLAN §2.6, the Pickler collar. A default subobject on EVERY jar, hidden until
+	// BuildLookIfNeeded decides this one is a Pickler — the same "one actor with a flag" shape the
+	// header argues for, extended to the geometry. Attached to Collision (the root) and NOT to Mesh,
+	// so the body's 0.35 scale does not multiply into the collar's; its size is computed in uu.
+	Collar = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Collar"));
+	Collar->SetupAttachment(Collision);
+	Collar->SetVisibility(false);
+	if (CylinderFinder.Succeeded())
+	{
+		Collar->SetStaticMesh(CylinderFinder.Object);
+	}
+	// Decoration: no collision, no shadow, no overlaps, no navigation. The shared pass, so a future
+	// edit here cannot quietly give a cosmetic flange a collision profile.
+	UTraceFxShapes::ConfigureFxComponent(Collar);
+	Collar->SetCanEverAffectNavigation(false);
 }
 
 void ATraceOysterJar::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -143,6 +319,148 @@ void ATraceOysterJar::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 void ATraceOysterJar::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// On the server bIsPickler is already set by Initialise. On a client it rides the same bunch as
+	// the spawn, so it is normally here too — and when it is not, Tick's call covers it. Both entry
+	// points are idempotent.
+	BuildLookIfNeeded();
+}
+
+// =================================================================================================
+// FX_AUDIO_PLAN §2.6 — the look
+// =================================================================================================
+
+float ATraceOysterJar::MeasureJarRadiusUU() const
+{
+	// MEASURED OFF THE LIVE COMPONENT, not off the 0.35 written in the constructor. The two are the
+	// same today, and that is exactly why this reads the component: the collar is specified as a
+	// MULTIPLE of the jar's radius, so a retune of the body scale that left a hard-coded radius here
+	// would silently detach the flange from the thing it is a flange on.
+	if (Mesh == nullptr)
+	{
+		return 0.f;
+	}
+	return 0.5f * UTraceFxShapes::BasicShapeExtentUU * static_cast<float>(Mesh->GetRelativeScale3D().X);
+}
+
+bool ATraceOysterJar::HasCollarBuilt() const
+{
+	return Collar != nullptr && Collar->IsVisible() && CollarBlend != ETraceFxBlend::None;
+}
+
+FString ATraceOysterJar::DescribeLook() const
+{
+	return FString::Printf(TEXT("jar=%s glow %.2f collar=%s"),
+		UTraceFxShapes::BlendName(JarBlend), BuiltGlow,
+		(Collar != nullptr && Collar->IsVisible()) ? UTraceFxShapes::BlendName(CollarBlend) : TEXT("<none: dash jar>"));
+}
+
+void ATraceOysterJar::BuildLookIfNeeded()
+{
+	// Re-entered whenever the KIND changes, which on a client is the frame bIsPickler lands if it
+	// arrived after the actor did. Everything below is a write of the same values, so a second pass
+	// costs one comparison and produces the identical jar.
+	if (bLookBuilt && bLookIsPickler == bIsPickler)
+	{
+		return;
+	}
+
+	// A dedicated server cooks no shaders, so there is no material to make and nothing to see. The
+	// GEOMETRY is left alone — the collar is decoration and, unlike ATraceSlimewall's slab, no
+	// invariant is asked about it.
+	if (GetNetMode() == NM_DedicatedServer)
+	{
+		bLookBuilt = true;
+		bLookIsPickler = bIsPickler;
+		return;
+	}
+
+	const bool bFirstBuild = !bLookBuilt;
+	bLookBuilt = true;
+	bLookIsPickler = bIsPickler;
+
+	// ---- the body -------------------------------------------------------------------------------
+	//
+	// Made once. The tint never changes and the jar never animates, so re-tinting on a kind change
+	// would be a second write of the same three parameters.
+	if (bFirstBuild && Mesh != nullptr)
+	{
+		JarMID = UTraceFxShapes::MakeGlowMID(Mesh, 0, ETraceFxBlend::Emissive, JarBlend);
+		if (JarMID != nullptr)
+		{
+			// LATCHED: read once, here, and never again for this jar. See CVarOysterJarGlow.
+			BuiltGlow = TraceOysterJar::BodyGlowNow();
+			UTraceFxShapes::SetGlow(JarMID, JarBlend, TraceOysterJar::JarColor(), BuiltGlow);
+		}
+		else
+		{
+			// *** THE BODY IS DRAWN ANYWAY. *** ART_BIBLE §6.1's "None => hide the component" is a rule
+			// about DECORATION, and a jar is not decoration: it is a volume that poisons whoever walks
+			// into it, and an invisible one is a trap rather than an ugly one. This is the identical
+			// call ATraceSlimewall::BuildSlabIfNeeded makes about its slab, for the identical reason,
+			// and the collar below — which IS decoration — takes the opposite branch.
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Oyster] Jar: no FX material resolved, so the body draws with the engine default. It is "
+				     "still lethal, still breakable and still on the same 4 s clock; only the accent is missing."));
+		}
+	}
+
+	// ---- the collar -----------------------------------------------------------------------------
+	if (Collar == nullptr)
+	{
+		return;
+	}
+
+	if (!bIsPickler)
+	{
+		Collar->SetVisibility(false);   // a dash jar is a plain cylinder — ART_BIBLE §6.3, by shape
+		return;
+	}
+
+	const float JarRadiusUU = MeasureJarRadiusUU();
+	if (JarRadiusUU <= KINDA_SMALL_NUMBER)
+	{
+		return;   // no body mesh: there is nothing for a flange to be a flange on
+	}
+
+	const float CollarRadiusUU = JarRadiusUU * TraceOysterJar::CollarRadiusScale;
+
+	// Sat DOWN onto the rim rather than centred on it: the flange occupies the top CollarHeightUU of
+	// the jar's own silhouette, so the Pickler jar is the same height as a dash jar and only its
+	// PROFILE differs. A collar floating above the rim would have changed the height as well, and then
+	// two things would be saying "Pickler" instead of one.
+	const float JarHalfHeightUU = 0.5f * UTraceFxShapes::BasicShapeExtentUU
+		* static_cast<float>(Mesh->GetRelativeScale3D().Z);
+
+	Collar->SetRelativeLocation(FVector(0.f, 0.f, JarHalfHeightUU - 0.5f * TraceOysterJar::CollarHeightUU));
+	Collar->SetRelativeScale3D(FVector(
+		UTraceFxShapes::ShapeScaleForRadiusUU(CollarRadiusUU),
+		UTraceFxShapes::ShapeScaleForRadiusUU(CollarRadiusUU),
+		UTraceFxShapes::ShapeScaleForLengthUU(TraceOysterJar::CollarHeightUU)));
+
+	if (CollarMID == nullptr)
+	{
+		CollarMID = UTraceFxShapes::MakeGlowMID(Collar, 0, ETraceFxBlend::Emissive, CollarBlend);
+	}
+
+	if (CollarMID != nullptr)
+	{
+		UTraceFxShapes::SetGlow(CollarMID, CollarBlend, TraceOysterJar::JarColor(),
+			FMath::Min(BuiltGlow * TraceOysterJar::CollarGlowRatio, TraceOysterJar::MaxJarGlow));
+	}
+
+	// HIDDEN, NOT GREY. The collar is pure decoration, so it takes ART_BIBLE §6.1's ordinary ruling:
+	// an untextured 100 uu default-grey ring around a jar is worse than no ring. The cost of losing it
+	// is that the two jar kinds stop being distinguishable, which is a degradation and not a lie.
+	Collar->SetVisibility(CollarMID != nullptr && CollarBlend != ETraceFxBlend::None);
+
+	UE_LOG(LogTraceGame, Verbose,
+		TEXT("[Oyster] Pickler jar dressed: body r %.1f uu glow %.2f, collar r %.1f uu (x%.2f) h %.0f uu "
+		     "glow %.2f, %s."),
+		JarRadiusUU, BuiltGlow, CollarRadiusUU, TraceOysterJar::CollarRadiusScale,
+		TraceOysterJar::CollarHeightUU,
+		FMath::Min(BuiltGlow * TraceOysterJar::CollarGlowRatio, TraceOysterJar::MaxJarGlow),
+		*DescribeLook());
 }
 
 float ATraceOysterJar::MatchTimeNow() const
@@ -166,12 +484,30 @@ void ATraceOysterJar::Initialise(UTraceAbilityComponent* InSourceComp, ETraceTea
 	LaunchLocation = GetActorLocation();
 	LaunchVelocity = InVelocity;
 
+	// The look depends on bIsPickler, which the line above is the first place to know. On the server
+	// this is what actually raises the collar; on a client Tick does it.
+	BuildLookIfNeeded();
+
 	if (FlightVelocity.IsNearlyZero())
 	{
 		// The dash jar. It is dropped where he is, so it is on the ground from the first frame and
 		// its 4 s starts now.
 		Land();
+		return;
 	}
+
+	// FX_AUDIO_PLAN §2.6 audio row: `OysterPickler` World (server, lob cast).
+	//
+	// HERE AND NOT IN THE KIT, and the reason is that this is the moment the lob EXISTS: Initialise is
+	// the one call that turns a spawned actor into a thrown one, it is server-only, and it runs after
+	// ResolveReleaseLocation has decided where the jar was actually let go of — so the sound is at the
+	// release point rather than at the muzzle the release was clamped back from.
+	//
+	// TraceAudio::Play, i.e. the ordinary table-driven path: `OysterPickler` is declared World-side in
+	// Audio/TraceSoundEvents.cpp, so this multicasts once and every machine (the host included) plays
+	// one copy. It is NOT PlayReplicatedLocal — the jar replicates, but Initialise does not run on a
+	// client, so there is no already-on-every-machine call site here to ride.
+	TraceAudio::Play(this, TraceSoundEvents::OysterPickler);
 }
 
 // =================================================================================================
@@ -181,6 +517,11 @@ void ATraceOysterJar::Initialise(UTraceAbilityComponent* InSourceComp, ETraceTea
 void ATraceOysterJar::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+
+	// BEFORE the authority guard, deliberately. A client's jar IS the mesh, and this is what builds
+	// it: bIsPickler can land a frame or two after the actor on a client, and the collar has to grow
+	// the moment it does. Idempotent and one comparison once it has.
+	BuildLookIfNeeded();
 
 	if (!HasAuthority())
 	{
@@ -483,6 +824,26 @@ void ATraceOysterJar::FireLandingEffect()
 			Candidate->LaunchCharacter(ToJar * PullSpeed, /*bXYOverride*/ true, /*bZOverride*/ true);
 			++PulledCount;
 			TraceOyster::RecordEffect(Candidate, TEXT("Pickler pull"), &TraceOyster::FEffectTally::PicklerPulls);
+
+			// FX_AUDIO_PLAN §2.6, the pull link. ONE PER VICTIM, fired from the line that actually
+			// launched them, so the FX cannot exist for a pull the choke point refused — every `continue`
+			// above is a player who is not yanked and does not get a ring.
+			//
+			// A RING FACING THE JAR RATHER THAN §2.6's LITERAL "cylinder victim->jar", and that is a
+			// deliberate substitution the burst tranche's own handoff offers (W3-FXBURST report §7.5:
+			// "GenericRing is a ring; if you want a link cylinder, draw it in the jar actor"). The
+			// cylinder option requires the jar to know its victims on every machine, i.e. a replicated
+			// victim list on a 0.29 s actor; the ring is the SAME replicated fact (one burst actor per
+			// victim, spawned by the server, drawn and heard identically everywhere) with no new wire
+			// format. Its normal is the pull axis, so it reads as a hoop the victim is being drawn
+			// through — which is the direction information the cylinder was carrying.
+			//
+			// POISONED GREEN, NOT OYSTER CYAN. §6.2's hue priority: the pull is the front half of a
+			// poison event, and GenericRing is the one burst type that takes a tint precisely because
+			// two kits share it.
+			ATraceFxBurst::Burst(WorldPtr, ETraceFxBurstType::GenericRing,
+				Candidate->GetActorLocation(), ToJar, /*RadiusUU*/ 0.f,
+				&ATraceOysterPoisonCloud::GetPoisonedHue());
 		}
 	}
 

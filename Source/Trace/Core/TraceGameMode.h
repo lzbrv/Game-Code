@@ -222,6 +222,19 @@ public:
 	 */
 	void NotifyCharacterDied(ATraceCharacter* Victim, AController* Killer, FName Cause);
 
+	/**
+	 * Where the Core may be dropped when its carrier leaves the match by any route.
+	 *
+	 * Spec v19 §4.1 made "where the carrier was" a place that can be off the map, so every drop
+	 * that is triggered by the carrier disappearing has to ask this first. In bounds it is a no-op
+	 * BY CONSTRUCTION — the clamp is gated on the bounds rule itself, never applied blind (the
+	 * essay inside the function says why that distinction is load-bearing).
+	 *
+	 * Called from NotifyCharacterDied (death) and from Logout (disconnect/bot removal), which are
+	 * the two ways a carrier stops existing. A third one added later belongs here too.
+	 */
+	FVector ClampCoreDropLocation(const FVector& Where) const;
+
 	/** Called by ATraceEndzone when a carrier reaches the opposing endzone. */
 	void NotifyScored(ETraceTeam ScoringTeam);
 
@@ -840,6 +853,24 @@ private:
 
 	/** Every bot this GameMode has spawned. Weak: a bot destroyed elsewhere must not be resurrected. */
 	TArray<TWeakObjectPtr<ATraceBotController>> Bots;
+
+	/**
+	 * Every controller Logout() has already run for. A second call for the same controller returns
+	 * immediately.
+	 *
+	 * RemoveOneBotFromTeam calls Logout(Bot) by hand and then Bot->Destroy(), and
+	 * AController::Destroyed() calls GameMode->Logout(this) a SECOND time for any controller
+	 * carrying a PlayerState — see the essay at that call site. Note the shape: those two calls are
+	 * sequential, not nested, so an "in flight" set that cleared itself on exit would catch nothing.
+	 * The old defence was "every step happens to be idempotent", which is a property of today's body
+	 * rather than a rule the next edit inherits. This set makes it a rule.
+	 *
+	 * Never cleared during a match: a controller that has logged out is destroyed and never logs in
+	 * again, and stale weak pointers are pruned on insert. Weak because the second call arrives from
+	 * AController::Destroyed(), i.e. while the controller is being torn down; the pointer is only
+	 * ever compared, never dereferenced.
+	 */
+	TSet<TWeakObjectPtr<AController>> LogoutsInFlight;
 
 	/** Monotonic, so two bots never share a scoreboard name even after churn. */
 	int32 NextBotNumber = 1;

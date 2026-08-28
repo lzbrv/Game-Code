@@ -186,21 +186,21 @@ namespace
 		GParryDurationOverride,
 		TEXT("OVERRIDE for seconds of TRACE invulnerability granted by a parry (spec v3 3). "
 		     "Negative (default) = use UTraceSettings::ParryDuration."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	FAutoConsoleVariableRef CVarParryCooldown(
 		TEXT("Trace.Parry.Cooldown"),
 		GParryCooldownOverride,
 		TEXT("OVERRIDE for seconds before the carrier may parry again. "
 		     "Negative (default) = use UTraceSettings::ParryCooldown."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	FAutoConsoleVariableRef CVarParryGlowScale(
 		TEXT("Trace.Parry.GlowScale"),
 		GParryGlowScaleOverride,
 		TEXT("OVERRIDE for the emissive multiplier on the red trace while parrying. "
 		     "Negative (default) = use UTraceSettings::ParryGlowScale."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	// =============================================================================================
 	// SPEC v8 §3 — the lag-compensated press. State, switches and the ledger.
@@ -359,7 +359,7 @@ namespace
 		GParryMaxTripHold,
 		TEXT("SPEC v8 §3. Ceiling in seconds on how long a lethal trip is held for a remote carrier's "
 		     "parry to arrive. Also clamped by UTraceSettings::MaxRewindTime."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * DEBUG. Seconds of trip hold to apply to EVERY carrier, including the host's own pawn and bots.
@@ -661,9 +661,10 @@ namespace TraceParry
 		GPressRewindMsTotal += static_cast<double>(RewindSeconds) * 1000.0;
 		GPressRewindMsMax = FMath::Max(GPressRewindMsMax, RewindSeconds * 1000.f);
 
-		// One line per press — a parry is a rare, deliberate act, so this cannot spam — and it is the
-		// evidence for the whole item: how much of the window the network ate, before and after.
-		UE_LOG(LogTraceGame, Display,
+		// One line per press, and it is the evidence for the whole item: how much of the window the
+		// network ate, before and after. At Log since the release pass (B6) — it still lands in every
+		// harness log file, but a retail console does not narrate each parry press.
+		UE_LOG(LogTraceGame, Log,
 			TEXT("[PARRYNET] %s pressed at t=%.3f, packet arrived t=%.3f: rewound %.1fms "
 			     "(ceiling %.0fms of a %.0fms cap%s). window [%.3f..%.3f] (%.0fms), cooldown until %.3f. heldTrips=%d"),
 			*GetNameSafe(Parrier), PressServerTime, ServerNow, RewindSeconds * 1000.f,
@@ -842,9 +843,10 @@ namespace TraceParry
 			if (HeldSoFarSeconds > 0.f)
 			{
 				// The press arrived AFTER the trip it answers. This counter is the item's proof: a
-				// pre-v8 build had already killed this carrier before their packet landed.
+				// pre-v8 build had already killed this carrier before their packet landed. Logged at
+				// Log since the release pass (B6): the counter is the proof, the line is the trace of it.
 				++GLateParrySaveCount;
-				UE_LOG(LogTraceGame, Display,
+				UE_LOG(LogTraceGame, Log,
 					TEXT("[PARRYNET] %s: a trip at t=%.3f was answered by a press that arrived %.0fms later "
 					     "- carrier lives, dasher is punished. (v8 §3; a pre-v8 build killed them here.)"),
 					*GetNameSafe(Carrier), TripServerTime, HeldSoFarSeconds * 1000.f);
@@ -1068,7 +1070,9 @@ namespace TraceParry
 			}
 		}
 
-		UE_LOG(LogTraceGame, Display,
+		// At Log since the release pass (B6): per-parry-kill bookkeeping belongs in the log file, not
+		// on a retail console. The unpaid-refund case above stays a Warning — that one is a real bug.
+		UE_LOG(LogTraceGame, Log,
 			TEXT("[PARRYREFUND] %s (spec v7 §6): parry cooldown %.2fs -> %.2fs | dash charges %d -> %d of %d "
 			     "(%s) | totals: parry resets %d, dash refunds %d, dash refunds owed but unwired %d"),
 			*GetNameSafe(Carrier),
@@ -1132,7 +1136,10 @@ namespace TraceParry
 		const ETrailLethality Lethality = UTraceSettings::Get().TrailLethality;
 		if (Lethality != ETrailLethality::KillsCarrier && Lethality != ETrailLethality::KillsBoth)
 		{
-			UE_LOG(LogTraceGame, Display,
+			// At Log since the release pass (B6): fires per parried dash whenever TrailLethality is
+			// tuned away from carrier kills, so it is per-event chatter under that config. The parry
+			// KILL line below stays at Display — that one explains a death.
+			UE_LOG(LogTraceGame, Log,
 				TEXT("[PARRYKILL] %s parried %s's dash, but TrailLethality=%d means the dash was never "
 				     "lethal to the carrier - nothing to punish (v6 3 [ASSUMPTION])."),
 				*GetNameSafe(Carrier), *GetNameSafe(Dasher), static_cast<int32>(Lethality));

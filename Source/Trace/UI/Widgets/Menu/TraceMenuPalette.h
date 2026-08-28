@@ -74,16 +74,12 @@ namespace TraceMenuStyle
 		return FLinearColor(C.R, C.G, C.B, A);
 	}
 
-	/** Colour that marks each difficulty, so the setting is legible without reading the word. */
-	static FLinearColor DifficultyColor(ETraceBotDifficulty InDifficulty)
-	{
-		switch (InDifficulty)
-		{
-		case ETraceBotDifficulty::Easy: return FLinearColor(0.30f, 1.00f, 0.72f, 1.f);
-		case ETraceBotDifficulty::Hard: return Amber;
-		default:                        return Cyan;
-		}
-	}
+	// DifficultyColor() lived here — mint for EASY, Amber for HARD — "so the setting is legible
+	// without reading the word". RETIRED by the release art bible §2.4 guard rail (menu accents on
+	// one screen come from at most two systems; only team-flavoured values may be amber): both the
+	// DIFFICULTY and SCORING MODE values now render the plain Cyan above, set in
+	// ATraceMenuHUD::BuildRowView for both renderers. Deleted rather than left unused, because an
+	// unused palette function that claims to colour the menu is a lie waiting for a reader.
 
 	static FString DifficultyBlurb(ETraceBotDifficulty InDifficulty)
 	{

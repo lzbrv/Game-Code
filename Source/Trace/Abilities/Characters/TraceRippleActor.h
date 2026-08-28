@@ -36,6 +36,43 @@
 //        material instance rather than a per-instance tint that the basic-shape fallback could not
 //        honour. RoccoRippleStartRingColor / RoccoRippleTrailRingColor are the knobs.
 //
+//        DEMO 13 IS THE CANON HERE and FX_AUDIO_PLAN §2.9 spends it: the start ring is ROCCO AMBER
+//        (his accent — an ability's world actor wears its owner's, ART_BIBLE §6.2) and the trail is
+//        NEUTRAL PALE, the arena's own neon. The bible blesses exactly this split by name. Both
+//        knobs moved in this pass; what did NOT move is the ring Glow, 3.5, which is the bible's
+//        own §3.2 ladder entry for "ripple rings" in the T2 wayfinding band.
+//
+// ===================================================================================================
+// WHAT FX_AUDIO_PLAN §2.9 ADDED, AND THE ONE PLACE ITS WIRING INSTRUCTION COULD NOT BE FOLLOWED
+// ===================================================================================================
+//
+//   START-RING PULSE   0.8 Hz, ±15%. THE ONE PERMITTED GAMEPLAY PULSE in the whole bible (§3.3):
+//                      everything else that breathes is scenery, and nothing that is LETHAL breathes
+//                      at all. This one is allowed because it says "take me here" about an entrance,
+//                      and it is faster than any of the world's pulses so it cannot be mistaken for
+//                      one. Ridden on M_TraceNeon's PulseAmp/PulseRate parameters when the material
+//                      has them, and on a per-frame Glow write when it does not (§2.9 asks for both,
+//                      in that order).
+//   EXPIRY DISSOLVE    the rings fade to nothing over the last 0.3 s instead of vanishing at the
+//                      deadline. Bible §6.4: an effect never pops out. It is COSMETIC ONLY — the
+//                      ride, the entry radius and the destroy are all still governed by the one
+//                      ExpireMatchTime, and a rider who steps in during the fade gets a full ride.
+//   RIDE FX + LOOP     three amber speed lines trailing every rider, and TraceSoundEvents::
+//                      RoccoRideLoop attached to him, on EVERY machine.
+//
+// *** THE RIDE FX ARE NOT ON THE §1.2 ROUTER, AND HERE IS WHY. *** §2.9's hook column says "router
+// edge on the riding flag". There is no such flag and there cannot usefully be one: the router is
+// driven by FTraceAbilityNetState, which belongs to ONE player's ability set, and the rider of a
+// ripple is very often somebody else — §6 says "any character, EITHER TEAM". Rocco's state can say
+// "my ripple is alive"; it cannot say "Slimeball is on it". Putting a riding bit in the RIDER's
+// state instead would mean every one of the ten kits carrying a bit about Rocco's ability.
+//
+// So the FX live HERE, on the replicated actor that already exists on every machine and already
+// knows the path — and each machine works out who is riding from motion it has already received
+// (see UpdateRideFx). That is the same "derive it, do not replicate it" shape ATraceRoxieRocket uses
+// for its trail, it costs no bandwidth, and it is correct for a simulated proxy, which is exactly
+// the case a router edge on Rocco's state would have got wrong.
+//
 // ===================================================================================================
 // THE PREDICTION MODEL, STATED PLAINLY BECAUSE IT IS NOT THE USUAL ONE
 // ===================================================================================================
@@ -61,15 +98,16 @@
 #include "Engine/NetSerialization.h"     // FVector_NetQuantize
 #include "UObject/ObjectPtr.h"
 
+#include "Gameplay/TraceFxShapes.h"      // ETraceFxBlend — stored per piece, so it must be complete
+
 #include "TraceRippleActor.generated.h"
 
 class APlayerState;
 class ATraceCharacter;
+class UAudioComponent;
 class UInstancedStaticMeshComponent;
 class UMaterialInstanceDynamic;
-class UMaterialInterface;
 class USceneComponent;
-class UStaticMesh;
 
 /**
  * One live ripple: a straight path through the world that anybody may ride once, plus its rings.
@@ -86,6 +124,7 @@ public:
 	ATraceRippleActor();
 
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void Tick(float DeltaSeconds) override;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
@@ -124,6 +163,34 @@ public:
 	/** The reason the last entry attempt for @p Candidate was refused, for the harness's logs. */
 	static const TCHAR* DescribeEntryRefusal(const ATraceCharacter* Candidate, const APlayerState* Source);
 
+	// --- FX_AUDIO_PLAN §2.9 queries, for Trace.Rocco.FxTest and for anybody debugging a dark ripple -
+
+	/** "start=Emissive trail=Emissive ride=Additive" — the achieved blends, for the log. */
+	FString DescribeBlends() const;
+
+	/** How many ring beads are registered for drawing, both components together. ZERO MEANS INVISIBLE. */
+	int32 GetDrawnBeadCount() const;
+
+	/** How many pawns this machine is currently drawing ride FX for. May exceed GetRiderCount() on a proxy. */
+	int32 GetPresentedRiderCount() const;
+
+	/**
+	 * The most pawns this machine has EVER presented at once, for the whole life of this ripple.
+	 *
+	 * *** A PEAK AND NOT A SNAPSHOT, BECAUSE A RIDE IS SHORTER THAN A HARNESS'S REACTION TIME. ***
+	 * A 378 uu path at 1,190 uu/s is over in a third of a second; the first version of
+	 * Trace.Rocco.FxTest sampled GetPresentedRiderCount() half a second after staging a rider and
+	 * read zero for two riders who had come and gone — reporting a working feature as dead. This
+	 * counter cannot be missed by sampling late.
+	 */
+	int32 GetPeakPresentedRiderCount() const { return PeakPresentedRiders; }
+
+	/** True when the start ring's pulse is being carried by M_TraceNeon rather than by a per-frame write. */
+	bool IsPulseInMaterial() const { return bPulseInMaterial; }
+
+	/** 0..1 cosmetic fade applied to every ring right now. 1 until the last 0.3 s, then down to 0. */
+	float GetDissolveAlpha() const;
+
 protected:
 	/** REPLICATED. The entrance. */
 	UPROPERTY(Replicated)
@@ -161,6 +228,17 @@ protected:
 	UPROPERTY(Transient)
 	TObjectPtr<UInstancedStaticMeshComponent> TrailRingMesh = nullptr;
 
+	/**
+	 * §2.9's ride FX: three amber speed lines per rider, all of them instances of ONE component.
+	 *
+	 * On the actor rather than attached to the rider, which is a budget decision as well as a
+	 * lifetime one: §1.4 allows four attached loop primitives PER PAWN across every kit, and a ride
+	 * that spent three of them would leave a Lily riding a ripple unable to draw her own flight aura.
+	 * Instances here cost the rider nothing and cannot outlive their pawn, because they are not on it.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInstancedStaticMeshComponent> RideFxMesh = nullptr;
+
 private:
 	/** One rider's progress along the path, on this machine. */
 	struct FRippleRider
@@ -175,6 +253,15 @@ private:
 	/** Who has already ridden. ONE RIDE PER PLAYER PER RIPPLE — see the [ASSUMPTION] in the .cpp. */
 	TArray<TWeakObjectPtr<ATraceCharacter>> LifetimeRiders;
 
+	/** One pawn this machine is DRAWING a ride for, and the loop sound attached to it. */
+	struct FPresentedRider
+	{
+		TWeakObjectPtr<ATraceCharacter> Pawn;
+
+		/** TraceSoundEvents::RoccoRideLoop, started locally by StartLoopOn. Faded out on exit. */
+		TWeakObjectPtr<UAudioComponent> Loop;
+	};
+
 	/** Server + local-prediction half of Tick. */
 	void UpdateRides(float DeltaSeconds);
 
@@ -187,23 +274,50 @@ private:
 	/** Adds one ring of instances to @p Mesh, centred on @p Center, in the plane normal to the path. */
 	void AddRing(UInstancedStaticMeshComponent* Mesh, const FVector& Center, const FVector& Direction) const;
 
+	/**
+	 * §2.9's ride FX + ride loop, on EVERY machine. Cosmetic only; writes no gameplay state.
+	 *
+	 * Works out who is visibly riding from information this machine already has — the replicated path
+	 * and each pawn's own motion — rather than from a flag nobody replicates. See the header for why
+	 * that is not a shortcut but the only correct answer for a rider who may be any character.
+	 */
+	void UpdateRideFx();
+
+	/** True when @p Candidate's motion says it is being carried by THIS path right now. Pure. */
+	bool LooksLikeRiding(const ATraceCharacter* Candidate) const;
+
+	/** Fades out and forgets every ride loop. Called on expiry and on EndPlay. */
+	void StopAllRideLoops();
+
+	/** Pushes hue and brightness into one ring's MID, honouring its achieved blend. */
+	void SetRingGlow(UMaterialInstanceDynamic* MID, ETraceFxBlend Blend, const FLinearColor& Color,
+	                 float Intensity) const;
+
 	/** The match clock. Identical to the ability component's. */
 	float MatchTimeNow() const;
 
 	bool bRingsBuilt = false;
 
-	UPROPERTY(Transient)
-	TObjectPtr<UStaticMesh> BeadMesh = nullptr;
+	/** True once the start ring's PulseAmp/PulseRate were accepted by the material. See the header. */
+	bool bPulseInMaterial = false;
 
-	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInterface> NeonMaterial = nullptr;
+	/** Who this machine is drawing speed lines and playing the ride loop for. */
+	TArray<FPresentedRider> PresentedRiders;
 
-	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInterface> FallbackMaterial = nullptr;
+	/** The high-water mark of the above. See GetPeakPresentedRiderCount. */
+	int32 PeakPresentedRiders = 0;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> StartRingMID = nullptr;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> TrailRingMID = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> RideFxMID = nullptr;
+
+	/** The achieved blends, one per piece. None means "hidden", never "grey". */
+	ETraceFxBlend StartRingBlend = ETraceFxBlend::None;
+	ETraceFxBlend TrailRingBlend = ETraceFxBlend::None;
+	ETraceFxBlend RideFxBlend = ETraceFxBlend::None;
 };

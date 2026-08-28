@@ -32,6 +32,8 @@
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceEndzone.h"
 #include "Gameplay/TraceHealthComponent.h"
+#include "Gameplay/TraceMelee.h"          // RESTRUCTURE E3: ETraceEquippedWeapon, for the SMG band
+#include "Gameplay/TraceParry.h"          // RESTRUCTURE E4: RequestParry, the one parry entry point
 #include "Gameplay/TraceTrailComponent.h"
 #include "Gameplay/TraceWeaponComponent.h"
 #include "Movement/TraceCharacterMovementComponent.h"
@@ -199,21 +201,76 @@ namespace TraceBotConstants
 	/**
 	 * SPEC v6 section 4.2. Minimum shot quality a bot will take at goal when it is NOT about to die.
 	 *
-	 * 0.08 on the 0..1 ShotScore scale, i.e. "no further out than about 92% of what the Core can
-	 * physically carry to the hoop". The gate exists because the cost of missing changed: a thrown
-	 * Core that hits the ground now turns over to the nearest enemy, and a shot released at the edge
-	 * of range lands in front of the goal it was aimed at, which is the single worst place to hand a
-	 * defender the Core. Under pressure it is waived - a shot thrown a moment before dying is still
-	 * better than being killed holding it, because a kill hands the Core over just as surely.
+	 * 0.08 on the 0..1 ShotScore scale. The score is 1 - GoalDistance/Reach and Reach is
+	 * MaxThrowRange() ALREADY multiplied by ThrowRangeSafetyFraction, so the gate reads "no further
+	 * out than 92% of the range this bot is willing to use", which is 92% x 85% = 78% of what the
+	 * Core can physically carry to the hoop. The gate exists because the cost of missing changed: a
+	 * thrown Core that hits the ground now turns over to the nearest enemy, and a shot released at
+	 * the edge of range lands in front of the goal it was aimed at, which is the single worst place
+	 * to hand a defender the Core. Under pressure it is waived - a shot thrown a moment before dying
+	 * is still better than being killed holding it, because a kill hands the Core over just as surely.
 	 *
-	 * MEASURED, AND WHY IT IS 0.08 AND NOT MORE. The first value tried was 0.22, and it was wrong for
-	 * a reason worth recording: spec v6 §4.3 moved the goal 2400 uu further away (into the back wall
-	 * instead of on the goal line) AND 1100 uu up, and throwing at a target that high costs range -
-	 * the Core's ballistic maximum falls from ~5150 uu flat to ~3300 uu at the hoop's height after
-	 * the safety fraction. A verified shot from 2600 uu therefore scores only 0.15, and 0.22 refused
-	 * it: the scenario's step 5 measured "a throw did NOT leave" against a bot that had a good shot.
-	 * At 0.08 only the last 8% of a range that is already short is refused, which is the ragged edge
-	 * this is meant to trim and not the shot itself.
+	 * *** THE RANGE NUMBERS BELOW ARE RE-DERIVED AT PATCH 28 §4 (CoreThrowSpeed 3300 -> 2900), AND
+	 * *** THE ONES THAT WERE HERE BEFORE WERE NEVER RIGHT.
+	 *
+	 * This comment used to read "the Core's ballistic maximum falls from ~5150 uu flat to ~3300 uu at
+	 * the hoop's height after the safety fraction". Neither figure matches any base this game has
+	 * shipped - not 2900, not the 3300 it was left at, and not the 3000 it was written against, whose
+	 * true pair is 7357/6365. It was wrong when it was written and stayed wrong through two retunes,
+	 * which is exactly why the numbers are shown with their inputs from here on.
+	 *
+	 * MaxThrowRange() solves over launch ANGLE, so it is a LOFTED maximum and is far larger than the
+	 * flat-throw figure [ModeB] core weight prints (3237 uu today). At the shipped mode-B tuning -
+	 * CoreThrowSpeed 2900 / sqrt(CoreMassScale 1.8) = 2161.5 uu/s, up bias 0.12 x 1.8^1.5 = 0.2898,
+	 * gravity -980 x 0.55 x 1.8 = -970.2 uu/s^2 - and against the hoop, whose centre sits 1264 uu up
+	 * while a standing pawn's eye is at 88 + 64 = 152 uu, i.e. a height delta of +1112 uu:
+	 *
+	 *                              level with the thrower      to the hoop (+1112 uu)
+	 *     ballistic maximum              6874 uu                    5878 uu
+	 *     x ThrowRangeSafetyFraction     5843 uu                    4997 uu  <- Reach
+	 *     x 0.92, i.e. this gate                                    4597 uu  <- shoots inside this
+	 *
+	 * At the 3300 base those last two were 6728 and 6190 uu.
+	 *
+	 * *** SO PATCH 28 SHORTENED THE SHOOTING WINDOW BY ~1600 uu, AND THAT IS NOT A PAPER RESULT: IT
+	 * *** BROKE Trace.ModeB.Verify STEP 5, WHICH IS THIS BRANCH'S OWN ACCEPTANCE TEST.
+	 *
+	 * Step 5 places a carrier 4800 uu off its goal mouth - at (11680, 600) with the hoop's ring at
+	 * (16800, 0, 1264) - and demands a goal BY THROWING. Measured twice per arm on ONE binary, with
+	 * Trace.ModeB.ThrowSpeed 3300 as the before arm: *** shipped 2900 FAILS twice (9 PASS / 1 FAIL),
+	 * the same binary at 3300 PASSES twice (10 PASS / 0 FAIL). *** Every other step passes in both
+	 * arms, which is what makes the attribution clean. The arithmetic says why, and it is not
+	 * marginal:
+	 *
+	 *     aim point   = ring centre - ring axis x 200 = (17000, 0, 1264)   [200 uu THROUGH the hoop]
+	 *     distance    = |(11680,600) -> (17000,0)|    = 5354 uu
+	 *     Reach today = 4997 uu   -> OUT OF RANGE by 357 uu, the shot is never scored
+	 *     Reach @3300 = 6728 uu   -> in range at once, ShotScore 0.20, comfortably over this gate
+	 *
+	 * And running closer no longer rescues it. Approaching head-on the shot becomes legal at X 12442
+	 * (0.92 x Reach from the aim point) while CarryInCommitDistance latches the carry-in at X 12643
+	 * (4200 uu from the ring) - a *** 201 uu window, about 0.2 s at a carrier's 976 uu/s ***, which is
+	 * inside the bot's own reaction delay and aim slew. At the 3300 base the same two lines were
+	 * 1800 uu apart.
+	 *
+	 * *** DO NOT "FIX" THIS BY LOWERING THIS GATE. *** 0.08 is a ragged-edge trim and the shot at 4800
+	 * uu is not near the edge of range, it is beyond it - a gate of 0.0 would still refuse it. The two
+	 * honest levers are CarryInCommitDistance (a design number, currently 4200) and the mode-B tuning
+	 * itself; the third option is that a 2900 uu/s Core simply means bots shoot from closer, in which
+	 * case step 5's standoff is what should move.
+	 *
+	 * WHY IT IS 0.08 AND NOT MORE. The first value tried was 0.22 and it refused shots the scenario
+	 * expected to see: spec v6 §4.3 moved the goal 2400 uu further away and 1100 uu up, and throwing
+	 * at a target that high costs range, so scores that used to be comfortable came out small. At 0.08
+	 * only the last 8% of a range that is already short is refused, which is the ragged edge this is
+	 * meant to trim and not the shot itself.
+	 *
+	 * ONE HISTORICAL CLAIM IS DELETED RATHER THAN RE-DERIVED, because it was later disproved. This
+	 * comment used to say that step 5 of the mode-B scenario measured "a throw did NOT leave" because
+	 * a 2600 uu shot scored under the gate. TraceCoreHarness.cpp established the real cause when the
+	 * step was moved to 4800: UpdateThrow returns early while bCommitCarryIn is set, and at 2600 uu
+	 * the bot was inside CarryInCommitDistance and correctly RUNNING IT IN. The step was never
+	 * refusing a shot. Do not re-tune this gate against that story.
 	 */
 	static constexpr float ThrowAtGoalMinScore = 0.08f;
 
@@ -698,7 +755,7 @@ static TAutoConsoleVariable<int32> CVarTraceBotAutoCharacter(
 	TEXT("   UTraceAbilityComponent::ServerSetCharacter, not here.\n")
 	TEXT("0: this poll never fires. A bot §2 has not yet reached stays characterless and every bot\n")
 	TEXT("   ability decision short-circuits at 'no character', which is an independent red arm."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /**
  * SPEC v28 §6's RED ARM — "the bots just stand on top of a locked out core".
@@ -1917,7 +1974,9 @@ void ATraceBotController::Tick(float DeltaSeconds)
 		if (bCompleted)
 		{
 			TRACE_BOT_KIT(PassCompletions);
-			UE_LOG(LogTraceGame, Display, TEXT("[BotPass] %s -> %s COMPLETED (hover hold)"),
+			// Verbose since RESTRUCTURE E5 (audit A4): a per-pass line is a steady stream in a
+			// 10-bot match. The countable evidence lives on in the opt-in [BotKit] dump.
+			UE_LOG(LogTraceGame, Verbose, TEXT("[BotPass] %s -> %s COMPLETED (hover hold)"),
 				*GetNameSafe(GetPlayerState<APlayerState>()),
 				*GetNameSafe(Receiver->GetPlayerState<APlayerState>()));
 		}
@@ -1928,6 +1987,21 @@ void ATraceBotController::Tick(float DeltaSeconds)
 	// SPEC v15 §3. Between the behaviours and the aim, for the ordering argument on UpdateAbilities().
 	UpdateAutoCharacter();
 	UpdateAbilities(DeltaSeconds);
+
+	// RESTRUCTURE tranche E (E4). After GatherWorldState (it reads LiveEnemies and the carrier
+	// mirror) and independent of the combat aim: a parry is a status window, not a crosshair job.
+	if (const UWorld* ParryWorld = GetWorld())
+	{
+		UpdateParryMinimum(static_cast<float>(ParryWorld->GetTimeSeconds()));
+	}
+
+	// RESTRUCTURE tranche D5. BEFORE UpdateCombat, and the order is the rule: UpdateWeaponMinimum
+	// (the SMG band) runs inside UpdateCombat and defers to whatever the knife band left in the
+	// hands, so the knife band has to have decided first. See UpdateKnifeBand's header block.
+	if (const UWorld* KnifeWorld = GetWorld())
+	{
+		UpdateKnifeBand(BotCharacter, static_cast<float>(KnifeWorld->GetTimeSeconds()));
+	}
 
 	UpdateCombat(DeltaSeconds);
 	UpdateMovementTech(DeltaSeconds);
@@ -2267,10 +2341,11 @@ void ATraceBotController::ResolveAttackEndzone()
 			TRACE_BOT_KIT(EndzoneFlips);
 		}
 
-		// Display, not Verbose, and deliberately one line per bot per flip. Ten lines at half time is
-		// not spam, it is the proof that all ten players turned round — which is the single piece of
-		// evidence this pass was asked for that cannot be inferred from anything else.
-		UE_LOG(LogTraceGame, Display,
+		// Verbose since RESTRUCTURE E5 (audit A4). This spent its dev life at Display — one line per
+		// bot per flip was the proof all ten players turned round at half time — but for ship the
+		// per-bot stream goes below the default verbosity; the [BotKit] endzone counters (opt-in)
+		// still carry the half-time evidence, and a measurement run raises LogTraceGame to Verbose.
+		UE_LOG(LogTraceGame, Verbose,
 			TEXT("[BotEndzone] %s (team %d) %s attacking endzone at X=%.0f Y=%.0f (side %+.0f)"),
 			*GetNameSafe(GetPlayerState<APlayerState>()),
 			static_cast<int32>(MyTeam),
@@ -3696,7 +3771,9 @@ void ATraceBotController::UpdatePass(float DeltaSeconds)
 		PassPhase = ETraceBotPassPhase::Holding;
 		PassPhaseStartTime = Now;
 
-		UE_LOG(LogTraceGame, Display, TEXT("[BotPass] %s -> %s: input DOWN, shield dropped [%s]"),
+		// Verbose since RESTRUCTURE E5 (audit A4): every pass line-up in a 10-bot match wrote this
+		// into every player's log. [BotKit]'s pass counters (opt-in) keep the mechanic countable.
+		UE_LOG(LogTraceGame, Verbose, TEXT("[BotPass] %s -> %s: input DOWN, shield dropped [%s]"),
 			*GetNameSafe(GetPlayerState<APlayerState>()),
 			*GetNameSafe(Receiver->GetPlayerState<APlayerState>()),
 			bCoreDriven ? TEXT("ATraceCore::RequestPassInput") : TraceBotPawnAPI::PassBindingName(Binding));
@@ -3775,11 +3852,37 @@ namespace TraceThrowBallistics
 	 * (it is Speed * sqrt(1 + bias^2 + 2*bias*sin(pitch))), so the closed form is a quartic and is not
 	 * worth writing. Bisection on a monotone residual is.
 	 */
+	/**
+	 * *** EVERY MEMBER INITIALISER BELOW IS DEAD, AND IS LABELLED RATHER THAN CORRECTED. ***
+	 *
+	 * An FModel is never used as constructed. The struct has exactly three CONSUMER sites in this file
+	 * - SolveThrowLaunch, MaxThrowRange and HasThrowLane - and every one of them assigns the result of
+	 * MakeThrowModel(). The only other instance in the tree is MakeThrowModel's own local, and it
+	 * writes ALL THREE fields, from ATraceCore::GetThrowSpeed(), GetThrowUpBias() and
+	 * GetThrowGravityZ(), before returning. No path reads a field MakeThrowModel has not written.
+	 *
+	 * WHY THEY ARE LEFT AS NUMBERS AND NOT DELETED: a default-constructible aggregate is what lets
+	 * MakeThrowModel be written as "make one, fill it in, return it", and zeroes here would turn the
+	 * one bug this could ever cause - somebody adding a fourth construction site that forgets
+	 * MakeThrowModel - from a wrong answer into a divide-by-nothing. Numbers in the right ballpark
+	 * fail loudly enough to be found and are inert until then.
+	 *
+	 * WHY THEY ARE NOT DERIVED: ATraceCore::GetThrowSpeed() reads UTraceSettings and the CVar layer,
+	 * so putting it in a default member initialiser would run a settings lookup on every construction
+	 * of a struct that is about to be overwritten anyway, and would make a plain aggregate depend on
+	 * subsystem init order. MakeThrowModel is the single place that resolves the live model and it
+	 * stays that way.
+	 *
+	 * THE NUMBERS ARE STALE, WHICH IS THE POINT OF SAYING SO. 2236 was CoreThrowSpeed 3000 after the
+	 * weight model; the base has since gone 3000 -> 3300 -> 2900 (Patch 28 §4) and the live value is
+	 * 2161.5 uu/s. Nothing was recomputed here because nothing here is read - if these ever start
+	 * mattering, that is the bug, not the values.
+	 */
 	struct FModel
 	{
-		float Speed = 2236.f;      // uu/s along the aim direction
-		float UpBias = 0.29f;      // extra world-up, as a fraction of Speed
-		float GravityZ = -970.f;   // signed, uu/s^2
+		float Speed = 2236.f;      // INERT placeholder - MakeThrowModel overwrites it. Live: 2161.5 uu/s.
+		float UpBias = 0.29f;      // INERT placeholder - MakeThrowModel overwrites it. Live: 0.2898.
+		float GravityZ = -970.f;   // INERT placeholder - MakeThrowModel overwrites it. Live: -970.2.
 	};
 
 	/**
@@ -4109,6 +4212,11 @@ bool ATraceBotController::HasThrowLane(const FVector& From, const FVector& World
 			// NAMED, at Display, and only while the metrics harness is on. "blocked=18 of 18" is a
 			// symptom that looks identical whether the arc is clipping a cover box, the goal frame or
 			// the floor under the bot's own feet, and those want completely different fixes.
+			//
+			// Guarded for Shipping (RESTRUCTURE E, found by the tranche-A prove-shipping build):
+			// TraceBotTelemetry only exists in dev builds, and this was the one call into it outside
+			// the dev blocks.
+#if !UE_BUILD_SHIPPING
 			const float NowSeconds = static_cast<float>(World->GetTimeSeconds());
 			if (TraceBotTelemetry::Enabled() && NowSeconds >= NextThrowLaneLogTime)
 			{
@@ -4119,6 +4227,7 @@ bool ATraceBotController::HasThrowLane(const FVector& From, const FVector& World
 					*GetNameSafe(Hit.GetActor()), *GetNameSafe(Hit.GetComponent()),
 					*Hit.ImpactPoint.ToCompactString());
 			}
+#endif
 			return false;
 		}
 		Previous = Point;
@@ -4233,7 +4342,9 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 			TRACE_BOT_KIT(ThrowsToTeammate);
 		}
 
-		UE_LOG(LogTraceGame, Display,
+		// Verbose since RESTRUCTURE E5 (audit A4), like the CHARGING line below: throws happen every
+		// few seconds of mode B. The [BotKitB] throw counters (opt-in) stay the countable evidence.
+		UE_LOG(LogTraceGame, Verbose,
 			TEXT("[BotThrow] %s RELEASED at %s (%s) after a %.2fs charge (x%.2f of full power)"),
 			*GetNameSafe(GetPlayerState<APlayerState>()),
 			bThrowAtGoal ? TEXT("the GOAL") : (PassReceiver.IsValid()
@@ -4287,11 +4398,15 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 		// Three things were wrong and all three are fixed here.
 		//
 		//  (a) THE RANGE WAS NOT A RANGE. "HalfFieldLength() * 0.55" is 9240 uu on this pitch, and it
-		//      is a fact about the map rather than about the Core: the light Core carried ~5000 uu on
-		//      a flat throw, the heavy one carries ~3400. So the gate simultaneously let through
-		//      shots that could not physically arrive AND, because the carrier is usually much
-		//      further out than 9240 on a 33600 uu field, refused every shot that could. It is now
-		//      MaxThrowRange() — the Core's own ballistics, at the goal's own height.
+		//      is a fact about the map rather than about the Core: on a FLAT throw the pre-weight
+		//      Core carried ~5000 uu and the heavy one ~3400, both at the 3000 base this was measured
+		//      at. (Patch 28 §4 has since taken the base to 2900, so the heavy flat throw is ~3240
+		//      today — the figure [ModeB] core weight prints every run. The ARGUMENT is unchanged and
+		//      the gap it describes only got wider.) So the gate simultaneously let through shots
+		//      that could not physically arrive AND, because the carrier is usually much further out
+		//      than 9240 on a 33600 uu field, refused every shot that could. It is now
+		//      MaxThrowRange() — the Core's own ballistics, at the goal's own height, and a LOFTED
+		//      maximum rather than a flat one: 4997 uu to the hoop after the safety fraction.
 		//  (b) THE AIM WAS FLAT. The elevation was a first-order drop correction with no solution for
 		//      the loft that actually extends a throw. Aiming UP roughly doubles the reachable
 		//      distance, which is the difference between "the goal is never in range" and "the goal
@@ -4616,7 +4731,8 @@ void ATraceBotController::UpdateThrow(float DeltaSeconds)
 	PassPhaseStartTime = Now;
 	ThrowChargeReleaseTime = Now + HoldSeconds;
 
-	UE_LOG(LogTraceGame, Display,
+	// Verbose since RESTRUCTURE E5 (audit A4) — the per-throw stream named at RESTRUCTURE :4619.
+	UE_LOG(LogTraceGame, Verbose,
 		TEXT("[BotThrow] %s CHARGING for %s (%s) - %.0f uu away, x%.2f power, holding %.2fs, aim error %.1fdeg"),
 		*GetNameSafe(GetPlayerState<APlayerState>()),
 		bThrowAtGoal ? TEXT("the GOAL") : (PassReceiver.IsValid()
@@ -4681,10 +4797,12 @@ void ATraceBotController::UpdateCarryInCommit()
 			CarryInCommitTime = Now;
 			TRACE_BOT_KIT(CarryInCommits);
 
-			// Display, not Verbose. This project has twice declared a working mechanic dead because
-			// its only log line was below the default verbosity, and "bots never carry it in" was
-			// exactly that kind of claim. It fires a handful of times a match, which is not spam.
-			UE_LOG(LogTraceGame, Display,
+			// Verbose since RESTRUCTURE E5 (audit A4). This line spent its dev life at Display
+			// because this project has twice declared a working mechanic dead when its only log line
+			// sat below the default verbosity — and that history is why the evidence now lives in
+			// the CarryInCommits counter on the opt-in [BotKitB] dump, which a measurement run reads
+			// without ten bots writing prose into every shipped player's log.
+			UE_LOG(LogTraceGame, Verbose,
 				TEXT("[BotCarryIn] %s COMMITTED to running it in, %.0f uu from the mouth"),
 				*GetNameSafe(GetPlayerState<APlayerState>()), Distance);
 		}
@@ -4707,7 +4825,8 @@ void ATraceBotController::UpdateCarryInCommit()
 	{
 		bCommitCarryIn = false;
 		TRACE_BOT_KIT(CarryInAbandoned);
-		UE_LOG(LogTraceGame, Display,
+		// Verbose since RESTRUCTURE E5 (audit A4); counted in CarryInAbandoned on the opt-in dump.
+		UE_LOG(LogTraceGame, Verbose,
 			TEXT("[BotCarryIn] %s gave up after %.1fs, still %.0f uu out"),
 			*GetNameSafe(GetPlayerState<APlayerState>()), Now - CarryInCommitTime, Distance);
 	}
@@ -5594,6 +5713,11 @@ void ATraceBotController::UpdateCombat(float DeltaSeconds)
 
 	ATraceCharacter* CurrentTarget = bWantsToAim ? ShootTarget.Get() : nullptr;
 
+	// RESTRUCTURE tranche E (E3): with this tick's live target known, hold the right firearm for
+	// the range. After the early-outs above on purpose — a crosshair that belongs to a pass, a pull
+	// or an aimed ability is mid-commitment and a weapon swap would serve nothing this tick.
+	UpdateWeaponMinimum(BotCharacter, CurrentTarget, Now);
+
 	// --- Reaction clock -------------------------------------------------------------------------
 	// Restarted whenever the target changes, so flanking a bot genuinely buys you its whole reaction
 	// window rather than nothing.
@@ -5805,6 +5929,379 @@ void ATraceBotController::UpdateCombat(float DeltaSeconds)
 			Now + FMath::FRandRange(
 				FMath::Max(0.f, Profile.BurstRestMin),
 				FMath::Max(0.f, Profile.BurstRestMax)));
+	}
+}
+
+// -------------------------------------------------------------------------------------------------
+// RESTRUCTURE tranche D5 — THE KNIFE BAND, ARRIVED.
+//
+// This was UTraceWeaponComponent::TickBotKnife(), and its own declaration said where it belonged:
+// "TEMPORARY, AND HONESTLY SO. This belongs in ATraceBotController's state machine ... but that file
+// is another ownership slice this pass." It is that file now, and the note is discharged. The rule
+// itself is unchanged, line for line: the same engage/disengage band, the same Trace.Knife.BotAuto
+// switch, the same four-decisions-a-second cadence, the same dual-wield collapse, the same swing.
+//
+// WHAT THE MOVE DID CHANGE, AND IT IS THE POINT. The old version ran from the WEAPON's tick, on
+// every pawn the server owned, and had to ask "is this thing a bot?" by looking at the controller
+// and rejecting APlayerControllers. Here the answer is structural: this IS the bot controller, so a
+// human's weapon choice is theirs by construction and a remote human's server-side proxy never
+// reaches this code at all. Practice-range targets are possessed by ATracePracticeDummyController,
+// which is not this class, so after the move they can NEVER draw a blade — the Demo 19 item 2 rule
+// enforced by the type system rather than by a bool. The bool is still checked below anyway; see
+// the autonomy paragraph on it.
+//
+// ORDERING WITH THE SMG BAND IS DELIBERATE. Tick calls this immediately before UpdateCombat, and
+// UpdateWeaponMinimum (the SMG band, tranche E3) runs inside UpdateCombat and defers to whatever
+// this left in the hands — `if (Weapon->IsKnifeEquipped()) return;`. Run the other way round the two
+// rules would wrestle for the pullout and the bot would hold neither weapon. The knife band
+// outranks the SMG band inside its own range; that was the contract when they lived in two files
+// and it is enforced by the call order now that they live in one.
+// -------------------------------------------------------------------------------------------------
+
+void ATraceBotController::UpdateKnifeBand(ATraceCharacter* BotCharacter, float Now)
+{
+	if (BotCharacter == nullptr || !BotCharacter->IsAlive() || BotCharacter->IsCarrier())
+	{
+		return;
+	}
+
+	UTraceWeaponComponent* Weapon = BotCharacter->FindComponentByClass<UTraceWeaponComponent>();
+	if (Weapon == nullptr)
+	{
+		return;
+	}
+
+	// *** DEMO 19 ITEM 2: "Don't let the bots attack." ***
+	//
+	// FIRST, before the cvar and before anything is measured, because this is a statement about the
+	// BODY rather than about the feature. A practice-range target is possessed by a controller that
+	// steers nothing and presses nothing — and the old weapon-side version of this rule never asked
+	// the controller what it wanted. It fired for every pawn that is not player-controlled, so the
+	// range's five stationary targets were drawing the blade and swinging it at anyone who came
+	// within 153 uu: which is exactly the distance you have to close to knife one.
+	//
+	// KEPT AFTER THE MOVE, EVEN THOUGH THE RANGE'S DUMMIES CANNOT REACH THIS CODE ANY MORE. The bit
+	// is a property of the PAWN — "this body is a target" — and it travels with the body, so any
+	// future non-player controller that is a bot controller inherits the refusal for free. Deleting
+	// it would make the rule depend on a class hierarchy nobody promised to keep.
+	// See UTraceWeaponComponent::SetAutonomousAttacksAllowed.
+	if (!Weapon->AreAutonomousAttacksAllowed())
+	{
+		return;
+	}
+
+	if (!TraceMelee::IsBotAutoKnifeEnabled())
+	{
+		return;
+	}
+
+	// Four decisions a second, not sixty. The pullout is 0.2 s, so a bot re-deciding every frame at
+	// a range boundary would live permanently inside a swap and never hold either weapon.
+	if ((Now - LastBotSwapDecisionTime) < 0.25f)
+	{
+		return;
+	}
+	LastBotSwapDecisionTime = Now;
+
+	if (Weapon->IsDeploying())
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	// Nearest living enemy who is not the carrier. Carriers are excluded because they are immune to
+	// the knife — chasing one with a blade out would be a bot committing to a weapon that cannot
+	// touch its target, which is worse than not using the knife at all.
+	//
+	// STILL A WORLD ITERATION RATHER THAN LiveEnemies, deliberately: the gathered list is filtered by
+	// the bot's own vision and range rules, and this band's question is purely geometric ("is a
+	// stabbable body within 153 uu"). Reusing the vision-filtered list would silently add a
+	// line-of-sight condition the spec never asked for and would change the shipped behaviour, which
+	// this move is not allowed to do.
+	// NOT the controller's cached MyTeam member, and not a slip: this reads the team off the PAWN at
+	// the moment of the decision, exactly as the rule did when it lived on the weapon component.
+	// GatherWorldState refreshes the cached copy from the same place and they will normally agree,
+	// but "normally" is not a thing a behaviour-preserving move gets to rely on. (The local also has
+	// to be named apart from the member — MSVC treats the shadow as C4458 and this project builds
+	// shadowing as an error; see Trace.Build.cs.)
+	const ETraceTeam BandTeam = BotCharacter->GetTeam();
+	double NearestDistanceSq = TNumericLimits<double>::Max();
+	ATraceCharacter* Nearest = nullptr;
+
+	for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+	{
+		ATraceCharacter* Candidate = *It;
+		if (Candidate == nullptr || Candidate == BotCharacter || !Candidate->IsAlive() || Candidate->IsCarrier())
+		{
+			continue;
+		}
+		if (BandTeam != ETraceTeam::None && Candidate->GetTeam() == BandTeam)
+		{
+			continue;
+		}
+
+		const double DistanceSq = FVector::DistSquared(Candidate->GetActorLocation(), BotCharacter->GetActorLocation());
+		if (DistanceSq < NearestDistanceSq)
+		{
+			NearestDistanceSq = DistanceSq;
+			Nearest = Candidate;
+		}
+	}
+
+	const double Engage = TraceMelee::GetBotEngageRangeUU();
+	const double Disengage = TraceMelee::GetBotDisengageRangeUU();
+
+	// =============================================================================================
+	// [DUALWIELD] SPEC v28 §10 — A BOT NO LONGER TRADES ITS GUN FOR A KNIFE, BECAUSE IT DOES NOT
+	// HAVE TO.
+	// =============================================================================================
+	//
+	// The whole of the v10 §1 range band below exists to answer one question: is it worth being
+	// unarmed for a moment in exchange for the knife's +22% and its 100-damage back-stab? Under the
+	// switch that trade does not exist — the blade is always in the off hand, the speed bonus is
+	// deliberately not paid (see ShouldUseKnifeMovementProfile), and putting the gun away would be a
+	// pure loss. So the rule collapses to its second half: keep shooting, and stab whatever walks
+	// into reach.
+	//
+	// THIS IS ALSO WHAT KEEPS THE BOTS PLAYTESTING THE FEATURE, which is the standing requirement on
+	// this rule ("Bots must use it, or it will not be playtested"). It runs on the same
+	// four-times-a-second authority tick and the same IsInSwingRange predicate it always did, so the
+	// melee half of dual-wield is still exercised by every bot match. Trace.Knife.BotAuto 0 still
+	// switches it off, and Trace.Knife.DualWield 0 restores the band.
+	if (TraceMelee::IsDualWieldEnabled())
+	{
+		if (Nearest != nullptr && TraceMelee::IsInSwingRange(BotCharacter, Nearest))
+		{
+			// StartSwing re-checks every gate, so this is a request rather than an assertion — and the
+			// 0.5 s cooldown paces it with no timer here. Note the shooting lockout in CanFire() means
+			// a bot that swings genuinely stops shooting for the animation, exactly as a player does,
+			// so the rule is measured on bots too rather than only on the local human.
+			Weapon->StartSwing();
+		}
+		return;
+	}
+
+	// The band IS the rule: inside Engage the +22% makes the knife the correct chase tool, outside
+	// Disengage it is not, and the gap between them is what stops a bot at the boundary thrashing.
+	if (!Weapon->IsKnifeEquipped())
+	{
+		if (NearestDistanceSq <= Engage * Engage)
+		{
+			Weapon->RequestEquip(ETraceEquippedWeapon::Knife);
+		}
+		return;
+	}
+
+	if (NearestDistanceSq > Disengage * Disengage)
+	{
+		Weapon->RequestEquip(ETraceEquippedWeapon::Gun);
+		return;
+	}
+
+	// AND THEN ACTUALLY SWING IT. Spec v10 §1: "Bots must use it, or it will not be playtested" —
+	// "at minimum swap to the knife to close distance AND swing in range".
+	//
+	// THIS BRANCH IS WHY THE FEATURE GETS PLAYTESTED AT ALL, and it was missing on the first
+	// measured pass: bots swapped to the knife 7 times in a 45 s headless match and swung ZERO
+	// times, with no refusals logged because StartSwing was simply never reached. The swap half of
+	// the rule was implemented and the swing half was not, which reads in-game as bots jogging at
+	// people with a blade out and politely declining to use it.
+	//
+	// A BOT CANNOT INHERIT THE HUMAN PATH HERE, and that is still true now that the rule lives in
+	// the controller. A human swings because DoFirePressed routes a held trigger into StartSwing;
+	// this controller's shooting logic reasons about GUN range and line of sight and has no reason
+	// to hold fire at 150 uu. So the knife band drives its own swing, exactly as it drives its own
+	// swap, rather than waiting for UpdateCombat to happen to pull the trigger at knife range.
+	//
+	// StartSwing re-checks every gate (alive, not carrying, not dashing, deployed, off cooldown), so
+	// this is a request and not an assertion; the 0.5 s cooldown paces it without a timer here.
+	if (Nearest != nullptr && TraceMelee::IsInSwingRange(BotCharacter, Nearest))
+	{
+		Weapon->StartSwing();
+	}
+}
+
+void ATraceBotController::UpdateWeaponMinimum(ATraceCharacter* BotCharacter, const ATraceCharacter* CurrentTarget, float Now)
+{
+	// Four decisions a second, for the knife band's own reason (the 0.2 s pullout).
+	if (Now < NextWeaponBandTime)
+	{
+		return;
+	}
+	NextWeaponBandTime = Now + 0.25f;
+
+	// A carrier's weapon is unavailable for the whole carry; asking would only collect refusals.
+	if (BotCharacter == nullptr || !BotCharacter->IsAlive() || BotCharacter->IsCarrier())
+	{
+		return;
+	}
+
+	UTraceWeaponComponent* Weapon = BotCharacter->FindComponentByClass<UTraceWeaponComponent>();
+	if (Weapon == nullptr || Weapon->IsDeploying())
+	{
+		return;
+	}
+
+	// THE KNIFE BAND OUTRANKS THIS RULE INSIDE ITS OWN RANGE. UpdateKnifeBand — above in this file
+	// since RESTRUCTURE D5, and called from Tick immediately before UpdateCombat so its decision is
+	// already in the hands by the time this runs — holds the blade out inside its engage/disengage
+	// band, and a second rule wrestling the hands would put the bot permanently mid-pullout. While
+	// the blade is out, ask for nothing; the band itself swaps back to the Gun when its target walks
+	// away, and this rule picks up from there.
+	if (Weapon->IsKnifeEquipped())
+	{
+		return;
+	}
+
+	// The band: the SMG's own falloff cliff (Demo.25 — full 33/18/12 inside it, 24/15/10 past it),
+	// read from the knob the damage table itself uses rather than copied. The disengage edge adds a
+	// flat hysteresis margin — 1,100 uu at the shipped 800 — mirroring the knife band's
+	// engage/disengage design so a target strafing on the cliff cannot make the bot thrash.
+	const float SmgBand = FMath::Max(1.f, UTraceSettings::Get().SmgFalloffStartUU);
+	const float GunBand = SmgBand + 300.f;
+
+	const float TargetDist = (CurrentTarget != nullptr && CurrentTarget->IsAlive())
+		? static_cast<float>(FVector::Dist(BotCharacter->GetActorLocation(), CurrentTarget->GetActorLocation()))
+		: TNumericLimits<float>::Max();
+
+	// RequestEquipIfDifferent is the idempotent entry point — re-asking is free, and "already
+	// holding it" returns false without touching the legality gates — so the band can simply state
+	// its preference each evaluation and only a real swap does anything.
+	if (TargetDist <= SmgBand)
+	{
+		if (Weapon->RequestEquipIfDifferent(ETraceEquippedWeapon::Smg))
+		{
+			// Display for the same reason the [BotAbility] E presses are: this is the evidence that
+			// the SMG is played at all, it fires only on the band's edges, and RESTRUCTURE E6 greps
+			// a soak for it.
+			UE_LOG(LogTraceGame, Display, TEXT("[BotWeapon] %s drew the SMG (target %.0f uu, inside the falloff cliff)"),
+				*GetNameSafe(GetPlayerState<APlayerState>()), TargetDist);
+		}
+	}
+	else if (TargetDist > GunBand)
+	{
+		if (Weapon->RequestEquipIfDifferent(ETraceEquippedWeapon::Gun))
+		{
+			UE_LOG(LogTraceGame, Verbose, TEXT("[BotWeapon] %s went back to the pistol (target %.0f uu)"),
+				*GetNameSafe(GetPlayerState<APlayerState>()),
+				(TargetDist < TNumericLimits<float>::Max()) ? TargetDist : -1.f);
+		}
+	}
+}
+
+void ATraceBotController::UpdateParryMinimum(float Now)
+{
+	// Carrier-only: the parry IS the carrier mechanic (a non-carrier press is refused NotCarrying).
+	ATraceCharacter* BotCharacter = GetBotCharacter();
+	if (BotCharacter == nullptr || !bIAmCarrier || !BotCharacter->IsAlive())
+	{
+		ParryPressTime = 0.f;
+		return;
+	}
+
+	// Normal/Hard only. Easy stays parry-less on purpose — difficulty legibility: the parry is a
+	// counter-read, and a newcomer's first matches should be winnable by dashing the trace without
+	// the trace fighting back.
+	if (UTraceSettings::GetBotDifficulty() == EBotDifficulty::Easy)
+	{
+		ParryPressTime = 0.f;
+		return;
+	}
+
+	// THE READ: somebody is dashing AT me. Velocity above what walking can produce (1.25x the
+	// WalkSpeed ceiling the movement component is clamped to) and pointed within 35 degrees of the
+	// bearing to this pawn, from inside detection range.
+	const FVector MyLocation = BotCharacter->GetActorLocation();
+	constexpr float DetectRadiusUU = 1500.f;
+	const float DashSpeedFloor = 1.25f * FMath::Max(1.f, UTraceSettings::Get().WalkSpeed);
+	const float ConeCos = FMath::Cos(FMath::DegreesToRadians(35.f));
+
+	bool bDasherInbound = false;
+	for (const ATraceCharacter* Enemy : LiveEnemies)
+	{
+		if (Enemy == nullptr || !Enemy->IsAlive())
+		{
+			continue;
+		}
+		if (FVector::DistSquared(MyLocation, Enemy->GetActorLocation()) > FMath::Square(DetectRadiusUU))
+		{
+			continue;
+		}
+
+		const FVector Velocity = Enemy->GetVelocity();
+		if (Velocity.Size() <= DashSpeedFloor)
+		{
+			continue;
+		}
+
+		const FVector ToMe = (MyLocation - Enemy->GetActorLocation()).GetSafeNormal();
+		if (ToMe.IsNearlyZero() || FVector::DotProduct(Velocity.GetSafeNormal(), ToMe) < ConeCos)
+		{
+			continue;
+		}
+
+		bDasherInbound = true;
+		break;
+	}
+
+	// A LATCHED INTENT IS DELIVERED, not re-litigated. A dash is 0.18 s (DashSpeed x DashDuration)
+	// and the parry window is 0.175 s, while the profile reaction delay is most of a second — so a
+	// rule that requires the dasher to STILL be mid-dash when the delay expires can never press at
+	// all (measured: 35 trace dashes, 0 parry attempts in a 6-minute Normal soak). The human
+	// behaviour being modelled is the flinch-parry: you see the dive, you parry a beat later, and
+	// what the window actually catches is the NEXT dash of the volley — chasers hold and refill
+	// charges, so the dives come in runs. The carrier/difficulty gates above still clear a stale
+	// intent when the situation genuinely ends (Core lost, death).
+	if (ParryPressTime > 0.f)
+	{
+		if (Now < ParryPressTime)
+		{
+			return;   // still reacting — hold the intent.
+		}
+		// fall through to the press below.
+	}
+	else
+	{
+		if (!bDasherInbound || Now < NextParryEvalTime)
+		{
+			return;
+		}
+
+		// First sight of the dasher: latch the intent and roll the standard reaction delay. A
+		// frame-one parry is both robotic and unfair; this is the same roll the trigger pays per
+		// acquisition.
+		const FTraceBotProfile& Profile = UTraceSettings::GetBotProfile();
+		const float Jitter = FMath::Clamp(Profile.ReactionJitterFraction, 0.f, 0.95f);
+		const float PersonalityScale = 1.35f - 0.7f * PersonalitySkillBias;
+		ParryPressTime = Now + FMath::Max(0.05f, Profile.ReactionTimeSeconds)
+			* PersonalityScale
+			* FMath::FRandRange(1.f - Jitter, 1.f + Jitter);
+		return;
+	}
+
+	// THE PRESS, through the one entry point a human's bind reaches. RequestParry re-checks every
+	// rule (alive, carrying, cooldown), so this is a request rather than an assertion.
+	ParryPressTime = 0.f;
+
+	ETraceParryRefusal Refusal = ETraceParryRefusal::None;
+	if (TraceParry::RequestParry(BotCharacter, &Refusal))
+	{
+		// Display for the E6 soak grep, and rare by construction: carrier-only, cooldown-limited.
+		UE_LOG(LogTraceGame, Display, TEXT("[BotParry] %s parried an inbound dash"),
+			*GetNameSafe(GetPlayerState<APlayerState>()));
+		NextParryEvalTime = Now + 0.75f;
+	}
+	else
+	{
+		// A refused ask is dropped, not retried same-tick: hesitate before reading the field again.
+		UE_LOG(LogTraceGame, Verbose, TEXT("[BotParry] %s parry refused (%s)"),
+			*GetNameSafe(GetPlayerState<APlayerState>()), LexToString(Refusal));
+		NextParryEvalTime = Now + 0.75f;
 	}
 }
 

@@ -485,12 +485,14 @@ public:
 	/** True while the Core is deliberately out of play (see KickoffTo). */
 	bool IsOutOfPlay() const { return bOutOfPlay; }
 
+#if !UE_BUILD_SHIPPING
 	/**
 	 * Server, diagnostics only (Trace.Core.GoalRepro). Arms the spec v10 §10 reproduction: teleport
 	 * the current holder deep into the attacking end, then — after a staging delay long enough for a
 	 * 40 ms client to have seen them there — fire the SAME KickoffTo() a scored goal fires.
 	 */
 	bool RequestGoalRepro();
+#endif // !UE_BUILD_SHIPPING
 
 	// =============================================================================================
 	// MODE B — scoring mode, the throw, the loose Core, the goals
@@ -1321,6 +1323,7 @@ public:
 
 	static FThrowMomentumSample LastThrow;
 
+#if !UE_BUILD_SHIPPING
 	/**
 	 * Server, diagnostics only (Trace.ModeB.MomentumTest). Three throws by the current holder — at a
 	 * dead stop, at a full run, and airborne with a jump's vertical velocity — printed with their
@@ -1361,6 +1364,7 @@ public:
 	 * not a fact about the throw rule and must never be reported as one.
 	 */
 	void RunRunningThrowTest();
+#endif // !UE_BUILD_SHIPPING
 
 	// --- Pass input ------------------------------------------------------------------------------
 
@@ -1716,6 +1720,7 @@ private:
 	/** Server. Ticks the pass state machine: acquire, validate, complete, cancel. */
 	void ServerTickPass(float DeltaSeconds);
 
+#if !UE_BUILD_SHIPPING
 	/**
 	 * Server, diagnostics only, throttled to 10 Hz and gated on Trace.PassStats.
 	 *
@@ -1724,6 +1729,7 @@ private:
 	 * cannot drift from the game.
 	 */
 	void SamplePassAvailabilityStats();
+#endif // !UE_BUILD_SHIPPING
 
 	/**
 	 * Server. Forgets the held mouse1 latch WITHOUT a release having been heard.
@@ -2176,6 +2182,7 @@ private:
 	/** Rebuilds GoalBoxes from the registrations, or from the endzone volumes when there are none. */
 	void RefreshGoalVolumes(bool bForce);
 
+#if !UE_BUILD_SHIPPING
 	/**
 	 * Server, mode B, DIAGNOSTICS ONLY (Trace.ModeB.Verify).
 	 *
@@ -2264,6 +2271,7 @@ private:
 	/** Throttle for TickFlightLog. Local to each machine; nothing about it is replicated. */
 	float NextFlightLogTime = 0.f;
 	bool bFlightLogWasLoose = false;
+#endif // !UE_BUILD_SHIPPING
 
 	// =============================================================================================
 	// SPEC v10 §10 — the teleport funnel, and the audit that proved what was actually wrong
@@ -2292,6 +2300,7 @@ private:
 	 */
 	void PlaceHolderlessCore();
 
+#if !UE_BUILD_SHIPPING
 	/**
 	 * EVERY MACHINE, diagnostics only (Trace.Core.TeleportAudit).
 	 *
@@ -2337,6 +2346,7 @@ private:
 	 * state it owns.
 	 */
 	bool bMomentumTestRun = false;
+#endif // !UE_BUILD_SHIPPING
 
 	/**
 	 * Called when the observed scoring mode changes. Normalises anything the new mode cannot
@@ -2680,6 +2690,7 @@ private:
 	/** Whether the at-rest probe established the pending landing (feeds RestProbeRescues). */
 	bool bPendingTurnoverByRestProbe = false;
 
+#if !UE_BUILD_SHIPPING
 	// --- SPEC v13 §8: the mid-air turnover reproduction. Diagnostics only. --------------------------
 	//
 	// Armed with Trace.ModeB.TurnoverRepro <shots>, from -ExecCmds as well as the console for the
@@ -2729,6 +2740,7 @@ private:
 	 * @return the run length in uu (0 when the surface is too small to graze).
 	 */
 	double MeasureTopFaceExtent(const FVector& FromPoint, FVector& OutDirection) const;
+#endif // !UE_BUILD_SHIPPING
 
 	/** Previous frame's holder position, so the mode-B carry-in test is swept rather than sampled. */
 	FVector LastCarrierGoalTestLocation = FVector::ZeroVector;
@@ -2768,6 +2780,7 @@ private:
 	bool bAppliedModeB = false;
 	bool bModeEverApplied = false;
 
+#if !UE_BUILD_SHIPPING
 	// --- Trace.ModeB.Verify scenario state (diagnostics only) --------------------------------------
 
 	int32 VerifyStep = -1;
@@ -2892,6 +2905,7 @@ private:
 	int32 VerifyPassCount = 0;
 	int32 VerifyFailCount = 0;
 	int32 VerifyGoalsAtStart = 0;
+#endif // !UE_BUILD_SHIPPING
 
 	/**
 	 * What the LAST GrantTo actually decided about the turnover grace, recorded by GrantTo itself.
@@ -3086,15 +3100,17 @@ public:
 	// =============================================================================================
 	// SPEC v32 §7b — WHAT Trace.Core.ArtShots HAS TO BE ABLE TO ASK.
 	//
-	// NOT behind #if !UE_BUILD_SHIPPING, unlike the staging function these sit beside. All three are
-	// const one-liners over state this class already keeps, and the harness that calls them is itself
-	// compiled unguarded in this file; adding a guard here would make a shipping build fail on a line
-	// that has nothing to do with shipping.
+	// Behind #if !UE_BUILD_SHIPPING since the release-hygiene pass: the ArtShots/FxProbe harness that
+	// calls these is now itself guarded out of Shipping, so the original reason these were left
+	// unguarded ("the harness that calls them is compiled unguarded in this file") no longer holds.
+	// They are still const one-liners over state this class already keeps; no shipping code reads any
+	// of them (grep-verified at the time of the pass).
 	//
 	// The v31 harness named each frame by the state it REQUESTED. These let it name the frame by the
 	// state the Core is actually in on the frame the shutter fires, which is the only thing a
 	// screenshot is evidence about.
 	// =============================================================================================
+#if !UE_BUILD_SHIPPING
 
 	/** "rest" / "flight" / "carried". Never null; safe for a filename. */
 	static const TCHAR* DebugArtStateName(ETraceCoreArtState State);
@@ -3128,6 +3144,7 @@ public:
 	 */
 	float GetDebugPickupHaloOpacity() const { return ArtHaloAppliedOpacity; }
 	float GetDebugThrownTrailOpacity() const { return ArtTrailAppliedOpacity; }
+#endif // !UE_BUILD_SHIPPING
 };
 
 

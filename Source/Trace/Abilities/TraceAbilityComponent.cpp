@@ -22,6 +22,11 @@
 #include "Net/UnrealNetwork.h"
 
 #include "Abilities/TraceCharacterAbilitySet.h"
+#include "AIController.h"                 // FX plan §1.6.1 — the bot control arm of Trace.Fx.AudioApiTest
+#include "Audio/TraceAudio.h"             // FX plan §1.6.4 — Trace.Fx.SyncTest's loop-attach proof
+#include "Sound/SoundAttenuation.h"       // ... and §1.6.5's two shapes, measured
+#include "Audio/TraceSoundEvents.h"       // ... and the event it attaches
+#include "Components/AudioComponent.h"    // ... and the handle it checks
 #include "Abilities/TraceAbilityWorldSubsystem.h"
 #include "Abilities/Characters/TraceAbilitySetSlimeball.h"   // v24 §4: Trace.FireRate.Measure arms the stuck passive
 #include "Core/TraceCharacter.h"
@@ -33,6 +38,11 @@
 #include "Gameplay/TraceHealthComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+// FX/AUDIO plan §7.1/§7.2 — the refusal toast and the V row. The toast is DRAWN by the HUD; this
+// file only produces it, at the three places a press is refused. See TraceAbilityToast below.
+#include "Core/TracePlayerController.h"
+#include "UI/TraceHUD.h"
+#include "Abilities/Characters/TraceAbilitySetRoxie.h"   // the §7.2 capture fixture only — see the arm
 
 // =================================================================================================
 // THE RED ARM.
@@ -190,6 +200,25 @@ static bool IsBotPreemptArmedOff()
 // state that the next OnRep silently reverts. Deliberately shared and deliberately never read.
 static FTraceAbilityNetState GNonAuthorityScratchState;
 
+#if !UE_BUILD_SHIPPING
+// =================================================================================================
+// FX ROUTER COUNTERS (FX_AUDIO_PLAN §1.1) — dev only, and they are EVIDENCE rather than telemetry.
+//
+// The two router virtuals ship empty until the per-kit tranches fill them, so "did the router run"
+// cannot be answered by looking at the screen this wave. These two integers can be: a bot match that
+// ends with Syncs == 0 has a router that never saw a first sight, and one with Edges == 0 has a
+// router that is not being driven by the 20 Hz tick. Trace.Fx.EdgeReport prints them.
+//
+// Process-wide rather than per-component on purpose: a component dies with its PlayerState, and the
+// question these answer is about the ROUTER, not about one player.
+// =================================================================================================
+namespace TraceAbilityFxRouterStats
+{
+	static int32 Syncs = 0;
+	static int32 Edges = 0;
+}
+#endif
+
 // =================================================================================================
 // Construction / lifetime
 // =================================================================================================
@@ -263,6 +292,23 @@ void UTraceAbilityComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 	if (AbilitySet != nullptr)
 	{
 		AbilitySet->TickAbilities(DeltaTime);
+	}
+
+	// FX_AUDIO_PLAN §1.1 — AUTHORITY PARITY. The host is the machine every one of these matches is
+	// judged on, and it is the machine that receives no OnRep at all.
+	//
+	// The authority never gets OnRep_AbilityState from the network: it wrote the property. Two things
+	// already cover part of that gap — MarkNetStateDirty() calls the OnRep by hand for every write
+	// that goes through the ability framework, and RebuildAbilitySet() syncs a freshly built set — but
+	// neither covers a field a kit wrote without marking it, or a state that changed while the set was
+	// still null. This tick closes it for all of them, and it is the ONLY router call a dedicated
+	// server ever makes.
+	//
+	// Cost: one struct compare per player per tick at 20 Hz (TickInterval = 0.05 s, set in this
+	// component's constructor), and the worst case for a host-side edge is that same 50 ms late.
+	if (HasAuthorityOwner())
+	{
+		RouteNetStateEdges();
 	}
 }
 
@@ -461,6 +507,26 @@ void UTraceAbilityComponent::ServerSetCharacter(ETraceCharacterId NewCharacter)
 	UE_LOG(LogTraceGame, Display, TEXT("[Ability] %s: %s -> %s (cooldown untouched: %.2fs remaining)."),
 		*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(Previous),
 		TraceCharacterIdToString(CharacterId), GetActivatedCooldownRemaining());
+
+	// SPEC v19 §3 — THE NEW CHARACTER'S MAX HEALTH APPLIES TO THE BODY THAT IS ALREADY STANDING
+	// THERE. UTraceHealthComponent::GetMaxHealth() reads the override live, but current Health is
+	// only written at spawn and on a full heal, so without this a pawn that switched to Lily kept
+	// 100 health against a 60 maximum until the first bullet snapped it.
+	//
+	// AN APPENDED CALL, NOT AN EDIT TO THE RULES ABOVE: everything that decides WHETHER the switch
+	// happens has already run and has already returned on every refusal, so this line only ever sees
+	// a character that actually changed. The clamp itself is downward-only, so switching away from
+	// Lily is not a free heal — see ReclampToMax.
+	if (const APlayerState* OwningState = GetOwningPlayerState())
+	{
+		if (const APawn* OwningPawn = OwningState->GetPawn())
+		{
+			if (UTraceHealthComponent* HealthComponent = OwningPawn->FindComponentByClass<UTraceHealthComponent>())
+			{
+				HealthComponent->ReclampToMax();
+			}
+		}
+	}
 }
 
 void UTraceAbilityComponent::ServerRequestSetCharacter_Implementation(ETraceCharacterId NewCharacter)
@@ -470,14 +536,70 @@ void UTraceAbilityComponent::ServerRequestSetCharacter_Implementation(ETraceChar
 
 void UTraceAbilityComponent::OnRep_CharacterId()
 {
+	// The previous character's presentation is not a baseline for this one's: the same Flags bits mean
+	// different things to different kits, so a diff across a swap would hand the new set an edge that
+	// never happened. Forget what was drawn; RebuildAbilitySet's SYNC re-establishes it.
+	bPresentedStateValid = false;
+
 	RebuildAbilitySet();
 }
 
 void UTraceAbilityComponent::OnRep_AbilityState()
 {
-	// Nothing generic to do — characters read GetNetState() at the point of use. The UFUNCTION
-	// exists so that a character which needs a client-side edge (a sound when Chud comes up) has a
-	// place to hang it: override TickAbilities and compare, or ask for a hook here.
+	// FX_AUDIO_PLAN §1.1. This used to be empty and to invite exactly this hook ("a character which
+	// needs a client-side edge ... ask for a hook here"). The hook is now here, once, for everybody:
+	// characters do not each re-implement "compare the state to what I drew last time" in their own
+	// TickAbilities, because ten copies of a diff is ten chances to get the join-in-progress case
+	// wrong.
+	RouteNetStateEdges();
+}
+
+// =================================================================================================
+// THE CLIENT FX ROUTER — FX_AUDIO_PLAN §1.1/§1.2
+//
+// One diff, three callers (see the header). What makes this correct rather than merely tidy is the
+// FIRST-SIGHT rule: a machine that has never seen this component's state must be told "these states
+// are ON" (SyncClientFx) and not "these bits just changed" (OnClientStateEdge), because it has drawn
+// nothing yet and an edge-only router would leave a mid-flight Lily with no aura on a client that
+// joined after she cast. That distinction is the entire reason this is not a two-line comparison
+// inside OnRep.
+// =================================================================================================
+
+void UTraceAbilityComponent::RouteNetStateEdges()
+{
+	if (AbilitySet == nullptr)
+	{
+		// The set is built by OnRep_CharacterId, and the two OnReps arrive in whatever order the
+		// property order and the packet decide. Losing the race is normal, not an error: the state is
+		// already stored, and the next sight of it — the tick, or RebuildAbilitySet's own call — is a
+		// SYNC that hands the new set the whole world at once. Flag it so, and drop this one.
+		bPresentedStateValid = false;
+		return;
+	}
+
+	if (!bPresentedStateValid)
+	{
+		AbilitySet->SyncClientFx(AbilityState);
+		PresentedState = AbilityState;
+		bPresentedStateValid = true;
+#if !UE_BUILD_SHIPPING
+		TraceAbilityFxRouterStats::Syncs++;
+#endif
+		return;
+	}
+
+	if (!(PresentedState == AbilityState))
+	{
+		// PresentedState is updated BEFORE the callback would be a bug in the other direction: a kit
+		// that reads State() inside its own edge handler must see the NEW state, and it does, because
+		// AbilityState is already the new one. Old is the copy this machine last drew.
+		const FTraceAbilityNetState Old = PresentedState;
+		PresentedState = AbilityState;
+		AbilitySet->OnClientStateEdge(Old, AbilityState);
+#if !UE_BUILD_SHIPPING
+		TraceAbilityFxRouterStats::Edges++;
+#endif
+	}
 }
 
 void UTraceAbilityComponent::RebuildAbilitySet()
@@ -518,6 +640,16 @@ void UTraceAbilityComponent::RebuildAbilitySet()
 	AbilitySet->Initialize(this);
 	AbilitySet->OnInitialized();
 	AbilitySet->OnEquipped();
+
+	// FX_AUDIO_PLAN §1.1 — THE JOIN-IN-PROGRESS CASE, and it is the one that cannot be fixed later.
+	//
+	// A client that connects mid-match receives CharacterId and AbilityState in the same burst, in an
+	// order it does not control. If the state arrived first, its OnRep already ran against a null set
+	// and cleared bPresentedStateValid; if it arrived second, it will route on its own. Either way the
+	// set that has JUST been built has been told nothing, so it is told now — as a SYNC, so a Zip that
+	// is already in flight or a wall that is already stuck gets its loop FX attached instead of
+	// waiting for a state change that may never come.
+	RouteNetStateEdges();
 }
 
 // =================================================================================================
@@ -562,6 +694,136 @@ float UTraceAbilityComponent::GetActivatedCooldownRemaining() const
 	return FrameworkRemaining;
 }
 
+#if !UE_BUILD_SHIPPING
+/**
+ * CAPTURE FIXTURE FOR THE V ROW (FX/AUDIO plan §7.2). *** IT IS NOW DEAD CODE AND IS SAFE TO DELETE.
+ * THIS BLOCK USED TO SAY "delete the whole arm the day UTraceAbilitySetRoxie overrides
+ * GetSecondaryCooldownDisplay (that override is W5-KITS-E's)". THAT OVERRIDE HAS LANDED. ***
+ *
+ * The row's DRAW landed a wave before its only producer did, and a drawing change verified by a log
+ * instead of a photograph is exactly the self-certifying evidence the rest of this project refuses.
+ * So this arm answered the row's question from Roxie's OWN published accessors —
+ * IsRocketReady()/GetRocketCooldownRemaining(), the same two the override now uses — rather than
+ * from an invented number, and only for Roxie.
+ *
+ * IT IS CONSULTED ONLY AFTER THE VIRTUAL HAS ALREADY SAID NO, which was the whole design: now that
+ * UTraceAbilitySetRoxie::GetSecondaryCooldownDisplay returns true for every live Roxie, control
+ * cannot reach this block for any character at all. It is left in place only because this file
+ * belongs to another slice; deleting it is this static, the block below it in
+ * GetSecondaryCooldownDisplay, and nothing else. Trace.Roxie.VRowTest forces the CVar to 0 before it
+ * measures anything, precisely so a green run can never be this arm's doing.
+ */
+static TAutoConsoleVariable<int32> CVarVRowRoxieFixture(
+	TEXT("Trace.HUD.VRowRoxieFixture"), 0,
+	TEXT("DEAD CAPTURE FIXTURE (FX plan 7.2) — UNREACHABLE since W5-KITS-E landed "
+	     "UTraceAbilitySetRoxie::GetSecondaryCooldownDisplay, which answers first for every Roxie. It "
+	     "used to feed the HUD's V row from her published IsRocketReady()/GetRocketCooldownRemaining() "
+	     "so the row could be photographed before it had a producer. Safe to delete along with the "
+	     "block that reads it."),
+	ECVF_Cheat);
+#endif
+
+bool UTraceAbilityComponent::GetSecondaryCooldownDisplay(float& OutRemaining, float& OutDuration,
+                                                         FString& OutLabel) const
+{
+	if (AbilitySet == nullptr)
+	{
+		return false;
+	}
+
+	if (AbilitySet->GetSecondaryCooldownDisplay(OutRemaining, OutDuration, OutLabel))
+	{
+		// The character answered. Clamp rather than trust: a negative remaining would draw a meter
+		// running backwards, and a zero duration is a divide in the HUD's fraction.
+		OutRemaining = FMath::Max(0.f, OutRemaining);
+		OutDuration = FMath::Max(0.01f, OutDuration);
+		return true;
+	}
+
+#if !UE_BUILD_SHIPPING
+	// UNREACHABLE as of W5-KITS-E: UTraceAbilitySetRoxie::GetSecondaryCooldownDisplay returns true
+	// above for every live Roxie, and no other character's set answers here at all. Kept, dead,
+	// because this file belongs to another slice — see the CVar's own comment for the deletion.
+	if (CVarVRowRoxieFixture.GetValueOnAnyThread() != 0)
+	{
+		if (const UTraceAbilitySetRoxie* RoxieSet = Cast<UTraceAbilitySetRoxie>(AbilitySet))
+		{
+			OutRemaining = FMath::Max(0.f, RoxieSet->GetRocketCooldownRemaining());
+			OutDuration = FMath::Max(0.01f, UTraceSettings::Get().RoxieRocketCooldownSeconds);
+			OutLabel = TEXT("ROCKET");
+			return true;
+		}
+	}
+#endif
+
+	return false;
+}
+
+// =================================================================================================
+// FX/AUDIO PLAN §7.1 — THE REFUSAL TOAST, PRODUCER SIDE (closes F3)
+//
+// *** NO NEW RPC, AND THAT IS THE WHOLE REASON THIS SEAM WORKS. *** TryActivate() runs its full
+// local half on the OWNING CLIENT (the prediction path) before it ever asks the server, so every
+// refusal below is already computed on the one machine that has a screen to draw on. The FText
+// CanActivate() fills in — Mortimer's posture reasons, Elle's "too close" — was being produced and
+// then dropped on the floor, which is F3 in one line.
+//
+// THREE RULES, and each of them is a bug this seam would otherwise have:
+//
+//   1. OWNING-PLAYER MACHINES ONLY. TryActivate() also runs on the server for every remote client
+//      and for every BOT (the bot controllers press E), and a listen host would otherwise watch
+//      eight bots' refusals scroll across their own HUD. IsLocalController() is the test.
+//   2. THE HUD OWNS THE PRESENTATION. This file produces a string and a tint; the chip, its fade,
+//      its scrim and its UIDeny sound (rate-limited there, once per 0.5 s, so a held key cannot
+//      machine-gun it) all live in ATraceHUD::ShowAbilityToast. A producer that also played the
+//      sound would be a second rate limiter able to disagree with the first.
+//   3. IT NEVER INVENTS WORDING. The CanActivate arm toasts the character's OWN FText verbatim. The
+//      two framework arms are the only ones this file words, because they are the only two refusals
+//      the framework — not a character — is responsible for.
+// =================================================================================================
+
+namespace TraceAbilityToast
+{
+	/** Cooldown refusal wears the dim ink of a thing that is merely not ready yet. */
+	static const FLinearColor Cooling(0.68f, 0.72f, 0.78f, 1.00f);
+
+	/** A refusal with a REASON wears the HUD's danger red: something about the world said no. */
+	static const FLinearColor Refused(0.95f, 0.22f, 0.18f, 1.00f);
+
+	/**
+	 * The local HUD for @p Component's player, or null on every machine that is not theirs.
+	 *
+	 * Null is the ordinary answer, not an error: the server runs TryActivate() for eight bots and
+	 * six remote clients, and none of those presses has a screen here.
+	 */
+	ATraceHUD* LocalHudFor(const UTraceAbilityComponent* Component)
+	{
+		if (Component == nullptr)
+		{
+			return nullptr;
+		}
+
+		const APlayerState* OwnerState = Component->GetOwningPlayerState();
+		AController* OwnerController = (OwnerState != nullptr) ? OwnerState->GetOwningController() : nullptr;
+
+		ATracePlayerController* LocalPC = Cast<ATracePlayerController>(OwnerController);
+		if (LocalPC == nullptr || !LocalPC->IsLocalController())
+		{
+			return nullptr;
+		}
+
+		return Cast<ATraceHUD>(LocalPC->GetHUD());
+	}
+
+	void Show(const UTraceAbilityComponent* Component, const FText& Text, const FLinearColor& Tint)
+	{
+		if (ATraceHUD* Hud = LocalHudFor(Component))
+		{
+			Hud->ShowAbilityToast(Text, Tint);
+		}
+	}
+}
+
 bool UTraceAbilityComponent::TryActivate()
 {
 	// ---- every refusal, centralised, so no character has to remember any of them ----------------
@@ -588,14 +850,31 @@ bool UTraceAbilityComponent::TryActivate()
 		return false;   // the interval is a dead phase; nothing fires in it
 	}
 
-	if (GetActivatedCooldownRemaining() > 0.f)
+	if (const float CoolingFor = GetActivatedCooldownRemaining(); CoolingFor > 0.f)
 	{
+		// FX plan §7.1, producer 1. The key is read from the player's OWN binding rather than
+		// hardcoded to E, for the same reason the ability row's label is: a toast that says "E IN
+		// 4.2S" to somebody who rebound the ability is a HUD lying about their own keyboard.
+		TraceAbilityToast::Show(this,
+			FText::FromString(FString::Printf(TEXT("%s IN %.1fS"),
+				*ATraceHUD::ActionKeyLabel(TEXT("Ability"), TEXT("E")), CoolingFor)),
+			TraceAbilityToast::Cooling);
 		return false;
 	}
 
 	FText Reason;
 	if (!AbilitySet->CanActivate(Reason))
 	{
+		// FX plan §7.1, producer 2 — AND THE ONE THAT CLOSES F3. The FText was already being
+		// produced here and dropped; Mortimer's posture refusals (TraceAbilitySetMortimer.h
+		// documents this exact gap) and Elle's "too close" light up for free the moment it is drawn.
+		//
+		// A character that refuses without wording gets NO toast rather than an empty chip: silence
+		// is at least honest, and an empty box is a bug report.
+		if (!Reason.IsEmpty())
+		{
+			TraceAbilityToast::Show(this, Reason, TraceAbilityToast::Refused);
+		}
 		return false;
 	}
 
@@ -644,6 +923,17 @@ void UTraceAbilityComponent::ServerTryActivate_Implementation()
 void UTraceAbilityComponent::ClientActivateRejected_Implementation(float AuthoritativeCooldownEndMatchTime)
 {
 	PredictedCooldownEndMatchTime = AuthoritativeCooldownEndMatchTime;
+
+	// FX plan §7.1, producer 3. THE CLIENT PREDICTED AN ACTIVATION THE SERVER REFUSED — the one
+	// refusal with no local explanation, because whatever the server disagreed about happened on the
+	// server. Before this line the correction was silent and the ability simply appeared not to have
+	// happened, which is indistinguishable from a dropped keypress or a hitch.
+	//
+	// One word, deliberately: this is the arm that must NOT guess. The server does not send a reason
+	// (that would be a new RPC payload for a rare event) and inventing one here would be worse than
+	// the silence it replaces.
+	TraceAbilityToast::Show(this, NSLOCTEXT("Trace", "AbilityRefused", "REFUSED"),
+		TraceAbilityToast::Refused);
 }
 
 void UTraceAbilityComponent::ServerHandleJumpPressed_Implementation()
@@ -1330,7 +1620,42 @@ void UTraceAbilityComponent::SetRosterEnforcementOn(bool bEnforced)
 
 bool UTraceAbilityComponent::HandleSecondaryPressed()
 {
-	return (AbilitySet != nullptr) && AbilitySet->OnSecondaryPressed();
+	if (AbilitySet == nullptr)
+	{
+		return false;
+	}
+
+	if (AbilitySet->OnSecondaryPressed())
+	{
+		return true;
+	}
+
+	// FX plan §7.1's fourth producer: V, refused because it is still cooling.
+	//
+	// *** IT IS ONE GENERIC BRANCH HERE RATHER THAN A ShowAbilityToast CALL INSIDE ROXIE'S OWN
+	// OnSecondaryPressed. *** The plan asks for "ROCKET IN 12S" on her V refusal; the same sentence
+	// is true of every future character with a timed secondary, and the fact needed to word it —
+	// label plus remaining — is already published by the §7.2 virtual. Writing it once here means a
+	// character file never has to know the HUD exists, which is the rule the whole ability framework
+	// is built on (see GetDashHitSweepRadius's note).
+	//
+	// A press that returned false for any OTHER reason (Mace's suspend needs a spike; Slimeball's
+	// stick found no wall) says nothing, because the virtual returns false for those characters and
+	// a toast with no cooldown behind it would be inventing a refusal reason this file cannot know.
+	float Remaining = 0.f;
+	float Duration = 0.f;
+	FString Label;
+	if (GetSecondaryCooldownDisplay(Remaining, Duration, Label) && Remaining > 0.f)
+	{
+		// %.0f, not %.1f: this is a 35 s cooldown, not a 4 s one, and a tenth of a second on a
+		// half-minute wait is noise the player cannot act on. The E toast keeps its tenth because
+		// E's cooldowns are short enough for one to matter.
+		TraceAbilityToast::Show(this,
+			FText::FromString(FString::Printf(TEXT("%s IN %.0fS"), *Label, Remaining)),
+			TraceAbilityToast::Cooling);
+	}
+
+	return false;
 }
 
 void UTraceAbilityComponent::HandleSecondaryReleased()
@@ -1627,6 +1952,13 @@ void UTraceAbilityComponent::DebugSetActivatedCooldown(float Seconds)
 	ActivatedCooldownEndMatchTime = MatchTimeNow() + FMath::Max(0.f, Seconds);
 	PredictedCooldownEndMatchTime = ActivatedCooldownEndMatchTime;
 }
+
+void UTraceAbilityComponent::DebugSimulateActivateRejected()
+{
+	// The authoritative deadline is what the real RPC carries, so the harness's press is corrected
+	// with the same number a real refusal would have corrected it with.
+	ClientActivateRejected_Implementation(ActivatedCooldownEndMatchTime);
+}
 #endif
 
 // =================================================================================================
@@ -1903,6 +2235,479 @@ namespace TraceAbilityDeathWipeVerify
 }
 
 // =================================================================================================
+// FX_AUDIO_PLAN §1.1/§1.2 — Trace.Fx.SyncTest and Trace.Fx.EdgeReport
+//
+// THE ROUTER IS THE ONE PIECE OF THIS PLAN THAT CANNOT BE SEEN. Its two virtuals ship empty until the
+// per-kit tranches fill them, so "the FX router works" is not a claim a screenshot can settle this
+// wave — and the router's whole value is in the case that is hardest to reach by hand: a machine that
+// sees a state for the FIRST time must be told SYNC (attach what is on) and not EDGE (react to what
+// changed), or a client that joins mid-flight sees a Lily with no aura for the rest of her Zip.
+//
+// So the contract is driven directly and asserted:
+//   1. FIRST SIGHT      -> exactly one SyncClientFx, and PresentedState now equals the live state.
+//   2. A RESEND         -> nothing at all. (An OnRep can fire for a property that did not change.)
+//   3. A REAL CHANGE    -> exactly one OnClientStateEdge, through the shipping path (a server write
+//                          plus MarkNetStateDirty, which is what every kit does).
+//   4. A LOOP ATTACHES  -> TraceAudio::StartLoopOn (§1.6.4) on the pawn returns a PLAYING component
+//                          and fades out cleanly. This is the mechanism a kit's SyncClientFx will use
+//                          for the join-in-progress case, exercised end to end.
+//
+// The state is snapshotted and restored, so a run leaves the subject exactly as it found them.
+// =================================================================================================
+
+namespace TraceAbilityFxRouterVerify
+{
+	/**
+	 * @param bRequireAuthority  true for the test (it WRITES replicated state, which only the server
+	 *                           may do); false for the report, which must also run on a CLIENT —
+	 *                           the client is the machine whose join-in-progress syncs are the whole
+	 *                           point of §1.1, and a client has no auth game mode to find.
+	 */
+	static UWorld* FindGameWorld(bool bRequireAuthority)
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* Candidate = Context.World();
+			if (Candidate == nullptr || !Candidate->IsGameWorld())
+			{
+				continue;
+			}
+			if (bRequireAuthority && Candidate->GetAuthGameMode() == nullptr)
+			{
+				continue;
+			}
+			return Candidate;
+		}
+		return nullptr;
+	}
+
+	/** The first human player's component, with a built ability set. Bots are refused for the usual
+	 *  reason: the game mode re-fills their character four times a second and would fight the test. */
+	static UTraceAbilityComponent* FindSubject(UWorld* WorldPtr, ATraceCharacter*& OutPawn, FString& OutWhyNot)
+	{
+		OutPawn = nullptr;
+		OutWhyNot = TEXT("no human player controller with a player state");
+		if (WorldPtr == nullptr)
+		{
+			OutWhyNot = TEXT("no world");
+			return nullptr;
+		}
+
+		for (FConstPlayerControllerIterator It = WorldPtr->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* PC = Cast<APlayerController>(It->Get());
+			APlayerState* State = (PC != nullptr) ? PC->PlayerState : nullptr;
+			UTraceAbilityComponent* Comp = (State != nullptr) ? UTraceAbilityComponent::Get(State) : nullptr;
+			if (Comp == nullptr)
+			{
+				continue;
+			}
+			OutPawn = Cast<ATraceCharacter>(PC->GetPawn());
+			return Comp;
+		}
+		return nullptr;
+	}
+
+	static void RunSyncTest()
+	{
+		UWorld* WorldPtr = FindGameWorld(/*bRequireAuthority=*/true);
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[FxRouter] no authoritative game world — the state this routes is server state, so this "
+				     "must run on the server."));
+			return;
+		}
+
+		ATraceCharacter* Pawn = nullptr;
+		FString WhyNot;
+		UTraceAbilityComponent* Comp = FindSubject(WorldPtr, Pawn, WhyNot);
+		if (Comp == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[FxRouter] no subject: %s."), *WhyNot);
+			return;
+		}
+
+		// A character is needed only because the router refuses to dispatch without a built set — that
+		// refusal is itself part of the contract (assertion 0 below), so it is checked first and then
+		// satisfied.
+		const bool bHadCharacter = (Comp->GetCharacterId() != ETraceCharacterId::None);
+		if (!bHadCharacter)
+		{
+			Comp->DebugForgetPresentedState();
+			Comp->RouteNetStateEdges();
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[FxRouter] no ability set on the subject yet — the router declined to dispatch, which is "
+				     "the documented answer while the two OnReps race. Giving them Lily and continuing."));
+			Comp->ServerSetCharacter(ETraceCharacterId::Lily);
+		}
+
+		if (Comp->GetAbilitySet() == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[FxRouter] the subject has character %s but no ability set was built — cannot test the "
+				     "router."), TraceCharacterIdToString(Comp->GetCharacterId()));
+			return;
+		}
+
+		const FTraceAbilityNetState Snapshot = Comp->GetNetState();
+		int32 Failures = 0;
+		int32 Checks = 0;
+
+		auto Check = [&Failures, &Checks](bool bCondition, const TCHAR* What, const FString& Detail)
+		{
+			++Checks;
+			if (bCondition)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[FxRouter]   PASS  %s  (%s)"), What, *Detail);
+			}
+			else
+			{
+				++Failures;
+				UE_LOG(LogTraceGame, Error, TEXT("[FxRouter]   *** FAIL *** %s  (%s)"), What, *Detail);
+			}
+		};
+
+		// ---- 1. FIRST SIGHT is a SYNC ------------------------------------------------------------
+		int32 SyncsBefore = TraceAbilityFxRouterStats::Syncs;
+		int32 EdgesBefore = TraceAbilityFxRouterStats::Edges;
+		Comp->DebugForgetPresentedState();
+		Comp->RouteNetStateEdges();
+		const int32 SyncDelta = TraceAbilityFxRouterStats::Syncs - SyncsBefore;
+		const int32 EdgeDelta = TraceAbilityFxRouterStats::Edges - EdgesBefore;
+		Check(SyncDelta == 1 && EdgeDelta == 0,
+			TEXT("a machine's FIRST sight of a valid state calls SyncClientFx, not OnClientStateEdge"),
+			FString::Printf(TEXT("syncs +%d, edges +%d"), SyncDelta, EdgeDelta));
+		Check(Comp->DebugGetPresentedState() == Comp->GetNetState(),
+			TEXT("the sync records what was presented, so the next change is a diff against it"),
+			TEXT("PresentedState == AbilityState"));
+
+		// ---- 2. A RESEND does nothing ------------------------------------------------------------
+		SyncsBefore = TraceAbilityFxRouterStats::Syncs;
+		EdgesBefore = TraceAbilityFxRouterStats::Edges;
+		Comp->RouteNetStateEdges();
+		Comp->RouteNetStateEdges();
+		Check((TraceAbilityFxRouterStats::Syncs - SyncsBefore) == 0
+			&& (TraceAbilityFxRouterStats::Edges - EdgesBefore) == 0,
+			TEXT("two more routes with nothing changed fire NOTHING"),
+			FString::Printf(TEXT("syncs +%d, edges +%d"),
+				TraceAbilityFxRouterStats::Syncs - SyncsBefore,
+				TraceAbilityFxRouterStats::Edges - EdgesBefore));
+
+		// ---- 3. A REAL CHANGE is an EDGE, through the shipping path -------------------------------
+		SyncsBefore = TraceAbilityFxRouterStats::Syncs;
+		EdgesBefore = TraceAbilityFxRouterStats::Edges;
+		const uint8 ProbeStacks = static_cast<uint8>(Snapshot.Stacks + 7);
+		Comp->GetMutableNetState().Stacks = ProbeStacks;
+		Comp->MarkNetStateDirty();     // the authority's own OnRep, exactly as every kit's write does
+		Check((TraceAbilityFxRouterStats::Edges - EdgesBefore) == 1
+			&& (TraceAbilityFxRouterStats::Syncs - SyncsBefore) == 0,
+			TEXT("a server write + MarkNetStateDirty produces exactly one OnClientStateEdge"),
+			FString::Printf(TEXT("stacks %d -> %d, syncs +%d, edges +%d"), Snapshot.Stacks, ProbeStacks,
+				TraceAbilityFxRouterStats::Syncs - SyncsBefore,
+				TraceAbilityFxRouterStats::Edges - EdgesBefore));
+		Check(Comp->DebugGetPresentedState().Stacks == ProbeStacks,
+			TEXT("the edge advanced what this machine has been shown"),
+			FString::Printf(TEXT("presented stacks = %d"), Comp->DebugGetPresentedState().Stacks));
+
+		// ---- 4. THE LOOP MECHANISM (§1.6.4) -------------------------------------------------------
+		//
+		// This is the half of "join in progress attaches loops" that a kit will actually call. Without
+		// a pawn there is nothing to attach to, which is a skip and not a failure — the router half
+		// above is still meaningful for a dead subject.
+		if (Pawn == nullptr || Pawn->GetRootComponent() == nullptr)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[FxRouter]   SKIP  loop attach: the subject has no pawn right now (dead, or between "
+				     "spawns). The edge/sync contract above does not need one."));
+		}
+		else if (WorldPtr->GetAudioDeviceRaw() == nullptr)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[FxRouter]   SKIP  loop attach: this process has no audio device (-nosound, or a "
+				     "dedicated server)."));
+		}
+		else
+		{
+			UAudioComponent* Loop = TraceAudio::StartLoopOn(Pawn->GetRootComponent(),
+				TraceSoundEvents::LilyZipLoop, /*FadeInSeconds=*/0.15f);
+			Check(Loop != nullptr && Loop->IsPlaying() && Loop->GetAttachParent() == Pawn->GetRootComponent(),
+				TEXT("StartLoopOn attaches a PLAYING looping component to the pawn"),
+				(Loop != nullptr)
+					? FString::Printf(TEXT("%s, playing=%d, attached to %s"), *Loop->GetName(),
+						Loop->IsPlaying() ? 1 : 0, *GetNameSafe(Loop->GetAttachParent()))
+					: FString(TEXT("StartLoopOn returned null")));
+
+			if (Loop != nullptr)
+			{
+				// The off-edge, exactly as §1.6.4 documents it for a kit: fade, then let the component
+				// destroy itself. Leaving it running would leave a hum on the subject for the rest of
+				// the match.
+				Loop->FadeOut(0.25f, 0.f);
+			}
+		}
+
+		// ---- restore -----------------------------------------------------------------------------
+		Comp->GetMutableNetState() = Snapshot;
+		Comp->MarkNetStateDirty();
+		if (!bHadCharacter)
+		{
+			Comp->ServerSetCharacter(ETraceCharacterId::None);
+		}
+
+		if (Failures == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[FxRouter] VERDICT: PASS — %d checks, 0 failures. Router totals this process: %d sync(s), "
+				     "%d edge(s). Subject and state restored."),
+				Checks, TraceAbilityFxRouterStats::Syncs, TraceAbilityFxRouterStats::Edges);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[FxRouter] VERDICT: *** %d PROBLEM(S) *** of %d checks — see the lines above."),
+				Failures, Checks);
+		}
+	}
+
+	static void RunEdgeReport()
+	{
+		UWorld* WorldPtr = FindGameWorld(/*bRequireAuthority=*/false);
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[FxRouter] no game world."));
+			return;
+		}
+
+		// The NETMODE is the headline, not a detail: on a client every one of these syncs and edges
+		// arrived through OnRep_AbilityState, which is the half of §1.1 a single-process run cannot
+		// exercise at all. On a listen server they came from the component's own 20 Hz tick.
+		const ENetMode NetMode = WorldPtr->GetNetMode();
+		const TCHAR* const NetModeName =
+			(NetMode == NM_Client) ? TEXT("CLIENT (these came through OnRep_AbilityState)")
+			: (NetMode == NM_ListenServer) ? TEXT("LISTEN SERVER (these came through the 20 Hz authority tick)")
+			: (NetMode == NM_DedicatedServer) ? TEXT("DEDICATED SERVER") : TEXT("STANDALONE");
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[FxRouter] ===== FX router traffic this process: %d SYNC(s) (first sight of a state) and "
+			     "%d EDGE(s) (a state changed). Netmode: %s ====="),
+			TraceAbilityFxRouterStats::Syncs, TraceAbilityFxRouterStats::Edges, NetModeName);
+
+		const AGameStateBase* GameState = WorldPtr->GetGameState();
+		if (GameState == nullptr)
+		{
+			return;
+		}
+
+		int32 WithSet = 0;
+		for (APlayerState* State : GameState->PlayerArray)
+		{
+			UTraceAbilityComponent* Comp = UTraceAbilityComponent::Get(State);
+			if (Comp == nullptr)
+			{
+				continue;
+			}
+			const FTraceAbilityNetState& Live = Comp->GetNetState();
+			const bool bHasSet = (Comp->GetAbilitySet() != nullptr);
+			WithSet += bHasSet ? 1 : 0;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[FxRouter]   %-24s %-10s set=%d  presented==live=%d  state{stacks=%d flags=0x%02X eff=%.2f "
+				     "aux=%.2f}"),
+				*GetNameSafe(State), TraceCharacterIdToString(Comp->GetCharacterId()), bHasSet ? 1 : 0,
+				(Comp->DebugGetPresentedState() == Live) ? 1 : 0,
+				Live.Stacks, Live.Flags, Live.EffectEndMatchTime, Live.AuxEndMatchTime);
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[FxRouter] %d of %d player state(s) carry a built ability set. A run that ends with 0 syncs "
+			     "has a router nothing ever reached; one with 0 edges has a router the 20 Hz tick is not "
+			     "driving."),
+			WithSet, GameState->PlayerArray.Num());
+	}
+
+	/**
+	 * FX_AUDIO_PLAN §1.6 — the four bypasses, driven once each, on the machine they are written for.
+	 *
+	 * Three of them ship with NO call sites this wave (the gunshot, melee and per-kit tranches wire
+	 * them in W4/W5), and an entry point with no caller is an entry point nobody has proven. The
+	 * expensive failures here are not compile errors: they are a multicast that never reaches the
+	 * relay, an exclusion that excludes the wrong machine, and an event whose declared side sends it
+	 * down a route that refuses it. All three are visible in the per-event play counts, which are
+	 * bumped only AFTER the side gate, the settings gate, the device test and the resolve — so a
+	 * count that moved means a sound genuinely reached the engine.
+	 */
+	static void RunAudioApiTest()
+	{
+		UWorld* WorldPtr = FindGameWorld(/*bRequireAuthority=*/true);
+		UTraceAudioSubsystem* Audio = (WorldPtr != nullptr) ? UTraceAudioSubsystem::Get(WorldPtr) : nullptr;
+		if (WorldPtr == nullptr || Audio == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[FxAudio] no authoritative game world with an audio subsystem — PlayAtExcluding is an "
+				     "authority call, so this must run on the server."));
+			return;
+		}
+
+		if (WorldPtr->GetAudioDeviceRaw() == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[FxAudio] this process has no audio device (-nosound). Every play would be a no-op and "
+				     "the counts would prove nothing — re-run without -nosound."));
+			return;
+		}
+
+		// The local player's pawn is the "predicted" side of the pair; a BOT's pawn is the control,
+		// because the whole guard on both calls is "a player on this machine, not merely a locally
+		// controlled one".
+		// FindSubject is borrowed from the router harness for its PAWN; the component it returns is of
+		// no interest here, because none of the four audio calls goes anywhere near ability state.
+		ATraceCharacter* PlayerPawn = nullptr;
+		FString WhyNot;
+		FindSubject(WorldPtr, PlayerPawn, WhyNot);
+		APawn* BotPawn = nullptr;
+		for (FConstControllerIterator It = WorldPtr->GetControllerIterator(); It; ++It)
+		{
+			const AAIController* Bot = Cast<AAIController>(It->Get());
+			APawn* Candidate = (Bot != nullptr) ? Bot->GetPawn() : nullptr;
+			if (Candidate != nullptr && Candidate != PlayerPawn)
+			{
+				BotPawn = Candidate;
+				break;
+			}
+		}
+
+		if (PlayerPawn == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[FxAudio] no local player pawn: %s."), *WhyNot);
+			return;
+		}
+
+		const FVector Where = PlayerPawn->GetActorLocation();
+		int32 Failures = 0;
+		int32 Checks = 0;
+
+		auto CountOf = [Audio](FName Event) -> int32
+		{
+			const int32* Found = Audio->GetPlaysByEvent().Find(Event);
+			return (Found != nullptr) ? *Found : 0;
+		};
+		auto Check = [&Failures, &Checks](bool bCondition, const TCHAR* What, const FString& Detail)
+		{
+			++Checks;
+			if (bCondition)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[FxAudio]   PASS  %s  (%s)"), What, *Detail);
+			}
+			else
+			{
+				++Failures;
+				UE_LOG(LogTraceGame, Error, TEXT("[FxAudio]   *** FAIL *** %s  (%s)"), What, *Detail);
+			}
+		};
+
+		// ---- §1.6.1 PlayPredictedLocal: the shooter's machine plays, a bot's does not -------------
+		const FName PredictedEvent = TraceSoundEvents::MeleeSwing;     // World-side, the §6 pattern
+		int32 Before = CountOf(PredictedEvent);
+		TraceAudio::PlayPredictedLocal(PlayerPawn, PredictedEvent, Where);
+		Check(CountOf(PredictedEvent) == Before + 1,
+			TEXT("PlayPredictedLocal on the local player's pawn plays here and now"),
+			FString::Printf(TEXT("%s %d -> %d"), *PredictedEvent.ToString(), Before, CountOf(PredictedEvent)));
+
+		if (BotPawn != nullptr)
+		{
+			Before = CountOf(PredictedEvent);
+			TraceAudio::PlayPredictedLocal(BotPawn, PredictedEvent, BotPawn->GetActorLocation());
+			Check(CountOf(PredictedEvent) == Before,
+				TEXT("PlayPredictedLocal on a BOT's pawn plays nothing (a bot predicts nothing)"),
+				FString::Printf(TEXT("%s stayed at %d"), *PredictedEvent.ToString(), Before));
+		}
+
+		// ---- §1.6.2 PlayAtExcluding: this machine is skipped when IT is the excluded one ----------
+		Before = CountOf(PredictedEvent);
+		TraceAudio::PlayAtExcluding(WorldPtr, PredictedEvent, Where, PlayerPawn);
+		Check(CountOf(PredictedEvent) == Before,
+			TEXT("PlayAtExcluding(excluded = this machine's player) does NOT play here — no double audio"),
+			FString::Printf(TEXT("%s stayed at %d"), *PredictedEvent.ToString(), Before));
+
+		if (BotPawn != nullptr)
+		{
+			Before = CountOf(PredictedEvent);
+			TraceAudio::PlayAtExcluding(WorldPtr, PredictedEvent, Where, BotPawn);
+			Check(CountOf(PredictedEvent) == Before + 1,
+				TEXT("PlayAtExcluding(excluded = somebody else) DOES play here, through the relay multicast"),
+				FString::Printf(TEXT("%s %d -> %d"), *PredictedEvent.ToString(), Before, CountOf(PredictedEvent)));
+		}
+
+		// ---- §1.6.3 PlayReplicatedLocal: a client-side event, no RPC, plays on this machine -------
+		const FName ReplicatedEvent = TraceSoundEvents::WeaponSwitch;   // declared Client-side
+		Before = CountOf(ReplicatedEvent);
+		TraceAudio::PlayReplicatedLocal(WorldPtr, ReplicatedEvent, Where);
+		Check(CountOf(ReplicatedEvent) == Before + 1,
+			TEXT("PlayReplicatedLocal plays the client-side event locally with no RPC"),
+			FString::Printf(TEXT("%s %d -> %d"), *ReplicatedEvent.ToString(), Before, CountOf(ReplicatedEvent)));
+
+		// ---- §1.6.5 the big attenuation, by event, not by caller ---------------------------------
+		USoundAttenuation* const Ordinary = Audio->GetWorldAttenuation();
+		USoundAttenuation* const Big = Audio->GetBigWorldAttenuation();
+		const float OrdinaryInner = (Ordinary != nullptr) ? Ordinary->Attenuation.AttenuationShapeExtents.X : -1.f;
+		const float BigInner = (Big != nullptr) ? Big->Attenuation.AttenuationShapeExtents.X : -1.f;
+		const float BigFalloff = (Big != nullptr) ? Big->Attenuation.FalloffDistance : -1.f;
+
+		Check(UTraceAudioSubsystem::IsBigWorldEvent(TraceSoundEvents::MortimerQuake)
+			&& UTraceAudioSubsystem::IsBigWorldEvent(TraceSoundEvents::RoxieRocketBurst)
+			&& UTraceAudioSubsystem::IsBigWorldEvent(TraceSoundEvents::Goal)
+			&& !UTraceAudioSubsystem::IsBigWorldEvent(TraceSoundEvents::MeleeSwing),
+			TEXT("the big-attenuation set is exactly MortimerQuake / RoxieRocketBurst / Goal"),
+			TEXT("membership by event name, not by call site"));
+
+		Check(BigInner > OrdinaryInner && BigFalloff > (BigInner * 7.f),
+			TEXT("the big shape is twice the inner radius and eight times the falloff of the ordinary one"),
+			FString::Printf(TEXT("ordinary inner %.0f uu; big inner %.0f uu, falloff %.0f uu"),
+				OrdinaryInner, BigInner, BigFalloff));
+
+		if (Failures == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[FxAudio] VERDICT: PASS — %d checks, 0 failures. The §1.6 entry points are wired; W4/W5 "
+				     "can call them."), Checks);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[FxAudio] VERDICT: *** %d PROBLEM(S) *** of %d checks."),
+				Failures, Checks);
+		}
+	}
+
+	FAutoConsoleCommand CmdFxAudioApiTest(
+		TEXT("Trace.Fx.AudioApiTest"),
+		TEXT("Dev only, SERVER, needs an audio device. FX plan §1.6: drives PlayPredictedLocal, "
+		     "PlayAtExcluding (both ways round), PlayReplicatedLocal and the big-attenuation shape, and reads "
+		     "the per-event play counts back to prove which machine actually heard what. The three calls have "
+		     "no shipping call sites until W4, so this is what stands in for them."),
+		FConsoleCommandDelegate::CreateStatic(&RunAudioApiTest));
+
+	FAutoConsoleCommand CmdFxSyncTest(
+		TEXT("Trace.Fx.SyncTest"),
+		TEXT("Dev only, SERVER. FX plan §1.1/§1.2: drives UTraceAbilityComponent::RouteNetStateEdges through "
+		     "first sight (SYNC), a resend (nothing) and a real server write (EDGE), and attaches one "
+		     "StartLoopOn loop to the subject's pawn to prove the join-in-progress mechanism end to end. "
+		     "Restores the state it borrowed."),
+		FConsoleCommandDelegate::CreateStatic(&RunSyncTest));
+
+	FAutoConsoleCommand CmdFxEdgeReport(
+		TEXT("Trace.Fx.EdgeReport"),
+		TEXT("Dev only. Prints how many SYNCs and EDGEs the FX router has dispatched this process and the "
+		     "live net state of every player, so a bot match can be checked for router traffic without any "
+		     "kit having implemented the two virtuals yet."),
+		FConsoleCommandDelegate::CreateStatic(&RunEdgeReport));
+}
+
+// =================================================================================================
 // SPEC v24 §4 + §0 — Trace.FireRate.Measure
 //
 // "Report the resulting real RPM for every character that modifies fire rate, before and after."
@@ -2026,9 +2831,34 @@ namespace TraceAbilityFireRateMeasure
 		float  RestoreFireInterval = 0.f;
 		bool   bRestored = false;
 		bool   bWallStaged = false;   // phase 0 repeats while a reload runs; the teleport must not
+
+		/**
+		 * Where the stuck stage parked the subject, so the window can PIN him there.
+		 *
+		 * The stick is not a flag the harness can hold up: the ability re-probes for its wall on every
+		 * one of its own ticks and lets go the moment the surface is out of reach
+		 * (UTraceAbilitySetSlimeball::ApplyStick, "the wall is gone"). A window is 1.8 s long, and in a
+		 * live bot match 1.8 s is plenty of time for a team-mate to walk into him, for a knock-back to
+		 * land, or for the 20 Hz velocity write to lose a little ground to gravity between ticks. Any
+		 * of those moves him off the 90 uu probe and the stage then measures the base gun for the rest
+		 * of the window — which is exactly the "the fire-rate scale MOVED during the window (x0.7692 to
+		 * x1.0000)" failure that was reported four times in a row before this pass.
+		 *
+		 * Pinning is the honest fix rather than a mask: the harness already OWNS where he stands (that
+		 * is what PlaceAgainstNearestWall is), and nothing about the passive is faked by holding him
+		 * still. What the ability does with the wall is still entirely the ability's business.
+		 */
+		FVector StagedLocation = FVector::ZeroVector;
+
+		/** Windows this arm has thrown away and re-taken after the stick lapsed. Capped; see the tick. */
+		int32  StickRestarts = 0;
+
 		FSample Samples[StageCount][2];
 		TWeakObjectPtr<ATraceCharacter> Subject;
 	};
+
+	/** A stuck window may be re-taken this many times before the run reports the lapse instead. */
+	constexpr int32 MaxStickRestarts = 2;
 
 	static UWorld* FindAuthoritativeWorld()
 	{
@@ -2098,8 +2928,10 @@ namespace TraceAbilityFireRateMeasure
 	 * next to it, hold V through the shipping input path, and let the ability's own probe keep the
 	 * stick alive for the whole window. Nothing about the passive is faked — only where he is.
 	 */
-	static bool PlaceAgainstNearestWall(ATraceCharacter* Pawn, FString& OutWhy)
+	static bool PlaceAgainstNearestWall(ATraceCharacter* Pawn, FVector& OutStagedLocation, FString& OutWhy)
 	{
+		OutStagedLocation = FVector::ZeroVector;
+
 		UWorld* WorldPtr = (Pawn != nullptr) ? Pawn->GetWorld() : nullptr;
 		if (WorldPtr == nullptr)
 		{
@@ -2176,14 +3008,69 @@ namespace TraceAbilityFireRateMeasure
 		// 60 uu off the face: inside the ability's own 90 uu reach, and outside the capsule's radius so
 		// the teleport does not bury him in the geometry he is about to stick to.
 		const FVector Target(BestPoint.X + BestNormal.X * 60.f, BestPoint.Y + BestNormal.Y * 60.f, Centre.Z);
-		if (!Pawn->SetActorLocation(Target, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics))
+
+		// *** BEING ALREADY THERE IS NOT A REFUSAL, AND READING IT AS ONE COST THIS STAGE ITS SECOND
+		// *** ARM ON EVERY RUN.
+		//
+		// AActor::SetActorLocation returns MoveComponent's answer, and MoveComponent returns FALSE when
+		// the move changed nothing: with bSweep off it early-outs to true ONLY for an exactly-zero
+		// delta, and otherwise hands the write to InternalSetWorldLocationAndRotation, which reports
+		// "not moved" for any delta below its equality tolerance (PrimitiveComponent.cpp:3284-3315,
+		// SceneComponent's no-op path). The AFTER arm re-stages from 60 uu off the SAME wall it just
+		// used, so the target it computes is where he already stands to within float noise — a delta of
+		// microns, too small to be a move and too large to be zero.
+		//
+		// Measured, not guessed: BEFORE/RED measured 201.8 RPM and AFTER printed "could not stage the
+		// wall stick: the teleport to the wall was refused" in the same second, four runs in a row
+		// (release-impl/logs-W1-RESTR-B/W1-RESTR-B-firerate-verbose.log:2743-2745).
+		constexpr double AlreadyThereToleranceSq = 4.0;   // 2 uu; well inside the 30 uu probe margin
+		const double MoveDistSq = FVector::DistSquared(Target, Pawn->GetActorLocation());
+		if (MoveDistSq > AlreadyThereToleranceSq
+			&& !Pawn->SetActorLocation(Target, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics))
 		{
-			OutWhy = TEXT("the teleport to the wall was refused");
+			OutWhy = FString::Printf(
+				TEXT("the teleport to the wall was refused (asked for %s, %.2f uu away)"),
+				*Target.ToCompactString(), FMath::Sqrt(MoveDistSq));
 			return false;
 		}
 
-		OutWhy = FString::Printf(TEXT("wall found %.0f uu away, standing 60 uu off its face"), BestDistance);
+		// The pin target for the whole window. Read back rather than assumed: a character sweep or a
+		// depenetration on the teleport frame can settle him a few uu away, and pinning him to a place
+		// he is not is how a pin turns into a jitter.
+		OutStagedLocation = Pawn->GetActorLocation();
+
+		OutWhy = FString::Printf(
+			TEXT("wall found %.0f uu away, standing %.0f uu off its face%s"),
+			BestDistance, 60.f,
+			(MoveDistSq <= AlreadyThereToleranceSq) ? TEXT(" (already there — no teleport needed)") : TEXT(""));
 		return true;
+	}
+
+	/**
+	 * Puts the subject back on the spot the stage staged him on, if he has drifted off it.
+	 *
+	 * Called every frame of a stuck window. See FRun::StagedLocation for why the window needs it; the
+	 * velocity write is part of the same thought — a pawn that is being pushed has a velocity that
+	 * would put him straight back off the wall on the next frame.
+	 */
+	static void HoldStagedPlacement(const FRun& Run, ATraceCharacter* Pawn)
+	{
+		if (Pawn == nullptr || Run.StagedLocation.IsZero())
+		{
+			return;
+		}
+
+		constexpr double DriftToleranceSq = 4.0;   // 2 uu: below this, moving him would be the jitter
+		if (FVector::DistSquared(Pawn->GetActorLocation(), Run.StagedLocation) <= DriftToleranceSq)
+		{
+			return;
+		}
+
+		Pawn->SetActorLocation(Run.StagedLocation, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+		if (UCharacterMovementComponent* MoveComp = Pawn->GetCharacterMovement())
+		{
+			MoveComp->Velocity = FVector::ZeroVector;
+		}
 	}
 
 	static void RestoreArm(FRun& Run)
@@ -2435,7 +3322,7 @@ namespace TraceAbilityFireRateMeasure
 				{
 					FString Why;
 					Run->bWallStaged = true;
-					if (!PlaceAgainstNearestWall(Subject, Why))
+					if (!PlaceAgainstNearestWall(Subject, Run->StagedLocation, Why))
 					{
 						Sample.Invalid = FString::Printf(TEXT("could not stage the wall stick: %s"), *Why);
 						LogSample(Sample, Stage.Label, Run->ArmIndex);
@@ -2549,6 +3436,47 @@ namespace TraceAbilityFireRateMeasure
 			// ---- phase 2: watch the clip. Every round that leaves it is stamped --------------------
 			if (Run->Phase == 2)
 			{
+				// ---- the stuck stage holds its own conditions up for the whole window --------------
+				//
+				// TWO THINGS, and they are prevention and recovery for the same failure. First, pin him
+				// where the stage put him, because the ability drops the stick the moment its own probe
+				// loses the wall and 1.8 s in a live match is long enough to be pushed off it. Second,
+				// if the stick lapses anyway, THROW THE PARTIAL WINDOW AWAY AND TAKE A NEW ONE rather
+				// than publishing a cadence that belongs to two different guns — the validity test at
+				// the end of the window would (correctly) refuse it, and a refusal is not a measurement.
+				//
+				// Capped at MaxStickRestarts so a genuinely broken passive still reports the lapse
+				// instead of looping for the whole match.
+				if (Stage.bStick)
+				{
+					HoldStagedPlacement(*Run, Subject);
+
+					UTraceAbilitySetSlimeball* Slime = Abilities->GetAbilitySetAs<UTraceAbilitySetSlimeball>();
+					if (Slime != nullptr && !Slime->IsStuck())
+					{
+						if (Run->StickRestarts < MaxStickRestarts)
+						{
+							++Run->StickRestarts;
+							UE_LOG(LogTraceGame, Warning,
+								TEXT("[FIRERATE] the wall stick lapsed %.2fs into the %s window (%d round(s) "
+								     "timed so far). Re-staging and taking the window again — attempt %d of %d."),
+								WindowSeconds - (Run->WindowEndWorld - NowWorld), Stage.Label, Sample.Shots,
+								Run->StickRestarts, MaxStickRestarts);
+
+							Weapon->StopFire();
+							Weapon->RequestReload();
+
+							// Back to phase 0, which re-stages the wall (now idempotent when he is
+							// already against one), waits out the reload and re-arms both the interval
+							// and the passive. The partial sample goes in the bin.
+							Sample = FSample();
+							Run->bWallStaged = false;
+							Run->Phase = 0;
+							return true;
+						}
+					}
+				}
+
 				// The seam, every frame. See FSample::MinScaleSeen.
 				const float ScaleNow = UTraceAbilityComponent::GetFireIntervalScaleFor(Subject);
 				Sample.MinScaleSeen = FMath::Min(Sample.MinScaleSeen, ScaleNow);
@@ -2653,7 +3581,9 @@ namespace TraceAbilityFireRateMeasure
 			Weapon->StopFire();
 			Weapon->RequestReload();
 
-			Run->bWallStaged = false;   // the next arm stages its own placement
+			Run->bWallStaged = false;      // the next arm stages its own placement
+			Run->StagedLocation = FVector::ZeroVector;
+			Run->StickRestarts = 0;        // and its own restart budget
 			if (Run->ArmIndex == 0)
 			{
 				Run->ArmIndex = 1;

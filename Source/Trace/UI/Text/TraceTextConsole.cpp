@@ -36,6 +36,8 @@
 #include "UI/Text/TraceText.h"
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 
+#if !UE_BUILD_SHIPPING
+
 // Named after the file for the unity/jumbo build; see Scripts/check-jumbo-build-collisions.py.
 namespace TraceTextConsoleFile
 {
@@ -59,6 +61,49 @@ namespace TraceTextConsoleFile
 	 * which is the point, because the caption is exactly the assertion the photograph must replace.
 	 */
 	static const TCHAR* WeightSpecimen = TEXT("MORTIMER");
+
+	/**
+	 * THE LATIN-1 SPECIMEN (UI plan WP12) — "BJÖRN — ÀÉÎÕÜ ¿¡".
+	 *
+	 * Every glyph in it except the ASCII letters is one the licensed sheets were never rasterised
+	 * for, so the whole string is a photograph of the per-glyph fallback: B, J, R and N come from
+	 * the drawing face, the Ö and the accented capitals and the inverted punctuation come from
+	 * T_FontAtlasNames, and they sit on ONE baseline or the fallback's vertical alignment is wrong.
+	 * The em dash is the string's other job: U+2014 is not in Latin-1 either, so it also proves the
+	 * charset's typographic-marks run reached the sheet.
+	 *
+	 * BUILT FROM CODEPOINTS, NOT TYPED AS TEXT, and that is not fussiness. A .cpp containing raw
+	 * UTF-8 needs a byte-order mark before MSVC will read it as UTF-8 rather than as the system
+	 * codepage; this file has none, and the day somebody builds this on Windows a literal "Ö" here
+	 * would silently become two wrong glyphs — which would look exactly like the fallback failing.
+	 */
+	static FString Latin1Specimen()
+	{
+		const TCHAR Chars[] = {
+			TEXT('B'), TEXT('J'), 0x00D6, TEXT('R'), TEXT('N'),   // BJÖRN
+			TEXT(' '), 0x2014, TEXT(' '),                          // em dash
+			0x00C0, 0x00C9, 0x00CE, 0x00D5, 0x00DC,                // ÀÉÎÕÜ
+			TEXT(' '), 0x00BF, 0x00A1,                             // ¿¡
+			TEXT('\0')
+		};
+		return FString(Chars);
+	}
+
+	/** One line saying whether the fallback is live, and how to reach the other arm. */
+	static FString Latin1Status()
+	{
+		if (!TraceText::IsAtlasActive())
+		{
+			return TEXT("ATLAS IS DOWN - THIS ROW IS ORDINARY SLATE/LATO, NOT THE FALLBACK SHEET");
+		}
+		if (TraceText::IsGlyphFallbackActive())
+		{
+			return FString::Printf(
+				TEXT("NON-ASCII FROM %s  -  RED ARM: Trace.Text.GlyphFallback 0"),
+				TraceText::FallbackFaceSourceFile());
+		}
+		return TEXT("FALLBACK OFF (Trace.Text.GlyphFallback 0) - THE HOLES ARE THE PRE-WP12 ARM");
+	}
 
 	/** Size for the face rows. Big enough that a stem is many pixels wide, so the ratio is robust. */
 	static constexpr float WeightSpecimenSize = 44.f;
@@ -87,6 +132,9 @@ namespace TraceTextConsoleFile
 
 	/** Defined below, next to the Slate half's version of the same comparison. */
 	static void DrawWeightPair(UCanvas* Canvas, float X, float Y, float S, const TCHAR* Which);
+
+	/** Defined below, next to the Slate half's version of the Latin-1 rows. */
+	static void DrawLatin1Block(UCanvas* Canvas, float X, float Y, float S);
 
 	static TSharedPtr<SWidget> Overlay;
 	static FDelegateHandle CanvasHandle;
@@ -141,6 +189,63 @@ namespace TraceTextConsoleFile
 		Y += TraceText::LineHeight(Caption.Size) * 1.6f;
 
 		DrawWeightPair(Canvas, X, Y, S, TEXT("CANVAS"));
+
+		// THE LATIN-1 BLOCK GOES IN A SECOND COLUMN, on the right, rather than under the rows above.
+		// The block above already reaches most of the way down a 1080-tall frame and the specimen
+		// this work package has to PHOTOGRAPH must not be the thing that falls off the bottom of it.
+		// The widest string on the left is the alphabet at 34 px — 933 px at 1080p — so 0.56 of the
+		// frame clears it at every size this preview is captured at.
+		DrawLatin1Block(Canvas, Canvas->SizeX * 0.56f, Canvas->SizeY * 0.52f, S);
+	}
+
+	/**
+	 * THE PER-GLYPH FALLBACK, PHOTOGRAPHED (UI plan WP12).
+	 *
+	 * Same specimen in every face, one line apart, at the size the scoreboard and the kill feed draw
+	 * names at. What a reviewer is looking for is threefold and none of it needs the caption:
+	 *
+	 *   1. NO HOLES. Before this work package, "BJÖRN" drew as "BJ RN" — the pen advanced by a space
+	 *      for the Ö and nothing was blitted. Every gap in these rows would be a glyph that did not
+	 *      reach the sheet.
+	 *   2. ONE BASELINE. The Ö is Lato and the B either side of it is not; Lato's cell is a 137 px
+	 *      line box against the licensed faces' 116, so if the baseline shift were missing or had
+	 *      the wrong sign the accented letters would sit visibly high or low in their own word.
+	 *   3. TWO TYPEFACES, ON PURPOSE. The ASCII letters change face row to row and the accented ones
+	 *      do not — that is what a fallback IS, and seeing it is how you know the fallback is what
+	 *      drew them rather than the sheet having quietly grown a charset it must not have.
+	 */
+	static void DrawLatin1Block(UCanvas* Canvas, float X, float Y, float S)
+	{
+		const FLinearColor Label(0.55f, 0.62f, 0.72f, 1.f);
+
+		TraceText::FStyle Caption(15.f * S, Label);
+		TraceCanvasText::Draw(Canvas, TEXT("LATIN-1 NAMES (WP12)  -  PER-GLYPH FALLBACK, EVERY FACE"),
+			X, Y, Caption);
+		Y += TraceText::LineHeight(Caption.Size) * 1.15f;
+
+		TraceCanvasText::Draw(Canvas, Latin1Status(), X, Y, Caption);
+		Y += TraceText::LineHeight(Caption.Size) * 1.4f;
+
+		const FString Specimen = Latin1Specimen();
+		const float Size = 34.f * S;
+		for (int32 Pass = 0; Pass < static_cast<int32>(ETraceTextWeight::Count); ++Pass)
+		{
+			const ETraceTextWeight Weight = static_cast<ETraceTextWeight>(Pass);
+
+			TraceText::FStyle Row(Size, WeightInk(Weight));
+			Row.Weight = Weight;
+			TraceCanvasText::Draw(Canvas, Specimen, X, Y, Row);
+
+			// The tag sits on the specimen's baseline, in the specimen's face — same rule as
+			// DrawWeightPair, and for the same reason: the faces no longer share an ascent.
+			TraceCanvasText::Draw(Canvas,
+				FString::Printf(TEXT("  %s = %s"), TraceText::WeightName(Weight),
+					TraceText::FaceSourceFile(Weight)),
+				X + TraceText::MeasureWidth(Specimen, Row) + (14.f * S),
+				Y + (TraceText::Ascent(Size, Weight) - TraceText::Ascent(Caption.Size)), Caption);
+
+			Y += TraceText::LineHeight(Size) * 1.05f;
+		}
 	}
 
 	/**
@@ -266,6 +371,40 @@ namespace TraceTextConsoleFile
 			];
 	}
 
+	/** The Latin-1 rows again, through the UMG/Slate leaf. Same claim, other renderer. */
+	static TSharedRef<SWidget> MakeLatin1Column()
+	{
+		const FLinearColor Label(0.55f, 0.62f, 0.72f, 1.f);
+		const FString Specimen = Latin1Specimen();
+
+		TSharedRef<SVerticalBox> Box = SNew(SVerticalBox);
+
+		Box->AddSlot().AutoHeight()
+		[
+			MakeAtlasLine(TEXT("UMG / SLATE  -  LATIN-1 NAMES (WP12), EVERY FACE"), 15.f, Label)
+		];
+		Box->AddSlot().AutoHeight().Padding(0.f, 0.f, 0.f, 8.f)
+		[
+			MakeAtlasLine(Latin1Status(), 15.f, Label)
+		];
+
+		for (int32 Index = 0; Index < static_cast<int32>(ETraceTextWeight::Count); ++Index)
+		{
+			const ETraceTextWeight Weight = static_cast<ETraceTextWeight>(Index);
+			Box->AddSlot().AutoHeight()
+			[
+				MakeAtlasLine(Specimen, 34.f, WeightInk(Weight), Weight)
+			];
+			Box->AddSlot().AutoHeight().Padding(0.f, 0.f, 0.f, 6.f)
+			[
+				MakeAtlasLine(FString::Printf(TEXT("%s = %s"), TraceText::WeightName(Weight),
+					TraceText::FaceSourceFile(Weight)), 13.f, Label)
+			];
+		}
+
+		return Box;
+	}
+
 	static TSharedRef<SWidget> BuildOverlay()
 	{
 		const FLinearColor Label(0.55f, 0.62f, 0.72f, 1.f);
@@ -324,6 +463,9 @@ namespace TraceTextConsoleFile
 			];
 		}
 
+		// TWO COLUMNS. The Latin-1 rows go on the RIGHT, for the same reason the Canvas half puts
+		// them there: the existing block already fills a 1080-tall frame top to bottom, and the one
+		// specimen this work package exists to photograph must not be the row that falls off it.
 		return SNew(SOverlay)
 			+ SOverlay::Slot()
 				.HAlign(HAlign_Left)
@@ -331,6 +473,13 @@ namespace TraceTextConsoleFile
 				.Padding(60.f, 60.f, 0.f, 0.f)
 			[
 				Box
+			]
+			+ SOverlay::Slot()
+				.HAlign(HAlign_Right)
+				.VAlign(VAlign_Top)
+				.Padding(0.f, 60.f, 60.f, 0.f)
+			[
+				MakeLatin1Column()
 			];
 	}
 
@@ -411,10 +560,76 @@ namespace TraceTextConsoleFile
 				TraceText::CapHeight(34.f, Weight), TraceText::Ascent(34.f, Weight));
 		}
 
+		// THE PER-GLYPH FALLBACK, PER CODEPOINT (UI plan WP12). A width would not settle this: a
+		// string of holes and a string of letters can measure the same if the fallback advances are
+		// wrong, and a string that measures right can still be drawing question marks. So this names
+		// every character of the specimen and says which sheet answered for it — "own" for the face
+		// asked for, "FALLBACK" for the Latin-1 sheet, and "NO CELL" for one that will draw a '?'.
+		{
+			const FString Specimen = Latin1Specimen();
+			const ETraceTextWeight Weight = ETraceTextWeight::Hud;   // the face the kill feed uses
+			FString Breakdown;
+			int32 FromFallback = 0;
+			int32 Undrawable = 0;
+			for (int32 Index = 0; Index < Specimen.Len(); ++Index)
+			{
+				const TCHAR Char = Specimen[Index];
+				if (Char == TEXT(' '))
+				{
+					continue;
+				}
+				const bool bAscii = (Char >= TEXT(' ') && Char <= TEXT('~'));
+				const bool bDrawable = TraceText::CanDraw(Char, Weight);
+				FromFallback += (!bAscii && bDrawable) ? 1 : 0;
+				Undrawable += bDrawable ? 0 : 1;
+				Breakdown += FString::Printf(TEXT("%sU+%04X=%s"),
+					Breakdown.IsEmpty() ? TEXT("") : TEXT(" "),
+					static_cast<int32>(Char),
+					bAscii ? TEXT("own") : (bDrawable ? TEXT("FALLBACK") : TEXT("NO CELL")));
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Text] Per-glyph fallback: %s. Specimen in the %s face — %d glyph(s) from %s, ")
+				TEXT("%d with no cell anywhere (those draw '?'). %s"),
+				TraceText::IsGlyphFallbackActive() ? TEXT("ON") : TEXT("OFF"),
+				TraceText::WeightName(Weight), FromFallback,
+				TraceText::FallbackFaceSourceFile(), Undrawable, *Breakdown);
+
+			// THE OTHER HALF OF THE RULE, PROBED RATHER THAN ASSUMED. The specimen above is all
+			// covered, so on its own it says nothing about what happens past the edge of the
+			// fallback charset — and "draws a '?' instead of advancing silently" is the half of
+			// WP12 that keeps a hole from coming back by another route. These four codepoints are
+			// chosen to bracket that edge with strings a real lobby produces:
+			//
+			//   U+00F6  o-umlaut          Latin-1: COVERED, the case the sheet was made for.
+			//   U+0141  L-with-stroke     Latin Extended-A. A Polish name really does carry it and
+			//                             the sheet really does not — this is a '?' and saying so
+			//                             is the point.
+			//   U+4E2D  a CJK ideograph   far outside anything this project rasterises.
+			//   U+00AD  soft hyphen       INVISIBLE ON PURPOSE, and the one that would be a new
+			//                             defect if it came out as a question mark.
+			// Named EdgeCase, not Probe: `Probe` is the FStyle a few lines up and -Wshadow is an
+			// error in this project.
+			const TCHAR EdgeCases[] = { 0x00F6, 0x0141, 0x4E2D, 0x00AD };
+			FString Edge;
+			for (const TCHAR EdgeCase : EdgeCases)
+			{
+				Edge += FString::Printf(TEXT("%sU+%04X=%s"),
+					Edge.IsEmpty() ? TEXT("") : TEXT(" "), static_cast<int32>(EdgeCase),
+					TraceText::CanDraw(EdgeCase, Weight) ? TEXT("drawable") : TEXT("draws '?'"));
+			}
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Text] Charset edge (%s face): %s. Anything \"draws '?'\" is a codepoint ")
+				TEXT("neither the licensed sheets nor %s has a cell for; TraceHUD's ")
+				TEXT("WarnIfUndrawable names those strings once each and stays quiet about the rest."),
+				TraceText::WeightName(Weight), *Edge, TraceText::FallbackFaceSourceFile());
+		}
+
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[Text] Preview it with `Trace.Text.Preview` — it now draws both weights of \"%s\" ")
-			TEXT("through both renderers. Force the fallback with `Trace.Text.Atlas 0` or ")
-			TEXT("-TraceNoFontAtlas."), WeightSpecimen);
+			TEXT("through both renderers, and the Latin-1 specimen in every face. Force the fallback ")
+			TEXT("with `Trace.Text.Atlas 0` or -TraceNoFontAtlas; put the pre-WP12 holes back in the ")
+			TEXT("Latin-1 rows with `Trace.Text.GlyphFallback 0`."), WeightSpecimen);
 
 		if (GEngine != nullptr)
 		{
@@ -466,3 +681,5 @@ namespace TraceTextConsoleFile
 		TEXT("Optional argument: on | off."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&Preview));
 }
+
+#endif // !UE_BUILD_SHIPPING

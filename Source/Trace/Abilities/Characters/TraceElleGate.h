@@ -226,6 +226,22 @@ public:
 	int32 GetDrawnBeadCount() const;
 
 	/**
+	 * How far the PAIRED gate's middle ring has turned, degrees, on this machine (FX §2.5).
+	 *
+	 * "The middle bead-ring of a paired gate rotates 12 deg/s" is a claim about MOTION, and motion is
+	 * the one thing a screenshot cannot show. Reading the live component's yaw back is the same trick
+	 * every other probe in this project uses for a size — measure the thing on screen rather than
+	 * re-derive the number the recipe asked for. A lone gate never turns and reads 0.
+	 */
+	float GetRingSpinDegrees() const;
+
+	/** True while the 0.3 s snap cast ring is still expanding (FX §2.5's "Snap cast ring"). */
+	bool IsCastRingPlaying() const;
+
+	/** 0..1 across the gate's last 0.3 s: 1 = full brightness, 0 = the instant it is destroyed. */
+	float GetExpiryFadeAlpha() const;
+
+	/**
 	 * The effect class an entry by @p Candidate is asked about, and the ONE decision that makes the
 	 * founding invariant work. Public so a harness can print it rather than infer it.
 	 *
@@ -273,9 +289,38 @@ protected:
 	UPROPERTY(Transient)
 	TObjectPtr<USceneComponent> Root = nullptr;
 
-	/** The rings. One component, one material instance — the colour is per GATE, not per ring. */
+	/**
+	 * The ANKLE and HEAD rings. One component, one material instance — the colour is per GATE, not
+	 * per ring, and the two static rings share it with the spinning one below.
+	 */
 	UPROPERTY(Transient)
 	TObjectPtr<UInstancedStaticMeshComponent> RingMesh = nullptr;
+
+	/**
+	 * The WAIST ring, alone in its own component so it can TURN (FX §2.5).
+	 *
+	 * §2.5 asks for the middle ring of a paired gate to rotate 12 deg/s, "motion communicates 'live
+	 * portal'; brightness stays constant — gates are on the bible's no-pulse list §3.3". A separate
+	 * component makes that one SetRelativeRotation per frame instead of twenty per-instance transform
+	 * writes plus a render-state dirty, and it costs nothing: the instances were always going to be in
+	 * SOME component and the colour is shared through the same MID.
+	 *
+	 * It is rotated about the mouth, which is where the actor's own origin already is — so the beads
+	 * orbit rather than swinging on an arm.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInstancedStaticMeshComponent> SpinRingMesh = nullptr;
+
+	/**
+	 * FX §2.5's SNAP CAST RING: a ground ring that sweeps r 30 -> 80 uu over 0.3 s as the mouth opens.
+	 *
+	 * Local to every machine and driven from BeginPlay rather than server-spawned, for the same reason
+	 * the ElleSnap sound is a replicated-local play: THE GATE ACTOR IS ALREADY THE MULTICAST. Spawning
+	 * an ATraceFxBurst here would put a second replicated actor on the wire to say a thing this one has
+	 * just finished saying.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInstancedStaticMeshComponent> CastRingMesh = nullptr;
 
 private:
 	/** SERVER ONLY. Expiry, then the step-through poll. */
@@ -299,8 +344,17 @@ private:
 	/** Cosmetic half. Builds the rings once the replicated mouth has arrived. */
 	void BuildRingsIfNeeded();
 
-	/** One ring of beads, centred on @p Center, lying in the horizontal plane. */
-	void AddRing(const FVector& Center, float Radius) const;
+	/** One ring of beads, centred on @p Center, lying in the horizontal plane, into @p Into. */
+	void AddRing(UInstancedStaticMeshComponent* Into, const FVector& Center, float Radius) const;
+
+	/** Cosmetic, every machine, every frame: the spin, the cast ring and the expiry fade. */
+	void TickGateFx(float DeltaSeconds);
+
+	/** Re-lays the cast ring's beads at this frame's radius. Hides the component when it is done. */
+	void UpdateCastRing();
+
+	/** Pushes the pair colour and the expiry fade into the shared ring MID. */
+	void PushRingColour();
 
 	/** The match clock. Identical to the ability component's. */
 	float MatchTimeNow() const;
@@ -337,6 +391,22 @@ private:
 	/** Colour the rings were last built with, so a pairing can recolour without a rebuild. */
 	bool bBuiltAsPaired = false;
 
+	/** Seconds the cast ring has been running. >= CastRingSeconds means "finished, hidden". */
+	float CastRingElapsed = 0.f;
+
+	/** The last expiry fade written into the MID, so the per-frame write can be skipped when it is 1. */
+	float LastFadeWritten = 1.f;
+
+	/**
+	 * Whether the local ElleSnap play has happened on this machine.
+	 *
+	 * BeginPlay is the trigger and BeginPlay runs exactly once, so this looks redundant — it is not:
+	 * a client's gate reaches BeginPlay before a single replicated property has landed, which is also
+	 * before the mouth is known, and playing a spatialised sound at (0,0,0) is worse than playing it a
+	 * frame late. The play is therefore deferred to the first tick that HAS a mouth.
+	 */
+	bool bSnapSoundPlayed = false;
+
 	UPROPERTY(Transient)
 	TObjectPtr<UStaticMesh> BeadMesh = nullptr;
 
@@ -348,4 +418,8 @@ private:
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> RingMID = nullptr;
+
+	/** The cast ring's own instance: orchid rather than a mouth purple, on its own 0.3 s clock. */
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> CastRingMID = nullptr;
 };

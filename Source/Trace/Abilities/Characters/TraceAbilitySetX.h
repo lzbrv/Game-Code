@@ -40,8 +40,11 @@
 //
 //        GetMoveSpeedMultiplier(). ANY enemy, not the one he marked — so a teammate's kill pressure
 //        on a marked target does not switch X's boost off, and a second X is not required for it to
-//        be worth marking two people. NOTE: the movement component does not call
-//        UTraceAbilityComponent::GetMoveSpeedMultiplierFor yet; see the report's cross-file needs.
+//        be worth marking two people. LIVE: UTraceCharacterMovementComponent::GetMaxSpeed()
+//        (TraceCharacterMovementComponent.cpp, ~:4190) multiplies the ground speed by
+//        UTraceAbilityComponent::GetMoveSpeedMultiplierFor. Ground only, and deliberately — the air
+//        ceilings are the momentum model, not GetMaxSpeed. (This note used to say the movement
+//        component "does not call it yet".)
 //
 //   "ACTIVATED — STING: loads the 5 bees into his gun and they stop orbiting. His NEXT FIVE BULLETS
 //    apply vulnerable on hit, at NORMAL damage. When all five are fired the bees resume orbiting.
@@ -107,10 +110,12 @@
 
 #include "Abilities/TraceAbilityTypes.h"
 #include "Abilities/TraceCharacterAbilitySet.h"
+#include "Gameplay/TraceFxShapes.h"       // ETraceFxBlend — stored per piece, so it must be complete
 
 #include "TraceAbilitySetX.generated.h"
 
 class ATraceCharacter;
+class UInstancedStaticMeshComponent;
 class UStaticMeshComponent;
 class UMaterialInstanceDynamic;
 class UMaterialInterface;
@@ -171,6 +176,20 @@ public:
 	virtual void OnPawnDied() override;
 	virtual void OnHalfTime() override;
 	virtual void TickAbilities(float DeltaSeconds) override;
+
+	// ---- FX_AUDIO_PLAN §1.2's client FX router ---------------------------------------------------
+	//
+	// The ONE thing X needs from the router is the STING-LOAD CONVERGE: §2.7 replaces "the swarm
+	// hides instantly" with "the bees fly to the gun over 0.3 s and then hide", and 0.3 s of
+	// animation has to start on the EDGE. The 20 Hz poll in TickAbilities is the belt (it starts the
+	// same converge if the edge was missed, and it is idempotent), but an animation started from a
+	// poll is an animation that begins up to 50 ms late on a state change the player caused.
+	//
+	// SyncClientFx SNAPS instead of animating, and that is the whole difference between the two
+	// hooks: a machine seeing an already-loaded X for the first time must not play the flight of
+	// bees that happened before it was watching.
+	virtual void OnClientStateEdge(const FTraceAbilityNetState& Old, const FTraceAbilityNetState& New) override;
+	virtual void SyncClientFx(const FTraceAbilityNetState& Current) override;
 
 	// ---- the activated ability: STING ----------------------------------------------------------
 	virtual bool  CanActivate(FText& OutReason) const override;
@@ -276,21 +295,120 @@ public:
 	/** The pawn being orbited. Gone -> the swarm retires itself. */
 	TWeakObjectPtr<ATraceCharacter> Host;
 
-	/** Hidden while Sting has the bees loaded in the gun ("they stop orbiting"). */
-	void SetSwarmVisible(bool bVisible);
+	/**
+	 * "They stop orbiting" — and, since FX_AUDIO_PLAN §2.7, they FLY THERE first.
+	 *
+	 * @param bLoaded   true when Sting has the bees in the gun.
+	 * @param bAnimate  true to play §2.7's 0.3 s converge into the muzzle before hiding; false to
+	 *                  snap straight to the answer. FALSE is for FIRST SIGHT (SyncClientFx): a
+	 *                  machine that has just started watching an already-loaded X must not be shown
+	 *                  a flight of bees that happened before it was looking.
+	 *
+	 * IDEMPOTENT IN BOTH DIRECTIONS. It is called from the §1.2 router edge AND from the 20 Hz poll
+	 * in UTraceAbilitySetX::TickAbilities, so it has to be safe to call with the same answer forty
+	 * times a second — a converge already in flight is left alone rather than restarted, which is
+	 * what would otherwise freeze the bees at their starting radius for as long as the poll ran.
+	 */
+	void SetSwarmLoaded(bool bLoaded, bool bAnimate);
+
+	/** True while the bees are flying into the gun. For the harness and for the poll's idempotence. */
+	bool IsConverging() const { return Phase == EPhase::Converging; }
+
+	/** True once they have arrived and the swarm is drawn nowhere. */
+	bool IsLoadedAndHidden() const { return Phase == EPhase::Loaded; }
+
+	/**
+	 * ONE LINE OF MEASUREMENTS TAKEN OFF THE LIVE COMPONENTS, for Trace.X.BeeFxTest.
+	 *
+	 * *** READ BACK, NEVER RE-DERIVED. *** Every number in it comes out of the components that are on
+	 * screen — the achieved blends, the instance counts, the halo's scale relative to the core's, the
+	 * trail radius and segment length recovered through UTraceFxShapes' inverse scale helpers. A
+	 * verifier that recomputed the numbers from TraceXBeeFx would only be checking its own
+	 * arithmetic; this checks the thing a player is looking at.
+	 */
+	FString DebugDescribe() const;
+
+	/** Bee @p BeeIndex's world position as the CORE instance actually holds it. False if absent. */
+	bool DebugGetBeeWorldLocation(int32 BeeIndex, FVector& OutLocation) const;
 
 private:
-	/** Built lazily so the count follows UTraceSettings::XBeeCount without a restart. */
-	void EnsureBeeComponents(int32 DesiredCount);
+	/**
+	 * WHERE THE SWARM IS IN §2.7'S THREE-STATE LIFE. It used to be one bool.
+	 *
+	 *   Orbiting     the resting state: five bees on the orbit, stinging on contact.
+	 *   Converging   Sting was activated; the bees are lerping into the muzzle over ConvergeSeconds.
+	 *   Loaded       they are in the gun and drawn nowhere.
+	 */
+	enum class EPhase : uint8
+	{
+		Orbiting,
+		Converging,
+		Loaded
+	};
+
+	/** Builds the five instanced pieces once, and re-counts instances when XBeeCount is retuned. */
+	void EnsureBeeInstances(int32 DesiredCount);
+
+	/** Places every instance of every piece for one frame. @p Alpha 0..1 is the converge progress. */
+	void PlaceBees(const FVector& Centre, float MatchTimeSeconds, int32 BeeCount, float ConvergeAlpha);
+
+	/** Shows or hides all five pieces at once. */
+	void SetPiecesVisible(bool bVisible);
+
+	// =============================================================================================
+	// THE FIVE PIECES — FX_AUDIO_PLAN §2.7's "bee polish", AND WHY THERE ARE FIVE OF THEM
+	// =============================================================================================
+	//
+	// §2.7 asks, PER BEE, for a halo sleeve at x1.8 scale and a trailing cylinder whose intensity
+	// fades 0.4 -> 0 along its length. Written literally that is five bees x (core + halo + trail) =
+	// fifteen components on one actor, and a fading trail needs more than one anyway because a
+	// material instance has ONE intensity.
+	//
+	// So every repeated element is ONE UInstancedStaticMeshComponent carrying N instances — the
+	// project's own bead-ring precedent (ATraceElleGate's 60, ATraceFxBurst's whole scatter slot) —
+	// and the trail's fade is three stacked segment components at three intensities rather than a
+	// gradient no material here can express.
+	//
+	// THE NET COMPONENT COUNT IS UNCHANGED: this replaces five per-bee UStaticMeshComponents with
+	// five instanced pieces, and buys the halo and the trail for nothing.
+	//
+	// The swarm is NOT counted against TraceFxLoopBudget's four-per-pawn ceiling, and that is not an
+	// oversight: §1.4's budget counts primitives ATTACHED TO A PAWN, and this is a separate,
+	// unattached, local-only actor whose bees orbit 120 uu out — outside the capsule footprint the
+	// budget is defined in terms of. It predates the budget and is X's passive rather than a
+	// while-active loop FX.
+
+	/** The bees themselves: N spheres 16 uu across, emissive amber. The shipped look, preserved. */
+	UPROPERTY(Transient)
+	TObjectPtr<UInstancedStaticMeshComponent> Cores;
+
+	/** §2.7's "additive halo sleeve x1.8 scale BeeRounds amber I 0.3". N instances, one per bee. */
+	UPROPERTY(Transient)
+	TObjectPtr<UInstancedStaticMeshComponent> Halos;
+
+	/**
+	 * §2.7's "one trailing cylinder (l 60 uu, r 3 uu) along the orbit tangent, I fading 0.4 -> 0".
+	 *
+	 * Three components because the fade is real: each holds N instances covering one third of the
+	 * trail's length, at its own intensity. One component could hold all 3N instances but would have
+	 * one MID and therefore one brightness, which is a streak rather than a trail.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInstancedStaticMeshComponent> TrailParts[3];
 
 	UPROPERTY(Transient)
-	TArray<TObjectPtr<UStaticMeshComponent>> Bees;
+	TObjectPtr<UMaterialInstanceDynamic> CoreMID;
 
 	UPROPERTY(Transient)
-	TArray<TObjectPtr<UMaterialInstanceDynamic>> BeeMIDs;
+	TObjectPtr<UMaterialInstanceDynamic> HaloMID;
 
 	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInterface> BaseMaterial;
+	TObjectPtr<UMaterialInstanceDynamic> TrailMIDs[3];
+
+	/** The blends the pieces ACHIEVED. SetGlow must be given these, never the preferred values. */
+	ETraceFxBlend CoreBlend = ETraceFxBlend::None;
+	ETraceFxBlend HaloBlend = ETraceFxBlend::None;
+	ETraceFxBlend TrailBlend = ETraceFxBlend::None;
 
 	/**
 	 * A UPROPERTY, and found in the CONSTRUCTOR, for two separate reasons: a constructor-time
@@ -298,9 +416,25 @@ private:
 	 * resolves to null once cooked — the policy TraceCore states), and holding it in a tracked
 	 * property is what stops the garbage collector from taking it out from under a function-local
 	 * static.
+	 *
+	 * The MATERIALS no longer come from here: both blends are resolved through UTraceFxShapes, whose
+	 * own CDO holds the cook references and which degrades down a defined ladder instead of silently
+	 * producing an opaque piece where an additive one was wanted.
 	 */
 	UPROPERTY(Transient)
 	TObjectPtr<class UStaticMesh> BeeMesh;
 
-	bool bVisible = true;
+	/** The cylinder the trail segments are made of. Same constructor-time policy as BeeMesh. */
+	UPROPERTY(Transient)
+	TObjectPtr<class UStaticMesh> TrailMesh;
+
+	EPhase Phase = EPhase::Orbiting;
+
+	/**
+	 * LOCAL world time the converge started. Local and not the match clock, deliberately: this is a
+	 * 0.3 s presentation flourish on a purely cosmetic actor, it starts when THIS machine learns the
+	 * bees were loaded, and nothing anywhere compares one machine's converge against another's. The
+	 * ORBIT stays on the match clock, because the orbit is where the bees sting from.
+	 */
+	float ConvergeStartWorldTime = 0.f;
 };

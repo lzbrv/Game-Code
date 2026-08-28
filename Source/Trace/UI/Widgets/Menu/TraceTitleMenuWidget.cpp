@@ -14,6 +14,7 @@
 
 #include "Trace.h"   // LogTraceGame
 #include "UI/TraceHardwareCursor.h"
+#include "UI/Text/TraceAtlasTextWidget.h"   // WP8.2 — the version label
 #include "UI/Text/TraceText.h"
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 #include "UI/Widgets/Menu/TraceMenuGridWidget.h"
@@ -23,40 +24,12 @@
 // anonymous namespaces become one. See Scripts/check-jumbo-build-collisions.py.
 namespace TraceTitleMenuWidgetLocal
 {
-	// ---- The title block, in the 1080-tall reference pixels the asset is authored in --------------
+	// ---- The title block ---------------------------------------------------------------------------
 	//
-	// These five numbers ARE spec v20 §0.2's fix, and every one of them is measured rather than
-	// chosen. The two sprites' ink boxes were taken off the artist's sheet ("UI Test Export_2.png"):
-	// the wordmark's ink is 14265 x 2200 sheet px, the swoosh's is 18521 x 3729, the swoosh sits
-	// 474 sheet px BELOW the mark's ink with its centre 427 px to the LEFT of it. Divide through by
-	// the mark's ink width and those become the four ratios below. Both sprites are cut so tightly
-	// (ink fills 99% of each crop) that the sprite rect and the ink rect are the same rectangle.
-
-	/** The mark's width in reference px, and the fraction of a narrow viewport it may not exceed. */
-	static constexpr float MarkWidth = 660.f;
-	static constexpr float MarkMaxWidthFraction = 0.46f;
-	static constexpr float MarkTopY = 46.f;
-
-	/** Swoosh ink / wordmark ink on the sheet is 1.298. Held a shade under it so the mark leads. */
-	static constexpr float SwooshWidthOfMark = 1.24f;
-
-	/** The artist's clear space: 474 sheet px / 14265 sheet px of mark = 0.0332. */
-	static constexpr float SwooshGapOfMark = 0.033f;
-
-	/** The artist's horizontal offset: 427 / 14265 = 0.0299, to the left. */
-	static constexpr float SwooshLeftOfMark = 0.030f;
-
-	/** Reference px the flourish must stop short of the tagline by, if the clamp has to bite. */
-	static constexpr float SwooshClearOfTagline = 16.f;
-
-	/**
-	 * The swoosh's opacity, down from the authored 0.78.
-	 *
-	 * It is a backdrop for the title, and it is drawn from a sprite whose mean luminance over black
-	 * is 148 against the mark's 24. Even after the mark is lifted to near-white, a flourish at full
-	 * strength competes with the six things on this screen a player actually has to read.
-	 */
-	static constexpr float SwooshOpacity = 0.55f;
+	// The composition constants (mark width/top, swoosh ratios, opacities) lived here until the
+	// release pass. WP9 made the CANVAS title draw the same sprites at the same places, so they
+	// moved to TraceTitleLayout in this class's header, where both renderers read ONE copy — the
+	// full measurement note travels with them.
 
 	// ---- The footer, once it is no longer sitting on the blurb ------------------------------------
 
@@ -267,6 +240,9 @@ void UTraceTitleMenuWidget::NativeOnInitialized()
 	// arranged once, with the grid already in it, instead of being torn down and re-arranged on the
 	// first frame the title screen is visible.
 	InstallGridBackground();
+
+	// WP8.2, same timing argument as the grid.
+	InstallVersionLabel();
 }
 
 void UTraceTitleMenuWidget::InstallGridBackground()
@@ -369,6 +345,70 @@ void UTraceTitleMenuWidget::InstallGridBackground()
 		TEXT("on the root canvas. %s"),
 		BackdropSlot->GetZOrder(), GridZ, LowestSibling, RootCanvas->GetChildrenCount(),
 		*UTraceMenuGrid::Describe());
+}
+
+void UTraceTitleMenuWidget::InstallVersionLabel()
+{
+	if (VersionLabel != nullptr)
+	{
+		return;
+	}
+
+	if (Backdrop == nullptr || WidgetTree == nullptr)
+	{
+		return;
+	}
+
+	// Same parent-resolution move as InstallGridBackground: ask the black fill where it lives.
+	UCanvasPanel* RootCanvas = Cast<UCanvasPanel>(Backdrop->GetParent());
+	if (RootCanvas == nullptr)
+	{
+		return;
+	}
+
+	UTraceAtlasText* Label = WidgetTree->ConstructWidget<UTraceAtlasText>(
+		UTraceAtlasText::StaticClass(), TEXT("VersionText"));
+	if (Label == nullptr)
+	{
+		return;
+	}
+
+	// FS_FOOTER x 0.9 and ink-dim at 0.55: a build identifier for screenshots and bug reports, and
+	// deliberately the quietest type on the screen. The Canvas path draws the same string at the
+	// same corner (ATraceMenuHUD::DrawVersionString).
+	Label->SetSize(11.7f);
+	Label->SetColor(TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.55f));
+	Label->SetVisibility(ESlateVisibility::HitTestInvisible);
+
+	UCanvasPanelSlot* LabelSlot = RootCanvas->AddChildToCanvas(Label);
+	if (LabelSlot == nullptr)
+	{
+		return;
+	}
+
+	// Bottom-right, in the same reference pixels as the Canvas draw (right edge -24, and -14 puts
+	// the ink where a FontSmall x 0.9 line drawn at ViewH - 28 ends up). Anchored so every window
+	// size and DPI scale agrees without this widget knowing either.
+	LabelSlot->SetAnchors(FAnchors(1.f, 1.f, 1.f, 1.f));
+	LabelSlot->SetAlignment(FVector2D(1.0, 1.0));
+	LabelSlot->SetAutoSize(true);
+	LabelSlot->SetPosition(FVector2D(-24.0, -14.0));
+
+	// Above every static layer (footer z 6), below the cursor and the travel/failure overlays, and
+	// NOT a tie with anything — a z-order tie is broken by allocator addresses (the measured hazard
+	// InstallGridBackground documents). Derived from the travel overlay's own slot so a regenerated
+	// asset moves this with it.
+	int32 LabelZ = 7;
+	if (TravelOverlay != nullptr)
+	{
+		if (const UCanvasPanelSlot* TravelSlot = Cast<UCanvasPanelSlot>(TravelOverlay->Slot))
+		{
+			LabelZ = TravelSlot->GetZOrder() - 2;
+		}
+	}
+	LabelSlot->SetZOrder(LabelZ);
+
+	VersionLabel = Label;
 }
 
 void UTraceTitleMenuWidget::InstallAtlasLabels()
@@ -478,6 +518,23 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 			TraceHardwareCursor::RenewSuppression(GetOwningPlayer(), TEXT("title screen"));
 		}
 
+		// ---- THE POINTER IS THE SAME OBJECT ON BOTH RENDERERS (UI QA finding 6) -------------------
+		//
+		// The QA pass photographed this screen's two arms side by side and found two different
+		// pointers: this widget's blade and, on the Canvas arm, a nine-pixel cyan cross. That arm now
+		// draws the blade too, through TraceHardwareCursor::DrawPointer.
+		//
+		// A widget cannot call an AHUD draw, so this is the same three facts reaching the same sprite
+		// by the only route a widget has: the tint, the height and the tip anchor, all read from the
+		// place that owns them rather than from this asset. Applying them here rather than trusting
+		// WBP_TitleMenu is what makes "identical on both renderers" true by construction — an asset
+		// edit cannot silently move one arm away from the other, and a re-slice of the sprite moves
+		// both at once.
+		//
+		// SetColorAndOpacity and not the brush's own tint: the brush is shared with whatever else the
+		// asset uses it for, and this is a per-widget multiply.
+		MenuCursor->SetColorAndOpacity(TraceHardwareCursor::PointerTint());
+
 		// Re-ANCHORED, not offset. The view hands over a 0..1 fraction of the viewport, so setting the
 		// anchor to it puts the sprite in the right place at any DPI scale and any window size without
 		// this widget having to know either. Offsets would have needed both.
@@ -491,6 +548,20 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 				CursorSlot->SetAnchors(FAnchors(
 					static_cast<float>(Fraction.X), static_cast<float>(Fraction.Y),
 					static_cast<float>(Fraction.X), static_cast<float>(Fraction.Y)));
+
+				// UIScale 1 deliberately: UMG has already applied the DPI scale to this widget, and
+				// under the engine's default curve that scale IS the Canvas path's UIScale (shortest
+				// side / 1080). So a size stated in reference pixels here lands at the same number of
+				// screen pixels the Canvas arm computes. Trace.UI.VerifyMenu measures that agreement
+				// for the rest of the screen; this is the pointer joining it.
+				const float CursorH = TraceHardwareCursor::PointerHeight(1.f);
+				CursorSlot->SetAutoSize(false);
+				CursorSlot->SetSize(FVector2D(CursorH * TraceMenuArtStyle::CursorAspect, CursorH));
+
+				// The ALIGNMENT is the tip, so the anchor point above is the pixel the arrow's point
+				// sits on — the same tip-anchoring the Canvas surfaces do by subtracting it.
+				CursorSlot->SetAlignment(FVector2D(
+					TraceMenuArtStyle::CursorTipU, TraceMenuArtStyle::CursorTipV));
 			}
 		}
 	}
@@ -534,6 +605,15 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 	SetTextOn(BlurbText, InView.Blurb);
 	SetTextOn(FooterKeysText, InView.FooterKeys);
 	SetTextOn(FooterHintText, InView.FooterHint);
+
+	// WP8.2 — guarded because the string is a process constant and SetText invalidates layout;
+	// this runs exactly once, on the first frame.
+	if (VersionLabel != nullptr && VersionLabel->Text != InView.Version)
+	{
+		VersionLabel->SetText(InView.Version);
+		VersionLabel->SetVisibility(InView.Version.IsEmpty()
+			? ESlateVisibility::Collapsed : ESlateVisibility::HitTestInvisible);
+	}
 
 	// AFTER the three strings are set, because it measures where the blurb ended up. Spec v20 §0.4.
 	PlaceFooterBelowBlurb();
@@ -721,7 +801,8 @@ void UTraceTitleMenuWidget::LiftWordmarkFromSprite()
 
 void UTraceTitleMenuWidget::ComposeTitleBlock()
 {
-	using namespace TraceTitleMenuWidgetLocal;
+	using namespace TraceTitleLayout;          // the shared composition numbers (see the header)
+	using namespace TraceTitleMenuWidgetLocal; // SetSlotRect and friends
 
 	UCanvasPanelSlot* MarkSlot = (Wordmark != nullptr) ? Cast<UCanvasPanelSlot>(Wordmark->Slot) : nullptr;
 	UCanvasPanelSlot* SwooshSlot = (SwooshImage != nullptr) ? Cast<UCanvasPanelSlot>(SwooshImage->Slot) : nullptr;
@@ -760,8 +841,8 @@ void UTraceTitleMenuWidget::ComposeTitleBlock()
 
 	// The clamp, and the only part of this that is not the artist's own proportion: whatever the
 	// sheet says, the flourish stops above the tagline. Taken from where the tagline actually IS so
-	// that moving it in the asset moves this too.
-	float TaglineTop = 359.f;
+	// that moving it in the asset moves this too; the shared authored position is the fallback.
+	float TaglineTop = TraceTitleLayout::TaglineY;
 	if (const UCanvasPanelSlot* TaglineSlot = (TaglineText != nullptr)
 		? Cast<UCanvasPanelSlot>(LiveText(TaglineText)->Slot) : nullptr)
 	{

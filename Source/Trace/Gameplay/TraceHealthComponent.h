@@ -446,11 +446,36 @@ public:
 	/** Server only. Restores full health and re-arms the death broadcast (used on respawn/reset). */
 	void ResetHealth();
 
+	/**
+	 * Server only. Clamps current health DOWN to GetMaxHealth(), and never up.
+	 *
+	 * SPEC v19 §3, THE HALF THAT WAS MISSING. GetMaxHealth() reads the character override live, but
+	 * Health itself is only ever written at BeginPlay and on a full heal — so a pawn that SWITCHES to
+	 * Lily mid-life kept the 100 it spawned with while its bar divided by 60, and the number only
+	 * snapped the first time it was hit (ApplyDamage clamps). This is the missing re-clamp, called
+	 * from UTraceAbilityComponent::ServerSetCharacter once the character has actually changed.
+	 *
+	 * DOWNWARD ONLY, deliberately: switching AWAY from Lily must not be a free heal to 100. A player
+	 * who leaves Lily at 12 health stays at 12 health with a bigger bar, which is what every other
+	 * way of raising max health in this project does.
+	 */
+	void ReclampToMax();
+
 	UFUNCTION()
 	void OnRep_Health();
 
-private:
+	/**
+	 * This owner's max health: the character's absolute override if it has one (spec v19 §3 — Lily's
+	 * 60), otherwise UTraceSettings::MaxHealth. Read live on every call; never cached.
+	 *
+	 * PUBLIC because ReclampToMax's contract is stated against it and the health harnesses assert on
+	 * "Health never exceeds max" — an invariant nothing outside this class could check while the
+	 * number was private. It is a pure query with no side effects; GetHealthPercent() remains the
+	 * right call for anything drawing a bar.
+	 */
 	float GetMaxHealth() const;
+
+private:
 
 	/** True only on the machine that owns this component's actor authority-wise. */
 	bool HasAuthority() const;

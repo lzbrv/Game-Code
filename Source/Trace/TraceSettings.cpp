@@ -1445,7 +1445,7 @@ namespace
 
 			// --- v14 §6: Chut -------------------------------------------------------------------------
 			{ TEXT("ChutKnifeFrontDamage"),            EKnobType::Float, TEXT("v14 §6: 50 from the front vs the standard 30") },
-			{ TEXT("ChutKnifeBackDamage"),             EKnobType::Float, TEXT("v14 §6 ASSUMPTION: back damage stays 100") },
+			{ TEXT("ChutKnifeBackDamage"),             EKnobType::Float, TEXT("v14 §6: back damage stays the standard — RETAINED FOR CONFIG COMPAT, no reader since C6") },
 			{ TEXT("ChutBashKnockbackSpeed"),          EKnobType::Float, TEXT("v14 §6: bash — NO EFFECT ON THE CORE CARRIER (Control class)") },
 			{ TEXT("ChutBashUpBias"),                  EKnobType::Float, TEXT("v14 §6: vertical component of the bash") },
 			{ TEXT("ChutBashEndFraction"),             EKnobType::Float, TEXT("v14 §6: the END of his standard dash, not the whole dash") },
@@ -1543,6 +1543,21 @@ namespace
 			// player can feel; it changed whether a designer can retune it without a rebuild.
 			{ TEXT("AirStrafeOpposingDeceleration"),   EKnobType::Float, TEXT("v18 §1a: uu/s^2 bled at a DEAD 180 reversal, scaled by the negative part of dot(wish, travel) so it is EXACTLY 0 at 90 degrees and inside it - the air strafe is untouched [by-name bind]") },
 
+			// --- Patch 28 §5: SOURCE-STYLE SURF -------------------------------------------------------
+			//
+			// AND THE SAME STORY AS THE ROW ABOVE, ONE PASS LATER AND FIVE TIMES OVER. The surf pass did
+			// not own TraceSettings.h, so the entire mechanic shipped name-bound against properties that
+			// did not exist and the component said so on every run:
+			//     MOVEKNOB summary: 27 bound, 5 on built-in defaults
+			// It played correctly the whole time on its own literals; what was missing was any way for a
+			// designer to touch it. The properties exist now and the same line reads 32 bound, 0 on
+			// built-in defaults. Listed here, on the pass that introduces them, for the v8 reason.
+			{ TEXT("bSurfEnabled"),                    EKnobType::Bool,  TEXT("Patch 28 §5: master switch. False restores the engine's ComputeSlideVector / LimitAirControl / CanStepUp on every surface, i.e. the pre-patch air game [by-name bind]") },
+			{ TEXT("SurfMinNormalZ"),                  EKnobType::Float, TEXT("Patch 28 §5: FLOOR of the surf band (normal Z). Surfable is this < Nz < the LIVE walkable limit, so a face you can stand on is never surfable. Keep it above WallJumpMaxNormalZ - wall, surf plane and floor must not overlap [by-name bind]") },
+			{ TEXT("SurfOverbounce"),                  EKnobType::Float, TEXT("Patch 28 §5: Source's PM_ClipVelocity overbounce. 1.0 = a pure plane projection; above 1 the ramp bounces you, below 1 you sink into it [by-name bind]") },
+			{ TEXT("SurfContactGraceSeconds"),         EKnobType::Float, TEXT("Patch 28 §5: how long the surf state survives the last contact, so a fan of facets does not flicker it (and the ceiling hanging off it) once per joint. NOT a coyote time [by-name bind]") },
+			{ TEXT("SurfSpeedCeilingMultiplier"),      EKnobType::Float, TEXT("Patch 28 §5: the surf ceiling as a MULTIPLE of the air-strafe HARD cap (1375 x 1.25 = 1719 uu/s; 2160 with a knife), so retuning the air cap moves it. Your ENTRY speed is the floor [by-name bind]") },
+
 			// --- v18 §2: Roxie -----------------------------------------------------------------------
 			//
 			// "Tuning to come after first implementation - so make every part of it a knob and do not
@@ -1569,7 +1584,7 @@ namespace
 			{ TEXT("ElleCloakDurationSeconds"),        EKnobType::Float, TEXT("v18 §2: 3s of cloak after passing or throwing THE CORE (ASSUMPTION: 'the trace' means the Core)") },
 			{ TEXT("ElleCloakOpacity"),                EKnobType::Float, TEXT("v18 §2: 'semi-transparent and hard to see or aim at'. 0 = invisible, 1 = no cloak at all = the RED arm") },
 			{ TEXT("bElleCloakEndsOnCorePickup"),      EKnobType::Bool,  TEXT("v18 §2 ASSUMPTION: picking the Core back up drops the cloak early") },
-			{ TEXT("ElleSlideJumpGainBonus"),          EKnobType::Float, TEXT("v18 §2: +40% of the GAIN, not the multiplier. 0.446875 x 1.40 = 0.625, so hers is 1.625 vs everyone's 1.446875") },
+			{ TEXT("ElleSlideJumpGainBonus"),          EKnobType::Float, TEXT("v18 §2 / Patch 28 §3: +30% of the GAIN, not the multiplier. 0.375000 x 1.30 = 0.487500, so hers is 1.487500 vs everyone's 1.375000") },
 			{ TEXT("ElleSnapSecondGateWindowSeconds"), EKnobType::Float, TEXT("v18 §2: 4s to place the second gate; miss it and the first expires") },
 			{ TEXT("ElleSnapPairLifetimeSeconds"),     EKnobType::Float, TEXT("v18 §2: with both placed, both expire after 8s") },
 			{ TEXT("ElleSnapGateRadiusUU"),            EKnobType::Float, TEXT("v18 §2: how close counts as stepping into a gate") },
@@ -1587,9 +1602,9 @@ namespace
 			{ TEXT("SlimeballStuckFireRateBonus"),     EKnobType::Float, TEXT("v18 §2: +30% fire rate WHILE STUCK ONLY. A RATE bonus - it divides FireInterval") },
 			{ TEXT("SlimeballStuckDamageReduction"),   EKnobType::Float, TEXT("v18 §2: 30% off BODY SHOTS AND FRONT KNIFE STABS while stuck. ASSUMPTION: headshots and backstabs unreduced, exactly like Chud") },
 			{ TEXT("SlimewallHeightUU"),               EKnobType::Float, TEXT("v18 §2: 'one player height tall' = 176uu (2 x the 88 capsule half-height). CHANGEABLE, the doc says so explicitly") },
-			{ TEXT("SlimewallWidthUU"),                EKnobType::Float, TEXT("v18 §2: the slab's THICKNESS along his aim, i.e. how far an enemy walks through it. 176 = the doc's 'and wide'") },
-			{ TEXT("SlimewallLengthUU"),               EKnobType::Float, TEXT("v18 §2: the SPAN across his aim - the part you hide behind. 1100 = the arena's one-player-height cover block") },
-			{ TEXT("SlimewallRangeUU"),                EKnobType::Float, TEXT("v18 §2: how far in front of him it goes up") },
+			{ TEXT("SlimewallWidthUU"),                EKnobType::Float, TEXT("v18 §2 / Patch 28 §2: the span ACROSS his aim, i.e. how far an enemy travels while crossing it. 176 = the doc's 'and wide'. The AXIS turned with item 2; the number and the job did not") },
+			{ TEXT("SlimewallLengthUU"),               EKnobType::Float, TEXT("v18 §2 / Patch 28 §2: the run ALONG his aim, away from him - how far it REACHES, no longer the part you hide behind. 1100 = the arena's one-player-height cover block") },
+			{ TEXT("SlimewallRangeUU"),                EKnobType::Float, TEXT("v18 §2 / Patch 28 §2: how far in front of him it goes up. CHANGED MEANING, NOT VALUE - it was the distance to the wall's CENTRE and is now the distance to its NEAR END, so the run occupies 400..1500 uu ahead") },
 			{ TEXT("SlimewallSlowFraction"),           EKnobType::Float, TEXT("v18 §2: 35%. CONTROL - refused on a carrier per the §4 assumption. 0 = a wall that only blocks sight = the RED arm") },
 			{ TEXT("SlimewallSlowLingerSeconds"),      EKnobType::Float, TEXT("v18 §2 ASSUMPTION: how long the slow lasts after leaving the slab; 0 makes a 176uu-thick wall barely noticeable") },
 			{ TEXT("SlimewallDurationSeconds"),        EKnobType::Float, TEXT("v18 §2: 4s, stated") },

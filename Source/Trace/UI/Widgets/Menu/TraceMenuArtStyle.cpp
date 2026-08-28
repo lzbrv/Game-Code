@@ -230,23 +230,42 @@ TraceMenuArtStyle::FPlateSilhouette TraceMenuArtStyle::ResolvePlateSilhouette(
 	return Out;
 }
 
+namespace TraceMenuArtStyleFile
+{
+	/**
+	 * The one lift, shared by AmberLifted() and WordHoverLifted() so the two "stated transformation"
+	 * functions in the palette cannot drift apart. Round-trips through the sheet's own byte values,
+	 * so the ratio being preserved is the one that was measured off the art rather than its
+	 * linear-light cousin. See the header.
+	 */
+	static FLinearColor ByteNormalised(const FLinearColor& InSheetColour)
+	{
+		const FColor Bytes = InSheetColour.ToFColor(/*bSRGB=*/true);
+		const uint8 Peak = FMath::Max3(Bytes.R, Bytes.G, Bytes.B);
+		if (Peak == 0)
+		{
+			return InSheetColour;
+		}
+
+		const float Scale = 255.f / static_cast<float>(Peak);
+		const auto Lift = [Scale](uint8 InChannel)
+		{
+			return static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(InChannel * Scale), 0, 255));
+		};
+		return FLinearColor::FromSRGBColor(FColor(Lift(Bytes.R), Lift(Bytes.G), Lift(Bytes.B), Bytes.A));
+	}
+}
+
 FLinearColor TraceMenuArtStyle::AmberLifted()
 {
-	// Round-trips through the sheet's own byte values, so the ratio being preserved is the one that
-	// was measured off the art rather than its linear-light cousin. See the header.
-	const FColor Bytes = TraceMenuArtStyle::Amber.ToFColor(/*bSRGB=*/true);
-	const uint8 Peak = FMath::Max3(Bytes.R, Bytes.G, Bytes.B);
-	if (Peak == 0)
-	{
-		return TraceMenuArtStyle::Amber;
-	}
+	return TraceMenuArtStyleFile::ByteNormalised(TraceMenuArtStyle::Amber);
+}
 
-	const float Scale = 255.f / static_cast<float>(Peak);
-	const auto Lift = [Scale](uint8 InChannel)
-	{
-		return static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(InChannel * Scale), 0, 255));
-	};
-	return FLinearColor::FromSRGBColor(FColor(Lift(Bytes.R), Lift(Bytes.G), Lift(Bytes.B), Bytes.A));
+FLinearColor TraceMenuArtStyle::WordHoverLifted()
+{
+	// sRGB(85,107,47) x (255/107) = sRGB(203,255,112), #CBFF70 — 12.2:1 on PlateFill against the
+	// artist record's 2.34:1. Release art bible §2.5; the reasoning lives in the header.
+	return TraceMenuArtStyleFile::ByteNormalised(TraceMenuArtStyle::WordHover);
 }
 
 FSlateFontInfo TraceMenuArtStyle::MenuFont(float InSize)

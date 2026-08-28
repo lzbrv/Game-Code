@@ -7,6 +7,7 @@
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
 #include "Engine/Texture2D.h"
+#include "TextureResource.h"            // FTextureResource::TextureRHI — see the portrait loader
 #include "Engine/World.h"
 #include "EngineFontServices.h"         // FEngineFontServices — measuring a Slate face from Engine
 #include "Fonts/FontMeasure.h"          // FSlateFontMeasure
@@ -33,6 +34,38 @@ int32 GTraceCharacterSelectClickTest = 0;
 // NAMED, not anonymous: UBT compiles this module as a unity/jumbo build, so two files that each
 // define something at the top of an anonymous namespace become one namespace with two definitions.
 // Scripts/check-jumbo-build-collisions.py gates the build on exactly that.
+namespace TraceCharSelectHighlightLatch
+{
+	/**
+	 * Trace.Characters.Highlight's latch — 1..N, or 0 for "the player is driving". File-scope rather
+	 * than a member for the same reason GTraceCharacterSelectDebugPick is, and file-scope rather than
+	 * exported because both ends of it — the console command and the Tick that reads it — are in this
+	 * translation unit and nothing outside has any business setting it.
+	 *
+	 * *** WHY A LATCH AND NOT A ONE-SHOT LIKE Trace.Characters.Select. ***
+	 * PollInput's mouse branch writes `Highlighted = Index` on EVERY tick the cursor rests inside a
+	 * card rectangle, and an unattended -game run has a cursor sitting wherever the platform left it.
+	 * A one-shot write would therefore survive exactly zero frames on any run whose cursor happens to
+	 * land on the grid — which is most of them; W8-VISUAL's own 16:10 select frames show the pointer
+	 * parked on card 2 and CHUT highlighted for the whole run. Held, the override is re-applied after
+	 * PollInput every tick and the panel stays on the character that was asked for.
+	 *
+	 * *** WHY THIS EXISTS AT ALL. *** W5-UIQA §7.2 wrote down that the detail panel's crop is a fixed
+	 * rectangle while the busts differ, and closed with "I could only exercise one character … that is
+	 * the check to run". Nobody ran it for four days, and the reason is that there was no way to: the
+	 * only two ways into the detail panel are hovering a card, which an unattended run cannot aim, and
+	 * Trace.Characters.Select, which CONFIRMS and closes the screen on the same tick it highlights. So
+	 * the check that was left open was not left open out of negligence — the instrument was missing.
+	 * This is the instrument. Ten frames, one per character, at
+	 *
+	 *     -TraceExec=Trace.Characters.Highlight 9
+	 *
+	 * is now a thing a script can do, which is what makes "all ten crops are clean" a measurement
+	 * rather than a claim about one of them.
+	 */
+	int32 Held = 0;
+}
+
 namespace TraceCharSelectClickTest
 {
 	/** Frames between stages. Enough that a Tick, and therefore a Draw and a PollInput, lands between. */
@@ -267,13 +300,15 @@ namespace TraceSelectGrid
 // SAME measurements the UMG title screen uses (TraceMenuArtStyle::FSpriteFrame) rather than new ones.
 namespace TraceCharacterSelectArt
 {
+	// The POINTER is not in this list any more. It used to be, and this file drew it itself; since the
+	// UI QA pass every surface draws it through TraceHardwareCursor::DrawPointer instead, which owns
+	// the one sprite, the one size and the one tint. See FTraceCharacterSelect::DrawCursor.
 	enum class ESprite : uint8
 	{
 		PlateDefault = 0,
 		PlateHover,
 		PlateDisabled,
 		ValueBox,
-		Cursor,
 		Count
 	};
 
@@ -285,7 +320,6 @@ namespace TraceCharacterSelectArt
 		case ESprite::PlateHover:    return TraceMenuArtStyle::BtnHover;
 		case ESprite::PlateDisabled: return TraceMenuArtStyle::BtnDisabled;
 		case ESprite::ValueBox:      return TraceMenuArtStyle::ValueBox;
-		case ESprite::Cursor:        return TraceMenuArtStyle::Cursor;
 		default:                     return nullptr;
 		}
 	}
@@ -342,18 +376,9 @@ namespace TraceCharacterSelectArt
 		}
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[CharSelect] Art: %d/%d of the artist's sprites resolved (button plate x3, value chip, "
-			     "cursor). Anything missing falls back to a drawn rectangle."), Resolved, SpriteCount);
-	}
-
-	/** One stretched tile. Used for the cursor, which has no slicing and must keep its aspect. */
-	void DrawSprite(AHUD* HUD, UTexture2D* Texture, float X, float Y, float W, float H, const FLinearColor& Tint)
-	{
-		if (HUD == nullptr || Texture == nullptr || W <= 0.f || H <= 0.f)
-		{
-			return;
-		}
-		HUD->DrawTexture(Texture, X, Y, W, H, 0.f, 0.f, 1.f, 1.f, Tint);
+			TEXT("[CharSelect] Art: %d/%d of the artist's sprites resolved (button plate x3, value chip). "
+			     "Anything missing falls back to a drawn rectangle. The pointer is not counted here - "
+			     "TraceHardwareCursor owns it and logs its own line."), Resolved, SpriteCount);
 	}
 
 	/**
@@ -418,6 +443,301 @@ namespace TraceCharacterSelectArt
 					Us[Column], Vs[Row], UWs[Column], VHs[Row], Tint);
 			}
 		}
+	}
+}
+
+// =============================================================================================
+// THE TEN PORTRAITS — UI plan WP10
+// =============================================================================================
+//
+// W4-PORTRAITS rendered, composed and imported ten 512-square busts and nobody consumed them: this
+// screen was the only place they were ever meant to appear, and until this pass `T_Portrait` did not
+// occur anywhere in Source/. That is what made character select the emptiest screen in the build —
+// ten cards, each about seventy per cent bare navy behind one faded watermark letter.
+//
+// ---------------------------------------------------------------------------------------------
+// THE PATH IS DERIVED FROM THE ROSTER, NOT TABULATED
+// ---------------------------------------------------------------------------------------------
+// One line per character in a table here would be an eleventh place a new character has to be
+// registered, and TraceCharacterRoster.h's whole argument is that there is exactly one. The shoot
+// names its files after the roster name (`compose_portraits.py` reads the same table), so the path
+// is that name title-cased: ROCCO -> T_Portrait_Rocco, X -> T_Portrait_X, SLIMEBALL ->
+// T_Portrait_Slimeball. An eleventh character that has been through the portrait stage is picked up
+// with no edit here; one that has not falls back to the monogram, which is the point of the fallback.
+//
+// ---------------------------------------------------------------------------------------------
+// A LOADED TEXTURE IS NOT A DRAWABLE ONE — AND THIS SCREEN IS THE WORST CASE FOR THAT
+// ---------------------------------------------------------------------------------------------
+// UI/TraceOptionsMenu.cpp documents the crash in full: AHUD::DrawTexture hands
+// `Texture->GetResource()` straight to an FCanvasTileItem and checks only the UTexture, so a texture
+// that is loaded but whose FTextureResource::TextureRHI has not arrived yet becomes a batched
+// element the render thread dies on (SIGSEGV in FBatchedElements::Draw). That page found it because
+// it was the first thing in the process to touch /Game/Trace/UI/Art.
+//
+// This screen is a stronger version of the same case. It opens during warm-up INSIDE A LIVE MATCH,
+// and /Game/Trace/UI/Art/Portraits is a package nothing else in a match references at all — no
+// cook-time reference from the map, no menu having warmed it, because the menu map was unloaded two
+// travels ago. So the portraits are guaranteed to be a cold synchronous load whose RHI textures land
+// one or two frames after LoadObject returns. Every draw below therefore goes through Drawable(),
+// and the frames before the resource exists draw the monogram — which is the same fallback a missing
+// file takes, so there is one path to test rather than two.
+//
+// ---------------------------------------------------------------------------------------------
+// AT MOST TWO NEW LOADS PER FRAME
+// ---------------------------------------------------------------------------------------------
+// Ten synchronous package loads on one frame is ~2.3 MB of BC7 read on the game thread, on the frame
+// the select screen opens — which is already the frame that opens the screen. Spreading them over
+// five frames costs 80 ms of monogram on a screen that is up for thirty seconds and nobody will see
+// it; a hitch on the frame a modal appears is the thing players do notice.
+namespace TraceCharacterSelectPortraits
+{
+	/** `/Game/Trace/UI/Art/Portraits/T_Portrait_<Name>` — W4-PORTRAITS' shipped location. */
+	static const TCHAR* const PathPrefix = TEXT("/Game/Trace/UI/Art/Portraits/T_Portrait_");
+
+	/**
+	 * THE DETAIL-PANEL CROP, CORRECTED AGAINST THE SHIPPED FRAMING.
+	 *
+	 * UI plan WP10 §3 asked for a 2x crop at UV (0.25, 0.05)-(0.75, 0.55). Those numbers were written
+	 * before anyone had seen a portrait. W4-PORTRAITS §4.1 measured the shipped set and the plan's
+	 * window CUTS THE CHIN OFF every bust — the chin sits at v 0.614 and the clavicle at v 0.715, so
+	 * a window ending at 0.55 stops above the mouth:
+	 *
+	 *     Lily fin tips  v 0.012      Rocco crest  v 0.232      chin      v 0.614
+	 *     X top bead     v 0.030      head top     v 0.354      clavicle  v 0.715
+	 *
+	 * (0.25, 0.20)-(0.75, 0.70) was the same width one row lower. *** IT DECAPITATED MORTIMER, AND
+	 * THE TOP OF THE WINDOW IS NOW 0.16 BECAUSE OF HIM. *** W5-UIQA §7.2 wrote down that the crop is
+	 * a fixed rectangle while the busts differ, and said the check to run was "all ten, not one";
+	 * W8-VISUAL ran it four days later and found exactly one failure, still shipping.
+	 *
+	 * THE NUMBER IS DERIVED, NOT NUDGED, AND THE DERIVATION IS THE POINT. Both halves are exact:
+	 *
+	 *   * the rig shot all ten through ONE frozen camera and printed it next to every capture —
+	 *     `[Portrait] proj <Name>: ... frameZ=[116.23,208.77] frameH=92.54uu`
+	 *     (Saved/Logs/release/W4-PORTRAITS-final.log), so v = (208.77 - Z) / 92.54 for every bust;
+	 *   * `compose_portraits.head_extent_uu()` reports, per character, the top of everything rigidly
+	 *     bound to the `head` bone — the definition W4-PORTRAITS' own framing gate is measured
+	 *     against, and the right one here too: geometry bound to the head bone moves with the head
+	 *     and reads as head in a silhouette, so a window that cuts it has cut the head.
+	 *
+	 * Run over the ten, that says every crown that MUST be inside the window is at v >= 0.181:
+	 *
+	 *     Mortimer  sig_lintel   Z 192.0  ->  v 0.181     <-- the binding one, and the only failure
+	 *     Rocco     sig_crest    Z 187.3  ->  v 0.232
+	 *     the other eight        Z 176.0  ->  v 0.354
+	 *
+	 * 0.16 clears the binding case by 0.021 (10.8 px on the 512 source). The window keeps its 0.50
+	 * span and its u pair, so this is the SAME 2x square one row higher, not a different crop — and
+	 * the bottom edge at 0.66 still clears every head core's floor, the tightest being Oyster's
+	 * helmet at Z 150 -> v 0.635, by 0.025 (12.8 px).
+	 *
+	 * The two tallest CROWNS still run off the top, deliberately: X's masts (Z 206 -> v 0.030) and
+	 * Lily's fins (Z 207.7 -> v 0.012) are not bound to the head bone, a window that held them would
+	 * have to be 0.99 tall, and a detail crop that shows the whole figure is not a detail crop.
+	 *
+	 * Re-measure rather than trusting the table above:
+	 *     python3 -c "import sys;sys.path.insert(0,'Scripts');import compose_portraits as c;\
+	 *                 print({n:(208.77-c.head_extent_uu(n)['full'][1])/92.54 for n in \
+	 *                 ['Rocco','Chut','Mace','Oyster','X','Roxie','Elle','Slimeball','Mortimer','Lily']})"
+	 *
+	 * Square, so the panel can size it from whichever of its two dimensions is the binding one.
+	 */
+	static constexpr float DetailMinU = 0.25f;
+	static constexpr float DetailMaxU = 0.75f;
+
+	/** The shipped top edge. See the derivation above; 0.20 is the value that cut Mortimer. */
+	static constexpr float DetailTopV = 0.16f;
+
+	/** Height AND width of the window. Square: the panel draws it into a square and never stretches. */
+	static constexpr float DetailSpanV = DetailMaxU - DetailMinU;
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * THE RED ARM FOR THE CROP, because a fix nobody can make fail is not evidence.
+	 *
+	 * `Trace.Characters.DetailCropTop 0.20` restores the window that shipped through W8 and puts the
+	 * underside of Mortimer's lintel back on the panel, on the same binary, in the same run:
+	 *
+	 *   -TraceExec=Trace.Characters.Highlight 9 -TraceExec2=Trace.Characters.DetailCropTop 0.20
+	 *
+	 * Cheat-only and compiled out of shipping, so no ini and no player can move the shipped framing.
+	 */
+	static TAutoConsoleVariable<float> CVarDetailCropTop(
+		TEXT("Trace.Characters.DetailCropTop"),
+		DetailTopV,
+		TEXT("Dev only. Top edge (v) of the detail panel's square portrait crop. Shipped value 0.16, "
+		     "derived from Mortimer's head-bone crown at v 0.181 — see TraceCharacterSelect.cpp. Set "
+		     "0.20 to restore the pre-W9 window and reproduce the decapitation."),
+		ECVF_Cheat);
+#endif
+
+	/** The window's top edge, this frame. One place, so the log line and the draw cannot disagree. */
+	static float DetailMinV()
+	{
+#if !UE_BUILD_SHIPPING
+		return FMath::Clamp(CVarDetailCropTop.GetValueOnGameThread(), 0.f, 1.f - DetailSpanV);
+#else
+		return DetailTopV;
+#endif
+	}
+
+	/** The bottom edge. Derived from the top so the window can never stop being square. */
+	static float DetailMaxV()
+	{
+		return DetailMinV() + DetailSpanV;
+	}
+
+	/**
+	 * THE CARD DRAWS THE WHOLE SQUARE, UNCROPPED, AND THAT IS A DECISION WITH TWO REASONS.
+	 *
+	 * 1. The composite has a 2 px accent frame and corner brackets BAKED INTO ITS EDGES
+	 *    (`compose_portraits.py`). Any crop throws them away; drawing the full square keeps the
+	 *    artist's frame and means this file must NOT draw a hairline of its own around a card
+	 *    portrait — that would be a second frame on top of the one already there. The detail crop
+	 *    below is the opposite case and does draw one, because the crop cuts the baked frame off.
+	 * 2. A card exists to make a SILHOUETTE legible. W4-PORTRAITS' framing gate deliberately spent
+	 *    headroom to keep Lily's fin tips (v 0.012) and X's top bead (v 0.030) inside the frame, and
+	 *    those are two of the four strongest silhouettes in the roster. Cropping two per cent off the
+	 *    top of the card to tidy the framing would spend the thing the gate bought.
+	 */
+	static constexpr float CardMinU = 0.f;
+	static constexpr float CardMaxU = 1.f;
+	static constexpr float CardMinV = 0.f;
+	static constexpr float CardMaxV = 1.f;
+
+	static TWeakObjectPtr<UTexture2D> Cache[TraceCharacterRoster::Count];
+
+	/** Set once when a path fails, so a build with no portrait stage does not hunt for one every frame. */
+	static bool bFailed[TraceCharacterRoster::Count] = {};
+
+	/** LoadObject calls left this frame. Reset by BeginFrame(); see the header note above. */
+	static int32 LoadBudget = 0;
+
+	static bool bLoggedInventory = false;
+
+	/** "ROCCO" -> "Rocco", "X" -> "X", "SLIMEBALL" -> "Slimeball". The shoot's own naming. */
+	static FString AssetNameFor(const TCHAR* RosterName)
+	{
+		FString Out = FString(RosterName).ToLower();
+		if (Out.Len() > 0)
+		{
+			Out[0] = FChar::ToUpper(Out[0]);
+		}
+		return Out;
+	}
+
+	/** See the header note: loaded is not drawable, and drawing a not-yet-drawable texture is a crash. */
+	static bool Drawable(const UTexture2D* Texture)
+	{
+		if (Texture == nullptr)
+		{
+			return false;
+		}
+		const FTextureResource* Resource = Texture->GetResource();
+		return Resource != nullptr && Resource->TextureRHI.IsValid();
+	}
+
+	/** Call once at the top of a Draw. */
+	void BeginFrame()
+	{
+		LoadBudget = 2;
+	}
+
+	/**
+	 * The bust for roster index @p Index, or null — which every caller treats as "draw the monogram".
+	 *
+	 * Null covers three different states on purpose and the caller does not need to tell them apart:
+	 * the file is absent (a clone that has not run `import-characters.sh --stage portraits`), the file
+	 * is present but its RHI texture has not landed yet, and this frame's load budget is spent.
+	 */
+	UTexture2D* For(int32 Index)
+	{
+		if (Index < 0 || Index >= TraceCharacterRoster::Count || bFailed[Index])
+		{
+			return nullptr;
+		}
+
+		if (UTexture2D* Live = Cache[Index].Get())
+		{
+			return Drawable(Live) ? Live : nullptr;
+		}
+
+		if (LoadBudget <= 0)
+		{
+			return nullptr;
+		}
+		--LoadBudget;
+
+		const TArray<TraceCharacterRoster::FTraceCharacterEntry>& Roster = TraceCharacterRoster::All();
+		if (!Roster.IsValidIndex(Index))
+		{
+			bFailed[Index] = true;
+			return nullptr;
+		}
+
+		const FString AssetName = AssetNameFor(Roster[Index].Name);
+		const FString Path = FString::Printf(TEXT("%s%s.T_Portrait_%s"), PathPrefix, *AssetName, *AssetName);
+
+		UTexture2D* Loaded = LoadObject<UTexture2D>(nullptr, *Path);
+		if (Loaded == nullptr)
+		{
+			// ONCE PER CHARACTER, EVER — not once per frame. bFailed is what makes that true, and it
+			// is the reason this is a Warning rather than a Verbose: a build with no portraits says so
+			// ten times at the top of the log and then never again.
+			bFailed[Index] = true;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[CharSelect] No portrait at %s. %s's card and detail panel fall back to the "
+				     "monogram watermark; nothing else changes. Run "
+				     "Scripts/import-characters.sh --stage portraits to produce it."),
+				*Path, Roster[Index].Name);
+			return nullptr;
+		}
+
+		Cache[Index] = Loaded;
+		return Drawable(Loaded) ? Loaded : nullptr;
+	}
+
+	/** One line, once per process, so a capture can be told apart from a build with no portraits in it. */
+	void LogInventoryOnce()
+	{
+		if (bLoggedInventory)
+		{
+			return;
+		}
+
+		// Only once every portrait has been ASKED for at least once, which the load budget makes take
+		// several frames. Logging on frame one would report "2/10 resolved" and mean nothing.
+		int32 Resolved = 0;
+		for (int32 Index = 0; Index < TraceCharacterRoster::Count; ++Index)
+		{
+			if (Cache[Index].IsValid())
+			{
+				++Resolved;
+			}
+			else if (!bFailed[Index])
+			{
+				return;   // not asked yet — say nothing until the whole set has been tried
+			}
+		}
+
+		bLoggedInventory = true;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CharSelect] Portraits: %d/%d resolved from %s*. Card draws the full 512 square "
+			     "(the accent frame is baked into it); the detail panel draws UV (%.2f,%.2f)-(%.2f,%.2f). "
+			     "Anything missing falls back to the monogram watermark."),
+			Resolved, TraceCharacterRoster::Count, PathPrefix,
+			DetailMinU, DetailMinV(), DetailMaxU, DetailMaxV());
+	}
+
+	/** One portrait, or a sub-rect of one. Aspect is the caller's problem; nothing here stretches. */
+	void Draw(AHUD* HUD, UTexture2D* Texture, float X, float Y, float W, float H,
+		float MinU, float MinV, float MaxU, float MaxV, const FLinearColor& Tint)
+	{
+		if (HUD == nullptr || Texture == nullptr || W <= 0.f || H <= 0.f)
+		{
+			return;
+		}
+		HUD->DrawTexture(Texture, X, Y, W, H, MinU, MinV, MaxU - MinU, MaxV - MinV, Tint);
 	}
 }
 
@@ -1072,6 +1392,279 @@ namespace TraceCharacterSelectFile
 	 */
 	static float SelectSpanSeconds = 0.f;
 
+	// =============================================================================================
+	// THE TILE'S TYPE AND PICTURE SIZES — SOLVED ONCE FOR THE WHOLE GRID (UI plan WP10)
+	// =============================================================================================
+	//
+	// *** WHY THIS IS NOT PER-CARD ARITHMETIC, WHICH IS WHERE THE FIRST ATTEMPT WENT WRONG. ***
+	//
+	// The obvious way to fit a picture beside a name is to give each card whatever is left after its
+	// OWN name. That was written, built and photographed, and the frame settles the argument: X's
+	// portrait came out 180 px square and SLIMEBALL's 78, because their names are 10 px and 233 px
+	// wide. Ten cards in one grid with ten different picture sizes does not read as a roster of ten
+	// characters; it reads as a rendering fault. Two of them also overflowed, because a name allowed
+	// to stop shrinking at its 72 % floor can still be wider than the room a long name left.
+	//
+	// So every size below is solved ONCE, against the WIDEST string in the roster, and every card
+	// draws at the same numbers. A grid is a grid.
+	//
+	// *** THE KEYCAP MOVED OFF THE NAME'S LINE, AND THAT IS WHAT MAKES THE PICTURE POSSIBLE. ***
+	// Measured off the shipped frame at 1080p, in the menu face at the authored sizes:
+	//
+	//     widest tile name     SLIMEBALL   233 px of ink at 25 px
+	//     widest ability name  SLIMEWALL   200 px of ink at 20 px
+	//     tile                             346 px wide
+	//
+	// A keycap and its gap are 42 of those 346. With the cap on the name's line the arithmetic has no
+	// solution worth having: leaving SLIMEBALL a legible 18 px caps the picture at 86 px square, and
+	// a 128 px picture would have forced every name in the roster down to 16 px. Stacking the cap
+	// above the name — where it also reads more honestly, as the key that picks this card rather than
+	// as a bullet beside its name — hands the name the full text column and buys 42 px for both.
+	//
+	// The cooldown chip moved for the same reason: it now shares the ACTIVATED label's line instead
+	// of the ability name's, so SLIMEWALL also gets the whole column.
+	//
+	// =============================================================================================
+	// *** AND THE MICRO ROW IS SOLVED HERE TOO NOW, BECAUSE IT WAS THE ONE THING ON THIS TILE THAT
+	// *** WAS NOT — WHICH IS WHY "ACTIVATED" PRINTED THROUGH THE COOLDOWN CHIP ON EVERY 16:10
+	// *** DISPLAY, INCLUDING THIS PROJECT OWNER'S LAPTOP, AND NEVER ON A 16:9 TEST MONITOR.
+	// =============================================================================================
+	//
+	// W8-VISUAL §4 measured the mechanism rather than reading it, and the measurement is the reason
+	// this note is long: the bug is a CLASS, not a label.
+	//
+	//     UIScale = Clamp(ViewH / ReferenceHeight, 0.6, 2.0)          — HEIGHT, TraceHUD.cpp
+	//     the text column TextW follows the tile, which follows       — WIDTH
+	//
+	// So the size of the type was derived from one axis of the viewport while the box it had to fit
+	// inside was derived from the other. Nothing compared them, and nothing elided. Narrow the display
+	// and the type grows while its column shrinks, until the right-aligned chip lands on the word.
+	// The governing number is UIScale / ViewW, and normalised to 1920x1080 it reads:
+	//
+	//     1920 x 1080  16:9    UIScale 1.000   ratio 1.00x  ->  "ACTIVATED"   (the developer's monitor)
+	//     1920 x 1200  16:10   UIScale 1.111   ratio 1.11x  ->  "ACTIVATE"    (every laptop)
+	//     3456 x 2234  1.547   UIScale 2.000   ratio 1.11x  ->  "ACTIVATE"    (this machine, native)
+	//     1728 x 1117  1.547   UIScale 1.034   ratio 1.15x  ->  "ACTIVAT"     (this machine, default)
+	//
+	// The two arms at 1.11x clip IDENTICALLY across a 3.3x difference in pixel count, which is what
+	// proves the governing variable is the ratio and not the resolution.
+	//
+	// THE FIX IS NOT A BIGGER MARGIN OR A SHORTER WORD. It is to solve the row against the dimension
+	// that bounds it, exactly as NameSize and LeadSize below are already solved against TextW — the
+	// label, its tracking, the chip's type and the chip's height all step down together until the
+	// whole row fits the column, and they step down UNIFORMLY so a chip never stops matching the type
+	// beside it. Fitted once for the grid against the WIDEST cooldown string in the roster, for the
+	// same reason everything else here is: ten cards with ten row scales photograph as a fault.
+	//
+	// The fit is ITERATED, not divided. A first-order scale (Need/Have) is only exact if advance width
+	// were perfectly linear in point size, and it is not — the face is rasterised and hinted per size,
+	// and ChipWidth adds H * 0.90 of plate. Two refinement passes cost two measurements of one short
+	// string per frame and remove the guesswork; the loop then verifies and stops.
+	struct FTileMetrics
+	{
+		float PortraitSide = 0.f;   // square, uniform, right-aligned inside the plate
+		float TextW = 0.f;          // the text column; NOTHING is measured against the tile's width
+		float NameSize = 0.f;
+		float NameTrack = 0.f;
+		float LeadSize = 0.f;
+		float LeadTrack = 0.f;
+		float CapH = 0.f;
+		float PortraitInset = 0.f;
+		float PortraitGap = 0.f;
+		float Pad = 0.f;
+
+		// ---- the micro row: "ACTIVATED" at the left of the text column, the cooldown chip at its
+		// ---- right, on one line. All four fall together; see the note above.
+		float MicroSize = 0.f;      // the ACTIVATED label's type size
+		float MicroTrack = 0.f;     // its tracking
+		float ChipTextSize = 0.f;   // the cooldown chip's type size
+		float ChipH = 0.f;          // the cooldown chip's height (and, via ChipWidth, its padding)
+		float MicroScale = 1.f;     // what the row had to give up to fit; 1.0 = nothing. Logged.
+		float MicroRowW = 0.f;      // what the fitted row actually measures. Must be <= TextW.
+	};
+
+	/** Set by FTraceCharacterSelect::Draw before the tiles, read by DrawCard. One grid, one answer. */
+	static FTileMetrics TileMetrics;
+
+	/**
+	 * Hash of the numbers on the [CharSelect] Layout line that a console command can move. See the
+	 * note at the log site: the line is once-per-process, and again when the answer changes, so an
+	 * A/B run inside one process is legible in the log and not only in the frames.
+	 */
+	static uint32 LastLoggedLayoutSignature = 0;
+
+	/**
+	 * Declared early so the micro-row fit below can ASK the chip how wide it would be rather than
+	 * re-deriving its padding. The definition is a few dozen lines down, next to DrawChip, because the
+	 * two must never disagree about what a chip costs; a copied `+ H * 0.90f` here is exactly the
+	 * shape this project's DEMO 21 rule forbids, and it is what a fit computed against the wrong
+	 * padding would silently become.
+	 */
+	float ChipWidth(AHUD* HUD, const FString& Text, float H, float MinW, float TextSize, float Tracking);
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * THE RED ARM FOR THE MICRO ROW, because a layout fix that cannot be made to fail again is not
+	 * evidence that it was ever broken.
+	 *
+	 * `Trace.Characters.FitMicroRow 0` puts the row back on UIScale alone — the height-derived sizing
+	 * that shipped through W8 — without touching anything else, so the overprint comes back on the
+	 * same binary in the same run and the A/B is two frames rather than two builds:
+	 *
+	 *   -TraceExec=Trace.Characters.FitMicroRow 0
+	 *
+	 * It is also the regression test: any future change that reintroduces a height-sized element in a
+	 * width-bounded column will look, at 1920x1200, exactly like arm 0 of this pair.
+	 *
+	 * Cheat-only and compiled out of shipping, so no ini and no player can turn the fit off.
+	 */
+	static TAutoConsoleVariable<int32> CVarFitMicroRow(
+		TEXT("Trace.Characters.FitMicroRow"),
+		1,
+		TEXT("Dev only. 1 (default): BOTH ability rows — the select card's ACTIVATED / cooldown line "
+		     "and the detail panel's keycap / ability name / cooldown line — are fitted to the WIDTH of "
+		     "the column that bounds them. 0: the pre-W9 behaviour, sized from UIScale (view HEIGHT) "
+		     "alone, which overprints the card's label on every display narrower than 16:9 and the "
+		     "panel's ability name on anything narrower than about 1.45:1."),
+		ECVF_Cheat);
+#endif
+
+	void SolveTileMetrics(AHUD* HUD, float TileW, float TileH, float S)
+	{
+		FTileMetrics M;
+		M.Pad = 18.f * S;
+		M.PortraitInset = 8.f * S;
+		M.PortraitGap = 12.f * S;
+		M.CapH = 26.f * S;
+
+		// 37 % of the tile, capped by the height the plate can spare. At the shipped 346 x 196 tile
+		// that is a 128 px square with 34 px of plate above and below it — a framed picture inside the
+		// card rather than a texture bled to its edges, which is what the composite is drawn as (it
+		// carries its own 2 px accent frame, corner brackets and accent underline; see
+		// TraceCharacterSelectPortraits::CardMinU).
+		M.PortraitSide = FMath::Clamp(TileW * 0.37f, 0.f, TileH - M.PortraitInset * 2.f);
+
+		M.TextW = TileW - M.PortraitInset - M.PortraitSide - M.PortraitGap - M.Pad;
+
+		// Below 56 design px the bust is a smudge; the card gives the picture up entirely rather than
+		// print a bad one, and the text column takes the whole tile back. Same floor governs the
+		// monogram fallback, so a narrow viewport does not get a tiny letter either.
+		if (M.PortraitSide < 56.f * S || M.TextW < 60.f * S)
+		{
+			M.PortraitSide = 0.f;
+			M.TextW = TileW - M.Pad * 2.f;
+		}
+
+		// ---- The two uniform type scales ---------------------------------------------------------
+		const float BaseName = TraceSelectLayout::SizeName * S;
+		const float BaseLead = TraceSelectLayout::SizeLead * S;
+		const float BaseNameTrack = TraceSelectLayout::TrackName * S;
+
+		float WidestName = 1.f;
+		float WidestLead = 1.f;
+		for (const TraceCharacterRoster::FTraceCharacterEntry& Entry : TraceCharacterRoster::All())
+		{
+			// Measured in the WEIGHT EACH IS DRAWN IN. Bold is about 1.5x the light advance, and
+			// measuring the wrong one is exactly how MORTIMER once printed through the panel beside it.
+			WidestName = FMath::Max(WidestName,
+				TraceCharacterSelectType::Width(HUD, Entry.Name, nullptr, BaseName, BaseNameTrack,
+					ETraceTextWeight::Bold));
+			WidestLead = FMath::Max(WidestLead,
+				TraceCharacterSelectType::Width(HUD, Entry.ActivatedName, nullptr, BaseLead, BaseNameTrack));
+		}
+
+		const float NameScale = FMath::Min(1.f, M.TextW / WidestName);
+		M.NameSize = BaseName * NameScale;
+		M.NameTrack = BaseNameTrack * NameScale;
+
+		// The ability name gets the same column, and is then held to 88 % of the character's name so
+		// the hierarchy is guaranteed by construction rather than by two numbers happening to differ.
+		// It is the light weight in Ink against a bold accent, so 88 % is plenty of separation.
+		const float LeadScale = FMath::Min(1.f, M.TextW / WidestLead);
+		M.LeadSize = FMath::Min(BaseLead * LeadScale, M.NameSize * 0.88f);
+
+		// Tracking follows the size that was actually CHOSEN, not the size the column fit produced —
+		// the 88 % clamp above can be the binding one, and tracking scaled off the other number is how
+		// a line ends up spaced for a size it is not set at.
+		M.LeadTrack = BaseNameTrack * (M.LeadSize / FMath::Max(BaseLead, 1.f));
+
+		// ---- THE MICRO ROW, FITTED TO THE COLUMN THAT BOUNDS IT ----------------------------------
+		//
+		// See the long note on FTileMetrics. Everything here was previously computed in DrawCard from
+		// UIScale alone — the one thing on the tile that was sized by view HEIGHT and bounded by view
+		// WIDTH — and that is the whole of the 16:10 overprint.
+		const float BaseMicro      = TraceSelectLayout::SizeLabel * 0.86f * S;
+		const float BaseMicroTrack = TraceSelectLayout::TrackLabel * S;
+		const float BaseChipText   = TraceSelectLayout::SizeLabel * S;
+		const float BaseChipH      = 22.f * S;
+
+		// Air between the last letter of ACTIVATED and the chip's left edge. Without it, "fits" means
+		// "touches", which photographs as a collision even when it is not one.
+		const float BaseMicroGap = 10.f * S;
+
+		// The WIDEST cooldown in the roster, not this card's — same reason as the two scales above.
+		// Built with the identical Printf DrawCard uses, so the string measured is the string drawn.
+		FString WidestCooldown = TEXT("00s");
+		{
+			float WidestCooldownW = 0.f;
+			for (const TraceCharacterRoster::FTraceCharacterEntry& Entry : TraceCharacterRoster::All())
+			{
+				const FString Text = FString::Printf(TEXT("%ds"), FMath::RoundToInt(Entry.ActivatedCooldown));
+				const float W = TraceCharacterSelectType::Width(HUD, Text, nullptr, BaseChipText, 0.f);
+				if (W > WidestCooldownW)
+				{
+					WidestCooldownW = W;
+					WidestCooldown = Text;
+				}
+			}
+		}
+
+		auto RowWidthAt = [&](float Scale) -> float
+		{
+			return TraceCharacterSelectType::Width(HUD, TEXT("ACTIVATED"), nullptr,
+					   BaseMicro * Scale, BaseMicroTrack * Scale)
+				+ (BaseMicroGap * Scale)
+				+ ChipWidth(HUD, WidestCooldown, BaseChipH * Scale, 0.f, BaseChipText * Scale, 0.f);
+		};
+
+		// Iterated rather than divided once: glyph advance is not perfectly linear in point size (the
+		// face is rasterised and hinted per size) and ChipWidth adds plate padding on top, so a single
+		// first-order step can land a hair over. Three passes is two corrections and a verification;
+		// each pass is two measurements of two short strings, once per frame for the whole grid.
+		M.MicroScale = 1.f;
+
+#if !UE_BUILD_SHIPPING
+		const bool bFitMicroRow = (CVarFitMicroRow.GetValueOnGameThread() != 0);
+#else
+		constexpr bool bFitMicroRow = true;
+#endif
+
+		for (int32 Pass = 0; bFitMicroRow && Pass < 3; ++Pass)
+		{
+			const float Need = RowWidthAt(M.MicroScale);
+			if (Need <= M.TextW)
+			{
+				break;
+			}
+			// Floored well below anything a display can ask for, and NOT floored at a "readable" size:
+			// a small row is a legibility cost the player can still read past, an overprinted one is a
+			// word with a box on it. Nothing is dropped and nothing is elided at any width.
+			M.MicroScale = FMath::Max(0.05f, M.MicroScale * (M.TextW / FMath::Max(Need, 1.f)));
+		}
+
+		M.MicroSize    = BaseMicro * M.MicroScale;
+		M.MicroTrack   = BaseMicroTrack * M.MicroScale;
+		M.ChipTextSize = BaseChipText * M.MicroScale;
+		M.ChipH        = BaseChipH * M.MicroScale;
+
+		// Measured at the size finally chosen, not predicted from it, so the layout log reports what
+		// the row IS rather than what the fit hoped for. This is the number a capture is checked
+		// against: MicroRowW <= TextW is the whole of "ACTIVATED cannot be overprinted".
+		M.MicroRowW = RowWidthAt(M.MicroScale);
+
+		TileMetrics = M;
+	}
+
 	/** A hairline rectangle outline. The free-function twin of FTraceCharacterSelect::DrawFrame. */
 	void StrokeRect(AHUD* HUD, float X, float Y, float W, float H, float Thick, const FLinearColor& Color)
 	{
@@ -1316,6 +1909,19 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 		GTraceCharacterSelectDebugPick = 0;
 		DebugPick(RequestedId);
 		ConfirmHighlighted(LocalState);
+	}
+
+	// Trace.Characters.Highlight's latch, applied AFTER PollInput and therefore after the mouse branch
+	// that would otherwise overwrite it every tick (see the note on TraceCharSelectHighlightLatch).
+	// It highlights and does not confirm, which is the whole difference from Trace.Characters.Select:
+	// the screen stays up and the detail panel below the grid can be photographed.
+	if (TraceCharSelectHighlightLatch::Held != 0)
+	{
+		const int32 Index = TraceCharSelectHighlightLatch::Held - 1;
+		if (TraceCharacterRoster::All().IsValidIndex(Index))
+		{
+			Highlighted = Index;
+		}
 	}
 
 	// Spec v15 §4. Armed the same way, and for the same reason: the cards have to have been DRAWN
@@ -1712,8 +2318,11 @@ void FTraceCharacterSelect::DebugPick(int32 CharacterId)
 //   2. A wall of tiny all-caps body     A four-step type ramp (display / name / body / micro-label)
 //                                       set in the menu typeface, and every paragraph sentence-cased.
 //   3. The gameplay HUD shows through   The backdrop is OPAQUE. See TraceSelectStyle::Backdrop.
-//   4. No identity beyond a 3 px stripe Accent-coloured name, a monogram watermark, a keycap and the
-//                                       artist's plate — per tile, in the character's own colour.
+//   4. No identity beyond a 3 px stripe Accent-coloured name, a keycap, the artist's plate and — since
+//                                       UI plan WP10 — THE CHARACTER'S OWN PORTRAIT, per tile and again
+//                                       as a 2x crop in the detail panel. The monogram watermark that
+//                                       used to be the whole answer here is now the fallback for a
+//                                       build whose portraits are missing.
 //   5. Cramped ability lines            ACTIVATED is a labelled section: the key in a cap, the name at
 //                                       lead size, the cooldown in its own chip. Not one hyphenated run.
 //   6. "0" reads as an ordinal          Every key is drawn inside a KEYCAP, so 0 reads as a key.
@@ -1736,6 +2345,10 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 	const float S = UIScale;
 	const FLinearColor TeamTint = TraceTeamColor(LocalState->Team);
 	const TArray<TraceCharacterRoster::FTraceCharacterEntry>& Roster = TraceCharacterRoster::All();
+
+	// WP10: hand this frame its portrait load budget before anything asks for one. See the note above
+	// namespace TraceCharacterSelectPortraits for why a budget exists at all.
+	TraceCharacterSelectPortraits::BeginFrame();
 
 	// ---- The backdrop ----------------------------------------------------------------------------
 	//
@@ -1887,18 +2500,47 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 	const float TileW = (InnerW - (TileGapX * (TraceSelectGrid::Columns - 1)))
 		/ static_cast<float>(TraceSelectGrid::Columns);
 
+	// The grid's uniform picture and type sizes, solved once for all ten cards before any of them is
+	// drawn. See TraceCharacterSelectFile::SolveTileMetrics.
+	TraceCharacterSelectFile::SolveTileMetrics(HUD, TileW, TileH, S);
+
 	// One line, once per process. A screenshot cannot tell "the redesign is not compiled in" from "it
 	// is compiled in and computed these numbers", and this screen has already cost one round trip to
 	// exactly that ambiguity. Now it also says which typeface actually reached the pixels, because the
 	// menu face failing to resolve is invisible in a still and changes every measurement here.
-	if (!bLoggedLayoutOnce)
+	//
+	// *** ONCE PER PROCESS, AND AGAIN WHENEVER THE ANSWER ACTUALLY CHANGES. *** "Once" was the right
+	// rule when nothing could change the answer mid-run. The two red arms this file now carries
+	// (Trace.Characters.FitMicroRow, Trace.Characters.DetailCropTop) exist precisely to change it
+	// inside one process, so a log that only ever described the first arm would make the second arm —
+	// the one that is supposed to be the FIX — unprovable from anything but a picture. The signature
+	// covers exactly the numbers on the line that a command can move, so a steady run still logs once.
+	const uint32 LayoutSignature = GetTypeHash(FString::Printf(TEXT("%.0f|%.0f|%.4f|%.4f|%.4f"),
+		ViewW, ViewH, S,
+		TraceCharacterSelectFile::TileMetrics.MicroScale,
+		TraceCharacterSelectPortraits::DetailMinV()));
+
+	if (!bLoggedLayoutOnce || LayoutSignature != TraceCharacterSelectFile::LastLoggedLayoutSignature)
 	{
 		bLoggedLayoutOnce = true;
+		TraceCharacterSelectFile::LastLoggedLayoutSignature = LayoutSignature;
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[CharSelect] Layout v20: view %.0fx%.0f scale %.3f | %d tiles as %d row(s) x %d col(s) | "
-			     "tile %.0fx%.0f at y=%.0f | detail panel %.0fx%.0f at y=%.0f | face=%s"),
-			ViewW, ViewH, S, TraceCharacterRoster::Count, TraceSelectGrid::Rows, TraceSelectGrid::Columns,
-			TileW, TileH, GridY, InnerW, TraceSelectLayout::DetailH * S, TraceSelectLayout::DetailTop * S,
+			TEXT("[CharSelect] Layout v20+WP10: view %.0fx%.0f scale %.3f (scale/width %.3e — the number "
+			     "that decides the micro row; 5.21e-4 is 1920x1080) | %d tiles as %d row(s) x %d col(s) | "
+			     "tile %.0fx%.0f at y=%.0f | card portrait %.0f square, text column %.0f, name %.1fpx, "
+			     "ability %.1fpx (uniform across the grid) | micro row fitted x%.3f -> label %.1fpx, "
+			     "chip %.1fpx tall, row %.0fpx of %.0fpx column | detail crop v %.3f..%.3f | "
+			     "detail panel %.0fx%.0f at y=%.0f | face=%s"),
+			ViewW, ViewH, S, S / FMath::Max(ViewW, 1.f),
+			TraceCharacterRoster::Count, TraceSelectGrid::Rows, TraceSelectGrid::Columns,
+			TileW, TileH, GridY,
+			TraceCharacterSelectFile::TileMetrics.PortraitSide, TraceCharacterSelectFile::TileMetrics.TextW,
+			TraceCharacterSelectFile::TileMetrics.NameSize, TraceCharacterSelectFile::TileMetrics.LeadSize,
+			TraceCharacterSelectFile::TileMetrics.MicroScale, TraceCharacterSelectFile::TileMetrics.MicroSize,
+			TraceCharacterSelectFile::TileMetrics.ChipH, TraceCharacterSelectFile::TileMetrics.MicroRowW,
+			TraceCharacterSelectFile::TileMetrics.TextW,
+			TraceCharacterSelectPortraits::DetailMinV(), TraceCharacterSelectPortraits::DetailMaxV(),
+			InnerW, TraceSelectLayout::DetailH * S, TraceSelectLayout::DetailTop * S,
 			TraceCharacterSelectType::HaveFace() ? TEXT("menu typeface") : TEXT("ENGINE BITMAP FALLBACK"));
 	}
 
@@ -1931,6 +2573,10 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 		}
 	}
 
+	// After the tiles, because it will not print until every card has asked for its portrait at least
+	// once — which the two-per-frame load budget makes take five frames.
+	TraceCharacterSelectPortraits::LogInventoryOnce();
+
 	// ---- The detail panel ------------------------------------------------------------------------
 	//
 	// THIS IS WHERE §6.1 IS ACTUALLY FIXED. The old screen printed all three ability paragraphs on all
@@ -1962,25 +2608,94 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 		const float IdentityX = PanelX + Pad;
 		float IdentityY = PanelY + Pad;
 
-		// The key that picks it, as a key, and in reading order: the word PRESS, then the cap. §6.6.
+		// ---- THE 2x DETAIL CROP, AND THE KEY BESIDE IT — UI plan WP10 §3 -------------------------
+		//
+		// W5-UIQA photographed what used to be here: "the detail panel's left third is a blank column
+		// under the name". The picture goes at the TOP of the column, where a portrait belongs, and
+		// the PRESS row moves alongside it instead of above it — which is what makes room for a
+		// picture worth looking at rather than for whatever was left at the bottom.
+		//
+		// THE SIZE IS SOLVED, NOT CHOSEN. It is the largest square that clears BOTH neighbours:
+		//   * the PRESS label and its keycap to its right, inside the identity column's width;
+		//   * the name, its rule and the status line underneath, inside the panel's inner height.
+		// At the shipped 1812 x 336 panel that is about 160 px, against the ~112 a bottom-anchored
+		// picture could have had. Square because the crop is square, and a portrait is the one thing
+		// on this screen that must never be stretched: the busts were shot through one frozen camera
+		// precisely so the set reads as one set.
+		const float DetailCapH = 44.f * S;
 		{
 			const FString Glyph = TraceCharacterSelectFile::KeyGlyphForIndex(Highlighted);
+			const float WordW = Glyph.IsEmpty() ? 0.f
+				: TraceCharacterSelectType::Width(HUD, TEXT("PRESS"), nullptr,
+					TraceSelectLayout::SizeLabel * S, TraceSelectLayout::TrackLabel * S);
+			const float KeyBlockW = Glyph.IsEmpty() ? 0.f : (WordW + (12.f * S) + DetailCapH);
+
+			// What the column still owes below the picture: the display name's line box, its rule and
+			// one status line, with their gaps. Measured rather than reserved as a constant, because
+			// the name's size is itself fitted a few lines below.
+			const float BelowH = TraceCharacterSelectType::LineHeight(HUD, nullptr, TraceSelectLayout::SizeDisplay * S)
+				+ (10.f * S) + (3.f * S) + (16.f * S)
+				+ TraceCharacterSelectType::LineHeight(HUD, nullptr, TraceSelectLayout::SizeLabel * S)
+				+ (18.f * S);
+
+			const float ByWidth = IdentityW - KeyBlockW - (16.f * S);
+			const float ByHeight = (PanelY + PanelH - Pad) - IdentityY - BelowH;
+			const float Side = FMath::Min(ByWidth, ByHeight);
+
+			// Below about sixty pixels the crop stops being a face and starts being a smear; at that
+			// point the honest answer is the empty column this replaced, not a bad picture. The PRESS
+			// row then keeps the whole width it always had.
+			if (Side >= 60.f * S)
+			{
+				if (UTexture2D* Portrait = TraceCharacterSelectPortraits::For(Highlighted))
+				{
+					TraceCharacterSelectPortraits::Draw(HUD, Portrait, IdentityX, IdentityY, Side, Side,
+						TraceCharacterSelectPortraits::DetailMinU, TraceCharacterSelectPortraits::DetailMinV(),
+						TraceCharacterSelectPortraits::DetailMaxU, TraceCharacterSelectPortraits::DetailMaxV(),
+						bTaken ? TraceSelectStyle::Dimmed(FLinearColor::White, 0.45f) : FLinearColor::White);
+
+					// A HAIRLINE HERE AND NOT ON THE CARD, and the asymmetry is deliberate rather than
+					// an oversight. `compose_portraits.py` bakes a 2 px accent frame, corner brackets
+					// and an accent underline into the edges of the 512 square; the card draws that
+					// square whole and inherits all three, so a stroke there would be a second frame
+					// on the artist's. This crop is the middle half of the image, so none of it is in
+					// frame and the picture would otherwise bleed into the panel with no edge at all.
+					TraceCharacterSelectFile::StrokeRect(HUD, IdentityX, IdentityY, Side, Side, 1.f * S,
+						TraceSelectStyle::WithAlpha(Entry.Accent, bTaken ? 0.30f : 0.70f));
+				}
+				else
+				{
+					// The monogram, at panel scale. Same fallback the card takes and for the same three
+					// reasons (no file / RHI not up yet / load budget spent), so there is one path to
+					// test rather than two.
+					const FString Monogram = FString(Entry.Name).Left(1);
+					const float MonoSize = Side * 0.78f;
+					const float MonoW = TraceCharacterSelectType::Width(HUD, Monogram, nullptr, MonoSize, 0.f);
+					const float MonoH = TraceCharacterSelectType::LineHeight(HUD, nullptr, MonoSize);
+
+					TraceCharacterSelectType::Draw(HUD, Monogram,
+						TraceSelectStyle::WithAlpha(Entry.Accent, bTaken ? 0.10f : 0.22f),
+						IdentityX + (Side - MonoW) * 0.5f, IdentityY + (Side - MonoH) * 0.5f,
+						nullptr, MonoSize, 0.f);
+				}
+			}
+
+			// The key that picks it, as a key, and in reading order: the word PRESS, then the cap. §6.6.
+			// Beside the picture now, top-aligned with it.
 			if (!Glyph.IsEmpty())
 			{
-				const float CapH = 44.f * S;
-				const float WordW = TraceCharacterSelectType::Width(HUD, TEXT("PRESS"), nullptr,
-					TraceSelectLayout::SizeLabel * S, TraceSelectLayout::TrackLabel * S);
+				const float KeyX = (Side >= 60.f * S) ? (IdentityX + Side + (16.f * S)) : IdentityX;
 
 				TraceCharacterSelectType::Draw(HUD, TEXT("PRESS"), TraceSelectStyle::InkDim,
-					IdentityX,
-					IdentityY + (CapH - TraceCharacterSelectType::LineHeight(HUD, nullptr, TraceSelectLayout::SizeLabel * S)) * 0.5f,
+					KeyX,
+					IdentityY + (DetailCapH - TraceCharacterSelectType::LineHeight(HUD, nullptr, TraceSelectLayout::SizeLabel * S)) * 0.5f,
 					nullptr, TraceSelectLayout::SizeLabel * S, TraceSelectLayout::TrackLabel * S);
 
-				TraceCharacterSelectFile::DrawChip(HUD, Glyph, IdentityX + WordW + (12.f * S), IdentityY,
-					CapH, CapH, Entry.Accent, TraceSelectStyle::Ink, 22.f * S, 0.f);
-
-				IdentityY += CapH + (18.f * S);
+				TraceCharacterSelectFile::DrawChip(HUD, Glyph, KeyX + WordW + (12.f * S), IdentityY,
+					DetailCapH, DetailCapH, Entry.Accent, TraceSelectStyle::Ink, 22.f * S, 0.f);
 			}
+
+			IdentityY += FMath::Max(Side >= 60.f * S ? Side : 0.f, Glyph.IsEmpty() ? 0.f : DetailCapH) + (18.f * S);
 		}
 
 		// The name, at display size, in the character's own colour — SHRUNK TO FIT ITS COLUMN.
@@ -2148,28 +2863,108 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 		// control, a name and a duration — so they get three different objects: a keycap, a line of
 		// display type in the character's colour, and a chip.
 		{
+			// One switch for both ability rows — the card's and this one — because they are one defect
+			// wearing two hats, and an A/B that only put half of it back would prove half of the fix.
+#if !UE_BUILD_SHIPPING
+			const bool bFitAbilityRow = (TraceCharacterSelectFile::CVarFitMicroRow.GetValueOnGameThread() != 0);
+#else
+			constexpr bool bFitAbilityRow = true;
+#endif
+
 			const float X = ColumnsX + (ColumnW + ColumnGap) * 2.f;
 			float Y = DrawHeading(TEXT("ACTIVATED"), Entry.Accent, X, ColumnsY);
 
-			const float RowH = 30.f * S;
-			const float KeyW = TraceCharacterSelectFile::DrawChip(HUD, TEXT("E"), X, Y, RowH, RowH,
-				TraceSelectStyle::Dimmed(Entry.Accent, BodyDim), TraceSelectStyle::Ink,
-				TraceSelectLayout::SizeChip * S, 0.f);
+			// ---- THE ROW IS FITTED TO ITS COLUMN, FOR THE SAME REASON THE CARD'S MICRO ROW IS ------
+			//
+			// Keycap, ability name and cooldown chip are all sized from UIScale — view HEIGHT — and
+			// laid out inside ColumnW, which is a third of the panel and therefore view WIDTH. That is
+			// the identical shape as the "ACTIVATED" overprint W8-VISUAL §4 measured on the cards, one
+			// panel down, and it fails the same way: at 1440x1080 (4:3, scale/width 6.94e-4) the 25s
+			// chip printed over the last two letters of SLIMEWALL. Captured before this block existed:
+			// scratchpad/w9uifix/ab_4x3.png, bottom strip.
+			//
+			// It survived W8 because it needs BOTH a narrow display AND the roster's longest ability
+			// name highlighted, and until Trace.Characters.Highlight there was no way to hold a chosen
+			// character on this panel at all. It is comfortable at every shape wider than about 1.45:1
+			// — measured 8.7% of the column still clear at 1728x1117 — so nothing that looks right
+			// today changes: the solve returns 1.0 wherever there was room.
+			//
+			// Fitted against the WIDEST ability name in the roster and not this card's, so walking the
+			// grid does not resize the row under the player's eyes.
+			const float BaseRowH = 30.f * S;
+			const float BaseChipText = TraceSelectLayout::SizeChip * S;
+			const float BaseLeadSize = TraceSelectLayout::SizeLead * S;
+			const float BaseLeadTrack = TraceSelectLayout::TrackName * S;
+			const float BaseRowGap = 12.f * S;
 
 			const FString Cooldown = FString::Printf(TEXT("%ds"), FMath::RoundToInt(Entry.ActivatedCooldown));
-			const float CooldownW = TraceCharacterSelectType::Width(HUD, Cooldown, nullptr, TraceSelectLayout::SizeChip * S, 0.f)
-				+ RowH * 0.90f;
+
+			FString WidestName = Entry.ActivatedName;
+			FString WidestCd = Cooldown;
+			{
+				float BestName = 0.f;
+				float BestCd = 0.f;
+				for (const TraceCharacterRoster::FTraceCharacterEntry& Row : Roster)
+				{
+					const float NameW = TraceCharacterSelectType::Width(HUD, Row.ActivatedName, nullptr,
+						BaseLeadSize, BaseLeadTrack);
+					if (NameW > BestName) { BestName = NameW; WidestName = Row.ActivatedName; }
+
+					const FString Cd = FString::Printf(TEXT("%ds"), FMath::RoundToInt(Row.ActivatedCooldown));
+					const float CdW = TraceCharacterSelectType::Width(HUD, Cd, nullptr, BaseChipText, 0.f);
+					if (CdW > BestCd) { BestCd = CdW; WidestCd = Cd; }
+				}
+			}
+
+			auto AbilityRowWidthAt = [&](float Scale) -> float
+			{
+				const float H = BaseRowH * Scale;
+				return TraceCharacterSelectFile::ChipWidth(HUD, TEXT("E"), H, H, BaseChipText * Scale, 0.f)
+					+ (BaseRowGap * Scale)
+					+ TraceCharacterSelectType::Width(HUD, WidestName, nullptr, BaseLeadSize * Scale, BaseLeadTrack * Scale)
+					+ (BaseRowGap * Scale)
+					+ TraceCharacterSelectFile::ChipWidth(HUD, WidestCd, H, 0.f, BaseChipText * Scale, 0.f);
+			};
+
+			// Iterated for the same reason SolveTileMetrics iterates: advance is not exactly linear in
+			// point size and the chips add plate padding, so one first-order step can land a hair over.
+			float RowScale = 1.f;
+			for (int32 Pass = 0; bFitAbilityRow && Pass < 3; ++Pass)
+			{
+				const float Need = AbilityRowWidthAt(RowScale);
+				if (Need <= ColumnW)
+				{
+					break;
+				}
+				RowScale = FMath::Max(0.05f, RowScale * (ColumnW / FMath::Max(Need, 1.f)));
+			}
+
+			const float RowH = BaseRowH * RowScale;
+			const float ChipText = BaseChipText * RowScale;
+			const float LeadSize = BaseLeadSize * RowScale;
+			const float LeadTrack = BaseLeadTrack * RowScale;
+
+			const float KeyW = TraceCharacterSelectFile::DrawChip(HUD, TEXT("E"), X, Y, RowH, RowH,
+				TraceSelectStyle::Dimmed(Entry.Accent, BodyDim), TraceSelectStyle::Ink,
+				ChipText, 0.f);
+
+			const float CooldownW = TraceCharacterSelectFile::ChipWidth(HUD, Cooldown, RowH, 0.f, ChipText, 0.f);
 
 			TraceCharacterSelectFile::DrawChip(HUD, Cooldown, X + ColumnW - CooldownW, Y, RowH, CooldownW,
-				TraceSelectStyle::Cyan, TraceSelectStyle::InkSoft, TraceSelectLayout::SizeChip * S, 0.f);
+				TraceSelectStyle::Cyan, TraceSelectStyle::InkSoft, ChipText, 0.f);
 
-			const float NameH = TraceCharacterSelectType::LineHeight(HUD, nullptr, TraceSelectLayout::SizeLead * S);
+			const float NameH = TraceCharacterSelectType::LineHeight(HUD, nullptr, LeadSize);
 			TraceCharacterSelectType::Draw(HUD, Entry.ActivatedName,
 				TraceSelectStyle::Dimmed(Entry.Accent, BodyDim),
-				X + KeyW + (12.f * S), Y + (RowH - NameH) * 0.5f, nullptr,
-				TraceSelectLayout::SizeLead * S, TraceSelectLayout::TrackName * S);
+				X + KeyW + (BaseRowGap * RowScale), Y + (RowH - NameH) * 0.5f, nullptr,
+				LeadSize, LeadTrack);
 
-			Y += RowH + (14.f * S);
+			// The paragraph below keeps the row's ORIGINAL height in its budget (AbilityRowH above is
+			// 30 * S + 14 * S), so a shrunk row gives the prose a little more air rather than moving it
+			// up. Deliberate: the fit-to-column search that chose BodySize ran against AbilityRowH, and
+			// advancing by the shrunk height here would hand the paragraph room the search never
+			// offered it — which is how a "fix" to one row silently re-opens the overflow in another.
+			Y += BaseRowH + (14.f * S);
 			TraceCharacterSelectType::WrapDraw(HUD, ActivatedText, BodyColor, X, Y, ColumnW,
 				nullptr, BodySize, BodyGap, BodyWeight);
 		}
@@ -2309,15 +3104,36 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
  * ONE IDENTITY TILE — spec v20 §6.1 and §6.4.
  *
  * What it holds is deliberately the same for every character: a keycap, the name in the character's
- * own accent, the activated ability's name and cooldown, and a monogram watermark. No paragraph, no
- * variable-length anything. That is what makes a fixed-height box honest rather than "roughly half
+ * own accent, the activated ability's name and cooldown, and the character's PORTRAIT. No paragraph,
+ * no variable-length anything. That is what makes a fixed-height box honest rather than "roughly half
  * empty" (Rocco) and "nearly overflowing" (Mortimer), which is the §6.1 complaint verbatim.
  *
- * §6.4 asked for identity "beyond a 3 px colour stripe". There are no portraits in this project and
- * inventing one is not a layout pass, so the identity is built out of what does exist: the accent as a
- * large field rather than a sliver, the name set at 25 px in that accent, the artist's plate carrying
- * the state (default / hover / disabled — the sheet's own three), and the initial as a big low-alpha
- * watermark so the tiles differ in SHAPE as well as in hue at a glance.
+ * *** THE PARAGRAPH THAT USED TO BE HERE IS FALSIFIED AND IS REWRITTEN BELOW (UI plan WP10). ***
+ * It read: "§6.4 asked for identity beyond a 3 px colour stripe. There are no portraits in this
+ * project and inventing one is not a layout pass, so the identity is built out of what does exist
+ * ... the initial as a big low-alpha watermark". That was true when it was written and stopped being
+ * true when W4-PORTRAITS shot ten busts. There ARE portraits now, at
+ * /Game/Trace/UI/Art/Portraits/T_Portrait_<Name>, and this tile draws one.
+ *
+ * WHAT THE PICTURE DID TO THE LAYOUT, because it is not simply "a texture in the empty half":
+ *
+ *   * The tile is now TWO COLUMNS — a text column on the left and a square portrait pinned to the
+ *     right edge — where before it was two blocks pinned to the top and bottom edges with a watermark
+ *     in the gap. Every width in the text half is measured against the text column, not against the
+ *     tile, so nothing can run underneath the picture.
+ *   * THE NAME NEVER YIELDS TO THE PORTRAIT. The portrait's width is what is left after the keycap
+ *     and the smallest size the name is allowed to shrink to; on a viewport narrow enough it gives up
+ *     its own width, and below 56 design px it gives up altogether and the monogram comes back. A
+ *     card whose picture had pushed SLIMEBALL off its own tile would be a worse card than one with no
+ *     picture, and that is the sort of thing that only shows up on somebody else's monitor.
+ *   * The square is drawn WHOLE, never cropped and never stretched — see
+ *     TraceCharacterSelectPortraits::CardMinU for the two reasons (the accent frame is baked into the
+ *     512's edges, and the framing gate spent real headroom keeping Lily's fins and X's beads inside
+ *     the frame).
+ *
+ * The monogram is still here. It is the fallback now rather than the answer: a clone that has not run
+ * the portrait stage, a frame or two before the RHI texture lands, or a load budget already spent all
+ * draw the same watermark this tile used to draw, in the square the portrait would have filled.
  */
 void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, int32 CardIndex, float X, float Y, float W, float H)
 {
@@ -2368,85 +3184,107 @@ void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, i
 		}
 	}
 
-	const float Pad = 18.f * S;
+	// Every number below comes from the grid-wide solve in SolveTileMetrics, never from this card's
+	// own name. See the long note there for why: per-card arithmetic produced ten different picture
+	// sizes in one grid, which photographs as a rendering fault.
+	const TraceCharacterSelectFile::FTileMetrics& M = TraceCharacterSelectFile::TileMetrics;
+	const float Pad = M.Pad;
+	const float TextW = M.TextW;
 
-	// THE TILE IS TWO BLOCKS PINNED TO OPPOSITE EDGES, not a stack that runs down from the top: the
-	// name group hangs off the top and the ability group off the BOTTOM. That is what stops the v1
-	// version of this redesign reintroducing §6.1's own complaint at a smaller scale — a top-down stack
-	// left about fifty pixels of nothing under every tile, which is dead space in exactly the way the
-	// old fixed-height cards were. The gap between the two blocks is the monogram's, on purpose.
-	const float CapH = 30.f * S;
-	const float LeadH = TraceCharacterSelectType::LineHeight(HUD, nullptr, TraceSelectLayout::SizeLead * S);
-	const float MicroSize = TraceSelectLayout::SizeLabel * 0.86f * S;
+	// THE TILE IS TWO COLUMNS, and inside the left one two blocks pinned to opposite edges: the key
+	// and name hang off the top and the ability group off the BOTTOM. That is what stops the v1
+	// version of this redesign reintroducing §6.1's own complaint at a smaller scale — a top-down
+	// stack left about fifty pixels of nothing under every tile, which is dead space in exactly the
+	// way the old fixed-height cards were. The gap between the two blocks used to be the monogram's;
+	// since WP10 the picture is a column of its own beside them and the gap is breathing room.
+	const float CapH = M.CapH;
+	const float LeadH = TraceCharacterSelectType::LineHeight(HUD, nullptr, M.LeadSize);
+	// The micro row's four numbers come from the grid-wide solve, NOT from UIScale. That is the fix
+	// for the 16:10 overprint: they are fitted to the text column's width in SolveTileMetrics, which
+	// is the dimension that bounds them. Deriving them here from S again — as this line used to —
+	// is precisely how a height-sized label ends up under a width-placed chip. See FTileMetrics.
+	const float MicroSize = M.MicroSize;
 	const float MicroH = TraceCharacterSelectType::LineHeight(HUD, nullptr, MicroSize);
+	const float CooldownH = M.ChipH;
 
-	const float BottomY = Y + H - Pad - LeadH;              // the ability name's line box
-	const float MicroY = BottomY - MicroH - (5.f * S);      // its ACTIVATED label
+	const float BottomY = Y + H - Pad - LeadH;                                   // the ability name's line box
+	const float MicroRowH = FMath::Max(MicroH, CooldownH);
+	const float MicroY = BottomY - MicroRowH - (5.f * S);                        // ACTIVATED + the cooldown chip
 
-	// ---- The monogram watermark ------------------------------------------------------------------
-	//
-	// Drawn FIRST so nothing has to fight it, and at an alpha low enough that it is texture rather than
-	// text. It is the cheapest per-character silhouette available without art: R and S and M and X do
-	// not look alike even out of focus, which is the property §6.4 is actually asking for. Sized and
-	// placed to sit in the gap BETWEEN the two blocks rather than behind either of them.
+	// ---- The portrait column — UI plan WP10 ------------------------------------------------------
+	if (M.PortraitSide > 0.f)
 	{
-		const FString Monogram = FString(Entry.Name).Left(1);
-		const float MonoSize = 88.f * S;
-		const float MonoW = TraceCharacterSelectType::Width(HUD, Monogram, nullptr, MonoSize, 0.f);
-		const float MonoH = TraceCharacterSelectType::LineHeight(HUD, nullptr, MonoSize);
+		const float PortraitSide = M.PortraitSide;
+		const float PortraitX = X + W - M.PortraitInset - PortraitSide;
+		const float PortraitY = Y + (H - PortraitSide) * 0.5f;
 
-		TraceCharacterSelectType::Draw(HUD, Monogram,
-			TraceSelectStyle::WithAlpha(Entry.Accent, bTaken ? 0.06f : 0.13f),
-			X + W - Pad - MonoW, MicroY - MonoH + (MonoH * 0.22f), nullptr, MonoSize, 0.f);
+		if (UTexture2D* Portrait = TraceCharacterSelectPortraits::For(CardIndex))
+		{
+			// NO STROKE AROUND IT. `compose_portraits.py` bakes a 2 px accent frame, corner brackets
+			// and an accent underline into the square, and this draws the square whole — a hairline
+			// here would be a second frame on the artist's. (The detail panel's 2x crop cuts all three
+			// off and does draw one; see the note there.)
+			//
+			// A taken card's portrait is dimmed by the same factor its type is. Greying the face is
+			// the point: the card has to say "somebody has this" louder than "here is a character".
+			TraceCharacterSelectPortraits::Draw(HUD, Portrait, PortraitX, PortraitY, PortraitSide, PortraitSide,
+				TraceCharacterSelectPortraits::CardMinU, TraceCharacterSelectPortraits::CardMinV,
+				TraceCharacterSelectPortraits::CardMaxU, TraceCharacterSelectPortraits::CardMaxV,
+				bTaken ? TraceSelectStyle::Dimmed(FLinearColor::White, Dim) : FLinearColor::White);
+		}
+		else
+		{
+			// ---- The monogram watermark, now the FALLBACK ------------------------------------------
+			//
+			// Unchanged in what it is and why it works — an alpha low enough that it is texture rather
+			// than text, and the cheapest per-character silhouette available without art: R and S and M
+			// and X do not look alike even out of focus. What changed is where it sits. It used to hang
+			// off the tile's right padding in the gap between the two text blocks; it now fills the
+			// square the picture would have occupied, so a build with no portraits keeps the same
+			// composition as one with them rather than falling back to a different, emptier layout.
+			const FString Monogram = FString(Entry.Name).Left(1);
+			const float MonoSize = PortraitSide * 0.80f;
+			const float MonoW = TraceCharacterSelectType::Width(HUD, Monogram, nullptr, MonoSize, 0.f);
+			const float MonoH = TraceCharacterSelectType::LineHeight(HUD, nullptr, MonoSize);
+
+			TraceCharacterSelectType::Draw(HUD, Monogram,
+				TraceSelectStyle::WithAlpha(Entry.Accent, bTaken ? 0.08f : 0.16f),
+				PortraitX + (PortraitSide - MonoW) * 0.5f, PortraitY + (PortraitSide - MonoH) * 0.5f,
+				nullptr, MonoSize, 0.f);
+		}
 	}
 
-	// ---- Keycap + name ---------------------------------------------------------------------------
+	// ---- Keycap, then the name under it ----------------------------------------------------------
+	//
+	// STACKED, not side by side, and it is the picture that pays for it — see SolveTileMetrics. It
+	// also reads better this way: a number sitting on the name's line looks like a bullet, and a
+	// keycap above it looks like what it is, the key that picks this card.
 	float PenY = Y + Pad;
 	{
 		const FString Glyph = TraceCharacterSelectFile::KeyGlyphForIndex(CardIndex);
-
-		float CapW = 0.f;
 		if (!Glyph.IsEmpty())
 		{
-			CapW = TraceCharacterSelectFile::DrawChip(HUD, Glyph, X + Pad, PenY, CapH, CapH,
+			TraceCharacterSelectFile::DrawChip(HUD, Glyph, X + Pad, PenY, CapH, CapH,
 				TraceSelectStyle::Dimmed(Entry.Accent, Dim),
 				TraceSelectStyle::WithAlpha(TraceSelectStyle::Ink, Dim),
-				TraceSelectLayout::SizeChip * S, 0.f);
-			CapW += 12.f * S;
+				TraceSelectLayout::SizeChip * 0.92f * S, 0.f);
+			PenY += CapH + (6.f * S);
 		}
 
-		// THE NAME IS FITTED, NOT ASSUMED. SLIMEBALL and MORTIMER are half again as wide as ROCCO, and
-		// at the 250-pixel tile a 4:3 viewport produces they ran past the tile's own padding in the
-		// first capture of this redesign. Shrinking the two longest names by a few points is invisible;
-		// a name touching the edge of its card is the "sloppy" this pass exists to remove. Floored at
-		// 72% so it degrades into smaller type rather than into unreadable type.
-		float NameSize = TraceSelectLayout::SizeName * S;
-		float NameTrack = TraceSelectLayout::TrackName * S;
-		{
-			const float Room = (W - Pad * 2.f) - CapW;
-			const float Natural = TraceCharacterSelectType::Width(HUD, Entry.Name, nullptr, NameSize, NameTrack,
-				ETraceTextWeight::Bold);
-			if (Natural > Room && Natural > 1.f)
-			{
-				const float Fit = FMath::Max(0.72f, Room / Natural);
-				NameSize *= Fit;
-				NameTrack *= Fit;
-			}
-		}
-
-		const float NameH = TraceCharacterSelectType::LineHeight(HUD, nullptr, NameSize);
+		const float NameH = TraceCharacterSelectType::LineHeight(HUD, nullptr, M.NameSize);
 		TraceCharacterSelectType::Draw(HUD, Entry.Name,
 			bTaken ? TraceSelectStyle::InkDim : Entry.Accent,
-			X + Pad + CapW, PenY + (CapH - NameH) * 0.5f, nullptr, NameSize, NameTrack,
-			ETraceTextWeight::Bold);
+			X + Pad, PenY, nullptr, M.NameSize, M.NameTrack, ETraceTextWeight::Bold);
 
-		PenY += CapH + (10.f * S);
+		PenY += NameH + (8.f * S);
 	}
 
-	// The accent rule. This is the "3 px colour stripe" from §6.4 promoted into the layout: full tile
-	// width, under the name, in the character's colour.
+	// The accent rule. This is the "3 px colour stripe" from §6.4 promoted into the layout: under the
+	// name, in the character's colour, and the full width of the TEXT COLUMN — it stops where the
+	// picture starts rather than running underneath it, which is what makes the two columns read as
+	// two columns instead of as a rule with a texture pasted over its right end.
 	HUD->DrawRect(TraceSelectStyle::WithAlpha(TraceSelectStyle::Dimmed(Entry.Accent, Dim), bTaken ? 0.35f : 0.75f),
-		X + Pad, PenY, W - Pad * 2.f, FMath::Max(1.f, 2.f * S));
+		X + Pad, PenY, TextW, FMath::Max(1.f, 2.f * S));
 
 	// ---- Bottom block: either the activated ability, or who has taken this card -------------------
 	//
@@ -2463,7 +3301,7 @@ void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, i
 		const float StripTextSize = TraceSelectLayout::SizeLabel * 0.9f * S;
 
 		HUD->DrawRect(TraceSelectStyle::WithAlpha(TraceSelectStyle::Danger, 0.20f),
-			X + Pad, StripY, W - Pad * 2.f, StripH);
+			X + Pad, StripY, TextW, StripH);
 		HUD->DrawRect(TraceSelectStyle::WithAlpha(TraceSelectStyle::Danger, 0.85f),
 			X + Pad, StripY, 3.f * S, StripH);
 
@@ -2473,36 +3311,26 @@ void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, i
 	}
 	else
 	{
+		// ACTIVATED and the cooldown share one line, at opposite ends of the text column. The chip used
+		// to sit on the ability NAME's line and against the tile's right padding — which since WP10 is
+		// inside the picture, and which cost SLIMEWALL a third of its column. Both facts are still one
+		// glance apart; they are simply a row higher.
 		TraceCharacterSelectType::Draw(HUD, TEXT("ACTIVATED"), TraceSelectStyle::InkDim,
-			X + Pad, MicroY, nullptr, MicroSize, TraceSelectLayout::TrackLabel * S);
+			X + Pad, MicroY + (MicroRowH - MicroH) * 0.5f, nullptr, MicroSize,
+			M.MicroTrack);
 
 		const FString Cooldown = FString::Printf(TEXT("%ds"), FMath::RoundToInt(Entry.ActivatedCooldown));
-		const float CooldownH = 24.f * S;
 		const float CooldownW = TraceCharacterSelectFile::ChipWidth(HUD, Cooldown, CooldownH, 0.f,
-			TraceSelectLayout::SizeLabel * S, 0.f);
+			M.ChipTextSize, 0.f);
 
-		TraceCharacterSelectFile::DrawChip(HUD, Cooldown, X + W - Pad - CooldownW,
-			BottomY + (LeadH - CooldownH) * 0.5f, CooldownH, CooldownW,
-			TraceSelectStyle::Cyan, TraceSelectStyle::InkSoft, TraceSelectLayout::SizeLabel * S, 0.f);
+		TraceCharacterSelectFile::DrawChip(HUD, Cooldown, X + Pad + TextW - CooldownW,
+			MicroY + (MicroRowH - CooldownH) * 0.5f, CooldownH, CooldownW,
+			TraceSelectStyle::Cyan, TraceSelectStyle::InkSoft, M.ChipTextSize, 0.f);
 
-		// Fitted for the same reason the name is: SLIMEWALL beside a cooldown chip is the widest
-		// combination in the roster.
-		float LeadSize = TraceSelectLayout::SizeLead * S;
-		float LeadTrack = TraceSelectLayout::TrackName * S;
-		{
-			const float Room = (W - Pad * 2.f) - CooldownW - (12.f * S);
-			const float Natural = TraceCharacterSelectType::Width(HUD, Entry.ActivatedName, nullptr, LeadSize, LeadTrack);
-			if (Natural > Room && Natural > 1.f)
-			{
-				const float Fit = FMath::Max(0.72f, Room / Natural);
-				LeadSize *= Fit;
-				LeadTrack *= Fit;
-			}
-		}
-
+		// Size and tracking are the grid's, not this card's: SLIMEWALL and ZIP are set at the same
+		// size on their own cards, which is the whole point of the uniform solve.
 		TraceCharacterSelectType::Draw(HUD, Entry.ActivatedName, TraceSelectStyle::Ink,
-			X + Pad, BottomY + (LeadH - TraceCharacterSelectType::LineHeight(HUD, nullptr, LeadSize)) * 0.5f,
-			nullptr, LeadSize, LeadTrack);
+			X + Pad, BottomY, nullptr, M.LeadSize, M.LeadTrack);
 	}
 
 	// ---- Selection --------------------------------------------------------------------------------
@@ -2542,25 +3370,20 @@ void FTraceCharacterSelect::DrawCursor(AHUD* HUD)
 		return;
 	}
 
-	// SPEC v20 §6.7 and §0.8 — the artist's cursor, which until then existed only on the UMG title
-	// screen. It is TIP-ANCHORED, not centre-anchored: PollInput hit-tests at CursorPos, and a
-	// centre-anchored arrow would draw its point about eleven pixels away from the pixel that is
-	// actually being clicked.
+	// ONE POINTER, DRAWN IN ONE PLACE — the UI QA pass's finding 6.
 	//
-	// SPEC v24 §0, applied here: the aspect ratio and the tip used to be four bare numbers typed into
-	// this function — `64.f / 87.f`, `12.f / 64.f`, `6.f / 87.f` — a second, slightly different copy
-	// of what UI/TraceOptionsMenu.cpp already carried for the same sprite. They are now DERIVED from
-	// the sprite's own dimensions in one place, so a re-slice moves every screen at once. See
-	// TraceMenuArtStyle::CursorSpriteW.
-	if (UTexture2D* Arrow = TraceCharacterSelectArt::Sprite(TraceCharacterSelectArt::ESprite::Cursor))
+	// Spec v20 §6.7 put the artist's arrow on this screen; spec v24 §0 moved its aspect and tip into
+	// TraceMenuArtStyle so this file stopped carrying its own copy. What was still not shared was the
+	// DRAW: this function, FTraceOptionsMenu::DrawCursor and ATraceMenuHUD::DrawCursor each had their
+	// own, and the third one drew a completely different picture (a cyan cross). All three now call
+	// the same function, which is also the one that decides the tint — see
+	// UI/TraceHardwareCursor.h's second header block for what "themed" means and why it is cyan.
+	//
+	// Still TIP-ANCHORED, and that is DrawPointer's contract rather than this caller's arithmetic:
+	// PollInput hit-tests at CursorPos, and a centre-anchored arrow would draw its point about eleven
+	// pixels away from the pixel that is actually being clicked.
+	if (TraceHardwareCursor::DrawPointer(HUD, CursorPos, UIScale))
 	{
-		const float ArrowH = 30.f * UIScale;
-		const float ArrowW = ArrowH * TraceMenuArtStyle::CursorAspect;
-
-		TraceCharacterSelectArt::DrawSprite(HUD, Arrow,
-			CursorPos.X - ArrowW * TraceMenuArtStyle::CursorTipU,
-			CursorPos.Y - ArrowH * TraceMenuArtStyle::CursorTipV,
-			ArrowW, ArrowH, FLinearColor::White);
 		return;
 	}
 
@@ -2636,6 +3459,50 @@ namespace TraceCharacterSelectCommands
 		UE_LOG(LogTraceGame, Display, TEXT("[CharSelect.ClickTest] Queued a click on card %d."),
 			GTraceCharacterSelectClickTest);
 	}
+
+	/**
+	 * Trace.Characters.Highlight <1..N | 0>
+	 *
+	 * HIGHLIGHTS WITHOUT CONFIRMING, and holds it. Trace.Characters.Select cannot be used to look at
+	 * the detail panel because it confirms on the same tick, and hovering cannot be aimed from a
+	 * headless run — so before this there was no way to photograph nine of the ten detail panels. See
+	 * TraceCharSelectHighlightLatch for the four-day defect that fact hid.
+	 *
+	 * 0 hands the screen back to the player, so a run can hold a card, shoot it, and let go.
+	 */
+	void TraceCharacterHighlightCommand(const TArray<FString>& Args)
+	{
+		const int32 Requested = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 0;
+
+		if (Requested < 0 || Requested > TraceCharacterRoster::Count)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[CharSelect] Trace.Characters.Highlight: %d is not 0..%d."),
+				Requested, TraceCharacterRoster::Count);
+			return;
+		}
+
+		TraceCharSelectHighlightLatch::Held = Requested;
+
+		if (Requested == 0)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Highlight released; the player drives it again."));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CharSelect] Highlight HELD on card %d (%s). The screen stays open — this does not confirm."),
+				Requested, TraceCharacterRoster::All()[Requested - 1].Name);
+		}
+	}
+
+	FAutoConsoleCommand CmdTraceCharacterHighlight(
+		TEXT("Trace.Characters.Highlight"),
+		TEXT("Dev only. Hold the select screen's highlight on card 1..N (0 releases it) WITHOUT "
+		     "confirming, so the detail panel for any character can be photographed by an unattended "
+		     "run. Trace.Characters.Select confirms and closes the screen; this does not. No effect "
+		     "unless the select screen is open on this machine."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&TraceCharacterHighlightCommand));
 
 	FAutoConsoleCommand CmdTraceCharacterSelectClickTest(
 		TEXT("Trace.Characters.ClickTest"),

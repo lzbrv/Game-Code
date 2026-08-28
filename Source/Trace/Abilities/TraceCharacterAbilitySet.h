@@ -1,12 +1,18 @@
 // Trace — the per-character extension point (spec v14 §5 / §6).
 //
 // ===================================================================================================
-// FOR THE FIVE CHARACTER AGENTS. READ THIS FIRST.
+// ADDING A CHARACTER. READ THIS FIRST.
 // ===================================================================================================
 //
-// You add exactly ONE new file pair to Source/Trace/Abilities/ and you edit NOTHING ELSE:
+// This front matter was written for the original five-agent pass, when five agents were each given
+// one character and told not to touch each other's files. The ROSTER IS TEN NOW (v14's five, +Roxie
+// /Elle/Slimeball at v18 §2, +Mortimer/Lily at v19 §3) and the instructions below have held for
+// every one of them unchanged — which is the point of the reflection bridge. Read "the five agents"
+// as "whoever adds the eleventh".
 //
-//     Abilities/TraceAbilitySetRocco.h / .cpp        (and Chut / Mace / Oyster / X)
+// You add exactly ONE new file pair to Source/Trace/Abilities/Characters/ and you edit NOTHING ELSE:
+//
+//     Abilities/Characters/TraceAbilitySetRocco.h / .cpp     (and the other nine)
 //
 //     UCLASS()
 //     class UTraceAbilitySetRocco : public UTraceCharacterAbilitySet
@@ -192,6 +198,63 @@ public:
 	virtual void TickAbilities(float DeltaSeconds) {}
 
 	// =============================================================================================
+	// THE CLIENT FX ROUTER — FX_AUDIO_PLAN §1.2. Two hooks, one rule.
+	// =============================================================================================
+	//
+	// THE RULE, and everything below follows from it: THE ROUTER OWNS EVERYTHING A NON-OWNER CAN SEE
+	// OR HEAR. First-person predicted feedback (the local dash, the owner's own cast flash) stays in
+	// the input path — TryActivate() and the kit's local half — because it must not wait for a round
+	// trip. Third-person presentation — attached loop FX, world beats, loop SOUNDS — belongs here,
+	// because here is the only place that runs on every machine with the same information.
+	//
+	// The two must not double-fire. If an element is in both halves, the owner sees it twice; if it is
+	// in neither, everybody but the owner sees nothing, which is the F10 blocker this plan exists to
+	// close.
+	//
+	// FOUR OBLIGATIONS ON EVERY IMPLEMENTATION (they are cheap, and each one is a shipped bug if it is
+	// skipped):
+	//   1. Resolve the pawn through GetOwningPlayerState()->GetPawn(). A NULL pawn means DETACH
+	//      EVERYTHING — a component parented to nothing is a component nobody will ever clean up.
+	//   2. Re-attach in OnPawnSpawned(), detach in OnPawnDied(). Attached FX must never survive onto a
+	//      corpse; the state that drove them is wiped on death by ApplyDeathStateWipe() anyway.
+	//   3. Build every component through UTraceFxShapes::ConfigureFxComponent + MakeGlowMID, and honour
+	//      the achieved blend: ETraceFxBlend::None hides the component rather than showing it grey.
+	//   4. Budget (bible §6.4): at most FOUR attached primitives per pawn, additive intensity <= 0.5,
+	//      inside 96 uu of the capsule axis. Motion is allowed; a brightness pulse on a lethal
+	//      telegraph is not.
+	//
+	// Elle's cloak is the one interaction worth naming: emissive FX attached by a router hook must
+	// either register with the same ApplyTeamColors() refresh that restores body emissives
+	// (TraceAbilitySetElle.cpp:60-181) or be plainly hidden while IsCloakVisualApplied().
+
+	/**
+	 * EDGE-TRIGGERED, on every machine: the replicated scratch pad CHANGED from @p Old to @p New.
+	 *
+	 * Called from UTraceAbilityComponent::RouteNetStateEdges — on a client from OnRep_AbilityState, on
+	 * the authority from the component's own 20 Hz tick, so a listen host sees remote players' edges
+	 * at most 50 ms late and its own the moment MarkStateDirty() runs.
+	 *
+	 * Compare the fields you care about (Old.Flags vs New.Flags for a rising bit, the two
+	 * EffectEndMatchTimes for a re-arm) and do only presentation here: no damage, no movement, no
+	 * state writes. The state is already what it is; this is the notification, not the decision.
+	 */
+	virtual void OnClientStateEdge(const FTraceAbilityNetState& Old, const FTraceAbilityNetState& New) {}
+
+	/**
+	 * FIRST SIGHT, on every machine: this machine now has a valid state and has NOT been told about
+	 * the edges that produced it. Attach the loop FX for whatever is ALREADY on.
+	 *
+	 * When it runs: a client joining a match in progress, a character swap, a pawn respawn — anything
+	 * that builds the ability set fresh while the state is non-empty. It is the difference between
+	 * "Lily's flight aura is on every machine that watched her cast" and "on every machine, including
+	 * the one that connected halfway through the flight".
+	 *
+	 * MUST BE IDEMPOTENT. It can run twice for the same live state (a rebuild that lands on the same
+	 * character), and it must not stack a second set of components when it does.
+	 */
+	virtual void SyncClientFx(const FTraceAbilityNetState& Current) {}
+
+	// =============================================================================================
 	// THE ACTIVATED ABILITY — bound to E by default (spec §5), rebindable
 	// =============================================================================================
 
@@ -314,13 +377,17 @@ public:
 	 * derived from the one the movement component computes for everybody.
 	 *
 	 * @param InWellTimedBonus  whatever UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus()
-	 *                          answers globally (1.446875 today).
+	 *                          answers globally (1.375 today — it was 1.446875 when this was written,
+	 *                          and spec v26 §3a and v28 §5 have both moved it since).
 	 *
 	 * The global number is passed IN rather than read here so there is exactly one definition of "the
 	 * base" and it is the shipped one — a character that read UTraceSettings itself would quietly stop
-	 * tracking a retune of the base. Elle is the only override (+40% of the GAIN, not the multiplier);
-	 * everybody else returns their argument, which is what makes spec v18 §4's "slide-jump 1.446875
-	 * (Elle changes only her own)" true by construction.
+	 * tracking a retune of the base. THAT DESIGN IS WHY THE STALE NUMBER ABOVE COST NOTHING: the base
+	 * moved twice and every character tracked it, because none of them holds a copy. Elle is the only
+	 * override (+30% of the GAIN as of Patch 28 §3, not the multiplier); everybody else returns their
+	 * argument, which is what makes spec v18 §4's "slide-jump (Elle changes only her own)" true by
+	 * construction — the parenthesis is the invariant, the number in the spec's sentence is only the
+	 * value it happened to have.
 	 */
 	virtual float ModifySlideJumpWindowSpeedBonus(float InWellTimedBonus) const { return InWellTimedBonus; }
 
@@ -341,6 +408,39 @@ public:
 	 * never make a genuinely-cooling ability look ready.
 	 */
 	virtual float GetCharacterOwnedCooldownRemaining() const { return 0.f; }
+
+	/**
+	 * THE SECONDARY (V) ABILITY'S COOLDOWN, FOR THE HUD (release FX/AUDIO plan §7.2, closes F2).
+	 *
+	 * Return false — the default, and the answer for eight of the ten characters — and the HUD draws
+	 * NO V row at all. Return true and it draws a second, half-height row under the E row: the
+	 * player's own [V] binding, the character's accent, and @p OutLabel with @p OutRemaining beside
+	 * it, greyed while cooling and flashing once on the rising edge of ready.
+	 *
+	 * *** WHY THIS IS A VIRTUAL AND NOT A CAST IN TraceHUD.cpp. *** The HUD already knows five
+	 * character classes by name for the status chips and every one of those is a place a new
+	 * character has to remember to be added. A V cooldown is not character-specific INFORMATION — it
+	 * is "this character's secondary is on a timer" — so the question belongs on the base class,
+	 * exactly as GetDashHitSweepRadius() moved Chut's radius out of the movement component.
+	 *
+	 * *** THE TWO ANSWERS THAT ARE NOT "false" ARE BOTH DECISIONS. ***
+	 *   - ROXIE returns true. Her FTraceAbilityNetState::AuxEndMatchTime is replicated *expressly*
+	 *     "so a client can grey its own V" (TraceAbilitySetRoxie.h) and until this row existed it
+	 *     was read by nothing — a replicated field with no consumer, which is the F2 finding.
+	 *   - MACE returns FALSE ON PURPOSE. Demo 17 hides her suspend cooldown (TraceAbilitySetMace.h);
+	 *     lighting it up here would be reversing a design decision by accident.
+	 *
+	 * @param OutRemaining  seconds until V is usable. 0 means READY, which is a drawn state, not a
+	 *                      reason to return false — the row is how the player learns the key exists.
+	 * @param OutDuration   the full cooldown, for the meter's denominator. Read it from the LIVE
+	 *                      UTraceSettings knob, never from the DataAsset copy (the F6 dual-source
+	 *                      trap: the DA is a snapshot and drifts the moment somebody retunes).
+	 * @param OutLabel      the ability's own name, upper case ("ROCKET"). Short: it shares a row.
+	 */
+	virtual bool GetSecondaryCooldownDisplay(float& OutRemaining, float& OutDuration, FString& OutLabel) const
+	{
+		return false;
+	}
 
 	/**
 	 * Damage this player is ABOUT to take, before it lands. Return the modified amount.

@@ -307,6 +307,49 @@ protected:
 	/** Aim, reaction delay, aim error, burst discipline and the trigger. Suppressed while carrying. */
 	void UpdateCombat(float DeltaSeconds);
 
+	/**
+	 * RESTRUCTURE tranche D5 — THE KNIFE BAND. Spec v10 §1: "Bots must use it, or it will not be
+	 * playtested." Swap to the knife inside TraceMelee::GetBotEngageRangeUU() of the nearest living
+	 * non-carrier enemy, back to the gun outside GetBotDisengageRangeUU(), and swing whenever one is
+	 * in reach. Under the v28 §10 dual-wield switch the swap half collapses and only the swing
+	 * remains — the blade is already in the off hand, so there is nothing to trade.
+	 *
+	 * THIS IS UTraceWeaponComponent::TickBotKnife(), MOVED. Its own declaration had said for two
+	 * passes that it "belongs in ATraceBotController's state machine ... but that file is another
+	 * ownership slice this pass". The rule is unchanged; what changed is that "is this a bot?" is
+	 * now answered by the type of `this` instead of by rejecting APlayerControllers, and that the
+	 * practice range's targets — possessed by ATracePracticeDummyController, which is not this
+	 * class — can no longer reach it at all. The per-pawn autonomy bit stays on the weapon
+	 * component (it is a property of the BODY and travels with it) and is still consulted.
+	 *
+	 * Called from Tick immediately BEFORE UpdateCombat, so its decision is in the hands before
+	 * UpdateWeaponMinimum below defers to it.
+	 */
+	void UpdateKnifeBand(ATraceCharacter* BotCharacter, float Now);
+
+	/**
+	 * RESTRUCTURE tranche E (E3) — THE SMG MINIMUM. Spec v28 §9 shipped a second firearm and the
+	 * bots never once drew it, which fails the standing bar ("a mechanic no bot ever performs is a
+	 * mechanic that has never been played"). The rule is the SMG's own falloff cliff read as a
+	 * band: inside UTraceSettings::SmgFalloffStartUU the SMG pays its full 33/18/12 and is the
+	 * right tool; past the cliff plus a hysteresis margin the pistol is. Mirrors UpdateKnifeBand's
+	 * engage/disengage shape, and DEFERS to it: whenever the knife rule is holding the blade out,
+	 * this asks for nothing at all.
+	 *
+	 * Called from UpdateCombat once the live target is resolved, so a bot whose crosshair belongs
+	 * to a pass, a pull or an aimed ability never swaps weapons mid-commitment.
+	 */
+	void UpdateWeaponMinimum(ATraceCharacter* BotCharacter, const ATraceCharacter* CurrentTarget, float Now);
+
+	/**
+	 * RESTRUCTURE tranche E (E4) — THE PARRY MINIMUM. Carrier-only, Normal/Hard only (Easy stays
+	 * parry-less — difficulty legibility): when an enemy is DASHING AT this carrier from inside
+	 * detection range, press parry once, through TraceParry::RequestParry — the same entry point a
+	 * human's bind reaches — after the profile's reaction delay. A refused ask (cooldown) is
+	 * dropped, not retried same-tick.
+	 */
+	void UpdateParryMinimum(float Now);
+
 	/** Applies wall repulsion + stuck evasion to DesiredMoveDirection and feeds AddMovementInput. */
 	void ApplySteering(float DeltaSeconds);
 
@@ -887,6 +930,39 @@ private:
 	/** Burst discipline: when the current burst ends, and when the bot may start the next one. */
 	float BurstEndTime = 0.f;
 	float BurstRestUntilTime = 0.f;
+
+	// --- RESTRUCTURE tranche E (E3): the SMG minimum -------------------------------------------
+
+	/**
+	 * Earliest world time the SMG band may be re-evaluated. Four decisions a second, for the knife
+	 * band's own reason: the pullout is 0.2 s, and a bot re-deciding every frame at a range
+	 * boundary would live permanently inside a swap and never hold either weapon.
+	 */
+	float NextWeaponBandTime = 0.f;
+
+	/**
+	 * RESTRUCTURE tranche D5. Local-clock time of the last knife-band swap decision, so a bot cannot
+	 * thrash the 0.2 s pullout. Moved here with UpdateKnifeBand from UTraceWeaponComponent, where it
+	 * was per-PAWN state on a per-pawn component; on the controller it is per-BOT state, which is
+	 * the same thing for every pawn this rule has ever run on (one controller, one pawn) and is
+	 * where a decision cadence belongs.
+	 */
+	float LastBotSwapDecisionTime = -1000.f;
+
+	// --- RESTRUCTURE tranche E (E4): the parry minimum -----------------------------------------
+
+	/**
+	 * World time a latched parry intent fires, or 0 while none is latched. The delay is rolled from
+	 * the profile's reaction time exactly as the trigger's is — a frame-one parry is both robotic
+	 * and unfair. The press is DELIVERED when the delay expires (unless the carry itself ended):
+	 * a dash lasts 0.18 s against a reaction delay of most of a second, so a press conditioned on
+	 * the dasher still being mid-dash could never land at all — the flinch-parry is aimed at the
+	 * volley, not at the dive that provoked it. See UpdateParryMinimum.
+	 */
+	float ParryPressTime = 0.f;
+
+	/** Earliest world time a new parry intent may be latched (hesitation after a refusal/whiff). */
+	float NextParryEvalTime = 0.f;
 
 	/**
 	 * Whether this bot intends to spend its dash on a trace intercept right now.

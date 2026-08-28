@@ -30,17 +30,20 @@
 //
 //             Knobs: ElleCloakDurationSeconds, ElleCloakOpacity, bElleCloakEndsOnCorePickup.
 //
-//   PASSIVE 2 — "+40% on well-timed slide-jump momentum boosts."
-//             ElleSlideJumpGainBonus scales the GAIN, not the whole multiplier: everyone's well-timed
-//             slide-jump is x1.446875, i.e. 1 + 0.446875 of gain, and +40% of the gain is
-//             0.446875 x 1.40 = 0.625, so Elle's is x1.625. Scaling the whole multiplier would give
-//             x2.025 — an ability more than twice the size of the one asked for. That reading is the
-//             project's own (bSlideJumpBonusScalesGainOnly under Movement|Slide) rather than one
-//             invented here.
+//   PASSIVE 2 — "+40% on well-timed slide-jump momentum boosts", CUT TO +30% BY PATCH 28 ITEM 3.
+//             ElleSlideJumpGainBonus scales the GAIN, not the whole multiplier. Everyone's
+//             well-timed slide-jump is x1.375000 today (1 + 0.375000 of gain — see the knob's own
+//             comment in TraceSettings.h for how the three global slide-jump knobs produce it), so
+//             +30% of the gain is 0.375000 x 1.30 = 0.487500 and Elle's is x1.487500. It was
+//             x1.525000 at the old +40%. Scaling the whole multiplier would give x1.7875 — an
+//             ability that beats DashSpeed off a fast slide. That reading is the project's own
+//             (bSlideJumpBonusScalesGainOnly under Movement|Slide) rather than one invented here.
 //
 //             GetSlideJumpWindowSpeedBonusForElle() below DERIVES it from the shipped global number
-//             at the point of use, so a retune of the base carries Elle with it and 1.625 is never
-//             hardcoded anywhere.
+//             at the point of use, so a retune of the base carries Elle with it and 1.4875 is never
+//             hardcoded anywhere. (The old text here quoted x1.446875 / x1.625; that pair went stale
+//             when spec v26 §3a and v28 §5 moved the globals, and only the COMMENTS carried the
+//             copy — the code has always derived. Patch 28 re-derived them.)
 //
 //             *** WIRED IN AS OF THE v18 §2 INTEGRATION PASS. ***
 //             UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus() used to read
@@ -132,6 +135,8 @@
 
 class ATraceCharacter;
 class ATraceElleGate;
+class UMaterialInstanceDynamic;
+class UStaticMeshComponent;
 
 UCLASS()
 class TRACE_API UTraceAbilitySetElle : public UTraceCharacterAbilitySet
@@ -176,6 +181,38 @@ public:
 	 */
 	bool IsCloakVisualApplied() const { return bCloakVisualApplied; }
 
+	/**
+	 * True while one of FX §2.5's two 0.3 s cloak SWEEPS is on the pawn.
+	 *
+	 * The sweep is the transition and the dim is the state, and the on-sweep deliberately sits BETWEEN
+	 * them: §2.5 says "body dim (shipped treatment) applies at sweep end", so for those 0.3 s
+	 * IsCloaked() is true, IsCloakVisualApplied() is still false, and this is what says why. Without
+	 * it that window looks exactly like the missed ApplyTeamColors() race the accessor above warns
+	 * about — which is a thing a harness must be able to tell apart, not a thing it should guess at.
+	 */
+	bool IsCloakSweepPlaying() const { return bCloakSweepRunning; }
+
+	/**
+	 * Where the sweep ring is right now, uu relative to the capsule centre (+ is head, - is feet), or
+	 * 0 when none is running. Read off the LIVE component, so "it travelled head to feet" is a
+	 * measurement rather than a re-derivation of the recipe.
+	 */
+	float GetCloakSweepHeightUU() const;
+
+	/**
+	 * WHERE THE LAST SWEEP STARTED AND HOW FAR IT ACTUALLY GOT, uu, kept AFTER it has finished.
+	 *
+	 * A probe that samples GetCloakSweepHeightUU() cannot prove the direction on a headless machine:
+	 * the sweep is 0.3 s and the ability tick is 20 Hz at best, so a loaded frame rate can put the
+	 * whole travel between two samples — measured, one run caught a single sample and reported
+	 * "z 88 -> 88 uu". These are written BY the sweep as it moves, so the summary exists whether or
+	 * not anybody was looking, and it is still the live component's own relative Z rather than the
+	 * recipe's number.
+	 */
+	float GetLastSweepStartZ() const { return LastSweepStartZ; }
+	float GetLastSweepEndZ() const { return LastSweepEndZ; }
+	bool  WasLastSweepCloakOn() const { return bLastSweepWasCloakOn; }
+
 	/** True while gate A is down and the second-gate window is still open. */
 	bool IsAwaitingSecondGate() const;
 
@@ -195,12 +232,13 @@ public:
 	 * PASSIVE 2. Elle's well-timed slide-jump PLANAR multiplier, DERIVED from the shipped global one.
 	 *
 	 * @param GlobalWellTimedBonus  whatever UTraceCharacterMovementComponent::
-	 *                              GetSlideJumpWindowSpeedBonus() answers for everybody else (1.446875
+	 *                              GetSlideJumpWindowSpeedBonus() answers for everybody else (1.375000
 	 *                              today). Passed in rather than read here so that this function has
 	 *                              exactly one definition of "the base" and it is the shipped one.
 	 *
 	 * Returns 1 + (GlobalWellTimedBonus - 1) x (1 + ElleSlideJumpGainBonus): the GAIN is scaled, the
-	 * multiplier is not. At today's numbers, 1 + 0.446875 x 1.40 = 1.625.
+	 * multiplier is not. At today's numbers, 1 + 0.375000 x 1.30 = 1.487500 (Patch 28 item 3; it was
+	 * 1 + 0.375000 x 1.40 = 1.525000 before).
 	 *
 	 * Static, and null-safe, because the seam that will eventually call it lives in the movement
 	 * component and must be able to ask without knowing whether an ability set exists at all — the
@@ -257,6 +295,28 @@ private:
 	/** EVERY MACHINE. Pushes the cosmetic half of the cloak onto (or off) the pawn's body meshes. */
 	void ApplyCloakVisual(bool bCloakOn);
 
+	// =============================================================================================
+	// FX §2.5 — THE TWO CLOAK SWEEPS. Every machine, off the same edge the dim rides.
+	// =============================================================================================
+	//
+	// ONE ATTACHED PRIMITIVE, and it is ADDITIVE. That matters more here than anywhere else in this
+	// kit: the cloak's entire job is to make Elle's body materials dark, and an EMISSIVE piece hung on
+	// her would be repainted by the very ApplyTeamColors() refresh that restores those materials
+	// (§1.2's Elle-cloak note). An additive piece with its own MID is outside that contract by
+	// construction — the stomp writes body meshes, and this is not one.
+	//
+	// It is also the reason the sweep is a TRANSIENT rather than a loop: it is gone 0.3 s later, so it
+	// cannot survive into the dimmed state and give away the player it just hid.
+
+	/** EVERY MACHINE. Starts a sweep: head->feet when @p bCloakOn, feet->head when decloaking. */
+	void StartCloakSweep(bool bCloakOn);
+
+	/** EVERY MACHINE, every ability tick. Moves and fades the ring; detaches it when it is done. */
+	void TickCloakSweep(float DeltaSeconds);
+
+	/** Takes the ring off the pawn and forgets it. Safe to call when there is none. */
+	void DetachCloakSweep();
+
 	/** SERVER. Destroys both gates and clears the pair bookkeeping. */
 	void DestroyGates();
 
@@ -292,4 +352,33 @@ private:
 
 	/** The pawn the visual was pushed onto, so a respawn cannot leave a corpse's materials dimmed. */
 	TWeakObjectPtr<ATraceCharacter> CloakVisualPawn;
+
+	/**
+	 * EVERY MACHINE. The last value ApplyCloakVisual() was called with for a LIVE pawn.
+	 *
+	 * The sweeps fire on EDGES and ApplyCloakVisual is called every tick the cloak is up (it has to
+	 * be — ApplyTeamColors() repaints her the instant a pass completes, and re-pushing at 20 Hz is how
+	 * that race is won). Without this the on-sweep would restart six times a second.
+	 */
+	bool bCloakVisualWanted = false;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> CloakSweep = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> CloakSweepMID = nullptr;
+
+	/** The pawn the ring is parented to, so a respawn mid-sweep detaches from the right one. */
+	TWeakObjectPtr<ATraceCharacter> CloakSweepPawn;
+
+	float CloakSweepElapsed = 0.f;
+	bool  bCloakSweepRunning = false;
+
+	/** true = the cloak-on sweep (head->feet, I 0.5); false = the decloak sweep (feet->head, I 0.35). */
+	bool  bCloakSweepIsOn = false;
+
+	/** The last sweep's travel, kept after it ends. See GetLastSweepStartZ. */
+	float LastSweepStartZ = 0.f;
+	float LastSweepEndZ = 0.f;
+	bool  bLastSweepWasCloakOn = false;
 };

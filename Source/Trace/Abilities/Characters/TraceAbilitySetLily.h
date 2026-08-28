@@ -89,10 +89,19 @@
 #include "CoreMinimal.h"
 #include "Internationalization/Text.h"
 #include "UObject/ObjectMacros.h"
+#include "UObject/ObjectPtr.h"
+#include "UObject/WeakObjectPtr.h"
 
 #include "Abilities/TraceCharacterAbilitySet.h"
+#include "Gameplay/TraceFxShapes.h"                       // ETraceFxBlend — the ACHIEVED blend is stored
 
 #include "TraceAbilitySetLily.generated.h"
+
+class ATraceCharacter;
+class UAudioComponent;
+class UInstancedStaticMeshComponent;
+class UMaterialInstanceDynamic;
+class UStaticMeshComponent;
 
 /** Lily's bits in FTraceAbilityNetState::Flags. Only one character is live per component, so these cannot collide. */
 namespace TraceLilyFlags
@@ -119,9 +128,28 @@ public:
 	// --- lifecycle -------------------------------------------------------------------------------
 	virtual void OnEquipped() override;
 	virtual void OnUnequipped() override;
+	virtual void OnPawnSpawned() override;
 	virtual void OnPawnDied() override;
 	virtual void OnHalfTime() override;
 	virtual void TickAbilities(float DeltaSeconds) override;
+
+	// =============================================================================================
+	// THE FX ROUTER — FX_AUDIO_PLAN §2.1. Everything anybody but Lily can see or hear is here.
+	// =============================================================================================
+	//
+	// WHY NONE OF IT IS IN ActivateAbility(). Zip is predicted: ActivateAbility runs on the server
+	// AND on the owning client, so building the aura there would build it twice on a listen host and
+	// leave every OTHER machine with nothing — which is the F10 blocker §1.2 exists to close. The
+	// replicated Zipping flag is the one fact all three machine roles share, so the flag's EDGE is
+	// the single producer of every visual and of the loop sound.
+	//
+	// THE OWNER LOSES HALF A ROUND TRIP on his own cast flash by that choice, and it is the right
+	// trade here rather than a compromise: Zip's flash is a GROUND RING at her feet and she is in
+	// first person, so the person who would notice the delay is the one person who cannot see the
+	// effect at all. (Contrast §6's gunshot, which is predicted precisely because the shooter feels
+	// its delay.)
+	virtual void OnClientStateEdge(const FTraceAbilityNetState& Old, const FTraceAbilityNetState& New) override;
+	virtual void SyncClientFx(const FTraceAbilityNetState& Current) override;
 
 	// =============================================================================================
 	// MOVEMENT + PASSIVE — all three read through TraceAbilityTraits, never by casting
@@ -197,6 +225,16 @@ public:
 	 * to be able to get there, and waiting is not a test, it is a delay.
 	 */
 	void DebugSetZipRemaining(float Seconds);
+
+	/** DEV ONLY, for Trace.Lily.ZipFxTest: how many of the four §2.1 pieces exist right now. */
+	int32 DebugFxPrimitiveCount() const;
+
+	/**
+	 * DEV ONLY: one line naming every piece, its ACHIEVED blend, and its radius/height/height-on-body
+	 * MEASURED BACK OFF THE LIVE COMPONENT. A verifier that re-derives the radius it expects from the
+	 * same constants the code used is checking its own arithmetic; this reads the thing on screen.
+	 */
+	FString DebugFxReport() const;
 #endif
 
 private:
@@ -273,4 +311,152 @@ private:
 
 	/** Mid-Zip pickups this flight has seen. Instrumentation the harness reads; not replicated. */
 	int32 ZipCorePickups = 0;
+
+	// =============================================================================================
+	// FX_AUDIO_PLAN §2.1 — THE FLIGHT PRESENTATION. Four primitives, and four is the whole budget.
+	// =============================================================================================
+	//
+	// §1.4's ceiling is FOUR attached primitives per pawn, additive only, intensity <= 0.5, inside
+	// 96 uu of the capsule axis. Lily spends all four, and the peak is momentary:
+	//
+	//     AuraRingA   loop, r 46 uu       |  present for the whole flight
+	//     AuraRingB   loop, r 46 uu       |  (the two halves of the anti-gravity wash)
+	//     ClimbJet    cone, base r 22 uu  |  present for the whole flight, VISIBLE only climbing
+	//     CastRing    r 40 -> 150 uu      |  0.4 s at the cast, then destroyed
+	//
+	// The cast ring is the only one that can push the count to four, it does so for 0.4 s of a 5 s
+	// flight, and it is destroyed rather than hidden so a Lily who is not casting is at three.
+	// 150 uu is outside the 96 uu capsule footprint — deliberately, and it is not a §1.4 breach: the
+	// 96 uu rule governs LOOPING state FX ("attached while the flag is up"), and the flash is a
+	// transient beat, the same class as an ATraceFxBurst ring and half the size of Elle's.
+	//
+	// WHY THEY ARE COMPONENTS ON THE PAWN AND NOT AN ACTOR. Every one of these has to follow her,
+	// and a follower actor is a second transform to drive at 20 Hz against a pawn that moves at 60+.
+	// The pawn owning them also gives the death rule for free: a destroyed pawn destroys its
+	// components, so a corpse cannot inherit an aura even if this file forgets — and it does not
+	// forget, see OnPawnDied.
+
+	/**
+	 * The two drifting flight rings, and the cast flash. Null when she is not flying.
+	 *
+	 * *** RINGS OF BEADS, NOT CYLINDERS, AND THE FIRST CAPTURE IS WHY. ***
+	 * §2.1 asks for a "cylinder SHELL" and /Engine/BasicShapes/Cylinder is SOLID, so the first pass
+	 * drew all three as filled discs — frames-W4-KITS-A/TraceAutoShot_lily_aura_20260825_030115.png
+	 * is a Lily standing on two white dinner plates, one of them cutting through her hips. The engine
+	 * ships no torus and this project cannot author meshes, so a ring is made the way W3-FXBURST
+	 * makes its rings: ONE UInstancedStaticMeshComponent carrying beads around a circle. That is one
+	 * primitive against §1.4's budget no matter how many beads it holds.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInstancedStaticMeshComponent> AuraRingA = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UInstancedStaticMeshComponent> AuraRingB = nullptr;
+
+	/** The climb jet: an inverted cone under the capsule, shown only while she is actually rising.
+	  * A cone is a SOLID shape in §2.1's own terms ("inverted cone under the capsule"), so this one
+	  * stays a plain mesh — the bead treatment above is specifically about the word "shell". */
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> ClimbJet = nullptr;
+
+	/** The cast flash. Built on the rising edge, destroyed 0.4 s later. */
+	UPROPERTY(Transient)
+	TObjectPtr<UInstancedStaticMeshComponent> CastRing = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> AuraMIDA = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> AuraMIDB = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> ClimbJetMID = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> CastRingMID = nullptr;
+
+	/**
+	 * The §1.6.4 loop. ONE PER MACHINE, started by the router off the replicated edge, which is what
+	 * makes the hum "the enemy-audible one the audit asks for" without a per-loop RPC.
+	 *
+	 * The caller owns it (see TraceAudio.h): a component that is never FadeOut'd leaks until its
+	 * actor dies, so every exit from flight goes through DetachZipFx.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UAudioComponent> ZipLoopSound = nullptr;
+
+	/**
+	 * The pawn the four components above are attached to.
+	 *
+	 * WEAK, AND CHECKED EVERY TICK. The ability set lives on the PlayerState and outlives the pawn
+	 * (that is the whole cooldown contract), so "my components" and "my pawn" are two lifetimes and
+	 * a respawn or a character swap can move one without the other. A stale pointer here would mean
+	 * an aura drifting on a pawn this player no longer owns.
+	 */
+	TWeakObjectPtr<ATraceCharacter> FxPawn;
+
+	/** The ACHIEVED blends (never the requested ones — SetGlow takes two different routes). */
+	ETraceFxBlend AuraBlendA = ETraceFxBlend::None;
+	ETraceFxBlend AuraBlendB = ETraceFxBlend::None;
+	ETraceFxBlend ClimbJetBlend = ETraceFxBlend::None;
+	ETraceFxBlend CastRingBlend = ETraceFxBlend::None;
+
+	/** 0..1 around the wash. Advanced by real time, so the two rings never drift apart. */
+	float AuraPhase = 0.f;
+
+	/** Match time the cast flash began, or 0 when none is running. */
+	float CastRingStartTime = 0.f;
+
+	/**
+	 * Match time the END DISSOLVE began, or 0 while she is flying.
+	 *
+	 * §2.1: "aura rings fade I->0 over 0.3 s (never pop-out, bible §6.4)". So the falling edge does
+	 * not destroy anything — it starts a fade, and the tick destroys the pieces when it finishes.
+	 * DEATH IS THE ONE EXCEPTION and takes the immediate path: a corpse must not be wearing a
+	 * fading aura for a third of a second (§1.2 obligation 2).
+	 */
+	float DissolveStartTime = 0.f;
+
+	/** True while the presented state says she is flying. The router's own copy of the flag. */
+	bool bFxFlying = false;
+
+	// --- the FX call surface ----------------------------------------------------------------------
+
+	/** True when the REPLICATED flag says Zip is up. The FX read this, never bZipping. */
+	bool IsZipPresented() const;
+
+	/** Idempotent. Builds the three loop pieces and starts the loop sound. Safe to call twice. */
+	void AttachZipFx();
+
+	/** @param bImmediate  true for death/swap (destroy now), false for the §2.1 0.3 s dissolve. */
+	void DetachZipFx(bool bImmediate);
+
+	/** The 0.4 s ground ring. Built fresh each cast; a second cast cannot stack two. */
+	void SpawnCastFlash();
+
+	/** One frame of the wash, the jet's visibility test, the dissolve and the flash. Every machine. */
+	void TickZipFx(float DeltaSeconds);
+
+	/** Re-parents everything when the pawn changed under us. Returns the pawn to build on, or null. */
+	ATraceCharacter* ResolveFxPawn();
+
+	/** Creates one configured, registered, additive FX primitive on @p Pawn, or null. */
+	UStaticMeshComponent* MakeFxPiece(ATraceCharacter* Pawn, const TCHAR* NameHint, UStaticMesh* Mesh,
+		TObjectPtr<UMaterialInstanceDynamic>& OutMID, ETraceFxBlend& OutBlend);
+
+	/** The same, as an instanced bead ring: one component, BeadsPerRing instances, no transforms yet. */
+	UInstancedStaticMeshComponent* MakeFxRing(ATraceCharacter* Pawn, const TCHAR* NameHint,
+		TObjectPtr<UMaterialInstanceDynamic>& OutMID, ETraceFxBlend& OutBlend);
+
+	/**
+	 * Lays @p Ring's beads on a circle of @p RadiusUU at height @p LocalZ on the pawn.
+	 *
+	 * The bead RADIUS is 13% of the ring's, floored at the bible's 8 uu-across minimum — the same
+	 * proportion W3-FXBURST measured for its rings, and it is not arbitrary: 24 beads around a circle
+	 * are spaced 2*PI*R/24 = 0.262*R apart and a 13% bead is 0.26*R across, so the beads just touch
+	 * at every radius. That is what makes one expansion look like a ring growing rather than like a
+	 * necklace coming apart.
+	 */
+	void LayOutRing(UInstancedStaticMeshComponent* Ring, float RadiusUU, float LocalZ,
+		float FadeAlpha = 1.f) const;
 };

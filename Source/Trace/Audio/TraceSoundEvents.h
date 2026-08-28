@@ -1,10 +1,11 @@
 // Copyright Trace. All Rights Reserved.
 //
 // ===================================================================================================
-// Trace — THE SOUND EVENT TABLE (spec v26 §9, extended by v29 §1)
+// Trace — THE SOUND EVENT TABLE (spec v26 §9, extended by v29 §1 and the release FX/AUDIO plan §5)
 // ===================================================================================================
 //
-// Twenty-eight sounds, and the ONE thing about them that is a design decision rather than a file:
+// Seventy-one sounds — the v26/v29 twenty-eight plus the release palette's forty-three — and the ONE
+// thing about them that is a design decision rather than a file:
 //
 //     "Some should be client side, some should be game-side. ... Core Turnover, dash, and parry
 //      should be game-side. The rest should be client side."
@@ -48,6 +49,21 @@
 //   RoccoRipple  World.   An ability going off in the world, exactly like Dash and Parry, which are
 //                         already game-side. An enemy who cannot hear a Ripple being laid cannot
 //                         react to it, and the Ripple is a thing OTHER players ride.
+//
+// ---------------------------------------------------------------------------------------------------
+// RELEASE FX/AUDIO PLAN §5 — THE SYNTHESIZED PALETTE (forty-three rows, appended after v29 §1f)
+// ---------------------------------------------------------------------------------------------------
+// Core combat, per-kit ability, UI and music events, one row per WAV rendered by
+// Scripts/generate_sounds.py. Two conventions from that plan, encoded in the rows:
+//
+//   * "(burst)" / "replicated-local" events are declared CLIENT even though every machine hears
+//     them: they are played by code that already runs on every machine (a replicated actor's
+//     BeginPlay, an OnRep, an ATraceFxBurst), so a stray Play() on them must be unable to
+//     double-multicast. The Client side is what makes that a no-op instead of a second broadcast.
+//
+//   * MusicTitle / AmbienceMatch / the two stingers carry ETraceSoundFamily::Music, which is the
+//     hook the music volume knob (UTraceAudioSettings::MusicVolumeScale) applies to — the same
+//     row-declared-family shape §1b gave footsteps, for the same "no name matching" reason.
 //
 // ---------------------------------------------------------------------------------------------------
 // An event NOT in this table (a WAV somebody drops into Art/Sounds/ tomorrow) is not an error:
@@ -99,6 +115,11 @@ enum class ETraceSoundFamily : uint8
 	Footstep = 1,
 	/** PistolShoot1..4 and SmgShoot1. */
 	Gunshot = 2,
+	/**
+	 * MusicTitle, AmbienceMatch and the two stingers (release FX/AUDIO plan §5.6). Carries
+	 * MusicVolumeScale, so a music-volume slider has one hook instead of four names to match.
+	 */
+	Music = 3,
 };
 
 /** One row of the table below. */
@@ -113,7 +134,7 @@ struct FTraceSoundEvent
 	/** What fires it, in the owner's words. Printed by Trace.Audio.Report. */
 	const TCHAR* Trigger = TEXT("");
 
-	/** Default, Footstep or Gunshot. See ETraceSoundFamily. */
+	/** Default, Footstep, Gunshot or Music. See ETraceSoundFamily. */
 	ETraceSoundFamily Family = ETraceSoundFamily::Default;
 };
 
@@ -205,6 +226,154 @@ namespace TraceSoundEvents
 	/** Rocco lays a Ripple. Game-side, at the path's start ring. */
 	TRACE_API extern const FName RoccoRipple;
 
+	// ---------------------------------------------------------------------------------------------
+	// RELEASE FX/AUDIO PLAN §5.1 — CORE COMBAT.
+	// ---------------------------------------------------------------------------------------------
+
+	/** A melee swing. World (predicted locally + PlayAtExcluding on authority, the §6 pattern). */
+	TRACE_API extern const FName MeleeSwing;
+
+	/** A melee hit lands, front verdict. Game-side, at the victim. */
+	TRACE_API extern const FName MeleeHit;
+
+	/** A melee hit lands, backstab verdict. Game-side, at the victim. */
+	TRACE_API extern const FName MeleeBackstab;
+
+	/** A reload begins. World (predicted locally + PlayAtExcluding on authority). */
+	TRACE_API extern const FName Reload;
+
+	/** You pulled the trigger on an empty clip. Client, rate-limited at the call site. */
+	TRACE_API extern const FName DryFire;
+
+	/** A weapon switch. Client (replicated-local: OnRep_EquippedWeapon runs on every machine). */
+	TRACE_API extern const FName WeaponSwitch;
+
+	/** YOUR health dropped. Client — the victim's own machine only. */
+	TRACE_API extern const FName DamageTaken;
+
+	/** A death burst at the body. Game-side. */
+	TRACE_API extern const FName DeathBurst;
+
+	/** You respawned. Client, at the possession point. */
+	TRACE_API extern const FName Respawn;
+
+	/** Your shot was eaten by a shield. Client — the shooter's machine, with the §7.4 marker. */
+	TRACE_API extern const FName ShieldBlock;
+
+	// ---------------------------------------------------------------------------------------------
+	// RELEASE FX/AUDIO PLAN §5.1 — PER-KIT ABILITIES. "(burst)" and "replicated-local" rows are
+	// Client BY DESIGN: their call sites already run on every machine. See the header comment.
+	// ---------------------------------------------------------------------------------------------
+
+	/** Chut's Bash connects. Client (burst — ATraceFxBurst plays it replicated-local). */
+	TRACE_API extern const FName ChutBash;
+
+	/** Mace's spike leaves his hand. Game-side, at the cast. */
+	TRACE_API extern const FName MaceSpikeThrow;
+
+	/** Mace's spike embeds in a wall. Client (burst). */
+	TRACE_API extern const FName MaceSpikeEmbed;
+
+	/** Mace reeling himself in. Client LOOP — the router starts/stops it per machine. */
+	TRACE_API extern const FName MacePullLoop;
+
+	/** Oyster lobs the Pickler. Game-side, at the release. */
+	TRACE_API extern const FName OysterPickler;
+
+	/** A jar breaks into a poison cloud. Client (replicated-local: cloud BeginPlay). */
+	TRACE_API extern const FName OysterJarBreak;
+
+	/** X's sting spark. Client (burst). */
+	TRACE_API extern const FName XSting;
+
+	/** X loads the sting clip. Game-side. */
+	TRACE_API extern const FName XStingLoad;
+
+	/** Roxie's rocket detonates. Client (burst, Big attenuation). */
+	TRACE_API extern const FName RoxieRocketBurst;
+
+	/** Roxie's rocket leaves the tube. Game-side, at the spawn. */
+	TRACE_API extern const FName RoxieRocketLaunch;
+
+	/** Roxie's rocket in flight. Client LOOP — rocket BeginPlay on every machine. */
+	TRACE_API extern const FName RoxieRocketLoop;
+
+	/** Roxie goes MODDED. Game-side. */
+	TRACE_API extern const FName RoxieModded;
+
+	/** Elle teleports. Client (burst, fired at both mouths). */
+	TRACE_API extern const FName ElleTeleport;
+
+	/** An Elle gate snaps open. Client (replicated-local: gate BeginPlay). */
+	TRACE_API extern const FName ElleSnap;
+
+	/** Elle cloaks. Game-side — the enemy is meant to hear it. */
+	TRACE_API extern const FName ElleCloak;
+
+	/** Elle decloaks. Game-side. */
+	TRACE_API extern const FName ElleDecloak;
+
+	/** A Slimewall goes up. Game-side, at the cast. */
+	TRACE_API extern const FName SlimeballWall;
+
+	/** Somebody sticks to slime. Game-side, quiet. */
+	TRACE_API extern const FName SlimeballStick;
+
+	/** Mortimer's Quake blast. Game-side, Big attenuation. */
+	TRACE_API extern const FName MortimerQuake;
+
+	/** Mortimer's mantle impulse. Client. */
+	TRACE_API extern const FName MortimerMantle;
+
+	/** Lily's Zip fires. Game-side, at the activation. */
+	TRACE_API extern const FName LilyZip;
+
+	/** Lily in flight. Client LOOP — the router starts/stops it per machine. */
+	TRACE_API extern const FName LilyZipLoop;
+
+	/** Riding Rocco's Ripple. Client LOOP — the router starts/stops it per machine. */
+	TRACE_API extern const FName RoccoRideLoop;
+
+	/** Rocco's second jump. Game-side. */
+	TRACE_API extern const FName RoccoJump;
+
+	// ---------------------------------------------------------------------------------------------
+	// RELEASE FX/AUDIO PLAN §5.1 — UI (2D, stereo files) AND THE KICKOFF COUNTDOWN. All Client.
+	// ---------------------------------------------------------------------------------------------
+
+	/** A menu row gains focus. Beside ButtonPress, which stays the activation sound. */
+	TRACE_API extern const FName UIHover;
+
+	/** Back / cancel. */
+	TRACE_API extern const FName UIBack;
+
+	/** A refusal — the §7.1 toast, an unbindable key. */
+	TRACE_API extern const FName UIDeny;
+
+	/** The kickoff countdown's last three seconds, one tick each. */
+	TRACE_API extern const FName CountdownTick;
+
+	/** The kickoff release. */
+	TRACE_API extern const FName CountdownGo;
+
+	// ---------------------------------------------------------------------------------------------
+	// RELEASE FX/AUDIO PLAN §5.1 — MUSIC (family Music, the MusicVolumeScale hook). All Client 2D.
+	// MusicTitle and AmbienceMatch LOOP and are played by UTraceMusicSubsystem (TraceMusicPlayer.h),
+	// never by TraceAudio::Play.
+	// ---------------------------------------------------------------------------------------------
+
+	/** Match end, your team won. */
+	TRACE_API extern const FName StingerVictory;
+
+	/** Match end, your team lost. */
+	TRACE_API extern const FName StingerDefeat;
+
+	/** The title-screen music LOOP (64 s). Streams — never force-inlined at import. */
+	TRACE_API extern const FName MusicTitle;
+
+	/** The in-match ambience LOOP (48 s). Streams — never force-inlined at import. */
+	TRACE_API extern const FName AmbienceMatch;
+
 	/** The whole table, in the spec's order. */
 	TRACE_API TConstArrayView<FTraceSoundEvent> All();
 
@@ -225,6 +394,6 @@ namespace TraceSoundEvents
 	/** Which family @p Event belongs to. Default for anything not in the table. */
 	TRACE_API ETraceSoundFamily FamilyOf(FName Event);
 
-	/** "footstep" / "gunshot" / "-", for logs and for Trace.Audio.Report. */
+	/** "footstep" / "gunshot" / "music" / "-", for logs and for Trace.Audio.Report. */
 	TRACE_API const TCHAR* FamilyName(ETraceSoundFamily Family);
 }

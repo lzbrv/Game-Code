@@ -54,9 +54,13 @@
 #include "UObject/ObjectMacros.h"
 #include "UObject/ObjectPtr.h"
 
+#include "Gameplay/TraceFxShapes.h"       // ETraceFxBlend — stored per piece, so it must be complete
+
 #include "TraceRoxieRocket.generated.h"
 
 class ATraceCharacter;
+class UAudioComponent;
+class UMaterialInstanceDynamic;
 class UStaticMeshComponent;
 class UTraceAbilitySetRoxie;
 
@@ -86,12 +90,40 @@ namespace TraceRoxieRocket
 	TRACE_API float GetHitRadiusUU();
 
 	/**
-	 * DEMO 17 item 3. Multiplier on the DRAWN body, whose base size is the hit radius above.
+	 * DEMO 17 item 3 / PATCH 28 item 1. Multiplier on the DRAWN body, whose base size is the hit
+	 * radius above. SHIPPED AT 1.6.
 	 *
-	 * 1.0 means "draw it exactly as big as the thing that kills you", which is the honest default and a
-	 * seven-fold widening of what shipped before Demo 17 (a 13 uu dart around a 45 uu lethal radius).
+	 * 1.0 meant "draw it exactly as big as the touch radius", which was Demo 17's honest default and a
+	 * 3.46x widening of what shipped before it (a 13 uu dart around a 45 uu touch radius). Patch 28
+	 * asked for larger again, so the drawn body is now 72 uu of radius against a 45 uu touch radius.
+	 *
+	 * THAT IS NOT A DRAWN/LETHAL DRIFT, and the reason is worth carrying: this rocket kills a pawn
+	 * whose CAPSULE (34 uu of radius) comes within the touch radius of the line, so the volume it
+	 * kills a player in is 45 + 34 = 79 uu about the line. 72 < 79, so the drawn skin still under-
+	 * claims. The ceiling is therefore GetHitRadiusUU() + the live capsule radius, it MOVES with both,
+	 * and Trace.Roxie.RocketFlightTest asserts it rather than trusting this comment.
 	 */
 	TRACE_API float GetVisualScale();
+
+	/**
+	 * *** THE ONE NUMBER THE WHOLE ROCKET IS DRAWN FROM. CHANGE ITS INPUTS, NOT ITS CALLERS. ***
+	 *
+	 * GetHitRadiusUU() x GetVisualScale(), in uu: the radius of the drawn body, and therefore the
+	 * unit every other piece of the rocket's presentation is expressed in — the launch flash, the
+	 * three trail segments, and the body's own length. Nothing in TraceRoxieRocket.cpp writes a bare
+	 * size literal; every one is a named fraction of this.
+	 *
+	 * WHY IT IS A FUNCTION AND NOT FOUR SCATTERED MULTIPLICATIONS. The owner has a queued request to
+	 * make the rocket model LARGER. With this in place that is one edit — RoxieRocketVisualScale in
+	 * the settings, or this line — and the flash, the trail and the body all move together and stay
+	 * in proportion. With the sizes written out at each site it would be four edits, three of which
+	 * somebody would find later by noticing the trail was thinner than the rocket.
+	 *
+	 * The two CEILINGS that do not scale with it are the bible's, not the rocket's, and they are
+	 * applied where they are read: the muzzle flash's 40 uu (§6.4) and the 8 uu emissive width floor
+	 * (§3.4). A bigger rocket gets a bigger trail; it does not get a bigger muzzle ceiling.
+	 */
+	TRACE_API float GetVisualRadiusUU();
 
 	/** Widest lateral excursion from the aim line, in uu. ZERO IS THE RED ARM — it flies straight. */
 	TRACE_API float GetWobbleAmplitudeUU();
@@ -198,6 +230,19 @@ public:
 	/** Seconds this rocket has been flying, on the match clock. Negative before the clock is up. */
 	float GetSecondsInFlight() const;
 
+	/**
+	 * ONE LINE OF MEASUREMENTS TAKEN OFF THE LIVE COMPONENTS, for Trace.Roxie.RocketFxTest.
+	 *
+	 * *** READ BACK, NEVER RE-DERIVED. *** The body radius, the flash's current radius and the trail's
+	 * three segment radii all come out of the components' world scales through UTraceFxShapes'
+	 * inverse helpers — the same conversion that wrote them, run backwards. A verifier that recomputed
+	 * them from TraceRoxieRocketFile would only be checking its own arithmetic.
+	 */
+	FString DebugDescribeFx() const;
+
+	/** True while the launch flash exists — i.e. inside its 0.28 s, before it destroys itself. */
+	bool IsLaunchFlashUp() const { return LaunchFlash != nullptr; }
+
 	/** The launch parameters, for the harness and for anything that wants to re-derive the path. */
 	FVector GetLaunchOrigin() const { return LaunchOrigin; }
 	FVector GetLaunchDirection() const { return LaunchDirection; }
@@ -226,12 +271,93 @@ protected:
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Roxie")
 	TObjectPtr<UStaticMeshComponent> Body = nullptr;
 
+	/**
+	 * FX_AUDIO_PLAN §2.3's LAUNCH FLASH: a muzzle-style cone at the spawn point, ember, growing
+	 * 0.55x -> 3.2x over 0.28 s and then DESTROYED.
+	 *
+	 * *** IT IS DESTROYED RATHER THAN HIDDEN, AND THAT IS THE PRIMITIVE BUDGET TALKING. *** The
+	 * bible allows four primitives per effect. A rocket in steady flight is Body plus three trail
+	 * segments — exactly four — and the flash is a FIFTH for the first 0.28 s of a three-second
+	 * flight. Hiding it would leave the rocket permanently at five; DestroyComponent() puts it back
+	 * to four for 92% of every flight and costs one null check per tick.
+	 *
+	 * It does NOT move with the rocket: a muzzle flash belongs to the tube, so this stays at the
+	 * launch origin (SetUsingAbsoluteLocation) while the rocket leaves it behind, which is what the
+	 * tracer's own cone does and is the difference between a launch and a permanent nose glow.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> LaunchFlash = nullptr;
+
+	/**
+	 * §2.3's TRAIL: three stacked cylinders behind the rocket, tapering 9 uu -> 4 uu over 220 uu,
+	 * additive ember at intensity 0.5 with a 30 Hz flicker between 0.4 and 0.6.
+	 *
+	 * THREE SEGMENTS AND NOT ONE because one mesh cannot taper — the same choice, and the same
+	 * reasoning, as UTraceFxShapes::TaperAlongLocalZ documents for the tracer's bolt. The plan asks
+	 * for 2 uu at the tail and this draws 4 uu: sub-8 uu emissive dissolves into dashes under TSR
+	 * (bible §3.4), which is the floor ATraceFxBurst::MinEmissiveRadiusUU enforces for the same
+	 * reason on every spark in the game.
+	 *
+	 * THE FLICKER IS NOT A LETHAL-TELEGRAPH PULSE. §3.3's prohibition is on a brightness oscillation
+	 * that a player could mistake for STATE — an armed tell, a charge, a warning. This is a 30 Hz
+	 * transient on a decorative exhaust whose lethal element (the body, whose size IS the hit radius)
+	 * holds a constant brightness throughout. The plan names it and permits it in the same sentence.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> TrailSegments[3] = { nullptr, nullptr, nullptr };
+
 private:
 	/** SERVER ONLY. Sweeps the segment covered since the last tick and resolves the first thing hit. */
 	void TickFlightAuthority(const FVector& FromPosition, const FVector& ToPosition);
 
 	/** Places the mesh and points it along the instantaneous direction of travel. Every machine. */
 	void UpdateVisual(const FVector& AtPosition);
+
+	/**
+	 * Builds the launch flash and the three trail segments. Called from BeginPlay on EVERY machine —
+	 * the rocket is replicated, so its BeginPlay is the broadcast and no RPC is involved.
+	 *
+	 * Every piece goes through UTraceFxShapes::MakeGlowMID and stores the achieved blend, so a build
+	 * where the materials did not resolve gets a HIDDEN piece rather than a default-grey 100 uu
+	 * cylinder flying across the arena (bible §6.1's degradation ladder, and the "no grey primitive"
+	 * rule ATraceFxBurst is measured by).
+	 */
+	void BuildFlightFx();
+
+	/**
+	 * Drives the flash's 0.28 s growth and the trail's placement and flicker. Every machine, per
+	 * frame, from Tick. Zero spawns: both are the components BuildFlightFx already made.
+	 *
+	 * @param AtPosition       where the rocket is this frame.
+	 * @param SecondsInFlight  on the MATCH clock, so every machine's flash is at the same size at the
+	 *                         same instant — the same argument the path itself is built on.
+	 */
+	void UpdateFlightFx(const FVector& AtPosition, float SecondsInFlight);
+
+	/**
+	 * SERVER ONLY. Spawns §2.3's RocketBurst at @p Location and destroys this actor.
+	 *
+	 * *** ONE FUNCTION FOR THE THREE ENDINGS §2.3 NAMES, AND TWO THAT DELIBERATELY DO NOT USE IT. ***
+	 *
+	 * §2.3: the burst plays on "any end: body, wall, expiry". Those three all come through here, so
+	 * three call sites cannot each forget it differently — which is what an expiry did before this
+	 * existed: the rocket simply stopped being drawn.
+	 *
+	 * The two that call Destroy() directly instead are not endings, they are teardowns, and bursting
+	 * on them would advertise a detonation that never happened:
+	 *   * the OWNER-LOST fizzle. Roxie swapped character or left mid-flight; the rocket cannot deal
+	 *     damage any more, so it must not look as though it did.
+	 *   * the local-time BACKSTOP. It only fires in a world whose match clock never became usable
+	 *     (no GameState, a fixture) — i.e. a rocket that never really flew.
+	 *
+	 * The burst is spawned BEFORE the Destroy: ATraceFxBurst is its own replicated actor and does not
+	 * care that its parent is about to go, but spawning it after would be spawning it from a dead
+	 * object.
+	 *
+	 * @param Normal  the surface normal for a wall hit, or the rocket's own travel direction reversed
+	 *                when there is no surface. RocketBurst lays its ring flat on this.
+	 */
+	void DetonateAndDestroy(const FVector& Location, const FVector& Normal);
 
 	/**
 	 * DEMO 17 item 3. Sizes the drawn body from the rocket's own HIT RADIUS, times RoxieRocketVisualScale.
@@ -257,6 +383,61 @@ private:
 	/** Server-side: where the last hit sweep ended, so the next one is continuous with it. */
 	FVector LastSweptPosition = FVector::ZeroVector;
 	bool bHasSwept = false;
+
+	/**
+	 * The dynamic materials for the flash and the three trail segments, and the blends they ACHIEVED.
+	 *
+	 * The blend is stored rather than assumed because UTraceFxShapes::MakeGlowMID can legitimately
+	 * degrade (Additive -> Emissive -> Fallback -> None) and SetGlow must be given what was achieved,
+	 * never what was asked for: the two materials take intensity by completely different routes and
+	 * writing a parameter a material does not have is a silent no-op.
+	 */
+	/**
+	 * The rocket BODY's material, and the blend it achieved.
+	 *
+	 * *** THIS USED TO BE A MID MADE FROM THE CONE'S OWN DEFAULT MATERIAL, AND IT WAS NOT EMBER. ***
+	 * The Demo 17 code called Body->CreateDynamicMaterialInstance(0, Body->GetMaterial(0)), i.e. it
+	 * wrapped whatever /Engine/BasicShapes/Cone ships with — BasicShapeMaterial, which is LIT and has
+	 * a "Color" input and no emissive at all. So "EmissiveColor", "Glow", "EmissiveStrength" and
+	 * "EmissivePower" were four silent no-ops and the rocket flew as a matte cone, which on this
+	 * arena's black floor is a DARK cone. It is visible in the first capture of this tranche
+	 * (FxHud_vrow_COOLING) as a near-black blob with a bright trail behind it.
+	 *
+	 * Resolved through UTraceFxShapes now, like every other piece: M_TraceNeon when it is there,
+	 * degrading down the documented ladder, and the achieved blend stored so SetGlow writes the
+	 * parameter the material actually has.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> BodyMID = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> LaunchFlashMID = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> TrailMIDs[3] = { nullptr, nullptr, nullptr };
+
+	ETraceFxBlend BodyBlend = ETraceFxBlend::None;
+	ETraceFxBlend LaunchFlashBlend = ETraceFxBlend::None;
+	ETraceFxBlend TrailBlend = ETraceFxBlend::None;
+
+	/**
+	 * §2.3's RoxieRocketLoop, started in BeginPlay on every machine and owned by this actor.
+	 *
+	 * *** IT IS NOT FADED OUT, AND THAT IS A DECISION RATHER THAN AN OMISSION. *** StartLoopOn hands
+	 * back a component with bAutoDestroy off, which everywhere else in this plan means "the caller
+	 * must FadeOut on the off-edge or it leaks". Here the off-edge IS the actor's destruction: the
+	 * component is attached to this rocket's root and goes with it, on every machine, so there is
+	 * nothing left to leak and nothing left alive to fade.
+	 *
+	 * The abrupt stop is also the right sound. A rocket does not trail away — it ends, and the frame
+	 * it ends on is the frame ATraceFxBurst plays RoxieRocketBurst at the same point in space. A
+	 * quarter-second fade under the detonation would be the engine still running after the explosion.
+	 *
+	 * The pointer is kept so that the loop is one named, findable thing rather than an anonymous
+	 * component, and so a future change that DOES need a fade has somewhere to put it.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UAudioComponent> FlightLoop = nullptr;
 
 	/**
 	 * Local world time the actor spawned, for the BACKSTOP only.

@@ -62,6 +62,9 @@
 #include "TraceAbilitySetMace.generated.h"
 
 class ATraceMaceSpike;
+class UAudioComponent;
+class UMaterialInstanceDynamic;
+class UStaticMeshComponent;
 struct FHitResult;
 
 /** Mace's bits in FTraceAbilityNetState::Flags. Only one character is live per component, so these cannot collide. */
@@ -88,9 +91,19 @@ public:
 	// --- lifecycle ---------------------------------------------------------------------------------
 	virtual void OnEquipped() override;
 	virtual void OnUnequipped() override;
+	virtual void OnPawnSpawned() override;
 	virtual void OnPawnDied() override;
 	virtual void OnHalfTime() override;
 	virtual void TickAbilities(float DeltaSeconds) override;
+
+	// --- the client FX router (FX_AUDIO_PLAN §1.2 / §2.4) ------------------------------------------
+	//
+	// Mace's two WHILE-ACTIVE tells — the suspend halo and the pull slip-stream — are third-person
+	// presentation, so they live here and NOT in OnSecondaryPressed/RequestSpikePull. Both of those
+	// run on one machine; these two hooks run on every machine off the same replicated flags the HUD
+	// already reads, which is the only way an opponent watching Mace hover sees anything at all.
+	virtual void OnClientStateEdge(const FTraceAbilityNetState& Old, const FTraceAbilityNetState& New) override;
+	virtual void SyncClientFx(const FTraceAbilityNetState& Current) override;
 
 	// --- PASSIVE: the magnet ------------------------------------------------------------------------
 
@@ -201,6 +214,51 @@ public:
 	/** The wall test, on one hit: "is this a surface a spike may embed in, and if not, why not?" */
 	bool IsSpikeableSurface(const FHitResult& Hit, FString& OutWhy) const;
 
+#if !UE_BUILD_SHIPPING
+	/**
+	 * DEV ONLY. One line describing the kit FX THIS MACHINE has attached to the pawn right now:
+	 * which pieces exist, their measured radii read back off the live components, and whether the
+	 * MacePullLoop audio component is actually playing.
+	 *
+	 * Read back rather than re-derived, for the reason every probe in this module gives: a fixture
+	 * that recomputes the number the recipe asked for is checking its own arithmetic, not the thing
+	 * on screen. It is also the only way the router half is falsifiable at all — an attached loop has
+	 * no log line of its own once it is up.
+	 */
+	FString DebugDescribeKitFx() const;
+
+	/** DEV ONLY. How many of this kit's loop primitives are attached on this machine (0..3). */
+	int32 DebugAttachedFxCount() const;
+
+	/**
+	 * DEV ONLY. The suspend halo's local Z, uu, or 0 when it is not attached.
+	 *
+	 * The bob is the halo's whole content — §2.4 makes it MOTION precisely so that suspend is not a
+	 * brightness pulse — and motion cannot be photographed. Sampling this over a second and reporting
+	 * the SPREAD is the measurement; two readings could both land on the same phase of a 1.2 Hz sine
+	 * and report a moving thing as still.
+	 */
+	double GetSuspendHaloLocalZ() const;
+
+	/**
+	 * DEV ONLY. The HUE a live dressing piece is actually wearing, read back off its own MID.
+	 *
+	 * *** THE ONE THING THE §2.4 PARADE COULD NOT SEE, AND THAT IS WHY A SECOND STALE VIOLET SURVIVED
+	 * A WHOLE WAVE HERE. *** Trace.Mace.FxTest photographed the halo and both slip-streams, measured
+	 * their radii, their bob and their audio, and asserted nine things about them — and never once
+	 * said what COLOUR they came out. A file-local `MaceViolet` literal that had stopped matching the
+	 * roster therefore passed every check the harness had. A frame is not enough either: a violet
+	 * 13 degrees off the right violet looks like violet.
+	 *
+	 * @param Piece  "halo", "streamA" or "streamB".
+	 * @param OutHue the accent as the MID holds it. These pieces are ADDITIVE, so intensity rides in
+	 *               the colour (UTraceFxShapes::SetGlow) — the intensity is divided back out here so
+	 *               the caller can compare against TraceCharacterRoster's row directly, which is the
+	 *               comparison that matters. Returns false when the piece is not attached.
+	 */
+	bool DebugPieceHue(const TCHAR* Piece, FLinearColor& OutHue) const;
+#endif
+
 private:
 	// --- suspend ------------------------------------------------------------------------------------
 	bool  bSuspendHeld = false;
@@ -260,4 +318,68 @@ private:
 
 	/** True on the machines that actually simulate this pawn's movement: the server and its owner. */
 	bool ShouldDriveMovement() const;
+
+	// =============================================================================================
+	// FX §2.4 — THE ATTACHED KIT FX. Every machine, driven from the replicated flags.
+	// =============================================================================================
+	//
+	// Two effects, at most three primitive components, and they are mutually exclusive in practice:
+	// StartPull() stops a suspend, so the halo is down before the slip-stream goes up. Even both at
+	// once is 3, inside §1.4's budget of 4 — and every piece goes through
+	// TraceFxLoopBudget::AttachLoopPrimitive, which is the thing that enforces that rather than this
+	// comment.
+	//
+	// THE PAWN IS RESOLVED THROUGH THE PLAYER STATE, never cached across a respawn: an attached
+	// component whose pawn has been replaced is a component nobody will ever clean up (§1.2 rule 1).
+
+	/** Reads @p Which and attaches or detaches each effect to match it. Idempotent — the sync path. */
+	void ApplyKitFx(const FTraceAbilityNetState& Which);
+
+	/** The suspend halo: one additive disc under the feet, bobbing. Attach/detach, idempotent. */
+	void SetSuspendFxAttached(bool bAttached);
+
+	/** The pull slip-stream: two additive cylinders trailing the pawn, plus MacePullLoop. Idempotent. */
+	void SetPullFxAttached(bool bAttached);
+
+	/** Everything down, in one call: death, unequip, half time, characters disabled, pawn gone. */
+	void DetachAllKitFx();
+
+	/** Per-tick motion — the halo's bob and the slip-stream's aim. Runs on EVERY machine. */
+	void TickKitFx(float DeltaSeconds);
+
+	/** The pawn the FX belong on: the player state's CURRENT pawn, or null. Never a cached one. */
+	ATraceCharacter* ResolveFxPawn() const;
+
+	/** Which pawn the attached pieces are actually on, so a respawn under us is detectable. */
+	TWeakObjectPtr<ATraceCharacter> FxPawn;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> SuspendHalo = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> SuspendHaloMID = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> PullStreamA = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> PullStreamAMID = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UStaticMeshComponent> PullStreamB = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> PullStreamBMID = nullptr;
+
+	/**
+	 * MacePullLoop, started by the router on every machine and OWNED here.
+	 *
+	 * TraceAudio::StartLoopOn hands back a component with bAutoDestroy off, so a loop that is never
+	 * faded leaks until the pawn dies — the caller keeping the pointer IS the contract (§1.6.4).
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UAudioComponent> PullLoopAudio = nullptr;
+
+	/** Seconds the halo has been up, for the bob. Absolute time would jump when the halo re-attaches. */
+	float SuspendFxSeconds = 0.f;
 };

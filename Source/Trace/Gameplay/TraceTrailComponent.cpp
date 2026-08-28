@@ -95,7 +95,7 @@ namespace
 		GTraceLifetimeOverride,
 		TEXT("OVERRIDE for seconds a trace point survives (spec v3 1: 2.00). "
 		     "Negative (default) = use UTraceSettings::TrailLifetime."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	FAutoConsoleVariableRef CVarTurnoverGrace(
 		TEXT("Trace.Trail.TurnoverGrace"),
@@ -103,7 +103,7 @@ namespace
 		TEXT("OVERRIDE for seconds after the Core changes team before the new holder's trace BEGINS "
 		     "FORMING (spec v10 3: 0.75). Negative (default) = use UTraceSettings::CoreTurnoverGraceSeconds. "
 		     "Delays formation only; already-laid segments stay lethal."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	// =============================================================================================
 	// SPEC v10 §2 — WHOLE-MODEL TRIP DETECTION. THE KNOBS.
@@ -210,14 +210,14 @@ namespace
 		GModelMarginMin,
 		TEXT("Spec v10 2. FLOOR, in uu, on how far past the capsule radius the trip test reaches, used "
 		     "when the mesh bounds are unavailable or tighter than the capsule. Default 10."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	FAutoConsoleVariableRef CVarModelMarginMax(
 		TEXT("Trace.Trail.ModelMarginMax"),
 		GModelMarginMax,
 		TEXT("Spec v10 2. CEILING, in uu, on how far past the capsule radius the trip test reaches. This "
-		     "is the WORST-CASE OVER-REACH of whole-model detection and it is a hard clamp. Default 26."),
-		ECVF_Default);
+		     "is the WORST-CASE OVER-REACH of whole-model detection and it is a hard clamp. Default 20."),
+		ECVF_Cheat);
 
 	FAutoConsoleVariableRef CVarModelMarginVertical(
 		TEXT("Trace.Trail.ModelMarginVertical"),
@@ -225,7 +225,7 @@ namespace
 		TEXT("Spec v10 2. Margin in uu over the capsule HALF-HEIGHT. Default 0: a Mannequin is inside its "
 		     "capsule vertically by construction, and the mesh bounds' 141uu vertical half-extent is not a "
 		     "silhouette. Raising this scores on air below a dasher's feet."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	FAutoConsoleVariableRef CVarModelMarginFixed(
 		TEXT("Trace.Trail.ModelMargin"),
@@ -233,7 +233,7 @@ namespace
 		TEXT("Spec v10 2. Negative (default) = derive the margin from the skeletal mesh's own bounds, "
 		     "clamped to [ModelMarginMin, ModelMarginMax]. >= 0 = use this fixed margin in uu for every "
 		     "pawn instead of measuring."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * THE KNOCK-ON, COUNTED WHERE IT HAPPENS.
@@ -297,7 +297,7 @@ namespace
 		     "passed, so a stationary carrier keeps their whole trace. Negative (default) = use "
 		     "UTraceSettings::TrailMaxLengthUU, or derive it from TrailLifetime x WalkSpeed x 0.75 "
 		     "if that is left at or below zero."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	// INTEGRATED: -1 now, because 22.5 and 63 live in UTraceSettings + DefaultGame.ini where the
 	// settings panel can reach them. These stay as CONSOLE overrides only. See GetTraceTrailRadius().
@@ -309,7 +309,7 @@ namespace
 		TEXT("HALF the trace's width in uu, LETHAL AND DRAWN TOGETHER (spec v7 3: 22.5, down from the "
 		     "player model's 45). Negative = fall back to UTraceSettings::TrailRadius. Changing this "
 		     "moves the kill volume and the ribbon by the same amount, on purpose."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	float GTrailHeightOverride = -1.f;
 
@@ -319,7 +319,7 @@ namespace
 		TEXT("The trace's height in uu, LETHAL AND DRAWN TOGETHER, centred on the carrier's mid-model "
 		     "(spec v7 3: 63, the middle third of the old 190). Negative = fall back to "
 		     "UTraceSettings::TrailHeight."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	// =============================================================================================
 	// SPEC v12 §6 — the trace clips into walls
@@ -379,7 +379,7 @@ namespace
 		     "volume cuts across a corner. 0 = the pre-v12 straight chord, i.e. the reported bug, "
 		     "reproduced on demand for A/B. Moves the drawn and the lethal trace together — there is "
 		     "only one polyline."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * Clearance the trace asks for, OVER its own half width, when deciding whether a segment is inside
@@ -401,7 +401,7 @@ namespace
 		     "uu of clearance the trace asks for OVER its own half width when testing a segment against "
 		     "the level (spec v12 6). Covers the ribbon's joint overlap and box corners. Clamped to the "
 		     "carrier's capsule radius - past that no legal route would ever be clear."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * Cap on the horizontal nudge applied to a point that is already inside something. Small on
@@ -418,7 +418,7 @@ namespace
 		     "geometry (spec v12 6). 0 disables the nudge and leaves only the subdivision. Never "
 		     "applied unless it reduces the penetration and the moved point is still in line of sight "
 		     "of where it started, so a thin wall cannot be tunnelled through."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * Ceiling on points inserted for ONE append. A 60uu chord subdivided by the carrier's real path
@@ -434,7 +434,7 @@ namespace
 		TEXT("Console override for TrailWallFitMaxInsert; negative (default) follows the setting. "
 		     "Most extra points the corner fitter may insert for one appended trail point (spec v12 6). "
 		     "Exhausting it falls back to the straight chord and logs."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * v13 §7: does the fitter ask the RENDERED level, or only the physics scene?
@@ -471,7 +471,7 @@ namespace
 		     "the fitter only routes chords that are BLOCKED, which reproduces the reported clipping "
 		     "on demand because a carrier running parallel to a wall never blocks a chord (spec v13 7). "
 		     "Moves the drawn and the lethal trace together - there is only one polyline."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	int32 GWallFitVisual = 1;
 
@@ -483,7 +483,7 @@ namespace
 		     "structure is NoCollision meshes over smaller invisible boxes, with emissive trim "
 		     "protruding 10-13uu past even those, so a collision-only fitter is blind to exactly the "
 		     "surfaces the ribbon is reported clipping into (spec v13 7)."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * The resolvers. CVar when somebody typed one, the shipped setting otherwise. Every read of
@@ -619,7 +619,7 @@ namespace
 		     "order after the fast array's RemoveAtSwap scrambles them (spec v7 7). 0 reproduces the "
 		     "bug: the far end of the trace snaps to the carrier. Clients only - authority never "
 		     "reorders."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/** Upper bound on pooled SMEAR elements (one per lethal segment). 2.0s at 60uu spacing is ~27. */
 	constexpr int32 MaxPooledSmearElements = 96;
@@ -655,7 +655,7 @@ namespace
 		     "renderer, kept ONLY as the before arm of Trace.Trail.PerfAB. 2 = draw nothing, which "
 		     "bounds the whole cost of the trace's visuals. Cosmetic - the kill volume is TrailPoints "
 		     "on every arm."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * uu of arc length per ribbon element (spec v6 §2).
@@ -677,29 +677,131 @@ namespace
 		GRibbonStep,
 		TEXT("uu of arc length per element of the curved ribbon (spec v6 2). Lower = smoother and more "
 		     "draw calls. Purely cosmetic - the kill volume is unchanged."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
-	 * Upper bound on pooled RIBBON elements. Past it the STEP COARSENS instead of the ribbon being
-	 * truncated, which is the whole difference between "a long trace looks chunkier" and "a long
-	 * trace has a lethal stretch nobody can see". The invariant does not get a budget.
+	 * FLOOR on pooled RIBBON elements — and it is a FLOOR since W9 §1. It used to be a ceiling, and
+	 * being a ceiling is the worst defect this overhaul found.
 	 *
-	 * 96 at the 60uu default is 5760uu of trace, which is longer than MaxTrailPoints x
-	 * TrailPointSpacing at any dash speed this game has.
+	 * *** THE SENTENCE THAT USED TO STAND HERE WAS WRONG IN BOTH OF ITS HALVES. *** It read: "Past it
+	 * the STEP COARSENS instead of the ribbon being truncated … 96 at the 60uu default is 5760uu of
+	 * trace, which is longer than MaxTrailPoints x TrailPointSpacing at any dash speed this game has."
+	 *
+	 *   THE ARITHMETIC WAS INVERTED. MaxTrailPoints x TrailPointSpacing is 256 x 60 = 15,360uu.
+	 *   5,760uu is 2.67x SMALLER than the thing it claimed to exceed. What actually kept the pool
+	 *   clear in ordinary play is TrailMaxLengthUU — 1,200uu, ~21 points — which the sentence never
+	 *   mentioned, so the guarantee was resting on a knob nobody had connected to it.
+	 *
+	 *   AND THE STEP CANNOT COARSEN PAST ONE ELEMENT PER LETHAL SEGMENT. ComputeRibbonSamples
+	 *   subdivides PER SEGMENT on purpose (v13 §7: an element may never step over a lethal vertex, or
+	 *   a straight box draws a hairpin as a chord through mid-air), so its sample count has a hard
+	 *   floor of PointCount-1 however far the step grows. Hand it 133 points against a fixed 96 and
+	 *   its coarsen loop cannot converge, it returns 132 elements, and PlaceRibbon drops the 36 it
+	 *   cannot place — from the HEAD, because element 0 is the OLDEST sample, so what disappears is
+	 *   the newest trace, the stretch immediately behind the carrier that a chaser is judging their
+	 *   dash against.
+	 *
+	 * W8-ADVERSARIAL measured the consequence on the shipped map, the shipped binary and the shipped
+	 * trace length with ONE documented designer knob moved (TrailPointSpacing 60 -> 10): 133 lethal
+	 * points, 96 visible pieces, and 229.6uu of trace that KILLS AND IS NOT DRAWN. Invisible kill
+	 * volume, in the mechanic the game is named after.
+	 *
+	 * SO THE INVARIANT NO LONGER RESTS ON AN INEQUALITY BETWEEN TWO TUNABLES. RibbonElementBudget()
+	 * hands the ribbon one element per lethal segment WHATEVER the polyline is; 96 is only the floor
+	 * it starts from, i.e. the point up to which the step may still subdivide a long segment for
+	 * smoothness. Elements are pooled lazily (EnsureRibbonElement), so nothing about the cost of an
+	 * ordinary trace changed: at the shipped ~21 points the ribbon was 27 boxes before this and is 27
+	 * boxes after it. Only a trace that would previously have been silently cut now costs more.
 	 */
-	constexpr int32 MaxRibbonElements = 96;
+	constexpr int32 RibbonElementFloor = 96;
 
 	/**
-	 * Elements in the owner-only predicted-head ribbon. The stub is at most GPredictedHeadMaxLength.
+	 * HARD CAP ON REPLICATED TRAIL POINTS, applied at the point of use in ServerUpdateTrail, and the
+	 * reason the ribbon's guarantee is unconditional rather than "unconditional up to a sane ini".
 	 *
-	 * v8 §2 took it from 12 to 24 with the cap's rise from 400 to 1200: BuildRibbonSamples COARSENS
-	 * rather than truncating, so 12 would still have covered the whole stub — as 100uu elements
-	 * chording a dash's curve. 24 keeps the stub's element length at the ribbon's own 60uu step, which
-	 * matters because the join between the stub and the replicated ribbon has to be invisible and a
-	 * chunkier element on one side of it is exactly how it becomes visible. Twelve extra boxes, on one
-	 * pawn per machine — the carrier's own.
+	 * 1024 is UTraceSettings::MaxTrailPoints's own declared ClampMax. ClampMin/ClampMax are editor
+	 * affordances and an ini can write straight past them, so the cap the drawing depends on is
+	 * enforced here as well as declared there. At every value the editor will let a designer type
+	 * this changes nothing at all.
 	 */
-	constexpr int32 MaxPredictedRibbonElements = 24;
+	constexpr int32 TrailPointHardCap = 1024;
+
+	/**
+	 * ABSOLUTE ceiling on pooled ribbon elements: the only thing standing between a mis-set ini and
+	 * one UStaticMeshComponent per uu of trace.
+	 *
+	 * It is TrailPointHardCap, and the pairing is the proof: the budget is PointCount-1, points are
+	 * capped at TrailPointHardCap, so the budget is at most TrailPointHardCap-1 and THIS CEILING IS
+	 * NEVER THE BINDING CONSTRAINT. It exists so that "the pool is unbounded" is not a sentence this
+	 * file contains, not because any configuration reaches it.
+	 */
+	constexpr int32 RibbonElementCeiling = TrailPointHardCap;
+
+	/**
+	 * FLOOR on elements in the owner-only predicted-head ribbon. The stub is at most
+	 * GPredictedHeadMaxLength.
+	 *
+	 * v8 §2 took it from 12 to 24 with the cap's rise from 400 to 1200, on the reading that
+	 * "BuildRibbonSamples COARSENS rather than truncating, so 12 would still have covered the whole
+	 * stub". W9 §1 found that reading false everywhere (see RibbonElementFloor) and it was false here
+	 * too, and more easily: the stub's control points are LocalPathHistory samples 25uu apart, so a
+	 * 1,200uu stub is ~48 segments against a pool of 24 — and the half that was dropped was the half
+	 * touching the carrier's feet, which is precisely the detached-trace report v8 §2 exists to close.
+	 * Like the replicated ribbon this is now a floor under RibbonElementBudget(), so 24 still decides
+	 * the stub's element LENGTH on the short stubs that are the common case (the join with the
+	 * replicated ribbon has to be invisible, and a chunkier element on one side of it is how it
+	 * becomes visible) and no longer decides how much of the stub exists.
+	 */
+	constexpr int32 PredictedRibbonElementFloor = 24;
+
+	/**
+	 * RED ARM for W9 §1: put the pre-W9 FIXED pool back, so the invisible kill volume it caused can be
+	 * reproduced on the very binary that fixes it.
+	 *
+	 * 0 (default) is the derived budget — one element per lethal segment, truncation impossible. Any
+	 * positive value is used as the pool size verbatim, so `Trace.Trail.RibbonPoolCap 96` is exactly
+	 * the geometry that shipped before this pass. MEASURED under it, same binary, one cvar apart:
+	 * Trace.Trail.LethalDrawn's four long fixtures report 58.99 / 372.96 / 217.26 / 4073.34 uu of
+	 * invisible kill volume and 0.00 on all four without it; a 60s Trace.Trail.WallClip drive on
+	 * Arena_Baked at TrailPointSpacing 10 reports 274.9uu against 0.0uu.
+	 *
+	 * *** IT IS COMPILED OUT OF SHIPPING ENTIRELY *** (see RibbonElementBudget), not merely marked
+	 * ECVF_Cheat. A knob whose only purpose is to restore an invisible kill volume must not be
+	 * reachable in a release build by any route, including one nobody has thought of yet — and this
+	 * overhaul has already found one legacy knob that was reachable in Shipping by a route nobody had
+	 * thought of.
+	 */
+	int32 GRibbonPoolCap = 0;
+
+	FAutoConsoleVariableRef CVarRibbonPoolCap(
+		TEXT("Trace.Trail.RibbonPoolCap"),
+		GRibbonPoolCap,
+		TEXT("W9 1 RED ARM. 0 (default): the ribbon is given one element per lethal segment and can "
+		     "never be truncated. Above 0: forces a fixed pool of that many elements, reproducing the "
+		     "pre-W9 truncation (96 is the value that shipped before). No effect in Shipping."),
+		ECVF_Cheat);
+
+	/**
+	 * HOW MANY RIBBON ELEMENTS THIS POLYLINE IS ALLOWED. This function is the whole of the W9 §1 fix.
+	 *
+	 * The rule is one element per lethal segment, floored so that a SHORT trace still gets to
+	 * subdivide its segments for smoothness, and ceilinged so the pool is bounded by something. The
+	 * floor is what the old constant really was for; the ceiling is what it was mistakenly doing.
+	 *
+	 * Callers must pass the SAME budget to ComputeRibbonSamples and to PlaceRibbon. Passing a smaller
+	 * one to PlaceRibbon is the defect: the sampler emits a complete ribbon and the placer draws a
+	 * prefix of it.
+	 */
+	int32 RibbonElementBudget(int32 PointCount, int32 Floor = RibbonElementFloor)
+	{
+#if !UE_BUILD_SHIPPING
+		if (GRibbonPoolCap > 0)
+		{
+			return GRibbonPoolCap;
+		}
+#endif
+		return FMath::Clamp(PointCount - 1, Floor, RibbonElementCeiling);
+	}
 
 	/**
 	 * ALTERNATING CROSS-SECTION INSET, and it is not a cosmetic nicety — it is the fix for the
@@ -749,7 +851,7 @@ namespace
 		     "kill volume exactly. Below 1 makes it look more like a thin Tron light wall AND makes it "
 		     "narrower than the thing that kills - see the comment for how much lethal ground that "
 		     "hides. Never changes the kill volume itself, only what the player is shown of it."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * Spec v6 §1: game-thread milliseconds every UTraceTrailComponent in the world spent on VISUALS
@@ -786,7 +888,7 @@ namespace
 		GMaxPoseGhosts,
 		TEXT("Cap on posed-Mannequin after-images per trace (spec v4 2). 0 disables them and leaves "
 		     "the trace as the continuous smear alone. Cosmetic - never changes the lethal volume."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * uu along the path between consecutive posed after-images.
@@ -803,7 +905,7 @@ namespace
 		GGhostSpacing,
 		TEXT("uu between posed-Mannequin after-images along the trace (spec v4 2). Lower = denser and "
 		     "prettier and more skinned draws. Cosmetic only."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * Forced LOD for the ghosts. 0 = automatic (screen-size driven), 1 = LOD0, 2 = LOD1, ...
@@ -820,7 +922,7 @@ namespace
 		GGhostForcedLOD,
 		TEXT("Forced LOD on posed-Mannequin after-images. 0 = automatic (default), 1 = LOD0, 2 = LOD1. "
 		     "Perf lever only."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * THE OWNER-ONLY NEAR CULL — and the single most important number in the v5 §2 bug report.
@@ -872,7 +974,7 @@ namespace
 		     "only - never changes the lethal volume, and never affects any other player's view. "
 		     "Replaces Trace.Trail.OwnerNearHideDistance, which hid by distance along the path and was "
 		     "the cause of the reported gap between the carrier and the end of their own trace."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/** Re-show hysteresis on the cull above, so a piece at the boundary cannot flicker. */
 	constexpr double OwnerHideCameraHysteresis = 40.0;
@@ -905,7 +1007,7 @@ namespace
 		     "from that carrier alone (spec v5 2). The continuous smear is unaffected and still reaches "
 		     "their feet. 0 draws the ghosts right up to the body. Presentation only - never changes the "
 		     "lethal volume, and never affects another player's view."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * SPEC v5 §2: how far the OWNER-ONLY predicted head stub may reach ahead of the newest drawn point.
@@ -947,7 +1049,7 @@ namespace
 		     "disables the prediction and restores the gap between a carrier and the end of their own "
 		     "trace. Beyond this length the stub is dropped entirely rather than clamped - see the "
 		     "comment. Set it to 400 to reproduce the pre-v8 client behaviour."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * SPEC v8 §2 — THE FIX ITSELF, and the A/B lever for it. 1 = on, the default.
@@ -973,7 +1075,7 @@ namespace
 		TEXT("1 (default) builds the owner-only predicted head through the carrier's own recorded path, "
 		     "so it follows the corners they turned and can honestly span a client's round trip (spec "
 		     "v8 2). 0 restores the v5 straight chord, which is the pre-v8 client behaviour."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * Samples kept in LocalPathHistory. At 120fps this is 1.0s of travel, which is an order of
@@ -1198,7 +1300,7 @@ namespace
 		TEXT("Brightness of the continuous smear relative to the posed-Mannequin after-images (spec v4 2). "
 		     "1 = the old solid-fence look; the smear must stay clearly visible or the gaps between "
 		     "ghosts read as passable. Cosmetic only - the kill volume is unchanged either way."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/** Brightness of a posed after-image on M_TraceNeon. Above the smear, below the clipping point. */
 	float GGhostGlow = 2.60f;
@@ -1208,7 +1310,7 @@ namespace
 		GGhostGlow,
 		TEXT("Emissive strength of the posed-Mannequin after-images (spec v4 2). Above ~3.5 the team "
 		     "colour clips to white and you can no longer tell whose trace it is."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/** Oldest after-images dim to this fraction of full glow. Never to zero: they are still lethal. */
 	constexpr float GhostOldestGlowScale = 0.55f;
@@ -1293,11 +1395,16 @@ namespace
 	 * and last lethal point, exactly where the ribbon stops being drawn. 0 = the pre-v14 radial cap,
 	 * which is the reported bug and the RED arm of Trace.Trail.LethalDrawn.
 	 *
-	 * INTERIOR joints keep their round cap and must: PlaceRibbon runs each element one TrailRadius
-	 * PAST every interior joint along its own axis, and that overlap box provably contains the disc
-	 * of radius TrailRadius about the joint (any point of the disc is within TrailRadius laterally
-	 * AND within TrailRadius along the next element's axis, which is exactly its back overlap). So
-	 * the interior is already covered in the safe direction and only the two OUTER caps were bare.
+	 * EVERY cap, not only the two outer ones — and the sentence that used to stand here said the
+	 * opposite, which has been false since v14 §1 and is corrected in W6 §F-2. It read: "INTERIOR
+	 * joints keep their round cap and must: PlaceRibbon runs each element one TrailRadius PAST every
+	 * interior joint, and that overlap box provably contains the disc about the joint." The overlap
+	 * was cut to a ONE uu seam in the same pass that introduced this cvar, precisely because a
+	 * Radius-deep overlap over-drew 28uu on a climb — so the box no longer contains the disc, and the
+	 * disc had to go with it. MeasurePointGapToTrace has passed bFlatCaps for BOTH ends of EVERY
+	 * segment since; the lethal volume is the union of flat-ended slabs, which is exactly the shape a
+	 * chain of boxes draws. The cost is the notch on the outside of a sharp corner, which is drawn as
+	 * a notch (see BuildRibbonElements' SeamOverlap).
 	 */
 	int32 GTrailFlatEndCaps = 1;
 
@@ -1309,7 +1416,7 @@ namespace
 		     "distance-to-segment, whose cap is a disc at every joint AND at both outer ends, so it "
 		     "kills up to one TrailRadius past the head and the tail with nothing drawn there. 0 is "
 		     "the reported bug and the red arm of Trace.Trail.LethalDrawn."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * THE RIBBON'S CROSS-SECTION STANDS UPRIGHT (spec v14 §1). 1 = yaw only; 0 = the pre-v14
@@ -1338,7 +1445,7 @@ namespace
 		TEXT("Spec v14 1. 1 (default): ribbon elements are yaw-only, so the drawn cross-section is the "
 		     "vertical column the trip test actually uses. 0: the pre-v14 yaw+pitch element, which "
 		     "leans out of the lethal column on every slope - the red arm of Trace.Trail.LethalDrawn."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * Largest vertical rise, in uu, a single upright ribbon element may span (spec v14 §1).
@@ -1366,7 +1473,60 @@ namespace
 		TEXT("Spec v14 1. Largest vertical rise one upright ribbon element may span, in uu. Caps the "
 		     "vertical over-draw at half this. Lower = smoother slopes and more elements. Purely "
 		     "cosmetic - the kill volume is unchanged."),
-		ECVF_Default);
+		ECVF_Cheat);
+
+	/**
+	 * HOW FAR THE DRAWN CENTRELINE MAY LEAVE THE LETHAL POLYLINE, in uu. 0 (default, W6 §F-2) means
+	 * IT MAY NOT: the ribbon's centreline IS the polyline the server kills along.
+	 *
+	 * *** THE PROOF THAT ZERO IS THE ONLY HONEST VALUE, because this was a real 4.5uu defect and the
+	 * argument that produced it looked sound. ***
+	 *
+	 * An element is a box of half width R about the chord between two samples. Suppose a sample sits
+	 * d uu to one side of the lethal segment it belongs to. Then, measured across the segment, the
+	 * element covers [-R + d, R + d] where the volume that kills covers [-R, R]. There are exactly
+	 * two ways to spend that d and BOTH of them break the invariant:
+	 *
+	 *   KEEP THE WIDTH AT R.  The far edge reaches only R - d from the line, so a strip d uu wide
+	 *                         kills with nothing drawn on it. That is an INVISIBLE KILL VOLUME, and
+	 *                         v14 §1 measured it at 2.5uu on the HAIRPIN fixture.
+	 *   WIDEN BY d.           Now the near edge stands R + d from the line, so a strip d uu wide is
+	 *                         drawn where nothing kills. That is what v14 §1 chose, and W5-NETQA
+	 *                         photographed the result on a live client: drawn half width 27.11uu
+	 *                         against a 22.50uu lethal half width, six times across two runs, on the
+	 *                         game's title mechanic. A player who dashes the visible edge of a corner
+	 *                         and lives has been lied to.
+	 *
+	 * There is no third way, because the two edges move together. So the deviation is removed at its
+	 * SOURCE rather than compensated for downstream: d = 0, the element is exactly R wide about a
+	 * chord that lies on the polyline, and the drawn solid becomes the lethal solid in plan exactly
+	 * (see ComputeRibbonSamples).
+	 *
+	 * WHAT THE LOOK COSTS, MEASURED RATHER THAN ASSERTED. The clamp this replaces was worth
+	 * 0.0741 x TrailPointSpacing = 4.4uu, AND ONLY AT A RIGHT ANGLE — that constant is the solution
+	 * of dX/dt = 0 for a 90-degree corner with equal legs. At the ~20-degree turns a carrier actually
+	 * lays at 60uu spacing the rounding was under 1uu, i.e. a tenth of the ribbon's own width and
+	 * well under a pixel at any range this trace is read from. The trail points themselves are laid
+	 * every 60uu along the carrier's real curved route, so the polyline through them is already the
+	 * curve; the spline was rounding its corners, not making them.
+	 *
+	 * ABOVE ZERO THIS IS THE RED ARM FOR F-2. `Trace.Trail.RibbonSplineSlack 4.45` restores the
+	 * pre-W6 geometry exactly — the Catmull-Rom clamped to that many uu and the element widened by
+	 * the same amount — so Trace.Trail.LethalDrawn and Trace.Trail.Geometry reproduce the reported
+	 * 27.11uu on the shipping build, one cvar away from the fix.
+	 */
+	float GRibbonSplineSlack = 0.f;
+
+	FAutoConsoleVariableRef CVarRibbonSplineSlack(
+		TEXT("Trace.Trail.RibbonSplineSlack"),
+		GRibbonSplineSlack,
+		TEXT("W6 F-2. How far, in uu, the drawn ribbon's centreline may leave the lethal polyline. "
+		     "0 (default) = it may not: the centreline IS the polyline and the drawn half width is "
+		     "exactly the lethal one. Above 0 restores the pre-W6 clamped Catmull-Rom AND the "
+		     "matching widening of every curved element, which draws that many uu of ribbon per side "
+		     "that cannot kill - the reported defect, and the RED ARM for Trace.Trail.LethalDrawn "
+		     "(try 4.45, which is what 0.0741 x the 60uu point spacing came to)."),
+		ECVF_Cheat);
 
 	/**
 	 * THE ONE DEFINITION OF THE TRACE'S OWN SOLID, in the two axes the trip test has always kept
@@ -1953,17 +2113,19 @@ UTraceTrailComponent::UTraceTrailComponent()
 	//
 	// The trace is the ONLY counterplay to a shielded holder (§3), so a player who cannot see it
 	// cannot play the game.
-	static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon"));
+	// MAP_PLAN §9: the COMMITTED parent, which is in the repository. This used to load the gitignored
+	// /Game/Generated/Materials copy, which meant a fresh clone drew the one element the game cannot be
+	// played without on a lit grey material.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TEXT("/Game/Trace/Materials/Parents/M_TraceNeon.M_TraceNeon"));
 	if (NeonFinder.Succeeded())
 	{
 		TrailMaterial = NeonFinder.Object;
 		bTrailMaterialIsNeon = true;
 	}
 
-	// Fallback exactly as the arena builder does it: /Game/Generated is gitignored and produced by
-	// Scripts/generate_content.py, so a developer who has not run that script must still get a
-	// visible - if flat and lit - trace rather than an invisible one. No .uasset is ever a hard
-	// requirement.
+	// Fallback exactly as the arena builder does it: a repository that is missing its committed
+	// parents must still get a visible - if flat and lit - trace rather than an invisible one. No
+	// .uasset is ever a hard requirement.
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> BasicFinder(TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
 	if (TrailMaterial == nullptr && BasicFinder.Succeeded())
 	{
@@ -2180,26 +2342,39 @@ double UTraceTrailComponent::GetTraceDrawnHalfReach()
 {
 	const double Radius = FMath::Max(1.0, static_cast<double>(GetTraceTrailRadius()));
 
-	// 1. THE JOINT OVERLAP, straight out of PlaceRibbon. An interior element is extended by
-	//    JointOverlap == TrailRadius along its own axis at each joint, and it is a BOX of half width
-	//    TrailRadius, so the corner of that box stands Radius * sqrt(2) from the joint it overlaps.
-	//    Read this together with PlaceRibbon: if that overlap ever changes, this must change with it.
-	const double JointCorner = Radius * UE_DOUBLE_SQRT_2;
-
-	// 2. THE SPLINE OVERSHOOT. BuildRibbonSamples resamples the polyline through a Catmull-Rom with
-	//    the standard 0.5 tension. A Catmull-Rom does not stay inside its control polygon: for the
-	//    tightest turn a running carrier can lay — a right angle with one TrailPointSpacing per leg —
-	//    the curve passes 0.0741 * spacing OUTSIDE the corner vertex. (Solve dX/dt = 0 on the segment
-	//    B->C with control points A,B,C,C: the extremum is at t = 1/3 and sits 4.44uu past B for
-	//    60uu legs.) Sharper than a right angle is not reachable: the carrier is a 34uu capsule and
-	//    cannot reverse inside 60uu of travel.
+	// 1. THE SQUARE THAT COVERS A DISC. Both terms of this sum were re-derived in W6 §F-2 and the
+	//    first one's OLD derivation is worth recording, because it went stale without changing the
+	//    number: it used to read "an interior element is extended by JointOverlap == TrailRadius at
+	//    each joint, so the corner of that box stands Radius * sqrt(2) from the joint". That overlap
+	//    has been ONE uu since v14 §1 cut it to a seam, so that reading has been false for a while.
 	//
-	//    NOT scaled by the resample step. The curve deviates from the polyline by this much however
-	//    finely it is sampled; a finer step draws the same overshoot with more elements.
-	const double Spacing = FMath::Max(1.0, static_cast<double>(UTraceSettings::Get().TrailPointSpacing));
-	const double SplineOvershoot = 0.0741 * Spacing;
+	//    The same number is still the right answer for a different, larger case that is not going
+	//    away: a segment that is a POINT IN PLAN — a fall — has a lethal volume that is a disc of
+	//    TrailRadius, and the smallest box that covers a disc is the square that circumscribes it,
+	//    whose corner stands exactly Radius * sqrt(2) out. BuildRibbonElements says so at that
+	//    branch. Nothing the ribbon draws reaches further than this.
+	const double DiscCorner = Radius * UE_DOUBLE_SQRT_2;
 
-	return JointCorner + SplineOvershoot;
+	// 2. THE SPLINE RESERVE, which the shipping ribbon no longer spends. Until W6 §F-2 the centreline
+	//    was a Catmull-Rom clamped to 0.0741 * TrailPointSpacing off the polyline (the solution of
+	//    dX/dt = 0 for a right-angle corner with one spacing per leg: the extremum is at t = 1/3 and
+	//    sits 4.44uu past the vertex for 60uu legs), and every curved element was widened by its own
+	//    residual to match. Both are gone at the default GRibbonSplineSlack of 0: the centreline is
+	//    the polyline and the element is exactly the lethal half width.
+	//
+	//    THE TERM IS KEPT ANYWAY, DELIBERATELY, and it is the difference between a bound and a
+	//    guess. This figure is what the wall fitter clears room by (TraceSettings.cpp), i.e. it is
+	//    an input to WHERE TRAIL POINTS GO — and trail points are the lethal volume. Shrinking it to
+	//    the ribbon's new true reach would move the kill volume in every corridor in the arena as a
+	//    side effect of a drawing fix, which is not a trade a defect pass gets to make; and holding
+	//    it means flipping the Trace.Trail.RibbonSplineSlack red arm cannot make the fitter
+	//    under-clear underneath a running measurement. So the reach over-states the drawing by about
+	//    12uu on purpose. Trace.Trail.LethalDrawn does NOT use it as its budget any more (it derives
+	//    the tight, construction-forced figure instead), which is what stopped this slack hiding F-2.
+	const double Spacing = FMath::Max(1.0, static_cast<double>(UTraceSettings::Get().TrailPointSpacing));
+	const double SplineReserve = 0.0741 * Spacing;
+
+	return DiscCorner + SplineReserve;
 }
 
 float UTraceTrailComponent::GetTurnoverGraceSeconds()
@@ -4209,7 +4384,14 @@ void UTraceTrailComponent::ServerUpdateTrail()
 	//    ceiling that the length cap already keeps two orders of magnitude clear of (1200uu at 60uu
 	//    spacing is ~21 points against MaxTrailPoints 256). It survives as the backstop for a
 	//    pathological spacing setting.
-	const int32 MaxPoints = FMath::Max(2, Settings.MaxTrailPoints);
+	//
+	//    W9 §1 CLAMPED IT TO TrailPointHardCap AS WELL AS TO 2, AND THE UPPER HALF IS LOAD-BEARING.
+	//    The ribbon's element budget is PointCount-1 (RibbonElementBudget), so this number is also the
+	//    number of UStaticMeshComponents a carrier's trace can cost. MaxTrailPoints declares
+	//    ClampMax=1024, but ClampMin/ClampMax are editor affordances — an ini writes straight past
+	//    them — so the drawing's bound is enforced here rather than assumed from a UPROPERTY. At every
+	//    value the editor will let a designer type this clamp does nothing.
+	const int32 MaxPoints = FMath::Clamp(Settings.MaxTrailPoints, 2, TrailPointHardCap);
 	if (TrailPoints.Items.Num() > MaxPoints)
 	{
 		TrailPoints.Items.RemoveAt(0, TrailPoints.Items.Num() - MaxPoints);
@@ -5071,14 +5253,18 @@ void UTraceTrailComponent::UpdateVisuals()
 	// UpdateTeamColor() early-outs unless the colour actually changed.
 	UpdateTeamColor();
 
+#if !UE_BUILD_SHIPPING
 	// A renderer switch has to force a rebuild, because none of the terms below would notice it: the
 	// point set, the invulnerability and the emission state are all identical either side of the
 	// lever. Without this, a stationary carrier would keep the old renderer's geometry on screen and
-	// Trace.Trail.PerfAB would measure the previous arm.
+	// Trace.Trail.PerfAB would measure the previous arm. Dev-only along with the lever itself:
+	// Shipping compiles the ribbon arm unconditionally (see IsRibbonRenderer), so there is no switch
+	// to notice there.
 	if (ActiveRendererArm != GTrailRenderer)
 	{
 		bVisualsDirty = true;
 	}
+#endif
 
 	// Change detection. bVisualsDirty is the primary signal (set by the replication callbacks and
 	// by every server-side mutation); the head/tail/count comparison is a cheap backstop so the
@@ -5122,7 +5308,15 @@ void UTraceTrailComponent::UpdateVisuals()
 
 bool UTraceTrailComponent::IsRibbonRenderer()
 {
+#if UE_BUILD_SHIPPING
+	// Shipping compiles the ribbon arm unconditionally. The legacy smear+ghost renderer (arm 0) and
+	// the draw-nothing measurement arm (arm 2) are Development evidence apparatus — the before arm
+	// and the bound of Trace.Trail.PerfAB — not player options; arm 2 in a real match would be a
+	// wallhack-class toggle in reverse (a lethal trace nobody is shown).
+	return true;
+#else
 	return GTrailRenderer != 0;
+#endif
 }
 
 int32 UTraceTrailComponent::PartsPerElement()
@@ -5132,11 +5326,13 @@ int32 UTraceTrailComponent::PartsPerElement()
 
 void UTraceTrailComponent::RebuildVisuals()
 {
+#if !UE_BUILD_SHIPPING
 	// THE RENDERER ARM IS PART OF THE POOL'S IDENTITY. Arm 0 puts two cylinders in every element and
 	// keeps a herd of posed Mannequins beside them; arm 1 puts one box in every element and no
 	// skinned meshes at all. Reinterpreting one pool as the other would pair a ribbon element with a
 	// head band's material and leave orphaned mannequins standing in the arena, so a switch tears the
-	// pool down. It happens only when a console command moves the lever.
+	// pool down. It happens only when a console command moves the lever — which only exists in
+	// Development; Shipping is the ribbon arm from first frame to last and never tears down.
 	if (ActiveRendererArm != GTrailRenderer)
 	{
 		DestroyVisualPool();
@@ -5151,6 +5347,7 @@ void UTraceTrailComponent::RebuildVisuals()
 		HidePredictedHead();
 		return;
 	}
+#endif
 
 	// THE OTHER HALF OF THE INVARIANT. What is drawn is exactly the lethal set — not the whole
 	// point array — so a player can never be shown a segment that would not have killed them.
@@ -5213,11 +5410,15 @@ void UTraceTrailComponent::RebuildVisuals()
 		ClearGhostRecords();
 		RebuildRibbon(LethalPointCount, InvulnerableScale);
 	}
+#if !UE_BUILD_SHIPPING
+	// The legacy spec v4 §2 renderer — Trace.Trail.PerfAB's live before-arm. Development only:
+	// IsRibbonRenderer() is a compile-time `true` in Shipping and these functions are not built there.
 	else
 	{
 		RebuildSmear(LethalPointCount, InvulnerableScale);
 		RebuildPoseGhosts(LethalPointCount, InvulnerableScale);
 	}
+#endif
 }
 
 FTraceSmearStyle UTraceTrailComponent::MakeSmearStyle() const
@@ -5372,6 +5573,9 @@ void UTraceTrailComponent::PlaceSmearSegment(
 // or last lethal point into trace that would not kill.
 // -------------------------------------------------------------------------------------------------
 
+#if !UE_BUILD_SHIPPING
+// Release pass: the legacy spec v4 §2 renderer (this smear + the posed ghosts below) is kept as
+// Trace.Trail.PerfAB's live before-arm but compiled out of Shipping — see IsRibbonRenderer().
 void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, float InvulnerableScale)
 {
 	if (CylinderMesh == nullptr || LethalPointCount <= 0)
@@ -5392,6 +5596,15 @@ void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, float Invulnerab
 
 	// If there are more segments than the pool can draw, drop the OLDEST. Truncating from the wrong
 	// end would hide the freshest stretch — the part an approaching enemy is judging.
+	//
+	// W9 §1, STATED RATHER THAN LEFT TO BE DISCOVERED: THIS ARM STILL TRUNCATES, AND IT IS THE ONLY
+	// ONE THAT DOES. Dropping the oldest is the least bad end to drop, but a dropped segment is still
+	// lethal ground with nothing drawn on it, so past 97 points this renderer has an invisible kill
+	// volume at the TAIL. It is deliberately not fixed: this whole function is `#if !UE_BUILD_SHIPPING`
+	// and reachable only through `Trace.Trail.Renderer 0`, i.e. it is the A/B baseline the ribbon is
+	// measured against, and changing its geometry would move the comparison every other tranche has
+	// already taken. The SHIPPED renderer (RebuildRibbon) cannot truncate at all — see
+	// RibbonElementBudget. Trace.Trail.Geometry grades whichever arm is live.
 	const int32 FirstSegment = FMath::Max(0, SegmentCount - MaxPooledSmearElements);
 
 	int32 Placed = 0;
@@ -5431,6 +5644,7 @@ void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, float Invulnerab
 
 	HideSmearFrom(Placed);
 }
+#endif   // !UE_BUILD_SHIPPING — legacy smear renderer
 
 // =================================================================================================
 // SPEC v6 §2 — THE CURVED RIBBON. THIS IS THE TRACE.
@@ -5448,12 +5662,16 @@ void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, float Invulnerab
 //                                Nothing about the drawn silhouette is a flattering fraction of the
 //                                volume that kills. The posed Mannequins are gone entirely.
 //
-//   IT CURVES TO FOLLOW.         The centreline is a Catmull-Rom curve THROUGH the trail points,
-//                                resampled at a near-uniform arc length, and every element is
-//                                oriented by the curve in full 3D — yaw AND pitch. The legacy smear
-//                                flattened every segment (Along.Z = 0), so a trace laid over a jump
-//                                was a staircase of level slabs; this one banks through the arc,
-//                                which is the "curving through the air" half of the request.
+//   IT CURVES TO FOLLOW.         The centreline is the carrier's own route, resampled at a
+//                                near-uniform arc length and subdivided so no element ever spans two
+//                                lethal segments or more than GRibbonVerticalStep of rise. The trail
+//                                points ARE that route, laid every TrailPointSpacing along it, so the
+//                                polyline through them is the curve; W6 §F-2 removed the Catmull-Rom
+//                                that used to round its corners, because rounding it moved the
+//                                drawing off the volume that kills (see GRibbonSplineSlack for the
+//                                proof, and for the red arm that puts the curve back). The legacy
+//                                smear flattened every segment (Along.Z = 0), so a trace laid over a
+//                                jump was a staircase of level slabs; this one follows the climb.
 //
 //   ONE FLUID SHAPE.             Three separate things were producing "noticeable sections", and all
 //                                three are addressed rather than one of them:
@@ -5481,19 +5699,32 @@ void UTraceTrailComponent::RebuildSmear(int32 LethalPointCount, float Invulnerab
 // trip test, lethality, lifetime, turnover grace and the parry all read TrailPoints and have no
 // notion that the renderer changed. WHERE THE SILHOUETTE AND THE TRIP VOLUME DIFFER, stated plainly:
 //
-//   * THE CENTRELINE IS SMOOTHED, so between two trail points it can bow outside the chord by up to
-//     ~1/8 of the chord (~7uu at the 60uu default spacing), and the elements chord that curve back
-//     by a sagitta of at most a few uu. Net: the drawn centreline is within ~10uu of the lethal
-//     polyline, against a lethal radius of 45uu — and the trip test inflates that by the tripper's
-//     own capsule radius (~34uu) before it decides. The ribbon is inside the volume that kills
-//     everywhere; it never advertises lethal ground that is not.
-//   * ALTERNATE ELEMENTS ARE INSET BY 0.6% of the cross-section (0.54uu of 90) to break Z-fighting.
-//     Same direction, three orders of magnitude smaller than the margin above.
+//   * THE CENTRELINE IS NOT SMOOTHED (W6 §F-2). It is the lethal polyline itself, so in plan the
+//     drawn solid and the lethal solid are the same solid: every element is a box of exactly the
+//     lethal half width about a chord lying on a lethal segment. The line that used to stand here —
+//     "the drawn centreline is within ~10uu of the lethal polyline … it never advertises lethal
+//     ground that is not" — was the defect stated as a tolerance: a centreline off the line by d is
+//     either d uu of invisible kill volume or d uu of ribbon that cannot kill, and v14 §1 chose the
+//     second. Measured on a live client at 27.11uu drawn against 22.50uu lethal before this pass.
+//   * ALTERNATE ELEMENTS ARE OUTSET BY 0.6% of the cross-section (0.135uu on a 22.5uu half width) to
+//     break Z-fighting in the 1uu strip where consecutive elements overlap. That is the ONE residue
+//     left in the over-drawing direction, it is two orders of magnitude smaller than the defect
+//     above and a fiftieth of the 34uu capsule that would have to fit in it, and Trace.Trail.Geometry
+//     now polices the drawn half width to within 0.05uu of it rather than allowing a whole uu.
 //   * A PITCHED ELEMENT tilts its cross-section with the curve, so its vertical band is the union of
 //     its two ends' bands (Height + |dZ|) rather than the exact lerp — an over-draw of at most half
 //     the height change, which is the safe direction and is what the smear always did.
 //   * VERTICALLY THE RIBBON NOW COVERS THE FULL LETHAL HEIGHT, where the legacy renderer left
 //     72-162uu open for the mannequins to stand in. This is strictly MORE honest than before.
+//   * THE RIBBON'S LENGTH IS NO LONGER ON THIS LIST, AND UNTIL W9 §1 IT SHOULD HAVE BEEN. The
+//     elements came out of a FIXED pool of 96 and PlaceRibbon silently dropped every element past
+//     it — from the head, because element 0 is the oldest sample — so past 97 lethal points the
+//     newest stretch of trace killed and was not drawn. Not a tolerance, not a cross-section
+//     difference: a missing piece, in the worse direction, measured at 229.6uu on a live map with
+//     one shipped designer knob moved. The pool is now DERIVED from the polyline (one element per
+//     lethal segment, see RibbonElementBudget), so the length of a trace is not something the
+//     renderer has an opinion about at all. Trace.Trail.RibbonPoolCap restores the old geometry for
+//     an A/B; Trace.Trail.Geometry, Trace.Trail.WallClip and Trace.Trail.LethalDrawn all grade it.
 // =================================================================================================
 
 void UTraceTrailComponent::BuildRibbonSamples(const TArray<FVector>& Points, const TArray<float>& Births,
@@ -5579,9 +5810,16 @@ void UTraceTrailComponent::ComputeRibbonSamples(const TArray<FVector>& Points, c
 	// segment, and the worst a straight element can deviate from the path it is drawing is the
 	// spline's own clamped slack.
 	//
-	// COARSEN, NEVER TRUNCATE, is preserved: if the budget cannot hold the subdivision the step grows
-	// until it can, and the control points themselves always survive (there are ~21 of them against a
-	// pool of MaxRibbonElements), so a long trace gets longer elements and never a missing tail.
+	// COARSEN, NEVER TRUNCATE, is preserved — but W9 §1 had to fix WHERE it is preserved, because the
+	// parenthesis that used to close this paragraph ("there are ~21 of them against a pool of
+	// MaxRibbonElements") was the whole guarantee and it was an observation about one ini, not a
+	// property of the code. Per-segment subdivision means the step growing can never take the sample
+	// count below PointCount-1: this loop's exit test is UNSATISFIABLE whenever MaxElements is smaller
+	// than that, it burns its twelve attempts, and it returns a ribbon longer than its caller's pool.
+	// Nothing here is wrong — a control point may not be stepped over and that is correct — so the fix
+	// is on the other side: RibbonElementBudget() guarantees MaxElements >= PointCount-1, this loop is
+	// therefore always able to converge, and the surplus PlaceRibbon used to drop no longer exists.
+	// What the loop still does, and all it does, is coarsen the SUBDIVISION of long segments.
 	// v14 §1: AND IT MAY NOT CLIMB MORE THAN ONE VERTICAL STEP EITHER, for the same reason one step
 	// further on. An upright element (GRibbonUpright) covers the UNION of its two ends' vertical
 	// bands, so it stands |dZ|/2 proud of the lethal band in the middle of a slope. Subdividing on
@@ -5590,8 +5828,21 @@ void UTraceTrailComponent::ComputeRibbonSamples(const TArray<FVector>& Points, c
 	// budget and the trace is still never truncated.
 	double SafeVerticalStep = FMath::Max(2.0, static_cast<double>(GRibbonVerticalStep));
 
+	// TWENTY-FOUR ATTEMPTS, NOT TWELVE, AND THE NUMBER IS A PROOF RATHER THAN A GENEROSITY (W9 §1).
+	//
+	// The exit test below is the only thing that keeps this function inside its caller's pool, so
+	// "it converges in practice" is not good enough — it has to converge for every polyline the game
+	// can build. Each attempt multiplies both steps by 1.6, so by the last one the horizontal step is
+	// at least 5 x 1.6^23 = 2.5e5 uu and the vertical at least 2 x 1.6^23 = 1.0e5 uu, against segments
+	// that ServerUpdateTrail restarts the trace rather than exceed at MaxTrailSegmentLength = 1000uu.
+	// Every segment is therefore ONE piece on the final attempt, the count is exactly PointCount-1,
+	// and RibbonElementBudget() guarantees MaxElements >= PointCount-1. Convergence is arithmetic.
+	//
+	// At twelve the multiplier reached 281x, which covers the same segments comfortably — but only
+	// comfortably, and a comfortable margin is what the pre-W9 comment on RibbonElementFloor thought
+	// it had.
 	TArray<double, TInlineAllocator<128>> SampleDistances;
-	for (int32 Attempt = 0; Attempt < 12; ++Attempt)
+	for (int32 Attempt = 0; Attempt < 24; ++Attempt)
 	{
 		SampleDistances.Reset();
 		SampleDistances.Add(0.0);
@@ -5638,47 +5889,46 @@ void UTraceTrailComponent::ComputeRibbonSamples(const TArray<FVector>& Points, c
 			? FMath::Clamp((Distance - Cumulative[Segment]) / SegmentLength, 0.0, 1.0)
 			: 0.0;
 
-		// End control points are duplicated rather than extrapolated: an extrapolated phantom point
-		// would let the curve overshoot PAST the first or last lethal point, i.e. draw trace beyond
-		// where the server kills. Duplication makes the curve stop exactly on the endpoint.
+		// P1 and P2 are the ends of the lethal segment this sample sits on, and are all the default
+		// arm uses. P0 and P3 are the spline's neighbours and are read only by the GRibbonSplineSlack
+		// red arm below; they are duplicated at the two ends rather than extrapolated, because an
+		// extrapolated phantom point would let that arm's curve overshoot PAST the first or last
+		// lethal point, i.e. draw trace beyond where the server kills.
 		const FVector& P0 = Points[FMath::Max(0, Segment - 1)];
 		const FVector& P1 = Points[Segment];
 		const FVector& P2 = Points[FMath::Min(PointCount - 1, Segment + 1)];
 		const FVector& P3 = Points[FMath::Min(PointCount - 1, Segment + 2)];
 
-		// v13 §7: THE SPLINE IS CLAMPED TO THE POLYLINE, AND THIS IS LOAD-BEARING FOR THE WALL FIX.
+		// W6 §F-2: THE DRAWN CENTRELINE IS THE LETHAL POLYLINE. THE SPLINE IS THE RED ARM.
 		//
-		// A Catmull-Rom does not stay inside its control polygon, and the textbook figure for how far
-		// it strays — 0.074 x segment length at a right angle — is only true when consecutive segments
-		// are the SAME length. This polyline's are not: the fitter inserts points at whatever spacing
-		// the carrier's real route needed and the length trim drops them off the tail, so a 6uu segment
-		// can sit next to a 70uu one, and a uniformly parameterised Catmull-Rom across that pair
-		// excursions far further than the idealised number. Measured on the arm-0 fixture before this
-		// clamp: the drawn ribbon stood 25.0uu outside the lethal column horizontally, against the
-		// 13.8uu GetTraceDrawnHalfReach() predicts.
+		// v13 §7 clamped a Catmull-Rom to within 0.0741 x TrailPointSpacing of the polyline, and
+		// v14 §1 then widened every curved element by that residual so the strip it would otherwise
+		// have left bare stayed covered. Both steps were right about their own half of the problem
+		// and the pair is what W5-NETQA photographed on a live client: 27.11uu of drawn half width
+		// against 22.50uu of lethal half width, six snapshots, two runs, on the game's title
+		// mechanic — 4.6uu per side of ribbon that looks lethal and is not.
 		//
-		// That mattered for more than tidiness. GetTraceDrawnHalfReach() is what the wall fitter clears
-		// room for; if the drawing can quietly reach further than it, the fitter under-clears by the
-		// difference and ribbon ends up in the wall no matter how large the push allowance is. So the
-		// overshoot is BOUNDED HERE rather than estimated there, and the reach becomes a guarantee
-		// instead of a model of a corner nobody promised to run.
+		// See GRibbonSplineSlack for why there is no third option once a sample is off the line: the
+		// element's two edges move together, so a deviation of d uu is either d uu of invisible kill
+		// volume or d uu of visible ribbon that cannot kill. The deviation therefore goes at the
+		// SOURCE. With the default slack of 0 the sample is the polyline point at this station —
+		// exactly Lerp(P1, P2, T), since T is already the fraction of THIS segment (the sampler
+		// above subdivides per segment and never steps over a control point) — every element is a
+		// box of exactly the lethal half width about a chord lying on the lethal segment, and the
+		// drawn solid is the lethal solid in plan.
 		//
-		// v14 §1 CORRECTED THE LAST SENTENCE OF THAT ARGUMENT, and the correction was worth 2.5uu of
-		// invisible kill volume at a hairpin. "Each element is still TrailRadius wide about a sample
-		// that is nearer the line" is true and does not say what it was taken to say: TrailRadius
-		// wide ABOUT THE SAMPLE is not TrailRadius wide about the POLYLINE. A sample sitting Slack uu
-		// to one side of the line leaves the far edge of its element only (TrailRadius - Slack) from
-		// the line, and the strip between there and TrailRadius kills with nothing drawn on it. The
-		// measured figure on the HAIRPIN fixture was exactly that: 2.5uu.
+		// ABOVE ZERO, the pre-W6 geometry is reproduced verbatim, clamp and widening together, so
+		// the defect can be measured on the shipping build one cvar away from its fix.
 		//
-		// So the residual deviation is RECORDED per sample and BuildRibbonElements adds it back to
-		// that element's half width. The spline keeps its smoothing, the cost is paid where it is
-		// incurred (a few uu, on curved elements only) and it is paid in the over-drawing direction.
+		// THE END CONTROL POINTS still matter to the red arm: duplicating rather than extrapolating
+		// them is what stops the curve overshooting past the first or last lethal point.
 		double SampleDeviation = 0.0;
-		FVector CurveSample = CatmullRom(P0, P1, P2, P3, T);
+		FVector CurveSample = FMath::Lerp(P1, P2, T);
+
+		const double Slack = FMath::Max(0.0, static_cast<double>(GRibbonSplineSlack));
+		if (Slack > 0.0)
 		{
-			const double Slack = 0.0741
-				* FMath::Max(1.0, static_cast<double>(UTraceSettings::Get().TrailPointSpacing));
+			CurveSample = CatmullRom(P0, P1, P2, P3, T);
 
 			double NearestDistance = TNumericLimits<double>::Max();
 			FVector NearestOnPolyline = CurveSample;
@@ -5738,13 +5988,26 @@ void UTraceTrailComponent::RebuildRibbon(int32 LethalPointCount, float Invulnera
 		RibbonSourceBirths.Add(TrailPoints.Items[Index].BirthServerTime);
 	}
 
+	// W9 §1: ONE BUDGET, DERIVED FROM THIS POLYLINE, HANDED TO BOTH HALVES.
+	//
+	// The sampler and the placer must agree or the sampler builds a ribbon the placer draws a PREFIX
+	// of, and the missing suffix is the newest trace — lethal and invisible. Passing the same local to
+	// both is the fix; see RibbonElementFloor for what it replaced and what it cost.
+	const int32 ElementBudget = RibbonElementBudget(RibbonSourcePoints.Num());
+
 	BuildRibbonSamples(RibbonSourcePoints, RibbonSourceBirths,
-		static_cast<double>(FMath::Max(5.f, GRibbonStep)), MaxRibbonElements);
+		static_cast<double>(FMath::Max(5.f, GRibbonStep)), ElementBudget);
+
+	// RECORDED, SO A TRUNCATION CAN NEVER BE SILENT AGAIN. Wanted <= Budget is the invariant;
+	// Trace.Trail.Geometry grades it and Trace.Trail.WallClip names it as the cause of an invisible
+	// kill volume instead of blaming the end cap for it, which is what it did with the 229.6uu.
+	RibbonElementsWanted = FMath::Max(0, RibbonSamples.Num() - 1);
+	RibbonElementBudgetUsed = ElementBudget;
 
 	CacheMeshMetrics();
 
 	PlaceRibbon(SmearMeshes, SmearMaterials, SmearBaseGlow, SmearAppliedGlowScale,
-		MaxRibbonElements, InvulnerableScale, /*bTailFade=*/true, /*bOnlyOwnerSees=*/false,
+		ElementBudget, InvulnerableScale, /*bTailFade=*/true, /*bOnlyOwnerSees=*/false,
 		/*bOverlapAtStart=*/false);
 }
 
@@ -5842,13 +6105,21 @@ void UTraceTrailComponent::BuildRibbonElements(const TArray<FVector>& Samples,
 		const double BackOverlap = JointOverlaps[ElementIndex];
 		const double ForwardOverlap = (ElementIndex + 1 < ElementCount) ? JointOverlaps[ElementIndex + 1] : 0.0;
 
-		// v14 §1: THE SPLINE'S RESIDUAL DEVIATION IS ADDED BACK TO THIS ELEMENT'S HALF WIDTH.
+		// THE SPLINE'S RESIDUAL DEVIATION IS ADDED BACK TO THIS ELEMENT'S HALF WIDTH — AND SINCE
+		// W6 §F-2 THAT DEVIATION IS ZERO ON THE SHIPPING PATH, SO THIS ADDS NOTHING.
 		//
-		// A ribbon element is Radius wide about a SAMPLE, and the sample can sit up to the clamped
-		// slack off the polyline the trip test kills along. Without this, the far edge of a curved
-		// element reaches only (Radius - deviation) from the line, and the strip beyond it kills with
-		// nothing drawn on it — 2.5uu of invisible kill volume, measured on the HAIRPIN fixture. The
-		// deviation is per sample and usually zero, so straight trace is untouched.
+		// The pairing is what matters and it must stay paired. A ribbon element is Radius wide about
+		// a SAMPLE; if the sample sits off the polyline the trip test kills along, then either the
+		// far edge reaches only (Radius - deviation) from the line and the strip beyond it kills with
+		// nothing drawn on it (2.5uu of invisible kill volume, measured on the HAIRPIN fixture by
+		// v14 §1), or the element is widened to cover it and the near edge stands (Radius + deviation)
+		// from the line, drawing ribbon that cannot kill (27.11uu against 22.50uu, measured on a live
+		// client by W5-NETQA — the F-2 defect). v14 §1 took the second; W6 removes the choice by
+		// making the deviation zero at its source (GRibbonSplineSlack).
+		//
+		// This line stays because the RED ARM needs it: with Trace.Trail.RibbonSplineSlack above zero
+		// the samples leave the line again, and the widening has to come back with them or the arm
+		// would reproduce the wrong one of the two failures.
 		const double SampleWiden = FMath::Max(
 			SampleSlack.IsValidIndex(ElementIndex) ? static_cast<double>(SampleSlack[ElementIndex]) : 0.0,
 			SampleSlack.IsValidIndex(ElementIndex + 1) ? static_cast<double>(SampleSlack[ElementIndex + 1]) : 0.0);
@@ -6027,6 +6298,30 @@ void UTraceTrailComponent::PlaceRibbon(
 		if (!EnsureRibbonElement(Pieces, Materials, BaseGlowOut, AppliedScaleOut,
 			Placed, MaxElements, bOnlyOwnerSees))
 		{
+			// W9 §1: THE POOL RAN OUT — AND IT MAY NEVER DO SO SILENTLY AGAIN.
+			//
+			// Element 0 is the OLDEST sample, so everything this break drops is the NEWEST trace: the
+			// stretch immediately behind the carrier, which is the piece a chaser is judging their
+			// dash against. On the replicated ribbon that is an INVISIBLE KILL VOLUME with no
+			// tolerance at all; on the owner-only stub it is a visible gap between the carrier and
+			// their own trace. The pre-W9 code took this branch on any trace past 97 points and said
+			// nothing whatever, which is how 229.6uu of undrawn kill volume reached a shipped map.
+			//
+			// RebuildRibbon/UpdatePredictedHead now size MaxElements from the polyline itself
+			// (RibbonElementBudget), so this is unreachable unless the Trace.Trail.RibbonPoolCap red
+			// arm is on or a later change has broken the budget. Either way it is a Warning, once per
+			// component, naming the direction of the failure.
+			if (!bRibbonTruncationReported)
+			{
+				bRibbonTruncationReported = true;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[RIBBONPOOL] %s: ribbon TRUNCATED - %d of %d elements placed, budget %d. %s"),
+					*GetNameSafe(GetOwner()), Placed, ElementCount, MaxElements,
+					bOnlyOwnerSees
+						? TEXT("Owner-only predicted stub: the carrier's own trace is short at the head.")
+						: TEXT("*** THIS IS AN INVISIBLE KILL VOLUME *** - the newest trace kills and "
+						       "is not drawn."));
+			}
 			break;
 		}
 
@@ -6340,8 +6635,13 @@ void UTraceTrailComponent::UpdatePredictedHead()
 	//
 	// Arm 2 of Trace.Trail.Renderer draws NOTHING, and that has to include the owner-only stub: the
 	// arm exists to bound the total cost of this component's visuals, and six elements it forgot to
-	// hide would be six elements silently subtracted from the answer.
-	if (CylinderMesh == nullptr || GPredictedHeadMaxLength <= 0.f || GTrailRenderer == 2)
+	// hide would be six elements silently subtracted from the answer. (The arm-2 term is dev-only
+	// with the lever itself; Shipping always draws the stub when the first two terms allow it.)
+	if (CylinderMesh == nullptr || GPredictedHeadMaxLength <= 0.f
+#if !UE_BUILD_SHIPPING
+		|| GTrailRenderer == 2
+#endif
+		)
 	{
 		HidePredictedHead();
 		return;
@@ -6546,14 +6846,21 @@ void UTraceTrailComponent::UpdatePredictedHead()
 			RibbonSourcePoints.Add(PathPoint);
 		}
 
+		// W9 §1: the same derived budget the replicated ribbon uses, floored at the stub's own 24. A
+		// 1,200uu stub built from 25uu LocalPathHistory samples is ~48 segments, so the fixed 24 was
+		// drawing half a stub and dropping the half at the carrier's feet — the detached-trace report
+		// v8 §2 exists to close, arriving by a second route. See PredictedRibbonElementFloor.
+		const int32 PredictedBudget =
+			RibbonElementBudget(RibbonSourcePoints.Num(), PredictedRibbonElementFloor);
+
 		BuildRibbonSamples(RibbonSourcePoints, RibbonSourceBirths,
-			static_cast<double>(FMath::Max(5.f, GRibbonStep)), MaxPredictedRibbonElements);
+			static_cast<double>(FMath::Max(5.f, GRibbonStep)), PredictedBudget);
 
 		// No age fade: the stub is the newest trace there is, so it wears the newest trace's
 		// brightness and cannot read as older than the element behind it.
 		PlaceRibbon(PredictedSmearMeshes, PredictedSmearMaterials,
 			PredictedSmearBaseGlow, PredictedSmearAppliedGlowScale,
-			MaxPredictedRibbonElements, InvulnerableScale, /*bTailFade=*/false, /*bOnlyOwnerSees=*/true,
+			PredictedBudget, InvulnerableScale, /*bTailFade=*/false, /*bOnlyOwnerSees=*/true,
 			/*bOverlapAtStart=*/true);
 
 		PredictedHeadLength = (PredictedSmearMeshes.Num() > 0) ? static_cast<float>(TotalLength) : 0.f;
@@ -6717,6 +7024,8 @@ bool UTraceTrailComponent::EnsurePredictedElement(int32 ElementIndex)
 // extend past the trace, outlive it, or survive a turnover.
 // -------------------------------------------------------------------------------------------------
 
+#if !UE_BUILD_SHIPPING
+// Release pass: legacy-arm only (see the RebuildSmear guard above) — not compiled into Shipping.
 void UTraceTrailComponent::RebuildPoseGhosts(int32 LethalPointCount, float InvulnerableScale)
 {
 	if (!AreCharacterGhostsEnabled() || LethalPointCount <= 0)
@@ -6910,6 +7219,7 @@ void UTraceTrailComponent::RebuildPoseGhosts(int32 LethalPointCount, float Invul
 
 	ReleasePoseGhostsFrom(GhostRecords.Num());
 }
+#endif   // !UE_BUILD_SHIPPING — legacy pose-ghost renderer
 
 USkeletalMeshComponent* UTraceTrailComponent::GetGhostSourceMesh() const
 {
@@ -7160,6 +7470,9 @@ void UTraceTrailComponent::ApplyProximityGlowFade()
 		PredictedSmearAppliedGlowScale, /*BodyHideRadius=*/0.0);
 }
 
+#if !UE_BUILD_SHIPPING
+// Release pass: only RebuildSmear grows this pool shape, so the grower is guarded with it. The
+// ribbon and predicted-head pools grow through EnsureRibbonElement / EnsurePredictedElement.
 bool UTraceTrailComponent::EnsureSmearElement(int32 ElementIndex)
 {
 	if (ElementIndex < 0 || ElementIndex >= MaxPooledSmearElements)
@@ -7194,6 +7507,7 @@ bool UTraceTrailComponent::EnsureSmearElement(int32 ElementIndex)
 	return true;
 }
 
+// Release pass: only RebuildPoseGhosts calls this, so it is guarded with the legacy arm too.
 bool UTraceTrailComponent::EnsurePoseGhost(int32 GhostIndex)
 {
 	const int32 MaxGhosts = ResolvedMaxGhosts();
@@ -7299,6 +7613,7 @@ bool UTraceTrailComponent::EnsurePoseGhost(int32 GhostIndex)
 
 	return true;
 }
+#endif   // !UE_BUILD_SHIPPING — legacy-arm pool growers (EnsureSmearElement / EnsurePoseGhost)
 
 UStaticMeshComponent* UTraceTrailComponent::CreatePooledMesh(UStaticMesh* SourceMesh, UMaterialInstanceDynamic*& OutMaterial)
 {
@@ -8505,6 +8820,12 @@ namespace
 	//                     this is visible ribbon that cannot kill.
 	//   LETHAL <= DRAWN   every lethal point is inside something on screen. Failing this is an
 	//                     invisible kill volume, which is the worse of the two.
+	//   WANTED <= POOL    (W9 §1) the ribbon rebuild was allowed to draw every element it needed.
+	//                     Failing this is the SAME invisible kill volume arriving from the renderer's
+	//                     budget rather than from its geometry, and it is a count rather than a
+	//                     distance — exact, and independent of where the lattice happened to sample.
+	//                     This command already PRINTED both halves of it (`lethalPoints=103
+	//                     visiblePieces=96`) and reported OK, because nothing compared them.
 	//
 	// It also prints where each number came from, because v7 §3's values live in this file's CVars
 	// until the integrator moves them into UTraceSettings, and a shadowed settings knob that silently
@@ -8566,25 +8887,68 @@ namespace
 
 				++Checked;
 
-				// One uu of slack: the alternating anti-Z-fight inset makes every other element 0.6%
-				// smaller, and a segment the carrier JUMPED along is deliberately drawn over the union
-				// of its two ends' vertical bands, so the height may legitimately exceed the flat
-				// cross-section by the segment's own rise. Width has no such allowance.
-				const double WidthLimit = static_cast<double>(Radius) + 1.0;
+				// THE WIDTH ALLOWANCE IS NOW 0.05uu, NOT 1.00uu (W6 §F-2), AND THE OLD ONE IS WHY
+				// THIS COMMAND WAS THE ONLY THING THAT CAUGHT THE DEFECT — barely.
+				//
+				// It used to read "one uu of slack: the alternating anti-Z-fight INSET makes every
+				// other element 0.6% smaller". Two things wrong with that. The constant has been an
+				// OUTSET (1.006) since v14 §1 flipped its sign, so the allowance was covering
+				// over-draw and not under-draw; and 0.6% of a 22.5uu half width is 0.135uu, so the
+				// remaining 0.865uu was covering nothing anybody had named. A tolerance nobody can
+				// account for is a tolerance a real defect will one day sit inside.
+				//
+				// So the limit is now exactly what the construction forces — the alternate outset —
+				// plus 0.05uu of arithmetic. That is the whole permitted difference between the
+				// drawn cross-section and the lethal one. On a live client this reads 22.64 against
+				// a 22.50 lethal half width on every trace shape; before W6 it read 27.11 on any
+				// curving trace, which this limit would have failed by 4.4uu instead of 3.6uu.
+				//
+				// HEIGHT still has its own allowance and always will: a segment the carrier JUMPED
+				// along is deliberately drawn over the union of its two ends' vertical bands, so the
+				// height legitimately exceeds the flat cross-section by the segment's own rise. It is
+				// reported, not graded.
+				const double WidthLimit = static_cast<double>(Radius) * RibbonAlternateOutset + 0.05;
 				const bool bWidthOk = MaxHalfWidth <= WidthLimit;
 				const bool bCoverOk = WorstUncovered <= 1.0;
 
-				if (!bWidthOk || !bCoverOk)
+				// *** W9 §1: THE POOL, GRADED — AND THIS COMMAND HAD THE DEFECT ON THE SCREEN AND
+				// PRINTED PASS. *** W8-ADVERSARIAL's D1 log, verbatim:
+				//
+				//   lethalPoints=103 visiblePieces=96 … worstUncoveredLethalPoint= 0.01uu OK
+				//   [TRAILGEOM] PASS - 1 trace(s) checked, 0 violation(s).
+				//
+				// Both halves of the number were already on the line and nothing compared them. The
+				// reason worstUncoveredLethalPoint did not save it is worth stating, because it is why
+				// a count is needed and a distance is not enough: that measurement asks only about the
+				// 103 CONTROL POINTS, and the carrier was hugging a wall, so the seven undrawn points
+				// at the head were sitting a hundredth of a uu from an OLDER element of the same
+				// folded-back trace. The lethal SEGMENTS between them were undrawn — the ring lattice
+				// in Trace.Trail.WallClip found 229.6uu of them — but no control point was anywhere
+				// near empty space. A path that doubles back hides a hole from a point test.
+				//
+				// The counts cannot be hidden from. They are exact, they are free, and they are the
+				// same pair the ribbon itself was built from.
+				int32 RibbonWanted = 0;
+				int32 RibbonBudget = 0;
+				Trail->GetRibbonBudget(RibbonWanted, RibbonBudget);
+				const bool bPoolOk = (RibbonWanted <= RibbonBudget);
+
+				if (!bWidthOk || !bCoverOk || !bPoolOk)
 				{
 					++Failed;
 				}
 
 				UE_LOG(LogTraceGame, Display,
-					TEXT("[TRAILGEOM]   %-26s lethalPoints=%3d visiblePieces=%2d | drawn halfWidth=%5.2f "
-					     "(lethal %5.2f) %s | drawn halfHeight=%5.2f (lethal flat %5.2f, +rise on jumps) | "
-					     "worstUncoveredLethalPoint=%5.2fuu %s"),
+					TEXT("[TRAILGEOM]   %-26s lethalPoints=%3d visiblePieces=%3d | ribbon wanted %3d "
+					     "elements of a %4d budget %s | drawn halfWidth=%5.2f "
+					     "(lethal %5.2f, limit %5.2f) %s | drawn halfHeight=%5.2f (lethal flat %5.2f, "
+					     "+rise on jumps) | worstUncoveredLethalPoint=%5.2fuu %s"),
 					*GetNameSafe(TraceChar), Trail->ComputeLastLethalIndex() + 1, VisiblePieces,
-					MaxHalfWidth, static_cast<double>(Radius), bWidthOk ? TEXT("OK") : TEXT("** WIDER THAN LETHAL **"),
+					RibbonWanted, RibbonBudget,
+					bPoolOk ? TEXT("OK")
+					        : TEXT("** TRUNCATED: THE HEAD OF THIS TRACE IS LETHAL AND NOT DRAWN **"),
+					MaxHalfWidth, static_cast<double>(Radius), WidthLimit,
+					bWidthOk ? TEXT("OK") : TEXT("** WIDER THAN LETHAL **"),
 					MaxHalfHeight, static_cast<double>(Height) * 0.5,
 					WorstUncovered, bCoverOk ? TEXT("OK") : TEXT("** LETHAL BUT NOT DRAWN **"));
 			}
@@ -11805,6 +12169,15 @@ namespace
 		FVector WorstLethalOutsideDrawnAt = FVector::ZeroVector;
 		bool bWorstLethalOutsideDrawnIsEndCap = false;
 
+		// W9 §1: was the ribbon TRUNCATED on the frame that produced the worst hole, and did it ever
+		// truncate at all over the run? The first names the cause of that number; the second is the
+		// standing check, because a truncation on any frame is a frame with undrawn kill volume in it
+		// whether or not the lattice happened to sample the missing stretch.
+		bool bWorstLethalOutsideDrawnIsTruncation = false;
+		int32 FramesRibbonTruncated = 0;
+		int32 WorstRibbonElementsWanted = 0;
+		int32 WorstRibbonElementBudget = 0;
+
 		int32 SavedArm = 1;
 		bool bArmSaved = false;
 
@@ -12506,6 +12879,28 @@ namespace
 				State.WorstLethalOutsideDrawn = Sample.LethalOutsideDrawn;
 				State.WorstLethalOutsideDrawnAt = Sample.LethalOutsideDrawnAt;
 				State.bWorstLethalOutsideDrawnIsEndCap = Sample.bLethalOutsideDrawnIsEndCap;
+
+				// W9 §1: was the ribbon truncated on the frame that produced this number? That is
+				// what lets the report say TRUNCATED instead of leaving the reader to work out which
+				// of the known causes of undrawn kill volume produced it — the previous version of
+				// this report picked the one that was arithmetically impossible.
+				State.bWorstLethalOutsideDrawnIsTruncation =
+					(Sample.RibbonElementsWanted > Sample.RibbonElementBudget);
+			}
+
+			// THE LONGEST RIBBON THE RUN ASKED FOR, tracked on its own and not off the worst hole.
+			// Hanging it on the hole made a clean run report "0 wanted against a budget of 0", which
+			// says nothing about whether the run ever went near the pool — and a pool line that
+			// cannot distinguish "never approached it" from "sat inside it" is the shape of hole this
+			// whole tranche exists to close.
+			if (Sample.RibbonElementsWanted > State.WorstRibbonElementsWanted)
+			{
+				State.WorstRibbonElementsWanted = Sample.RibbonElementsWanted;
+				State.WorstRibbonElementBudget = Sample.RibbonElementBudget;
+			}
+			if (Sample.RibbonElementsWanted > Sample.RibbonElementBudget)
+			{
+				++State.FramesRibbonTruncated;
 			}
 
 			State.Elapsed += DeltaTime;
@@ -12552,18 +12947,75 @@ namespace
 				&& (State.Geometry.Num() > 0) && (State.Targets.Num() > 0);
 			const bool bValid = bPressed && bDroveEnough;
 
-			// THREE INDEPENDENT VERDICTS, REPORTED SEPARATELY AND THEN ANDED.
+			// FOUR INDEPENDENT VERDICTS, REPORTED SEPARATELY AND THEN ANDED (three before W9 §1).
 			//
 			// They are separate because they fail for different reasons and a single rolled-up verdict
 			// hides an A/B. CLIP is this section's bug. OVERHANG and INVISIBLE are the two directions
 			// of the standing invariant, and both are properties of how the ribbon is DRAWN rather than
 			// of where the points are — so they read the same on every fitter arm, and folding them
-			// into one word would make the fitter's arms indistinguishable.
+			// into one word would make the fitter's arms indistinguishable. RIBBON POOL is W9 §1's,
+			// and it is a COUNT rather than a distance on purpose: a truncated ribbon is undrawn kill
+			// volume even on a frame where this lattice's rings happened to miss the missing stretch,
+			// so it must not depend on the drive having got lucky.
 			const bool bOverhangOk = (State.WorstDrawnOutsideLethal
 				<= (DrawnReach - static_cast<double>(UTraceTrailComponent::GetTraceTrailRadius()) + ClipTolerance));
 			const bool bVisibleOk = (State.WorstLethalOutsideDrawn <= ClipTolerance);
 			const bool bClean = (State.WorstDrawn <= ClipTolerance) && (State.WorstLethal <= ClipTolerance);
-			const bool bPass = bValid && bClean && bOverhangOk && bVisibleOk;
+
+			// W9 §1: A FOURTH VERDICT, AND IT IS A CAUSE RATHER THAN A MEASUREMENT.
+			//
+			// A truncated ribbon is undrawn kill volume WHETHER OR NOT this lattice happens to sample
+			// the missing stretch — the geometry is simply not on screen — so it fails the run on the
+			// count, not on a uu figure the drive may or may not have caught. It is separate from
+			// bVisibleOk for the same reason the other three are separate: it fails for its own reason
+			// and rolling it in would hide which.
+			const bool bBudgetOk = (State.FramesRibbonTruncated == 0);
+			const bool bPass = bValid && bClean && bOverhangOk && bVisibleOk && bBudgetOk;
+
+			// THE CAUSE OF AN UNDRAWN KILL VOLUME, NAMED HONESTLY (W9 §1).
+			//
+			// This used to be a single branch that said "and it is the trace's own END CAP" whenever
+			// the worst sample sat near an end of the polyline. A ribbon truncated at its pool has a
+			// new end that satisfies that test trivially, so the report attached the end-cap
+			// explanation to 229.6uu of missing trace — and the end-cap defect is a radial bulge
+			// bounded by TrailRadius (22.5uu), so it could not have produced a tenth of it. A reader
+			// following that sentence would have gone to Trace.Trail.FlatEndCaps and found nothing.
+			// Truncation is now tested FIRST and by construction rather than by proximity, and the
+			// end-cap arm now has to be small enough to be true.
+			FString InvisibleCause;
+			if (!bVisibleOk || !bBudgetOk)
+			{
+				if (State.FramesRibbonTruncated > 0)
+				{
+					InvisibleCause = FString::Printf(
+						TEXT(" — and THE RIBBON WAS TRUNCATED: on %d of %d measured frames the rebuild "
+						     "wanted more elements than its pool held (worst %d wanted / %d budget). "
+						     "Element 0 is the OLDEST sample, so what is missing is the NEWEST trace, "
+						     "the stretch immediately behind the carrier. This is a complete "
+						     "explanation for any magnitude and it is NOT the v14 1 end cap, which is "
+						     "bounded by TrailRadius (%.1fuu). Check Trace.Trail.RibbonPoolCap first."),
+						State.FramesRibbonTruncated, State.FramesMeasured,
+						State.WorstRibbonElementsWanted, State.WorstRibbonElementBudget,
+						static_cast<double>(UTraceTrailComponent::GetTraceTrailRadius()));
+				}
+				else if (State.bWorstLethalOutsideDrawnIsEndCap)
+				{
+					InvisibleCause =
+						TEXT(" — and it is the trace's own END CAP: the trip test is radial about the "
+						     "first and last point while the ribbon keeps its outer elements flush with "
+						     "them. That is the v14 1 defect; it should be impossible with "
+						     "Trace.Trail.FlatEndCaps 1, so seeing it here means the cap arm is off or "
+						     "the flattening is not reaching this path.");
+				}
+				else
+				{
+					InvisibleCause =
+						TEXT(" — and it is NEITHER a truncated ribbon NOR an end cap (the figure is "
+						     "larger than TrailRadius, which is all a cap can produce). Look at the "
+						     "element geometry itself: Trace.Trail.LethalDrawn measures the same "
+						     "invariant on fixtures with no world in the way.");
+				}
+			}
 
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[WALLCLIP] arm=%d (half-width clearance=%d, rendered-geometry fitting=%d), %.0fs, %d frames measured, longest "
@@ -12579,6 +13031,8 @@ namespace
 				     "ends' bands, capped by Trace.Trail.RibbonVerticalStep); of the horizontal figure "
 				     "%.1fuu was past a flat END cap (v14 1: charged, not excused)\n"
 				     "           INVARIANT/INVISIBLE  LETHAL outside drawn %.1fuu at %s (must be 0) -> %s%s\n"
+				     "           INVARIANT/RIBBON POOL  worst rebuild wanted %d elements against a budget "
+				     "of %d; truncated on %d/%d frames -> %s\n"
 				     "           fitter push: %d points moved, worst move %.1fuu, worst residual depth "
 				     "%.1fuu, %d could not be improved at all.\n"
 				     "           fitter route: %d appends routed, %d points inserted, %d could not be fitted.\n"
@@ -12623,13 +13077,12 @@ namespace
 				State.WorstLethalOutsideDrawn, *State.WorstLethalOutsideDrawnAt.ToCompactString(),
 				bVisibleOk ? TEXT("PASS")
 				           : TEXT("*** FAIL: INVISIBLE KILL VOLUME ***"),
-				(!bVisibleOk && State.bWorstLethalOutsideDrawnIsEndCap)
-					? TEXT(" — and it is the trace's own END CAP: the trip test is radial about the "
-					       "first and last point while the ribbon keeps its outer elements flush with "
-					       "them. That is the v14 1 defect; it should be impossible with "
-					       "Trace.Trail.FlatEndCaps 1, so seeing it here means the cap arm is off or "
-					       "the flattening is not reaching this path.")
-					: TEXT(""),
+				*InvisibleCause,
+				State.WorstRibbonElementsWanted, State.WorstRibbonElementBudget,
+				State.FramesRibbonTruncated, State.FramesMeasured,
+				bBudgetOk ? TEXT("PASS — every element the ribbon needed was drawn")
+				          : TEXT("*** FAIL: THE RIBBON WAS TRUNCATED — lethal trace with nothing "
+				                 "drawn on it, at the HEAD (element 0 is the oldest sample) ***"),
 				Pushes, WorstPush, WorstResidual, Unpushable,
 				Routed, Inserted, Unroutable,
 				!bValid
@@ -13159,15 +13612,22 @@ namespace
 	// asked whether the END CAPS agree.
 	//
 	// So this command asks the geometry directly. It builds THE REAL ribbon — the shipping
-	// ComputeRibbonSamples and the shipping BuildRibbonElements, not a copy of their maths — over
-	// fixture polylines chosen to contain every shape that has ever broken this, and measures both
-	// directions against the SAME predicate the server kills with. No world, no pawn, no level, no
-	// bots, no frame rate; it runs in a millisecond and gives the same answer every time.
+	// ComputeRibbonSamples, the shipping BuildRibbonElements and (since W9 §1) the shipping ELEMENT
+	// BUDGET, not a copy of their maths — over fixture polylines chosen to contain every shape that
+	// has ever broken this, and measures both directions against the SAME predicate the server kills
+	// with. No world, no pawn, no level, no bots, no frame rate, and the same answer every time.
 	//
-	// AND IT GOES RED ON DEMAND. `Trace.Trail.LethalDrawn 0` forces the pre-v14 arms
-	// (Trace.Trail.RibbonUpright 0 + Trace.Trail.FlatEndCaps 0) and reproduces both reported numbers
-	// on the shipping build; `Trace.Trail.LethalDrawn 1` runs the identical fixtures with the fix in.
-	// Same build, same code path, one pair of cvars between them.
+	// IT NO LONGER RUNS IN A MILLISECOND, AND THE SENTENCE THAT SAID SO IS THE SENTENCE THIS PASS HAD
+	// TO DELETE. Every fixture was small enough to be instant, so the set was instant — and it was
+	// small enough for exactly the same reason it was blind: the defect W8-ADVERSARIAL found lives
+	// past 96 elements and the largest fixture here reached 42. The long fixtures at the bottom of
+	// BuildLethalDrawnFixtures take the whole command to 0.86s, measured. That is the correct price.
+	//
+	// AND IT GOES RED ON DEMAND, on THREE independent arms now, all on the shipping build:
+	//   Trace.Trail.LethalDrawn 0     the pre-v14 pitched cross-section and radial end caps.
+	//   Trace.Trail.RibbonSplineSlack the pre-W6 smoothed centreline (F-2).
+	//   Trace.Trail.RibbonPoolCap 96  the pre-W9 FIXED ribbon pool — the truncation, reproduced.
+	// `Trace.Trail.LethalDrawn 1` runs the identical fixtures with every fix in.
 
 	struct FLethalDrawnFixture
 	{
@@ -13195,9 +13655,46 @@ namespace
 		}
 
 		{
+			// W6 §F-2 ADDED THIS ONE, and the gap it fills is the reason the defect shipped: the
+			// fixture set went straight from a perfectly straight line to a right angle, so the
+			// SHAPE A CARRIER ACTUALLY LAYS — a long, gently curving run — was the one shape never
+			// measured. It is also the shape F-2 was reported on: W5-NETQA's client read 27.11uu on
+			// a 19-point curving trace while a 2-point stub taken moments earlier read 22.64 and
+			// passed. A curve is not a corner and it is not a line, and it has to be its own row.
+			//
+			// 400uu radius at 100uu between points is 14.3 degrees of turn per point over ~129
+			// degrees of arc — a carrier rounding one of the arena's centre pillars at speed.
+			//
+			// *** THE 100uu SPACING IS DELIBERATE AND IS HALF OF WHY THIS FIXTURE FINDS ANYTHING. ***
+			// TrailPointSpacing is a MINIMUM, not a pitch: a carrier at dash speed covers 55uu in one
+			// frame, so its points land 60-120uu apart, and ComputeRibbonSamples then subdivides any
+			// segment longer than the ribbon step into pieces. Those INTERIOR samples are the only
+			// ones that can leave the polyline at all — a sample landing exactly on a control point
+			// has nowhere to deviate to — so a fixture built at exactly the 60uu minimum draws one
+			// element per segment, never subdivides, and cannot reproduce F-2 no matter how sharply
+			// it turns. Built that way this fixture read 22.635 in BOTH arms. W5-NETQA's live client
+			// had 19 lethal points and 32 visible pieces, i.e. it was subdividing constantly, which
+			// is the condition this now reproduces.
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("GENTLE CURVE");
+			Fixture.Why = TEXT("the shape a carrier actually lays, and the one F-2 was reported on: "
+			                   "14-degree turns at dash-speed 100uu spacing, no corner anywhere");
+			constexpr double ArcRadius = 400.0;
+			constexpr double ArcSpacing = 100.0;
+			const double Turn = ArcSpacing / ArcRadius;   // radians per point, = spacing / radius
+			for (int32 Index = 0; Index < 10; ++Index)
+			{
+				const double Angle = Turn * static_cast<double>(Index);
+				Fixture.Points.Add(FVector(ArcRadius * FMath::Sin(Angle),
+					ArcRadius * (1.0 - FMath::Cos(Angle)), 0.0));
+			}
+		}
+
+		{
 			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
 			Fixture.Name = TEXT("RIGHT ANGLE");
-			Fixture.Why = TEXT("the joint overlap has to cover the round cap at the corner");
+			Fixture.Why = TEXT("the sharpest corner a running carrier can lay: the two flat caps "
+			                   "meet at 90 degrees and the notch between them must be DRAWN");
 			for (int32 Index = 0; Index < 5; ++Index)
 			{
 				Fixture.Points.Add(FVector(Index * 60.0, 0.0, 0.0));
@@ -13205,6 +13702,27 @@ namespace
 			for (int32 Index = 1; Index <= 4; ++Index)
 			{
 				Fixture.Points.Add(FVector(240.0, Index * 60.0, 0.0));
+			}
+		}
+
+		{
+			// W6 §F-2 ADDED THIS ONE TOO, and the reason is the same as GENTLE CURVE's: RIGHT ANGLE
+			// above is built at exactly the 60uu minimum spacing, so it draws one element per segment,
+			// never subdivides, and therefore has no interior sample that could leave the line. It
+			// reads the same number in both arms and always will. A hard corner laid at the spacing a
+			// DASHING carrier actually produces is a different test, and it is the one a player is
+			// most likely to be looking at when they decide whether they can cut a corner.
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("DASH CORNER");
+			Fixture.Why = TEXT("a right angle at the 120uu spacing a dashing carrier lays, so every "
+			                   "segment subdivides and the corner is drawn by interior samples");
+			for (int32 Index = 0; Index < 4; ++Index)
+			{
+				Fixture.Points.Add(FVector(Index * 120.0, 0.0, 0.0));
+			}
+			for (int32 Index = 1; Index <= 3; ++Index)
+			{
+				Fixture.Points.Add(FVector(360.0, Index * 120.0, 0.0));
 			}
 		}
 
@@ -13274,6 +13792,131 @@ namespace
 			                   "zero-length segment, so something must be drawn on it");
 			Fixture.Points.Add(FVector(0.0, 0.0, 0.0));
 		}
+
+		// =========================================================================================
+		// W9 §1: THE SHAPE THIS SET WAS MISSING — A LONG ONE. IT IS ALSO THE ONLY SHAPE THAT HAS EVER
+		// PRODUCED INVISIBLE KILL VOLUME ON A LIVE MAP.
+		//
+		// Every fixture above is 10 control points or fewer, and the most elements any of them
+		// produces is 42. The ribbon draws out of a POOL, and until W9 that pool was a fixed 96: the
+		// harness that certifies "the trace shows exactly what is lethal" had never run a polyline
+		// within 2.3x of the bound that breaks it. W8-ADVERSARIAL then broke it on the shipped map, on
+		// the shipped binary, at the shipped trace length, with one documented designer ini knob
+		// moved — 229.6uu of trace that kills and is not drawn.
+		//
+		// A fixture set whose largest case is a fifth of the bound is not a test of the bound. These
+		// four bracket it: one element past the old pool, the worst the WALL FITTER can produce at
+		// completely stock settings, the exact live repro, and the hard maximum the game can build at
+		// all. Every one of them is a polyline ServerUpdateTrail can actually hand RebuildRibbon.
+		//
+		// HOW TO SEE THEM FAIL: `Trace.Trail.RibbonPoolCap 96` restores the pre-W9 fixed pool. All
+		// four then go red — MEASURED at 58.99 / 372.96 / 217.26 / 4073.34 uu of invisible kill
+		// volume, in the order below. At the default budget all four read 0.00.
+		//
+		// THEY COST REAL TIME AND THAT IS THE CORRECT TRADE. Direction two rings every ~8uu of the
+		// whole polyline and asks every element about every sample, so MAX TRACE alone is ~10^8
+		// distance tests; the fourteen fixtures together measured 0.86s against the ten's few
+		// milliseconds. The command's docstring used to promise a millisecond, and a millisecond is
+		// what it cost to miss this.
+		// =========================================================================================
+
+		{
+			// One element PAST the old pool, and not two — the point of this fixture is the cliff
+			// edge itself. 98 points at the shipping 60uu spacing is 97 segments, and with
+			// GRibbonStep also 60 that is exactly 97 elements against the 96 that used to be
+			// available. Under the red arm it loses precisely one element's worth of trace at the
+			// head, which is the smallest failure the defect can produce and therefore the one most
+			// likely to be dismissed as noise.
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("POOL EDGE");
+			Fixture.Why = TEXT("98 points = 97 elements, ONE past the 96-element pool that used to be "
+			                   "fixed: the smallest truncation the defect can produce");
+			constexpr double ArcRadius = 3000.0;
+			constexpr double ArcSpacing = 60.0;
+			const double Turn = ArcSpacing / ArcRadius;
+			for (int32 Index = 0; Index < 98; ++Index)
+			{
+				const double Angle = Turn * static_cast<double>(Index);
+				Fixture.Points.Add(FVector(ArcRadius * FMath::Sin(Angle),
+					ArcRadius * (1.0 - FMath::Cos(Angle)), 0.0));
+			}
+		}
+
+		{
+			// *** THE ONE THAT NEEDS NO INI AT ALL. *** AppendTrailPointsFitted may insert up to
+			// TrailWallFitMaxInsert = 6 extra points for each 60uu append, so the worst case at
+			// COMPLETELY STOCK SETTINGS is 7 points per 60uu of path — 140 points inside the shipped
+			// TrailMaxLengthUU of 1200uu, i.e. ~8.6uu apart. That is a carrier threading a run of
+			// pillars, and it is 44 points past the old pool with nothing whatever misconfigured.
+			// W8-ADVERSARIAL observed the fitter routing live on this map, so the path is not dead.
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("FITTER WORST");
+			Fixture.Why = TEXT("140 points in the shipped 1200uu cap — the wall fitter's worst case "
+			                   "(7 points per 60uu append) at STOCK ini, no knob moved");
+			constexpr int32 PointCount = 140;
+			constexpr double Length = 1200.0;
+			const double Step = Length / static_cast<double>(PointCount - 1);
+			for (int32 Index = 0; Index < PointCount; ++Index)
+			{
+				// A gentle weave, because inserted points are inserted to go ROUND something: a
+				// dead-straight fixture would let consecutive elements be collinear and hide any
+				// error the corners make.
+				const double X = Step * static_cast<double>(Index);
+				const double Y = 45.0 * FMath::Sin(X / 180.0);
+				Fixture.Points.Add(FVector(X, Y, 0.0));
+			}
+		}
+
+		{
+			// THE LIVE REPRO, TO THE POINT COUNT. W8-ADVERSARIAL's D1 run moved exactly one
+			// documented designer knob — TrailPointSpacing 60 -> 10, both inside its own ClampMin of
+			// 10 — kept the shipped TrailMaxLengthUU, and measured 133 lethal points against 96
+			// visible pieces and 229.6uu of undrawn kill volume. This is that polyline, with the
+			// turns a carrier driven along a wall for ninety seconds actually lays.
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("FINE SPACING");
+			Fixture.Why = TEXT("133 points at TrailPointSpacing 10 — W8-ADVERSARIAL's live repro, one "
+			                   "in-range ini knob from stock, which measured 229.6uu undrawn");
+			constexpr int32 PointCount = 133;
+			constexpr double Spacing = 10.0;
+			double Heading = 0.0;
+			FVector At = FVector::ZeroVector;
+			for (int32 Index = 0; Index < PointCount; ++Index)
+			{
+				Fixture.Points.Add(At);
+				// Two long sweeping turns and one hard one, so the fixture is a drive rather than a
+				// line: 1.5 degrees per 10uu point, reversing twice.
+				const double TurnRate = (Index < 45) ? 0.026 : ((Index < 90) ? -0.026 : 0.09);
+				Heading += TurnRate;
+				At += FVector(Spacing * FMath::Cos(Heading), Spacing * FMath::Sin(Heading), 0.0);
+			}
+		}
+
+		{
+			// THE HARD MAXIMUM THE GAME CAN BUILD. MaxTrailPoints is 256 and ServerUpdateTrail now
+			// clamps it there (TrailPointHardCap), so 256 points is the longest polyline
+			// RebuildRibbon can EVER be handed — 2.67x the old pool. It includes a climb because
+			// GRibbonVerticalStep subdivides on RISE as well as run, which is the one thing that can
+			// push the element count above one per segment and is therefore the case where the
+			// budget's floor has to do real work.
+			FLethalDrawnFixture& Fixture = Out.AddDefaulted_GetRef();
+			Fixture.Name = TEXT("MAX TRACE");
+			Fixture.Why = TEXT("256 points = MaxTrailPoints, the longest trace the game can produce at "
+			                   "all, with a climb so the vertical subdivision is loaded too");
+			constexpr int32 PointCount = 256;
+			constexpr double ArcRadius = 2400.0;
+			constexpr double ArcSpacing = 60.0;
+			const double Turn = ArcSpacing / ArcRadius;
+			for (int32 Index = 0; Index < PointCount; ++Index)
+			{
+				const double Angle = Turn * static_cast<double>(Index);
+				// A 12uu rise per point over the middle third: a ramp taken at speed.
+				const double Rise = (Index < 85) ? 0.0
+					: ((Index < 170) ? 12.0 * static_cast<double>(Index - 85) : 12.0 * 85.0);
+				Fixture.Points.Add(FVector(ArcRadius * FMath::Sin(Angle),
+					ArcRadius * (1.0 - FMath::Cos(Angle)), Rise));
+			}
+		}
 	}
 
 	struct FLethalDrawnResult
@@ -13283,9 +13926,33 @@ namespace
 		double DrawnOutsideLethalVertical = 0.0;
 		double LethalOutsideDrawn = 0.0;
 		FVector LethalOutsideDrawnAt = FVector::ZeroVector;
+
+		/**
+		 * W6 §F-2: THE CROSS-SECTION, MEASURED DIRECTLY, because the two distance figures above
+		 * could not see the defect.
+		 *
+		 * DrawnOutsideLethal asks "how far outside the lethal solid does the drawing reach", and a
+		 * ribbon widened by 4.5uu about a centreline moved 4.5uu the other way answers that with a
+		 * number well inside a budget that had ~13uu of room in it for the VERTICAL DROP fixture's
+		 * square-on-a-disc. The live-world Trace.Trail.Geometry caught F-2 precisely because it
+		 * measures the element's own half width instead — so the no-world fixture measures it too
+		 * now, on every shape, and the two commands finally grade the same quantity.
+		 */
+		double MaxDrawnHalfWidth = 0.0;
+
 		int32 Elements = 0;
 		int32 LethalSamples = 0;
 		int32 DrawnSamples = 0;
+
+		/**
+		 * W9 §1: elements the sampler EMITTED, and the pool the placer would have had for them.
+		 *
+		 * Wanted > Budget is a truncated ribbon, i.e. lethal trace with nothing drawn on it, and it is
+		 * reported as its own failure rather than left to be inferred from the uu figure — the live
+		 * harness had the uu figure and blamed the wrong defect for it.
+		 */
+		int32 ElementsWanted = 0;
+		int32 ElementBudget = 0;
 	};
 
 	void MeasureLethalDrawn(const TArray<FVector>& Points, FLethalDrawnResult& Out)
@@ -13296,16 +13963,41 @@ namespace
 		const double Height = static_cast<double>(UTraceTrailComponent::GetTraceTrailHeight());
 		const double HalfHeight = Height * 0.5;
 
+		// THE SHIPPING BUDGET, FROM THE SHIPPING FUNCTION — not a constant retyped here. Under the
+		// Trace.Trail.RibbonPoolCap red arm this is the pre-W9 fixed pool and the fixtures below go
+		// red; at the default it is one element per lethal segment and they are 0.00.
+		const int32 Budget = RibbonElementBudget(Points.Num());
+
 		TArray<FVector> Samples;
 		TArray<float> Births;
 		TArray<float> Slack;
 		UTraceTrailComponent::ComputeRibbonSamples(Points, TArray<float>(),
-			static_cast<double>(FMath::Max(5.f, GRibbonStep)), MaxRibbonElements,
+			static_cast<double>(FMath::Max(5.f, GRibbonStep)), Budget,
 			Samples, Births, Slack);
 
 		TArray<UTraceTrailComponent::FTraceRibbonElement> Elements;
 		UTraceTrailComponent::BuildRibbonElements(Samples, Slack, Radius, Height,
 			static_cast<double>(GRibbonWidthScale), /*bOverlapAtStart=*/false, Elements);
+
+		// *** W9 §1: MODEL THE POOL. THIS IS THE OTHER HALF OF WHY THIS HARNESS COULD NOT SEE THE
+		// WORST DEFECT IN THE OVERHAUL. ***
+		//
+		// ComputeRibbonSamples is ALLOWED to return more elements than the budget — its coarsen loop
+		// cannot go below one element per lethal segment, so on a long polyline it simply exhausts its
+		// attempts and hands back the whole ribbon. It is PlaceRibbon that then drops the surplus, and
+		// it drops it from the HEAD because element 0 is the oldest sample. Measuring every element
+		// the SAMPLER emitted therefore measures a ribbon nobody is ever shown: with the pre-W9 fixed
+		// pool this function reported 0.00uu of invisible kill volume on the very polylines that lost
+		// 229.6uu of it on a live map.
+		//
+		// So the same truncation is applied here, in the same direction, before a single sample is
+		// taken. Long fixtures alone would NOT have been enough without this line.
+		Out.ElementsWanted = Elements.Num();
+		Out.ElementBudget = Budget;
+		if (Elements.Num() > Budget)
+		{
+			Elements.SetNum(Budget);
+		}
 
 		Out.Elements = Elements.Num();
 
@@ -13316,6 +14008,11 @@ namespace
 		for (const UTraceTrailComponent::FTraceRibbonElement& Element : Elements)
 		{
 			const FVector Half = Element.Size * 0.5;
+
+			// The cross-section, straight off the element. Local Y is the ribbon's width; X is its
+			// length along the path and Z its height, and neither of those is a cross-section.
+			Out.MaxDrawnHalfWidth = FMath::Max(Out.MaxDrawnHalfWidth, FMath::Abs(Half.Y));
+
 			const int32 LengthSteps = FMath::Clamp(FMath::CeilToInt(Element.Size.X / 8.0), 1, 48);
 
 			for (int32 Step = 0; Step <= LengthSteps; ++Step)
@@ -13415,11 +14112,15 @@ namespace
 
 	FAutoConsoleCommand CmdLethalDrawn(
 		TEXT("Trace.Trail.LethalDrawn"),
-		TEXT("Trace.Trail.LethalDrawn [Arm=-1] — spec v14 1. Measures BOTH directions of "
-		     "'the trace shows exactly what is lethal' on fixture polylines, using the shipping ribbon "
-		     "builder and the shipping trip-test geometry. No world, no pawn, no level needed. "
-		     "Arm 0 forces the pre-v14 pitched cross-section and radial end caps (the reported bug, "
-		     "reproduced); arm 1 forces the v14 arms; -1 measures whatever is configured."),
+		TEXT("Trace.Trail.LethalDrawn [Arm=-1] — spec v14 1 + W6 F-2. Measures BOTH directions of "
+		     "'the trace shows exactly what is lethal' on fixture polylines, AND the drawn "
+		     "cross-section itself, using the shipping ribbon builder and the shipping trip-test "
+		     "geometry. No world, no pawn, no level needed. Arm 0 forces the pre-v14 pitched "
+		     "cross-section and radial end caps (the v14 bug, reproduced); arm 1 forces the v14 arms; "
+		     "-1 measures whatever is configured. Two further red arms are separate cvars and compose "
+		     "with all three: Trace.Trail.RibbonSplineSlack 4.45 puts the over-wide mitre back, and "
+		     "Trace.Trail.RibbonPoolCap 96 puts the pre-W9 fixed ribbon pool back (the truncation). "
+		     "Takes ~0.9s rather than a millisecond: the long fixtures are the point."),
 		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
 		{
 			const int32 Arm = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), -1, 1) : -1;
@@ -13435,14 +14136,42 @@ namespace
 			const double Radius = static_cast<double>(UTraceTrailComponent::GetTraceTrailRadius());
 			const double DrawnReach = UTraceTrailComponent::GetTraceDrawnHalfReach();
 
-			// THE BUDGET, DERIVED AND NOT TYPED. Two terms, both forced by drawing a round-cornered
-			// solid with straight boxes:
-			//   Radius * (sqrt(2) - 1) = 9.3uu   the corner of the joint-overlap box, which must cover
-			//                                    the round cap at every interior joint.
-			//   0.0741 * TrailPointSpacing = 4.4uu   the clamped Catmull-Rom slack.
-			// That is GetTraceDrawnHalfReach() - TrailRadius. Anything above it is a defect; anything
-			// below it is the price of boxes, paid in the OVER-drawing direction.
-			const double Budget = DrawnReach - Radius;
+			// THE BUDGET, DERIVED AND NOT TYPED — AND IT IS NO LONGER THE WALL FITTER'S REACH.
+			//
+			// It used to be GetTraceDrawnHalfReach() - Radius, i.e. ~13.8uu, on the reading that the
+			// fitter's clearance and the drawing's overhang are the same quantity. They are not, and
+			// the difference is exactly how F-2 lived here undetected: the fitter's figure carries a
+			// deliberate reserve (see GetTraceDrawnHalfReach), and 4.5uu of ribbon drawn where
+			// nothing kills fitted inside that reserve with room to spare. A budget with unexplained
+			// room in it will absorb a real defect, and this one did.
+			//
+			// So it is now the tight, construction-forced figure, every term of which is a thing the
+			// code does on purpose and can be pointed at:
+			//
+			//   Radius * (sqrt(2) * Outset - 1) = 9.5uu   the VERTICAL DROP case, and only it: a
+			//                                             segment that is a point in plan kills
+			//                                             inside a DISC, and the smallest box that
+			//                                             covers a disc is the square around it.
+			//   SeamOverlap = 1uu                         each element runs one uu past an interior
+			//                                             joint so no seam can open; at a corner that
+			//                                             uu sits outside both flat caps.
+			//
+			// Anything above that is a defect; anything below it is the price of drawing a solid with
+			// boxes, paid in the OVER-drawing direction.
+			//
+			// *** NEITHER LIMIT WIDENS WITH THE RED ARM, AND THAT IS THE POINT OF HAVING ONE. *** The
+			// first cut of this pass added GRibbonSplineSlack to both budgets, on the reasoning that
+			// the arm's own widening is "expected". It is not expected, it is the defect: with the
+			// slack allowed for, Trace.Trail.RibbonSplineSlack 4.446 reproduced the live client's
+			// 27.108uu half width to two thousandths of a uu and the fixture still printed PASS. A
+			// harness that cannot go red on the exact number it was written for teaches nothing, so
+			// the limits are the invariant and the arm is measured against it like anything else.
+			const double Budget = Radius * (UE_DOUBLE_SQRT_2 * RibbonAlternateOutset - 1.0) + 1.0;
+
+			// AND THE CROSS-SECTION HAS ITS OWN LIMIT, which is the one F-2 broke. Exactly the lethal
+			// half width, plus the alternating anti-Z-fight outset, plus 0.05uu of arithmetic.
+			// Nothing else may make the ribbon wider than the volume that kills.
+			const double WidthLimit = Radius * RibbonAlternateOutset + 0.05;
 
 			// Direction two has no budget at all. The only tolerance is arithmetic: the drawn faces are
 			// sampled at 0.999 of their extents and doubles are doubles.
@@ -13452,21 +14181,26 @@ namespace
 			BuildLethalDrawnFixtures(Fixtures);
 
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[LETHALDRAWN] spec v14 1: 'ensure that the trace shows exactly what is lethal'. "
-				     "arm upright=%d flatEndCaps=%d. Trace half width %.1fuu, height %.1fuu, spacing "
-				     "%.0fuu, ribbon step %.0fuu, vertical step %.0fuu. Overhang budget %.1fuu "
-				     "(= drawn reach %.1f - half width %.1f); invisible-kill budget is ZERO."),
-				GRibbonUpright, GTrailFlatEndCaps, Radius,
+				TEXT("[LETHALDRAWN] spec v14 1 + W6 F-2: 'ensure that the trace shows exactly what is "
+				     "lethal'. arm upright=%d flatEndCaps=%d splineSlack=%.2fuu. Trace half width "
+				     "%.1fuu, height %.1fuu, spacing %.0fuu, ribbon step %.0fuu, vertical step %.0fuu. "
+				     "Overhang budget %.2fuu (construction-forced, NOT the fitter's %.1fuu reach); "
+				     "drawn half width limit %.2fuu; invisible-kill budget is ZERO."),
+				GRibbonUpright, GTrailFlatEndCaps, GRibbonSplineSlack, Radius,
 				static_cast<double>(UTraceTrailComponent::GetTraceTrailHeight()),
 				UTraceSettings::Get().TrailPointSpacing, GRibbonStep, GRibbonVerticalStep,
-				Budget, DrawnReach, Radius);
+				Budget, DrawnReach, WidthLimit);
 
 			double WorstOverhang = 0.0;
 			double WorstVertical = 0.0;
 			double WorstInvisible = 0.0;
+			double WorstHalfWidth = 0.0;
 			FString WorstOverhangFixture;
 			FString WorstInvisibleFixture;
+			FString WorstHalfWidthFixture;
+			FString WorstTruncatedFixture;   // W9 §1 — first fixture whose ribbon did not fit its pool.
 			int32 Failures = 0;
+			int32 Truncated = 0;
 
 			for (const FLethalDrawnFixture& Fixture : Fixtures)
 			{
@@ -13475,15 +14209,33 @@ namespace
 
 				const bool bOverhangOk = (Result.DrawnOutsideLethal <= Budget);
 				const bool bVisibleOk = (Result.LethalOutsideDrawn <= InvisibleTolerance);
+				const bool bWidthOk = (Result.MaxDrawnHalfWidth <= WidthLimit);
+
+				// W9 §1: THE CAUSE, GRADED SEPARATELY FROM ITS SYMPTOM.
+				//
+				// A truncated ribbon shows up in the uu figure above as an ordinary invisible kill
+				// volume, and the live harness proved that a number alone gets misdiagnosed — it
+				// charged 229.6uu to an end-cap defect that can produce at most 22.5. So the count is
+				// its own verdict: if the sampler wanted more elements than the pool holds, the
+				// ribbon is short whatever the geometry says, and this line says so by name.
+				const bool bBudgetOk = (Result.ElementsWanted <= Result.ElementBudget);
 
 				// A fixture that drew nothing, or that found no lethal sample, has not tested anything
 				// and says so rather than passing quietly.
 				const bool bMeasured = (Result.Elements > 0) && (Result.LethalSamples > 0)
 					&& (Result.DrawnSamples > 0);
 
-				if (!bMeasured || !bOverhangOk || !bVisibleOk)
+				if (!bMeasured || !bOverhangOk || !bVisibleOk || !bWidthOk || !bBudgetOk)
 				{
 					++Failures;
+				}
+				if (!bBudgetOk)
+				{
+					++Truncated;
+					if (WorstTruncatedFixture.IsEmpty())
+					{
+						WorstTruncatedFixture = Fixture.Name;
+					}
 				}
 
 				if (Result.DrawnOutsideLethal > WorstOverhang)
@@ -13497,13 +14249,25 @@ namespace
 					WorstInvisible = Result.LethalOutsideDrawn;
 					WorstInvisibleFixture = Fixture.Name;
 				}
+				if (Result.MaxDrawnHalfWidth > WorstHalfWidth)
+				{
+					WorstHalfWidth = Result.MaxDrawnHalfWidth;
+					WorstHalfWidthFixture = Fixture.Name;
+				}
 
 				UE_LOG(LogTraceGame, Display,
-					TEXT("[LETHALDRAWN] %-14s %2d pts -> %2d elements, %d lethal / %d drawn samples. "
-					     "DRAWN outside lethal %5.1fuu at %s (budget %.1f) %s | vertical %5.1fuu | "
-					     "LETHAL outside drawn %5.1fuu at %s %s   [%s]"),
-					Fixture.Name, Fixture.Points.Num(), Result.Elements,
+					TEXT("[LETHALDRAWN] %-14s %3d pts -> %3d of %3d elements drawn (pool %4d) %s, "
+					     "%d lethal / %d drawn samples. "
+					     "drawn halfWidth %6.3f (lethal %.2f) %s | DRAWN outside lethal %5.2fuu at %s "
+					     "(budget %.2f) %s | vertical %5.2fuu | LETHAL outside drawn %6.2fuu at %s %s"
+					     "   [%s]"),
+					Fixture.Name, Fixture.Points.Num(),
+					Result.Elements, Result.ElementsWanted, Result.ElementBudget,
+					bBudgetOk ? TEXT("whole")
+					          : TEXT("*** TRUNCATED: the head of this trace is not drawn ***"),
 					Result.LethalSamples, Result.DrawnSamples,
+					Result.MaxDrawnHalfWidth, Radius,
+					bWidthOk ? TEXT("OK") : TEXT("*** WIDER THAN LETHAL ***"),
 					Result.DrawnOutsideLethal, *Result.DrawnOutsideLethalAt.ToCompactString(), Budget,
 					bOverhangOk ? TEXT("PASS") : TEXT("*** FAIL ***"),
 					Result.DrawnOutsideLethalVertical,
@@ -13512,17 +14276,35 @@ namespace
 					bMeasured ? Fixture.Why : TEXT("*** NOTHING MEASURED — this fixture is not a test ***"));
 			}
 
+			// W9 §1: THE CAUSE LINE, SO THE READER IS NOT LEFT TO GUESS AT A NUMBER. The live harness
+			// went red on this defect and named the v14 end cap, which can produce 22.5uu at the very
+			// most and therefore could not possibly have explained the 229.6 it was printed against.
+			// A truncation says truncation.
+			const FString InvisibleCause = (Truncated > 0)
+				? FString::Printf(
+					TEXT("\n           CAUSE: THE RIBBON POOL. %d fixture(s) wanted more elements than "
+					     "the pool holds, first %s. Everything past the pool is dropped from the HEAD "
+					     "(element 0 is the OLDEST sample), so the undrawn stretch is the newest trace "
+					     "— the piece immediately behind the carrier. This is NOT the v14 1 end cap: "
+					     "that defect is bounded by TrailRadius (%.1fuu) and cannot produce more."),
+					Truncated, *WorstTruncatedFixture, Radius)
+				: FString();
+
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[LETHALDRAWN] DONE. %d fixtures, %d failed.\n"
-				     "           WORST drawn outside lethal  %.1fuu (%s), budget %.1fuu\n"
-				     "           WORST vertical over-draw     %.1fuu (deliberate: an element unions its "
+				TEXT("[LETHALDRAWN] DONE. %d fixtures, %d failed, %d truncated.\n"
+				     "           WIDEST drawn half width      %.3fuu (%s), lethal %.2fuu, limit %.2fuu\n"
+				     "           WORST drawn outside lethal   %.2fuu (%s), budget %.2fuu\n"
+				     "           WORST vertical over-draw     %.2fuu (deliberate: an element unions its "
 				     "two ends' bands; capped by Trace.Trail.RibbonVerticalStep)\n"
-				     "           WORST lethal outside drawn   %.1fuu (%s), budget 0\n"
+				     "           WORST lethal outside drawn   %.2fuu (%s), budget 0%s\n"
 				     "           VERDICT: %s"),
-				Fixtures.Num(), Failures,
+				Fixtures.Num(), Failures, Truncated,
+				WorstHalfWidth, WorstHalfWidthFixture.IsEmpty() ? TEXT("-") : *WorstHalfWidthFixture,
+				Radius, WidthLimit,
 				WorstOverhang, WorstOverhangFixture.IsEmpty() ? TEXT("-") : *WorstOverhangFixture, Budget,
 				WorstVertical,
 				WorstInvisible, WorstInvisibleFixture.IsEmpty() ? TEXT("-") : *WorstInvisibleFixture,
+				*InvisibleCause,
 				(Failures == 0)
 					? TEXT("PASS — the drawn solid and the lethal solid are the same solid, within the "
 					       "stated budget, on every fixture.")
@@ -13581,6 +14363,12 @@ void UTraceTrailComponent::DestroyVisualPool()
 	RibbonSampleBirth.Reset();
 	RibbonSourcePoints.Reset();
 	RibbonSourceBirths.Reset();
+
+	// W9 §1: the pool is gone, so the last rebuild's budget reading describes nothing. Left stale it
+	// would let Trace.Trail.Geometry report a truncation against a ribbon that no longer exists.
+	// bRibbonTruncationReported is deliberately NOT cleared: one Warning per component, ever.
+	RibbonElementsWanted = 0;
+	RibbonElementBudgetUsed = 0;
 
 	LastVisualPointCount = -1;
 	bColorApplied = false;
@@ -13873,6 +14661,10 @@ void UTraceTrailComponent::MeasureWorldClipping(const TArray<FTraceClipBox>& Geo
 
 	const int32 LethalCount = ComputeLastLethalIndex() + 1;
 	Out.LethalPoints = LethalCount;
+
+	// W9 §1: carried on every sample so the report can NAME a truncated ribbon instead of measuring
+	// the hole it leaves and guessing which defect made it. See FTraceClipSample::RibbonElementsWanted.
+	GetRibbonBudget(Out.RibbonElementsWanted, Out.RibbonElementBudget);
 
 	// -------------------------------------------------------------------------------------------
 	// BROAD PHASE. The trace is ~1200uu long and the arena is thousands of rendered boxes, so the
@@ -14176,10 +14968,19 @@ void UTraceTrailComponent::MeasureWorldClipping(const TArray<FTraceClipBox>& Geo
 
 							// Name the cause rather than leave a number to be explained. See
 							// FTraceClipSample::bLethalOutsideDrawnIsEndCap.
+							//
+							// W9 §1: TWO TESTS, NOT ONE, AND THE SECOND IS THE ONE THAT WAS MISSING.
+							// Proximity to an end alone is satisfied by ANY new end, including the one
+							// a ribbon truncated at its pool has just acquired — so this flag fired on
+							// a 229.6uu hole and the report blamed a cap defect that is bounded by
+							// TrailRadius and could not have produced a tenth of it. A cap can only
+							// leave undrawn kill volume out to its own radius; past that the cause is
+							// something else and this must not claim otherwise.
 							const double ToHead = FVector::Dist(At, LethalPolyline.Last());
 							const double ToTail = FVector::Dist(At, LethalPolyline[0]);
 							Out.bLethalOutsideDrawnIsEndCap =
-								(FMath::Min(ToHead, ToTail) <= (TrailRadius + TrailHalfHeight));
+								(FMath::Min(ToHead, ToTail) <= (TrailRadius + TrailHalfHeight))
+								&& (OutsideDrawn <= (TrailRadius + 0.5));
 						}
 					}
 				}

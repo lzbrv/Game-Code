@@ -56,7 +56,38 @@ namespace TraceTextFile
 		"Light must be the default weight — the owner's instruction is that the game is light and "
 		"bold is the exception, so a caller that says nothing has to get light.");
 
+	/**
+	 * The per-glyph fallback, switchable at runtime (UI plan WP12).
+	 *
+	 * 0 restores exactly the behaviour this work package removed: a codepoint outside the drawing
+	 * face's charset advances the pen and draws nothing, so "Björn" comes out with a hole in it.
+	 * That is a RED ARM, for the same reason Trace.Text.Atlas above is one — a fix nobody can watch
+	 * fail is not evidence, and here the two arms differ by a handful of glyphs in one string, which
+	 * is precisely the kind of change a screenshot has to be able to bracket.
+	 *
+	 * ECVF_Cheat: nothing about this is a preference. Default 1 is the shipped behaviour.
+	 */
+	static TAutoConsoleVariable<int32> CVarGlyphFallback(
+		TEXT("Trace.Text.GlyphFallback"),
+		1,
+		TEXT("1 = a codepoint the drawing face has no cell for is drawn from the Latin-1 sheet\n")
+		TEXT("    T_FontAtlasNames (Lato, OFL), baseline-aligned into the line (default).\n")
+		TEXT("0 = RED ARM: it advances the pen and draws nothing, as before UI plan WP12 — a\n")
+		TEXT("    non-ASCII player name comes out with holes in it.\n")
+		TEXT("Use Trace.Text.Report to see which is live."),
+		ECVF_Cheat);
+
 	static constexpr int32 NumWeights = Metrics::NumWeights;
+
+	/**
+	 * Where the fallback sheet lives in the texture array — one past the last weight.
+	 *
+	 * It is NOT an ETraceTextWeight and must never become one (see TraceText.h and the fallback
+	 * banner in the generated header): nothing may ask to draw in it. It only needs a slot here
+	 * because it is a texture that has to be loaded, guarded and kept alive like any other.
+	 */
+	static constexpr int32 FallbackSlot = NumWeights;
+	static constexpr int32 NumSheets = NumWeights + 1;
 
 	static constexpr int32 WeightIndex(ETraceTextWeight Weight)
 	{
@@ -71,10 +102,11 @@ namespace TraceTextFile
 		FString FailureReason;
 	};
 
-	static FWeightState WeightStates[NumWeights];
+	/** One per weight, plus one at FallbackSlot for the Latin-1 sheet. */
+	static FWeightState WeightStates[NumSheets];
 
 	/**
-	 * Keeps the sheets alive — one per weight.
+	 * Keeps the sheets alive — one per weight, plus the fallback sheet.
 	 *
 	 * A TStrongObjectPtr in a static would work until module shutdown ordering bit somebody; an
 	 * FGCObject is the pattern the engine itself uses for exactly this and it releases cleanly.
@@ -82,7 +114,7 @@ namespace TraceTextFile
 	class FAtlasRef : public FGCObject
 	{
 	public:
-		TObjectPtr<UTexture2D> Textures[NumWeights];
+		TObjectPtr<UTexture2D> Textures[NumSheets];
 
 		virtual void AddReferencedObjects(FReferenceCollector& Collector) override
 		{
@@ -108,6 +140,15 @@ namespace TraceTextFile
 	/** The DEFAULT weight's texture loaded AND passed the guard. Ignores the two overrides. */
 	static bool bAtlasUsable = false;
 	static FString FailureReason;
+
+	/**
+	 * The Latin-1 sheet loaded AND passed the guard. Ignores CVarGlyphFallback.
+	 *
+	 * Separate from bAtlasUsable on purpose: a missing fallback sheet must not take the menus down
+	 * with it. It costs the holes back in non-ASCII names and nothing else, which is exactly the
+	 * state the whole game was in before WP12.
+	 */
+	static bool bFallbackUsable = false;
 
 	static bool ForcedOffAtLaunch()
 	{
@@ -158,17 +199,29 @@ namespace TraceTextFile
 	 * *something*, so it survives review. Refusing the atlas outright turns it into a legible log
 	 * line and a menu in Lato.
 	 */
-	/** Loads and guards ONE weight's sheet. Returns true when that weight can draw its own ink. */
+	/**
+	 * The face record for a slot in the texture array: a weight, or the fallback sheet.
+	 *
+	 * Metrics::Face() deliberately CLAMPS an out-of-range index to the default weight, which is the
+	 * right answer for a weight that came off a knob and the wrong one here — FallbackSlot is out of
+	 * range by construction and clamping it would load the light sheet and call it the fallback.
+	 */
+	static const Metrics::FFace& SheetFace(int32 Index)
+	{
+		return (Index == FallbackSlot) ? Metrics::FallbackFace : Metrics::Face(Index);
+	}
+
+	/** Loads and guards ONE sheet. Returns true when that weight (or the fallback) can draw its ink. */
 	static bool ResolveWeight(int32 Index)
 	{
-		const Metrics::FFace& Face = Metrics::Face(Index);
+		const Metrics::FFace& Face = SheetFace(Index);
 		FWeightState& State = WeightStates[Index];
 
 		UTexture2D* Texture = LoadObject<UTexture2D>(nullptr, Face.TextureAsset);
 		if (Texture == nullptr)
 		{
 			State.FailureReason = FString::Printf(
-				TEXT("%s (the %s weight) did not load. Run Scripts/import-font-atlas.sh to import it."),
+				TEXT("%s (the %s sheet) did not load. Run Scripts/import-font-atlas.sh to import it."),
 				Face.TextureAsset, Face.Name);
 			return false;
 		}
@@ -181,7 +234,7 @@ namespace TraceTextFile
 		if (Width != Face.AtlasWidth || Height != Face.AtlasHeight)
 		{
 			State.FailureReason = FString::Printf(
-				TEXT("%s (the %s weight) is %dx%d but TraceFontAtlasMetrics.h describes a %dx%d sheet ")
+				TEXT("%s (the %s sheet) is %dx%d but TraceFontAtlasMetrics.h describes a %dx%d sheet ")
 				TEXT("— the metrics and the texture are out of step, so every glyph would sample the ")
 				TEXT("wrong cell. Re-run Scripts/import-font-atlas.sh (it does both halves together)."),
 				Face.TextureAsset, Face.Name, Width, Height, Face.AtlasWidth, Face.AtlasHeight);
@@ -201,23 +254,40 @@ namespace TraceTextFile
 		}
 		bResolved = true;
 
-		// EVERY weight is resolved here, not lazily on first bold draw. The character-select screen
+		// EVERY sheet is resolved here, not lazily on first bold draw. The character-select screen
 		// is the first thing that asks for bold and it asks during a draw pass; a synchronous texture
 		// load and an editor-build shader/texture compile on that frame is a visible hitch, and the
 		// failure log would land in the middle of gameplay rather than at menu load.
-		for (int32 Index = 0; Index < NumWeights; ++Index)
+		//
+		// The Latin-1 sheet is in this loop for a sharper version of the same reason: the frame that
+		// first needs it is the frame a player called "Björn" is killed on, which is the worst
+		// imaginable moment to discover a texture wants compiling.
+		for (int32 Index = 0; Index < NumSheets; ++Index)
 		{
 			ResolveWeight(Index);
 		}
 
 		bAtlasUsable = WeightStates[Metrics::DefaultWeight].bUsable;
 		FailureReason = WeightStates[Metrics::DefaultWeight].FailureReason;
+		bFallbackUsable = WeightStates[FallbackSlot].bUsable;
 
 		if (!bAtlasUsable)
 		{
 			UE_LOG(LogTraceGame, Error, TEXT("[Text] %s Falling back to %s."),
 				*FailureReason, TraceMenuArtStyle::MenuFontSourceFile);
 			return;
+		}
+
+		// The Latin-1 sheet failing is a QUIET failure and that is why it gets its own warning: the
+		// menus, the HUD and every authored string carry on looking perfect, and the only symptom is
+		// a hole in the name of a player nobody on this machine is called.
+		if (!bFallbackUsable)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Text] The per-glyph fallback sheet is NOT available, so a codepoint outside ")
+				TEXT("the drawing face's charset will advance the pen and draw nothing — a non-ASCII ")
+				TEXT("player name comes out with holes in it, exactly as before UI plan WP12. %s"),
+				*WeightStates[FallbackSlot].FailureReason);
 		}
 
 		const Metrics::FFace& Default = Metrics::Face(Metrics::DefaultWeight);
@@ -254,6 +324,19 @@ namespace TraceTextFile
 					TEXT("instead — same typeface, wrong emphasis, and nothing on screen will say so. %s"),
 					Metrics::Face(Index).Name, Default.Name, *WeightStates[Index].FailureReason);
 			}
+		}
+
+		if (bFallbackUsable)
+		{
+			const Metrics::FFace& Fallback = Metrics::FallbackFace;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Text]   %-5s -> %-30s per-glyph FALLBACK: %s (%dx%d, %d glyphs in %d ranges, ")
+				TEXT("ascent %.0f against the line box's %.0f, so a fallback glyph is drawn %.0f px ")
+				TEXT("higher and lands on the same baseline). Nothing can ASK for this face."),
+				Fallback.Name, Fallback.Source, Fallback.TextureAsset,
+				Fallback.AtlasWidth, Fallback.AtlasHeight,
+				Metrics::NumFallbackGlyphs, Metrics::NumFallbackRanges,
+				Fallback.Ascent, Default.Ascent, Fallback.Ascent - Default.Ascent);
 		}
 	}
 
@@ -309,6 +392,117 @@ namespace TraceTextFile
 	}
 
 	// ---------------------------------------------------------------------------------------------
+	// THE PER-GLYPH FALLBACK (UI plan WP12) — see the banner in TraceText.h
+	// ---------------------------------------------------------------------------------------------
+
+	static bool GlyphFallbackAllowed()
+	{
+		return bFallbackUsable && CVarGlyphFallback.GetValueOnAnyThread() != 0;
+	}
+
+	/**
+	 * Characters that are SUPPOSED to draw nothing, and must not be given a '?'.
+	 *
+	 * The rule for a codepoint missing from both sheets is "draw a question mark rather than advance
+	 * silently" — because a silent advance is the hole this work package removes. That rule is wrong
+	 * for characters whose whole job is to be invisible, and each of these is here because it can
+	 * genuinely arrive in a string this game did not author:
+	 *
+	 *   U+00AD  SOFT HYPHEN. A line-break OPPORTUNITY, not a hyphen. Scripts/generate_font_atlas.py
+	 *           skips it in the Latin-1 charset ON PURPOSE, so without this it is the one Latin-1
+	 *           codepoint that would come back as a question mark.
+	 *   U+200B..U+200F, U+2060, U+FEFF   zero-width space/joiners, the bidi marks and the byte-order
+	 *           mark. A name pasted out of a web page carries these more often than not.
+	 *
+	 * Controls below U+0020 and the C1 block are handled by the whitespace/range tests in
+	 * ResolveGlyph rather than listed here.
+	 */
+	static bool IsDeliberatelyInvisible(int32 Code)
+	{
+		return Code == 0x00AD
+			|| (Code >= 0x200B && Code <= 0x200F)
+			|| Code == 0x2060
+			|| Code == 0xFEFF;
+	}
+
+	/** What one character resolves to: which sheet, which cell, and what the pen advances by. */
+	struct FResolvedGlyph
+	{
+		/** Null means "draw nothing"; the pen still advances by Advance. */
+		const Metrics::FCell* Cell = nullptr;
+		/** True when Cell points into Metrics::FallbackCells and not into the face's own table. */
+		bool bFallback = false;
+		/** True when even the fallback sheet had no cell, so Cell is its '?'. */
+		bool bSubstituted = false;
+		/** Atlas pixels. Scaled by ScaleFor(Size) at the point of use. */
+		float Advance = 0.f;
+	};
+
+	/**
+	 * THE ONE PLACE THAT DECIDES WHICH SHEET A CHARACTER COMES FROM.
+	 *
+	 * Measurement and layout both go through it, which is what stops a name being MEASURED as a row
+	 * of blanks and DRAWN as letters (or the reverse) — that split is precisely the defect that
+	 * mis-sized the kill feed before spec v23 §A4, and it would come straight back if the fallback
+	 * were applied in the draw loop alone.
+	 */
+	static FResolvedGlyph ResolveGlyph(const Metrics::FFace& Face, TCHAR Char)
+	{
+		FResolvedGlyph Out;
+		const int32 Code = static_cast<int32>(Char);
+
+		// WHITESPACE FIRST, AND THE ORDER MATTERS. U+00A0 (no-break space) IS in the fallback sheet,
+		// so without this test it would resolve to a Lato cell: a draw call for a blank quad, and an
+		// advance taken from a face that is not setting this line. Every space in a line has to
+		// advance by the SAME width or the string measures differently from how it looks.
+		if (Char == TEXT(' ') || Char == TEXT('\t') || Code == 0x00A0 || FChar::IsWhitespace(Char))
+		{
+			Out.Advance = SpaceCell(Face).USize;
+			return Out;
+		}
+
+		if (const Metrics::FCell* Own = FindCell(Face, Char))
+		{
+			Out.Cell = Own;
+			Out.Advance = Own->USize;
+			return Out;
+		}
+
+		// Everything below here is a codepoint the DRAWING face has no cell for.
+		//
+		// Controls, and characters that are meant to be invisible, keep the old behaviour: advance
+		// and draw nothing. A question mark for a zero-width joiner would be a new defect, not a fix.
+		if (Code < 0x20 || (Code >= 0x7F && Code <= 0x9F) || IsDeliberatelyInvisible(Code)
+			|| !GlyphFallbackAllowed())
+		{
+			Out.Advance = SpaceCell(Face).USize;
+			return Out;
+		}
+
+		const int32 Index = Metrics::FallbackIndexOf(Code);
+		Out.bSubstituted = (Index == INDEX_NONE);
+		Out.Cell = &Metrics::FallbackCells[
+			Out.bSubstituted ? Metrics::FallbackQuestionIndex : Index];
+		Out.bFallback = true;
+		Out.Advance = Out.Cell->USize;
+		return Out;
+	}
+
+	/**
+	 * How far a fallback glyph is lifted, in ATLAS pixels, so its baseline lands on the line's.
+	 *
+	 * Negative in practice: Lato's ascent (108 at em 96) is taller than either licensed face's
+	 * (95 and 93), so its glyphs start above the line box's top edge. Their INK still fits inside
+	 * the box — Scripts/import_font_atlas.py measures that across every cell and refuses to emit the
+	 * header if it ever stops being true, so a multi-line label cannot start colliding with itself
+	 * because somebody changed the fallback face.
+	 */
+	static float FallbackBaselineShift(const Metrics::FFace& Face)
+	{
+		return Face.Ascent - Metrics::FallbackFace.Ascent;
+	}
+
+	// ---------------------------------------------------------------------------------------------
 	// The fallback face. Everything below has to keep working when the atlas stands down, and
 	// MEASUREMENT most of all — a caller that centres a row on a width measured in one face and then
 	// draws it in another gets a menu that is subtly, unattributably off.
@@ -353,8 +547,11 @@ namespace TraceTextFile
 		int32 Drawn = 0;
 		for (int32 Index = 0; Index < Line.Len(); ++Index)
 		{
-			const Metrics::FCell* Cell = FindCell(Face, Line[Index]);
-			Width += (Cell != nullptr ? Cell->USize : SpaceCell(Face).USize) * Scale;
+			// ResolveGlyph, not FindCell: a fallback glyph is as wide as LATO makes it, and that is
+			// the width it will be DRAWN at. Measuring it as a blank space here — which is what this
+			// loop did before WP12 — would under-report every accented name by the difference and
+			// centre it off by half of that.
+			Width += ResolveGlyph(Face, Line[Index]).Advance * Scale;
 			++Drawn;
 		}
 		// Tracking is between glyphs, not after the last one — otherwise a centred string drifts
@@ -473,6 +670,57 @@ UTexture2D* TraceText::AtlasTexture(ETraceTextWeight Weight)
 	return TraceTextFile::Refs().Textures[TraceTextFile::EffectiveIndex(Weight)];
 }
 
+UTexture2D* TraceText::QuadTexture(const FGlyphQuad& Quad, ETraceTextWeight Weight)
+{
+	TraceTextFile::Resolve();
+	// A fallback quad's UVs were normalised against the Latin-1 sheet's dimensions, so handing back
+	// the style's sheet for one would draw a smear of the wrong letters at the right size — the
+	// failure mode that looks like a corrupt texture rather than like a bug in text layout.
+	return Quad.bFallback
+		? TraceTextFile::Refs().Textures[TraceTextFile::FallbackSlot]
+		: TraceTextFile::Refs().Textures[TraceTextFile::EffectiveIndex(Weight)];
+}
+
+bool TraceText::IsGlyphFallbackActive()
+{
+	TraceTextFile::Resolve();
+	return IsAtlasActive() && TraceTextFile::GlyphFallbackAllowed();
+}
+
+const TCHAR* TraceText::FallbackFaceSourceFile()
+{
+	return TraceFontAtlasMetrics::FallbackFace.Source;
+}
+
+bool TraceText::CanDraw(TCHAR Char, ETraceTextWeight Weight)
+{
+	// With the atlas down every glyph goes through Slate and the question is Lato's to answer, not
+	// this module's — and Lato covers far more than either sheet here does.
+	if (!IsAtlasActive())
+	{
+		return true;
+	}
+
+	const int32 Code = static_cast<int32>(Char);
+	if (Char == TEXT(' ') || Char == TEXT('\t') || Char == TEXT('\n') || Code == 0x00A0
+		|| FChar::IsWhitespace(Char) || Code < 0x20
+		|| TraceTextFile::IsDeliberatelyInvisible(Code))
+	{
+		// Drawing nothing is the CORRECT rendering of these, so they are drawable by any useful
+		// definition. Saying otherwise would have the HUD warn about every line break.
+		return true;
+	}
+
+	TraceTextFile::Resolve();
+	if (TraceTextFile::FindCell(TraceTextFile::EffectiveFace(Weight), Char) != nullptr)
+	{
+		return true;
+	}
+
+	return TraceTextFile::GlyphFallbackAllowed()
+		&& TraceFontAtlasMetrics::FallbackIndexOf(Code) != INDEX_NONE;
+}
+
 FString TraceText::DescribeFace()
 {
 	TraceTextFile::Resolve();
@@ -492,6 +740,34 @@ FString TraceText::DescribeFace()
 		const TraceFontAtlasMetrics::FFace& Default =
 			TraceFontAtlasMetrics::Face(TraceFontAtlasMetrics::DefaultWeight);
 
+		// The per-glyph fallback, said in the same paragraph as the faces, because "which face is
+		// live" and "what happens to a codepoint none of them has" are one question to anybody
+		// reading a kill feed with a foreign name in it.
+		const TraceFontAtlasMetrics::FFace& Fallback = TraceFontAtlasMetrics::FallbackFace;
+		FString GlyphFallback;
+		if (!TraceTextFile::bFallbackUsable)
+		{
+			GlyphFallback = FString::Printf(
+				TEXT(" PER-GLYPH FALLBACK: UNAVAILABLE — %s did not resolve, so a codepoint outside ")
+				TEXT("the drawing face's charset draws nothing at all."),
+				Fallback.TextureAsset);
+		}
+		else if (!TraceText::IsGlyphFallbackActive())
+		{
+			GlyphFallback = TEXT(" PER-GLYPH FALLBACK: OFF (`Trace.Text.GlyphFallback 0`), so a ")
+				TEXT("codepoint outside the drawing face's charset draws nothing — the pre-WP12 arm.");
+		}
+		else
+		{
+			GlyphFallback = FString::Printf(
+				TEXT(" PER-GLYPH FALLBACK: %s from %s (%d glyphs, Latin-1 plus typographic marks). ")
+				TEXT("A codepoint the drawing face has no cell for is taken from there and lifted ")
+				TEXT("%.0f atlas px onto this line's baseline; one missing from BOTH draws its '?'. ")
+				TEXT("Nothing can ASK for that face — it is not an ETraceTextWeight."),
+				Fallback.Source, Fallback.TextureAsset, TraceFontAtlasMetrics::NumFallbackGlyphs,
+				Fallback.Ascent - Default.Ascent);
+		}
+
 		return FString::Printf(
 			TEXT("GLYPH ATLAS — %s is the default face, from %s (%dx%d, %d glyphs, em %.0f, cap %.0f). ")
 			TEXT("Every letter is one textured quad drawn by Source/Trace/UI/Text; no UFont and no ")
@@ -500,10 +776,10 @@ FString TraceText::DescribeFace()
 			TEXT("so they share NEITHER advances NOR baselines — measure and baseline-align a string in ")
 			TEXT("the weight you will draw it in. They DO share the %.0f px line box, which is what one ")
 			TEXT("layout pass needs and what the importer enforces. Force the fallback with ")
-			TEXT("-TraceNoFontAtlas or `Trace.Text.Atlas 0`."),
+			TEXT("-TraceNoFontAtlas or `Trace.Text.Atlas 0`.%s"),
 			Default.Source, Default.TextureAsset, Default.AtlasWidth, Default.AtlasHeight,
 			TraceFontAtlasMetrics::NumGlyphs, TraceFontAtlasMetrics::EmSize, Default.CapHeight,
-			*Weights, TraceFontAtlasMetrics::LineHeight);
+			*Weights, TraceFontAtlasMetrics::LineHeight, *GlyphFallback);
 	}
 
 	FString Why;
@@ -655,6 +931,14 @@ bool TraceText::LayoutString(const FString& Text, const FStyle& Style, TArray<FG
 	const float AtlasW = static_cast<float>(Face.AtlasWidth);
 	const float AtlasH = static_cast<float>(Face.AtlasHeight);
 
+	// The OTHER sheet a quad in this string may address — see the per-glyph fallback banner in
+	// TraceText.h. Its dimensions differ from the face's, so the UVs cannot share a divisor, and its
+	// baseline sits lower inside its taller cell, so its quads are lifted by this much.
+	const TraceFontAtlasMetrics::FFace& Fallback = TraceFontAtlasMetrics::FallbackFace;
+	const float FallbackW = static_cast<float>(Fallback.AtlasWidth);
+	const float FallbackH = static_cast<float>(Fallback.AtlasHeight);
+	const float FallbackLift = TraceTextFile::FallbackBaselineShift(Face) * Scale;
+
 	OutQuads.Reserve(Text.Len());
 
 	for (int32 LineIndex = 0; LineIndex < Lines.Num(); ++LineIndex)
@@ -677,23 +961,30 @@ bool TraceText::LayoutString(const FString& Text, const FStyle& Style, TArray<FG
 
 		for (int32 CharIndex = 0; CharIndex < Line.Len(); ++CharIndex)
 		{
-			const TCHAR Char = Line[CharIndex];
-			const TraceFontAtlasMetrics::FCell* Cell = TraceTextFile::FindCell(Face, Char);
-			const TraceFontAtlasMetrics::FCell& Advance =
-				(Cell != nullptr) ? *Cell : TraceTextFile::SpaceCell(Face);
+			// The SAME resolver the measurement above ran, so the quads and the width this string
+			// was centred by can never disagree about which sheet a character came from.
+			const TraceTextFile::FResolvedGlyph Glyph =
+				TraceTextFile::ResolveGlyph(Face, Line[CharIndex]);
 
 			// Whitespace and unmapped characters advance and draw nothing. Emitting a quad for a
 			// space would be a transparent draw call per space, on every frame, for nothing.
-			if (Cell != nullptr && Char != TEXT(' '))
+			if (Glyph.Cell != nullptr)
 			{
+				const TraceFontAtlasMetrics::FCell& Cell = *Glyph.Cell;
+				const float SheetW = Glyph.bFallback ? FallbackW : AtlasW;
+				const float SheetH = Glyph.bFallback ? FallbackH : AtlasH;
+
 				FGlyphQuad& Quad = OutQuads.AddDefaulted_GetRef();
-				Quad.Pos = FVector2f(PenX, PenY);
-				Quad.Size = FVector2f(Cell->USize * Scale, Cell->VSize * Scale);
-				Quad.UVMin = FVector2f(Cell->U / AtlasW, Cell->V / AtlasH);
-				Quad.UVSize = FVector2f(Cell->USize / AtlasW, Cell->VSize / AtlasH);
+				// A fallback glyph is lifted onto this line's baseline. Everything else about it —
+				// the pen, the tracking, the alignment it was laid out inside — is identical.
+				Quad.Pos = FVector2f(PenX, PenY + (Glyph.bFallback ? FallbackLift : 0.f));
+				Quad.Size = FVector2f(Cell.USize * Scale, Cell.VSize * Scale);
+				Quad.UVMin = FVector2f(Cell.U / SheetW, Cell.V / SheetH);
+				Quad.UVSize = FVector2f(Cell.USize / SheetW, Cell.VSize / SheetH);
+				Quad.bFallback = Glyph.bFallback;
 			}
 
-			PenX += Advance.USize * Scale + Style.Tracking;
+			PenX += Glyph.Advance * Scale + Style.Tracking;
 		}
 	}
 

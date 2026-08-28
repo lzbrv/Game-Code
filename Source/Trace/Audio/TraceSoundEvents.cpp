@@ -30,6 +30,52 @@ namespace TraceSoundEvents
 	const FName PistolShoot4(TEXT("PistolShoot4"));
 	const FName SmgShoot1(TEXT("SmgShoot1"));
 
+	// RELEASE FX/AUDIO PLAN §5.1 — the synthesized palette. Stems live in Art/Sounds/Combat/,
+	// Abilities/, UI/ and Music/; the folder is filing, not naming, exactly as with the footsteps.
+	const FName MeleeSwing(TEXT("MeleeSwing"));
+	const FName MeleeHit(TEXT("MeleeHit"));
+	const FName MeleeBackstab(TEXT("MeleeBackstab"));
+	const FName Reload(TEXT("Reload"));
+	const FName DryFire(TEXT("DryFire"));
+	const FName WeaponSwitch(TEXT("WeaponSwitch"));
+	const FName DamageTaken(TEXT("DamageTaken"));
+	const FName DeathBurst(TEXT("DeathBurst"));
+	const FName Respawn(TEXT("Respawn"));
+	const FName ShieldBlock(TEXT("ShieldBlock"));
+	const FName ChutBash(TEXT("ChutBash"));
+	const FName MaceSpikeThrow(TEXT("MaceSpikeThrow"));
+	const FName MaceSpikeEmbed(TEXT("MaceSpikeEmbed"));
+	const FName MacePullLoop(TEXT("MacePullLoop"));
+	const FName OysterPickler(TEXT("OysterPickler"));
+	const FName OysterJarBreak(TEXT("OysterJarBreak"));
+	const FName XSting(TEXT("XSting"));
+	const FName XStingLoad(TEXT("XStingLoad"));
+	const FName RoxieRocketBurst(TEXT("RoxieRocketBurst"));
+	const FName RoxieRocketLaunch(TEXT("RoxieRocketLaunch"));
+	const FName RoxieRocketLoop(TEXT("RoxieRocketLoop"));
+	const FName RoxieModded(TEXT("RoxieModded"));
+	const FName ElleTeleport(TEXT("ElleTeleport"));
+	const FName ElleSnap(TEXT("ElleSnap"));
+	const FName ElleCloak(TEXT("ElleCloak"));
+	const FName ElleDecloak(TEXT("ElleDecloak"));
+	const FName SlimeballWall(TEXT("SlimeballWall"));
+	const FName SlimeballStick(TEXT("SlimeballStick"));
+	const FName MortimerQuake(TEXT("MortimerQuake"));
+	const FName MortimerMantle(TEXT("MortimerMantle"));
+	const FName LilyZip(TEXT("LilyZip"));
+	const FName LilyZipLoop(TEXT("LilyZipLoop"));
+	const FName RoccoRideLoop(TEXT("RoccoRideLoop"));
+	const FName RoccoJump(TEXT("RoccoJump"));
+	const FName UIHover(TEXT("UIHover"));
+	const FName UIBack(TEXT("UIBack"));
+	const FName UIDeny(TEXT("UIDeny"));
+	const FName CountdownTick(TEXT("CountdownTick"));
+	const FName CountdownGo(TEXT("CountdownGo"));
+	const FName StingerVictory(TEXT("StingerVictory"));
+	const FName StingerDefeat(TEXT("StingerDefeat"));
+	const FName MusicTitle(TEXT("MusicTitle"));
+	const FName AmbienceMatch(TEXT("AmbienceMatch"));
+
 	// Function-local so these are built after FName's pool is up, for the same reason All() is a
 	// function-local static. Eleven names, in clip order, and the ONE place the count lives.
 	static TConstArrayView<FName> Footsteps()
@@ -77,8 +123,8 @@ namespace TraceSoundEvents
 		//
 		// APPEND, NEVER INSERT. The v26 nine are first and in the v26 order, deliberately: spec v29
 		// §1a is "keep the existing client/global split", and a reader diffing this against the old
-		// table should see nine untouched rows followed by nineteen new ones, not a reshuffle they
-		// have to audit line by line.
+		// table should see nine untouched rows followed by v29's nineteen and then the release
+		// palette's forty-three, not a reshuffle they have to audit line by line.
 		static const FTraceSoundEvent Table[] =
 		{
 			// ---- spec v26 §9. NOT ONE OF THESE MOVED IN v29 §1a. --------------------------------
@@ -121,6 +167,64 @@ namespace TraceSoundEvents
 			{ Goal,         ETraceSoundSide::World,  TEXT("a goal is scored (ATraceGameMode::NotifyScored)") },
 			{ Kill,         ETraceSoundSide::Client, TEXT("you registered a kill (ClientNotifyHit, bKilled)") },
 			{ RoccoRipple,  ETraceSoundSide::World,  TEXT("Rocco lays a Ripple (UTraceAbilitySetRocco::ActivateAbility)") },
+
+			// ---- RELEASE FX/AUDIO PLAN §5.1: core combat. -----------------------------------------
+			// Client rows marked "(burst)" or "replicated-local" DO reach every machine — through
+			// code that already runs everywhere — and are Client here precisely so a stray Play()
+			// cannot double-multicast them. See the header comment.
+			{ MeleeSwing,       ETraceSoundSide::World,  TEXT("a melee swing (predicted local + PlayAtExcluding)") },
+			{ MeleeHit,         ETraceSoundSide::World,  TEXT("a melee hit lands, front verdict") },
+			{ MeleeBackstab,    ETraceSoundSide::World,  TEXT("a melee hit lands, backstab verdict") },
+			{ Reload,           ETraceSoundSide::World,  TEXT("a reload begins (predicted local + PlayAtExcluding)") },
+			{ DryFire,          ETraceSoundSide::Client, TEXT("you pulled the trigger on an empty clip") },
+			{ WeaponSwitch,     ETraceSoundSide::Client, TEXT("a weapon switch (replicated-local: OnRep_EquippedWeapon)") },
+			{ DamageTaken,      ETraceSoundSide::Client, TEXT("YOUR health dropped (victim's machine only)") },
+			{ DeathBurst,       ETraceSoundSide::World,  TEXT("a death, at the body") },
+			{ Respawn,          ETraceSoundSide::Client, TEXT("you respawned (AcknowledgePossession)") },
+			{ ShieldBlock,      ETraceSoundSide::Client, TEXT("your shot was shield-blocked (ClientNotifyHit)") },
+
+			// ---- RELEASE FX/AUDIO PLAN §5.1: per-kit abilities. -----------------------------------
+			{ ChutBash,         ETraceSoundSide::Client, TEXT("Chut's Bash connects (burst)") },
+			{ MaceSpikeThrow,   ETraceSoundSide::World,  TEXT("Mace's spike cast is accepted") },
+			{ MaceSpikeEmbed,   ETraceSoundSide::Client, TEXT("Mace's spike embeds (burst)") },
+			{ MacePullLoop,     ETraceSoundSide::Client, TEXT("Mace reeling in (router loop, per machine)") },
+			{ OysterPickler,    ETraceSoundSide::World,  TEXT("Oyster lobs the Pickler") },
+			{ OysterJarBreak,   ETraceSoundSide::Client, TEXT("a jar breaks into a cloud (replicated-local: cloud BeginPlay)") },
+			{ XSting,           ETraceSoundSide::Client, TEXT("X's sting spark (burst)") },
+			{ XStingLoad,       ETraceSoundSide::World,  TEXT("X loads the sting clip") },
+			{ RoxieRocketBurst, ETraceSoundSide::Client, TEXT("Roxie's rocket detonates (burst, Big attenuation)") },
+			{ RoxieRocketLaunch, ETraceSoundSide::World, TEXT("Roxie's rocket leaves the tube") },
+			{ RoxieRocketLoop,  ETraceSoundSide::Client, TEXT("Roxie's rocket in flight (replicated-local: rocket BeginPlay)") },
+			{ RoxieModded,      ETraceSoundSide::World,  TEXT("Roxie goes MODDED") },
+			{ ElleTeleport,     ETraceSoundSide::Client, TEXT("Elle teleports (burst, both mouths)") },
+			{ ElleSnap,         ETraceSoundSide::Client, TEXT("an Elle gate snaps open (replicated-local: gate BeginPlay)") },
+			{ ElleCloak,        ETraceSoundSide::World,  TEXT("Elle cloaks") },
+			{ ElleDecloak,      ETraceSoundSide::World,  TEXT("Elle decloaks") },
+			{ SlimeballWall,    ETraceSoundSide::World,  TEXT("a Slimewall goes up") },
+			{ SlimeballStick,   ETraceSoundSide::World,  TEXT("somebody sticks to slime") },
+			{ MortimerQuake,    ETraceSoundSide::World,  TEXT("Mortimer's Quake blast (Big attenuation)") },
+			{ MortimerMantle,   ETraceSoundSide::Client, TEXT("Mortimer's mantle impulse") },
+			{ LilyZip,          ETraceSoundSide::World,  TEXT("Lily's Zip fires") },
+			{ LilyZipLoop,      ETraceSoundSide::Client, TEXT("Lily in flight (router loop, per machine)") },
+			{ RoccoRideLoop,    ETraceSoundSide::Client, TEXT("riding Rocco's Ripple (router loop, per machine)") },
+			{ RoccoJump,        ETraceSoundSide::World,  TEXT("Rocco's second jump") },
+
+			// ---- RELEASE FX/AUDIO PLAN §5.1: UI + countdown. All Client, all 2D. ------------------
+			{ UIHover,          ETraceSoundSide::Client, TEXT("a menu row gains focus") },
+			{ UIBack,           ETraceSoundSide::Client, TEXT("back / cancel") },
+			{ UIDeny,           ETraceSoundSide::Client, TEXT("a refusal (s7.1 toast, unbindable key)") },
+			{ CountdownTick,    ETraceSoundSide::Client, TEXT("kickoff countdown, last 3 s") },
+			{ CountdownGo,      ETraceSoundSide::Client, TEXT("kickoff release") },
+
+			// ---- RELEASE FX/AUDIO PLAN §5.1: music. Family Music = the MusicVolumeScale hook. -----
+			{ StingerVictory,   ETraceSoundSide::Client, TEXT("match end, your team won"),
+			  ETraceSoundFamily::Music },
+			{ StingerDefeat,    ETraceSoundSide::Client, TEXT("match end, your team lost"),
+			  ETraceSoundFamily::Music },
+			{ MusicTitle,       ETraceSoundSide::Client, TEXT("title-screen loop (UTraceMusicSubsystem)"),
+			  ETraceSoundFamily::Music },
+			{ AmbienceMatch,    ETraceSoundSide::Client, TEXT("in-match ambience loop (UTraceMusicSubsystem)"),
+			  ETraceSoundFamily::Music },
 		};
 		return TConstArrayView<FTraceSoundEvent>(Table, UE_ARRAY_COUNT(Table));
 	}
@@ -176,6 +280,7 @@ namespace TraceSoundEvents
 		{
 		case ETraceSoundFamily::Footstep: return TEXT("footstep");
 		case ETraceSoundFamily::Gunshot:  return TEXT("gunshot");
+		case ETraceSoundFamily::Music:    return TEXT("music");
 		default:                          return TEXT("-");
 		}
 	}

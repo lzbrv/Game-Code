@@ -60,11 +60,16 @@
 //     "Parried"  (TraceParry::GetParryKillCause())  -> shield      the carrier killing a dasher
 //     "Trail"    (UTraceTrailComponent)             -> chevrons    a trace kill
 //     "Bullet"   (UTraceWeaponComponent)            -> skull       IF it was a head shot
-//                                                   -> round       body / leg
+//                                                   -> smg         body / leg, killer had the SMG out
+//                                                   -> pistol      body / leg otherwise
 //     "Fell"     (ATraceCharacter)                  -> cross       the arena took them
 //
+// (IconForCause in the .cpp also maps the knife, backstab, explicit-"Headshot" and rocket causes
+// their owning slices added since this table was first written.)
+//
 // See ResolveBulletIcon() in the .cpp for how the head shot is recovered, what it is exact about,
-// and the one-line change in another slice's file that would make it exact in every case.
+// and the one-line change in another slice's file that would make it exact in every case — and
+// HandleDeath for how the SMG split is read off the killer's own equipped weapon.
 
 #pragma once
 
@@ -114,7 +119,15 @@ enum class ETraceKillIcon : uint8
 	 * shot by a gun they never saw and could have duelled. The rocket is dodged, not out-aimed, and a
 	 * player who cannot tell which of the two killed them cannot learn anything from the feed.
 	 */
-	Ability = 7
+	Ability = 7,
+	/**
+	 * Cause "Bullet" whose killer had the SMG out (bible §7.3 / UI WP6.4). Resolved by the relay
+	 * from the killer's equipped weapon at the instant of the death — exact for this game's
+	 * hitscan guns, because HandleDeath runs synchronously inside the same ApplyDamage call stack
+	 * as the shot. A second gun deserved a second glyph for the same reason the rocket got one:
+	 * "which weapon beat me" is the feed's whole answer.
+	 */
+	Smg = 8
 };
 
 /**

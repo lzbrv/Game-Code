@@ -36,9 +36,23 @@ namespace TraceAutoShot
 	void Arm(AHUD* OwnerHUD, const TCHAR* Tag);
 
 	/**
-	 * Runs console commands a fixed number of seconds after a HUD comes up.
+	 * Runs console commands a fixed number of seconds after a HUD comes up, in up to TWO rounds.
 	 *
 	 *     -TraceExec="Trace.VerifyKnobs|Trace.ModeB.Verify"  -TraceExecAt=8
+	 *     -TraceExec2="Trace.Characters.BodyMesh"            -TraceExec2At=30  -TraceExec2On=Match
+	 *
+	 * *** THE SECOND ROUND IS NOT A CONVENIENCE, IT IS THE ONLY WAY TO SEQUENCE TWO COMMANDS. ***
+	 * Every command of one round fires in ONE callback, back to back, in a single frame — see the
+	 * implementation's "one timer, not one per command". So a pair where the first command CHANGES
+	 * state the second must READ cannot be expressed as one round at all: the character census
+	 * (PIPELINE_DESIGN.md §9.3) selects a character, whose body lands on a later poll tick, and then
+	 * has to look at it. Round 2 is that gap, expressed on the command line instead of in a comment
+	 * saying "hope it settles".
+	 *
+	 * Each round has its own On= tag and its own At= delay, and each arms independently: -TraceExec2
+	 * on its own behaves exactly like -TraceExec. -TraceExec2At DEFAULTS to ten seconds after round
+	 * 1's resolved delay rather than to a fixed number, so moving -TraceExecAt cannot silently invert
+	 * the order of the two rounds.
 	 *
 	 * WHY THIS EXISTS. The project's verification commands (Trace.VerifyKnobs, Trace.ModeB.Verify,
 	 * Trace.Trail.TestHeadGap, Trace.TestRecoil, ...) only mean anything once there is a match, a
@@ -50,11 +64,13 @@ namespace TraceAutoShot
 	 * Commands are separated by '|' rather than ',' because several of them take numeric arguments
 	 * and a comma would have to be escaped past both the shell and FParse.
 	 *
-	 * Same arm-once-per-world rule as Arm(): a HUD is rebuilt on travel, so the menu HUD and the
-	 * match HUD each get one chance, and @p Tag decides which. Dev-only; compiles out of Shipping.
+	 * Same arm-once-per-world rule as Arm(), PER ROUND: a HUD is rebuilt on travel, so the menu HUD
+	 * and the match HUD each get one chance at each round, and @p Tag decides which. Dev-only;
+	 * compiles out of Shipping.
 	 *
-	 * @param Tag Must match -TraceExecOn= (default "Match") or nothing is scheduled. This is what
-	 *            stops a match-only command from firing against the title screen.
+	 * @param Tag Must match -TraceExecOn= / -TraceExec2On= (each defaulting to "Match") or that round
+	 *            schedules nothing. This is what stops a match-only command from firing against the
+	 *            title screen.
 	 */
 	void ArmDeferredExec(AHUD* OwnerHUD, const TCHAR* Tag);
 }

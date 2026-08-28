@@ -33,6 +33,7 @@
 #include "UObject/WeakObjectPtr.h"
 
 #include "Settings/TraceUserSettings.h"   // ETraceInputAction
+#include "UI/TraceNetworking.h"           // FTraceTextEntry - the CALL SIGN row types in it (WP2.2)
 #include "UI/Text/TraceTextWeight.h"      // ETraceTextWeight - which FACE a string is set in (v26 §2)
 
 class AHUD;
@@ -141,7 +142,24 @@ public:
 		 * sixth destination on it. It IS on the settings page, which is the only route the title screen
 		 * has to anything.
 		 */
-		Crosshair
+		Crosshair,
+
+		/**
+		 * UI PLAN WP3 — master / effects / music.
+		 *
+		 * ITS OWN PAGE, and reached from SETTINGS rather than from the pause root — the same shape as
+		 * CROSSHAIR and for the same two reasons. The settings page is already twenty-odd rows and
+		 * three more sliders would push the pitch further into its 18px floor at 720p; and the pause
+		 * root stays five rows, because VIDEO earned its place there by an emergency (spec v11 §0: a
+		 * collapsed frame rate) and loudness is not one. A player who wants the music down can afford
+		 * the two-click walk; a player at 8 fps cannot.
+		 *
+		 * WHY IT IS A PAGE AT ALL RATHER THAN THREE ROWS ON SETTINGS: the three faders are read
+		 * TOGETHER — "effects too loud relative to music" is the question, and it is answered by
+		 * seeing all three tracks stacked — which is exactly the argument the QUALITY block on the
+		 * video page makes for its nine.
+		 */
+		Audio
 	};
 
 	// ---- Host callbacks -------------------------------------------------------------------------
@@ -180,6 +198,14 @@ public:
 	 * page nobody can be shown to have checked.
 	 */
 	void OpenCrosshair();
+
+	/**
+	 * UI PLAN WP3 — opens straight on the audio page, with BACK closing the overlay.
+	 *
+	 * Triplet of OpenVideo and OpenCrosshair, and it exists for the identical headless reason:
+	 * `Trace.Menu.Audio` is the only way a run with no keyboard can photograph this page.
+	 */
+	void OpenAudio();
 
 	/** Closes, fires OnClosed, and abandons any rebind that was in progress. */
 	void Close();
@@ -320,6 +346,16 @@ private:
 		Choice,
 		/** A rebindable action. */
 		Binding,
+		/**
+		 * UI PLAN WP2.2 — a one-line string the player TYPES. Exactly one row is one: CALL SIGN.
+		 *
+		 * A KIND OF ITS OWN and not a Choice over a list of names, because the value is unbounded:
+		 * arrows cannot walk an alphabet, and the row has to hand the keyboard to FTraceTextEntry for
+		 * the duration of an edit — the same handover the JOIN prompt performs on the title screen,
+		 * through the same class, so the caret, the blink, the paste and the backspace repeat are one
+		 * implementation rather than two.
+		 */
+		TextEntry,
 		/** A button: RESUME, RESET, BACK... */
 		Action
 	};
@@ -332,6 +368,8 @@ private:
 		OpenVideo,
 		/** SPEC v29 §3 — the CROSSHAIR row on the settings page. */
 		OpenCrosshair,
+		/** UI PLAN WP3 — the AUDIO row on the settings page. */
+		OpenAudio,
 		ReturnToTitle,
 		Quit,
 		ResetDefaults,
@@ -354,6 +392,14 @@ private:
 		 * the seven crosshair fields and no others.
 		 */
 		ResetCrosshairDefaults,
+		/**
+		 * UI PLAN WP3 — puts the three VOLUME faders back to their shipped defaults, and nothing else.
+		 *
+		 * A fourth separate reset. The rule is now stated three times above and holds here without
+		 * further argument: a reset row belongs to the page it is drawn on. It goes through
+		 * UTraceUserSettings::ResetAudioToDefaults, which touches the three faders and no other field.
+		 */
+		ResetAudioDefaults,
 		Back
 	};
 
@@ -404,6 +450,29 @@ private:
 		CrosshairOpacity,
 		CrosshairDot,
 		CrosshairOutline,
+
+		/**
+		 * UI PLAN WP2.2 — the CALL SIGN row.
+		 *
+		 * *** ABOVE THE VIDEO BLOCK, for the third time and for the same load-bearing reason. ***
+		 * IsVideoSetting() is `>= ResolutionScale`; a call sign routed through UTraceGameUserSettings
+		 * would be a row that took input and changed nothing. It is a TextEntry row, so it never
+		 * reaches GetSettingValue at all — but the enum's own rule does not admit exceptions, because
+		 * an exception is how the next row lands on the wrong side of the line.
+		 */
+		CallSign,
+
+		/**
+		 * UI PLAN WP3 — the three player faders. Above the video block, same rule, same reason.
+		 *
+		 * They live on UTraceUserSettings (per-machine taste, never in a diff) and multiply into
+		 * UTraceAudioSubsystem::VolumeFor — they are NOT UTraceAudioSettings::MasterVolume, which is
+		 * the designer's checked-in mix. The argument is written out on the properties themselves in
+		 * Settings/TraceUserSettings.h.
+		 */
+		MasterVolume,
+		SfxVolume,
+		MusicVolume,
 
 		// ---- Video. IsVideoSetting() is the boundary and depends on this ordering. ----
 		ResolutionScale,
@@ -610,6 +679,45 @@ private:
 	 */
 	void DrawCrosshairPreview(AHUD* HUD, float X, float Y, float W, float H);
 
+	// ---- Call sign (UI plan WP2) -----------------------------------------------------------------
+	//
+	// THIS PAGE OWNS NO NAME EITHER — the third repetition of the rule the video and crosshair blocks
+	// state. The row reads UTraceUserSettings::GetCallSignOrDefault() on the frame it is drawn and
+	// writes UTraceUserSettings::CallSign on the frame the player commits, and the FIELD (the caret,
+	// the text being typed) belongs to CallSignEntry rather than to a second copy of the string here.
+
+	/** Hands the keyboard to CallSignEntry, seeded with the stored name. Called by ActivateSelected. */
+	void BeginCallSignEntry();
+
+	/**
+	 * Services the field while it is active, and applies the result on the frame it is committed.
+	 *
+	 * Called from Tick BEFORE PollInput and returns true when the field consumed this frame — which
+	 * is the "the host must not route its own bindings while IsActive()" rule FTraceTextEntry's header
+	 * states, applied one level down: this class is the host, and its own arrow keys, Enter, Escape
+	 * and Backspace would otherwise fight the player's typing for every one of those keys.
+	 */
+	bool TickCallSignEntry(APlayerController* PC);
+
+	/** Writes, saves and pushes the typed name at the live match. The submit half of WP2.4. */
+	void CommitCallSign();
+
+	// ---- Audio (UI plan WP3) ---------------------------------------------------------------------
+
+	/**
+	 * The click the player hears when they move a fader, rate-limited.
+	 *
+	 * A volume slider with no sound is a volume slider a player has to leave the menu to evaluate.
+	 * The sample goes through UTraceAudioSubsystem::PlayLocalNow, which routes through VolumeFor and
+	 * therefore through the very fader being dragged — so what the player hears IS the level they are
+	 * choosing, not a preview of it.
+	 *
+	 * NOT ON THE MUSIC ROW: the bed is already playing and RefreshVolume() moves it live, so a
+	 * one-shot on top of it would be a second, unrelated sound answering a question the music itself
+	 * is already answering.
+	 */
+	void PreviewAudioChange(ESetting Setting);
+
 	// ---- Field of view --------------------------------------------------------------------------
 	//
 	// The VALUE lives in UTraceGameUserSettings, which persists it and pushes it onto live cameras.
@@ -701,6 +809,30 @@ private:
 	 * the overlay instead of dropping the player onto a page they never opened.
 	 */
 	EPage CrosshairReturnPage = EPage::Settings;
+
+	/** UI PLAN WP3 — where BACK goes from the AUDIO page. Same contract as CrosshairReturnPage. */
+	EPage AudioReturnPage = EPage::Settings;
+
+	/**
+	 * UI PLAN WP2.2 — the CALL SIGN field.
+	 *
+	 * The SAME class the JOIN prompt uses (UI/TraceNetworking.h), opened in
+	 * ETraceTextCharset::CallSign at 16 characters. It is only ever active while the CALL SIGN row is
+	 * being edited; IsActive() is what the input routing branches on.
+	 */
+	FTraceTextEntry CallSignEntry;
+
+	/**
+	 * Real time of the last fader preview click, for the 120 ms throttle.
+	 *
+	 * REAL time and not the world time in `Now`: the in-match pause menu stops the world, so a throttle
+	 * measured against world time would never expire there and the very first click would be the only
+	 * one a paused player ever heard.
+	 */
+	double LastAudioPreviewRealTime = -1000.0;
+
+	/** How close together two preview clicks may be. A held arrow key steps every 55 ms; this halves it. */
+	static constexpr double AudioPreviewMinInterval = 0.120;
 
 	// ---- SPEC v28 §3a — THE SWALLOWED FIRST PRESS -----------------------------------------------
 	//

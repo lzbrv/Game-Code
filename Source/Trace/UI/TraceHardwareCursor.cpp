@@ -5,14 +5,19 @@
 #include "Containers/Ticker.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
+#include "Engine/Texture2D.h"             // the pointer sprite
+#include "TextureResource.h"              // FTextureResource::TextureRHI — see PointerSprite
 #include "Engine/World.h"
 #include "Framework/Application/SlateApplication.h"
+#include "GameFramework/HUD.h"            // AHUD::DrawTexture — the one pointer draw
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
 #include "UnrealClient.h"                 // FViewport
 
 #include "Trace.h"                        // LogTraceGame
 #include "UI/TraceMenuHUD.h"              // ATraceMenuHUD::IsOptionsOpen — see PollMenuSurfaces
+#include "UI/Widgets/Menu/TraceMenuArtStyle.h"   // the sprite's path, aspect and tip — named once
+#include "UI/Widgets/Menu/TraceMenuPalette.h"    // TraceMenuStyle::Cyan — see PointerTint
 
 // Named after the file, not anonymous. Scripts/check-jumbo-build-collisions.py, and the unity build
 // it exists to protect: two files' anonymous namespaces become one under UBT's jumbo compilation.
@@ -258,6 +263,72 @@ namespace TraceHardwareCursorFile
 				FTickerDelegate::CreateStatic(&TraceHardwareCursorFile::Tick), 0.f);
 		}
 	}
+
+	// ---- The sprite, cached once for every surface that draws it --------------------------------
+
+	static TWeakObjectPtr<UTexture2D> PointerCache;
+
+	/** Set once a load genuinely fails, so a build with no menu art does not hunt for it every frame. */
+	static bool bPointerFailed = false;
+
+	static bool bLoggedPointer = false;
+
+	/**
+	 * T_MenuCursor, or null.
+	 *
+	 * WEAK, for the reason FTraceCharacterSelect's own art cache spells out: this is a menu texture
+	 * being drawn from inside a live match, nothing on the arena map references it, and a raw pointer
+	 * would be collected out from under a long match and then drawn through.
+	 *
+	 * DRAWABLE, not merely loaded. AHUD::DrawTexture hands `GetResource()` straight to an
+	 * FCanvasTileItem and checks only the UTexture, so a texture whose FTextureResource::TextureRHI
+	 * has not arrived yet is a batched element the render thread dies on. UI/TraceOptionsMenu.cpp has
+	 * the measurement; character select is the case that makes it likely, because it is the first
+	 * thing in a match to touch /Game/Trace/UI/Art at all.
+	 */
+	static UTexture2D* PointerSprite()
+	{
+		if (bPointerFailed)
+		{
+			return nullptr;
+		}
+
+		UTexture2D* Texture = PointerCache.Get();
+		if (Texture == nullptr)
+		{
+			Texture = LoadObject<UTexture2D>(nullptr, TraceMenuArtStyle::Cursor);
+			if (Texture == nullptr)
+			{
+				bPointerFailed = true;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Cursor] %s did not load. Every surface falls back to the vector cross it "
+					     "drew before the sprite existed; the pointer is still on screen."),
+					TraceMenuArtStyle::Cursor);
+				return nullptr;
+			}
+			PointerCache = Texture;
+		}
+
+		const FTextureResource* Resource = Texture->GetResource();
+		if (Resource == nullptr || !Resource->TextureRHI.IsValid())
+		{
+			return nullptr;
+		}
+
+		if (!bLoggedPointer)
+		{
+			bLoggedPointer = true;
+			const FLinearColor Tint = TraceHardwareCursor::PointerTint();
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Cursor] One pointer for every surface: %s, %.0f reference px tall, aspect %.4f, "
+				     "tip (%.4f, %.4f), tint (%.2f, %.2f, %.2f)."),
+				TraceMenuArtStyle::Cursor, TraceHardwareCursor::PointerHeight(1.f),
+				TraceMenuArtStyle::CursorAspect, TraceMenuArtStyle::CursorTipU, TraceMenuArtStyle::CursorTipV,
+				Tint.R, Tint.G, Tint.B);
+		}
+
+		return Texture;
+	}
 }
 
 void TraceHardwareCursor::EnsureRunning()
@@ -306,6 +377,51 @@ void TraceHardwareCursor::ReleaseNow()
 bool TraceHardwareCursor::IsRedArmed()
 {
 	return TraceHardwareCursorFile::GHardwareCursorRedArm != 0;
+}
+
+// =================================================================================================
+// WHAT THE POINTER IS — see the second block of the header
+// =================================================================================================
+
+FLinearColor TraceHardwareCursor::PointerTint()
+{
+	// THE INTERFACE CYAN ITSELF, not a copy of its three floats. TraceMenuStyle::Cyan is the value
+	// the title palette's own comment calls "a cyan that carries the interface", and reading it
+	// rather than restating it is what stops this from becoming the fourth place that number lives.
+	// It costs nothing: the include is confined to this .cpp, so the select screen still does not
+	// compile the menu map's types to draw an arrow.
+	return TraceMenuStyle::Cyan;
+}
+
+float TraceHardwareCursor::PointerHeight(float InUIScale)
+{
+	// 30 reference pixels. Both Canvas surfaces already used exactly this; the number moves here so
+	// the UMG title screen can size its UImage from the same place instead of from its own asset.
+	return 30.f * FMath::Max(0.01f, InUIScale);
+}
+
+bool TraceHardwareCursor::DrawPointer(AHUD* HUD, const FVector2D& TipPos, float InUIScale)
+{
+	if (HUD == nullptr)
+	{
+		return false;
+	}
+
+	UTexture2D* Arrow = TraceHardwareCursorFile::PointerSprite();
+	if (Arrow == nullptr)
+	{
+		return false;
+	}
+
+	const float ArrowH = PointerHeight(InUIScale);
+	const float ArrowW = ArrowH * TraceMenuArtStyle::CursorAspect;
+
+	HUD->DrawTexture(Arrow,
+		TipPos.X - ArrowW * TraceMenuArtStyle::CursorTipU,
+		TipPos.Y - ArrowH * TraceMenuArtStyle::CursorTipV,
+		ArrowW, ArrowH, 0.f, 0.f, 1.f, 1.f, PointerTint());
+
+	return true;
 }
 
 FString TraceHardwareCursor::Describe()

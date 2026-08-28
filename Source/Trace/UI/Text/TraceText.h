@@ -69,6 +69,38 @@
 // `Trace.Text.Atlas 0` was typed, every function here switches to TraceMenuArtStyle::MenuFont (Lato)
 // AND KEEPS WORKING — measurement included, so a caller's layout stays correct in the degraded path.
 // A menu in the wrong font beats a menu with no text. `Trace.Text.Report` says which is live.
+//
+// =================================================================================================
+// AND A SECOND, SMALLER FALLBACK: PER GLYPH (UI plan WP12)
+// =================================================================================================
+// The one above is all-or-nothing and answers "is the atlas usable at all". This one answers a
+// different question, one codepoint at a time, while the atlas is perfectly healthy.
+//
+// The three licensed sheets are PRINTABLE ASCII. Every string this game authors is inside that set;
+// the one class of string it does not author is a PLAYER NAME. "Björn" arriving over the network
+// had no cell for its ö, so LayoutString advanced the pen by a space and drew nothing — a hole in
+// the kill feed, in a name, which is the most conspicuous place in the game to have one.
+//
+// Extending Sofachrome or Erbaum to cover Latin-1 was ruled out: it rasterises more of two faces
+// this public repository may not redistribute (docs/FONTS.md). Instead there is a FOURTH sheet,
+// T_FontAtlasNames — Lato, which is OFL and whose .ttf is already committed — rasterised over
+// Latin-1 plus a few typographic marks. A codepoint the DRAWING face has no cell for is drawn from
+// that sheet, scaled by the same em and shifted so its baseline lands on the line's baseline; a
+// codepoint missing from BOTH draws that sheet's '?' rather than advancing silently.
+//
+// Three consequences worth stating, because each is a decision:
+//
+//   * IT IS GLOBAL, not a names-only special case. One code path, in LayoutString(), so a
+//     non-ASCII character cannot draw correctly in the kill feed and as a hole somewhere else.
+//   * IT IS NOT A WEIGHT. Nothing can ASK to draw in it — ETraceTextWeight does not list it and
+//     WeightFromName() cannot return it. It is reached only by a codepoint, never by a style.
+//   * "Björn" therefore sets its ö in Lato inside an Erbaum line. That is what font fallback is,
+//     it only ever happens on characters the licensed faces were never rasterised for, and only
+//     in strings the game did not write. `Trace.Text.GlyphFallback 0` puts the holes back for a
+//     same-binary before/after.
+//
+// A quad from that sheet is flagged FGlyphQuad::bFallback, and a renderer must sample the texture
+// QuadTexture() hands back for it rather than the style's own sheet.
 
 #pragma once
 
@@ -144,6 +176,20 @@ namespace TraceText
 		FVector2f Size = FVector2f::ZeroVector;
 		FVector2f UVMin = FVector2f::ZeroVector;
 		FVector2f UVSize = FVector2f::ZeroVector;
+
+		/**
+		 * True when this glyph came from the Latin-1 FALLBACK sheet rather than the style's own
+		 * face — see the per-glyph fallback block at the top of this file.
+		 *
+		 * *** THE UVs ARE NORMALISED AGAINST A DIFFERENT TEXTURE WHEN THIS IS SET. *** A renderer
+		 * that ignored it would address the fallback sheet's cells on the style's sheet and draw
+		 * a smear of the wrong letters. Ask QuadTexture() rather than branching on it: it is the
+		 * one place that knows which sheet each flag maps to.
+		 *
+		 * Pos is already shifted onto the drawing face's baseline, so nothing else about a
+		 * fallback quad is special.
+		 */
+		bool bFallback = false;
 	};
 
 	// =============================================================================================
@@ -212,6 +258,44 @@ namespace TraceText
 	TRACE_API UTexture2D* AtlasTexture(ETraceTextWeight Weight = ETraceTextWeight::Light);
 
 	// =============================================================================================
+	// THE PER-GLYPH FALLBACK SHEET (WP12) — what a renderer and a diagnostic need of it
+	// =============================================================================================
+
+	/**
+	 * The sheet a quad should be sampled from. THE ONLY THING A RENDERER NEEDS TO KNOW about the
+	 * per-glyph fallback.
+	 *
+	 * Pass the weight the quads were laid out in. A quad from the style's own face comes back with
+	 * the same texture AtlasTexture() would hand over; one from the Latin-1 sheet comes back with
+	 * that instead. Both renderers in this module call it per quad and change nothing else.
+	 */
+	TRACE_API UTexture2D* QuadTexture(const FGlyphQuad& Quad,
+		ETraceTextWeight Weight = ETraceTextWeight::Light);
+
+	/**
+	 * True when the Latin-1 sheet resolved and is allowed to serve missing glyphs.
+	 *
+	 * False means the old behaviour: a codepoint outside printable ASCII advances the pen and draws
+	 * nothing. Callers do not need to branch on it — it is here so `Trace.Text.Report` and the
+	 * preview can state which of the two behaviours produced the pixels.
+	 */
+	TRACE_API bool IsGlyphFallbackActive();
+
+	/** "Lato-Regular.ttf" — the file the fallback glyphs are rasterised from, for a caption. */
+	TRACE_API const TCHAR* FallbackFaceSourceFile();
+
+	/**
+	 * True when @p Char will reach the screen as ITSELF: it has a cell in @p Weight's own sheet, or
+	 * in the Latin-1 fallback sheet, or it is whitespace (which correctly draws nothing).
+	 *
+	 * False means the character has no cell ANYWHERE and will draw the fallback sheet's '?'. That
+	 * is the only case worth a log line, and it is what TraceHUD's WarnIfUndrawable asks. Answering
+	 * from here rather than from a hard-coded range keeps the charset in one place: this module is
+	 * still the only thing that includes TraceFontAtlasMetrics.h.
+	 */
+	TRACE_API bool CanDraw(TCHAR Char, ETraceTextWeight Weight = ETraceTextWeight::Light);
+
+	// =============================================================================================
 	// METRICS — all in screen pixels at @p Size, and all correct in the fallback too
 	// =============================================================================================
 
@@ -266,6 +350,10 @@ namespace TraceText
 	 * Returns false when the atlas is not live, in which case OutQuads is emptied and the caller must
 	 * take its own fallback path (both renderers in this module do). Whitespace produces no quad but
 	 * still advances the pen.
+	 *
+	 * Quads are NOT guaranteed to come from one texture: a codepoint the style's face has no cell
+	 * for comes back flagged bFallback, addressing the Latin-1 sheet. Sample QuadTexture(), not
+	 * AtlasTexture(), for each one.
 	 */
 	TRACE_API bool LayoutString(const FString& Text, const FStyle& Style, TArray<FGlyphQuad>& OutQuads);
 

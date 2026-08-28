@@ -172,6 +172,27 @@ namespace TraceNet
 }
 
 /**
+ * Which alphabet a field will accept — UI plan WP2.3.
+ *
+ * ONE FIELD CLASS, TWO ALPHABETS, and the mode is a property of the OPENING rather than of the
+ * class: the join prompt and the CALL SIGN row want the same caret, the same blink, the same paste
+ * and the same repeat, and differ only in which characters are legal. A second class would have
+ * been a second copy of every one of those behaviours.
+ *
+ *   Address   — letters, digits, '.', ':', '-', '_'. What ClientTravel can be handed. The default,
+ *               so the join prompt's Begin() call is unchanged.
+ *   CallSign  — letters, digits, SPACE, '-', '_', '.'. A name, not a URL: ':' and ';' are refused
+ *               because they are the two characters an address wants and a name never does, and
+ *               because a call sign carrying a colon reads as a truncated endpoint everywhere it
+ *               is printed (kill feed, scoreboard, log lines).
+ */
+enum class ETraceTextCharset : uint8
+{
+	Address = 0,
+	CallSign
+};
+
+/**
  * A one-line text field driven entirely by polled key state.
  *
  * WHY POLLING. The menu is Canvas-drawn and this project has no Slate widgets to focus, so there is
@@ -181,17 +202,32 @@ namespace TraceNet
  * pattern in this codebase rather than a second one.
  *
  * The cost of polling is that the key -> character mapping has to be written down (see the table in
- * the .cpp). That table is deliberately restricted to what an address can contain — letters, digits,
- * dot, colon, hyphen, underscore — which also means a stray key press can never corrupt the field.
+ * the .cpp). That table is deliberately restricted to what a field may contain — see
+ * ETraceTextCharset — which also means a stray key press can never corrupt the field.
  *
  * The host must not route its own bindings while IsActive(); the title screen checks it exactly the
- * way it already checks FTraceOptionsMenu::IsOpen().
+ * way it already checks FTraceOptionsMenu::IsOpen(), and so does the CALL SIGN row on the settings
+ * page (FTraceOptionsMenu::Tick).
  */
 class TRACE_API FTraceTextEntry
 {
 public:
-	/** Starts editing, with the caret at the end of @p InitialText. */
-	void Begin(const FString& InitialText);
+	/** The address field's cap, and the default for any caller that does not state one. */
+	static constexpr int32 DefaultMaxLength = 64;
+
+	/**
+	 * Starts editing, with the caret at the end of @p InitialText.
+	 *
+	 * @param InCharset    which alphabet is legal. Defaults to Address — zero-diff for the join prompt.
+	 * @param InMaxLength  hard cap on the text, in characters. Defaults to the 64 an address gets;
+	 *                     WP2.3 passes 16 for a call sign. Clamped to at least 1, because a field
+	 *                     that can hold nothing is a field that silently eats every key press.
+	 */
+	void Begin(const FString& InitialText, ETraceTextCharset InCharset = ETraceTextCharset::Address,
+		int32 InMaxLength = DefaultMaxLength);
+
+	/** Which alphabet this opening is accepting. Meaningless while !IsActive(). */
+	ETraceTextCharset GetCharset() const { return Charset; }
 
 	/** Stops editing and clears the pending submit/cancel edges. */
 	void End();
@@ -226,8 +262,14 @@ public:
 	bool WasRecentlyPasted(float Now) const { return (Now - LastPasteTime) < 2.f; }
 
 private:
-	/** Appends @p Char at the caret if the field has room and the character is legal. */
-	void InsertChar(TCHAR Char);
+	/**
+	 * Appends @p Char at the caret if the field has room and the character is legal for the charset
+	 * this opening was Begun with.
+	 *
+	 * @return true when the character actually landed. The caller uses that to decide whether the
+	 *         keystroke counts as an edit — see the caret blink in Poll.
+	 */
+	bool InsertChar(TCHAR Char);
 
 	void Backspace();
 	void DeleteForward();
@@ -252,7 +294,20 @@ private:
 	float NextRepeatTime = 0.f;
 	bool bRepeatArmed = false;
 
-	static constexpr int32 MaxLength = 64;
+	/** WP2.3 — which alphabet the current opening accepts. Set by Begin, never guessed at. */
+	ETraceTextCharset Charset = ETraceTextCharset::Address;
+
+	/**
+	 * WP2.3 — the cap, per OPENING rather than per class.
+	 *
+	 * It was a `static constexpr int32 MaxLength = 64` until the call sign needed 16. An instance
+	 * field is what lets one field class serve both without either caller having to trim the string
+	 * afterwards — and trimming afterwards is exactly the bug it avoids: a 40-character paste into a
+	 * 16-character name would otherwise be accepted here, drawn here, and silently truncated by the
+	 * settings accessor, so the row and the game would disagree about the player's own name.
+	 */
+	int32 MaxLength = DefaultMaxLength;
+
 	static constexpr float RepeatDelay = 0.40f;
 	static constexpr float RepeatInterval = 0.045f;
 };

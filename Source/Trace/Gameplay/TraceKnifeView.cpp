@@ -135,14 +135,14 @@ namespace TraceKnifeViewFile
 		TEXT("at a third of what it should look like because a first-person primitive is drawn with ")
 		TEXT("its depth compressed. Reaches only the ViewModelRoot path: with pack hands up the hold ")
 		TEXT("comes from Trace.Knife.HoldSwing/HoldFlat instead."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	static TAutoConsoleVariable<float> CVarHoldYaw(
 		TEXT("Trace.Knife.HoldYaw"),
 		-10.f,
 		TEXT("Spec v33. The NO-HANDS fallback blade's YAW in rig space, degrees, negative = the ")
 		TEXT("point crosses inboard toward the crosshair. Not depth-compressed, so close to literal."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	static TAutoConsoleVariable<float> CVarHoldRoll(
 		TEXT("Trace.Knife.HoldRoll"),
@@ -150,7 +150,7 @@ namespace TraceKnifeViewFile
 		TEXT("Spec v33. The NO-HANDS fallback blade's ROLL in rig space, degrees. Turns the lit edge ")
 		TEXT("— the cyan channel, the only part of the blade that glows — toward the camera. On the ")
 		TEXT("wrist the equivalent knob is Trace.Knife.HoldFlat."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * *** THE HELD ATTITUDE IN RIG SPACE — THE NO-HANDS FALLBACK'S POSE, AND ONLY ITS POSE. ***
@@ -222,7 +222,7 @@ namespace TraceKnifeViewFile
 		TEXT("pivot itself (which is what shipped, and it buried the whole handle in the hand), 0.5 = ")
 		TEXT("the middle of the handle, 1 = on the pommel. Multiplied by the MEASURED handle length, ")
 		TEXT("never typed as an absolute."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * *** SCALE IS 1.0 AND THAT IS A DECISION, WITH THE BASE IT MODIFIES WRITTEN NEXT TO IT. ***
@@ -399,7 +399,7 @@ namespace TraceKnifeViewFile
 		TEXT("A_Knife_Stab, at up to 0.9 opacity, driven off the SAME StabPeakFraction the 4.4x cyan ")
 		TEXT("flash uses. 0 = never show it, which is the red arm for Trace.Knife.PackDemo and for ")
 		TEXT("Trace.Knife.StreakProbe."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	// =============================================================================================
 	// SWITCHES
@@ -420,7 +420,7 @@ namespace TraceKnifeViewFile
 		TEXT("Spec v31 s5. 1 = draw the pack's SK_TraceKnife with its four authored clips and hide ")
 		TEXT("the procedural cube blade. 0 = the v27 cube blade, which is also what a checkout with ")
 		TEXT("no LFS pull gets. Trace.Knife.PackStatus reports which one is live."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * *** WHERE THE BLADE HANGS: THE HAND'S WRIST, OR THE RIG ROOT. ***
@@ -446,7 +446,7 @@ namespace TraceKnifeViewFile
 		TEXT("Spec v31 s5/s6. 1 = parent the pack blade to the gloved hands' wrist_right bone when ")
 		TEXT("that rig exists (the pack's stated attachment). 0 = always hang it off ViewModelRoot at ")
 		TEXT("this file's own rest pose. Trace.Knife.PackStatus reports which was used."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/** The bone the pack's hands doc names for a right-handed one-hand hold. */
 	static const FName WristRightBone(TEXT("wrist_right"));
@@ -544,7 +544,7 @@ namespace TraceKnifeViewFile
 		TEXT("the grip channel the curled fingers make (the hammer grip, and the anatomical answer); ")
 		TEXT("90 = the handle lies along the fingers, which is the pose the user photographed as ")
 		TEXT("'clipping through the hand'. 40 is the sabre grip. Live."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * THE ROLL ABOUT THE BLADE'S OWN LONG AXIS, MEASURED FROM FLAT-TO-THE-LENS.
@@ -563,7 +563,7 @@ namespace TraceKnifeViewFile
 		0.f,
 		TEXT("Spec v33. Degrees of roll about the blade's own long axis, measured from the attitude ")
 		TEXT("that presents the blade's flat to the lens. 180 flips the cutting edge. Live."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * HOW FAR INTO THE PALM THE HANDLE SITS, in uu along the measured palm normal.
@@ -581,7 +581,7 @@ namespace TraceKnifeViewFile
 		TEXT("Spec v33. uu along the measured palm normal, positive = deeper into the finger curl. ")
 		TEXT("Offsets the handle off the published fist centroid, which is the centre of the closed ")
 		TEXT("hand rather than the centre of the grip tube. Live."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/**
 	 * *** NO LONGER THE SHIPPED POSE. THIS IS THE FALLBACK FOR WHEN THE HANDS RIG WILL NOT ANSWER,
@@ -610,7 +610,7 @@ namespace TraceKnifeViewFile
 		0,
 		TEXT("Spec v31 s5. 1 = print one line every time the blade changes clip, naming the clip and ")
 		TEXT("the state that chose it. This is how a 0.30 s stab is verified without a camera."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/** Ping-pong 0..1..0 over [0,1], for the breathing idles. Cheap, and phase-continuous. */
 	static float Breathe(float Alpha01)

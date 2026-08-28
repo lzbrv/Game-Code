@@ -245,6 +245,23 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Footstep Volume Boost (dB, on top of the scale above) [v31 §3]", ClampMin = "-24.0", ClampMax = "24.0", UIMin = "0.0", UIMax = "12.0"))
 	float FootstepVolumeBoostDb = 5.0f;
 
+	// =============================================================================================
+	// RELEASE FX/AUDIO PLAN §5.6 — MUSIC GETS ITS OWN VOLUME KNOB, THE SAME SHAPE AS THE FOOTSTEPS'
+	// =============================================================================================
+	//
+	// A MULTIPLIER ON THE MASTER, never an absolute level — the standing rule, third application
+	// (VolumeTrim, FootstepVolumeScale, now this). It applies BY FAMILY: the four
+	// ETraceSoundFamily::Music rows (MusicTitle, AmbienceMatch, StingerVictory, StingerDefeat)
+	// carry it, declared on the row in TraceSoundEvents.cpp, so a fifth music event added tomorrow
+	// gets the knob by being declared music and nothing gets it by name-matching "Music".
+	//
+	// 0.7 rather than 1.0 because music is a BED: MusicTitle is RMS-normalized to -12 dBFS, which
+	// at unity gain would sit well above the UI one-shots it plays under. Readers:
+	// UTraceMusicSubsystem (Audio/TraceMusicPlayer.h) applies Master x this to its persistent 2D
+	// component; the audio-settings page's music slider edits it (a user gain multiplies on top).
+	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Music Volume (x Master)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+	float MusicVolumeScale = 0.7f;
+
 	/**
 	 * SPEC v29 §1c — how long without firing resets the pistol ladder to PistolShoot1.
 	 *

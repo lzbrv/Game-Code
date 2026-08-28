@@ -5,6 +5,8 @@
 #include "Abilities/TraceAbilityComponent.h"                  // spec v14 §5 — the E / V binds
 #include "Abilities/Characters/TraceAbilityInputRelay.h"      // ... and Mace's reactivation routing
 #include "Audio/TraceAudio.h"              // spec v26 §9 — the hitmarker sounds, client-side
+#include "Camera/CameraTypes.h"            // FMinimalViewInfo — the view kick modifier's payload
+#include "Camera/PlayerCameraManager.h"    // FX plan §1.5 — the view kick's modifier lives on it
 #include "Containers/Ticker.h"             // FTSTicker — the v13 §2 hotkey probe
 #include "Core/TraceCharacter.h"
 #include "Core/TracePlayerState.h"
@@ -16,6 +18,7 @@
 #include "Engine/LocalPlayer.h"
 #include "Engine/NetDriver.h"           // UNetDriver::ClientConnections, for the solo-pause test
 #include "Engine/World.h"
+#include "TimerManager.h"                  // WP2.4 — the call-sign push retries until a PlayerState exists
 #include "GameFramework/Character.h"       // ACharacter::Jump / StopJumping on ATraceCharacter
 #include "GameFramework/GameModeBase.h"
 #include "GameFramework/GameStateBase.h"   // PlayerArray, for the TraceNetInfo roster dump
@@ -351,6 +354,11 @@ void ATracePlayerController::BeginPlay()
 		// reach this map without ever having seen the title screen (Scripts/run-client.sh, or `open
 		// <ip>` from the console). Idempotent.
 		TraceNet::BindFailureHandlers();
+
+		// UI PLAN WP2.4 — the player's CALL SIGN, pushed at the server the moment we have a
+		// PlayerState to rename. See ApplyStoredCallSign for why this is a rename RPC and not a
+		// local write, and why it retries.
+		ApplyStoredCallSign(/*AttemptsLeft*/ 20);
 	}
 
 	// Every controller, not just the local one, and at Display: on a listen server this is the line
@@ -376,6 +384,58 @@ void ATracePlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	}
 
 	Super::EndPlay(EndPlayReason);
+}
+
+void ATracePlayerController::ApplyStoredCallSign(int32 AttemptsLeft)
+{
+	if (!IsLocalController())
+	{
+		return;
+	}
+
+	const FString Wanted = UTraceUserSettings::Get().GetCallSignOrDefault();
+
+	if (PlayerState == nullptr)
+	{
+		// THE CASE THE WHOLE FEATURE IS ABOUT. A remote client reaches BeginPlay before the server
+		// has welcomed it, so there is no PlayerState to rename yet; a single-shot push would be a
+		// no-op on precisely the machine that needs it. Half-second retries, bounded.
+		if (AttemptsLeft > 0)
+		{
+			if (UWorld* World = GetWorld())
+			{
+				World->GetTimerManager().SetTimer(CallSignRetryHandle,
+					FTimerDelegate::CreateWeakLambda(this, [this, AttemptsLeft]()
+					{
+						ApplyStoredCallSign(AttemptsLeft - 1);
+					}), 0.5f, /*bLoop*/ false);
+			}
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[CallSign] gave up waiting for a PlayerState; this machine keeps its engine-generated name."));
+		}
+		return;
+	}
+
+	if (PlayerState->GetPlayerName() == Wanted)
+	{
+		// Already right — a respawn, a re-possession or a second BeginPlay must not send a rename per
+		// pawn. This is also what makes the call safe to repeat from the settings row's submit path.
+		return;
+	}
+
+	const FString Before = PlayerState->GetPlayerName();
+
+	// The ENGINE'S rename path: APlayerController::ServerChangeName -> AGameModeBase::ChangeName ->
+	// APlayerState::SetPlayerName, which replicates. A local SetPlayerName here would be a client
+	// lying to itself — the scoreboard on every other machine would still read the old name.
+	ServerChangeName(Wanted);
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[CallSign] '%s' -> '%s' via ServerChangeName (netmode %d)."),
+		*Before, *Wanted, static_cast<int32>(GetNetMode()));
 }
 
 void ATracePlayerController::ApplyGameInputMode()
@@ -1114,6 +1174,23 @@ void ATracePlayerController::AcknowledgePossession(APawn* P)
 	// not the pawn, so a player holding Tab through their own death and respawn is still holding it
 	// afterwards — clearing the flag here would blank the scoreboard mid-hold and it would not come
 	// back until they released and pressed again. The Completed/Canceled bindings own that flag.
+
+	// --- FX_AUDIO_PLAN §5.1 (Respawn) — "you are back", to you and to nobody else ---------------
+	//
+	// THE POSSESSION POINT, which is the frame the player gets their body: APlayerController's
+	// ClientRestart path calls this for the local controller on every machine that has one, the
+	// listen host's included, so one line here covers the host and every remote client with no RPC
+	// of its own. Client-side by the table, and TraceAudio::Play's own gate then refuses anything
+	// that is not a player on this machine — a bot's possession makes no sound anywhere.
+	//
+	// IT ALSO FIRES ON THE FIRST POSSESSION OF A MATCH, and that is the right behaviour rather than
+	// a leak: "you have a body now" is the same fact at kickoff as it is after a death, and the
+	// alternative (a first-possession flag) would make the match's own start the one time the cue is
+	// missing. Named Respawn because that is what §5.1 calls the row.
+	if (P != nullptr)
+	{
+		TraceAudio::Play(this, TraceSoundEvents::Respawn);
+	}
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1345,9 +1422,15 @@ void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
  * movement feels like it takes a second to register inputs" — and it exists because this project's
  * standing rule is that a harness which cannot go red is not evidence.
  *
- * Not `ECVF_Cheat`: it changes no gameplay rule, only whether one class of input is dropped, and a
- * playtester who dislikes the new behaviour should be able to turn it off without a cheat-enabled
- * build.
+ * *** `ECVF_Cheat` SINCE W9-SHIPGUARD, AND "WITHOUT A CHEAT-ENABLED BUILD" WAS THE MISTAKE. *** This
+ * paragraph used to read "Not `ECVF_Cheat`: it changes no gameplay rule, only whether one class of
+ * input is dropped, and a playtester who dislikes the new behaviour should be able to turn it off
+ * without a cheat-enabled build." A playtester still can: ECVF_Cheat is inert wherever
+ * DISABLE_CHEAT_CVARS is 0, which is every configuration except Shipping and Test, so no build a
+ * playtester runs needs anything "enabled" to reach this. The flag closes exactly one door — the
+ * [ConsoleVariables] section of a SHIPPED build's Engine.ini, which LoadConsoleVariablesFromINI
+ * applies with bAllowCheating = false and which is player-writable in a packaged game. See
+ * Trace.Keys.LegacySteal in TraceUserSettings.cpp for the measurement behind that.
  */
 static int32 GTraceRedeliverHeldPressEdges = 1;
 static FAutoConsoleVariableRef CVarTraceRedeliverHeldPressEdges(
@@ -1357,7 +1440,7 @@ static FAutoConsoleVariableRef CVarTraceRedeliverHeldPressEdges(
 	     "HOLD-shaped action whose key is still physically down is re-delivered, because Enhanced Input "
 	     "only fires Started on a transition and that transition already happened behind the overlay. "
 	     "0 is the RED arm: the press stays swallowed and the player must release and press again."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 void ATracePlayerController::RedeliverHeldPressEdges()
 {
@@ -2519,6 +2602,8 @@ void ATracePlayerController::GetLiveMappedActions(TArray<const UInputAction*>& O
 	}
 }
 
+#if !UE_BUILD_SHIPPING
+
 // =================================================================================================
 // Trace.Input.VerifyAssets — SPEC v17 §6, the evidence half.
 //
@@ -3198,6 +3283,75 @@ namespace TracePlayerControllerInput
 		TEXT("the parry and the pull mutually exclusive on one press."),
 		FConsoleCommandDelegate::CreateStatic(&VerifyRightMouse));
 
+	/**
+	 * UI PLAN WP2.4 — the CALL-SIGN REPLICATION PROOF, and it has to run on BOTH machines.
+	 *
+	 * Prints every APlayerState this machine knows: its name, whether it is a bot, and whether it is
+	 * THIS machine's own local player. On a listen server the interesting row is the one that is
+	 * neither a bot nor local — the remote client — because its name arrived by replication after that
+	 * client's own ATracePlayerController::BeginPlay pushed it through ServerChangeName. Before WP2.4
+	 * every human row read `Mac-3249D6BCCE489DF8`.
+	 *
+	 * No arguments, deliberately: -TraceExec must be one unquoted command-line token on this project,
+	 * so a headless client can only be handed verbs.
+	 */
+	void CallSignRoster(UWorld* World)
+	{
+		const AGameStateBase* GS = (World != nullptr) ? World->GetGameState() : nullptr;
+		if (GS == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[CallSign] roster: no game state on this machine yet."));
+			return;
+		}
+
+		const APlayerController* LocalPC = World->GetFirstPlayerController();
+		const APlayerState* LocalState = (LocalPC != nullptr) ? LocalPC->PlayerState : nullptr;
+
+		int32 Humans = 0;
+		int32 NamedHumans = 0;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CallSign] ===== roster as seen from netmode=%d (0 standalone, 2 listen, 3 client): %d player state(s) ====="),
+			static_cast<int32>(World->GetNetMode()), GS->PlayerArray.Num());
+
+		for (const APlayerState* State : GS->PlayerArray)
+		{
+			if (State == nullptr)
+			{
+				continue;
+			}
+			const bool bBot = State->IsABot();
+			const bool bLocal = (State == LocalState);
+			const FString Name = State->GetPlayerName();
+			// The engine's generated fallback is "Mac-<hex>" / "Player<N>"; a call sign never looks
+			// like the first of those, which is what makes this a machine-checkable claim.
+			const bool bLooksGenerated = Name.StartsWith(TEXT("Mac-")) || Name.StartsWith(TEXT("Win-"))
+				|| Name.StartsWith(TEXT("Linux-"));
+			if (!bBot)
+			{
+				++Humans;
+				if (!bLooksGenerated)
+				{
+					++NamedHumans;
+				}
+			}
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CallSign]   %-24s bot=%d local=%d generatedName=%d"),
+				*Name, bBot ? 1 : 0, bLocal ? 1 : 0, bLooksGenerated ? 1 : 0);
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CallSign] VERDICT: %d of %d human player state(s) carry a real call sign on this machine "
+			     "(a remote row that is named here is a name that CROSSED THE WIRE)."),
+			NamedHumans, Humans);
+	}
+
+	FAutoConsoleCommandWithWorld CmdCallSignRoster(
+		TEXT("Trace.CallSign.Roster"),
+		TEXT("Dev only, runs anywhere. UI plan WP2.4. Every player state this machine knows, with its "
+		     "name, bot flag and whether it is the local player — the two-process proof that a client's "
+		     "call sign reaches the server's PlayerState."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(&CallSignRoster));
+
 	FAutoConsoleCommand CmdVerifyInputAssets(
 		TEXT("Trace.Input.VerifyAssets"),
 		TEXT("Spec v17 s6. Compares /Game/Trace/Input's IA_*/IMC_Trace assets against the C++ action ")
@@ -3206,17 +3360,20 @@ namespace TracePlayerControllerInput
 		FConsoleCommandDelegate::CreateStatic(&VerifyInputAssets));
 }
 
+#endif // !UE_BUILD_SHIPPING
+
 // -------------------------------------------------------------------------------------------
 // RPCs
 // -------------------------------------------------------------------------------------------
 
-void ATracePlayerController::ClientNotifyHit_Implementation(bool bKilled, ETraceHitZone Zone)
+void ATracePlayerController::ClientNotifyHit_Implementation(bool bKilled, ETraceHitZone Zone, bool bShieldBlocked)
 {
 	if (const UWorld* World = GetWorld())
 	{
 		LastHitMarkerTime = World->GetTimeSeconds();
 	}
 	bLastHitMarkerWasKill = bKilled;
+	bLastHitMarkerWasShieldBlocked = bShieldBlocked;
 	LastHitMarkerZone = Zone;
 
 	// SPEC v26 §9 — Bodyshot / Headshot, client-side, and this is the one place they can be.
@@ -3251,11 +3408,164 @@ void ATracePlayerController::ClientNotifyHit_Implementation(bool bKilled, ETrace
 	// lag-compensated resolver and found one of our bullets on somebody. It cannot be produced by
 	// any local, client-side part of the fire path.
 	++DebugHitConfirmCount;
+	if (bShieldBlocked)
+	{
+		// C5. LOGGED AT Log AND NOT BEHIND THE INPUT DIAGNOSTIC, because "I hit them and nothing
+		// happened" against a carrier is the single most likely bug report the gun will generate and
+		// it is not a bug — the melee path already logs its own version of this line by name. One
+		// line per blocked shot, and a shot is not a per-frame event.
+		++DebugShieldBlockedHitCount;
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[ShieldBlock] confirmed hit #%d on the Core carrier's shield (zone %s) — 0 damage by "
+			     "design (spec v10 §1). Blocked so far: %d."),
+			DebugHitConfirmCount, TraceHitZoneToString(Zone), DebugShieldBlockedHitCount);
+	}
 	if (InputLogLevel() >= 1)
 	{
-		UE_LOG(LogTraceGame, Display, TEXT("INPUT HitConfirm #%d killed=%d zone=%s"),
-			DebugHitConfirmCount, bKilled ? 1 : 0, TraceHitZoneToString(Zone));
+		UE_LOG(LogTraceGame, Display, TEXT("INPUT HitConfirm #%d killed=%d zone=%s shieldBlocked=%d"),
+			DebugHitConfirmCount, bKilled ? 1 : 0, TraceHitZoneToString(Zone), bShieldBlocked ? 1 : 0);
 	}
+}
+
+// =================================================================================================
+// VIEW KICK — FX_AUDIO_PLAN §1.5
+//
+// "Camera shake without assets." Three numbers, one damped sine, and a camera modifier so the offset
+// lands on the rendered POV and never on the aim. See the header for the full argument; what follows
+// is only the arithmetic.
+// =================================================================================================
+
+void ATracePlayerController::KickValuesFor(ETraceViewKick KickType, float& OutAmplitudeDeg,
+                                           float& OutDurationSeconds, float& OutNoiseHz)
+{
+	// THE TABLE, §1.5 verbatim. Kept as code rather than as settings knobs on purpose: these four are
+	// a feel that belongs to four abilities, not a tuning surface, and a fifth kick should be a fifth
+	// row here where the whole set can be compared at once.
+	switch (KickType)
+	{
+	case ETraceViewKick::BashVictim: OutAmplitudeDeg = 3.5f; OutDurationSeconds = 0.25f; OutNoiseHz = 9.f; return;
+	case ETraceViewKick::QuakeNear:  OutAmplitudeDeg = 4.0f; OutDurationSeconds = 0.35f; OutNoiseHz = 7.f; return;
+	case ETraceViewKick::QuakeFar:   OutAmplitudeDeg = 1.5f; OutDurationSeconds = 0.30f; OutNoiseHz = 7.f; return;
+	case ETraceViewKick::RocketSelf: OutAmplitudeDeg = 2.5f; OutDurationSeconds = 0.30f; OutNoiseHz = 8.f; return;
+	}
+
+	// An id from a newer build than this one. Silence beats a guess: a kick nobody asked for is a
+	// camera fault, and the enum is replicated so this is reachable across a version mismatch.
+	OutAmplitudeDeg = 0.f;
+	OutDurationSeconds = 0.f;
+	OutNoiseHz = 0.f;
+}
+
+void ATracePlayerController::AddViewKick(float PitchAmplitudeDeg, float DurationSeconds, float NoiseHz)
+{
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	if (DurationSeconds <= 0.f || FMath::IsNearlyZero(PitchAmplitudeDeg))
+	{
+		return;   // nothing to run; not an error (KickValuesFor answers this way for an unknown id)
+	}
+
+	// A LOCAL EFFECT ON A LOCAL CONTROLLER. The RPC below already guarantees this on a client, but
+	// AddViewKick is also called directly (the dev command, and any future local producer), and a kick
+	// applied to a remote player's controller object on the server would be a camera modifier attached
+	// to a camera manager that nothing renders.
+	if (!IsLocalController())
+	{
+		return;
+	}
+
+	ViewKickAmplitudeDeg = PitchAmplitudeDeg;
+	ViewKickDurationSeconds = DurationSeconds;
+	ViewKickNoiseHz = FMath::Max(0.f, NoiseHz);
+	ViewKickStartTime = World->GetTimeSeconds();
+
+	// Lazily attached, once, and only on a machine that has actually taken a kick: a camera manager
+	// with no modifiers is the normal state for every controller in the game.
+	if (ViewKickModifier == nullptr && PlayerCameraManager != nullptr)
+	{
+		ViewKickModifier = Cast<UTraceViewKickModifier>(
+			PlayerCameraManager->AddNewCameraModifier(UTraceViewKickModifier::StaticClass()));
+
+		if (ViewKickModifier == nullptr)
+		{
+			// Degraded, not broken: everything else about the ability still happens, the victim simply
+			// does not feel it. Once per controller, because the reason will not change.
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ViewKick] no camera modifier could be added to %s — view kicks will not be felt on "
+				     "this machine."), *GetNameSafe(PlayerCameraManager));
+		}
+	}
+}
+
+float ATracePlayerController::GetViewKickPitchOffset() const
+{
+	if (ViewKickDurationSeconds <= 0.f)
+	{
+		return 0.f;
+	}
+
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return 0.f;
+	}
+
+	const float Elapsed = World->GetTimeSeconds() - ViewKickStartTime;
+	if (Elapsed < 0.f || Elapsed >= ViewKickDurationSeconds)
+	{
+		return 0.f;
+	}
+
+	// sin(2*PI*f*t) * A * (1 - t/D)^2 — §1.5. The squared envelope is what makes the end of the kick
+	// invisible rather than merely small: a linear taper still has 1/e of its speed at the cut.
+	const float Phase = 2.f * PI * ViewKickNoiseHz * Elapsed;
+	const float Decay = 1.f - (Elapsed / ViewKickDurationSeconds);
+	return FMath::Sin(Phase) * ViewKickAmplitudeDeg * Decay * Decay;
+}
+
+void ATracePlayerController::ClientAbilityKick_Implementation(ETraceViewKick KickType)
+{
+	float Amplitude = 0.f;
+	float Duration = 0.f;
+	float NoiseHz = 0.f;
+	KickValuesFor(KickType, Amplitude, Duration, NoiseHz);
+
+	AddViewKick(Amplitude, Duration, NoiseHz);
+
+	UE_LOG(LogTraceGame, Verbose, TEXT("[ViewKick] type %d: %.2f deg / %.2fs / %.1f Hz."),
+		static_cast<int32>(KickType), Amplitude, Duration, NoiseHz);
+}
+
+bool UTraceViewKickModifier::ModifyCamera(float DeltaTime, FMinimalViewInfo& InOutPOV)
+{
+	// Super applies the modifier's own alpha blending machinery, which this one does not use (the
+	// envelope IS the blend), but skipping it would also skip the Blueprint hook and the debug draw.
+	Super::ModifyCamera(DeltaTime, InOutPOV);
+
+	const ATracePlayerController* Owner = (CameraOwner != nullptr)
+		? Cast<ATracePlayerController>(CameraOwner->GetOwningPlayerController())
+		: nullptr;
+	if (Owner == nullptr)
+	{
+		return false;
+	}
+
+	const float Offset = Owner->GetViewKickPitchOffset();
+	if (!FMath::IsNearlyZero(Offset))
+	{
+		// PITCH ONLY, and additively on the POV that has already been computed. Nothing here is
+		// written back anywhere: the next frame recomputes the POV from the untouched control
+		// rotation, so a kick cannot accumulate into the player's aim.
+		InOutPOV.Rotation.Pitch += Offset;
+	}
+
+	// FALSE = keep going down the modifier chain. Returning true would stop every other modifier,
+	// which on this project is nothing today and would be a trap tomorrow.
+	return false;
 }
 
 void ATracePlayerController::ClientNotifyKilledBy_Implementation(const FString& KillerName, FName Cause)
@@ -3981,6 +4291,135 @@ namespace TraceReloadBindTest
 		     "prove it reaches the handler and starts a reload. Presses an UNCLAIMED key first as the control, "
 		     "so the run cannot pass by responding to any key at all."),
 		FConsoleCommandDelegate::CreateStatic(&Run));
+}
+
+// =================================================================================================
+// Trace.Fx.ViewKick — FX_AUDIO_PLAN §1.5, THE EVIDENCE HALF.
+//
+// The kick is four numbers and a curve, and the thing that can actually be wrong about it is not the
+// curve: it is whether the offset reaches the RENDERED view without reaching the AIM. So this command
+// records the control rotation, fires a kick, samples the envelope while it runs, and prints both —
+// the peak offset it produced and the control-rotation drift it caused, which must be exactly zero.
+// =================================================================================================
+namespace TraceViewKickProbe
+{
+	struct FRun
+	{
+		int32   Samples = 0;
+		float   PeakAbsOffset = 0.f;
+		double  StartedReal = 0.0;
+		float   ExpectedPeak = 0.f;
+		float   Duration = 0.f;
+		FRotator ControlAtStart = FRotator::ZeroRotator;
+	};
+
+	static void Run(const TArray<FString>& Args)
+	{
+		UWorld* WorldPtr = nullptr;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (Context.World() != nullptr && Context.World()->IsGameWorld())
+				{
+					WorldPtr = Context.World();
+					break;
+				}
+			}
+		}
+
+		ATracePlayerController* PC = (WorldPtr != nullptr)
+			? Cast<ATracePlayerController>(WorldPtr->GetFirstPlayerController()) : nullptr;
+		if (PC == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ViewKick] no local player controller — nothing to kick."));
+			return;
+		}
+
+		// Default to the biggest one: if QuakeNear is invisible, so is every other row.
+		int32 TypeIndex = static_cast<int32>(ETraceViewKick::QuakeNear);
+		if (Args.Num() > 0)
+		{
+			TypeIndex = FMath::Clamp(FCString::Atoi(*Args[0]), 0, static_cast<int32>(ETraceViewKick::RocketSelf));
+		}
+		const ETraceViewKick KickType = static_cast<ETraceViewKick>(TypeIndex);
+
+		float Amplitude = 0.f;
+		float Duration = 0.f;
+		float NoiseHz = 0.f;
+		ATracePlayerController::KickValuesFor(KickType, Amplitude, Duration, NoiseHz);
+
+		TSharedPtr<FRun> State = MakeShared<FRun>();
+		State->StartedReal = FPlatformTime::Seconds();
+		State->ExpectedPeak = Amplitude;
+		State->Duration = Duration;
+		State->ControlAtStart = PC->GetControlRotation();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ViewKick] firing type %d (%.2f deg / %.2fs / %.1f Hz) on %s. Control rotation before: %s."),
+			TypeIndex, Amplitude, Duration, NoiseHz, *PC->GetName(), *State->ControlAtStart.ToCompactString());
+
+		PC->ClientAbilityKick(KickType);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakPC = TWeakObjectPtr<ATracePlayerController>(PC)](float) -> bool
+		{
+			ATracePlayerController* LivePC = WeakPC.Get();
+			if (LivePC == nullptr)
+			{
+				return false;
+			}
+
+			const float Offset = LivePC->GetViewKickPitchOffset();
+			State->PeakAbsOffset = FMath::Max(State->PeakAbsOffset, FMath::Abs(Offset));
+			++State->Samples;
+
+			// One kick's length plus a beat, so the last sample is taken AFTER the envelope has run
+			// out and the "returns to exactly zero" claim is measured rather than assumed.
+			if ((FPlatformTime::Seconds() - State->StartedReal) < (State->Duration + 0.20))
+			{
+				return true;
+			}
+
+			const FRotator ControlNow = LivePC->GetControlRotation();
+			const float PitchDrift = FMath::Abs(FRotator::NormalizeAxis(ControlNow.Pitch - State->ControlAtStart.Pitch));
+			const float YawDrift = FMath::Abs(FRotator::NormalizeAxis(ControlNow.Yaw - State->ControlAtStart.Yaw));
+			const float ResidualOffset = FMath::Abs(LivePC->GetViewKickPitchOffset());
+
+			// A kick that never got sampled above ~40% of its amplitude means the ticker ran too
+			// coarsely to catch the first quarter-cycle, not that the kick was small.
+			const bool bMoved = State->PeakAbsOffset > (State->ExpectedPeak * 0.4f);
+			const bool bClean = (PitchDrift < 0.01f) && (YawDrift < 0.01f);
+			const bool bSettled = ResidualOffset < 0.001f;
+			const int32 Failures = (bMoved ? 0 : 1) + (bClean ? 0 : 1) + (bSettled ? 0 : 1);
+
+			if (Failures == 0)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[ViewKick] VERDICT: PASS — peak view offset %.3f deg of an expected %.2f over %d samples; "
+					     "control rotation moved %.4f deg pitch / %.4f deg yaw (the aim is untouched); residual "
+					     "%.4f deg."),
+					State->PeakAbsOffset, State->ExpectedPeak, State->Samples, PitchDrift, YawDrift, ResidualOffset);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[ViewKick] VERDICT: *** %d PROBLEM(S) *** — peak %.3f deg of %.2f expected (moved=%d), "
+					     "control drift %.4f/%.4f deg (clean=%d), residual %.4f deg (settled=%d)."),
+					Failures, State->PeakAbsOffset, State->ExpectedPeak, bMoved ? 1 : 0,
+					PitchDrift, YawDrift, bClean ? 1 : 0, ResidualOffset, bSettled ? 1 : 0);
+			}
+			return false;
+		}));
+	}
+
+	FAutoConsoleCommand CmdViewKick(
+		TEXT("Trace.Fx.ViewKick"),
+		TEXT("Dev only. FX plan §1.5: fire one view kick (arg: 0 BashVictim, 1 QuakeNear, 2 QuakeFar, "
+		     "3 RocketSelf; default 1) on the local player and report the peak pitch offset it put on the "
+		     "RENDERED view together with the drift it put on the control rotation — which must be zero, "
+		     "because a kick that moves the aim is gun recoil and spec v25 §5 removed that."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&Run));
 }
 
 #endif // !UE_BUILD_SHIPPING

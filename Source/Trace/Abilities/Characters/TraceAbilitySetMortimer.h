@@ -128,15 +128,14 @@
 #include "UObject/ObjectPtr.h"
 
 #include "Abilities/TraceCharacterAbilitySet.h"
+#include "Gameplay/TraceFxShapes.h"          // ETraceFxBlend — stored per piece, so it must be complete
 
 #include "TraceAbilitySetMortimer.generated.h"
 
 class ATraceCharacter;
 class UInstancedStaticMeshComponent;
 class UMaterialInstanceDynamic;
-class UMaterialInterface;
 class USceneComponent;
-class UStaticMesh;
 
 /**
  * Why Quake refused. Returned by CheckBlastPosture() so the log, the HUD toast and the harness can
@@ -176,11 +175,30 @@ TRACE_API const TCHAR* TraceMortimerBlastRefusalToString(ETraceMortimerBlastRefu
  * (see UTraceAbilitySetMortimer::ActivateAbility). bAlwaysRelevant because a 600 uu ring is exactly
  * the kind of thing net culling would drop for the enemy who is about to be launched by it.
  *
- * THE RING IS BUILT FROM /Engine/BasicShapes CYLINDERS, not from a particle system or a Niagara
- * asset. That is copied from ATraceRippleActor::AddRing deliberately: this project generates its
- * content with a Python script, an install that has not run it has no M_TraceNeon, and an effect that
- * silently draws nothing on half the team's machines would recreate the bug it is fixing. The neon
- * material is used when present and BasicShapeMaterial when it is not.
+ * THE WHOLE THING IS BUILT FROM /Engine/BasicShapes PRIMITIVES, not from a particle system or a
+ * Niagara asset: this project generates its content with a Python script, an install that has not
+ * run it has no M_TraceNeon, and an effect that silently draws nothing on half the team's machines
+ * would recreate the bug it is fixing. Every piece now goes through UTraceFxShapes::MakeGlowMID and
+ * STORES ITS ACHIEVED BLEND (FX_AUDIO_PLAN's material-sourcing rule), which is what turns "the neon
+ * material is used when present" into a ladder with a bottom rung: Emissive -> Fallback -> None, and
+ * on None the component is HIDDEN rather than drawn in engine grey.
+ *
+ * *** FX_AUDIO_PLAN §2.8 ADDS TWO PIECES TO THE RING, AND CONSTRAINS ALL THREE. ***
+ *
+ *   GROUND CRACKS  six radial floor bars that grow from the epicentre to the SAME real blast radius
+ *                  the ring reaches, emissive slate at the bible's T1 tier (Glow 2.6), fading out
+ *                  over the last half second. They are the piece that carries Mortimer's HUE: a big
+ *                  additive volume over a lit floor comes back white (W3-FXBURST measured exactly
+ *                  that for the QuakeHit wedge), so the colour identity of a quake has to live in
+ *                  thin emissive geometry, and this is it.
+ *   DUST           eight additive slate puffs rising 40 uu, intensity 0.3. Additive because it is a
+ *                  big soft volume and an opaque one would punch a hole in the floor.
+ *
+ * AND THE RING'S BRIGHTNESS IS NOW CONSTANT WHILE IT EXPANDS. §2.8: "constant brightness during
+ * expansion (lethal telegraph)". A ring that dims while it is still growing is under-reading a
+ * volume that can still throw you — so the timeline is split: the ring EXPANDS at full brightness,
+ * reaches the real radius, and only then dissolves in place. Bible §6.4's "never pop-out" is served
+ * by the dissolve; §3.3's "lethal telegraphs never pulse" by there being no oscillation anywhere.
  */
 UCLASS()
 class TRACE_API ATraceMortimerQuakeWave : public AActor
@@ -211,6 +229,59 @@ public:
 	/** How many bead instances are actually registered for drawing. ZERO MEANS INVISIBLE. */
 	int32 GetDrawnBeadCount() const;
 
+	/** §2.8's ground cracks — instances registered for drawing. Zero means the cracks are invisible. */
+	int32 GetDrawnCrackCount() const;
+
+	/** §2.8's dust puffs — instances registered for drawing. */
+	int32 GetDrawnDustCount() const;
+
+	/**
+	 * How far the RING reaches RIGHT NOW, uu — its animated radius this frame, not WaveRadiusUU,
+	 * which is where it is going. Read by Trace.Mortimer.FxTest.
+	 */
+	float GetRingRadiusUU() const;
+
+	/**
+	 * How far the CRACKS reach right now, uu.
+	 *
+	 * *** IT MUST ALWAYS EQUAL GetRingRadiusUU(), AND THAT IS THE POINT OF EXPOSING BOTH. *** They
+	 * are computed from one local in UpdateRing, so today they cannot differ; the harness asserts the
+	 * equality anyway, because the day somebody gives the cracks a radius of their own is the day a
+	 * decoration starts out-reading the volume it decorates (bible §6.2 invariant 1), and that is a
+	 * failure a screenshot would not catch.
+	 */
+	float GetCrackReachUU() const;
+
+	/** "ring=Emissive cracks=Emissive dust=Additive" — the achieved blends, for the log. */
+	FString DescribeBlends() const;
+
+	/** Bible §3.2: an FX transient never exceeds the smear-head precedent. §2.8 restates it. */
+	static constexpr float MaxTransientGlow = 4.2f;
+
+	/**
+	 * *** THE HUE HEADROOM, AND IT IS A MEASUREMENT, NOT A TASTE. ***
+	 *
+	 * M_TraceNeon's emissive is Colour x Glow, and a SATURATED hue multiplied far enough clips in
+	 * every channel and comes back WHITE — the failure ATraceElleGate measured for its own rings
+	 * (Glow 3.5 photographed as pink, 1.0 as purple; it shipped 1.0) and W3-FXBURST measured again
+	 * for its burst set. The first capture run of THIS effect reproduced it a third time: slate
+	 * (0.38, 0.52, 0.85) at Glow 4.2 is a product of 3.57 on the blue channel, and against the arena's
+	 * own bright blue floor the ring and the cracks both photographed as white bands
+	 * (frames-W4-KITS-D/quake_TraceAutoShot_Match_20260825_032017_11.png).
+	 *
+	 * So the ring's brightest channel is held at this product. §2.8's two tiers — ring 4.2, cracks
+	 * 2.6 — are then SCALED rather than clamped, so the ratio between them survives: the ring stays
+	 * 1.6x the cracks, which is what makes the shockwave read as the event and the cracks as the
+	 * ground it happened on.
+	 *
+	 * 2.0 is the largest round product that leaves slate's RED channel below 1.0 — past 2.24 every
+	 * channel clips and the ring is neutral white — and it is still above the arena floor grid's own
+	 * product, so a lethal telegraph out-reads the floor it is drawn on. The full derivation, the
+	 * measured trend and an honest caveat about the sampling live on Trace.Mortimer.QuakeHueHeadroom
+	 * in the .cpp.
+	 */
+	static constexpr float DefaultHueHeadroom = 2.0f;
+
 protected:
 	/** REPLICATED. The blast radius this wave is drawing. */
 	UPROPERTY(Replicated)
@@ -227,31 +298,69 @@ protected:
 	UPROPERTY(Transient)
 	TObjectPtr<UInstancedStaticMeshComponent> RingMesh = nullptr;
 
+	/**
+	 * §2.8's ground cracks. One component, CrackCount instances lying flat on the floor, each
+	 * STRETCHED along its own radial every frame so the set grows outward with the ring.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UInstancedStaticMeshComponent> CrackMesh = nullptr;
+
+	/** §2.8's dust. One component, DustCount additive spheres that rise and fade. */
+	UPROPERTY(Transient)
+	TObjectPtr<UInstancedStaticMeshComponent> DustMesh = nullptr;
+
 private:
 	/**
-	 * Places the beads once. Split from Tick because a client may tick before the replicated radius
-	 * has landed, in which case there is nothing to build yet — same idempotent shape as
-	 * ATraceRippleActor::BuildRingsIfNeeded.
+	 * Places the beads, the cracks and the dust once. Split from Tick because a client may tick
+	 * before the replicated radius has landed, in which case there is nothing to build yet — same
+	 * idempotent shape as ATraceRippleActor::BuildRingsIfNeeded.
 	 */
 	void BuildIfNeeded();
 
-	/** Moves the beads out to @p Alpha of the radius and fades the material. */
+	/** Drives all three pieces from the one clock. @p Alpha is 0..1 across WaveSeconds. */
 	void UpdateRing(float Alpha);
+
+	/**
+	 * Pushes hue + brightness into one piece's MID, clamping to MaxTransientGlow on the way.
+	 *
+	 * A helper rather than three copies of the clamp: §2.8 gives the ring and the cracks two
+	 * different tiers off the bible's Glow ladder, and a ceiling written out three times is a
+	 * ceiling that will eventually be written out wrong once.
+	 */
+	void SetPieceGlow(UMaterialInstanceDynamic* MID, ETraceFxBlend Blend, float Intensity) const;
 
 	float Elapsed = 0.f;
 	bool bBuilt = false;
 
-	UPROPERTY(Transient)
-	TObjectPtr<UStaticMesh> BeadMesh = nullptr;
+	/** The slate hue actually in use, already normalised to a 0..1 colour. See BuildIfNeeded. */
+	FLinearColor Hue = FLinearColor::White;
 
-	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInterface> NeonMaterial = nullptr;
+	/**
+	 * The factor every emissive tier is multiplied by so the RING's brightest channel lands on the
+	 * headroom. LATCHED AT BUILD, and it has to be: the dev override is re-read every time it is
+	 * read at all, so a ladder of four waves photographed at four values would otherwise re-write
+	 * itself to whatever the CVar said LAST and produce four identical frames presented as a ladder.
+	 * That is the exact mistake ATraceFxBurst::SetPieceGlow documents having made.
+	 */
+	float GlowScaleAtBuild = 1.f;
 
-	UPROPERTY(Transient)
-	TObjectPtr<UMaterialInterface> FallbackMaterial = nullptr;
+	/** Where the ring and the cracks got to on the last update. The drawn==lethal probe reads both. */
+	float RingRadiusUU = 0.f;
+	float CrackReachUU = 0.f;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> RingMID = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> CrackMID = nullptr;
+
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> DustMID = nullptr;
+
+	/** The achieved blends, one per piece. None means "hidden", never "grey". */
+	ETraceFxBlend RingBlend = ETraceFxBlend::None;
+	ETraceFxBlend CrackBlend = ETraceFxBlend::None;
+	ETraceFxBlend DustBlend = ETraceFxBlend::None;
 };
 
 /**
@@ -322,10 +431,15 @@ public:
 	 * DEMO 20 ITEM 2: "increase mortimer's dash cooldown by 25%". 1.25, from
 	 * UTraceSettings::MortimerDashCooldownScale, applied to the shared UTraceSettings::DashCooldown.
 	 *
-	 * *** NOT LIVE. NOTHING CALLS THIS YET. *** The one line it needs is in
-	 * UTraceCharacterMovementComponent::GetDashCooldown() and is written out verbatim in
-	 * TraceAbilityTraits::GetDashCooldownScale's comment. Trace.Mortimer.Verify prints NOT LIVE for
-	 * it and Trace.Mortimer.DashTest goes red on it; do not delete either warning without the fix.
+	 * *** LIVE. *** UTraceCharacterMovementComponent::GetDashCooldown() multiplies the shared
+	 * cooldown by this through TraceAbilityTraits::GetDashCooldownScale, and Trace.Mortimer.DashTest
+	 * MEASURES THE SHIPPED MOVEMENT COMPONENT rather than the knob — which is why it is the thing to
+	 * believe about this passive.
+	 *
+	 * This block said "NOT LIVE. NOTHING CALLS THIS YET" for several passes after the call site
+	 * landed, while :42-44 of this same header already said LIVE. That contradiction is the exact
+	 * failure the list at the top of this file was written to prevent; correct BOTH in the same edit
+	 * as any future change here.
 	 */
 	float GetDashCooldownScale() const;
 
@@ -478,9 +592,46 @@ public:
 	/** Shockwaves this set has spawned. Dev instrumentation, exactly like BlastCount. */
 	int32 GetWaveCount() const { return WaveCount; }
 
+	/** Kicks DELIVERED by the last blast: near-ring first, then far. Dev instrumentation. */
+	int32 GetLastQuakeNearKicks() const { return LastQuakeNearKicks; }
+	int32 GetLastQuakeFarKicks() const { return LastQuakeFarKicks; }
+
+	/**
+	 * Pawns the last blast's kick sweep FOUND inside the radius, whether or not it could kick them.
+	 *
+	 * The two numbers are separate on purpose: a bot has no camera, so in a bots-only match the
+	 * deliveries are legitimately zero while the sweep is working perfectly, and a harness that could
+	 * only see deliveries would report a working feature as dead.
+	 */
+	int32 GetLastQuakeKickCandidates() const { return LastQuakeKickCandidates; }
+
 private:
 	/** Nothing but the launch: direction, falloff and LaunchCharacter. Assumes every rule has passed. */
 	void LaunchVictim(ATraceCharacter* Victim, const FVector& FromLocation) const;
+
+	/**
+	 * SERVER ONLY. FX_AUDIO_PLAN §2.8's shake row: one reliable ClientAbilityKick per PLAYER inside
+	 * the blast — QuakeNear within half the radius, QuakeFar out to the whole of it.
+	 *
+	 * *** IT IS NOT A VICTIM SWEEP AND MUST NOT BE ONE. *** §2.8: "victims and bystanders both (it is
+	 * a quake)". A team-mate standing next to Mortimer is refused by the choke point and is thrown
+	 * nowhere, and the shake is the only evidence he has that anything happened at all — so this
+	 * asks about DISTANCE and about nothing else. No team test, no line of sight, no carrier test:
+	 * the kick moves a camera, not a pawn, and none of §4's rules are about cameras.
+	 *
+	 * THE CASTER IS DELIBERATELY EXCLUDED. "victims and bystanders" is the whole list and he is
+	 * neither; the practical half of the reason is that Trace.Mortimer.QuakeTest fires up to sixty
+	 * quakes from the local player's own pawn for the camera, and a self-kick would tilt every frame
+	 * of the photography away from the thing being photographed.
+	 *
+	 * @param Origin  the blast centre, i.e. the same location RunBlast measured its radius from.
+	 */
+	void ApplyQuakeKicks(const FVector& Origin);
+
+	/** Filled in by ApplyQuakeKicks so a harness can prove the sweep ran without a second machine. */
+	int32 LastQuakeNearKicks = 0;
+	int32 LastQuakeFarKicks = 0;
+	int32 LastQuakeKickCandidates = 0;
 
 	/** bMortimerBlastNeedsLineOfSight's trace. True when the knob is off. */
 	bool HasLineOfSightTo(const ATraceCharacter* Victim) const;
