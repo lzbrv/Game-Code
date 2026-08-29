@@ -34,6 +34,8 @@
 
 #include "TraceAudioRelay.generated.h"
 
+class APawn;
+
 /**
  * The one actor the game-side sounds travel on. Server-spawned, never placed, never visible.
  *
@@ -56,6 +58,25 @@ public:
 	 */
 	UFUNCTION(NetMulticast, Unreliable)
 	void MulticastPlaySound(FName Event, FVector_NetQuantize Where);
+
+	/**
+	 * THE SAME MULTICAST, MINUS ONE MACHINE (FX_AUDIO_PLAN §1.6.2).
+	 *
+	 * A multicast cannot be addressed, so the exclusion is decided by the RECEIVER: every machine runs
+	 * this body, and the one where @p Excluded is a locally-controlled PLAYER pawn plays nothing,
+	 * because it already played its own predicted copy the instant the trigger went down. Everyone
+	 * else — the listen server included, unless the shooter is the host — hears it exactly as they
+	 * hear an ordinary game-side sound.
+	 *
+	 * WHY THE PAWN AND NOT A PLAYER-ID: the pawn reference already replicates and is already relevant
+	 * on every machine that can hear the sound (it is the thing making it). A machine that has not
+	 * heard of that pawn resolves it to null and plays the sound, which is the right answer — a
+	 * listener too far away to have the shooter replicated is not the shooter.
+	 *
+	 * Unreliable, like its sibling, for the same reason: a late sound is worse than a lost one.
+	 */
+	UFUNCTION(NetMulticast, Unreliable)
+	void MulticastPlaySoundExcluding(FName Event, FVector_NetQuantize Where, APawn* Excluded);
 
 	/** The relay for @p World, or null. Server and clients both — clients get theirs by replication. */
 	static ATraceAudioRelay* Find(const UWorld* World);

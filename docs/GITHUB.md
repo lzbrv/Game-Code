@@ -77,7 +77,7 @@ This is not us being cautious. It is the reason most Unreal studios eventually l
 | `Trace.uproject` | Project descriptor. Watch `EngineAssociation` — see §8. |
 | `Source/**` | All C++, `.Build.cs`, `.Target.cs`. This is the actual work. |
 | `Config/*.ini` | Project settings, gameplay tunables, input config. **Text — merges fine.** |
-| `Content/**` | Assets. Via LFS, and lockable. 641 files today — see §2.1. |
+| `Content/**` | Assets. Via LFS, and lockable. ~1,400 files today — see §2.1. |
 | `Scripts/**`, `docs/**`, `README.md` | Text. |
 | `.gitignore`, `.gitattributes` | Critical. Commit these **first**, before anything else. |
 | `Plugins/**` (source of plugins we author) | Same rules as `Source/`. |
@@ -110,41 +110,75 @@ If you have already committed one of them by accident, see §10.
 **This repo is no longer asset-free.** Earlier versions of this document said it was, and that
 sentence is why you may have been told locking does not matter here. It does now.
 
-Measured on 2026-08-09 at commit `a1f8a7f`:
+Measured on 2026-08-23 at commit `36401e2` (58 commits on `main`):
 
 | | Files | LFS bytes | Share |
 |---|---:|---:|---:|
-| `Content/__ExternalActors__/` — one `.uasset` per actor of `Arena_Baked` | 572 | 4.80 MiB | 93% |
-| `Content/Trace/Materials/` — `M_TraceSurface`, `M_TraceNeon` + 64 instances | 66 | 0.32 MiB | 6% |
-| `Content/Maps/` — `Arena.umap`, `Arena_Baked.umap`, `MainMenu.umap` | 3 | 19 KB | 0.4% |
-| **Total in LFS** | **641** | **5.14 MiB** | |
-| Everything else (C++, scripts, docs, config) — plain Git, 810 tracked files total | 169 | — | |
+| `Content/Trace/` — materials, UI art + font atlases, input, character data, audio | 270 | 16.6 MB | 55% |
+| `Content/__ExternalActors__/Maps/Arena_Baked/` — one `.uasset` per actor | 579 | 4.9 MB | 16% |
+| `Content/__ExternalActors__/Maps/Fish_*/` — the two collaborator test maps | 532 | 4.7 MB | 16% |
+| `Art/` — sound bank WAVs, Lato, misc source art | 37 | 3.5 MB | 12% |
+| `Content/Maps/` — the `.umap` files themselves (+ `_GENERATED` pieces) | 8 | 0.2 MB | 0.6% |
+| `Content/ramp.uasset` — stray root asset (owner disposition pending) | 1 | 0.1 MB | 0.3% |
+| **Total in LFS** | **1,427** | **~30 MB** | |
+| Everything else (C++, scripts, docs, config) — plain Git, 1,763 tracked files total | 336 | — | |
 
-A fresh full clone therefore costs about **8.3 MiB**: 3.12 MiB of Git objects plus 5.14 MiB of LFS
-payload. Of that, only the 5.14 MiB counts against the LFS bandwidth quota (§5).
+A fresh full clone therefore costs about **30 MB**, nearly all of it LFS payload — and only the
+LFS payload counts against the LFS bandwidth quota (§5).
+
+#### The release branch more than doubles it
+
+The measurement above is of commit `36401e2` and is left as-is, because it is what the numbers
+elsewhere in this document were derived from. The release-overhaul branch is bigger, and the growth
+is almost entirely **character art and sound**. Measured on the working tree on 2026-08-28:
+
+| | Files | LFS bytes | Share |
+|---|---:|---:|---:|
+| `Content/Trace/` — materials, UI art + font atlases, input, character data, audio, **the ten character bodies + shared skeleton + retargeted anim set** | 383 | 36.0 MB | 51% |
+| `Art/` — the WAV bank (now 71 files), Lato, the character and kit source art | 80 | 24.5 MB | 35% |
+| `Content/__ExternalActors__/Maps/Arena_Baked/` — one `.uasset` per actor | 647 | 5.1 MB | 7% |
+| `Content/__ExternalActors__/Maps/Fish_*/` — the two collaborator test maps | 532 | 4.5 MB | 6% |
+| `Content/Maps/` — the `.umap` files themselves (+ `_GENERATED` pieces) | 8 | 0.2 MB | 0.3% |
+| **Total in LFS** | **1,650** | **~70 MB** | |
+| Everything else (C++, scripts, docs, config) — plain Git, 2,018 files in the tree | 368 | — | |
+
+`Content/ramp.uasset` is gone from this table because it was deleted on the branch — see
+`KNOWN_LIMITATIONS.md` item 7 for why, and for how to bring it back.
+
+Reproduce it after the branch is committed:
+
+```bash
+git lfs ls-files | wc -l     # 1650
+git ls-files    | wc -l      # 2018
+```
+
+**What this means for §5's arithmetic:** a clone now costs ~70 MB rather than ~30 MB, so the
+"32 clones a month" headroom below is roughly halved. It is still nowhere near the 10 GiB quota.
 
 Reproduce any of it yourself:
 
 ```bash
-git lfs ls-files | wc -l     # 641 — files stored in LFS
-git ls-files    | wc -l      # 810 — files tracked in total
+git lfs ls-files | wc -l     # 1427 — files stored in LFS
+git ls-files    | wc -l      # 1763 — files tracked in total
 git lfs ls-files -s          # every LFS file with its size, one per line
-du -sh .git/lfs/objects      # 6.4M on disk — see the note below
+du -sh .git/lfs/objects      # ~41M on disk — see the note below
 ```
 
-`du` reads **6.4M** rather than 5.14 MiB, and that is not a contradiction: `du` counts allocated
-disk blocks, and 641 mostly-small files each round up to a 4 KB block. The 5.14 MiB figure is the
-sum of the actual file sizes, which is what GitHub bills and what a clone transfers. The gap is a
-property of your filesystem, not of the repository.
+`du` reads more than the ~30 MB logical figure, and that is not a contradiction: `du` counts
+allocated disk blocks, and 1,427 mostly-small files each round up to a 4 KB block (a local cache
+can also hold superseded versions). The ~30 MB figure is the sum of the actual file sizes, which
+is what GitHub bills and what a clone transfers. The gap is a property of your filesystem, not of
+the repository.
 
 Two facts worth holding on to:
 
-- **Every one of the 641 binaries went into LFS, not into Git.** `git ls-files '*.uasset' '*.umap'`
-  and `git lfs ls-files` both return 641, and the sets match. Nothing slipped past `.gitattributes`.
-- **Across all 24 commits there are still only 641 unique LFS objects.** Nobody has re-saved a map
-  yet. That is why storage today equals the working-tree size — and it is exactly what stops being
-  true the first time someone opens `Arena_Baked`, moves a wall and commits: that version is added,
-  the old one is kept forever, and the repo grows by the size of every actor that changed.
+- **Every binary went into LFS, not into Git.** Every `.uasset`, `.umap`, `.wav`, `.png` and
+  `.ttf` that `git ls-files` reports is in `git lfs ls-files` too. Nothing slipped past
+  `.gitattributes`.
+- **LFS storage counts every version forever.** Each time someone re-saves an asset and commits,
+  the new version is added and the old one is kept — the quota grows by the size of every actor
+  that changed, on every commit, and only a history rewrite gets it back. That is why locking and
+  deliberate, batched asset commits matter here (§4).
 
 ---
 
@@ -521,36 +555,39 @@ Earlier versions of this section said Trace was "deliberately asset-free, so LFS
 one empty `.umap`." **That is no longer true** — see §2.1. Here is the real position, and the
 tripwires that matter.
 
-**Storage used today: 5.14 MiB of the 10 GiB included.** That is 0.05%. Not close to binding.
+**Storage used today: ~70 MB of the 10 GiB included** on the release branch (~30 MB at `36401e2`).
+That is ~0.7%. Not close to binding.
 
-**A full fresh clone costs 5.14 MiB of bandwidth** (the LFS payload; the 3.12 MiB of Git objects
-does not count against the LFS quota). So:
+**A full fresh clone costs ~70 MB of bandwidth** (the LFS payload; the Git objects
+do not count against the LFS quota). So:
 
 | Scenario | LFS bandwidth | Share of the 10 GiB month |
 |---|---:|---:|
-| One person clones once | 5.14 MiB | 0.05% |
-| Four people each clone once | 20.6 MiB | 0.2% |
-| Four people re-clone *every day for a month* | 617 MiB | 6% |
+| One person clones once | ~70 MB | 0.7% |
+| Four people each clone once | ~280 MB | 2.7% |
+| Four people re-clone *every day for a month* | ~8.4 GiB | 84% |
 
-At today's size you would need roughly **1,990 full clones in one month** to exhaust the bandwidth
-allowance. Re-cloning is not currently a risk. It is worth knowing *why* it is not, because the
+At today's size you would need roughly **145 full clones in one month** to exhaust the bandwidth
+allowance. Re-cloning is not currently a risk — but note that the release branch halved the
+headroom, and the row above went from 36% to 84% of a month in one branch. It is worth knowing *why* it is not, because the
 thing that changes is the repo size, not the habit:
 
 > **The tripwire:** bandwidth binds when *(repo LFS size) × (clones and `git lfs pull`s per month)*
 > exceeds 10 GiB. For four developers pulling fresh a couple of times a week — call it 32 clones a
-> month — the repo can reach about **320 MiB** before that starts to bite. Today it is 5 MiB. A
-> single imported character with textures is ~500 MB.
+> month — the repo can reach about **320 MiB** before that starts to bite. Today it is ~70 MB. A
+> single *hand-modelled* character with real textures is ~500 MB — the ten generated bodies this
+> project ships cost **6.4 MB between them** (11 MB with the shared skeleton and animation set),
+> which is why they fit. Most of the branch's growth is the sound bank, not the characters.
 
 So the honest summary is: **four people re-cloning is the risk that arrives the month someone
 imports real art, not the risk you have today.** One character import takes the repo past the point
 where habitual re-cloning costs real money, and it does so in a single commit.
 
 **Storage has a different shape, and it is the one this project will hit first.** Storage counts
-every version forever. Right now all 641 LFS objects are first versions — nobody has re-saved a map.
-The moment `Arena_Baked` starts being edited, every actor you touch adds a new permanent copy, and a
-full re-bake rewrites all 572 external actors: **~4.8 MiB per re-bake, kept forever.** That is
-~2,100 re-bakes to fill 10 GiB, so the arena alone will not do it — but iterating on real textures
-fifty times will.
+every version forever. `Arena_Baked` is being edited now, so every actor a commit touches adds a new
+permanent copy, and a full re-bake rewrites all 647 external actors: **~5 MB per re-bake, kept
+forever.** That is ~2,000 re-bakes to fill 10 GiB, so the arena alone will not do it — but iterating
+on real textures fifty times will.
 
 ### When you have to pay, and how
 
@@ -633,8 +670,8 @@ Perforce server, especially given four people and no ops appetite.
 
 ### Recommendation for Trace, right now
 
-**Stay on GitHub + LFS + locking.** The project now has 5.14 MiB of real assets (§2.1) and the quota
-is nowhere near binding — 0.05% of storage. What has changed is that the *workflow* now matters:
+**Stay on GitHub + LFS + locking.** The project now has ~70 MB of real assets (§2.1) and the quota
+is nowhere near binding — ~0.7% of storage. What has changed is that the *workflow* now matters:
 locking was theoretical when there was nothing to lock, and it is not any more.
 
 Revisit the hosting question the moment someone says the words "I'm importing the character model."
@@ -842,8 +879,10 @@ Nothing in those directories is authored. You cannot lose work this way.
 
 ## 11. First-time repo bootstrap
 
-**This is already done.** `lzbrv/Game-Code` has 24 commits on `main`, and all 641 binaries went
-into LFS correctly — verified in §2.1. You do not need to run any of this. It is recorded because
+**This is already done.** `lzbrv/Game-Code` has 58 commits on `main` as of 2026-08-23, and all
+1,427 binaries in that history went into LFS correctly — verified in §2.1. The release branch adds
+845 new binaries and removes 622 (mostly renames whose replacement is a new file), for a net +223,
+and every one of them takes the same route. You do not need to run any of this. It is recorded because
 the *order* is the part people get wrong, and because you will need it if you ever start a second
 repo.
 

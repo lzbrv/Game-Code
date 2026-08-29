@@ -100,9 +100,20 @@ namespace TraceCanvasTextFile
 
 		for (const TraceText::FGlyphQuad& Quad : Quads)
 		{
+			// PER QUAD, not per string, since UI plan WP12. Most quads come back with the texture
+			// fetched above; one whose codepoint the style's face has no cell for comes back with
+			// the Latin-1 sheet instead, because its UVs were normalised against THAT sheet's
+			// dimensions. Sampling this string's own sheet for it would draw a smear of the wrong
+			// letters — see TraceText::QuadTexture, which is the only thing that decides.
+			UTexture2D* Sheet = TraceText::QuadTexture(Quad, Style.Weight);
+			if (Sheet == nullptr || Sheet->GetResource() == nullptr)
+			{
+				continue;
+			}
+
 			FCanvasTileItem Tile(
 				FVector2D(X + Quad.Pos.X, Y + Quad.Pos.Y),
-				Atlas->GetResource(),
+				Sheet->GetResource(),
 				FVector2D(Quad.Size.X, Quad.Size.Y),
 				FVector2D(Quad.UVMin.X, Quad.UVMin.Y),
 				FVector2D(Quad.UVMin.X + Quad.UVSize.X, Quad.UVMin.Y + Quad.UVSize.Y),

@@ -115,8 +115,25 @@ int32 STraceAtlasText::OnPaint(const FPaintArgs& Args, const FGeometry& Allotted
 		// its own middle and pull the neighbouring cell in through the gutter.
 		Brush.Margin = FMargin(0.f);
 
+		// Which sheet the brush is currently pointed at. Since UI plan WP12 a string may draw from
+		// two — the style's face, and the Latin-1 fallback for a codepoint that face has no cell for
+		// — so the resource is re-pointed when (and only when) the sheet actually changes. Every
+		// quad already carries UVs normalised against ITS OWN sheet's dimensions.
+		const UTexture2D* Bound = Atlas;
+
 		for (const TraceText::FGlyphQuad& Quad : Quads)
 		{
+			UTexture2D* Sheet = TraceText::QuadTexture(Quad, Params.Style.Weight);
+			if (Sheet == nullptr)
+			{
+				continue;
+			}
+			if (Sheet != Bound)
+			{
+				Brush.SetResourceObject(Sheet);
+				Bound = Sheet;
+			}
+
 			Brush.ImageSize = FVector2f(Quad.Size.X, Quad.Size.Y);
 			Brush.SetUVRegion(FBox2f(
 				Quad.UVMin,

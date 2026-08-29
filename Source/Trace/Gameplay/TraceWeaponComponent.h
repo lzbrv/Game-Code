@@ -5,6 +5,7 @@
 #include "Engine/NetSerialization.h"
 #include "Gameplay/TraceHitZones.h"   // ETraceHitZone
 #include "Gameplay/TraceMelee.h"      // ETraceEquippedWeapon, ETraceMeleeRefusal, FTraceMeleeHit
+#include "Audio/TraceAudioWatch.h"    // FX_AUDIO_PLAN §6.1: FTracePistolLadder, by value, for the predicted shot
 #include "UObject/ObjectPtr.h"
 #include "TraceWeaponComponent.generated.h"
 
@@ -424,6 +425,45 @@ public:
 	 */
 	void LoadAbilityClip(int32 RoundCount);
 
+	/**
+	 * FX_AUDIO_PLAN §2.7 — THE ONE CANONICAL EXCEPTION TO THE TRACER'S COLOUR, AS A SEAM.
+	 *
+	 * The bible's §6.3 rule is that a tracer is never anything but the shot's own hue: the trail and
+	 * the body already say which team fired, and a third team-coloured thing crossing the arena adds
+	 * no information. X's Sting is the single exception the art direction grants — while his BEE
+	 * ROUNDS are in the clip the beam and its impact plane are amber, because the rounds themselves
+	 * are a different thing being fired and the enemy is entitled to see that coming.
+	 *
+	 * @return false (and OutTint untouched) for every ordinary shot, which is the overwhelming
+	 *         majority of them. True with the override colour while the clip holds ability rounds.
+	 *
+	 * *** THIS IS A SEAM AND NOT X'S FEATURE. *** The weapon component is the only object that knows
+	 * the clip was loaded by an ability (LoadAbilityClip / AbilityRoundsInClip), so the KNOWLEDGE has
+	 * to be published from here; the amber itself is FX_AUDIO_PLAN's BeeRounds constant and X's kit
+	 * (Abilities/Characters/TraceAbilitySetX.cpp) is where the rest of the bee presentation lives.
+	 *
+	 * WHAT IT CAN AND CANNOT SEE, STATED SO NOBODY MEASURES IT WRONG: AbilityRoundsInClip replicates
+	 * COND_OwnerOnly, so this answers true on the authority and on the shooting player's own machine
+	 * and false on every third-party client. The shooter therefore sees amber down their own sights
+	 * (which is the case the tell is for) and a bystander sees the ordinary hue. Closing that would
+	 * mean either relaxing the replication condition — a per-shot cost paid by everyone for a rare
+	 * ability — or carrying a bit on MulticastFireEffects, which is the cheaper fix if a verifier
+	 * ever calls the third-party read a defect. Recorded rather than hidden.
+	 */
+	bool GetTracerTintOverride(FLinearColor& OutTint) const;
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * The victim this machine's own predicted trace last resolved, or null. DEV ONLY.
+	 *
+	 * Exposed for Trace.Fx.ImpactShots, which has to say in its log whether each staged shot hit a
+	 * BODY or the world — that is the whole content of FX_AUDIO_PLAN §3's "geometry hits only" rule,
+	 * and a screenshot alone cannot establish it. Read-only, never used for gameplay, and it is the
+	 * same field the Trace.DebugHitZones instrumentation already reads.
+	 */
+	const ATraceCharacter* DebugGetLastPredictedVictim() const { return LastPredictedVictim.Get(); }
+#endif
+
 	UFUNCTION()
 	void OnRep_Ammo();
 
@@ -439,11 +479,16 @@ public:
 	 * Cosmetic railgun effect for everyone except the shooter, who already predicted it.
 	 *
 	 * @param bImpacted True when the beam actually stopped on something (a body or world geometry)
-	 *                  rather than dying at maximum range, so the impact flash is only drawn where
-	 *                  there is a surface to flash against.
+	 *                  rather than dying at maximum range.
+	 * @param bWorldHit True when what stopped it was WORLD GEOMETRY rather than a player — the
+	 *                  server's own resolve, which is the only honest answer on a machine that did
+	 *                  not run the shot. FX_AUDIO_PLAN §3 draws its impact plane on geometry and
+	 *                  NEVER on a body: spec v4 §4 deleted the on-victim sphere because it covered up
+	 *                  the exact point the shooter was trying to read, and that ruling stands. One
+	 *                  bit on an already-unreliable cosmetic multicast.
 	 */
 	UFUNCTION(NetMulticast, Unreliable)
-	void MulticastFireEffects(FVector_NetQuantize Origin, FVector_NetQuantize Impact, bool bImpacted);
+	void MulticastFireEffects(FVector_NetQuantize Origin, FVector_NetQuantize Impact, bool bImpacted, bool bWorldHit);
 
 	// =============================================================================================
 	// THE KNIFE (spec v10 §1). Design rationale: Gameplay/TraceMelee.h. Read it first.
@@ -544,23 +589,28 @@ public:
 	 *
 	 * DEMO 19 ITEM 2, verbatim: "Don't let the bots attack." The practice range's five targets are
 	 * possessed by a bare ATracePracticeDummyController that deliberately steers nothing and presses
-	 * nothing — but TickBotKnife() below does not consult the controller's intentions. It fires for
-	 * ANY pawn whose controller is not an APlayerController, so the range's targets were drawing the
-	 * knife and swinging it at whatever came within reach, which is exactly the "bots attacking" the
-	 * user reported and precisely what a row of stationary targets must not do.
+	 * nothing — but the knife rule, which lived on THIS component at the time, did not consult the
+	 * controller's intentions. It fired for ANY pawn whose controller is not an APlayerController,
+	 * so the range's targets were drawing the knife and swinging it at whatever came within reach,
+	 * which is exactly the "bots attacking" the user reported and precisely what a row of stationary
+	 * targets must not do.
 	 *
 	 * WHY A PER-PAWN BIT RATHER THAN Trace.Knife.BotAuto 0. The cvar is global: switching it off in
 	 * the range would also silence the bots of a range deliberately opened with `?bots=5`, and it
 	 * would silence them in a real match on the same machine. This bit is a property of the PAWN, so
 	 * "this body is a target" travels with the body and nothing else changes.
 	 *
-	 * WHY IT LIVES ON THE WEAPON AND NOT ON THE AI. The autonomy being switched off is this
-	 * component's own (TickBotKnife is a melee-slice behaviour, not an ATraceBotController one), so
-	 * the switch belongs at the thing it switches. The AI slice stays untouched.
+	 * WHY IT STILL LIVES ON THE WEAPON NOW THAT THE RULE DOES NOT (RESTRUCTURE D5). The rule moved
+	 * to ATraceBotController::UpdateKnifeBand and the range's dummies, on a different controller
+	 * class, can no longer reach it — so on today's code this bit is belt as well as braces. It
+	 * stays because it is a fact about the BODY rather than about any one AI: it travels with the
+	 * pawn through possession changes and respawns, and the controller ASKS it
+	 * (AreAutonomousAttacksAllowed) rather than owning it. Making the refusal depend only on a class
+	 * hierarchy would be trusting a shape nobody promised to keep.
 	 *
-	 * NOT REPLICATED and not saved: it only gates a server-side tick, and a target's pawn is rebuilt
-	 * from scratch on every respawn — ATracePracticeDummyController::OnPossess re-applies it there,
-	 * which is the only place it is ever set.
+	 * NOT REPLICATED and not saved: it only gates a server-side decision, and a target's pawn is
+	 * rebuilt from scratch on every respawn — ATracePracticeDummyController::OnPossess re-applies it
+	 * there, which is the only place it is ever set.
 	 */
 	void SetAutonomousAttacksAllowed(bool bAllowed) { bAutonomousAttacksAllowed = bAllowed; }
 	bool AreAutonomousAttacksAllowed() const { return bAutonomousAttacksAllowed; }
@@ -680,7 +730,15 @@ private:
 	 */
 	void AdvanceFireClock();
 
-	void PlayLocalTracer(const FVector& From, const FVector& To, bool bImpacted) const;
+	/**
+	 * Draws one railgun beam on THIS machine, between two points somebody else has already resolved.
+	 *
+	 * @param bWorldHit  did the shot stop on world geometry (as opposed to a player, or nothing)?
+	 *                   FX_AUDIO_PLAN §3's impact plane is drawn only when this is true — see the
+	 *                   MulticastFireEffects doc above for the ruling that makes "never on bodies"
+	 *                   a rule rather than a preference.
+	 */
+	void PlayLocalTracer(const FVector& From, const FVector& To, bool bImpacted, bool bWorldHit) const;
 
 	// --- Upwards recoil (spec v5 section 6) ------------------------------------------------------
 	//
@@ -778,6 +836,61 @@ private:
 	ETraceHitZone LastPredictedZone = ETraceHitZone::None;
 	TWeakObjectPtr<ATraceCharacter> LastPredictedVictim;
 	double LastPredictedFireServerTime = -1000.0;
+
+	/**
+	 * FX_AUDIO_PLAN §6.1 — THIS MACHINE'S OWN COPY OF THE PISTOL LADDER, for the predicted gunshot.
+	 *
+	 * NOT REPLICATED and deliberately not shared with anything: it is a pure value type
+	 * (FTracePistolLadder, Audio/TraceAudioWatch.h) whose whole state is "which shot of the burst was
+	 * the last one, and when". The observer subsystem keeps its own instance per pawn on the
+	 * authority and hands the ladder to everybody ELSE; this one runs the identical rule on the
+	 * identical shared-clock stamp for the shooter alone.
+	 *
+	 * *** THE TWO LADDERS CANNOT DISAGREE ABOUT ANYTHING A LISTENER HEARS, AND THAT IS THE ARGUMENT
+	 * FOR HAVING TWO. *** FireOnce stamps FireServerTime off the shared clock, the reset threshold is
+	 * the same derived UTraceAudioSettings::GetPistolLadderResetSeconds() on both machines, and the
+	 * rule is four lines with no randomness in it — so the sequences agree except under jitter big
+	 * enough to reorder shots against a 0.3 s window. And each listener only ever hears ONE of the
+	 * two: the shooter hears this one, everybody else hears the observer's, because the multicast
+	 * excludes the shooter. §6.3.
+	 *
+	 * Reused rather than reimplemented: the struct exists for exactly this, and a second copy of the
+	 * "1, 2, 3, 4 forever, reset after silence" rule is a second thing to keep in step with the SMG's
+	 * no-ladder exception and with PistolShotEvent's clamp at four.
+	 */
+	FTracePistolLadder LocalShotLadder;
+
+	/**
+	 * When this machine last played the empty-clip click, on the LOCAL clock.
+	 *
+	 * §5.1 asks for the dry fire to be rate-limited at 0.15 s and the reason is the trigger, not the
+	 * sound: a held trigger on an empty gun runs StartFire's refusal every frame the fire gate would
+	 * otherwise have opened, and an unlimited click there is a buzz rather than a click. Local, not
+	 * replicated, and not part of any gameplay decision — the refusal itself is CanFire()'s and is
+	 * untouched.
+	 */
+	double LastDryFireLocalTime = -1000.0;
+
+	/** §5.1's rate limit for the dry-fire click, in seconds. See LastDryFireLocalTime. */
+	static constexpr double DryFireRepeatSeconds = 0.15;
+
+	/**
+	 * The selector THIS MACHINE last played a WeaponSwitch sound for. Per-machine, never replicated.
+	 *
+	 * *** IT EXISTS TO KILL THE JOIN-TIME CLICK. *** OnRep_EquippedWeapon is the §5.1 trigger site
+	 * and it is the right one — it runs on every machine, including the authority via the by-hand
+	 * call in ApplyEquip, so one swap is one sound everywhere with no RPC of its own. But a
+	 * replicated property whose value differs from its class default ALSO runs its OnRep on initial
+	 * receive, so a client joining a match in progress would hear a swap for every pawn already
+	 * holding an SMG, all in the same frame, from across the arena. Seeding on the first sight and
+	 * sounding only a genuine change is the whole fix.
+	 *
+	 * ETraceEquippedWeapon has no "unset" value (see the enum's own comment on why nothing is ever
+	 * appended to it), so the seeded state is carried by the bool beside it rather than by a
+	 * sentinel that would have to be taught to every switch in the file.
+	 */
+	ETraceEquippedWeapon LastSoundedWeapon = ETraceEquippedWeapon::Gun;
+	bool bSoundedWeaponValid = false;
 
 	/** Trigger state. Only meaningful on the machine that owns the input (client, or listen host). */
 	bool bTriggerHeld = false;
@@ -1129,22 +1242,16 @@ private:
 
 	// --- Bots (spec §1: "Bots must use it, or it will not be playtested") -------------------------
 
-	/**
-	 * The bot's knife rule, in one function: swap to the knife inside BotEngageRangeUU of the
-	 * nearest living enemy, back to the gun outside BotDisengageRangeUU, and let the existing burst
-	 * logic do the swinging — because StartFire() dispatches to a swing, a bot holding its trigger
-	 * with the knife out is already swinging at the 0.5 s cadence with no change to its controller.
-	 *
-	 * TEMPORARY, AND HONESTLY SO. This belongs in ATraceBotController's state machine (a knife pass
-	 * on HuntCarrier / ChaseLooseCore / Fight would be far better than a range band), but that file
-	 * is another ownership slice this pass. It lives here so the weapon is actually exercised by a
-	 * bot match TODAY rather than being shipped untested; see the pass report for the hand-off.
-	 * Authority + bot-controlled only, and switchable with Trace.Knife.BotAuto.
-	 */
-	void TickBotKnife();
-
-	/** Local-clock time of the last bot swap decision, so a bot cannot thrash the 0.2 s pullout. */
-	double LastBotSwapDecisionTime = -1000.0;
+	// THE BOT'S KNIFE RULE IS NO LONGER HERE (RESTRUCTURE D5). It was TickBotKnife(), and its own
+	// declaration on this spot had said for two passes that it "belongs in ATraceBotController's
+	// state machine ... but that file is another ownership slice this pass". It is now
+	// ATraceBotController::UpdateKnifeBand(), beside the SMG band it has to be ordered against, with
+	// its decision-cadence latch (LastBotSwapDecisionTime) moved with it. The rule is unchanged.
+	//
+	// What is left on this component is the SURFACE that rule drives — RequestEquip, StartSwing,
+	// IsKnifeEquipped, IsDeploying — all public, all also the human path, so the bot and the player
+	// reach the knife through exactly the same doors. Nothing on the weapon decides for a bot any
+	// more.
 
 	/** See SetAutonomousAttacksAllowed. True for everything except a practice-range target. */
 	bool bAutonomousAttacksAllowed = true;

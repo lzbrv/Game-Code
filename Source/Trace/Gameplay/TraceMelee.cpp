@@ -33,24 +33,24 @@
 
 static TAutoConsoleVariable<float> CVarKnifeBackstabDamage(
 	TEXT("Trace.Knife.BackstabDamage"), -1.f,
-	TEXT("Override for the back-stab damage. Negative defers to UTraceMeleeSettings."), ECVF_Default);
+	TEXT("Override for the back-stab damage. Negative defers to UTraceMeleeSettings."), ECVF_Cheat);
 
 static TAutoConsoleVariable<float> CVarKnifeFrontDamage(
 	TEXT("Trace.Knife.FrontDamage"), -1.f,
-	TEXT("Override for the front-hit damage. Negative defers to UTraceMeleeSettings."), ECVF_Default);
+	TEXT("Override for the front-hit damage. Negative defers to UTraceMeleeSettings."), ECVF_Cheat);
 
 static TAutoConsoleVariable<float> CVarKnifeBackstabAngle(
 	TEXT("Trace.Knife.BackstabAngle"), -1.f,
-	TEXT("Override for the back-stab half-angle in degrees. Negative defers to UTraceMeleeSettings."), ECVF_Default);
+	TEXT("Override for the back-stab half-angle in degrees. Negative defers to UTraceMeleeSettings."), ECVF_Cheat);
 
 static TAutoConsoleVariable<float> CVarKnifeCooldown(
 	TEXT("Trace.Knife.Cooldown"), -1.f,
-	TEXT("Override for the seconds between swings. Negative defers to UTraceMeleeSettings."), ECVF_Default);
+	TEXT("Override for the seconds between swings. Negative defers to UTraceMeleeSettings."), ECVF_Cheat);
 
 static TAutoConsoleVariable<float> CVarKnifeSwapSeconds(
 	TEXT("Trace.Knife.SwapSeconds"), -1.f,
 	TEXT("Override for the BASE pullout time — a gun's, and the number the knife's is relative to. "
-	     "Negative defers to UTraceMeleeSettings."), ECVF_Default);
+	     "Negative defers to UTraceMeleeSettings."), ECVF_Cheat);
 
 /**
  * SPEC v31 §1. The knife's share of the base pullout. Negative defers to the setting.
@@ -63,11 +63,11 @@ static TAutoConsoleVariable<float> CVarKnifeSwapSeconds(
 static TAutoConsoleVariable<float> CVarKnifeSwapMultiplier(
 	TEXT("Trace.Knife.SwapMultiplier"), -1.f,
 	TEXT("Spec v31 §1. Override for the KNIFE's share of the base pullout (0.65 ships = 35% shorter; "
-	     "1 = the pre-v31 single number). Negative defers to UTraceMeleeSettings."), ECVF_Default);
+	     "1 = the pre-v31 single number). Negative defers to UTraceMeleeSettings."), ECVF_Cheat);
 
 static TAutoConsoleVariable<float> CVarKnifeRange(
 	TEXT("Trace.Knife.Range"), -1.f,
-	TEXT("Override for the blade reach in uu. Negative defers to UTraceMeleeSettings."), ECVF_Default);
+	TEXT("Override for the blade reach in uu. Negative defers to UTraceMeleeSettings."), ECVF_Cheat);
 
 // NOTE there is deliberately no Trace.Knife.SpeedMultiplier. The knife's movement numbers live on
 // UTraceSettings and are owned by UTraceCharacterMovementComponent (KnifeMoveSpeedMultiplier and
@@ -77,7 +77,7 @@ static TAutoConsoleVariable<float> CVarKnifeRange(
 static TAutoConsoleVariable<int32> CVarKnifeBotAuto(
 	TEXT("Trace.Knife.BotAuto"), 1,
 	TEXT("1: bots swap to the knife to close on a nearby target and swing when in reach. 0: bots stay on the gun."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 static TAutoConsoleVariable<int32> CVarKnifeDebug(
 	TEXT("Trace.Knife.Debug"), 0,
@@ -97,7 +97,7 @@ static TAutoConsoleVariable<int32> CVarKnifeDualWield(
 	TEXT("Spec v28 §10. -1 (shipped): defer to UTraceMeleeSettings::bDualWieldKnife. 1: knife always in "
 	     "the off hand, melee on its own bind, guns-only weapon switching. 0: the v27 knife-as-a-separate-"
 	     "weapon behaviour. See the switch's full contract on UTraceMeleeSettings::bDualWieldKnife."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /**
  * A/B ARM FOR THE CARRIER-IMMUNITY RULE. Default 1 = the shipped rule; 0 removes it.
@@ -345,11 +345,17 @@ bool TraceMelee::IsDualWieldEnabled()
 	// `-TraceLegacyKnife` and not `-TraceDualWield=0`, because a bare param is what every other
 	// harness switch in this project uses and it cannot be typo'd into a silent no-op the way a
 	// `=value` form can.
+#if !UE_BUILD_SHIPPING
+	// Development only, same rule as the movement legacy arms (release pass, B3): the legacy arm is
+	// A/B evidence, not a player option — a launch flag must not let one machine run the v27
+	// knife-as-a-separate-weapon rules against peers running dual wield. Shipping resolves from the
+	// CVar override (ECVF_Cheat) and the settings alone.
 	static const bool bLegacyFlag = FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyKnife"));
 	if (bLegacyFlag)
 	{
 		return false;
 	}
+#endif
 
 	const int32 Override = CVarKnifeDualWield.GetValueOnAnyThread();
 	if (Override >= 0)
@@ -572,6 +578,20 @@ ATraceCharacter* TraceMelee::ResolveSwing(
 
 	OutHit.bBackstab = IsBackstab(Origin, VictimLocation, VictimYaw, &OutHit.ApproachAngleDegrees);
 	OutHit.Damage = DamageForApproach(OutHit.bBackstab);
+
+	// *** THE MeleeHit / MeleeBackstab SOUNDS ARE NOT PLAYED HERE, AND MUST NOT BE. ***
+	//
+	// FX_AUDIO_PLAN §5.1 names this function's verdict block as the trigger site for the two knife
+	// impact sounds, and it is where the verdict is DECIDED — but it is not where the hit happens.
+	// This resolver is pure and it runs TWICE in one process on a listen host: once as the swinger's
+	// own cosmetic prediction (UTraceWeaponComponent::TickSwing, which applies no damage on any
+	// machine) and once on the authority inside ServerSwing. A TraceAudio::PlayAt here would
+	// therefore announce every host swing twice — the exact double-audio failure §8.7's audit is
+	// about — and would also announce swings the server is about to refuse.
+	//
+	// The pair is played in UTraceWeaponComponent::ServerSwing_Implementation, immediately after
+	// UTraceHealthComponent::ApplyDamage, where the damage is a fact and the verdict below has
+	// already chosen which of the two events it is. Do not add a second call site here.
 
 	if (IsDebugLoggingEnabled())
 	{
@@ -2581,12 +2601,16 @@ static FAutoConsoleCommandWithWorldAndArgs GTraceWeaponVerifyRedArmCmd(
 
 		UE_LOG(LogTraceGame, Display,
 			TEXT("========== [Weapon] RED ARM (v32 s7c): restoring the PRE-v31 pullout =========="));
+
+		CVarKnifeSwapMultiplier->Set(1.f, ECVF_SetByConsole);
+
+		// Logged AFTER the flip, and the knife number is the knife's own resolver, so the line
+		// reports the pullout this arm actually runs with rather than a pre-change read. (F4,
+		// code-gameplay: the old line read GetSwapSeconds() twice, both before the Set.)
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[Weapon] Trace.Knife.SwapMultiplier %.3f -> 1.000. Knife pullout becomes %.4fs, a gun's ")
 			TEXT("%.4fs — the state the owner asked to be rid of. THE \"35%% SHORTER\" CHECK MUST NOW FAIL."),
-			Restore, TraceMelee::GetSwapSeconds(), TraceMelee::GetSwapSeconds());
-
-		CVarKnifeSwapMultiplier->Set(1.f, ECVF_SetByConsole);
+			Restore, TraceMelee::GetSwapSecondsFor(ETraceEquippedWeapon::Knife), TraceMelee::GetSwapSeconds());
 
 		TraceRunStowVerify(World);
 

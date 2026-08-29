@@ -44,6 +44,10 @@ Archive/
 *.xcodeproj/
 *.xcworkspace/
 *.sln
+# .slnx is the newer VS solution container; same generated-file rule as *.sln. (Two .slnx
+# files from 78b6a26 are already tracked and stay tracked until the owner untracks them —
+# see README Known limitations.)
+*.slnx
 *.suo
 *.sdf
 *.opensdf
@@ -194,10 +198,14 @@ $RECYCLE.BIN/
 !/.gitattributes
 !/.gitignore
 
-# Generated art (Scripts/generate_content.py). Binary, regenerated per developer
-# from the pinned UE 5.8.1 install - never committed. See the asset policy in
-# Scripts/generate_content.py.
-/Content/Generated/
+# /Content/Generated/ USED TO BE IGNORED HERE AND NO LONGER EXISTS (MAP_PLAN §9).
+# It was the pre-v17 output of Scripts/generate_content.py: a per-developer, gitignored copy of
+# M_TraceSurface/M_TraceNeon that every FX load site preferred, so a fresh clone silently rendered
+# trails, ripples, slimewalls, melee arcs and ability FX on the lit BasicShapeMaterial while the
+# machine that had run the generator looked correct. The parents are now committed at
+# /Game/Trace/Materials/Parents (Content/Trace/Materials/Parents), the generator re-authors them in
+# place, and every C++ site loads that path. The directory was deleted from the working tree; the
+# rule is gone with it so a stray re-creation is visible in git status instead of being hidden.
 
 # Licensed fonts: usable per-developer, NEVER redistributed. This repo is public.
 # See Scripts/generate_font_atlas.py and docs/FONTS.md.
@@ -211,8 +219,6 @@ Art/Fonts/*.pdf
 # committed so a clean clone can re-run the import; the blanket rules above were written for
 # Sofachrome, which is commercial and must stay out. Keep this list to fonts whose licence you
 # have actually read - never add MyriadPro, ProximaNova, TrajanPro or Sofachrome.
-!Art/Fonts/Lato-Regular.ttf
-# Lato is SIL OFL — safe to commit, unlike the licensed faces above.
 !Art/Fonts/Lato-Regular.ttf
 !Art/Fonts/README*
 
@@ -228,6 +234,11 @@ Art/Fonts/*.pdf
 /*.otf
 /*.ttf
 /*.zip
+# Root export junk rides the same `git add -A` train: at the time this was written the live
+# hazard was "UI Test Export_2.png" (11.3 MB, untracked, unignored). Root only, like the
+# rules above — screenshots and textures deliberately vendored under Art/ or Content/ keep
+# their own rules.
+/*.png
 
 # Git LFS re-installs its own hooks into whatever core.hooksPath points at (see
 # Scripts/setup-hooks.sh). Those four are generated per machine and per git-lfs

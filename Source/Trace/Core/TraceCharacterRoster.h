@@ -103,27 +103,37 @@ namespace TraceCharacterRoster
 		/**
 		 * THE BODY EVERY OTHER PLAYER SEES — a LoadObject path to a USkeletalMesh, or EMPTY.
 		 *
-		 * EMPTY IS THE NORMAL VALUE AND IT MEANS "EPIC'S MANNEQUIN". Nine of the ten rows are empty
-		 * today, and the fallback is not a degraded state: a character with no bespoke body is drawn
-		 * exactly as this game has always drawn everybody. Only a row that names a mesh changes what
-		 * ATraceCharacter puts on the pawn.
+		 * EMPTY MEANS "EPIC'S MANNEQUIN", AND SINCE DEMO 29 ITEM 1 ALL TEN ROWS ARE EMPTY AGAIN.
+		 * They named generated bodies between PIPELINE_DESIGN.md §9.1 and Demo 29; the ten strings are
+		 * shelved in comments in TraceCharacterRoster.cpp, which also carries the measurement of why
+		 * (a retarget bake that moved sixteen locomotion sequences' root travel into the pelvis). The
+		 * Mannequin is not a degraded state — a character with no bespoke body is drawn exactly as
+		 * this game has always drawn everybody — and it is also what an UNRESOLVABLE path falls back
+		 * to, which is why this stayed a string: a clone that has not run
+		 * Scripts/import-characters.sh must fall back rather than fail.
 		 *
 		 * SOFT BY CONSTRUCTION — it is a STRING here and a TSoftObjectPtr on the asset. A hard
-		 * reference would make a fresh clone that has never run Scripts/import-rocco.sh fail to
-		 * construct, which is the same reason ATraceCharacter::CharacterMeshAsset is soft. A path
-		 * that does not resolve is reported through ETraceCharacterArtStatus, not crashed on.
+		 * reference would make that clone fail to CONSTRUCT rather than fall back, which is the same
+		 * reason ATraceCharacter::CharacterMeshAsset is soft. A path that does not resolve is
+		 * reported through ETraceCharacterArtStatus, not crashed on.
 		 */
 		const TCHAR* BodyMeshPath = TEXT("");
 
 		/**
 		 * Yaw, in degrees, that turns THIS mesh's authored forward onto the actor's +X.
 		 *
-		 * *** MEASURED PER RIG, NOT COPIED. *** Epic's Mannequin is authored facing +Y and therefore
-		 * needs -90 (TraceCharacterLayout::MeshYaw, and the default here). Rocco's rig is authored
-		 * facing +X and needs 0 — copying the Mannequin's -90 onto him turns him sideways, which is
-		 * the single most likely way this feature looks broken. The number for a new mesh comes from
-		 * measuring `Z x (LeftHand - RightHand)` on the imported asset; run on the Mannequin that
-		 * formula reproduces -90, which is how the measurement is known to be right.
+		 * *** MEASURED PER RIG, NOT COPIED — AND THE FACT THAT EVERY ROW READS -90 IS A RESULT,
+		 * NOT A DEFAULT. *** Epic's Mannequin is authored facing +Y and therefore needs -90
+		 * (TraceCharacterLayout::MeshYaw, and the default here); the ten generated bodies shelved by
+		 * Demo 29 item 1 are authored facing +Y too (PIPELINE_DESIGN.md §3.1) and measured the same
+		 * -90, which is why the rows keep the number while their mesh paths are empty — it is not
+		 * READ while BodyMeshPath is empty, and it is the right answer either way. The rig that proves the
+		 * rule is the one that is gone: the hand-modelled RoccoTest.fbx was authored facing +X and
+		 * needed 0, and copying the Mannequin's -90 onto it turned him sideways — the single most
+		 * likely way this feature looks broken. The number for a new mesh comes from measuring
+		 * `Z x (LeftHand - RightHand)` on the imported asset (Scripts/import_characters.py's
+		 * facing_heading(), which FAILS an import that measures outside its expected value); run on
+		 * the Mannequin that formula reproduces -90, which is how the measurement is known to be right.
 		 */
 		float BodyMeshYaw = -90.f;
 
@@ -135,9 +145,13 @@ namespace TraceCharacterRoster
 		 *
 		 * *** THIS FIELD EXISTS BECAUSE AN ANIM BLUEPRINT BELONGS TO A SKELETON, NOT TO A MESH. ***
 		 * A row that names a body on a rig of its own MUST name an anim class built for that rig, or
-		 * the pawn is drawn in its bind pose: ABP_Unarmed drives root/pelvis/hand_r and SK_Rocco's
-		 * skeleton has Hips1/Spine021/RightHand1, so there is nothing for it to move. Rocco's class
-		 * is the retarget of ABP_Unarmed onto his skeleton, baked by Scripts/retarget-rocco.sh.
+		 * the pawn is drawn in its bind pose: an ABP is compiled against one SKELETON ASSET, and
+		 * Epic's ABP_Unarmed is compiled against the Mannequin's, so it has nothing to move on any
+		 * other rig. It is a per-SKELETON field rather than a per-character one, which is why all ten
+		 * rows carried the SAME string while the generated bodies were wired: they share
+		 * SK_TraceBody_Skeleton, so one retarget bake (Scripts/retarget_body.py) produced the one
+		 * class they all named. Demo 29 item 1 shelved that string with the mesh paths — the two are
+		 * shelved and restored together, because either one alone is a bug.
 		 *
 		 * SOFT BY CONSTRUCTION, exactly like BodyMeshPath, and unresolvable for the same reason: a
 		 * clone that has not run the import and the retarget does not have it. ApplyBodyAnimInstance

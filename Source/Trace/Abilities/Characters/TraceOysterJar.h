@@ -70,11 +70,13 @@
 #include "UObject/ObjectMacros.h"
 #include "UObject/ObjectPtr.h"
 
-#include "TraceTypes.h"    // ETraceTeam
+#include "TraceTypes.h"                // ETraceTeam
+#include "Gameplay/TraceFxShapes.h"    // ETraceFxBlend — stored per piece, so it must be complete
 
 #include "TraceOysterJar.generated.h"
 
 class ATraceCharacter;
+class UMaterialInstanceDynamic;
 class USphereComponent;
 class UStaticMeshComponent;
 class UTraceAbilityComponent;
@@ -213,6 +215,31 @@ public:
 	/** SERVER ONLY. Records that this jar was released from a clamped point. Called by the thrower. */
 	void NoteReleaseWasClamped() { bReleaseClamped = true; }
 
+	// --- FX_AUDIO_PLAN §2.6, the look, and the questions a harness asks about it -------------------
+
+	/**
+	 * *** THE COLLAR IS THE ONLY THING THAT TELLS THE TWO JARS APART, AND THAT IS A BIBLE RULING. ***
+	 *
+	 * ART_BIBLE §6.3 forbids the obvious alternative in as many words: "jars Oyster cyan (armed tell =
+	 * slow accent shimmer is FORBIDDEN — jars are lethal volumes; distinguish dash-jar vs Pickler by
+	 * SHAPE: dash jar plain cylinder, Pickler jar + collar ring)". A jar is a volume that poisons you,
+	 * and §3.3's "what must NOT pulse" list names ability lethal volumes explicitly — a brightness tell
+	 * on a kill volume is a lying kill volume. So the difference is geometry, and it is legible from
+	 * any angle and at any brightness, which a shimmer is not.
+	 *
+	 * True once this machine has actually built one, not merely once bIsPickler arrived.
+	 */
+	bool HasCollarBuilt() const;
+
+	/** "jar=Emissive glow 0.75 collar=Emissive" — the ACHIEVED blends and glow. Never a promise. */
+	FString DescribeLook() const;
+
+	/** The Glow this jar was actually built at. See BuiltGlow — it is latched, not re-read. */
+	float GetBuiltGlow() const { return BuiltGlow; }
+
+	/** The jar body's radius in uu, measured off the mesh component's live scale. The collar is 1.25x. */
+	float MeasureJarRadiusUU() const;
+
 protected:
 	virtual void BeginPlay() override;
 
@@ -229,6 +256,25 @@ protected:
 	/** Blocks WORLD STATIC ONLY — see the header. It is what makes the lob land, and nothing else. */
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Oyster")
 	TObjectPtr<USphereComponent> Collision = nullptr;
+
+	/**
+	 * FX_AUDIO_PLAN §2.6. The Pickler jar's collar: a flange around the top rim, 1.25x the jar's own
+	 * radius. Present on EVERY jar as a component and made visible only on a Pickler one, so the two
+	 * kinds of jar are one actor with one component set and the difference is a visibility flag — the
+	 * same shape this class already has for bIsPickler itself.
+	 *
+	 * DECORATION, so unlike the jar body it is HIDDEN rather than drawn grey when no material resolves
+	 * (ART_BIBLE §6.1). The body is not: a jar you cannot see is a trap, which is the call
+	 * ATraceSlimewall::BuildSlabIfNeeded already made for its slab.
+	 */
+	UPROPERTY(VisibleAnywhere, Category = "Trace|Oyster")
+	TObjectPtr<UStaticMeshComponent> Collar = nullptr;
+
+	UPROPERTY()
+	TObjectPtr<UMaterialInstanceDynamic> JarMID = nullptr;
+
+	UPROPERTY()
+	TObjectPtr<UMaterialInstanceDynamic> CollarMID = nullptr;
 
 private:
 	TWeakObjectPtr<UTraceAbilityComponent> SourceComponent;
@@ -259,6 +305,36 @@ private:
 	float   LandedMatchTime = 0.f;
 	int32   FlightSweepCount = 0;
 	bool    bReleaseClamped = false;
+
+	/**
+	 * FX_AUDIO_PLAN §2.6. Tints the jar and, on a Pickler jar, raises the collar.
+	 *
+	 * Idempotent and called from BeginPlay AND from the top of Tick — BEFORE Tick's authority guard,
+	 * because a client's jar is "a mesh" and the mesh is exactly what this builds. bIsPickler is
+	 * replicated and a client can see the actor before it, so the collar decision is re-checked
+	 * against bLookIsPickler on every call and the flange is raised the frame the flag lands.
+	 */
+	void BuildLookIfNeeded();
+
+	/** True once the tint has been applied on THIS machine. */
+	bool bLookBuilt = false;
+
+	/** Which kind of jar the current look was built for, so a late bIsPickler still grows a collar. */
+	bool bLookIsPickler = false;
+
+	/** The blends MakeGlowMID actually achieved. None on the collar means it is hidden, not grey. */
+	ETraceFxBlend JarBlend = ETraceFxBlend::None;
+	ETraceFxBlend CollarBlend = ETraceFxBlend::None;
+
+	/**
+	 * The Glow this jar was BUILT with, latched once. The collar is derived from it by a fixed ratio.
+	 *
+	 * Latched rather than re-read, and the reason is a measurement that came out wrong once already
+	 * (ATraceFxBurst's hue ladder): a dev override that is re-read every frame makes four jars staged
+	 * at four values all re-write themselves to whatever the CVar said LAST, and produces four
+	 * identical rungs presented as a ladder.
+	 */
+	float BuiltGlow = 0.f;
 
 	float MatchTimeNow() const;
 

@@ -78,6 +78,8 @@
 #include "Trace.h"
 #include "TraceTypes.h"
 
+#if !UE_BUILD_SHIPPING
+
 namespace
 {
 	/** The one authoritative game world, or null. Same shape every harness in this project uses. */
@@ -801,3 +803,5 @@ namespace
 			}
 		}));
 } // namespace
+
+#endif // !UE_BUILD_SHIPPING

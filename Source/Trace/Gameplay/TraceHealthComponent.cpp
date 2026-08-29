@@ -5,9 +5,16 @@
 #include "Net/UnrealNetwork.h"
 
 #include "Abilities/TraceAbilityTypes.h"   // spec v19 §3: TraceAbilityTraits — Lily's 60 health
+#include "Abilities/TraceAbilityComponent.h"        // C3: the switch this component now re-clamps against
+#include "Abilities/TraceAbilityWorldSubsystem.h"   // C3: GatherAllComponents, for Trace.Health.ReclampTest
+#include "Audio/TraceAudio.h"                     // FX_AUDIO_PLAN §5.1: DamageTaken (client) and DeathBurst (world)
+#include "Audio/TraceSoundEvents.h"
+#include "UObject/ObjectKey.h"                 // FObjectKey — the per-actor state the FX_AUDIO_PLAN cues keep beside their call sites
 
+#include "Components/CapsuleComponent.h"   // FX_AUDIO_PLAN §2.7: the mark reads the victim's LIVE capsule
 #include "Components/SceneComponent.h"
 #include "Components/StaticMeshComponent.h"
+#include "Gameplay/TraceFxShapes.h"        // §2.7's mark is built through the shared FX library
 #include "Containers/Ticker.h"             // FTSTicker — the per-frame driver for the self-test
 #include "Engine/StaticMesh.h"
 #include "Materials/MaterialInstanceDynamic.h"
@@ -22,6 +29,7 @@
 #include "GameFramework/Controller.h"
 #include "GameFramework/GameStateBase.h"   // GetServerWorldTimeSeconds — the one clock both ends share
 #include "GameFramework/PlayerController.h"
+#include "GameFramework/PlayerState.h"     // C3: Trace.Health.ReclampTest names the subject
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformTime.h"              // FPlatformTime::Seconds — the v16 §4 harnesses pace on real time
 #include "Math/UnrealMathUtility.h"
@@ -41,21 +49,56 @@
 // NOT also a command name.
 // =================================================================================================
 
+/**
+ * FX_AUDIO_PLAN §5.1 (DamageTaken) — the one piece of memory the cue needs, and why it lives here.
+ *
+ * "Your health went DOWN" is not something OnRep_Health can see on its own: it is handed the new
+ * value and the old one is already gone. The obvious fix is a member on the component — and this
+ * pass does not own Gameplay/TraceHealthComponent.h (release tranche W4-SHOTS owns the .cpp's damage
+ * and death lines and nothing else), so the memory is kept beside the call site instead.
+ *
+ * A TMap keyed by FObjectKey rather than a raw pointer, so a component that is destroyed and a new
+ * one allocated at the same address cannot inherit the dead one's health. Bounded by pruning: the
+ * population is at most one entry per living pawn plus the regen fixture, and anything whose
+ * component has gone is dropped the moment the map would otherwise grow past that.
+ *
+ * NAMED, NOT ANONYMOUS: this module is a unity build and Scripts/check-jumbo-build-collisions.py
+ * gates on exactly that.
+ */
+namespace TraceHealthComponentFile
+{
+	static TMap<FObjectKey, float> GPresentedHealth;
+
+	/** Entries kept before a prune sweep runs. Ten players, a fixture and slack. */
+	static constexpr int32 PresentedHealthPruneAt = 64;
+
+	/**
+	 * Records @p Component's current health and plays the DamageTaken cue if it FELL.
+	 *
+	 * Only a fall, and only on the machine whose player owns the pawn — TraceAudio::Play's own
+	 * client-side gate does the second half, so a bot taking a bullet makes no thud on a listen host.
+	 * A rise is regeneration or a respawn and is silent. The first sight of a component is treated as
+	 * "it was at full", which is the spawn contract rather than a guess; see the block in the body
+	 * for the listen-host hit that a silent seed would have eaten.
+	 */
+	void NoteHealthForDamageCue(const UTraceHealthComponent* Component);
+}
+
 static TAutoConsoleVariable<int32> CVarHealthRegen(
 	TEXT("Trace.Health.Regen"), 1,
 	TEXT("1 (shipped): health regenerates after Trace.Health.RegenDelay seconds without damage. "
 	     "0: removes the mechanic, so Trace.Health.RegenTest can be shown FAILING on a build without it."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 static TAutoConsoleVariable<float> CVarHealthRegenDelay(
 	TEXT("Trace.Health.RegenDelay"), -1.f,
 	TEXT("Override for the seconds of no damage before regeneration begins. Negative defers to UTraceHealthSettings."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 static TAutoConsoleVariable<float> CVarHealthRegenRate(
 	TEXT("Trace.Health.RegenRate"), -1.f,
 	TEXT("Override for the regeneration rate in HP per second. Negative defers to UTraceHealthSettings."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /**
  * How many times a heal has been rescinded by damage arriving on the same frame.
@@ -84,7 +127,7 @@ static TAutoConsoleVariable<int32> CVarVulnerable(
 	TEXT("1 (shipped): a vulnerable target takes +XVulnerableDamageBonus damage from every source. "
 	     "0: the RED arm — the mark is still applied and still drawn, but multiplies nothing, so "
 	     "Trace.X.VulnerableTest can be shown measuring 40 instead of 50."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /**
  * THE ORDERING ARM, and the only observable form the ordering claim can take.
@@ -105,14 +148,14 @@ static TAutoConsoleVariable<int32> CVarVulnerableApplyOrder(
 	TEXT("1 (shipped): the vulnerable multiplier is evaluated AFTER ApplyDamage's carrier early-out. "
 	     "0: the RED arm — evaluated BEFORE it, which makes the amplifier run on a Core carrier's "
 	     "damage and moves TraceVulnerable::GetCarrierAmplifiedCount()."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /** THE CARRIER ARM. 0 removes both carrier locks so Trace.X.CarrierTest can reproduce the failure. */
 static TAutoConsoleVariable<int32> CVarVulnerableCarrierImmune(
 	TEXT("Trace.X.VulnerableCarrierImmune"), 1,
 	TEXT("1 (shipped): a Core carrier can neither be marked vulnerable nor have the multiplier "
 	     "applied to them. 0: the RED arm for spec v14 §4 — both locks removed."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /**
  * THE STACKING ARM (spec v16 §4). 0 pins every mark at one stack.
@@ -129,7 +172,7 @@ static TAutoConsoleVariable<int32> CVarVulnerableStacking(
 	     "after, all of them expiring together. 0: the RED arm — the mark still lands and still "
 	     "amplifies, but the count is pinned at 1, so Trace.X.VulnerableStackTest measures x1.25 "
 	     "where it expects x1.35."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /**
  * The four counters. File-static for the same reason GRegenSameFrameRescinds is: the facts being
@@ -844,6 +887,122 @@ void UTraceHealthComponent::ResetHealth()
 	OnRep_Health();
 }
 
+#if !UE_BUILD_SHIPPING
+namespace TraceHealthReclamp
+{
+	/**
+	 * RED ARM for Trace.Health.ReclampTest. While this is set, ReclampToMax() does nothing, which is
+	 * the pre-fix behaviour — a live switch to Lily leaving 100 health against a 60 max. The test
+	 * sets it for its first arm so that the green arm is a measurement of THIS code and not of a
+	 * pawn that happened to spawn at 60 already. Never set outside that command.
+	 */
+	bool bSuppressReclamp = false;
+}
+#endif
+
+void UTraceHealthComponent::ReclampToMax()
+{
+	if (!HasAuthority())
+	{
+		// Clients get the clamp through replication, exactly as they get the reset.
+		return;
+	}
+
+#if !UE_BUILD_SHIPPING
+	if (TraceHealthReclamp::bSuppressReclamp)
+	{
+		return;
+	}
+#endif
+
+	if (!IsAlive())
+	{
+		// A corpse is at 0 and must stay there: clamping the dead would be a write in the one state
+		// where Health is load-bearing for the death broadcast.
+		return;
+	}
+
+	const float MaxHealth = GetMaxHealth();
+	if (Health <= MaxHealth + UE_KINDA_SMALL_NUMBER)
+	{
+		// The common case, including every switch AWAY from Lily. Not a no-op by accident: this is
+		// the "downward only" rule, and it is what stops a character swap being a free heal.
+		return;
+	}
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[Health] %s: max health is now %.0f and current health was %.0f — clamped down to the "
+		     "new maximum (spec v19 §3; downward only)."),
+		*GetNameSafe(GetOwner()), MaxHealth, Health);
+
+	Health = MaxHealth;
+
+	// Server-side OnRep by hand, the house pattern every write in this file uses, so a listen
+	// server's own machine takes the identical path a remote client takes.
+	OnRep_Health();
+
+	// The bar is the first thing the player looks at after a switch; do not make them wait for the
+	// next natural net update to see 60.
+	if (AActor* OwningActor = GetOwner())
+	{
+		OwningActor->ForceNetUpdate();
+	}
+}
+
+void TraceHealthComponentFile::NoteHealthForDamageCue(const UTraceHealthComponent* Component)
+{
+	if (!IsValid(Component))
+	{
+		return;
+	}
+
+	// THE PERCENT AND NOT THE RAW FLOAT, because Health is protected and this pass does not own the
+	// header (see the namespace comment). It is the same quantity for this purpose: GetMaxHealth() is
+	// a per-character constant that is settled before the pawn spawns, so within one life the percent
+	// falls exactly when the health does.
+	const AActor* OwningActor = Component->GetOwner();
+	const float Now = Component->GetHealthPercent();
+	const FObjectKey Key(Component);
+
+	float* Previous = GPresentedHealth.Find(Key);
+	if (Previous == nullptr)
+	{
+		// Cheap and rare: only when the map would otherwise grow, and only over dead keys.
+		if (GPresentedHealth.Num() >= PresentedHealthPruneAt)
+		{
+			for (auto It = GPresentedHealth.CreateIterator(); It; ++It)
+			{
+				if (It.Key().ResolveObjectPtr() == nullptr)
+				{
+					It.RemoveCurrent();
+				}
+			}
+		}
+
+		// *** THE FIRST SIGHT OF A COMPONENT IS "IT WAS FULL", NOT "SAY NOTHING". ***
+		// Seeding silently looks safer and loses a real hit. The authority never runs OnRep_Health at
+		// spawn — the comment at the initialisation in BeginPlay says so in as many words — so the
+		// FIRST time this is reached on a listen host is already the post-damage value, and a silent
+		// seed would eat the host's own first hit of every life. Every pawn in this game spawns at
+		// full health (ResetHealth), so "was full" is not an assumption, it is the spawn contract; and
+		// the only machine that can hear this is the one whose player owns the pawn, so a late joiner
+		// cannot be given somebody else's accumulated damage either.
+		Previous = &GPresentedHealth.Add(Key, 1.f);
+	}
+
+	const float Was = *Previous;
+	*Previous = Now;
+
+	if (Now >= Was || Now < 0.f)
+	{
+		return;
+	}
+
+	// The local-player gate is TraceAudio::Play's own (DamageTaken is Client-side in the table), so
+	// a bot's pawn and every remote player's proxy refuse here without this file testing for either.
+	TraceAudio::Play(OwningActor, TraceSoundEvents::DamageTaken);
+}
+
 void UTraceHealthComponent::BroadcastDeath(AController* Instigator, FName Cause)
 {
 	if (bDeathBroadcast)
@@ -869,6 +1028,19 @@ void UTraceHealthComponent::BroadcastDeath(AController* Instigator, FName Cause)
 	UE_LOG(LogTraceGame, Log, TEXT("[%s] died (cause '%s', killer '%s')"),
 		*GetNameSafe(GetOwner()), *Cause.ToString(), *GetNameSafe(Instigator));
 
+	// --- FX_AUDIO_PLAN §5.1 (DeathBurst) — AT THE BODY, HEARD BY THE ROOM ----------------------
+	//
+	// THE DEATH FUNNEL AND NOTHING ELSE. Every route to a death in this project passes through this
+	// function exactly once per life (bDeathBroadcast above is that guarantee) — ApplyDamage's lethal
+	// branch, Kill(), the out-of-bounds rule, the harnesses — so one line here is one burst per death
+	// with no route left to forget. World-side and authority-only by the table and by PlayAt's own
+	// gate, at the body's location because that is the thing that just stopped existing; a listener
+	// learns WHERE somebody died, which is the whole information content of the sound.
+	if (const AActor* DeadActor = GetOwner())
+	{
+		TraceAudio::PlayAt(DeadActor, TraceSoundEvents::DeathBurst, DeadActor->GetActorLocation());
+	}
+
 	OnDeath.Broadcast(GetOwner(), Instigator, Cause);
 }
 
@@ -886,6 +1058,19 @@ void UTraceHealthComponent::OnRep_Health()
 	{
 		OwningCharacter->SetDeadPresentation(!IsAlive());
 	}
+
+	// --- FX_AUDIO_PLAN §5.1 (DamageTaken) — YOUR OWN HEALTH WENT DOWN --------------------------
+	//
+	// CLIENT-SIDE, on the victim's own machine, and nowhere else: this is the sound of being hit,
+	// which is information for exactly one person. TraceAudio::Play routes it by the table (DamageTaken
+	// is declared Client) and its local-player gate refuses a bot, so a listen host does not get a
+	// thud for every bot that takes a bullet.
+	//
+	// *** WHY IT IS DRIVEN FROM HERE AND NOT FROM ApplyDamage. *** ApplyDamage runs on the authority
+	// only, so a remote player would never hear their own damage; this hook runs on every machine
+	// that holds the pawn, and the server calls it by hand after every write so a listen host takes
+	// the identical path. It is the same argument the death presentation two lines up is built on.
+	TraceHealthComponentFile::NoteHealthForDamageCue(this);
 }
 
 // =================================================================================================
@@ -943,6 +1128,214 @@ void UTraceHealthComponent::UpdateVulnerableMarker()
 	}
 }
 
+// =================================================================================================
+// FX_AUDIO_PLAN §2.7 — THE MARKED-ENEMY WORLD TELL
+//
+// *** THE FINDING THIS CLOSES, IN ONE SENTENCE. *** X's speed passive keys off "is ANY enemy
+// vulnerable", his Sting exists to apply the mark, and the mark's only world-side presentation was a
+// 55 uu amber disc floating over the victim's head that shared no colour, no shape and no vocabulary
+// with anything else in the game — so the state X plays around was, in practice, not readable.
+// §2.7 replaces it: a spinning rose diamond above the head and a rose ring at the feet, in the
+// SEMANTIC hue the bible reserves for Vulnerable, visible on every machine.
+//
+// WHY THE PIECES LIVE IN A FILE-SCOPE MAP RATHER THAN ON THE ACTOR. This tranche owns
+// Gameplay/TraceHealthComponent.cpp and NOT the .h, so ATraceVulnerableMarker cannot grow members.
+// The memory is therefore kept beside the call site — the same constraint, the same solution and the
+// same shape as TraceHealthComponentFile::GPresentedHealth twenty lines up, which W4-SHOTS added for
+// the identical reason and documented in the identical terms. Keyed by FObjectKey so a destroyed
+// marker and a new one allocated at the same address cannot inherit each other's components.
+//
+// NAMED, NOT ANONYMOUS: this module is a unity build and Scripts/check-jumbo-build-collisions.py
+// gates on exactly that.
+// =================================================================================================
+namespace TraceVulnerableMarkFx
+{
+	/**
+	 * §2.7's hue: the bible's semantic Vulnerable rose, linear (1.00, 0.35, 0.45).
+	 *
+	 * *** SEMANTIC BEATS ACCENT, AND THIS IS WHY THE MARK IS NOT AMBER. *** Bible §6.2 invariant 2
+	 * puts the semantic wheel above the owner's accent: the mark is a STATUS ON A VICTIM, not one of
+	 * X's own world actors, so it wears the status colour and not X's BeeRounds amber. That also
+	 * keeps it distinguishable from the bees themselves, which are amber and are frequently in the
+	 * same frame as the person they just stung.
+	 *
+	 * The marker used to lerp amber -> red as the mark expired. That is two hues on one effect (§6.2)
+	 * and it is replaced by the monotonic dissolve below, which reads the same "the window is
+	 * closing" without breaking the rule or colliding with the bees.
+	 */
+	const FLinearColor VulnerableRose(1.00f, 0.35f, 0.45f, 1.f);
+
+	/** §2.7: "two crossed planes ('diamond') 18x18 uu, 24 uu above the victim's head". */
+	constexpr float DiamondEdgeUU = 18.f;
+	constexpr float DiamondAboveHeadUU = 24.f;
+
+	/** §2.7: "additive Vulnerable rose I 0.6, spinning 90 deg/s". */
+	constexpr float DiamondIntensity = 0.6f;
+	constexpr float SpinDegreesPerSecond = 90.f;
+
+	/**
+	 * §2.7: "+ feet ring r 44 uu additive I 0.35".
+	 *
+	 * A CYLINDER AND NOT A BEAD RING, which is the same call §2.4's suspend halo makes in as many
+	 * words ("cylinder r 40 uu, h 3 uu"): at 0.35 additive on a near-black floor a thin filled disc
+	 * reads as a pool of light under the player, which is what a feet ring is for. Bead rings are for
+	 * effects whose OUTLINE is the information (gates, quake fronts, the ripple).
+	 */
+	constexpr float FeetRingRadiusUU = 44.f;
+	constexpr float FeetRingHeightUU = 3.f;
+	constexpr float FeetRingIntensity = 0.35f;
+
+	/**
+	 * The last fraction of a second, over which both pieces fade to nothing.
+	 *
+	 * Bible §6.4: "expiry dissolves ... 0.3 s fade, NEVER A POP-OUT". The mark is 2 s long, so 0.25 s
+	 * is an eighth of it — long enough to read as an ending and short enough that a player cannot
+	 * mistake a dissolving mark for a live one and waste a shot on the amplifier.
+	 *
+	 * It is MONOTONIC and therefore not a §3.3 pulse: brightness only ever falls, and only once.
+	 */
+	constexpr float DissolveSeconds = 0.25f;
+
+	/** The two crossed planes and their materials. The feet ring uses the actor's own Ring member. */
+	struct FMarkPieces
+	{
+		TWeakObjectPtr<UStaticMeshComponent> PlaneA;
+		TWeakObjectPtr<UStaticMeshComponent> PlaneB;
+		TWeakObjectPtr<UMaterialInstanceDynamic> PlaneAMID;
+		TWeakObjectPtr<UMaterialInstanceDynamic> PlaneBMID;
+
+		/**
+		 * The blends the pieces ACHIEVED, not the ones that were asked for.
+		 *
+		 * UTraceFxShapes::SetGlow must be given the achieved value: Additive carries brightness in
+		 * the colour and Emissive carries it in a Glow scalar, so handing it the wrong one writes a
+		 * parameter the material does not have and silently does nothing.
+		 */
+		ETraceFxBlend DiamondBlend = ETraceFxBlend::None;
+		ETraceFxBlend RingBlend = ETraceFxBlend::None;
+
+		bool bBuilt = false;
+	};
+
+	static TMap<FObjectKey, FMarkPieces> GMarkPieces;
+
+	/** Entries kept before a prune sweep runs. Ten players marked at once, and slack. */
+	static constexpr int32 MarkPiecesPruneAt = 64;
+
+	/** The entry for @p Marker, pruning anything whose marker has gone when the map grows. */
+	FMarkPieces& PiecesFor(const AActor* Marker)
+	{
+		if (GMarkPieces.Num() >= MarkPiecesPruneAt)
+		{
+			for (auto It = GMarkPieces.CreateIterator(); It; ++It)
+			{
+				if (It.Key().ResolveObjectPtr() == nullptr)
+				{
+					It.RemoveCurrent();
+				}
+			}
+		}
+		return GMarkPieces.FindOrAdd(FObjectKey(Marker));
+	}
+
+	/**
+	 * Builds the two diamond planes and re-makes the feet ring's material. Idempotent, once per
+	 * marker, on the first tick after it spawns.
+	 *
+	 * A FREE FUNCTION AND NOT A METHOD, for the reason at the top of this block: the .h belongs to
+	 * another tranche this pass, so ATraceVulnerableMarker cannot grow one. The ring's MID is passed
+	 * in BY REFERENCE from the marker's own Tick, which is a member and can reach the private field —
+	 * that is the whole of the coupling, and it is one argument.
+	 *
+	 * @param OutRingMID  a TObjectPtr& and not a raw pointer&, because a MID has to live in a
+	 *                    TObjectPtr UPROPERTY to survive a garbage collection and a
+	 *                    `UMaterialInstanceDynamic*&` cannot bind to one. Same constraint
+	 *                    UTraceFxShapes::MakeGlowMID documents, solved the same way round.
+	 */
+	void BuildIfNeeded(AActor* Marker, UStaticMeshComponent* RingComponent,
+		TObjectPtr<UMaterialInstanceDynamic>& OutRingMID, FMarkPieces& Pieces)
+	{
+		if (Pieces.bBuilt || Marker == nullptr)
+		{
+			return;
+		}
+		Pieces.bBuilt = true;
+
+		USceneComponent* const MarkerRoot = Marker->GetRootComponent();
+		UStaticMesh* const Plane = UTraceFxShapes::GetPlane();
+
+		// ---- the two diamond planes ---------------------------------------------------------
+		if (MarkerRoot != nullptr && Plane != nullptr)
+		{
+			UStaticMeshComponent* Built[2] = { nullptr, nullptr };
+			UMaterialInstanceDynamic* BuiltMIDs[2] = { nullptr, nullptr };
+
+			for (int32 Index = 0; Index < 2; ++Index)
+			{
+				UStaticMeshComponent* Piece = NewObject<UStaticMeshComponent>(Marker,
+					*FString::Printf(TEXT("VulnerableDiamond%d"), Index));
+				if (Piece == nullptr)
+				{
+					continue;
+				}
+
+				Piece->SetupAttachment(MarkerRoot);
+				Piece->SetStaticMesh(Plane);
+				UTraceFxShapes::ConfigureFxComponent(Piece);
+				Piece->RegisterComponent();
+
+				// ADDITIVE. §2.7 asks for it by name, and the reason is the one ATraceTracer
+				// measured: an additive piece writes no depth, so a diamond floating over a
+				// player's head cannot punch a hole in the arena behind them or occlude the head
+				// it is labelling.
+				ETraceFxBlend Achieved = ETraceFxBlend::None;
+				BuiltMIDs[Index] = UTraceFxShapes::MakeGlowMID(Piece, 0, ETraceFxBlend::Additive, Achieved);
+				if (Index == 0)
+				{
+					Pieces.DiamondBlend = Achieved;
+				}
+				if (Achieved == ETraceFxBlend::None)
+				{
+					// Bible §6.1's ladder ends at "no effect", never at "a grey 100 uu square over
+					// a player's head".
+					Piece->SetVisibility(false, true);
+				}
+
+				Built[Index] = Piece;
+			}
+
+			Pieces.PlaneA = Built[0];
+			Pieces.PlaneB = Built[1];
+			Pieces.PlaneAMID = BuiltMIDs[0];
+			Pieces.PlaneBMID = BuiltMIDs[1];
+		}
+
+		// ---- the feet ring's material -------------------------------------------------------
+		//
+		// THROUGH MakeGlowMID AND NOT CreateDynamicMaterialInstance(BaseMaterial), which is what
+		// this used to do. The old call always produced an OPAQUE neon disc and had no way to say
+		// so; the library resolves the additive parent, degrades down the ladder in a defined
+		// order, and HANDS BACK WHAT IT ACHIEVED — which is the value SetGlow has to be given in
+		// order to write the parameter the material actually has.
+		if (RingComponent != nullptr)
+		{
+			OutRingMID = UTraceFxShapes::MakeGlowMID(RingComponent, 0, ETraceFxBlend::Additive,
+				Pieces.RingBlend);
+			if (Pieces.RingBlend == ETraceFxBlend::None)
+			{
+				RingComponent->SetVisibility(false, true);
+			}
+		}
+
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[Vulnerable] mark tell built on %s: diamond 2 x %.0f uu (%s) %.0f uu over the head, "
+			     "feet ring r %.0f uu (%s), spin %.0f deg/s."),
+			*GetNameSafe(Marker->GetOwner()), DiamondEdgeUU, UTraceFxShapes::BlendName(Pieces.DiamondBlend),
+			DiamondAboveHeadUU, FeetRingRadiusUU, UTraceFxShapes::BlendName(Pieces.RingBlend),
+			SpinDegreesPerSecond);
+	}
+}
+
 ATraceVulnerableMarker::ATraceVulnerableMarker()
 {
 	PrimaryActorTick.bCanEverTick = true;
@@ -957,16 +1350,22 @@ ATraceVulnerableMarker::ATraceVulnerableMarker()
 	SetRootComponent(MarkerRoot);
 	MarkerRoot->SetMobility(EComponentMobility::Movable);
 
+	// §2.7's FEET RING. It kept its member name through the rewrite because the name is in
+	// Gameplay/TraceHealthComponent.h, which this tranche does not own — but its JOB changed: it used
+	// to be the whole marker, a 55 uu disc over the victim's head, and it is now the ground half of a
+	// two-piece tell whose head half is the crossed diamond built in Tick.
 	Ring = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("Ring"));
 	Ring->SetupAttachment(MarkerRoot);
-	// NO COLLISION. It floats where a head is and must never eat a bullet meant for one.
+	// NO COLLISION. It sits under a player's feet, where bullets, jars and the Core all travel.
 	Ring->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 	Ring->SetCollisionProfileName(TEXT("NoCollision"));
 	Ring->SetGenerateOverlapEvents(false);
 	Ring->SetCanEverAffectNavigation(false);
 	Ring->SetCastShadow(false);
 	Ring->bReceivesDecals = false;
-	Ring->SetRelativeScale3D(FVector(0.55f, 0.55f, 0.06f));
+	// The SIZE is set in Tick from TraceVulnerableMarkFx's constants through
+	// UTraceFxShapes::ShapeScaleForRadiusUU, so that "r 44 uu" appears in this file as 44 and not as
+	// a scale somebody has to divide by 100 in their head to check against the plan.
 
 	// Constructor-time finders, the same policy TraceCore uses: engine assets referenced this way
 	// cook into a packaged build, a runtime LoadObject would resolve to null once cooked.
@@ -976,7 +1375,18 @@ ATraceVulnerableMarker::ATraceVulnerableMarker()
 		Ring->SetStaticMesh(CylinderFinder.Object);
 	}
 
-	static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon"));
+	// *** BaseMaterial IS NO LONGER WHAT THE MARK IS MADE OF, AND IT IS KEPT ON PURPOSE. ***
+	//
+	// Both pieces now resolve their material through UTraceFxShapes, which prefers the ADDITIVE
+	// parent and degrades down a defined ladder (Additive -> Emissive -> Fallback -> None) while
+	// telling the caller what it achieved. That is strictly better than what these two finders fed:
+	// an always-opaque neon disc with no way to report that it had fallen back.
+	//
+	// The finders stay because a constructor-time FObjectFinder is what leaves a COOK REFERENCE —
+	// the policy ATraceCore's constructor states — and because the field is a UPROPERTY declared in
+	// Gameplay/TraceHealthComponent.h, which this tranche does not own and therefore does not shrink.
+	// Removing them would be a header change to delete two references that cost one load each.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TEXT("/Game/Trace/Materials/Parents/M_TraceNeon.M_TraceNeon"));
 	if (NeonFinder.Succeeded())
 	{
 		BaseMaterial = NeonFinder.Object;
@@ -1010,37 +1420,103 @@ void ATraceVulnerableMarker::Tick(float DeltaSeconds)
 		return;
 	}
 
-	// Follow the head, spin, and pulse faster as the 2 s runs out so the mark reads as a timer.
+	// *** THIS COMMENT USED TO SAY "spin, and PULSE FASTER as the 2 s runs out so the mark reads as a
+	// timer". THE CODE UNDER IT NEVER PULSED — it lerped a hue and bobbed 6 uu, and nothing anywhere
+	// in this actor has ever changed a brightness at a rate. *** The timer read is now real and is a
+	// monotonic dissolve over the last quarter second (§6.4: an expiry is a fade, never a pop-out).
 	const float Remaining = Watched->GetVulnerableRemaining();
-	const float Total = FMath::Max(0.01f, TraceVulnerable::GetDurationSeconds());
-	const float Fraction = FMath::Clamp(Remaining / Total, 0.f, 1.f);
 	const float LocalNow = static_cast<float>(MarkerWorld->GetTimeSeconds());
+
+	// The dissolve, and the ONE place either piece's brightness comes from. It only ever falls, and
+	// only inside the last DissolveSeconds, so it is not a §3.3 pulse and cannot be read as a state
+	// coming on.
+	const float Dissolve = FMath::Clamp(Remaining / TraceVulnerableMarkFx::DissolveSeconds, 0.f, 1.f);
+
+	// THE VICTIM'S LIVE CAPSULE, not a constant 118. A crouched player's head is lower and a rescaled
+	// one's is higher; §2.7 says "24 uu above the victim's HEAD", so the head is measured rather than
+	// assumed. The old number was a fixed height that put the marker inside the skull of anything
+	// short and a foot over the hair of anything tall.
+	float HalfHeight = 88.f;
+	if (const ATraceCharacter* MarkedCharacter = Cast<ATraceCharacter>(MarkedActor))
+	{
+		if (const UCapsuleComponent* Capsule = MarkedCharacter->GetCapsuleComponent())
+		{
+			HalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+		}
+	}
 
 	// NOT named "Location": AActor has had a member by that name in this engine's lineage, and MSVC
 	// errors on a local shadowing an enclosing class's member where clang says nothing. That exact
 	// mistake has broken the Windows build in this project three times.
-	FVector MarkerLocation = MarkedActor->GetActorLocation();
-	MarkerLocation.Z += 118.f + 6.f * FMath::Sin(LocalNow * 6.f);
+	const FVector MarkerLocation = MarkedActor->GetActorLocation();
 	SetActorLocation(MarkerLocation);
-	SetActorRotation(FRotator(0.f, LocalNow * 220.f, 0.f));
 
+	// THE SPIN IS THE ACTOR'S, AND IT IS 90 deg/s BECAUSE §2.7 SAYS SO. The old marker span at 220,
+	// which at 2 s is a full turn and a quarter — fast enough to read as an alarm rather than as a
+	// state. MOTION rather than brightness is what the bible permits a status tell to use, so this is
+	// the one thing about the mark that moves.
+	SetActorRotation(FRotator(0.f, LocalNow * TraceVulnerableMarkFx::SpinDegreesPerSecond, 0.f));
+
+	TraceVulnerableMarkFx::FMarkPieces& Pieces = TraceVulnerableMarkFx::PiecesFor(this);
+	TraceVulnerableMarkFx::BuildIfNeeded(this, Ring, RingMID, Pieces);
+
+	// ---- the head diamond: two crossed planes, 24 uu above the head ------------------------------
+	//
+	// TWO PLANES AT 90 DEGREES TO EACH OTHER, each tilted 45 degrees within its own plane so a square
+	// reads as a diamond. Crossed is what makes it legible from every angle: a single plane vanishes
+	// to a line edge-on, which for a tell that must be readable from wherever the shooter happens to
+	// be standing is the same as not being there.
+	// PLACED IN THE ACTOR'S OWN FRAME, not in world space. The actor sits ON the victim and carries
+	// the 90 deg/s spin, so a purely VERTICAL relative offset is invariant under that spin and the
+	// rotation comes for free — one SetRelativeLocation per piece per frame and no world-space
+	// arithmetic that has to be redone after the actor turns.
+	const FVector DiamondLocal(0.f, 0.f, HalfHeight + TraceVulnerableMarkFx::DiamondAboveHeadUU);
+
+	const FQuat InPlaneDiamond(FVector::UpVector, PI * 0.25);          // 45 deg about the plane's own normal
+	const FQuat StandUpright(FVector::RightVector, -HALF_PI);          // the plane's +Z normal -> horizontal
+	const FQuat CrossQuarterTurn(FVector::UpVector, HALF_PI);          // the second plane, 90 deg round
+
+	if (UStaticMeshComponent* PlaneA = Pieces.PlaneA.Get())
+	{
+		PlaneA->SetRelativeLocation(DiamondLocal);
+		PlaneA->SetRelativeRotation(StandUpright * InPlaneDiamond);
+		UTraceFxShapes::SizePlane(PlaneA, TraceVulnerableMarkFx::DiamondEdgeUU,
+			TraceVulnerableMarkFx::DiamondEdgeUU);
+		UTraceFxShapes::SetGlow(Pieces.PlaneAMID.Get(), Pieces.DiamondBlend,
+			TraceVulnerableMarkFx::VulnerableRose, TraceVulnerableMarkFx::DiamondIntensity, Dissolve);
+	}
+
+	if (UStaticMeshComponent* PlaneB = Pieces.PlaneB.Get())
+	{
+		PlaneB->SetRelativeLocation(DiamondLocal);
+		PlaneB->SetRelativeRotation(CrossQuarterTurn * StandUpright * InPlaneDiamond);
+		UTraceFxShapes::SizePlane(PlaneB, TraceVulnerableMarkFx::DiamondEdgeUU,
+			TraceVulnerableMarkFx::DiamondEdgeUU);
+		UTraceFxShapes::SetGlow(Pieces.PlaneBMID.Get(), Pieces.DiamondBlend,
+			TraceVulnerableMarkFx::VulnerableRose, TraceVulnerableMarkFx::DiamondIntensity, Dissolve);
+	}
+
+	// ---- the feet ring ----------------------------------------------------------------------------
 	if (Ring != nullptr)
 	{
-		if (RingMID == nullptr && BaseMaterial != nullptr)
-		{
-			RingMID = Ring->CreateDynamicMaterialInstance(0, BaseMaterial);
-		}
-		if (RingMID != nullptr)
-		{
-			// Amber -> red as it expires. Both parameter names are set because the neon material and
-			// the engine basic material do not agree on one; the absent one is a no-op.
-			const FLinearColor Colour = FMath::Lerp(FLinearColor(1.f, 0.15f, 0.05f, 1.f),
-			                                        FLinearColor(1.f, 0.75f, 0.05f, 1.f), Fraction);
-			RingMID->SetVectorParameterValue(TEXT("Color"), Colour);
-			RingMID->SetVectorParameterValue(TEXT("BaseColor"), Colour);
-		}
+		// AT THE FEET, derived from the same live capsule the diamond's height is: the actor origin
+		// of an ATraceCharacter is the capsule CENTRE, so the soles are one half height below it.
+		//
+		// IT KEEPS ITS RELATIVE ROTATION AT IDENTITY AND THE SPIN DOES NOT MATTER: a cylinder is
+		// rotationally symmetric about its own Z, so a spinning disc and a still one are the same
+		// pixels. Saying so here is cheaper than a reader wondering whether the ring is spinning too.
+		Ring->SetRelativeLocation(FVector(0.f, 0.f,
+			-(HalfHeight - TraceVulnerableMarkFx::FeetRingHeightUU)));
+		Ring->SetRelativeScale3D(FVector(
+			UTraceFxShapes::ShapeScaleForRadiusUU(TraceVulnerableMarkFx::FeetRingRadiusUU),
+			UTraceFxShapes::ShapeScaleForRadiusUU(TraceVulnerableMarkFx::FeetRingRadiusUU),
+			UTraceFxShapes::ShapeScaleForLengthUU(TraceVulnerableMarkFx::FeetRingHeightUU)));
+
+		UTraceFxShapes::SetGlow(RingMID, Pieces.RingBlend, TraceVulnerableMarkFx::VulnerableRose,
+			TraceVulnerableMarkFx::FeetRingIntensity, Dissolve);
 	}
 }
+
 
 // =================================================================================================
 // Regeneration test fixture
@@ -1621,6 +2097,189 @@ static FAutoConsoleCommandWithWorldAndArgs CmdHealthWatch(
 
 			return WatchWorld->GetTimeSeconds() < EndTime;
 		}), Interval);
+	}));
+
+// =================================================================================================
+// RESTRUCTURE C3 — LILY'S 60 HEALTH ON A LIVE CHARACTER SWITCH
+//
+//   Trace.Health.ReclampTest   Runs BOTH ARMS in one pass, on the real local pawn:
+//
+//     RED ARM   the re-clamp suppressed (TraceHealthReclamp::bSuppressReclamp), which is exactly
+//               the code that shipped before C3. Stage a 100/100 pawn, switch it to Lily, and the
+//               numbers must come back 100 health against a 60 maximum. *** A RED ARM THAT DOES
+//               NOT REPRODUCE FAILS THE TEST ***: without it, a green arm proves nothing but that
+//               the pawn happened to be at 60 already, which is precisely the trap the spec's
+//               "verify first, then re-clamp" instruction is about.
+//
+//     GREEN ARM the shipped code. Same staging, same switch, and health must read 60 immediately —
+//               no bullet, no respawn, no full heal in between.
+//
+//     FREE HEAL the switch BACK off Lily. Max goes to 100 and health must NOT move: the clamp is
+//               downward only, and "swap character to top up" would be a bigger bug than the one
+//               being fixed.
+//
+// The pawn's original character and full health are restored before the command returns, so this
+// is safe to run inside a match battery.
+// =================================================================================================
+
+namespace TraceReclampTest
+{
+	/** Everything but Lily, in roster order. The first one the team is not already holding wins. */
+	constexpr ETraceCharacterId StagingCandidates[] = {
+		ETraceCharacterId::Rocco, ETraceCharacterId::Chut, ETraceCharacterId::Mace,
+		ETraceCharacterId::Oyster, ETraceCharacterId::X, ETraceCharacterId::Roxie,
+		ETraceCharacterId::Elle, ETraceCharacterId::Slimeball, ETraceCharacterId::Mortimer
+	};
+
+	/** Clears @p Id off every OTHER component on the subject's team, so uniqueness cannot refuse us. */
+	void FreeOnTeam(const TArray<UTraceAbilityComponent*>& All, UTraceAbilityComponent* Subject, ETraceCharacterId Id)
+	{
+		for (UTraceAbilityComponent* Other : All)
+		{
+			if (Other != nullptr && Other != Subject && Other->GetTeam() == Subject->GetTeam()
+				&& Other->GetCharacterId() == Id)
+			{
+				Other->ServerSetCharacter(ETraceCharacterId::None);
+			}
+		}
+	}
+
+	/** Takes @p Id for the subject, clearing a teammate off it first. False = the roster refused. */
+	bool Take(const TArray<UTraceAbilityComponent*>& All, UTraceAbilityComponent* Subject, ETraceCharacterId Id)
+	{
+		FreeOnTeam(All, Subject, Id);
+		Subject->ServerSetCharacter(Id);
+		return Subject->GetCharacterId() == Id;
+	}
+}
+
+static FAutoConsoleCommandWithWorld CmdHealthReclampTest(
+	TEXT("Trace.Health.ReclampTest"),
+	TEXT("Dev only, SERVER. Spec v19 §3 / RESTRUCTURE C3: switching to Lily mid-life must clamp health "
+	     "to 60, and switching away must not heal. Runs a red arm (re-clamp suppressed) first, so a "
+	     "green arm is a measurement of the fix."),
+	FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World)
+	{
+		if (World == nullptr || World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[ReclampTest] Server only, and needs a game world."));
+			return;
+		}
+
+		TArray<UTraceAbilityComponent*> All;
+		UTraceAbilityWorldSubsystem::GatherAllComponents(World, All);
+
+		UTraceAbilityComponent* Subject = nullptr;
+		ATraceCharacter* SubjectPawn = nullptr;
+		for (int32 Pass = 0; Pass < 2 && Subject == nullptr; ++Pass)
+		{
+			for (UTraceAbilityComponent* Candidate : All)
+			{
+				if (Candidate == nullptr || (Pass == 0 && Candidate->IsBot()))
+				{
+					continue;   // humans first, bots only as a fallback
+				}
+				ATraceCharacter* Pawn = Candidate->GetOwningCharacter();
+				if (IsValid(Pawn) && Pawn->Health != nullptr && Pawn->Health->IsAlive())
+				{
+					Subject = Candidate;
+					SubjectPawn = Pawn;
+					break;
+				}
+			}
+		}
+
+		if (Subject == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[ReclampTest] *** NO LIVE PAWN WITH AN ABILITY COMPONENT. *** %d component(s) on this "
+				     "machine. Run this inside a match, not on the title screen."), All.Num());
+			return;
+		}
+
+		if (!UTraceAbilityComponent::AreCharactersEnabled(World))
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[ReclampTest] *** CHARACTERS ARE OFF HERE (mode A, or the disable toggle). *** There is "
+				     "no character switch to test."));
+			return;
+		}
+
+		UTraceHealthComponent* Health = SubjectPawn->Health;
+		const ETraceCharacterId Original = Subject->GetCharacterId();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ReclampTest] ===== subject %s (bot=%d, character %s), starting health %.1f / max %.1f ====="),
+			*GetNameSafe(Subject->GetOwningPlayerState()), Subject->IsBot() ? 1 : 0,
+			TraceCharacterIdToString(Original), Health->Health, Health->GetMaxHealth());
+
+		// ---- staging: a 100/100 pawn on somebody who is not Lily ------------------------------
+		ETraceCharacterId Staging = ETraceCharacterId::None;
+		for (const ETraceCharacterId Candidate : TraceReclampTest::StagingCandidates)
+		{
+			if (TraceReclampTest::Take(All, Subject, Candidate))
+			{
+				Staging = Candidate;
+				break;
+			}
+		}
+		if (Staging == ETraceCharacterId::None)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[ReclampTest] *** COULD NOT TAKE ANY NON-LILY CHARACTER. *** The roster refused all nine; "
+				     "the test cannot stage a 100-health pawn."));
+			return;
+		}
+		Health->ResetHealth();
+
+		const float StagedHealth = Health->Health;
+		const float StagedMax = Health->GetMaxHealth();
+		UE_LOG(LogTraceGame, Display, TEXT("[ReclampTest] staged on %s: health %.1f / max %.1f."),
+			TraceCharacterIdToString(Staging), StagedHealth, StagedMax);
+
+		// ---- RED ARM: the pre-C3 code ---------------------------------------------------------
+		TraceHealthReclamp::bSuppressReclamp = true;
+		const bool bRedTookLily = TraceReclampTest::Take(All, Subject, ETraceCharacterId::Lily);
+		const float RedHealth = Health->Health;
+		const float RedMax = Health->GetMaxHealth();
+		TraceHealthReclamp::bSuppressReclamp = false;
+
+		const bool bRedReproduced = bRedTookLily && RedHealth > RedMax + 0.01f;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ReclampTest] RED ARM (re-clamp suppressed): switched to Lily -> health %.1f / max %.1f. "
+			     "Bug reproduced = %d (health ABOVE max is the defect C3 fixes)."),
+			RedHealth, RedMax, bRedReproduced ? 1 : 0);
+
+		// ---- GREEN ARM: re-stage, then the shipped path ---------------------------------------
+		TraceReclampTest::Take(All, Subject, Staging);
+		Health->ResetHealth();
+		const bool bGreenTookLily = TraceReclampTest::Take(All, Subject, ETraceCharacterId::Lily);
+		const float GreenHealth = Health->Health;
+		const float GreenMax = Health->GetMaxHealth();
+		const bool bGreenClamped = bGreenTookLily && FMath::IsNearlyEqual(GreenHealth, GreenMax, 0.01f);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ReclampTest] GREEN ARM: switched to Lily -> health %.1f / max %.1f. Clamped on select = %d."),
+			GreenHealth, GreenMax, bGreenClamped ? 1 : 0);
+
+		// ---- FREE HEAL: switching away must not top anybody up --------------------------------
+		const bool bLeftLily = TraceReclampTest::Take(All, Subject, Staging);
+		const float AwayHealth = Health->Health;
+		const float AwayMax = Health->GetMaxHealth();
+		const bool bNoFreeHeal = bLeftLily && FMath::IsNearlyEqual(AwayHealth, GreenHealth, 0.01f) && AwayMax > GreenMax;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ReclampTest] FREE-HEAL CHECK: back to %s -> health %.1f / max %.1f. Health held = %d."),
+			TraceCharacterIdToString(Staging), AwayHealth, AwayMax, bNoFreeHeal ? 1 : 0);
+
+		// ---- restore ---------------------------------------------------------------------------
+		TraceReclampTest::Take(All, Subject, Original);
+		Health->ResetHealth();
+
+		const bool bPass = bRedReproduced && bGreenClamped && bNoFreeHeal;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ReclampTest] VERDICT: %s — redArmReproducedTheBug=%d clampedOnSelect=%d noFreeHeal=%d. "
+			     "Restored to %s at %.1f health."),
+			bPass ? TEXT("PASS") : TEXT("FAIL"), bRedReproduced ? 1 : 0, bGreenClamped ? 1 : 0,
+			bNoFreeHeal ? 1 : 0, TraceCharacterIdToString(Subject->GetCharacterId()), Health->Health);
 	}));
 
 // =================================================================================================

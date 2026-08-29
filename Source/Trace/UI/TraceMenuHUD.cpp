@@ -3,11 +3,13 @@
 #include "UI/TraceMenuHUD.h"
 
 #include "Audio/TraceAudio.h"         // spec v26 §9 — ButtonPress, client-side
+#include "Audio/TraceMusicPlayer.h"   // FX/audio plan §5.7 — the title loop, started in BeginPlay
 #include "Blueprint/UserWidget.h"
 #include "Engine/Canvas.h"
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
 #include "Engine/GameViewportClient.h"
+#include "Engine/Texture2D.h"         // WP9 — the Canvas title's sprite cache
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "UnrealClient.h"             // FViewport::IsForegroundWindow
@@ -17,10 +19,12 @@
 #include "InputCoreTypes.h"
 #include "InputKeyEventArgs.h"
 #include "Misc/CommandLine.h"
+#include "Misc/ConfigCacheIni.h"      // GConfig — the WP8.2 version string reads ProjectVersion once
 #include "Misc/CoreMiscDefines.h"     // FInputDeviceId
 #include "Misc/Parse.h"
 #include "HAL/PlatformTime.h"
 #include "Settings/TraceUserSettings.h"
+#include "TextureResource.h"          // WP9 — the RHI-readiness guard on the Canvas title's sprites
 #include "TimerManager.h"
 #include "Trace.h"                    // LogTraceGame
 #include "UI/Text/TraceCanvasText.h"   // spec v22 §A1 — this renderer types from the atlas
@@ -28,6 +32,7 @@
 #include "UI/TraceHardwareCursor.h"    // spec v24 §2 — one pointer on screen, not two
 #include "UI/TraceMatchOptions.h"
 #include "UI/TraceNetworking.h"
+#include "UI/Widgets/Menu/TraceMenuArtStyle.h"   // WP9 — the Canvas title draws the artist's sprites
 #include "UI/Widgets/Menu/TraceMenuPalette.h"
 #include "UI/Widgets/Menu/TraceTitleMenuWidget.h"
 
@@ -43,9 +48,13 @@
 // cost nothing, stay sharp at any resolution, and look like something a light cycle would drive on.
 //
 // The comment here used to add "and there is no .uasset budget for a real typeface (contract: no
-// assets)". THAT CONTRACT IS RETIRED — see spec v17 §0 and Trace.Build.cs. The stroke font stays
-// because it is better at this size, not because anything forbids a font asset. UTraceStrokeText
+// assets)". THAT CONTRACT IS RETIRED — see spec v17 §0 and Trace.Build.cs. UTraceStrokeText
 // (UI/Widgets/Menu/TraceStrokeTextWidget.h) is the same five glyphs for the UMG renderer.
+//
+// SINCE THE RELEASE PASS (UI plan WP9) THIS IS THE WORDMARK'S FALLBACK, NOT ITS RENDERER: the
+// Canvas title draws the artist's T_TraceWordmark sprite whenever it is loadable and drawable, and
+// these glyphs are what a fresh checkout (or a failed import) shows instead of nothing. The travel
+// overlay still strokes its dim TRACE from them every time.
 // =================================================================================================
 
 // Spec v22 §A1 — this renderer types in the artist's face too. See TraceMenuHUDType below.
@@ -260,6 +269,164 @@ namespace TraceMenuHUDFile
 		}
 		return GUseUMG != 0;
 	}
+
+	/**
+	 * Release UI plan WP8.2 — "V 0.1.0", bottom-right of the title screen.
+	 *
+	 * Read once from the one place a version already exists — ProjectVersion in
+	 * Config/DefaultGame.ini ([/Script/EngineSettings.GeneralProjectSettings]) — rather than a
+	 * second constant that would drift from it. Empty when the ini has no version, in which case
+	 * nothing is drawn: an empty corner beats "V ".
+	 *
+	 * Both renderers show it from this one string: the Canvas path draws it in DrawHUD, and
+	 * BuildMenuView hands it to the widget in the view (a Canvas draw alone cannot serve the UMG
+	 * frames — AHUD's canvas composites UNDER Slate, which is the same fact that makes the modals
+	 * stand the widget down).
+	 */
+	static const FString& ProjectVersionLabel()
+	{
+		static const FString Label = []() -> FString
+		{
+			FString Version;
+			if (GConfig != nullptr)
+			{
+				GConfig->GetString(TEXT("/Script/EngineSettings.GeneralProjectSettings"),
+					TEXT("ProjectVersion"), Version, GGameIni);
+			}
+			Version.TrimStartAndEndInline();
+			return Version.IsEmpty() ? FString() : FString::Printf(TEXT("V %s"), *Version);
+		}();
+		return Label;
+	}
+}
+
+// =================================================================================================
+// RELEASE UI PLAN WP9 — THE CANVAS TITLE DRAWS THE ARTIST'S ART TOO
+// =================================================================================================
+//
+// The Canvas renderer is what a player sees behind every SETTINGS/JOIN modal (spec v25 §1 stands the
+// UMG widget down for those frames) and whenever the widget is off or missing. Until this pass it
+// drew the stroke-vector wordmark on plateless rows — so opening a modal swapped 58.8% of the frame
+// to what read as a DIFFERENT GAME under the scrim. The full Slate/UMG modal rebuild is deferred
+// (TraceOptionsMenu.h documents why); the shipped mitigation is to draw the artist's sprites HERE
+// too: wordmark, swoosh, and the button plates as a horizontal 3-slice (Canvas cannot 9-slice, but
+// at a fixed row height a 3-slice is exact). The stroke wordmark and the flat rects remain as the
+// fallback whenever a texture is unavailable — the standing rule that a missing texture must leave
+// the menu drawable.
+//
+// THE GUARD IS NOT OPTIONAL. "A LOADED TEXTURE IS NOT A DRAWABLE ONE": AHUD::DrawTexture hands
+// Texture->GetResource() straight to an FCanvasTileItem, and a texture whose FTextureResource has no
+// RHI texture yet is a SIGSEGV on the render thread ~130 ms later — measured, three callstacks, in
+// TraceOptionsMenu.cpp:339-420, whose loader this cache duplicates verbatim rather than re-learning.
+namespace TraceMenuHUDSprites
+{
+	enum class ESprite : uint8
+	{
+		BtnDefault,
+		BtnHover,
+		Wordmark,
+		Swoosh,
+		Count
+	};
+
+	static const TCHAR* const SpritePaths[static_cast<int32>(ESprite::Count)] =
+	{
+		TraceMenuArtStyle::BtnDefault,
+		TraceMenuArtStyle::BtnHover,
+		TraceMenuArtStyle::Wordmark,
+		TraceMenuArtStyle::Swoosh,
+	};
+
+	static TWeakObjectPtr<UTexture2D> GCache[static_cast<int32>(ESprite::Count)];
+
+	/** Set only on a genuine load failure: a collected texture is re-fetched, a missing one is not re-hunted every frame. */
+	static bool GFailed[static_cast<int32>(ESprite::Count)] = {};
+
+	/** The measured crash guard — see the banner above and TraceOptionsMenu.cpp's original. */
+	static bool IsDrawable(const UTexture2D* Tex)
+	{
+		if (Tex == nullptr)
+		{
+			return false;
+		}
+		const FTextureResource* Resource = Tex->GetResource();
+		if (Resource == nullptr || !Resource->TextureRHI.IsValid())
+		{
+			UE_LOG(LogTraceGame, Verbose, TEXT("[MenuArt] '%s' is loaded but has no RHI texture yet; ")
+				TEXT("the Canvas title draws its fallback this frame."), *Tex->GetName());
+			return false;
+		}
+		return true;
+	}
+
+	/** The texture, or null — which every caller treats as "draw what you drew before spec WP9". */
+	static UTexture2D* Sprite(ESprite Which)
+	{
+		const int32 Index = static_cast<int32>(Which);
+		if (UTexture2D* Cached = GCache[Index].Get())
+		{
+			return IsDrawable(Cached) ? Cached : nullptr;
+		}
+		if (GFailed[Index])
+		{
+			return nullptr;
+		}
+
+		UTexture2D* Loaded = LoadObject<UTexture2D>(nullptr, SpritePaths[Index]);
+		if (Loaded == nullptr)
+		{
+			// Once. A warning per frame per sprite on the title screen is its own defect.
+			GFailed[Index] = true;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[MenuArt] Canvas title art '%s' did not load; that element keeps its stroke/rect fallback."),
+				SpritePaths[Index]);
+			return nullptr;
+		}
+
+		// Rooted: on a pure Canvas session nothing else references these (the WBP that would is
+		// exactly what is not loaded), and a GC mid-session would blank the title for a frame.
+		Loaded->AddToRoot();
+		GCache[Index] = Loaded;
+		return IsDrawable(Loaded) ? Loaded : nullptr;
+	}
+
+	/**
+	 * Three-slice in X: the two caps keep their shape, only the middle stretches. Same shape as
+	 * TraceOptionsMenuArt::Draw3H, for the same reason — at a fixed plate height this is exactly
+	 * what the 9-slice would have drawn.
+	 *
+	 * @param CapU   the cap as a fraction of the sprite's WIDTH (a texture coordinate)
+	 * @param CapPx  the cap's width on screen, derived from the sprite's height scale by the caller
+	 */
+	static void Draw3H(AHUD* HUD, UTexture2D* Tex, float X, float Y, float W, float H,
+		float CapU, float CapPx, const FLinearColor& Tint)
+	{
+		const float Cap = FMath::Min(CapPx, W * 0.5f);
+		const float MidW = W - Cap * 2.f;
+
+		HUD->DrawTexture(Tex, X, Y, Cap, H, 0.f, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
+		if (MidW > 0.f)
+		{
+			HUD->DrawTexture(Tex, X + Cap, Y, MidW, H, CapU, 0.f, 1.f - CapU * 2.f, 1.f, Tint, BLEND_Translucent);
+		}
+		HUD->DrawTexture(Tex, X + W - Cap, Y, Cap, H, 1.f - CapU, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
+	}
+
+	/**
+	 * Draws a button-plate sprite so its PLATE lands exactly on (X, Y, W, H) — the row rect — with
+	 * the glow overhanging outside, which is what the UMG row's GlowInset does. Forget the overhang
+	 * and the plate comes out a fifth small inside its own row (measured once already, on the UMG
+	 * side).
+	 */
+	static void DrawPlate(AHUD* HUD, UTexture2D* Tex, float X, float Y, float W, float H, const FLinearColor& Tint)
+	{
+		const TraceMenuArtStyle::FSpriteFrame& Frame = TraceMenuArtStyle::ButtonFrame;
+		const float Grow = H * (Frame.Glow / Frame.PlateH);
+		const float DrawnH = H + Grow * 2.f;
+		const float CapU = Frame.Cap / Frame.SpriteW();
+		const float CapPx = DrawnH * (Frame.Cap / Frame.SpriteH());
+		Draw3H(HUD, Tex, X - Grow, Y - Grow, W + Grow * 2.f, DrawnH, CapU, CapPx, Tint);
+	}
 }
 
 bool ATraceMenuHUD::TryAdoptMenuWidget()
@@ -407,7 +574,15 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 		: FString(TEXT("PORT 7777 IS BUSY ON THIS MACHINE - THE HUD WILL SHOW THE REAL PORT IN-GAME"));
 
 	OutView.FooterKeys = TEXT("W / S  OR  ARROWS   MOVE          A / D   CHANGE          ENTER   SELECT          ESC   QUIT");
-	OutView.FooterHint = TEXT("PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE   -   OTHERS PICK JOIN AND TYPE YOUR ADDRESS ABOVE");
+
+	// WP8.1 — the address prints in TWO places (the chip above, and the JOIN modal's "THIS MACHINE
+	// IS"), not five. This hint used to end "... AND TYPE YOUR ADDRESS ABOVE", which was repetition
+	// number four; the chip it pointed at is right there.
+	OutView.FooterHint = TEXT("PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE");
+
+	// WP8.2 — the version, bottom-right. The widget draws it because this Canvas cannot reach a UMG
+	// frame (AHUD's canvas composites under Slate); the Canvas path draws the same string in DrawHUD.
+	OutView.Version = TraceMenuHUDFile::ProjectVersionLabel();
 
 	// ---- Failure banner ---------------------------------------------------------------------------
 	{
@@ -569,6 +744,21 @@ void ATraceMenuHUD::BeginPlay()
 		AcceptUnlockTime = TitleShownTime + TraceMenuStyle::ActivationGraceSeconds;
 	}
 
+	// ---- FX/AUDIO PLAN §5.7 — THE TITLE LOOP ----------------------------------------------------
+	//
+	// UTraceMusicSubsystem is a GAME INSTANCE subsystem, so the component it owns survives the
+	// menu-level -> arena travel and back; Play() is a no-op when that track is already playing.
+	// Both facts together are why this is an UNCONDITIONAL call in BeginPlay rather than a
+	// "have we started yet" flag: returning to the title screen from a match re-runs this line and
+	// simply re-asserts what is already true, and a map restart cannot leave the menu silent.
+	//
+	// Null-tested rather than assumed: Get() refuses on a dedicated server, and it returns null
+	// before a game instance exists at all.
+	if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(this))
+	{
+		Music->Play(TraceSoundEvents::MusicTitle);
+	}
+
 #if !UE_BUILD_SHIPPING
 	TraceAutoShot::Arm(this, TEXT("Menu"));
 	TraceAutoShot::ArmDeferredExec(this, TEXT("Menu"));
@@ -606,18 +796,72 @@ namespace
 	 * log line each step prints is the check: if a step's description stops matching what the
 	 * screenshot shows selected, this list is stale.
 	 *
-	 * RE-WALKED FOR SPEC v15 §5, which DELETED the SWAP WEAPON row. Verdict: NOT AFFECTED, and here
-	 * is the walk that says so. FTraceOptionsMenu::RebuildRows lays the settings page out as
+	 * RE-WALKED FOR SPEC v15 §5, which DELETED the SWAP WEAPON row. Verdict at the time: NOT
+	 * AFFECTED — SWAP WEAPON was the twelfth binding, six rows BELOW MOVE FORWARD, so deleting it
+	 * moved nothing the script ever selects.
 	 *
-	 *    0 header DISPLAY   1 VIDEO SETTINGS  <- the selection starts here (first selectable row)
-	 *    2 header MATCH     3 CHARACTERS      4 note   5 note
-	 *    6 header MOUSE     7 SENSITIVITY     8 VERTICAL SENSITIVITY   9 INVERT MOUSE Y
-	 *   10 header CONTROLS 11 MOVE FORWARD   12..  the rest of TraceInputActions::All(), in order
+	 * *** RE-WALKED AGAIN FOR THE RELEASE UI PLAN (WP2 CALL SIGN + WP3 AUDIO), AND THIS TIME IT WAS
+	 * AFFECTED — TWICE OVER. *** Two passes have inserted rows ABOVE everything this script walks:
+	 * spec v29 §3 put a CROSSHAIR door under VIDEO SETTINGS (that one shipped WITHOUT this comment
+	 * being re-walked, which is exactly the silent re-aim the warning above predicts — the first Down
+	 * had been landing on CROSSHAIR and calling it CHARACTERS ever since), and WP2/WP3 have now added
+	 * a PLAYER section above the whole page plus a SOUND door in the middle of it.
 	 *
-	 * and the script's four Downs land on 3, 7, 8, 9 and 11 — every one of them AT OR ABOVE the
-	 * first binding row. SWAP WEAPON was the twelfth binding, six rows BELOW MOVE FORWARD, so
-	 * deleting it moves nothing the script ever selects. Nothing to re-aim; the descriptions below
-	 * still name what is selected.
+	 * FTraceOptionsMenu::RebuildRows now lays the settings page out as
+	 *
+	 *    0 header PLAYER    1 CALL SIGN       <- the selection starts here (first selectable row)
+	 *    2 note
+	 *    3 header DISPLAY   4 VIDEO SETTINGS  5 CROSSHAIR
+	 *    6 header SOUND     7 AUDIO
+	 *    8 header MATCH     9 CHARACTERS     10 note  11 note
+	 *   12 header MOUSE    13 SENSITIVITY    14 VERTICAL SENSITIVITY   15 INVERT MOUSE Y
+	 *   16 header CONTROLS 17 MOVE FORWARD   18..  the rest of TraceInputActions::All(), in order
+	 *
+	 * MoveSelection skips headers and notes, so the SELECTABLE walk from the top is
+	 *
+	 *    1 CALL SIGN -> 4 VIDEO SETTINGS -> 5 CROSSHAIR -> 7 AUDIO -> 9 CHARACTERS
+	 *      -> 13 SENSITIVITY -> 14 VERTICAL -> 15 INVERT MOUSE Y -> 17 MOVE FORWARD
+	 *
+	 * i.e. reaching CHARACTERS now costs FOUR Downs where it used to cost one, and every later step
+	 * keeps its own relative distance (CHARACTERS -> SENSITIVITY is still one Down, and so on). The
+	 * leading step below is therefore four Downs and nothing else in the list moves.
+	 *
+	 * *** THE CALL SIGN ROW IS NOT ACTIVATED BY THIS SCRIPT, DELIBERATELY. *** Enter on it hands the
+	 * keyboard to FTraceTextEntry for the rest of the run (FTraceOptionsMenu::TickCallSignEntry), so
+	 * every subsequent injected key would be typed into a name instead of driving a row — the script
+	 * would still "pass" while proving nothing. The call sign has its own headless driver,
+	 * Trace.CallSign.Set, which goes through the same storage and the same ServerChangeName the row's
+	 * submit path uses.
+	 *
+	 * ---- MEASURED, AND IT IS WHY THE RE-WALK ALONE DOES NOT MAKE THE DONE LINE PASS ---------------
+	 *
+	 * *** THIS SCRIPT'S END-STATE ASSERTIONS DO NOT HOLD ON A HEADLESS RUN, AND THE CAUSE IS NOT THE
+	 * ROW COUNTS. *** Run headlessly after the re-walk above
+	 * (Saved/Logs/release/W3-UISETTINGS-autosettings.log), every step's DESCRIPTION matched the page
+	 * — the layout was confirmed independently, row by row, with Trace.Menu.Nudge <n> 0
+	 * (W3-UISETTINGS-rowdump.log) — and the DONE line still reported sensitivity=1.00 (expected 1.20)
+	 * and moveForward=ENTER (expected K), with the four RIGHT presses landing on VERTICAL SENSITIVITY
+	 * and the rebind capture opening on slot 1 rather than slot 0.
+	 *
+	 * The signature says what is happening: the two steps aimed at CHARACTERS produced NO
+	 * `[Settings] Saved` line at all, which no Slider or Toggle row can do — so the highlight was not
+	 * where the injected keys had put it. The remaining mover of `Selected` is
+	 * FTraceOptionsMenu::PollMouse, which runs AFTER PollNavigation and drags the selection onto
+	 * whatever row the pointer is over whenever the pointer appears to have moved. Headlessly the OS
+	 * cursor sits wherever it sits — in the archived settings capture it is resting on INVERT MOUSE Y
+	 * — and a row that slides under a resting pointer as the page is laid out looks exactly like a
+	 * pointer that moved. That is the same class of defect the bCursorMoved guard was added for, one
+	 * step further out, and it is a property of driving a MOUSE-AND-KEYBOARD menu with the keyboard
+	 * only on a machine with no hand on the mouse.
+	 *
+	 * SO: the counts below are correct against the page and are worth keeping correct; the DONE
+	 * line's numbers are NOT a usable pass/fail signal headlessly and must not be "fixed" by
+	 * trial-and-error nudging of the counts, which would leave the descriptions lying about the rows
+	 * again. What this run IS good evidence for is the input PATH — it drove fifteen real
+	 * MoveSelection focus changes through the real polling code (Trace.Audio.Heard: UIHover x15).
+	 * A trustworthy end-state assertion needs the pointer parked off the panel first, which is a
+	 * change to this harness rather than to the page it drives, and it is left for whoever next
+	 * needs the assertion rather than done blind here.
 	 */
 	struct FAutoSettingsKey { FKey (*Key)(); const TCHAR* What; };
 
@@ -625,6 +869,13 @@ namespace
 	{
 		static const TArray<FAutoSettingsKey> Script =
 		{
+			// FOUR Downs, not one: CALL SIGN -> VIDEO SETTINGS -> CROSSHAIR -> AUDIO -> CHARACTERS.
+			// See the walk in the block comment above; the count is the number of SELECTABLE rows
+			// between the page's opening selection and this one, and it is the only step in this list
+			// that the release UI plan moved.
+			{ []{ return EKeys::Down;  }, TEXT("-> video settings (from call sign)") },
+			{ []{ return EKeys::Down;  }, TEXT("-> crosshair") },
+			{ []{ return EKeys::Down;  }, TEXT("-> audio") },
 			{ []{ return EKeys::Down;  }, TEXT("-> characters (spec v14 3)") },
 
 			// LEFT/RIGHT rather than ENTER. This is now belt-and-braces: ActivateSelected on a
@@ -1268,6 +1519,18 @@ void ATraceMenuHUD::MoveSelection(int32 Delta)
 	}
 
 	const int32 Next = FMath::Clamp(static_cast<int32>(Selected) + Delta, 0, static_cast<int32>(ETraceMenuRow::Count) - 1);
+
+	// FX/AUDIO PLAN §5.1 — "UIHover: menu row focus change", client-side 2D (the ButtonPress
+	// precedent is in ActivateSelection below).
+	//
+	// ON THE CHANGE, NEVER ON THE PRESS. The clamp above means holding DOWN at the bottom of the list
+	// calls this function every frame while Selected does not move, and a sound on every one of those
+	// frames would turn the end of the list into a buzz.
+	if (Next != static_cast<int32>(Selected))
+	{
+		TraceAudio::PlayLocal2D(this, TraceSoundEvents::UIHover);
+	}
+
 	Selected = static_cast<ETraceMenuRow>(Next);
 }
 
@@ -1832,6 +2095,15 @@ void ATraceMenuHUD::DrawHUD()
 					{
 						if (RowRects[Index].bIsValid && RowRects[Index].IsInside(Position))
 						{
+							// FX/AUDIO PLAN §5.1 — the pointer's half of "menu row focus change".
+							// Guarded on the row ACTUALLY changing: this block already only runs when
+							// the cursor moved more than 2 px, but 2 px of travel inside one row must
+							// not re-announce the row it is already on.
+							if (Selected != static_cast<ETraceMenuRow>(Index))
+							{
+								TraceAudio::PlayLocal2D(this, TraceSoundEvents::UIHover);
+							}
+
 							Selected = static_cast<ETraceMenuRow>(Index);
 							break;
 						}
@@ -1881,11 +2153,13 @@ void ATraceMenuHUD::DrawHUD()
 	// argument, both arms of the measurement and all three captured callstacks are in the header of
 	// UI/TraceOptionsMenu.h.
 	//
-	// So a Canvas modal is under Slate again, and the widget has to stand down for one. The cost is
+	// So a Canvas modal is under Slate again, and the widget has to stand down for one. The cost was
 	// the §A2 defect returning: for as long as SETTINGS or the JOIN prompt is open, the screen behind
 	// it is the Canvas title screen rather than the artist's UMG one — measured at 1920x1080 as 58.8%
-	// of the frame changing renderer on one keypress. That is a cosmetic regression on one screen and
-	// it is the trade spec v25 §1 asks for.
+	// of the frame changing renderer on one keypress. That is the trade spec v25 §1 asks for, and the
+	// release pass (UI plan WP9) shrank what it costs: the Canvas title now draws the artist's
+	// wordmark, swoosh and button plates itself (see TraceMenuHUDSprites), so the swap is a renderer
+	// change the player is not supposed to notice rather than a different-looking game under a scrim.
 	//
 	// STILL TAKEN HERE, NOT INSIDE EACH MODAL, and that has not stopped mattering: a frame that kept
 	// the widget up while a modal drew underneath it would be a title screen with an INVISIBLE
@@ -1935,6 +2209,11 @@ void ATraceMenuHUD::DrawHUD()
 		// After the footer, not before: the footer's dark strip runs to the bottom edge and would
 		// otherwise swallow the frame's bottom rail and two of its corner ticks.
 		DrawBezel();
+
+		// After the strip and the bezel so it sits on both; before the join prompt below and the
+		// options overlay at the end of DrawHUD, so a modal's scrim dims it rather than losing it.
+		DrawVersionString();
+
 		DrawCursor();
 		DrawTravelOverlay();
 	}
@@ -2065,6 +2344,64 @@ void ATraceMenuHUD::DrawBezel()
 void ATraceMenuHUD::DrawWordmark()
 {
 	const float CX = ViewW * 0.5f;
+
+	// ---- WP9: THE ARTIST'S MARK, ON THIS RENDERER TOO ---------------------------------------------
+	//
+	// This screen is what shows through every modal's scrim, and until the release pass it announced
+	// itself with a stroke-vector TRACE in cyan — the audit's single loudest "different game" tell.
+	// So the sprite path comes first, at the SAME composition the UMG widget uses (TraceTitleLayout,
+	// one copy for both renderers): the artist's wordmark, their swoosh under it at their measured
+	// offsets, the tagline at its authored line. White tint — the sprites carry their own colour
+	// since the slicer's lift/re-tone (slice-ui-assets.py notes 6 and 7).
+	//
+	// The stroke wordmark below is the FALLBACK, kept per the standing rule that a missing texture
+	// must leave the menu drawable — and it is still what a fresh checkout shows before the sprites
+	// are generated.
+	UTexture2D* Mark = TraceMenuHUDSprites::Sprite(TraceMenuHUDSprites::ESprite::Wordmark);
+	if (Mark != nullptr && Mark->GetSizeX() > 0 && Mark->GetSizeY() > 0)
+	{
+		using namespace TraceTitleLayout;
+
+		const float MarkW = FMath::Min(MarkWidth * UIScale, ViewW * MarkMaxWidthFraction);
+		const float MarkH = MarkW * (static_cast<float>(Mark->GetSizeY()) / static_cast<float>(Mark->GetSizeX()));
+		const float MarkTop = MarkTopY * UIScale;
+		const float TaglineTop = TaglineY * UIScale;
+
+		DrawTexture(Mark, CX - MarkW * 0.5f, MarkTop, MarkW, MarkH,
+			0.f, 0.f, 1.f, 1.f, FLinearColor::White, BLEND_Translucent);
+
+		UTexture2D* SwooshTex = TraceMenuHUDSprites::Sprite(TraceMenuHUDSprites::ESprite::Swoosh);
+		if (SwooshTex != nullptr && SwooshTex->GetSizeX() > 0 && SwooshTex->GetSizeY() > 0)
+		{
+			const float SwooshAspect =
+				static_cast<float>(SwooshTex->GetSizeY()) / static_cast<float>(SwooshTex->GetSizeX());
+			float SwooshW = MarkW * SwooshWidthOfMark;
+			const float SwooshTop = MarkTop + MarkH + MarkW * SwooshGapOfMark;
+
+			// The same clamp the widget applies: whatever the sheet says, the flourish stops short
+			// of the tagline.
+			const float MaxSwooshH = FMath::Max(1.f, TaglineTop - SwooshClearOfTagline * UIScale - SwooshTop);
+			if (SwooshW * SwooshAspect > MaxSwooshH)
+			{
+				SwooshW = MaxSwooshH / FMath::Max(SwooshAspect, KINDA_SMALL_NUMBER);
+			}
+
+			DrawTexture(SwooshTex,
+				CX - MarkW * SwooshLeftOfMark - SwooshW * 0.5f, SwooshTop,
+				SwooshW, SwooshW * SwooshAspect,
+				0.f, 0.f, 1.f, 1.f,
+				FLinearColor(1.f, 1.f, 1.f, SwooshOpacity), BLEND_Translucent);
+		}
+
+		DrawTextCentered(TEXT("5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER"),
+			TraceMenuStyle::InkDim, CX, TaglineTop, FontSmall, 1.15f * UIScale);
+
+		// Remembered for DrawAddressChip, which has to sit exactly under the tagline and must not
+		// re-derive the wordmark's geometry to find out where that is.
+		TaglineBottomY = TaglineTop + MeasureHeight(TEXT("X"), FontSmall, 1.15f * UIScale);
+		return;
+	}
+
 	const float CapHeight = ViewH * 0.155f;
 	const float TitleY = ViewH * 0.135f;
 	const float Thickness = FMath::Max(2.f, CapHeight * 0.055f);
@@ -2081,8 +2418,7 @@ void ATraceMenuHUD::DrawWordmark()
 	DrawTextCentered(TEXT("5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER"),
 		TraceMenuStyle::InkDim, CX, RuleY + (18.f * UIScale), FontSmall, 1.15f * UIScale);
 
-	// Remembered for DrawAddressChip, which has to sit exactly under the tagline and must not
-	// re-derive the wordmark's geometry to find out where that is.
+	// Remembered for DrawAddressChip, same as the sprite arm above.
 	TaglineBottomY = RuleY + (18.f * UIScale) + MeasureHeight(TEXT("X"), FontSmall, 1.15f * UIScale);
 }
 
@@ -2219,7 +2555,9 @@ void ATraceMenuHUD::DrawJoinPrompt()
 	// come back with it — and it is still not being restored. 0.78 is the value this screen was
 	// designed at, a scrim that hides the screen behind it entirely is not a scrim, and the honest
 	// reading of the v25 §1 trade is that the Canvas title screen shows through a modal. Raising the
-	// number here would be hiding the cost rather than paying it.
+	// number here would be hiding the cost rather than paying it. WP9 shrank that cost at its source
+	// instead: the Canvas title now draws the artist's wordmark, swoosh and plates itself, so what
+	// shows through this scrim is the same screen, not a different-looking game.
 	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.78f), 0.f, 0.f, ViewW, ViewH);
 
 	const float CX = ViewW * 0.5f;
@@ -2298,15 +2636,50 @@ void ATraceMenuHUD::DrawJoinPrompt()
 	}
 
 	// ---- Keys, and this machine's own address ----------------------------------------------------
-	DrawTextCentered(TEXT("ENTER   CONNECT          ESC   CANCEL          CTRL / CMD + V   PASTE          BACKSPACE   DELETE"),
-		TraceMenuStyle::InkDim, CX, PanelY + PanelH - (66.f * UIScale), FontSmall, 1.f * UIScale);
+	//
+	// WP5 — FITTED, NOT ASSUMED. The four-hint line overflowed the 900 px panel at 1080p
+	// (photographed in the release audit). The house measure-and-shrink pattern
+	// (TraceCharacterSelect's name fit): measure at natural scale WITH THE FACE THAT DRAWS IT —
+	// measure-with-the-face-you-draw is the HUD's own law — and multiply the scale down, floored at
+	// 0.72 so it degrades into smaller type rather than unreadable type. Below the floor (cannot
+	// happen with the current copy) the PASTE segment goes first: paste is discoverable,
+	// connect/cancel are not.
+	const float HintPad = 24.f * UIScale;
+	const float HintRoom = PanelW - HintPad * 2.f;
+	{
+		FString Keys = TEXT("ENTER   CONNECT          ESC   CANCEL          CTRL / CMD + V   PASTE          BACKSPACE   DELETE");
+		float KeysScale = 1.f * UIScale;
+		float Natural = MeasureWidth(Keys, FontSmall, KeysScale);
+		if (Natural > HintRoom && Natural > 1.f)
+		{
+			if (HintRoom / Natural < 0.72f)
+			{
+				Keys = TEXT("ENTER   CONNECT          ESC   CANCEL          BACKSPACE   DELETE");
+				Natural = MeasureWidth(Keys, FontSmall, KeysScale);
+			}
+			if (Natural > HintRoom && Natural > 1.f)
+			{
+				KeysScale *= FMath::Max(0.72f, HintRoom / Natural);
+			}
+		}
+		DrawTextCentered(Keys, TraceMenuStyle::InkDim, CX, PanelY + PanelH - (66.f * UIScale), FontSmall, KeysScale);
+	}
 
 	// Deliberately repeated here as well as on the title screen behind it. Somebody in this prompt is
 	// mid-conversation with the person they are trying to reach, and "what's yours?" is the very next
-	// question — having it on screen saves a round trip through Escape.
-	DrawTextCentered(FString::Printf(TEXT("THIS MACHINE IS %s"), *TraceNet::GetHostEndpoint()),
-		TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.7f),
-		CX, PanelY + PanelH - (40.f * UIScale), FontSmall, 1.f * UIScale);
+	// question — having it on screen saves a round trip through Escape. Same fit guard: a long
+	// tailscale hostname is exactly the string that does not fit a 900 px panel.
+	{
+		const FString Machine = FString::Printf(TEXT("THIS MACHINE IS %s"), *TraceNet::GetHostEndpoint());
+		float MachineScale = 1.f * UIScale;
+		const float Natural = MeasureWidth(Machine, FontSmall, MachineScale);
+		if (Natural > HintRoom && Natural > 1.f)
+		{
+			MachineScale *= FMath::Max(0.72f, HintRoom / Natural);
+		}
+		DrawTextCentered(Machine, TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.7f),
+			CX, PanelY + PanelH - (40.f * UIScale), FontSmall, MachineScale);
+	}
 }
 
 void ATraceMenuHUD::DrawMenuRows()
@@ -2316,9 +2689,10 @@ void ATraceMenuHUD::DrawMenuRows()
 	const float CX = ViewW * 0.5f;
 	const float Spacing = TraceMenuStyle::RowSpacing * UIScale;
 
-	// The rows sit on an opaque console rather than straight on the grid. Without it the perspective
-	// lines run right through the labels and the blurb underneath is simply unreadable — the grid
-	// wins every legibility contest it is allowed to enter.
+	// The rows sat on an opaque console rather than straight on the grid, because the perspective
+	// lines ran right through the labels — the grid wins every legibility contest it is allowed to
+	// enter. Since WP9 the plates themselves are opaque sprites and the console only draws on the
+	// spriteless fallback; see bPlates below.
 	//
 	// The arithmetic moved into TraceMenuStyle::ComputeConsoleLayout in spec v17 §4 so that
 	// GetCanvasRowRect (which the UMG verifier compares against) and this draw cannot disagree.
@@ -2332,14 +2706,24 @@ void ATraceMenuHUD::DrawMenuRows()
 	const float PanelW = Layout.PanelW;
 	const float PanelH = Layout.PanelH;
 
-	DrawRect(TraceMenuStyle::PanelFill, PanelX, PanelY, PanelW, PanelH);
+	// WP9: when the artist's plates are drawable the rows are opaque navy buttons and carry their
+	// own legibility, exactly as on the UMG screen — whose ConsolePanel is a CLEAR border. Drawing
+	// the old cyan-edged console behind them would be the "different game" tell surviving in a
+	// frame. The panel remains the fallback's legibility device when the sprites are absent.
+	const bool bPlates =
+		TraceMenuHUDSprites::Sprite(TraceMenuHUDSprites::ESprite::BtnDefault) != nullptr
+		&& TraceMenuHUDSprites::Sprite(TraceMenuHUDSprites::ESprite::BtnHover) != nullptr;
+	if (!bPlates)
+	{
+		DrawRect(TraceMenuStyle::PanelFill, PanelX, PanelY, PanelW, PanelH);
 
-	const float Edge = FMath::Max(1.f, 1.2f * UIScale);
-	const FLinearColor PanelEdge = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.28f);
-	DrawRect(PanelEdge, PanelX, PanelY, PanelW, Edge);
-	DrawRect(PanelEdge, PanelX, PanelY + PanelH - Edge, PanelW, Edge);
-	DrawRect(PanelEdge, PanelX, PanelY, Edge, PanelH);
-	DrawRect(PanelEdge, PanelX + PanelW - Edge, PanelY, Edge, PanelH);
+		const float Edge = FMath::Max(1.f, 1.2f * UIScale);
+		const FLinearColor PanelEdge = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.28f);
+		DrawRect(PanelEdge, PanelX, PanelY, PanelW, Edge);
+		DrawRect(PanelEdge, PanelX, PanelY + PanelH - Edge, PanelW, Edge);
+		DrawRect(PanelEdge, PanelX, PanelY, Edge, PanelH);
+		DrawRect(PanelEdge, PanelX + PanelW - Edge, PanelY, Edge, PanelH);
+	}
 
 	const float FirstY = Layout.FirstRowY;
 	for (int32 Index = 0; Index < RowCount; ++Index)
@@ -2366,8 +2750,9 @@ FString ATraceMenuHUD::BuildBlurb() const
 	switch (Selected)
 	{
 	case ETraceMenuRow::Play:
-		return FString::Printf(TEXT("HOSTS A GAME ON %s.  OTHERS PICK JOIN AND TYPE THAT."),
-			*TraceNet::GetHostEndpoint());
+		// WP8.1 — points at the chip instead of repeating its number. The chip is the address's one
+		// authoritative appearance on this screen.
+		return TEXT("HOSTS A GAME ON YOUR ADDRESS ABOVE.  OTHERS PICK JOIN AND TYPE IT.");
 
 	case ETraceMenuRow::Join:
 		return LastJoinAddress.IsEmpty()
@@ -2421,14 +2806,15 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 	default:                        OutView.Label = TEXT("");             break;
 	}
 
-	// The two NETWORK rows carry a right-aligned status word instead of a stepper. Small font, not
+	// The JOIN row carries a right-aligned status word instead of a stepper. Small font, not
 	// the row font: an IPv4 address plus a port is twenty characters, and at the label's size it
 	// would collide with "JOIN" on a 1280-wide window. It is a readout, not a value to change.
-	if (Row == ETraceMenuRow::Play)
-	{
-		OutView.Status = FString::Printf(TEXT("HOST  %s"), *TraceNet::GetHostEndpoint());
-	}
-	else if (Row == ETraceMenuRow::Join)
+	//
+	// PLAY carried a "HOST <address>" readout too, until WP8.1: that was the address's third
+	// appearance on one screen, one row under the chip that is its single authoritative source. The
+	// row label and the blurb carry the hosting fact; the chip carries the number. JOIN's remembered
+	// target stays — a reconnect affordance, not a repetition.
+	if (Row == ETraceMenuRow::Join)
 	{
 		OutView.Status = LastJoinAddress.IsEmpty() ? FString(TEXT("ENTER AN ADDRESS")) : LastJoinAddress;
 	}
@@ -2451,11 +2837,12 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 			? TraceScoringModeLabel(ScoringMode)
 			: TraceDifficulty::ToDisplayName(Difficulty);
 
-		// Mode B wears the amber that this screen reserves for "this is not the default" — the same
-		// colour HARD gets, for the same reason. Mode A is the shipped game and takes the plain cyan.
-		OutView.ValueColor = bIsModeRow
-			? (TraceIsGoalMode(ScoringMode) ? TraceMenuStyle::Amber : TraceMenuStyle::Cyan)
-			: TraceMenuStyle::DifficultyColor(Difficulty);
+		// One cyan for BOTH value rows — the art bible §2.4 guard rail: menu accents on one screen
+		// come from at most two systems, and only team-flavoured values may be amber. Mode B used to
+		// wear amber and DIFFICULTY used to colour-code its setting (mint/cyan/amber), which put a
+		// third and fourth accent voice on a screen whose selection language is already amber ring +
+		// rail. The WORDS carry the settings; the colour stays neutral.
+		OutView.ValueColor = TraceMenuStyle::Cyan;
 
 		OutView.bShowArrows = true;
 		OutView.bCanLeft = bIsModeRow
@@ -2473,30 +2860,52 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 	const float X = CenterX - Width * 0.5f;
 	const float PadX = TraceMenuStyle::RowPadX * UIScale;
 
-	// Plate. Always opaque enough to lift the label off the grid; brighter when selected.
-	DrawRect(FLinearColor(0.f, 0.02f, 0.04f, bSelected ? 0.80f : 0.55f), X, Y, Width, RowH);
+	// ---- WP9: the artist's plate, as a horizontal 3-slice -----------------------------------------
+	//
+	// The selected row wears the HOVER plate (ring and all) exactly as the UMG row does — selection
+	// and hover are one state on this screen. Canvas cannot 9-slice, but the row height is fixed, so
+	// a 3-slice whose caps scale with the sprite's height is exactly what the 9-slice would draw.
+	// The pre-WP9 rectangles remain the fallback for a missing texture.
+	UTexture2D* Plate = TraceMenuHUDSprites::Sprite(bSelected
+		? TraceMenuHUDSprites::ESprite::BtnHover
+		: TraceMenuHUDSprites::ESprite::BtnDefault);
+	const float Pulse = 0.72f + 0.28f * FMath::Sin(Now * 4.5f);
+	if (Plate != nullptr)
+	{
+		TraceMenuHUDSprites::DrawPlate(this, Plate, X, Y, Width, RowH, FLinearColor::White);
+	}
+	else
+	{
+		// Plate. Always opaque enough to lift the label off the grid; brighter when selected.
+		DrawRect(FLinearColor(0.f, 0.02f, 0.04f, bSelected ? 0.80f : 0.55f), X, Y, Width, RowH);
 
-	const float Edge = FMath::Max(1.f, 1.2f * UIScale);
-	DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, bSelected ? 0.55f : 0.16f), X, Y, Width, Edge);
-	DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, bSelected ? 0.55f : 0.16f), X, Y + RowH - Edge, Width, Edge);
+		const float Edge = FMath::Max(1.f, 1.2f * UIScale);
+		DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, bSelected ? 0.55f : 0.16f), X, Y, Width, Edge);
+		DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, bSelected ? 0.55f : 0.16f), X, Y + RowH - Edge, Width, Edge);
+
+		if (bSelected)
+		{
+			// Breathing wash across the plate, as before WP9.
+			DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.10f * Pulse), X, Y, Width, RowH);
+		}
+	}
 
 	if (bSelected)
 	{
-		// Breathing selection bar on the leading edge, plus a wash across the plate.
-		const float Pulse = 0.72f + 0.28f * FMath::Sin(Now * 4.5f);
-		DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.10f * Pulse), X, Y, Width, RowH);
-		DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, Pulse), X, Y, 5.f * UIScale, RowH);
-
-		// Chevron, drawn rather than typed — the bitmap fonts have no glyph worth using here.
-		const float ChevX = X - (18.f * UIScale);
-		const float ChevY = Y + RowH * 0.5f;
-		const float ChevS = 10.f * UIScale;
-		const float ChevT = FMath::Max(1.f, 2.5f * UIScale);
-		DrawLine(ChevX - ChevS, ChevY - ChevS, ChevX, ChevY, TraceMenuStyle::Cyan, ChevT);
-		DrawLine(ChevX, ChevY, ChevX - ChevS, ChevY + ChevS, TraceMenuStyle::Cyan, ChevT);
+		// The selection rail on the leading edge. Amber — the selection language the UMG row
+		// established (amber ring, amber rail) — drawn just outside the plate where the widget puts
+		// its mark, breathing on the same clock the old cyan bar did. On the spriteless fallback it
+		// still reads correctly against the flat rect.
+		const float RailW = 6.f * UIScale;
+		const float RailX = X - (24.f * UIScale);
+		DrawRect(TraceMenuStyle::WithAlpha(TraceMenuArtStyle::AmberLifted(), Pulse), RailX, Y, RailW, RowH);
 	}
 
-	const FLinearColor LabelColor = bSelected ? TraceMenuStyle::Ink : TraceMenuStyle::InkDim;
+	// WP4 — the word colours, shared with the UMG row's VisualsFor(): the selected/hovered word is
+	// the artist's green lifted to read on the plate (#CBFF70, art bible §2.5), every other label is
+	// the sheet's white.
+	const FLinearColor LabelColor = bSelected
+		? TraceMenuArtStyle::WordHoverLifted() : TraceMenuArtStyle::WordDefault;
 	const float LabelScale = 1.55f * UIScale;
 
 	// WHAT the row says is decided in exactly one place, BuildRowView, because the UMG renderer says
@@ -2601,9 +3010,26 @@ void ATraceMenuHUD::DrawFooter()
 	DrawTextCentered(TEXT("W / S  OR  ARROWS   MOVE          A / D   CHANGE          ENTER   SELECT          ESC   QUIT"),
 		TraceMenuStyle::InkDim, CX, Y, FontSmall, 1.05f * UIScale);
 
-	DrawTextCentered(TEXT("PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE   -   OTHERS PICK JOIN AND TYPE YOUR ADDRESS ABOVE"),
+	// WP8.1 — no address repetition here any more; the chip under the tagline is the one source.
+	DrawTextCentered(TEXT("PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE"),
 		TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.6f),
 		CX, Y + (24.f * UIScale), FontSmall, 1.f * UIScale);
+}
+
+void ATraceMenuHUD::DrawVersionString()
+{
+	// WP8.2. Bottom-right, small and dim — a build identifier for screenshots and bug reports, not a
+	// design element. Drawn after the footer strip so it sits ON it, and before the modals'
+	// scrims/panels in this frame's order, so a modal dims it proportionally rather than losing it.
+	const FString& Label = TraceMenuHUDFile::ProjectVersionLabel();
+	if (Label.IsEmpty())
+	{
+		return;
+	}
+	TraceMenuHUDType::Draw(this, Label,
+		TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.55f),
+		ViewW - (24.f * UIScale), ViewH - (28.f * UIScale),
+		FontSmall, 0.9f * UIScale, TraceText::EHAlign::Right);
 }
 
 void ATraceMenuHUD::DrawCursor()
@@ -2638,11 +3064,11 @@ void ATraceMenuHUD::DrawCursor()
 
 	// ---- HIDE THE OS POINTER WHILE WE DRAW OUR OWN (spec v24 §2, integration) --------------------
 	//
-	// Past this point this function IS drawing a pointer — the cyan cross below — so the hardware
-	// arrow must go, exactly as it does on the UMG title screen, the settings modal and character
-	// select. This is the Canvas fallback path: Trace.UI.UseUMG 0, a missing WBP asset, or a modal
-	// that declined to elevate over Slate. UTraceTitleMenuWidget::ApplyView never runs there, so
-	// nothing else renews the lease and the player got the system arrow on top of the cross.
+	// Past this point this function IS drawing a pointer, so the hardware arrow must go, exactly as it
+	// does on the UMG title screen, the settings modal and character select. This is the Canvas
+	// fallback path: Trace.UI.UseUMG 0, a missing WBP asset, or a modal that declined to elevate over
+	// Slate. UTraceTitleMenuWidget::ApplyView never runs there, so nothing else renews the lease and
+	// the player got the system arrow on top of ours.
 	//
 	// Placed AFTER both early-outs on purpose. The lease is a statement that a pointer is being
 	// drawn THIS FRAME, so it must not be renewed on the frames this function returns without
@@ -2651,6 +3077,28 @@ void ATraceMenuHUD::DrawCursor()
 	// the last renewal, so leaving this screen hands the arrow back with no exit path to forget.
 	TraceHardwareCursor::EnsureRunning();
 	TraceHardwareCursor::RenewSuppression(GetOwningPlayerController(), TEXT("title screen (Canvas)"));
+
+	// ---- ONE SCREEN, ONE POINTER, ON BOTH RENDERERS (UI QA finding 6) ---------------------------
+	//
+	// This function used to draw a nine-pixel cyan gap-cross, and that was invisible as a defect for
+	// as long as the cross was the only pointer in the project. It stopped being invisible when the
+	// UMG title screen started drawing the artist's blade: the SAME SCREEN, one CVar apart, showed
+	// two different pointers, photographed side by side in `crop_cursor_umg_vs_canvas.png`. Spec v17
+	// §0's rule for this pair is that the two renderers must not look different, and the pointer was
+	// the last place they did.
+	//
+	// The blade wins, in the cross's own colour. UI/TraceHardwareCursor.h has the whole argument; the
+	// short version is that the artist drew a pointer and this screen was not using it, while the
+	// palette's own two-hue rule says a white one would have been a third colour on a screen that
+	// allows two.
+	//
+	// The cross stays as the FALLBACK, and it is a real one rather than a courtesy: DrawPointer
+	// returns false on a build with no menu art and for the frame or two before the sprite's RHI
+	// texture lands, and a title screen with no pointer at all is unusable with a mouse.
+	if (TraceHardwareCursor::DrawPointer(this, LastCursorPos, UIScale))
+	{
+		return;
+	}
 
 	const float S = 9.f * UIScale;
 	const float T = FMath::Max(1.f, 1.5f * UIScale);

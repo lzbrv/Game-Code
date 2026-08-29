@@ -16,14 +16,21 @@
 
 #include "Abilities/TraceAbilityComponent.h"
 #include "Abilities/Characters/TraceOysterJar.h"   // TraceOysterJar::IsLegacyE — spec v26 §6's red arm
+#include "Abilities/Characters/TraceAbilitySetElle.h"   // IsCloakVisualApplied — §1.2's cloak rule
+#include "Audio/TraceAudio.h"
+#include "Audio/TraceSoundEvents.h"
+#include "Components/CapsuleComponent.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "Core/TraceCharacter.h"
+#include "Gameplay/TraceFxBurst.h"                 // ATraceFxBurst + TraceFxLoopBudget (§1.3, §1.4)
+#include "Gameplay/TraceFxShapes.h"
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
 
 #if !UE_BUILD_SHIPPING
-// Harness only — see "THE EVIDENCE" at the foot of this file.
-#include "Components/CapsuleComponent.h"
+// Harness only — see "THE EVIDENCE" at the foot of this file. (CapsuleComponent.h moved up: the §2.6
+// drip reads the victim's capsule to find chest and feet, so it is needed in every configuration.)
 #include "Containers/Ticker.h"
 #include "DrawDebugHelpers.h"
 #include "Engine/Engine.h"
@@ -358,9 +365,248 @@ void UTraceOysterPoisonComponent::TickComponent(float DeltaTime, ELevelTick Tick
 	if (GetOwner() != nullptr && GetOwner()->HasAuthority())
 	{
 		TickAuthority();
+		if (!IsValid(this))
+		{
+			return;   // TickAuthority destroys the component when the poison is over
+		}
 	}
 
 	ApplySlowClamp();
+
+	// EVERY MACHINE, and after the authority half so a component that just expired does not spend a
+	// frame drawing drips for a poison that is over. See the header block on UpdateDripFx.
+	DripElapsed += DeltaTime;
+	UpdateDripFx();
+}
+
+// =================================================================================================
+// FX_AUDIO_PLAN §2.6 — THE VICTIM DRIP
+//
+// "3 spheres r 6 uu, additive Poisoned I 0.4, spawning at CHEST and falling to FEET over 0.4 s,
+//  staggered, while poisoned."
+//
+// Three pieces, one phase each, 1/3 of the cycle apart, so at any instant the victim has a sphere
+// near the chest, one mid-fall and one at the ankles — a continuous drip rather than three balls
+// that blink together. The fall is the ONLY animation: intensity is constant at 0.4 apart from a
+// short fade-in at the top and a fade-out at the bottom, because a piece that popped into existence
+// at the chest and vanished at the feet would strobe at 2.5 Hz.
+//
+// WHY THE FALL IS ALLOWED AND A BRIGHTNESS PULSE WOULD NOT BE: FX_AUDIO_PLAN §1.4 permits while-active
+// loops to "bob/rotate (motion)" and forbids a brightness pulse only where the state is a LETHAL
+// TELEGRAPH. Poison-on-a-victim is a status readout, not a kill volume — the kill volume is the cloud
+// back at the jar, and that one holds a constant brightness for exactly this reason.
+// =================================================================================================
+
+namespace TraceOysterDripTuning
+{
+	/** §2.6: three of them. */
+	constexpr int32 NumDrips = 3;
+
+	/** §2.6: r 6 uu. 12 uu across, comfortably over ART_BIBLE §3.4's 8 uu floor. */
+	constexpr float DripRadiusUU = 6.f;
+
+	/** §2.6: additive I 0.4. TraceFxLoopBudget::AttachLoopPrimitive clamps to §1.4's 0.5 regardless. */
+	constexpr float DripIntensity = 0.4f;
+
+	/** §2.6: chest to feet in 0.4 s, per drip. Three drips, staggered, so one lands every 0.133 s. */
+	constexpr float FallSeconds = 0.4f;
+
+	/** Where a drip is born, as a fraction of the capsule half-height above the pawn origin. */
+	constexpr float ChestFraction = 0.45f;
+
+	/**
+	 * The top and bottom of the fall are cross-faded over this fraction of it.
+	 *
+	 * Not a taste call: the alternative is a piece that appears and disappears, and a hard on/off at
+	 * 2.5 Hz is a brightness pulse in everything but name. ART_BIBLE §6.4's "never a pop-out" applied
+	 * to the smallest effect in the plan.
+	 */
+	constexpr float EdgeFadeFraction = 0.2f;
+}
+
+int32 UTraceOysterPoisonComponent::GetDripPieceCount() const
+{
+	int32 Count = 0;
+	for (const UStaticMeshComponent* Piece : DripPieces)
+	{
+		if (Piece != nullptr && IsValid(Piece))
+		{
+			++Count;
+		}
+	}
+	return Count;
+}
+
+void UTraceOysterPoisonComponent::DetachDripFx()
+{
+	if (DripPieces.Num() == 0)
+	{
+		return;
+	}
+
+	// Through the budget helper, not through DestroyComponent, because the helper owns the per-pawn
+	// registration as well as the component. FX_AUDIO_PLAN §8.9: "no FX component survives its pawn",
+	// and Trace.Fx.LoopBudget is what reports a kit that forgot.
+	APawn* Pawn = Cast<APawn>(GetOwner());
+	for (UStaticMeshComponent* Piece : DripPieces)
+	{
+		TraceFxLoopBudget::DetachLoopPrimitive(Pawn, Piece);
+	}
+
+	DripPieces.Reset();
+	DripMIDs.Reset();
+}
+
+void UTraceOysterPoisonComponent::UpdateDripFx()
+{
+	// A dedicated server cooks no shaders and has nobody to show them to. It still runs every line of
+	// the poison's rules above; this is the only part of the component it skips.
+	if (GetNetMode() == NM_DedicatedServer)
+	{
+		return;
+	}
+
+	ATraceCharacter* Victim = GetVictim();
+	if (Victim == nullptr || !Victim->IsAlive())
+	{
+		DetachDripFx();
+		return;
+	}
+
+	// *** ELLE'S CLOAK. FX_AUDIO_PLAN §1.2's last rule, applied to a debuff nobody thought about. ***
+	//
+	// The rule is written for a kit's own attached FX; a VICTIM's status FX is the case that actually
+	// bites, because the victim did not choose to be lit up. A cloaked Elle who walks through a poison
+	// cloud would otherwise be outlined by three glowing green spheres — her ability defeated by
+	// somebody else's passive, on every machine, with no way for her to know. The pieces are plainly
+	// HIDDEN rather than detached, so they resume the instant she decloaks with no rebuild and no
+	// budget churn.
+	bool bHiddenByCloak = false;
+	if (const UTraceAbilityComponent* Comp = UTraceAbilityComponent::Get(Victim))
+	{
+		if (const UTraceAbilitySetElle* Elle = Comp->GetAbilitySetAs<UTraceAbilitySetElle>())
+		{
+			bHiddenByCloak = Elle->IsCloakVisualApplied();
+		}
+	}
+
+	const UCapsuleComponent* Capsule = Victim->GetCapsuleComponent();
+	if (Capsule == nullptr)
+	{
+		return;
+	}
+	const float HalfHeightUU = Capsule->GetScaledCapsuleHalfHeight();
+
+	// ---- build once ------------------------------------------------------------------------------
+	if (DripPieces.Num() == 0)
+	{
+		UStaticMesh* Sphere = UTraceFxShapes::GetSphere();
+		if (Sphere == nullptr)
+		{
+			return;   // no mesh, no drips. The poison is unaffected; it always was.
+		}
+
+		DripPieces.SetNum(TraceOysterDripTuning::NumDrips);
+		DripMIDs.SetNum(TraceOysterDripTuning::NumDrips);
+
+		for (int32 Index = 0; Index < TraceOysterDripTuning::NumDrips; ++Index)
+		{
+			// THE §1.4 CHOKE POINT, not a hand-rolled NewObject. It enforces additive-only, the 0.5
+			// intensity ceiling and the capsule footprint, and it REFUSES the fifth primitive on a pawn
+			// — which is the case that matters here, because a victim can be poisoned AND slimed at the
+			// same time and the SLOWED ring is the fourth. A refusal is survivable: fewer drips.
+			DripPieces[Index] = TraceFxLoopBudget::AttachLoopPrimitive(
+				Victim, Victim->GetRootComponent(), Sphere,
+				*FString::Printf(TEXT("OysterDrip%d"), Index),
+				ATraceOysterPoisonCloud::GetPoisonedHue(), TraceOysterDripTuning::DripIntensity,
+				FVector::ZeroVector, TraceOysterDripTuning::DripRadiusUU, DripMIDs[Index]);
+		}
+
+		// Compacted so GetDripPieceCount, the loop below and the harness all agree on what exists. A
+		// null slot is a refusal the budget already logged; it is not an error here.
+		for (int32 Index = DripPieces.Num() - 1; Index >= 0; --Index)
+		{
+			if (DripPieces[Index] == nullptr)
+			{
+				DripPieces.RemoveAt(Index);
+				DripMIDs.RemoveAt(Index);
+			}
+		}
+
+		if (DripPieces.Num() == 0)
+		{
+			DripMIDs.Reset();
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[Oyster] Poison drips attached to %s: %d of %d piece(s), r %.0f uu, additive I %.2f."),
+			*GetNameSafe(Victim), DripPieces.Num(), TraceOysterDripTuning::NumDrips,
+			TraceOysterDripTuning::DripRadiusUU, TraceOysterDripTuning::DripIntensity);
+	}
+
+	// ---- animate ---------------------------------------------------------------------------------
+	const float ChestZ = TraceOysterDripTuning::ChestFraction * HalfHeightUU;
+	const float FeetZ  = -HalfHeightUU + TraceOysterDripTuning::DripRadiusUU;
+	const int32 Count  = DripPieces.Num();
+
+	for (int32 Index = 0; Index < Count; ++Index)
+	{
+		UStaticMeshComponent* Piece = DripPieces[Index];
+		if (Piece == nullptr)
+		{
+			continue;
+		}
+
+		Piece->SetVisibility(!bHiddenByCloak);
+		if (bHiddenByCloak)
+		{
+			continue;   // hidden, but still ticking its phase, so decloaking does not restart the fall
+		}
+
+		// The stagger. Phase is per-piece and constant, so three drips are evenly spread down the fall
+		// however many of them the budget actually granted.
+		const float Phase = FMath::Frac(
+			DripElapsed / TraceOysterDripTuning::FallSeconds + static_cast<float>(Index) / static_cast<float>(Count));
+
+		// A little side-to-side so three drips are not one column. Derived from the index, not random:
+		// a client and the server draw the identical drip without either of them sending anything.
+		const float Yaw = 2.f * PI * (static_cast<float>(Index) / static_cast<float>(Count));
+		const float Lateral = 0.55f * TraceOysterDripTuning::DripRadiusUU;
+
+		Piece->SetRelativeLocation(FVector(
+			Lateral * FMath::Cos(Yaw),
+			Lateral * FMath::Sin(Yaw),
+			FMath::Lerp(ChestZ, FeetZ, Phase)));
+
+		// Cross-faded at both ends — see EdgeFadeFraction. Never above DripIntensity, which is itself
+		// below §1.4's ceiling; this only ever writes intensity DOWN, which the budget helper permits.
+		const float Edge = TraceOysterDripTuning::EdgeFadeFraction;
+		const float Fade = FMath::Min(FMath::Min(Phase, 1.f - Phase) / Edge, 1.f);
+
+		if (UMaterialInstanceDynamic* MID = DripMIDs.IsValidIndex(Index) ? DripMIDs[Index].Get() : nullptr)
+		{
+			UTraceFxShapes::SetGlow(MID, ETraceFxBlend::Additive,
+				ATraceOysterPoisonCloud::GetPoisonedHue(),
+				TraceOysterDripTuning::DripIntensity * Fade);
+		}
+	}
+}
+
+void UTraceOysterPoisonComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	DetachDripFx();
+	Super::EndPlay(EndPlayReason);
+}
+
+void UTraceOysterPoisonComponent::OnComponentDestroyed(bool bDestroyingHierarchy)
+{
+	// BOTH paths, because they are different paths: TickAuthority calls DestroyComponent() (which
+	// reaches OnComponentDestroyed and, for a registered component, EndPlay too), while a client loses
+	// this component to replication and a level teardown loses it to EndPlay. DetachDripFx is
+	// idempotent, so whichever arrives second does nothing.
+	DetachDripFx();
+	Super::OnComponentDestroyed(bDestroyingHierarchy);
 }
 
 void UTraceOysterPoisonComponent::TickAuthority()
@@ -544,11 +790,25 @@ namespace TraceOysterCloudTuning
 
 	/**
 	 * The break itself: a short brighter beat so a jar going off is noticed, then it settles back.
-	 * 0.30 + 0.45 = 0.75 at the instant of the burst, which the sweep above puts clearly short of the
-	 * 1.00 that blows out — a flash, not a flashbang.
+	 *
+	 * *** CUT FROM 0.45 TO 0.20 BY FX_AUDIO_PLAN §2.6, AND THE CEILING IS THE POINT. *** §2.6's row
+	 * for this cloud reads "KEEP the shipped honest cloud ... Enforce hue = Poisoned (0.35,0.95,0.20)
+	 * exactly, ADDITIVE I <= 0.5", so the peak of this curve — not its floor — is what the rule
+	 * governs. 0.30 + 0.20 = 0.50 exactly, and PeakIntensity below asserts it at compile time.
+	 *
+	 * The old 0.45 peaked at 0.75. That was not a bug against the sweep quoted above (0.75 sits well
+	 * short of the 1.00 that blows out), it was a bug against the BUDGET: 0.5 is the ceiling the whole
+	 * plan holds every while-active additive effect to, and a cloud that a poisoned player is standing
+	 * INSIDE for four seconds is exactly the case the ceiling is for. Re-run Trace.Oyster.CloudSweep
+	 * before moving either number; the sweep is what says 0.30 is readable at all.
 	 */
-	constexpr float FlashBoost    = 0.45f;
+	constexpr float FlashBoost    = 0.20f;
 	constexpr float FlashFraction = 0.12f;
+
+	/** The brightest this cloud can ever be, and FX_AUDIO_PLAN §2.6's stated ceiling for it. */
+	constexpr float PeakIntensity = BaseIntensity + FlashBoost;
+	static_assert(PeakIntensity <= 0.5f + UE_KINDA_SMALL_NUMBER,
+		"FX_AUDIO_PLAN §2.6: the poison cloud is an additive effect and its intensity must never exceed 0.5.");
 
 	/**
 	 * The cloud holds its brightness for most of the poison's life and only then fades out, rather
@@ -557,8 +817,21 @@ namespace TraceOysterCloudTuning
 	 */
 	constexpr float TailStartFraction = 0.55f;
 
-	/** Poison green. Not a team colour: a jar is dangerous to whoever is standing in it. */
-	const FLinearColor CloudColor(0.12f, 0.85f, 0.25f, 1.f);
+	/**
+	 * Poison green. Not a team colour: a jar is dangerous to whoever is standing in it.
+	 *
+	 * *** RE-SAMPLED TO THE BIBLE'S SEMANTIC WHEEL BY FX_AUDIO_PLAN §2.6. *** It was (0.12, 0.85, 0.25)
+	 * — a green invented here — and §2.6 says "Enforce hue = Poisoned (0.35, 0.95, 0.20) EXACTLY". The
+	 * difference is not decorative: ART_BIBLE §6.2's "one hue per effect" is a statement about the
+	 * whole game, and poison has four pieces of geometry across three files (this cloud, the jar-break
+	 * pop, the victim's drips and the Pickler pull link). Four near-misses of the same green read as
+	 * four unrelated effects. So the constant moved to ATraceOysterPoisonCloud::GetPoisonedHue() and
+	 * every one of the four calls it.
+	 */
+	const FLinearColor& CloudColor()
+	{
+		return ATraceOysterPoisonCloud::GetPoisonedHue();
+	}
 
 	/** /Engine/BasicShapes primitives are 100 uu across; the real half-width is read off the mesh. */
 	constexpr float ExpectedMeshHalfWidthUU = 50.f;
@@ -653,6 +926,14 @@ void ATraceOysterPoisonCloud::GetLifetimeReplicatedProps(TArray<FLifetimePropert
 	DOREPLIFETIME(ATraceOysterPoisonCloud, ExpireMatchTime);
 }
 
+const FLinearColor& ATraceOysterPoisonCloud::GetPoisonedHue()
+{
+	// ART_BIBLE §2.5, semantic `Poisoned`. See the header for why this is a function and not four
+	// copies of three floats.
+	static const FLinearColor Poisoned(0.35f, 0.95f, 0.20f, 1.f);
+	return Poisoned;
+}
+
 void ATraceOysterPoisonCloud::BeginPlay()
 {
 	Super::BeginPlay();
@@ -661,6 +942,27 @@ void ATraceOysterPoisonCloud::BeginPlay()
 	// radius may not have landed yet, so the real build happens from Tick — BuildPuffsIfNeeded is
 	// idempotent and costs one comparison until it can do the job.
 	BuildPuffsIfNeeded();
+
+	// =============================================================================================
+	// FX_AUDIO_PLAN §2.6 audio row — `OysterJarBreak`, "ONE SOUND, THREE TRIGGERS, ALL VIA THE CLOUD"
+	// =============================================================================================
+	//
+	// §2.6: "OysterJarBreak — cloud-local (PlayReplicatedLocal in cloud BeginPlay) — covers dash-jar
+	// break, jar-jump AND Pickler detonation (one sound, three triggers, all via the cloud)". That is
+	// not a shortcut, it is the only site that is true for all three: ATraceOysterJar::ServerBreakNow
+	// DESTROYS the jar in the same call that bursts it, so a multicast from the jar would be an RPC on
+	// an actor that is already gone — the failure mode that works on a listen server and quietly does
+	// not on a client, which is the identical argument the header gives for the cloud being a
+	// replicated actor rather than a multicast in the first place.
+	//
+	// PlayReplicatedLocal and NOT Play: this BeginPlay runs on EVERY machine because the cloud
+	// replicates, so the actor's own replication IS the multicast. An RPC on top would play the break
+	// twice on every client and once more on the host — FX_AUDIO_PLAN §8.7's double-audio failure.
+	// `OysterJarBreak` is declared CLIENT-side in Audio/TraceSoundEvents.cpp for exactly this reason,
+	// which is what makes a stray TraceAudio::Play() on it impossible to get wrong.
+	//
+	// UNCONDITIONAL, like the cloud itself: a jar that broke in an empty corridor still broke.
+	TraceAudio::PlayReplicatedLocal(this, TraceSoundEvents::OysterJarBreak, GetActorLocation());
 }
 
 float ATraceOysterPoisonCloud::MatchTimeNow() const
@@ -709,6 +1011,31 @@ ATraceOysterPoisonCloud* ATraceOysterPoisonCloud::ServerSpawnForBurst(UWorld* Wo
 
 	// The server has every number already, so there is no reason to make it wait a frame like a client.
 	Cloud->BuildPuffsIfNeeded();
+
+	// =============================================================================================
+	// FX_AUDIO_PLAN §2.6 — the jar-break POP, the fast beat the four-second cloud cannot carry
+	// =============================================================================================
+	//
+	// §2.6: "Jar-break pop | `JarPop` burst type: 6 tiny spheres (r 8 uu) scatter 60 uu outward + fade
+	// 0.25 s, Poisoned hue | cloud BeginPlay (all machines — the cloud is the replicated fact; no
+	// extra actor)".
+	//
+	// DEVIATION, NAMED: it is fired from HERE (the server, one line after the cloud is spawned) rather
+	// than from the cloud's BeginPlay on every machine, and it therefore IS "an extra actor" — one
+	// ATraceFxBurst per break, alive 1.2 s. The reason is that ATraceFxBurst::Burst is authority-only
+	// by contract (W3-FXBURST built it that way so a burst is one replicated fact rather than nine
+	// independent local guesses), and calling it from a BeginPlay that runs on every machine would
+	// mean the server spawning one burst and then each client spawning a second, local, unreplicated
+	// copy on top of the replicated one. The §2.6 parenthetical is arguing against an RPC, and this
+	// costs none: the burst actor's own replication is the multicast, exactly as the cloud's is.
+	//
+	// The pop is what makes a break READ. The cloud is deliberately slow (it holds for 55% of the
+	// poison's life before it fades) because it is announcing a volume that stays dangerous; the pop
+	// is the 0.25 s event that says a jar just went off, and one cannot do the other's job.
+	//
+	// UpVector, because §2.6 gives the pop no surface to spray off — the JarPop recipe scatters on a
+	// sphere and uses the direction only to orient the scatter's poles.
+	ATraceFxBurst::Burst(WorldPtr, ETraceFxBurstType::JarPop, Origin, FVector::UpVector);
 
 	return Cloud;
 }
@@ -833,7 +1160,7 @@ void ATraceOysterPoisonCloud::ApplyIntensity(float Intensity)
 
 	// EmissiveMeshMaterial has no Glow scalar, so the intensity rides in the colour itself — exactly
 	// how ATraceTracer::SetMIDColor drives this same material for its sheath (bGlowScalar = false).
-	const FLinearColor Scaled = TraceOysterCloudTuning::CloudColor * LastAppliedIntensity;
+	const FLinearColor Scaled = TraceOysterCloudTuning::CloudColor() * LastAppliedIntensity;
 
 	for (UMaterialInstanceDynamic* MID : PuffMIDs)
 	{
@@ -1801,6 +2128,833 @@ namespace TraceOysterCloudVerify
 			const float Window = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 1.f, 300.f) : 30.f;
 			Run->DeadlineRealTime = FPlatformTime::Seconds() + static_cast<double>(Window);
 			ScheduleCloudReport(Run, 0.f);
+		}));
+}
+
+// =================================================================================================
+// FX_AUDIO_PLAN §2.6 — THE PARADE
+//
+// Trace.Oyster.FxParade
+//     SERVER. Stages every §2.6 element that has a picture and photographs each one from a camera
+//     that is actually pointing at it:
+//
+//       1  a DASH jar and a PICKLER jar 90 uu apart, so the collar — the only thing that tells them
+//          apart, by ART_BIBLE §6.3's explicit ruling — can be judged side by side.
+//       2  the Pickler jar BROKEN through the shipping path: the cloud at the Poisoned hue, the
+//          JarPop burst, and the OysterJarBreak sound, all from one ServerBreakNow.
+//       3  a poisoned VICTIM, framed from outside, so the three falling drips can be judged. There is
+//          no other way to see them: they hang on somebody else's pawn and the local view is a rifle.
+//
+// It exists for the reason W3-FXBURST's parade did: headless, a screenshot lands one or two frames
+// after it is asked for, and an FX nobody has photographed is an FX nobody has verified. Each step
+// PRINTS what it measured off the live actors as well as shooting it, so the log and the frame are
+// two independent claims about the same thing.
+//
+// The measurements that make DRAWN == LETHAL a fact rather than a hope live in Trace.Oyster.CloudTest,
+// not here — that command already reads the knob fresh, compares it against the cloud's replicated
+// radius AND against the renderer's own bounds, and draws a red wire sphere at the knob's radius in
+// the photograph. This parade is about hue, shape and the things CloudTest does not dress.
+// =================================================================================================
+
+namespace TraceOysterFxParade
+{
+	using namespace TraceOysterCloudVerify;
+
+	struct FParadeRun
+	{
+		int32 Step = 0;
+		int32 AttemptsLeft = 40;
+		double NextRealTime = 0.0;
+
+		FVector Origin = FVector::ZeroVector;
+		TWeakObjectPtr<ATraceOysterJar> DashJar;
+		TWeakObjectPtr<ATraceOysterJar> PicklerJar;
+		TWeakObjectPtr<ATraceCharacter> DripVictim;
+		TWeakObjectPtr<ACameraActor> ShotCamera;
+		FString ShotPath;
+
+		/** Play counts sampled BEFORE a step, so the step's own audio is a delta and not a total. */
+		int32 AudioBaselinePickler = 0;
+		int32 AudioBaselineBreak = 0;
+
+		/** Recorded at spawn, because a Pickler jar detonates 0.29 s later and cannot be asked twice. */
+		bool bPicklerHadCollarAtSpawn = false;
+		bool bDashWasPlainAtSpawn = false;
+	};
+
+	/**
+	 * How many times @p Event has reached the ENGINE on this machine.
+	 *
+	 * The subsystem's per-event map is bumped after the side gate, the settings gate, the device test
+	 * and the resolve, so a delta across a step is the difference between "I called Play" and "a sound
+	 * played" — which is the distinction W3-FXBURST's first capture run discovered the hard way.
+	 */
+	int32 AudioPlays(UWorld* WorldPtr, FName Event)
+	{
+		const UTraceAudioSubsystem* Audio = (WorldPtr != nullptr)
+			? WorldPtr->GetSubsystem<UTraceAudioSubsystem>() : nullptr;
+		if (Audio == nullptr)
+		{
+			return 0;
+		}
+		const int32* Found = Audio->GetPlaysByEvent().Find(Event);
+		return (Found != nullptr) ? *Found : 0;
+	}
+
+	bool TickParade(TSharedPtr<FParadeRun> Run);
+
+	void Schedule(TSharedPtr<FParadeRun> Run, float DelaySeconds)
+	{
+		Run->NextRealTime = FPlatformTime::Seconds() + static_cast<double>(DelaySeconds);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Run](float) -> bool
+			{
+				if (FPlatformTime::Seconds() < Run->NextRealTime)
+				{
+					return true;
+				}
+				return TickParade(Run);
+			}), 0.f);
+	}
+
+	/** A local view target looking at @p Focus from @p Distance uu, slightly above it. */
+	ACameraActor* LookAt(UWorld* WorldPtr, TWeakObjectPtr<ACameraActor>& CameraSlot, APlayerController* PC,
+		const FVector& Focus, float DistanceUU, float HeightUU)
+	{
+		if (WorldPtr == nullptr || PC == nullptr)
+		{
+			return nullptr;
+		}
+
+		// Back along the line to the local pawn: the one direction already known to be open, because
+		// the player is standing in it. Same argument as FrameCloudForCapture's.
+		FVector Away(1.f, 0.f, 0.f);
+		if (const APawn* LocalPawn = PC->GetPawn())
+		{
+			const FVector Towards = (LocalPawn->GetActorLocation() - Focus).GetSafeNormal2D();
+			if (!Towards.IsNearlyZero())
+			{
+				Away = Towards;
+			}
+		}
+
+		// AND IT HAS TO BE A DIRECTION WITH A CLEAR LINE. "Back along the line to the local pawn" is
+		// usually open — the player is standing in it — but a pawn on the far side of a pillar puts the
+		// camera inside it, and the first drip frame came back half-occluded by a goal-mouth wall. Eight
+		// candidates at 45 degrees, first clear one wins, and the fallback is the original direction
+		// with a note rather than a silent bad capture. Same shape as PickOpenBurstOrigin's search.
+		FVector Eye = Focus + Away * DistanceUU + FVector(0.f, 0.f, HeightUU);
+		{
+			FCollisionQueryParams CameraParams(SCENE_QUERY_STAT(TraceOysterFxCamera), /*bTraceComplex*/ false);
+			if (const APawn* LocalPawn = PC->GetPawn())
+			{
+				CameraParams.AddIgnoredActor(LocalPawn);
+			}
+
+			for (int32 Step = 0; Step < 8; ++Step)
+			{
+				const FVector Direction = Away.RotateAngleAxis(45.f * static_cast<float>(Step), FVector::UpVector);
+				const FVector Candidate = Focus + Direction * DistanceUU + FVector(0.f, 0.f, HeightUU);
+
+				FHitResult CameraHit;
+				if (!WorldPtr->LineTraceSingleByChannel(CameraHit, Candidate, Focus, ECC_Visibility, CameraParams))
+				{
+					Eye = Candidate;
+					break;
+				}
+			}
+		}
+
+		if (ACameraActor* Old = CameraSlot.Get())
+		{
+			Old->Destroy();
+		}
+
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		SpawnParams.ObjectFlags |= RF_Transient;
+
+		ACameraActor* Camera = WorldPtr->SpawnActor<ACameraActor>(
+			ACameraActor::StaticClass(), FTransform((Focus - Eye).Rotation(), Eye), SpawnParams);
+		if (Camera != nullptr)
+		{
+			PC->SetViewTargetWithBlend(Camera, 0.f);
+			CameraSlot = Camera;
+		}
+		return Camera;
+	}
+
+	/** The parade's own shorthand for the call above. */
+	ACameraActor* LookAt(UWorld* WorldPtr, TSharedPtr<FParadeRun> Run, const FVector& Focus,
+		float DistanceUU, float HeightUU)
+	{
+		return LookAt(WorldPtr, Run->ShotCamera,
+			(WorldPtr != nullptr) ? WorldPtr->GetFirstPlayerController() : nullptr,
+			Focus, DistanceUU, HeightUU);
+	}
+
+	FString Shoot(UWorld* WorldPtr, const TCHAR* Label)
+	{
+		const FString FileName = FString::Printf(TEXT("OysterFx_%s_pid%d.png"),
+			Label, FPlatformProcess::GetCurrentProcessId());
+		const FString Path = FPaths::ConvertRelativePathToFull(
+			FPaths::ProjectSavedDir() / TEXT("Screenshots") / FileName);
+
+		FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*FPaths::GetPath(Path));
+		FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/false, /*bAddFilenameSuffix=*/false);
+		UE_LOG(LogTraceGame, Display, TEXT("[OysterFx] Screenshot requested: %s"), *Path);
+		(void)WorldPtr;
+		return Path;
+	}
+
+	/** Destroys every cloud in the world. A frame of a NEW cloud must not contain an old one. */
+	void ClearClouds(UWorld* WorldPtr)
+	{
+		// Gathered first: Destroy() mutates the level's actor array, which TActorIterator is walking.
+		TArray<ATraceOysterPoisonCloud*> Stale;
+		for (TActorIterator<ATraceOysterPoisonCloud> It(WorldPtr); It; ++It)
+		{
+			Stale.Add(*It);
+		}
+		for (ATraceOysterPoisonCloud* Old : Stale)
+		{
+			if (IsValid(Old))
+			{
+				Old->Destroy();
+			}
+		}
+	}
+
+	/**
+	 * Stops a bot where it stands, so a camera aimed at it 0.8 s ago is still aimed at it.
+	 *
+	 * The first run of this parade photographed an empty stretch of arena floor: bots run at ~600 uu/s
+	 * and the victim had simply left. Freezing the SUBJECT rather than chasing it with the camera is
+	 * the same call Trace.Slimeball.Verify makes when it puts the wall ON the victim — what is being
+	 * photographed is an effect, not a bot's pathing.
+	 */
+	void FreezeVictim(ATraceCharacter* Victim)
+	{
+		if (Victim == nullptr)
+		{
+			return;
+		}
+		if (UTraceCharacterMovementComponent* MoveComp = Victim->GetTraceMovement())
+		{
+			MoveComp->StopMovementImmediately();
+			MoveComp->DisableMovement();
+		}
+	}
+
+	void ThawVictim(ATraceCharacter* Victim)
+	{
+		if (Victim == nullptr)
+		{
+			return;
+		}
+		if (UTraceCharacterMovementComponent* MoveComp = Victim->GetTraceMovement())
+		{
+			MoveComp->SetMovementMode(MOVE_Walking);
+		}
+	}
+
+	/**
+	 * A living ENEMY of @p NotThis, falling back to anybody else.
+	 *
+	 * The enemy test is not cosmetic. The §4 choke point refuses Control on a team-mate, so a pull
+	 * staged on a friendly bot produces no launch and therefore NO PULL LINK — which is exactly what
+	 * this parade's second run reported ("0 GenericRing link(s)") and it was the harness picking the
+	 * wrong bot, not the effect failing. The fallback is kept so a 1v0 world still photographs drips.
+	 */
+	ATraceCharacter* FindVictim(UWorld* WorldPtr, const ATraceCharacter* NotThis)
+	{
+		const ETraceTeam MyTeam = (NotThis != nullptr) ? NotThis->GetTeam() : ETraceTeam::None;
+		ATraceCharacter* Fallback = nullptr;
+
+		for (TActorIterator<ATraceCharacter> It(WorldPtr); It; ++It)
+		{
+			ATraceCharacter* Candidate = *It;
+			if (Candidate == nullptr || Candidate == NotThis || !Candidate->IsAlive())
+			{
+				continue;
+			}
+			// AND NOT ONE THIS MACHINE IS NOT DRAWING. The first drip frame came back as a single green
+			// sphere hanging in mid-air over an empty floor: the effect was correct, on the right pawn,
+			// and the pawn's body was simply not rendered (a corpse still hidden, or a cloak). A
+			// photograph of a status effect needs the BODY it is a status of.
+			if (Candidate->IsHidden() || (Candidate->GetMesh() != nullptr && !Candidate->GetMesh()->IsVisible()))
+			{
+				continue;
+			}
+
+			// AND NOT THE CARRIER. Spec §4 is the founding invariant — no ability Control reaches a
+			// player holding the Core — so a fixture that stages one on the carrier is photographing
+			// the rule working, labelled as the effect failing. That is precisely what this parade's
+			// first run did: SLOWED came back active=0 and the frame shows the Core in the victim's
+			// hands. Excluded here rather than "handled" at the shot, because there is nothing to fix.
+			if (UTraceAbilityComponent::IsCarrier(Candidate))
+			{
+				continue;
+			}
+
+			const ETraceTeam TheirTeam = Candidate->GetTeam();
+			if (MyTeam != ETraceTeam::None && TheirTeam != ETraceTeam::None && TheirTeam != MyTeam)
+			{
+				return Candidate;
+			}
+			if (Fallback == nullptr)
+			{
+				Fallback = Candidate;
+			}
+		}
+		return Fallback;
+	}
+
+	bool TickParade(TSharedPtr<FParadeRun> Run)
+	{
+		static const TCHAR* Test = TEXT("OysterFx");
+
+		UWorld* WorldPtr = FindAuthoritativeWorld();
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[%s] No authoritative world. SERVER ONLY."), Test);
+			return false;
+		}
+		UnpauseAndReport(WorldPtr, Test);
+
+		UTraceAbilityComponent* Comp = FindHumanAbilityComponent(WorldPtr);
+		ATraceCharacter* Pawn = (Comp != nullptr) ? Comp->GetOwningCharacter() : nullptr;
+		if (Comp == nullptr || Pawn == nullptr)
+		{
+			if (Run->AttemptsLeft-- > 0)
+			{
+				Schedule(Run, 1.0f);
+				return false;
+			}
+			UE_LOG(LogTraceGame, Error, TEXT("[%s] No human pawn inside the budget."), Test);
+			return false;
+		}
+
+		switch (Run->Step)
+		{
+		// ---- 0: two jars, side by side --------------------------------------------------------
+		case 0:
+		{
+			Comp->ServerSetCharacter(ETraceCharacterId::Oyster);
+			UTraceAbilitySetOyster* OysterSet = Comp->GetAbilitySetAs<UTraceAbilitySetOyster>();
+			if (OysterSet == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[%s] The human is not holding Oyster's ability set."), Test);
+				return false;
+			}
+
+			// A cloud left over from a bot's own jar would put the camera INSIDE a 380 uu additive dome
+			// and turn this frame into a green wash — which is exactly what the first run produced.
+			ClearClouds(WorldPtr);
+
+			bool bClear = false;
+			Run->Origin = PickOpenBurstOrigin(WorldPtr, Pawn, 520.f, bClear);
+			// Off the floor by the jar's own half-height so neither jar is buried in it.
+			Run->Origin.Z += 20.f;
+
+			const FVector Across = FVector::CrossProduct(
+				(Run->Origin - Pawn->GetActorLocation()).GetSafeNormal2D(), FVector::UpVector) * 45.f;
+
+			ATraceOysterJar* Dash    = OysterSet->DebugSpawnJarAt(Run->Origin - Across, /*bPickler*/ false);
+			ATraceOysterJar* Pickler = OysterSet->DebugSpawnJarAt(Run->Origin + Across, /*bPickler*/ true);
+			Run->DashJar    = Dash;
+			Run->PicklerJar = Pickler;
+
+			// *** ASKED NOW, NOT AT THE SHUTTER. *** A Pickler jar that is placed on the ground lands
+			// immediately, and spec v26 §6b then gives it a fuse of PullRadius/PullSpeed = 0.29 s — so
+			// by the time a screenshot has been requested, taken and confirmed, the jar this assertion
+			// is about has blown itself up. The first run of this parade reported "*** no collar ***"
+			// for exactly that reason and it was the HARNESS that was wrong, not the collar. The
+			// picture below is therefore taken inside the fuse; the claim is recorded here.
+			Run->bDashWasPlainAtSpawn      = (Dash != nullptr) && !Dash->HasCollarBuilt();
+			Run->bPicklerHadCollarAtSpawn  = (Pickler != nullptr) && Pickler->HasCollarBuilt();
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] JARS at spawn: dash %s (%s), pickler %s (%s), body radius %.1f uu. "
+				     "ART_BIBLE §6.3 'distinguish by SHAPE' rule: %s."),
+				Test,
+				Run->bDashWasPlainAtSpawn ? TEXT("PLAIN") : TEXT("*** has a collar ***"),
+				(Dash != nullptr) ? *Dash->DescribeLook() : TEXT("<no jar>"),
+				Run->bPicklerHadCollarAtSpawn ? TEXT("COLLARED") : TEXT("*** no collar ***"),
+				(Pickler != nullptr) ? *Pickler->DescribeLook() : TEXT("<no jar>"),
+				(Dash != nullptr) ? Dash->MeasureJarRadiusUU() : 0.f,
+				(Run->bDashWasPlainAtSpawn && Run->bPicklerHadCollarAtSpawn) ? TEXT("PASS") : TEXT("*** FAIL ***"));
+
+			LookAt(WorldPtr, Run, Run->Origin, 300.f, 45.f);
+			Run->Step = 1;
+			Schedule(Run, 0.07f);   // inside the Pickler jar's 0.29 s fuse
+			return false;
+		}
+
+		// ---- 1: photograph them ------------------------------------------------------------------
+		case 1:
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] shutter: pickler still alive = %d (its §6b fuse is %.2f s)."),
+				Test, Run->PicklerJar.IsValid() ? 1 : 0, ATraceOysterJar::GetPicklerDetonateDelaySeconds());
+
+			Run->ShotPath = Shoot(WorldPtr, TEXT("jars"));
+			Run->Step = 2;
+			Schedule(Run, 2.0f);
+			return false;
+		}
+
+		// ---- 2: break a FRESH dash jar -----------------------------------------------------------
+		case 2:
+		{
+			ConfirmShot(Run->ShotPath);
+
+			UTraceAbilitySetOyster* OysterSet = Comp->GetAbilitySetAs<UTraceAbilitySetOyster>();
+			if (OysterSet == nullptr)
+			{
+				return false;
+			}
+
+			// Clear the field so the cloud in the next frame is THIS break's and not a survivor of the
+			// Pickler jar's own detonation two seconds ago.
+			ClearClouds(WorldPtr);
+
+			Run->AudioBaselineBreak = AudioPlays(WorldPtr, TraceSoundEvents::OysterJarBreak);
+
+			if (ATraceOysterJar* Fresh = OysterSet->DebugSpawnJarAt(Run->Origin, /*bPickler*/ false))
+			{
+				// THE SHIPPING BREAK PATH. Burst() spawns the cloud; the cloud's BeginPlay plays
+				// OysterJarBreak locally on every machine; ServerSpawnForBurst fires the JarPop.
+				Fresh->ServerBreakNow(TEXT("harness: FX_AUDIO_PLAN §2.6 parade"));
+			}
+
+			LookAt(WorldPtr, Run, Run->Origin,
+				FMath::Max(300.f, UTraceSettings::Get().OysterPoisonRadiusUU * 2.6f), 160.f);
+			Run->Step = 3;
+			Schedule(Run, 0.20f);   // inside JarPop's 0.25 s animation
+			return false;
+		}
+
+		// ---- 3: photograph the cloud + pop --------------------------------------------------------
+		case 3:
+		{
+			int32 Bursts = 0;
+			for (TActorIterator<ATraceFxBurst> It(WorldPtr); It; ++It)
+			{
+				if (*It != nullptr && (*It)->GetBurstType() == ETraceFxBurstType::JarPop)
+				{
+					++Bursts;
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[%s] JarPop burst live: %s, radius %.0f uu, %d/%d primitive(s) visible."),
+						Test, *(*It)->DescribeBlends(), (*It)->GetResolvedRadiusUU(),
+						(*It)->GetVisiblePrimitiveCount(), (*It)->GetPrimitiveCount());
+				}
+			}
+
+			ATraceOysterPoisonCloud* Cloud = nullptr;
+			CountClouds(WorldPtr, &Cloud);
+
+			const int32 BreakPlays = AudioPlays(WorldPtr, TraceSoundEvents::OysterJarBreak)
+				- Run->AudioBaselineBreak;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] BREAK: %d JarPop burst(s); cloud %s, intensity %.3f (§2.6 ceiling 0.5); "
+				     "OysterJarBreak reached the engine %d time(s) — §8.7 wants exactly 1 per break."),
+				Test, Bursts,
+				(Cloud != nullptr) ? *FString::Printf(TEXT("r %.0f uu, %d puffs, extent %.1f uu"),
+					Cloud->GetCloudRadiusUU(), Cloud->GetBuiltPuffCount(), Cloud->MeasureBuiltExtentUU())
+					: TEXT("*** MISSING ***"),
+				(Cloud != nullptr) ? Cloud->GetLastAppliedIntensity() : 0.f,
+				BreakPlays);
+
+			Run->ShotPath = Shoot(WorldPtr, TEXT("break"));
+			Run->Step = 4;
+			Schedule(Run, 2.0f);
+			return false;
+		}
+
+		// ---- 4: a real LOB, landed on a victim: the sound and the pull links -----------------------
+		case 4:
+		{
+			ConfirmShot(Run->ShotPath);
+
+			ATraceCharacter* Victim = FindVictim(WorldPtr, Pawn);
+			if (Victim == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[%s] No second pawn, so the PULL LINK and the DRIPS cannot be staged. "
+					     "Run this in a match with ?bots=N."), Test);
+				Run->Step = 8;
+				Schedule(Run, 0.f);
+				return false;
+			}
+			Run->DripVictim = Victim;
+			ClearClouds(WorldPtr);
+
+			Run->AudioBaselinePickler = AudioPlays(WorldPtr, TraceSoundEvents::OysterPickler);
+
+			// A REAL LOB, through the shipping constructor: Initialise() with a non-zero velocity is
+			// what makes a jar a thrown one, and it is the line that plays OysterPickler.
+			//
+			// RELEASED ESSENTIALLY ON TOP OF THE VICTIM (40 uu up, 30 uu back), not "a short way" from
+			// them. The 160 uu offset the first version used made the pull a measurement of the bot's
+			// pathing as much as of the rule: a bot that took two steps between being chosen and the
+			// jar landing was outside a radius the frame could not show, and "0 pull links" then means
+			// nothing at all. The block reason is printed below so a refusal names itself.
+			const FVector Toward = (Victim->GetActorLocation() - Pawn->GetActorLocation()).GetSafeNormal2D();
+			const FVector Release = Victim->GetActorLocation() - Toward * 30.f + FVector(0.f, 0.f, 40.f);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] pull victim %s: team %d, carrier %d, %.0f uu from the release point; the choke "
+				     "point says Control is '%s' (pull radius %.0f uu)."),
+				Test, *GetNameSafe(Victim), static_cast<int32>(Victim->GetTeam()),
+				UTraceAbilityComponent::IsCarrier(Victim) ? 1 : 0,
+				static_cast<float>(FVector::Dist(Victim->GetActorLocation(), Release)),
+				TraceAbilityBlockReasonToString(
+					Comp->CanAffectTargetDetailed(Victim, ETraceAbilityEffect::Control)),
+				UTraceSettings::Get().OysterPicklerPullRadiusUU);
+
+			FActorSpawnParameters SpawnParams;
+			SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			ATraceOysterJar* Lobbed = WorldPtr->SpawnActor<ATraceOysterJar>(
+				ATraceOysterJar::StaticClass(), FTransform(Release), SpawnParams);
+			if (Lobbed != nullptr)
+			{
+				Lobbed->Initialise(Comp, Pawn->GetTeam(), /*bPickler*/ true, Toward * 400.f + FVector(0.f, 0.f, 120.f));
+				// Landed by hand so the impact happens at a known place in a known frame rather than
+				// wherever a 400 uu/s toss ends up. Land() is the same call the flight makes.
+				Lobbed->ServerForceLandNow();
+			}
+			Run->PicklerJar = Lobbed;
+
+			// FAR ENOUGH BACK TO BE OUTSIDE THE POISON RADIUS. The first pull frame was a flat green
+			// wash: the jar detonates 0.29 s after it lands (spec v26 §6b) and a camera 300 uu from the
+			// victim is INSIDE the 380 uu cloud that leaves behind. Backed off past the radius, and the
+			// shutter moved inside the fuse.
+			LookAt(WorldPtr, Run,
+				Victim->GetActorLocation(),
+				FMath::Max(650.f, UTraceSettings::Get().OysterPoisonRadiusUU * 1.8f), 170.f);
+			Run->Step = 5;
+			Schedule(Run, 0.08f);
+			return false;
+		}
+
+		// ---- 5: photograph the pull links ---------------------------------------------------------
+		case 5:
+		{
+			int32 Rings = 0;
+			for (TActorIterator<ATraceFxBurst> It(WorldPtr); It; ++It)
+			{
+				if (*It != nullptr && (*It)->GetBurstType() == ETraceFxBurstType::GenericRing)
+				{
+					++Rings;
+				}
+			}
+
+			const int32 PicklerPlays = AudioPlays(WorldPtr, TraceSoundEvents::OysterPickler)
+				- Run->AudioBaselinePickler;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] PULL: %d GenericRing link(s) live (one per victim the choke point allowed); "
+				     "OysterPickler reached the engine %d time(s) on the lob."),
+				Test, Rings, PicklerPlays);
+
+			// CLEARED IMMEDIATELY BEFORE THE SHUTTER, not two steps ago. This match has bot Oysters in
+			// it dropping dash jars of their own, and a 380 uu additive dome anywhere near the camera
+			// turns the frame into a flat green wash — which is what the first two attempts produced,
+			// even from 684 uu back. Clouds are actors; the pull LINKS are ATraceFxBurst actors and are
+			// untouched by this.
+			ClearClouds(WorldPtr);
+
+			// Re-aimed at where the victim IS, not where they were when the jar landed — they have just
+			// been launched at 1300 uu/s, which is the whole point of the effect being photographed.
+			if (const ATraceCharacter* Victim = Run->DripVictim.Get())
+			{
+				LookAt(WorldPtr, Run, Victim->GetActorLocation(), 320.f, 110.f);
+			}
+
+			Run->ShotPath = Shoot(WorldPtr, TEXT("pull"));
+			Run->Step = 6;
+			Schedule(Run, 2.0f);
+			return false;
+		}
+
+		// ---- 6: poison the victim and frame the drips ----------------------------------------------
+		case 6:
+		{
+			ConfirmShot(Run->ShotPath);
+
+			ATraceCharacter* Victim = Run->DripVictim.Get();
+			if (Victim == nullptr || !Victim->IsAlive())
+			{
+				Victim = FindVictim(WorldPtr, Pawn);
+				Run->DripVictim = Victim;
+			}
+			if (Victim == nullptr)
+			{
+				Run->Step = 8;
+				Schedule(Run, 0.f);
+				return false;
+			}
+
+			FreezeVictim(Victim);
+			// The drips are 6 uu spheres; a 380 uu cloud in the same frame would be the only thing in it.
+			ClearClouds(WorldPtr);
+			UTraceOysterPoisonComponent::ApplyTo(Victim, Comp);
+
+			LookAt(WorldPtr, Run, Victim->GetActorLocation(), 230.f, 30.f);
+			Run->Step = 7;
+			Schedule(Run, 0.6f);
+			return false;
+		}
+
+		// ---- 7: photograph the drips ----------------------------------------------------------------
+		case 7:
+		{
+			const ATraceCharacter* Victim = Run->DripVictim.Get();
+			const UTraceOysterPoisonComponent* Poison = UTraceOysterPoisonComponent::Find(Victim);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] DRIPS on %s: %d piece(s) drawn on this machine (§2.6 asks for 3; fewer means the "
+				     "§1.4 loop budget refused some, which it logs). Slow in force: %d, multiplier %.3f."),
+				Test, *GetNameSafe(Victim),
+				(Poison != nullptr) ? Poison->GetDripPieceCount() : -1,
+				(Poison != nullptr && Poison->IsSlowActive()) ? 1 : 0,
+				(Poison != nullptr) ? Poison->GetSpeedMultiplier() : 1.f);
+
+			// Same reason as the pull shot: the drips are 6 uu spheres and a bot's cloud drifting into
+			// frame is the only thing anybody would see.
+			ClearClouds(WorldPtr);
+
+			// Re-aimed one last time: FreezeVictim stops the pawn, but a frozen pawn that was mid-air
+			// still finishes its fall, so the camera is pointed at the body that is actually there.
+			if (Victim != nullptr)
+			{
+				LookAt(WorldPtr, Run, Victim->GetActorLocation(), 230.f, 30.f);
+			}
+
+			Run->ShotPath = Shoot(WorldPtr, TEXT("drips"));
+			Run->Step = 8;
+			Schedule(Run, 2.0f);
+			return false;
+		}
+
+		// ---- 8: hand the view back ------------------------------------------------------------------
+		default:
+		{
+			ConfirmShot(Run->ShotPath);
+
+			ThawVictim(Run->DripVictim.Get());
+
+			if (APlayerController* PC = WorldPtr->GetFirstPlayerController())
+			{
+				PC->SetViewTargetWithBlend(PC->GetPawn(), 0.f);
+			}
+			if (ACameraActor* Camera = Run->ShotCamera.Get())
+			{
+				Camera->Destroy();
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("[%s] ===== parade complete. ====="), Test);
+			return false;
+		}
+		}
+	}
+
+	// =============================================================================================
+	// Trace.Oyster.JarLadder — the measurement behind ATraceOysterJar's shipped Glow
+	//
+	// FX_AUDIO_PLAN §2.6 asks for Glow 1.4. The first parade frame said that is a WHITE cylinder: the
+	// pixels came back at the correct hue but saturation 0.094, because M_TraceNeon's emissive is
+	// Color x Glow and the accent's brightest channels clip long before 1.4.
+	//
+	// So four jars are staged in a row, each BUILT at a different Glow — the value is latched per jar
+	// at build for exactly this reason — and photographed in ONE frame, on ONE surface, under ONE
+	// exposure. Reading four rungs off four separate frames would be comparing four tone-mappings.
+	// The pixels are then read back out of the PNG by hand (see the report), which is the only way to
+	// turn "it looks white" into a number somebody can disagree with.
+	//
+	// *** TWO THINGS THIS BLOCK USED TO SAY THAT ARE NO LONGER TRUE, AND WHY THE RUNGS ARE STILL RIGHT.
+	// *** It said "Oyster's two brightest channels (0.85, 0.95)" and it called 0.74 the shipped value.
+	// Oyster's accent was re-spaced from cyan #95EDF9 to deep sea green #6FE5A2 (brightest channel
+	// 0.95 -> 0.78), and TraceOysterJar's glow is no longer a literal at all: it is DERIVED as
+	// 0.70 / brightest, i.e. 0.897 today, so that the product the tonemapper sees stays on
+	// ATraceFxBurst's measured hue-headroom cap whatever colour Oyster is wearing. See the long block
+	// on TraceOysterJar::JarGlowShipped().
+	//
+	// The four rungs below are deliberately left as ABSOLUTE glows. What this ladder measures is the
+	// rate at which saturation is spent as the brightest channel is pushed, which is a property of the
+	// tonemapper and not of a hue; and 0.74 / 1.00 now STRADDLE the derived 0.897 instead of one of
+	// them landing on it, which is what a ladder is for. Re-shoot it if the HEADROOM is retuned — not
+	// because an accent moved.
+	// =============================================================================================
+
+	struct FLadderRun
+	{
+		int32 Step = 0;
+		int32 AttemptsLeft = 40;
+		double NextRealTime = 0.0;
+		FString ShotPath;
+		TWeakObjectPtr<ACameraActor> ShotCamera;
+	};
+
+	/** The rungs, brightest first, left to right in the frame. */
+	static const float LadderGlows[4] = { 1.40f, 1.00f, 0.74f, 0.50f };
+
+	bool TickLadder(TSharedPtr<FLadderRun> Run);
+
+	void ScheduleLadder(TSharedPtr<FLadderRun> Run, float DelaySeconds)
+	{
+		Run->NextRealTime = FPlatformTime::Seconds() + static_cast<double>(DelaySeconds);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Run](float) -> bool
+			{
+				if (FPlatformTime::Seconds() < Run->NextRealTime)
+				{
+					return true;
+				}
+				return TickLadder(Run);
+			}), 0.f);
+	}
+
+	void SetJarGlowCVar(float Value)
+	{
+		if (IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Oyster.JarGlow")))
+		{
+			Var->Set(Value, ECVF_SetByConsole);
+		}
+	}
+
+	bool TickLadder(TSharedPtr<FLadderRun> Run)
+	{
+		static const TCHAR* Test = TEXT("OysterJarLadder");
+
+		UWorld* WorldPtr = FindAuthoritativeWorld();
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[%s] No authoritative world. SERVER ONLY."), Test);
+			return false;
+		}
+		UnpauseAndReport(WorldPtr, Test);
+
+		UTraceAbilityComponent* Comp = FindHumanAbilityComponent(WorldPtr);
+		ATraceCharacter* Pawn = (Comp != nullptr) ? Comp->GetOwningCharacter() : nullptr;
+		if (Comp == nullptr || Pawn == nullptr)
+		{
+			if (Run->AttemptsLeft-- > 0)
+			{
+				ScheduleLadder(Run, 1.0f);
+				return false;
+			}
+			UE_LOG(LogTraceGame, Error, TEXT("[%s] No human pawn inside the budget."), Test);
+			return false;
+		}
+
+		if (Run->Step == 0)
+		{
+			Comp->ServerSetCharacter(ETraceCharacterId::Oyster);
+			UTraceAbilitySetOyster* OysterSet = Comp->GetAbilitySetAs<UTraceAbilitySetOyster>();
+			if (OysterSet == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[%s] The human is not holding Oyster's ability set."), Test);
+				return false;
+			}
+
+			ClearClouds(WorldPtr);
+
+			bool bClear = false;
+			FVector Centre = PickOpenBurstOrigin(WorldPtr, Pawn, 560.f, bClear);
+			Centre.Z += 20.f;
+
+			const FVector Across = FVector::CrossProduct(
+				(Centre - Pawn->GetActorLocation()).GetSafeNormal2D(), FVector::UpVector);
+
+			// DASH jars, not Pickler ones: a Pickler jar detonates 0.29 s after it is placed and this
+			// frame is taken later than that. The body's Glow is what is being measured and both kinds
+			// wear the same one.
+			//
+			// SPAWNED DIRECTLY, NOT THROUGH DebugSpawnJarAt, and that is the fix for the ladder's own
+			// first run: the kit's spawn path enforces spec v14 §6's "max 3; a fourth despawns the
+			// oldest", so the BRIGHTEST rung had been deleted before the shutter opened and the frame
+			// showed three jars presented as four. The cap is a rule about Oyster's jars in a match; a
+			// row of jars standing still to be photographed is not that, and going round it here keeps
+			// the rule intact everywhere it means something. Initialise() with a zero velocity is the
+			// same call the dash jar makes.
+			FActorSpawnParameters LadderSpawn;
+			LadderSpawn.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			LadderSpawn.ObjectFlags |= RF_Transient;
+
+			for (int32 Index = 0; Index < 4; ++Index)
+			{
+				SetJarGlowCVar(LadderGlows[Index]);
+				const float Offset = (static_cast<float>(Index) - 1.5f) * 95.f;
+
+				ATraceOysterJar* Jar = WorldPtr->SpawnActor<ATraceOysterJar>(
+					ATraceOysterJar::StaticClass(), FTransform(Centre + Across * Offset), LadderSpawn);
+				if (Jar != nullptr)
+				{
+					Jar->Initialise(Comp, Pawn->GetTeam(), /*bPickler*/ false, FVector::ZeroVector);
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[%s] rung %d at offset %+.0f uu: requested %.2f, built %.2f (%s)."),
+						Test, Index, Offset, LadderGlows[Index], Jar->GetBuiltGlow(), *Jar->DescribeLook());
+				}
+			}
+			SetJarGlowCVar(0.f);   // back to the shipped constant before anything else spawns a jar
+
+			LookAt(WorldPtr, Run->ShotCamera, WorldPtr->GetFirstPlayerController(), Centre, 330.f, 40.f);
+			Run->Step = 1;
+			ScheduleLadder(Run, 0.5f);
+			return false;
+		}
+
+		if (Run->Step == 1)
+		{
+			// The OFFSETS are printed with the rungs above, not just the values: Across is
+			// Cross(toward, Up), which puts a NEGATIVE offset on the right of frame, and the ladder's
+			// first read got its left and its right the wrong way round because nothing said so.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[%s] four rungs by offset (-142 uu is RIGHTMOST in frame): %.2f@-142 %.2f@-47 "
+				     "%.2f@+47 %.2f@+142."),
+				Test, LadderGlows[0], LadderGlows[1], LadderGlows[2], LadderGlows[3]);
+			Run->ShotPath = Shoot(WorldPtr, TEXT("jarladder"));
+			Run->Step = 2;
+			ScheduleLadder(Run, 2.5f);
+			return false;
+		}
+
+		ConfirmShot(Run->ShotPath);
+		if (APlayerController* PC = WorldPtr->GetFirstPlayerController())
+		{
+			PC->SetViewTargetWithBlend(PC->GetPawn(), 0.f);
+		}
+		if (ACameraActor* Camera = Run->ShotCamera.Get())
+		{
+			Camera->Destroy();
+		}
+		UE_LOG(LogTraceGame, Display, TEXT("[%s] ===== ladder complete. ====="), Test);
+		return false;
+	}
+
+	FAutoConsoleCommand CmdOysterJarLadder(
+		TEXT("Trace.Oyster.JarLadder"),
+		TEXT("Dev only, SERVER. Stages four Oyster jars built at Glow 1.40 / 1.00 / 0.74 / 0.50 in one "
+		     "row and photographs them in ONE frame, so the shipped value can be read off pixels rather "
+		     "than argued about. Restores Trace.Oyster.JarGlow to 0 before it returns."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			ScheduleLadder(MakeShared<FLadderRun>(), 0.f);
+		}));
+
+	FAutoConsoleCommand CmdOysterFxParade(
+		TEXT("Trace.Oyster.FxParade"),
+		TEXT("Dev only, SERVER. FX_AUDIO_PLAN §2.6. Stages Oyster's FX and photographs each one: a dash "
+		     "jar beside a Pickler jar (the collar is the only thing that distinguishes them), the break "
+		     "(cloud + JarPop + OysterJarBreak), and a poisoned victim's drips seen from outside. Prints "
+		     "what it measured off the live actors as well as shooting it. Trace.Oyster.CloudTest is the "
+		     "command that proves drawn == lethal; this one judges hue and shape."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			Schedule(MakeShared<FParadeRun>(), 0.f);
 		}));
 }
 

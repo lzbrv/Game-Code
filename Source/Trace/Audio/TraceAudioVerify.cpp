@@ -52,6 +52,8 @@
 #include "Trace.h"
 #include "TraceTypes.h"
 
+#if !UE_BUILD_SHIPPING
+
 // Named after the file. Two anonymous namespaces in one unity translation unit are one namespace —
 // see Scripts/check-jumbo-build-collisions.py and the four Windows-only breaks it exists to stop.
 namespace TraceAudioVerify
@@ -159,9 +161,15 @@ namespace TraceAudioVerify
 				++Missing;
 			}
 
-			UE_LOG(LogTraceGame, Display, TEXT("  %-14s %-11s %-11s %6.2f  %s"),
+			// DEMO 29 items 9 and 11: an unwired event still RESOLVES - its WAV is on disk and its
+			// USoundWave is in the bank, which is what the rest of this row measures - but it is not
+			// allowed to sound. Marking the row is the difference between this report saying "the
+			// bank is wired" (true) and a reader taking it to mean "you will hear this" (not true).
+			const bool bUnwired = TraceSoundEvents::IsUnwired(Row.Name);
+			UE_LOG(LogTraceGame, Display, TEXT("  %-14s %-11s %-11s %6.2f  %s%s"),
 				*Row.Name.ToString(), TraceSoundEvents::SideName(Row.Side),
-				SourceOf(Audio, Row.Name), DurationOf(Sound), Row.Trigger);
+				SourceOf(Audio, Row.Name), DurationOf(Sound),
+				bUnwired ? TEXT("[UNWIRED] ") : TEXT(""), Row.Trigger);
 		}
 
 		if (Audio != nullptr)
@@ -170,9 +178,9 @@ namespace TraceAudioVerify
 			UE_LOG(LogTraceGame, Display, TEXT(""));
 			UE_LOG(LogTraceGame, Display,
 				TEXT("counters    local %d  world %d  multicasts sent %d  |  refused: not-authority %d, "
-				     "not-local-player %d  |  missing %d  no-device %d"),
+				     "not-local-player %d, unwired %d  |  missing %d  no-device %d"),
 				Tally.LocalPlays, Tally.WorldPlays, Tally.MulticastsSent,
-				Tally.RefusedNotAuthority, Tally.RefusedNotLocalPlayer,
+				Tally.RefusedNotAuthority, Tally.RefusedNotLocalPlayer, Tally.RefusedUnwired,
 				Tally.MissingSound, Tally.NoAudioDevice);
 		}
 
@@ -824,3 +832,5 @@ namespace TraceAudioVerify
 		TEXT("Set Trace.Audio.TurnoverEdge 0 first for the RED arm, which must FAIL."),
 		FConsoleCommandDelegate::CreateStatic(&TurnoverArm));
 }
+
+#endif // !UE_BUILD_SHIPPING

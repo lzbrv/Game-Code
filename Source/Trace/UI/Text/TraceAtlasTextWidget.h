@@ -39,7 +39,10 @@
 //     Label->VerticalAlignment = TraceText::EVAlign::CapTop;   // top edge = the cap line
 //
 // Everything degrades on its own: with the atlas off the leaf draws the same string, at the same
-// size and position, in Lato via MakeText. A caller never branches on which face is live.
+// size and position, in Lato via MakeText. A caller never branches on which face is live. Since UI
+// plan WP12 that is true one GLYPH at a time as well: with the atlas UP, a codepoint the chosen
+// face has no cell for is drawn from the Latin-1 sheet inside the same OnPaint loop, so a player
+// name arriving from the network sets its accented letters instead of leaving holes.
 
 #pragma once
 

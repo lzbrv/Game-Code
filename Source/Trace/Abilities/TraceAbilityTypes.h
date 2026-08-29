@@ -1,7 +1,8 @@
 // Trace — the ability framework's shared type layer (spec v14 §5).
 //
-// This header is deliberately tiny and dependency-light: it is what the five character files and
-// every damage call site in the module include, so it must never pull in a gameplay class header.
+// This header is deliberately tiny and dependency-light: it is what the TEN character files (five at
+// spec v14, +3 at v18 §2, +2 at v19 §3) and every damage call site in the module include, so it must
+// never pull in a gameplay class header.
 //
 // It declares four things and nothing else:
 //
@@ -354,21 +355,20 @@ namespace TraceAbilityTraits
 	 * 1.0 for everybody but Mortimer. DEMO 20 ITEM 2: "increase mortimer's dash cooldown by 25%",
 	 * so 1.25 for him, against the shared UTraceSettings::DashCooldown of 3.5 s.
 	 *
-	 * *** CALL SITE NEEDED, AND IT DOES NOT EXIST YET. ***
-	 * UTraceCharacterMovementComponent::GetDashCooldown() must become
+	 * *** LIVE. *** UTraceCharacterMovementComponent::GetDashCooldown() reads it:
 	 *
 	 *     return FMath::Max(0.f, UTraceSettings::Get().DashCooldown
 	 *         * TraceAbilityTraits::GetDashCooldownScale(CharacterOwner));
 	 *
-	 * and nothing else changes: GetDashRechargeWindow() is defined as duration + cooldown, so the
-	 * HUD's dash meter follows on its own. Source/Trace/Movement/ is owned by another agent in the
-	 * pass that added this trait, which is the only reason the line is not already there.
+	 * (TraceCharacterMovementComponent.cpp, ~:800). Nothing else needed changing:
+	 * GetDashRechargeWindow() is defined as duration + cooldown, so the HUD's dash meter followed on
+	 * its own. Trace.Mortimer.DashTest measures the shipped movement component rather than the knob,
+	 * which is what makes it evidence that the wiring is real.
 	 *
-	 * UNTIL IT IS, THIS FUNCTION IS READ BY NOBODY AND MORTIMER'S DASH RECHARGES LIKE EVERYBODY
-	 * ELSE'S. Trace.Mortimer.Verify says so on every run and Trace.Mortimer.DashTest measures the
-	 * shipped movement component rather than the knob, so it goes red on exactly this gap. Do not
-	 * delete either of those warnings without deleting this paragraph — a knob nothing reads that
-	 * nothing complains about is this project's single most repeated failure.
+	 * HISTORY, KEPT ON PURPOSE: this block used to read "CALL SITE NEEDED, AND IT DOES NOT EXIST
+	 * YET", because Source/Trace/Movement/ belonged to another agent in the pass that added the
+	 * trait. The warning outlived the gap by several passes — a knob nothing reads is this project's
+	 * most repeated failure, and a "not live" note that is no longer true is its second.
 	 */
 	TRACE_API float GetDashCooldownScale(const AActor* Actor);
 
@@ -380,7 +380,9 @@ namespace TraceAbilityTraits
 	 * exactly +1 on top of the shipped 1 / 2. Expressed as an ADDEND and not as a total so that a
 	 * retune of BaseDashCharges still moves her with everyone else.
 	 *
-	 * CALL SITE NEEDED: UTraceCharacterMovementComponent::GetMaxDashCharges().
+	 * LIVE at UTraceCharacterMovementComponent::GetMaxDashCharges()
+	 * (TraceCharacterMovementComponent.cpp, ~:1673 — `Max += TraceAbilityTraits::GetExtraDashCharges`).
+	 * The line that used to say "CALL SITE NEEDED" here was stale.
 	 */
 	TRACE_API int32 GetExtraDashCharges(const AActor* Actor);
 
@@ -392,7 +394,9 @@ namespace TraceAbilityTraits
 	 * wall-jump numbers must not move", which is why this is a per-pawn query rather than an edit to
 	 * WallJumpSpeedRetention.
 	 *
-	 * CALL SITE NEEDED: UTraceCharacterMovementComponent::TryWallJump().
+	 * LIVE at UTraceCharacterMovementComponent::TryWallJump()
+	 * (TraceCharacterMovementComponent.cpp, ~:2981 — it multiplies GetWallJumpSpeedRetention()).
+	 * The line that used to say "CALL SITE NEEDED" here was stale.
 	 */
 	TRACE_API float GetWallJumpMomentumScale(const AActor* Actor);
 
@@ -402,7 +406,9 @@ namespace TraceAbilityTraits
 	 * 0 for everybody but Lily, who "has only 60 health". ZERO rather than a multiplier because the
 	 * spec states an absolute, and a fraction of a retuned MaxHealth would silently stop being 60.
 	 *
-	 * CALL SITE NEEDED: UTraceHealthComponent::GetMaxHealth().
+	 * LIVE at UTraceHealthComponent::GetMaxHealth(), which reads it on every call rather than caching
+	 * it — and, since RESTRUCTURE C3, UTraceHealthComponent::ReclampToMax() re-applies it to a pawn
+	 * that switches character mid-life. The line that used to say "CALL SITE NEEDED" here was stale.
 	 */
 	TRACE_API float GetMaxHealthOverride(const AActor* Actor);
 

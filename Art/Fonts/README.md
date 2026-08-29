@@ -39,13 +39,6 @@ repository — they are commercial.** The same applies to any font whose licence
 forbids embedding: the imported .uasset embeds the file's bytes, so importing it
 here is redistribution.
 
-## Known repository issue (not fixed here — flagged to the orchestrator)
-
-`.gitignore:204-206` ignores `Art/Fonts/*.otf`, `*.ttf` and `*.pdf` wholesale, so
-`Lato-Regular.ttf` is **not committed** even though its licence allows it. The
-game still works from a clean clone, because the imported
-`Content/Trace/UI/Fonts/F_TraceMenu_Face.uasset` carries the font data and is not
-ignored — but nobody can re-run the import without fetching Lato again. The
-one-line fix belongs to whoever owns `.gitignore`:
-
-    !Art/Fonts/Lato-Regular.ttf
+(A "Known repository issue" section used to live here: `.gitignore`'s blanket font rules once
+swallowed `Lato-Regular.ttf`. Resolved — `.gitignore` now carries `!Art/Fonts/Lato-Regular.ttf`
+and the file is tracked in LFS, so a clean clone can re-run the import.)

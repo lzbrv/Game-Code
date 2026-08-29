@@ -48,7 +48,56 @@ class UBorder;
 class UImage;
 class UTextBlock;
 class UTexture2D;
+class UTraceAtlasText;
 class UTraceMenuGrid;
+
+/**
+ * The title block's composition, in the 1080-tall reference pixels the asset is authored in.
+ *
+ * These numbers ARE spec v20 §0.2's fix, and every one is measured rather than chosen. The two
+ * sprites' ink boxes were taken off the artist's sheet ("UI Test Export_2.png"): the wordmark's ink
+ * is 14265 x 2200 sheet px, the swoosh's is 18521 x 3729, the swoosh sits 474 sheet px BELOW the
+ * mark's ink with its centre 427 px to the LEFT of it. Divide through by the mark's ink width and
+ * those become the ratios below. Both sprites are cut so tightly (ink fills 99% of each crop) that
+ * the sprite rect and the ink rect are the same rectangle.
+ *
+ * They lived inside TraceTitleMenuWidget.cpp until the release pass; WP9 made the CANVAS title draw
+ * the same sprites at the same places (it is what shows through a modal's scrim), and two copies of
+ * a composition is two compositions that drift — the exact reasoning TraceMenuPalette.h records for
+ * the palette. Consumed by UTraceTitleMenuWidget::ComposeTitleBlock and ATraceMenuHUD::DrawWordmark.
+ */
+namespace TraceTitleLayout
+{
+	/** The mark's width in reference px, and the fraction of a narrow viewport it may not exceed. */
+	static constexpr float MarkWidth = 660.f;
+	static constexpr float MarkMaxWidthFraction = 0.46f;
+	static constexpr float MarkTopY = 46.f;
+
+	/** Swoosh ink / wordmark ink on the sheet is 1.298. Held a shade under it so the mark leads. */
+	static constexpr float SwooshWidthOfMark = 1.24f;
+
+	/** The artist's clear space: 474 sheet px / 14265 sheet px of mark = 0.0332. */
+	static constexpr float SwooshGapOfMark = 0.033f;
+
+	/** The artist's horizontal offset: 427 / 14265 = 0.0299, to the left. */
+	static constexpr float SwooshLeftOfMark = 0.030f;
+
+	/** Reference px the flourish must stop short of the tagline by, if the clamp has to bite. */
+	static constexpr float SwooshClearOfTagline = 16.f;
+
+	/**
+	 * The swoosh's opacity, down from the authored 0.78.
+	 *
+	 * It is a backdrop for the title. Even after the WP8.3 re-tone onto the plate palette, a
+	 * flourish at full strength competes with the six things on this screen a player actually has
+	 * to read.
+	 */
+	static constexpr float SwooshOpacity = 0.55f;
+
+	/** Where the tagline is authored on the root canvas, reference px. The widget MEASURES the live
+	 *  slot and uses this only as the first-frame fallback; the Canvas path draws at it directly. */
+	static constexpr float TaglineY = 359.f;
+}
 
 /** One frame of the title screen, as ATraceMenuHUD sees it. */
 struct FTraceTitleMenuView
@@ -70,6 +119,9 @@ struct FTraceTitleMenuView
 
 	FString FooterKeys;
 	FString FooterHint;
+
+	/** WP8.2 — "V 0.1.0", from ProjectVersion. Empty draws nothing. The HUD owns the read. */
+	FString Version;
 
 	bool bFailureVisible = false;
 	FString FailureHeadline;
@@ -371,6 +423,20 @@ private:
 	/** The grid, once installed. Null if the install found no canvas to put it on; never fatal. */
 	UPROPERTY(Transient)
 	TObjectPtr<UTraceMenuGrid> GridFloor;
+
+	// ---- WP8.2: THE VERSION STRING, bottom-right ----------------------------------------------------
+
+	/**
+	 * Adds a small atlas-text label to the root canvas for the view's Version string. Code rather
+	 * than Scripts/generate-menu-widgets.py for exactly InstallGridBackground()'s reasons — chiefly
+	 * that a label which only exists once somebody re-runs the generator is a label missing from
+	 * every checkout until they do. Idempotent; a failure leaves the corner empty, never fatal.
+	 */
+	void InstallVersionLabel();
+
+	/** The label, once installed. Null if the install found no canvas; never fatal. */
+	UPROPERTY(Transient)
+	TObjectPtr<UTraceAtlasText> VersionLabel;
 
 	// ---- SPEC v22 §A1: THE WHOLE SCREEN IS ONE TYPEFACE ---------------------------------------------
 	//

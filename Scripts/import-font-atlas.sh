@@ -4,10 +4,10 @@
 #
 # Puts the game's TYPE on screen. Runs the two halves of Scripts/import_font_atlas.py:
 #
-#   1. metrics  Content/Trace/UI/Fonts/Source/T_FontAtlas{,Bold,Hud}.json
+#   1. metrics  Content/Trace/UI/Fonts/Source/T_FontAtlas{,Bold,Hud,Names}.json
 #                 -> Source/Trace/UI/Text/TraceFontAtlasMetrics.h    (plain python)
-#   2. texture  Content/Trace/UI/Fonts/Source/T_FontAtlas{,Bold,Hud}.png
-#                 -> Content/Trace/UI/Fonts/T_FontAtlas{,Bold,Hud}.uasset  (in the editor)
+#   2. texture  Content/Trace/UI/Fonts/Source/T_FontAtlas{,Bold,Hud,Names}.png
+#                 -> Content/Trace/UI/Fonts/T_FontAtlas{,Bold,Hud,Names}.uasset  (editor)
 #
 # ------------------------------------------------------------------------------
 # THREE FACES (spec v23 §A3, third face by v25 §4)
@@ -29,6 +29,34 @@
 # three. Ascent, descent, cap height and advances are per face and may differ —
 # Erbaum splits the shared 116 px line box 93/23 where Sofachrome splits it 95/21.
 #
+# ------------------------------------------------------------------------------
+# ...AND A FOURTH SHEET, WHICH IS NOT A FACE ANYONE CAN ASK FOR (UI plan WP12)
+# ------------------------------------------------------------------------------
+#   T_FontAtlasNames Lato-Regular.ttf (OFL)          per-glyph FALLBACK, Latin-1
+#
+# The three above are printable ASCII, which covers every string this game AUTHORS
+# and not the one class it does not: PLAYER NAMES. "Bjorn" (with an o-umlaut) used
+# to draw a hole where that letter should be. This sheet fills those holes, one
+# codepoint at a time, inside the atlas path.
+#
+# It is deliberately NOT a fourth weight: nothing can ASK to draw in it, it is not
+# in ETraceTextWeight, and it does NOT share the other three's line box or charset
+# (Lato splits 137 px at em 96, and Latin-1 has holes in it where the C1 controls
+# and the soft hyphen were skipped). It is guarded by import_font_atlas.py's
+# check_fallback() instead, which enforces the em and MEASURES that a fallback
+# glyph's ink still fits the shared line box once it is shifted onto the baseline.
+#
+# *** THIS ONE'S FONT FILE IS IN THE REPOSITORY, AND LEGALLY SO. *** Lato is under
+# the SIL Open Font License; Art/Fonts/Lato-Regular.ttf and Art/Fonts/README.md are
+# both committed. Regenerating it therefore needs nothing you do not already have:
+#
+#   python3 Scripts/generate_font_atlas.py --font Art/Fonts/Lato-Regular.ttf \\
+#       --name T_FontAtlasNames --charset latin1 --size 96 --preview
+#
+# Do NOT pass --charset latin1 for the other three. Rasterising 96 more codepoints
+# of Sofachrome or Erbaum into a public repo is exactly the exposure docs/FONTS.md
+# flags, and it is the reason this sheet exists instead.
+#
 # YOU DO NOT NEED TO RUN THIS TO PLAY. All outputs are committed, exactly like
 # the railgun's assets. Run it after re-running Scripts/generate_font_atlas.py,
 # then commit what changes under Content/Trace/UI/Fonts and Source/Trace/UI/Text.
@@ -49,7 +77,7 @@
 # font here at all.
 #
 # ------------------------------------------------------------------------------
-# THE FONT FILE IS NOT IN THIS REPOSITORY, BY DESIGN
+# THE LICENSED FONT FILES ARE NOT IN THIS REPOSITORY, BY DESIGN
 # ------------------------------------------------------------------------------
 # Sofachrome and Erbaum are licensed to the owner for desktop use, not for
 # embedding, and this repo is public. Only the rasterised sheets are committed.
@@ -57,6 +85,11 @@
 # see docs/FONTS.md and the header of Scripts/generate_font_atlas.py, which also
 # records that a whole-charset atlas is a GREY position that a commercial
 # release should replace with a bought app licence.
+#
+# That is true of THREE of the four sheets. Lato is the exception in both halves
+# of the sentence: it is OFL, its .ttf is committed at Art/Fonts/Lato-Regular.ttf
+# with its licence text in Art/Fonts/README.md, and neither its font file nor its
+# sheet carries any of the above restrictions. See the FOURTH SHEET block.
 # ==============================================================================
 set -euo pipefail
 
@@ -72,8 +105,9 @@ usage() {
 ${TRACE_PROJECT_NAME} import-font-atlas
 
 Regenerates Source/Trace/UI/Text/TraceFontAtlasMetrics.h and imports
-Content/Trace/UI/Fonts/T_FontAtlas, T_FontAtlasBold and T_FontAtlasHud — the
-light, bold and HUD faces — from the sheets under .../Fonts/Source.
+Content/Trace/UI/Fonts/T_FontAtlas, T_FontAtlasBold, T_FontAtlasHud and
+T_FontAtlasNames — the light, bold and HUD faces plus the Latin-1 per-glyph
+fallback — from the sheets under .../Fonts/Source.
 
 USAGE
   Scripts/import-font-atlas.sh [options]
@@ -81,8 +115,8 @@ USAGE
 OPTIONS
       --header-only   Only regenerate the metrics header (no editor, instant)
       --texture-only  Only import the textures (leave the header alone)
-      --weight NAME   Import only this weight (Light | Bold | Hud). The header still
-                      describes every weight. Use it to add or refresh ONE sheet
+      --weight NAME   Import only this sheet (Light | Bold | Hud | Names). The header
+                      still describes every sheet. Use it to add or refresh ONE sheet
                       without rewriting an .uasset you have not locked — .uasset
                       is lockable in .gitattributes, so it is read-only until
                       Scripts/lock.sh says otherwise.
@@ -94,9 +128,12 @@ AFTER RUNNING
   git status Content/Trace/UI/Fonts Source/Trace/UI/Text
 
 IN GAME
-  Trace.Text.Report            names the face and weights that are actually drawing
-  Trace.Text.Preview           specimen through BOTH renderers, in EVERY face
-  -TraceNoFontAtlas            forces the Lato fallback, on purpose
+  Trace.Text.Report            names the face and weights that are actually drawing,
+                               and which glyph of a Latin-1 name came from which sheet
+  Trace.Text.Preview           specimen through BOTH renderers, in EVERY face, with the
+                               Latin-1 rows in the right-hand column
+  -TraceNoFontAtlas            forces the whole-atlas Lato fallback, on purpose
+  Trace.Text.GlyphFallback 0   RED ARM: puts the pre-WP12 holes back in a non-ASCII name
 EOF
 }
 
@@ -104,7 +141,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --header-only)  DO_EDITOR=0 ;;
         --texture-only) DO_HEADER=0 ;;
-        --weight)       shift; [ $# -gt 0 ] || trace_die "--weight needs a name (Light | Bold | Hud)"
+        --weight)       shift; [ $# -gt 0 ] || trace_die "--weight needs a name (Light | Bold | Hud | Names)"
                         ONLY_WEIGHT="$1" ;;
         -n|--dry-run)   DRY_RUN=1 ;;
         -h|--help)      usage; exit 0 ;;
@@ -127,17 +164,29 @@ SRC_DIR="${TRACE_PROJECT_ROOT}/Content/Trace/UI/Fonts/Source"
 # --thin" — the second attempt deleted ( ) [ ] { } and / while the HUD draws "[E]").
 #
 # APPEND to these arrays, never insert: the index is the ETraceTextWeight value.
-ATLASES=("T_FontAtlas" "T_FontAtlasBold" "T_FontAtlasHud")
-WEIGHT_NAMES=("Light" "Bold" "Hud")
-FONT_FILES=("Sofachrome W05 ExtraLight.ttf" "Sofachrome Rg.otf" "Erbaum-Bold.otf")
+#
+# The FOURTH entry is the WP12 fallback sheet, and it is the odd one out twice over:
+# its font file IS committed (Lato is OFL) and its charset is latin1, not ascii. The
+# per-sheet charset is carried here too, so the command a missing sheet tells you to
+# run is the right command for THAT sheet rather than for the other three.
+ATLASES=("T_FontAtlas" "T_FontAtlasBold" "T_FontAtlasHud" "T_FontAtlasNames")
+WEIGHT_NAMES=("Light" "Bold" "Hud" "Names")
+FONT_FILES=("Sofachrome W05 ExtraLight.ttf" "Sofachrome Rg.otf" "Erbaum-Bold.otf" "Lato-Regular.ttf")
+CHARSETS=("ascii" "ascii" "ascii" "latin1")
 
 for I in "${!ATLASES[@]}"; do
     NAME="${ATLASES[$I]}"
     for F in "${SRC_DIR}/${NAME}.png" "${SRC_DIR}/${NAME}.json"; do
+        if [ "${CHARSETS[$I]}" = "ascii" ]; then
+            NOTE="That needs your own licensed copy of the face at Art/Fonts/ — see docs/FONTS.md."
+        else
+            NOTE="Lato is OFL and Art/Fonts/Lato-Regular.ttf is committed, so that command needs nothing
+you do not already have. Do NOT pass --charset latin1 for any of the other three sheets."
+        fi
         [ -f "$F" ] || trace_die "Missing ${F}
 Generate it first:  python3 Scripts/generate_font_atlas.py --name ${NAME} \\
-    --font \"Art/Fonts/${FONT_FILES[$I]}\" --preview
-That needs your own licensed copy of the face at Art/Fonts/ — see docs/FONTS.md."
+    --font \"Art/Fonts/${FONT_FILES[$I]}\" --charset ${CHARSETS[$I]} --preview
+${NOTE}"
     done
 
     # An LFS pointer is a ~130-byte text file starting with 'version https://'. Handing
@@ -244,5 +293,5 @@ if [ "$MISSING" != "0" ]; then
     exit 1
 fi
 
-trace_msg "The atlas is imported (${#ATLASES[@]} faces: ${ATLASES[*]})."
+trace_msg "The atlas is imported (${#ATLASES[@]} sheets: ${ATLASES[*]} — three faces plus the Latin-1 fallback)."
 trace_msg "Next: ./Scripts/build.sh, then in game: Trace.Text.Report / Trace.Text.Preview"

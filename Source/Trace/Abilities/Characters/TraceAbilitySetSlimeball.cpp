@@ -759,11 +759,11 @@ void UTraceAbilitySetSlimeball::ClearWall()
 	}
 }
 
-bool UTraceAbilitySetSlimeball::ResolveSlimewallPlacement(FVector& OutCenter, FVector& OutPlanarAim,
+bool UTraceAbilitySetSlimeball::ResolveSlimewallPlacement(FVector& OutCenter, FVector& OutSlabNormal,
                                                           FVector& OutHalfExtents, FString& OutWhy) const
 {
 	OutCenter = FVector::ZeroVector;
-	OutPlanarAim = FVector::ZeroVector;
+	OutSlabNormal = FVector::ZeroVector;
 	OutHalfExtents = FVector::ZeroVector;
 
 	const ATraceCharacter* MyPawn = GetCharacter();
@@ -776,18 +776,8 @@ bool UTraceAbilitySetSlimeball::ResolveSlimewallPlacement(FVector& OutCenter, FV
 
 	const UTraceSettings& Settings = UTraceSettings::Get();
 
-	// THREE KNOBS, because §2 says "(for now, make this changeable)" of all three dimensions. The axis
-	// each one means is the [ASSUMPTION] recorded on the knobs themselves: WIDTH is the thickness
-	// along his aim (what an enemy walks through, and therefore what makes the 35% slow last longer
-	// than a rounding error), LENGTH is the span across it, HEIGHT is vertical.
-	const float Width  = FMath::Max(10.f, Settings.SlimewallWidthUU);
-	const float Length = FMath::Max(50.f, Settings.SlimewallLengthUU);
-	const float Height = FMath::Max(20.f, Settings.SlimewallHeightUU);
-	OutHalfExtents = FVector(Width * 0.5f, Length * 0.5f, Height * 0.5f);
-
-	// "in his AIM DIRECTION", flattened. A wall is a vertical slab standing on the floor, so the
-	// pitch of his view decides nothing about it — only the compass bearing does. Looking straight
-	// down would otherwise produce a degenerate direction and a wall in an arbitrary orientation.
+	// "in his AIM DIRECTION", flattened. Only the compass bearing matters; a wall is a vertical slab
+	// standing on the floor, so the pitch of his view decides nothing about it.
 	FVector PlanarAim = FVector(MyPawn->GetAimDirection().X, MyPawn->GetAimDirection().Y, 0.f).GetSafeNormal();
 	if (PlanarAim.IsNearlyZero())
 	{
@@ -799,67 +789,33 @@ bool UTraceAbilitySetSlimeball::ResolveSlimewallPlacement(FVector& OutCenter, FV
 		OutWhy = TEXT("no horizontal aim direction");
 		return false;
 	}
-	OutPlanarAim = PlanarAim;
 
-	float CapsuleRadius = 34.f;
-	float CapsuleHalfHeight = 88.f;
-	if (const UCapsuleComponent* Capsule = MyPawn->GetCapsuleComponent())
-	{
-		CapsuleRadius = Capsule->GetScaledCapsuleRadius();
-		CapsuleHalfHeight = Capsule->GetScaledCapsuleHalfHeight();
-	}
-
-	FCollisionObjectQueryParams ObjectParams;
-	ObjectParams.AddObjectTypesToQuery(ECC_WorldStatic);
-
-	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(TraceSlimewallPlacement), /*bTraceComplex*/ false);
-	QueryParams.AddIgnoredActor(MyPawn);
-
-	// ---- how far in front of him it goes up ------------------------------------------------------
+	// =============================================================================================
+	// PATCH 28 ITEM 2 — "the slimewall should be placed FORWARD instead of laterally in front of him"
+	// =============================================================================================
 	//
-	// Shortened by anything solid in the way, so throwing a wall at a pillar two metres away puts it
-	// against the pillar rather than half inside it. The clearance kept is HALF THE THICKNESS, because
-	// the centre is what is being placed.
-	const float DesiredRange = FMath::Max(0.f, Settings.SlimewallRangeUU);
-	const float MinimumRange = CapsuleRadius + (Width * 0.5f) + 10.f;
-
-	float PlacementRange = DesiredRange;
-	FHitResult ForwardHit;
-	if (WorldPtr->LineTraceSingleByObjectType(ForwardHit, MyPawn->GetActorLocation(),
-		MyPawn->GetActorLocation() + PlanarAim * DesiredRange, ObjectParams, QueryParams))
+	// THREE KNOBS, because §2 says "(for now, make this changeable)" of all three dimensions, and the
+	// axis each one means is the [ASSUMPTION] recorded on the knobs themselves in TraceSettings.h.
+	// WHAT PATCH 28 CHANGED IS WHICH WORLD AXIS THE *LENGTH* RUNS ALONG, not what the knobs mean:
+	//
+	//   HEIGHT  176 uu   vertical                             — one player tall.       UNCHANGED.
+	//   WIDTH   176 uu   the thickness an enemy walks THROUGH — one player wide.       UNCHANGED,
+	//                    and it is now the LATERAL thickness rather than the along-aim one, so the
+	//                    176 x 176 cross-section is exactly §2's "one player height tall and wide".
+	//   LENGTH 1100 uu   the long run, which now points AWAY from him instead of across his view.
+	//
+	// The whole of the turn is which vector is handed in as the slab's normal, and that decision
+	// lives on the wall (ATraceSlimewall::ResolveForwardRun) rather than here — see its header for
+	// why it shortens rather than retreating when the lane is blocked, and for why the slab's own
+	// local axes deliberately did not move.
+	if (!ATraceSlimewall::ResolveForwardRun(WorldPtr, MyPawn, PlanarAim,
+			Settings.SlimewallWidthUU, Settings.SlimewallLengthUU, Settings.SlimewallHeightUU,
+			FMath::Max(0.f, Settings.SlimewallRangeUU),
+			OutCenter, OutSlabNormal, OutHalfExtents, OutWhy))
 	{
-		PlacementRange = static_cast<float>(ForwardHit.Distance) - (Width * 0.5f);
-	}
-
-	if (PlacementRange < MinimumRange)
-	{
-		// A FREE FIZZLE. The framework charges the cooldown only on a true return, and
-		// UTraceCharacterAbilitySet's header names "Mace's spike hitting nothing" as the precedent.
-		// Standing nose-to-nose with a wall must not cost 25 s.
-		OutWhy = FString::Printf(
-			TEXT("no room — only %.0f uu of clearance ahead and the slab needs %.0f"),
-			FMath::Max(0.f, PlacementRange), MinimumRange);
 		return false;
 	}
 
-	const FVector Feet = MyPawn->GetActorLocation() - FVector(0.f, 0.f, CapsuleHalfHeight);
-	const FVector Ahead = Feet + PlanarAim * PlacementRange;
-
-	// ---- and then drop it onto the floor ---------------------------------------------------------
-	//
-	// Measured from a whole wall-height ABOVE the target point so that placing it up a short step
-	// finds the step rather than the floor underneath it, and traced a long way down so that placing
-	// it over a ledge still finds ground rather than leaving the slab hanging at his own feet height.
-	float FloorZ = Feet.Z;
-	FHitResult FloorHit;
-	if (WorldPtr->LineTraceSingleByObjectType(FloorHit, Ahead + FVector(0.f, 0.f, Height),
-		Ahead - FVector(0.f, 0.f, Height * 4.f), ObjectParams, QueryParams))
-	{
-		FloorZ = static_cast<float>(FloorHit.ImpactPoint.Z);
-	}
-
-	OutCenter = FVector(Ahead.X, Ahead.Y, FloorZ + Height * 0.5f);
-	OutWhy = TEXT("placed");
 	return true;
 }
 
@@ -874,11 +830,11 @@ bool UTraceAbilitySetSlimeball::ActivateAbility()
 	}
 
 	FVector Centre = FVector::ZeroVector;
-	FVector PlanarAim = FVector::ZeroVector;
+	FVector SlabNormal = FVector::ZeroVector;   // LATERAL since Patch 28 item 2 — the slab's thin axis
 	FVector Extents = FVector::ZeroVector;
 	FString Why;
 
-	if (!ResolveSlimewallPlacement(Centre, PlanarAim, Extents, Why))
+	if (!ResolveSlimewallPlacement(Centre, SlabNormal, Extents, Why))
 	{
 		UE_LOG(LogTraceGame, Verbose, TEXT("[Slimeball] Slimewall fizzled: %s. No cooldown charged."), *Why);
 		return false;
@@ -908,7 +864,7 @@ bool UTraceAbilitySetSlimeball::ActivateAbility()
 
 	const float Duration = FMath::Max(0.25f, UTraceSettings::Get().SlimewallDurationSeconds);
 
-	ActiveWall = ATraceSlimewall::ServerSpawn(WorldPtr, MySource, MyTeam, Centre, PlanarAim, Extents,
+	ActiveWall = ATraceSlimewall::ServerSpawn(WorldPtr, MySource, MyTeam, Centre, SlabNormal, Extents,
 		MatchTimeNow() + Duration);
 
 	if (!ActiveWall.IsValid())
@@ -920,9 +876,11 @@ bool UTraceAbilitySetSlimeball::ActivateAbility()
 	PublishState();
 
 	UE_LOG(LogTraceGame, Log,
-		TEXT("[Slimeball] SLIMEWALL up for %.1fs: %.0f thick x %.0f long x %.0f tall at %.0f uu ahead. "
-		     "Bullets pass through it; enemies crossing it lose %.0f%% speed. Cooldown %.0fs."),
-		Duration, Extents.X * 2.f, Extents.Y * 2.f, Extents.Z * 2.f, UTraceSettings::Get().SlimewallRangeUU,
+		TEXT("[Slimeball] SLIMEWALL up for %.1fs: %.0f wide x %.0f tall in cross-section, running %.0f uu "
+		     "FORWARD from %.0f uu ahead of him (knob %.0f). Bullets pass through it; enemies crossing it "
+		     "lose %.0f%% speed. Cooldown %.0fs."),
+		Duration, Extents.X * 2.f, Extents.Z * 2.f, Extents.Y * 2.f,
+		UTraceSettings::Get().SlimewallRangeUU, UTraceSettings::Get().SlimewallLengthUU,
 		FMath::Clamp(UTraceSettings::Get().SlimewallSlowFraction, 0.f, 0.95f) * 100.f,
 		UTraceSettings::Get().SlimewallCooldownSeconds);
 
@@ -1757,30 +1715,54 @@ namespace TraceSlimeballVerify
 		const bool bSameWallStanding = (Slime->GetActiveWall() == Wall) && (Wall != nullptr);
 
 		// ---- measure what actually went up -------------------------------------------------------
-		float AheadUU = 0.f;
-		float AimAgreement = 0.f;
+		//
+		// PATCH 28 ITEM 2 MOVED THE THREE GEOMETRY QUESTIONS THIS BLOCK ASKS. The wall used to be a
+		// lateral barrier CENTRED SlimewallRangeUU ahead, so "how far ahead is its centre" and "does
+		// its normal agree with his aim" were the right questions. It now runs FORWARD from that
+		// distance, so:
+		//   * the centre is (range + half the achieved run) ahead — it is the NEAR END that sits on
+		//     the knob, and that is what is measured;
+		//   * its normal is LATERAL, so the aim dot is ~0 rather than ~1, and the number worth
+		//     asserting is that its LONG AXIS lies along his aim;
+		//   * the achieved run may be SHORTER than SlimewallLengthUU when something was in the lane,
+		//     which is a placement fact and not a failure, so the length check is a range.
+		float NearEndUU = 0.f;
+		float CentreAheadUU = 0.f;
+		float NormalAgreement = 0.f;      // |dot(slab normal, his aim)| — want ~0
+		float LongAxisAgreement = 0.f;    // |dot(slab long axis, his aim)| — want ~1
 		float LifeSeconds = 0.f;
 		FVector Extents = FVector::ZeroVector;
 		if (Wall != nullptr)
 		{
 			const FVector PlanarAim = FVector(MyPawn->GetAimDirection().X, MyPawn->GetAimDirection().Y, 0.f).GetSafeNormal();
 			const FVector ToWall = Wall->GetWallCenter() - MyPawn->GetActorLocation();
-			AheadUU = static_cast<float>(FVector::DotProduct(FVector(ToWall.X, ToWall.Y, 0.f), PlanarAim));
-			AimAgreement = static_cast<float>(FVector::DotProduct(Wall->GetWallAim(), PlanarAim));
-			LifeSeconds = Wall->GetExpireMatchTime() - Slime->MatchTimeNow();
+			const FVector Normal = Wall->GetWallAim().GetSafeNormal();
+
+			// The slab's basis, exactly as ATraceSlimewall documents it and IsInsideWall builds it —
+			// local +X is the normal, local +Y is Up x Normal. Asked here rather than assumed, so a
+			// change to that basis fails this arm instead of passing it by coincidence.
+			const FVector LongAxis = FVector::CrossProduct(FVector::UpVector, Normal).GetSafeNormal();
+
 			Extents = Wall->GetHalfExtentsUU();
+			CentreAheadUU = static_cast<float>(FVector::DotProduct(FVector(ToWall.X, ToWall.Y, 0.f), PlanarAim));
+			NearEndUU = CentreAheadUU - Extents.Y;
+			NormalAgreement = FMath::Abs(static_cast<float>(FVector::DotProduct(Normal, PlanarAim)));
+			LongAxisAgreement = FMath::Abs(static_cast<float>(FVector::DotProduct(LongAxis, PlanarAim)));
+			LifeSeconds = Wall->GetExpireMatchTime() - Slime->MatchTimeNow();
 		}
 
-		const FVector WantExtents(FMath::Max(10.f, Settings.SlimewallWidthUU) * 0.5f,
-		                          FMath::Max(50.f, Settings.SlimewallLengthUU) * 0.5f,
-		                          FMath::Max(20.f, Settings.SlimewallHeightUU) * 0.5f);
+		const float WantThickness = FMath::Max(10.f, Settings.SlimewallWidthUU);
+		const float WantRun       = FMath::Max(50.f, Settings.SlimewallLengthUU);
+		const float WantHeight    = FMath::Max(20.f, Settings.SlimewallHeightUU);
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[SLIME] arm D: RED (armed off) fired=%d cooldown %.2fs | GREEN fired=%d wall=%s at %.0f uu ahead "
-			     "(knob %.0f), aim agreement %.3f, %.0fx%.0fx%.0f, lasts %.2fs, cooldown %.1fs | second press "
-			     "fired=%d, same wall still standing=%d"),
-			bRedFired ? 1 : 0, RedCooldown, bFired ? 1 : 0, *GetNameSafe(Wall), AheadUU, Settings.SlimewallRangeUU,
-			AimAgreement, Extents.X * 2.f, Extents.Y * 2.f, Extents.Z * 2.f, LifeSeconds, Cooldown,
+			TEXT("[SLIME] arm D: RED (armed off) fired=%d cooldown %.2fs | GREEN fired=%d wall=%s | FORWARD RUN: "
+			     "near end %.0f uu ahead (knob %.0f), centre %.0f uu ahead, run %.0f uu of %.0f, cross-section "
+			     "%.0f wide x %.0f tall | normal-vs-aim %.3f (want ~0), long-axis-vs-aim %.3f (want ~1) | "
+			     "lasts %.2fs, cooldown %.1fs | second press fired=%d, same wall still standing=%d"),
+			bRedFired ? 1 : 0, RedCooldown, bFired ? 1 : 0, *GetNameSafe(Wall),
+			NearEndUU, Settings.SlimewallRangeUU, CentreAheadUU, Extents.Y * 2.f, WantRun,
+			Extents.X * 2.f, Extents.Z * 2.f, NormalAgreement, LongAxisAgreement, LifeSeconds, Cooldown,
 			bSecondFired ? 1 : 0, bSameWallStanding ? 1 : 0);
 
 		List.Check(State.bRedActivationSuppressed,
@@ -1794,15 +1776,29 @@ namespace TraceSlimeballVerify
 			FString::Printf(TEXT("TryActivate returned %d and GetActiveWall() is %s — the placement sweep and "
 				"ActivateAbility are exercised by no other arm in this file"),
 				bFired ? 1 : 0, *GetNameSafe(Wall)));
-		List.Check(Wall != nullptr && AheadUU > 0.f && AheadUU <= Settings.SlimewallRangeUU + 1.f,
-			TEXT("D: it goes up IN FRONT of him, no further than the placement knob"),
-			FString::Printf(TEXT("%.0f uu ahead, knob is %.0f"), AheadUU, Settings.SlimewallRangeUU));
-		List.Check(Wall != nullptr && AimAgreement > 0.99f,
-			TEXT("D: and it faces his aim direction (§2: 'in his aim direction')"),
-			FString::Printf(TEXT("dot(wall aim, his planar aim) = %.4f"), AimAgreement));
-		List.Check(Wall != nullptr && Extents.Equals(WantExtents, 0.5f),
-			TEXT("D: at exactly the three dimension knobs (§2: 'make this changeable')"),
-			FString::Printf(TEXT("half extents %s, want %s"), *Extents.ToCompactString(), *WantExtents.ToCompactString()));
+		List.Check(Wall != nullptr && NearEndUU > 0.f
+				&& FMath::IsNearlyEqual(NearEndUU, Settings.SlimewallRangeUU, 1.f),
+			TEXT("D: it STARTS in front of him, at the placement knob (Patch 28 §2: the near END, not the centre)"),
+			FString::Printf(TEXT("near end %.1f uu ahead, knob is %.1f; centre is %.0f uu ahead because the "
+			                     "run extends forward from the near end"),
+				NearEndUU, Settings.SlimewallRangeUU, CentreAheadUU));
+		List.Check(Wall != nullptr && LongAxisAgreement > 0.99f && NormalAgreement < 0.02f,
+			TEXT("*** D: PATCH 28 §2 — it runs FORWARD, not laterally: the LONG axis lies along his aim ***"),
+			FString::Printf(TEXT("|dot(long axis, aim)| = %.4f (want 1), |dot(slab normal, aim)| = %.4f "
+			                     "(want 0). Before Patch 28 these two were the other way round"),
+				LongAxisAgreement, NormalAgreement));
+		List.Check(Wall != nullptr
+				&& FMath::IsNearlyEqual(Extents.X * 2.f, WantThickness, 0.5f)
+				&& FMath::IsNearlyEqual(Extents.Z * 2.f, WantHeight, 0.5f),
+			TEXT("D: ONE PLAYER TALL AND WIDE in cross-section, at exactly the two knobs (§2)"),
+			FString::Printf(TEXT("%.1f wide x %.1f tall, knobs are %.1f x %.1f"),
+				Extents.X * 2.f, Extents.Z * 2.f, WantThickness, WantHeight));
+		List.Check(Wall != nullptr && Extents.Y * 2.f >= WantThickness
+				&& Extents.Y * 2.f <= WantRun + 0.5f,
+			TEXT("D: and it runs up to the LENGTH knob forward, shortened only by what is in the lane"),
+			FString::Printf(TEXT("%.1f uu of run against a %.1f uu knob. Anything below the %.1f uu thickness "
+			                     "is refused as a free fizzle rather than placed as a block"),
+				Extents.Y * 2.f, WantRun, WantThickness));
 		List.Check(Wall != nullptr && FMath::IsNearlyEqual(LifeSeconds, Settings.SlimewallDurationSeconds, 0.2f),
 			TEXT("D: and it lasts the duration knob (§2: 4 s)"),
 			FString::Printf(TEXT("%.2fs, knob is %.2fs"), LifeSeconds, Settings.SlimewallDurationSeconds));

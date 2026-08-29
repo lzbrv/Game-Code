@@ -60,13 +60,15 @@
 // row height is therefore doing nothing to the corner; it is left in place because it is still the
 // brush's desired size and removing it is a change to widget layout, not to this measurement.
 //
-// The consequence is real and is on screen. This plate's texture is 512 x 153, so its slices are
-// 44 x 44 local units at every row height and every DPI scale, while the plate image at RowHeight 60
-// is only 72.5 units tall. 44 + 44 does not fit, Slate's own overlap guard squashes both vertical
-// slices to 36.24, and the artist's circular corner is drawn as an ellipse — 28 wide by 23.03 tall,
-// a vertical squash of 0.8226. ResolvePlateSilhouette() below is the arithmetic that says so, and
-// what would remove it is a smaller SOURCE TEXTURE (about 256 x 77 for this plate, same art), whose
-// 22 px slices fit in the 36.24 available.
+// The consequence WAS real and WAS on screen, and the fix it named has been taken (release UI plan
+// WP7). This plate shipped as a 512 x 153 texture, whose 44 x 44 slices did not fit the 72.5-unit
+// plate image at RowHeight 60: Slate's overlap guard squashed both vertical slices to 36.24 and the
+// artist's circular corner drew as an ellipse, 28 wide by 23.03 tall — a vertical squash of 0.8226.
+// The source is now cut at 256 wide (same art, Scripts/slice-ui-assets.py TARGETS), so the cap
+// slice is 22 px, 22 + 22 fits every plate the menu draws including the ~90 x 60 KEY chip, the
+// overlap guard never fires, and the corner reaches the screen circular. ResolvePlateSilhouette()
+// below is the arithmetic either way: it reads the LIVE texture size, so it reported the squash
+// then and reports 1.0 now, with no edit here.
 //
 // The first four measurements below were taken off the sheet, row by row, not eyeballed. They are
 // mirrored in Scripts/slice-ui-assets.py (which cuts to them) and in Scripts/generate-menu-widgets.py
@@ -193,7 +195,15 @@ namespace TraceMenuArtStyle
 	static const TCHAR* const Chevron      = TEXT("/Game/Trace/UI/Art/T_MenuBack.T_MenuBack");
 	static const TCHAR* const ValueBox     = TEXT("/Game/Trace/UI/Art/T_MenuValueBox.T_MenuValueBox");
 
-	/** Imported and NOT yet placed: they belong to the settings screen, which is still Canvas. */
+	/**
+	 * Placed: the Canvas options pages draw the TRACK (TraceOptionsMenu.cpp).
+	 *
+	 * THE HANDLE IS NO LONGER DRAWN BY ANYTHING, and the path is kept as the artist's record rather
+	 * than deleted. T_MenuSliderHandle is the same 64x87 diagonal blade as T_MenuCursor with the rail
+	 * subtracted from under it, so on a page carrying both there were two identical blades and one of
+	 * them was the mouse pointer (UI QA finding 6b). The thumb is drawn as a vertical fader cap now;
+	 * see DrawSliderRow. A re-cut that produced a vertical thumb sprite would make this live again.
+	 */
 	static const TCHAR* const SliderTrack  = TEXT("/Game/Trace/UI/Art/T_MenuSliderTrack.T_MenuSliderTrack");
 	static const TCHAR* const SliderHandle = TEXT("/Game/Trace/UI/Art/T_MenuSliderHandle.T_MenuSliderHandle");
 
@@ -248,6 +258,10 @@ namespace TraceMenuArtStyle
 	 * value in it stops being what the sheet says, the file stops being worth reading. The selection
 	 * is carried by three signals besides the word anyway — the amber ring on T_MenuBtn_Hover, the
 	 * amber rail on the row's leading edge, and the plate's pulse — none of which changed.
+	 *
+	 * Shipped as WordHoverLifted() per the release art bible §2.5 — same hue, artist's own
+	 * transformation precedent (AmberLifted). This constant stays as the artist record it derives
+	 * from; nothing draws a word in it directly any more.
 	 */
 	static const FLinearColor WordHover = FLinearColor::FromSRGBColor(FColor(85, 107, 47));
 
@@ -288,6 +302,20 @@ namespace TraceMenuArtStyle
 	 */
 	TRACE_API FLinearColor AmberLifted();
 
+	/**
+	 * WordHover's HUE at full brightness: sRGB(85,107,47) -> sRGB(203,255,112), #CBFF70.
+	 *
+	 * The same stated transformation as AmberLifted, applied to the artist's other glow colour, for
+	 * the same reason and under the same rule — a TRANSFORMATION of the sheet's colour, not an
+	 * invented one, and it moves when WordHover does. The artist's hover green is a flat fill at
+	 * 2.34:1 against PlateFill (measured, see WordHover above): legible on their backlit sheet,
+	 * not on a screen. Byte-normalised it keeps the exact hue and clears the plate at 12.2:1.
+	 *
+	 * This is what the hovered/selected WORD is drawn in, on both renderers (release art bible
+	 * §2.5). WordHover itself stays untouched above — it is the artist record this derives from.
+	 */
+	TRACE_API FLinearColor WordHoverLifted();
+
 	// =============================================================================================
 	// 9-slice geometry, in SHEET pixels. Mirrored in Scripts/slice-ui-assets.py.
 	// =============================================================================================
@@ -312,8 +340,10 @@ namespace TraceMenuArtStyle
 		 * plate edge is soft over about ten sheet pixels, so the half-coverage contour — where the
 		 * silhouette visually is — sits a little inside the nominal edge.
 		 *
-		 * MEASURED off Content/Trace/UI/Art/Source/T_MenuBtn_Default.png (512 x 153, the imported
-		 * sprite), by taking the alpha's 0.5 crossing along the flat middle of each side and scaling by
+		 * MEASURED off Content/Trace/UI/Art/Source/T_MenuBtn_Default.png (at its original 512 x 153
+		 * cut; the sprite has since been re-cut to 256-wide — WP7 — which changes none of these
+		 * numbers, because they are stated in SHEET pixels and a resize is a uniform scale), by
+		 * taking the alpha's 0.5 crossing along the flat middle of each side and scaling by
 		 * the sheet/sprite ratio: left 122.7, right 122.0, top 122.6, bottom 122.9 sheet px. The same
 		 * pass recovers the plate as 4724.6 x 1230.8 sheet px, which is the 4723 x 1230 above to within
 		 * a fifth of a sprite pixel — so the two measurements agree and only this one is new.
@@ -329,7 +359,8 @@ namespace TraceMenuArtStyle
 		 * MEASURED, and it is a genuine circular arc rather than a squircle — which is worth knowing,
 		 * because a Slate rounded box can only draw circular corners and could not have followed a
 		 * superellipse at any radius. Fitting the 0.5-alpha contour of all four corners of
-		 * T_MenuBtn_Default.png gives 28.04 / 27.96 / 28.04 / 27.98 sprite px at an RMS residual of
+		 * T_MenuBtn_Default.png (its original 512-wide cut; sheet-pixel result unchanged by the WP7
+		 * re-cut) gives 28.04 / 27.96 / 28.04 / 27.98 sprite px at an RMS residual of
 		 * 0.05 px, and a free superellipse exponent lands on 2.00. 28.0 sprite px is 272.4 sheet px,
 		 * which is 0.2211 of the plate's height.
 		 *
@@ -414,21 +445,32 @@ namespace TraceMenuArtStyle
 	// THE WRONG STEP IS THAT SLATE DOES NOT SIZE A BOX BRUSH'S CORNERS FROM ImageSize. It sizes them
 	// from the TEXTURE'S OWN PIXEL SIZE (SlateCore's ElementBatcher.cpp, AddBoxElement:
 	// `LeftMarginX = TextureWidth * Margin.Left`). ImageSize decides the widget's DESIRED size and
-	// nothing else here. So the plate's 9-slice corners are drawn 44 x 44 LOCAL UNITS — 512 x 0.0860
-	// and 153 x 0.2880 — no matter how tall the row is or what DPI scale it is being drawn at.
+	// nothing else here. At the plate's original 512-wide cut the 9-slice corners were therefore
+	// drawn 44 x 44 LOCAL UNITS — 512 x 0.0860 and 153 x 0.2880 — no matter how tall the row was or
+	// what DPI scale it was drawn at.
 	//
-	// AND AT A 60-UNIT ROW THAT DOES NOT FIT. The plate image is RowHeight plus two glow insets tall,
-	// i.e. 72.5 local units, and the top and bottom slices want 44 each. Slate's own overlap guard
-	// then fires — `if (BottomMarginY < TopMarginY) { TopMarginY = LocalSize.Y / 2; ... }` — and
-	// squashes both slices to 36.24. Two things follow, and both are visible:
+	// AND AT A 60-UNIT ROW THAT DID NOT FIT. The plate image is RowHeight plus two glow insets tall,
+	// i.e. 72.5 local units, and the top and bottom slices wanted 44 each. Slate's own overlap guard
+	// then fired — `if (BottomMarginY < TopMarginY) { TopMarginY = LocalSize.Y / 2; ... }` — and
+	// squashed both slices to 36.24. Two things followed, and both were visible:
 	//
-	//   * the plate's edges move INWARD from the row rect: 6.92 local units on the left and right,
+	//   * the plate's edges moved INWARD from the row rect: 6.92 local units on the left and right,
 	//     4.60 on the top and bottom. That is the gap above;
-	//   * the artist's circular 28-px corner is drawn as an ELLIPSE, 28 wide by 23.03 tall, because
-	//     the vertical slice is compressed by 36.24/44.06 = 0.8226 and the horizontal one is not.
+	//   * the artist's circular 28-px corner drew as an ELLIPSE, 28 wide by 23.03 tall, because
+	//     the vertical slice was compressed by 36.24/44.06 = 0.8226 and the horizontal one was not.
 	//
-	// Neither number moves with the resolution — they are local units, and the DPI scale multiplies
-	// the row and the plate together — so this is one shape to follow, not one per screen.
+	// Neither number moved with the resolution — they are local units, and the DPI scale multiplies
+	// the row and the plate together — so it was one shape to follow, not one per screen.
+	//
+	// THE RE-CUT THIS BLOCK ASKED FOR HAS BEEN TAKEN (release UI plan WP7): the three T_MenuBtn_*
+	// sources are now cut 256 wide, the cap slice is 22 px, 22 + 22 fits the 72.5 available (and the
+	// KEY chip's 60), the overlap guard never fires and the corner ships circular. The arithmetic
+	// below is deliberately kept live rather than deleted — it reads the LIVE brush and texture, so
+	// it is what PROVES the squash is gone (Squash() == 1.0) and what would catch it coming back.
+	// Known trade, stated: at 4K (DPI 2) the 76 px-tall source upscales ~2x into a softer,
+	// glow-edged plate; the corner SHAPE wins over edge crispness. If a 4K capture ever reads badly,
+	// the recorded fallback is TWO sources (256 for rows, 512 kept for plates drawn >= 88 px tall) —
+	// not taken preemptively.
 	//
 	// THIS FUNCTION IS THAT ARITHMETIC, restated from Slate's own source so a stroke can be laid on
 	// the answer instead of on a guess. It is deliberately not a table of the numbers above: feed it
@@ -492,6 +534,14 @@ namespace TraceMenuArtStyle
 	// (0.180, 0.075), FTraceCharacterSelect had `64.f / 87.f` again with a DIFFERENT tip,
 	// (12/64, 6/87) = (0.1875, 0.0690). Two screens, two answers, for one picture — and a re-slice
 	// that changed the sprite would have moved neither.
+	//
+	// THE SECOND HALF OF THAT JOB WAS FINISHED BY THE UI QA PASS. Sharing the numbers left three
+	// separate DRAWS, and one of them (the Canvas title screen) was not drawing this sprite at all —
+	// it drew a nine-pixel cyan cross, so the same screen looked different on its two renderers.
+	// UI/TraceHardwareCursor.h now owns the pointer end to end: it reads the four constants below,
+	// loads the sprite once, decides the tint, and every Canvas surface calls its DrawPointer. The
+	// constants stay HERE because this file is where the sprite's geometry is measured; what moved is
+	// the drawing, not the measurement.
 	//
 	// §0's rule is that a value derived from a base must be expressed RELATIVE to that base so it
 	// follows when the base moves. Here the base is the sprite's own pixel size, so that is what is

@@ -216,6 +216,18 @@ public:
 	float GetActivatedCooldownRemaining() const;
 
 	/**
+	 * The V row's data, for the HUD (FX/AUDIO plan §7.2). Forwards to
+	 * UTraceCharacterAbilitySet::GetSecondaryCooldownDisplay(); false when this player has no
+	 * character, or when their character has no V cooldown to show.
+	 *
+	 * *** THE HUD ASKS THIS COMPONENT, NOT THE PAWN. *** The component lives on the PlayerState, so
+	 * this answer survives death — which is the same requirement spec v14 §5 put on the E row (a
+	 * cooldown that keeps running while you are dead has to keep being drawn while you are dead).
+	 * Routing the HUD through the pawn would have made the V row blink out on every respawn.
+	 */
+	bool GetSecondaryCooldownDisplay(float& OutRemaining, float& OutDuration, FString& OutLabel) const;
+
+	/**
 	 * HALF TIME. Spec §5: "They should all reset at halftime." Zeroes the activated cooldown, wipes
 	 * the per-character transient state and tells the character set to tear down its world actors.
 	 *
@@ -613,9 +625,19 @@ public:
 	/**
 	 * SPEC v18 §2. @p Actor's well-timed slide-jump planar multiplier, given the global one.
 	 *
-	 * Elle is the only character that changes it (+40% of the GAIN → 1.625 against everybody's
-	 * 1.446875). Everybody else — and every pawn with no component — gets @p InWellTimedBonus back
+	 * Elle is the only character that changes it (+30% of the GAIN → ×1.4875 against everybody's
+	 * ×1.375). Everybody else — and every pawn with no component — gets @p InWellTimedBonus back
 	 * unchanged, which is spec v18 §4's "Elle changes only her own" made structural.
+	 *
+	 * BOTH NUMBERS ARE RESTATED HERE ONLY AS A READING AID AND BOTH HAVE ALREADY GONE STALE ONCE:
+	 * this said "+40% → 1.625 against everybody's 1.446875", which was true against Elle's pre-Patch
+	 * 28 §3 bonus AND against a global that spec v28 §5 had already moved. The code derives both at
+	 * the point of use and always did. Today's chain, in full, so the next retune makes this visibly
+	 * rather than quietly wrong:
+	 *
+	 *     global   1 + (SlideJumpWindowSpeedBonus 1.3125 - 1) x SlideJumpBonusScale 1.50 = 1.46875
+	 *              then x SlideJumpMomentumScale 0.80 on the GAIN                        = 1.375
+	 *     Elle     1 + (1.375 - 1) x (1 + ElleSlideJumpGainBonus 0.30)                   = 1.4875
 	 */
 	static float GetSlideJumpWindowSpeedBonusFor(const AActor* Actor, float InWellTimedBonus);
 
@@ -630,6 +652,22 @@ public:
 	 * character exists to start one.
 	 */
 	void DebugSetActivatedCooldown(float Seconds);
+
+	/**
+	 * DEV ONLY. Runs the body of ClientActivateRejected exactly as its RPC delivery would.
+	 *
+	 * Exists for ONE caller: Trace.HUD.FxHudShots, which has to photograph the FX §7.1 REFUSED
+	 * toast. That toast's producer is the server telling an owning client "the activation you
+	 * predicted is refused" — an event that needs two processes and a disagreement between them to
+	 * occur naturally, and which therefore cannot be staged in the standalone world a capture rig
+	 * runs in.
+	 *
+	 * *** IT CALLS THE SHIPPED HANDLER, NOT A COPY OF IT. *** The alternative — the harness calling
+	 * ATraceHUD::ShowAbilityToast itself — would photograph a toast that proves only that
+	 * ShowAbilityToast draws, which is the self-certifying evidence this project refuses. Going
+	 * through the real handler means the capture also proves the handler raises it.
+	 */
+	void DebugSimulateActivateRejected();
 #endif
 
 	// =============================================================================================
@@ -717,6 +755,57 @@ protected:
 	/** The live ability set. Constructed on every machine from CharacterId; never replicated. */
 	UPROPERTY(Transient)
 	TObjectPtr<UTraceCharacterAbilitySet> AbilitySet = nullptr;
+
+	// =============================================================================================
+	// THE CLIENT FX ROUTER — FX_AUDIO_PLAN §1.1. Local presentation state, NOT replicated.
+	// =============================================================================================
+
+	/**
+	 * What this machine has ALREADY been shown. The diff against AbilityState is the edge.
+	 *
+	 * Deliberately not a UPROPERTY(Replicated) and deliberately per-machine: the server's copy tracks
+	 * what the server's own FX have been told, each client's copy tracks its own. A replicated
+	 * "presented" state would be one machine's presentation imposed on all of them.
+	 */
+	FTraceAbilityNetState PresentedState;
+
+	/**
+	 * False until this machine has seen a valid state at least once. The FIRST sight is a SYNC (attach
+	 * what is already on), every sight after it is an EDGE (react to what changed).
+	 *
+	 * Cleared in OnRep_CharacterId, because a character swap makes the previous character's state
+	 * meaningless as a diff baseline: the new set must be told "here is the world", not "here is what
+	 * changed since somebody else's ability".
+	 */
+	bool bPresentedStateValid = false;
+
+public:
+	/**
+	 * FX_AUDIO_PLAN §1.1 — the one place the two router virtuals are called from.
+	 *
+	 * Diffs AbilityState against PresentedState and dispatches: no set yet -> nothing (and the next
+	 * sight becomes a SYNC); first valid sight -> SyncClientFx; a real change -> OnClientStateEdge.
+	 * A resend that changes nothing does nothing, which is what makes this safe to call from a tick.
+	 *
+	 * THREE CALLERS, and all three are needed:
+	 *   - OnRep_AbilityState        every machine that is NOT the authority, the moment it changes;
+	 *   - TickComponent (authority) because a listen host never gets an OnRep for the pawns it owns
+	 *                               — at 20 Hz, so the host's own FX lag by at most 50 ms;
+	 *   - RebuildAbilitySet         so a set built AFTER the state arrived (join in progress, swap)
+	 *                               gets its SYNC instead of waiting for the next change.
+	 *
+	 * Public because the dev harnesses drive it directly (Trace.Fx.SyncTest); gameplay code should
+	 * never need to.
+	 */
+	void RouteNetStateEdges();
+
+#if !UE_BUILD_SHIPPING
+	/** DEV ONLY. Forces the next RouteNetStateEdges() to be a first sight — Trace.Fx.SyncTest's seam. */
+	void DebugForgetPresentedState() { bPresentedStateValid = false; }
+
+	/** DEV ONLY. What this machine has been shown, for the router harness's before/after compare. */
+	const FTraceAbilityNetState& DebugGetPresentedState() const { return PresentedState; }
+#endif
 
 private:
 	/**

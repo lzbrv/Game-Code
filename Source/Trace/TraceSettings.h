@@ -2041,20 +2041,34 @@ public:
 	 *
 	 * WHAT "THE BOOST" IS. The slide-jump multiplies your planar speed by
 	 *
-	 *     SlideJumpHorizontalRetention (1.0)  x  the well-timed bonus (1.446875)
+	 *     SlideJumpHorizontalRetention (1.0)  x  the well-timed bonus (1.46875)
 	 *
 	 * and only the part ABOVE 1.0 is a boost — 1.0 is pure preservation, which is what escaping
 	 * ground friction is worth and is not something the note asks to cut. So the 20% comes off the
 	 * GAIN, which is the same reading bSlideJumpBonusScalesGainOnly already ships for v9 §7:
 	 *
-	 *     1 + (1.446875 - 1) x 0.80 = 1.3575
+	 *     1 + (1.46875 - 1) x 0.80 = 1.375
+	 *
+	 * *** THE TWO NUMBERS ABOVE WERE 1.446875 AND 1.3575 UNTIL THIS PASS, AND BOTH WERE STALE. ***
+	 * They were correct against SlideJumpBonusScale 1.43; spec v28 §5 raised it to 1.50 and nothing
+	 * re-derived the worked example here, so this comment claimed a shipped multiplier the game had
+	 * not used for two passes. The derivation is written out in full rather than restated as a pair
+	 * of results, so the next retune of SlideJumpWindowSpeedBonus (1.3125) or SlideJumpBonusScale
+	 * (1.50) makes the arithmetic visibly wrong instead of quietly wrong:
+	 *
+	 *     1 + (1.3125 - 1) x 1.50  = 1.46875     v8 §8 base, x v9 §7's scale on the GAIN
+	 *     1 + (1.46875 - 1) x 0.80 = 1.375       then v26 §3a's -20%, also on the GAIN
+	 *
+	 * 1.375000 is what the movement audit measures at the SLIDE-JUMP (windowed) row, and it is the
+	 * number Elle's passive scales.
 	 *
 	 * A MISTIMED SLIDE-JUMP IS UNCHANGED, and that follows rather than being a carve-out: at
 	 * retention 1.0 it has no gain, so 80% of nothing is nothing. The 20% is paid entirely by the
 	 * well-timed hop, which is the only place the slide-jump manufactures speed at all.
 	 *
 	 * Applied by UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus(), BEFORE the
-	 * character seam — so Elle's +40% passive scales the reduced gain rather than fighting it.
+	 * character seam — so Elle's passive (+30% as of Patch 28 §3) scales the reduced gain rather than
+	 * fighting it.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Momentum Boost Scale (v26 §3, x the GAIN)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.5", UIMax = "1.5"))
 	float SlideJumpMomentumScale = 0.80f;
@@ -2352,6 +2366,162 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Wall Jump", meta = (DisplayName = "Jump Input Buffer (s) [v10 §5]", ClampMin = "0.0", ClampMax = "0.5", UIMin = "0.0", UIMax = "0.3"))
 	float WallJumpInputBufferSeconds = 0.12f;
+
+	// ==========================================================================================
+	// MOVEMENT — SURF  (Patch 28 §5, new)
+	//
+	// "Players should be able to accelerate using curved ramps, in accordance with source movement
+	// standards (kind of like surfing in CS:GO)."
+	//
+	// WHY THESE FIVE EXIST AS A LATER EDIT THAN THE MECHANIC THEY TUNE, stated plainly because it is
+	// the failure this page has shipped more than any other. The surf pass could not put its
+	// UPROPERTYs here — this file was not on its ownership line — so the whole feature went out
+	// name-bound against properties that did not exist, and the movement component's own report said
+	// so out loud on every run:
+	//
+	//     MOVEKNOB summary: 27 bound, 5 on built-in defaults
+	//
+	// The game PLAYED correctly the entire time (every accessor falls back to the shipped literal),
+	// but no ini line and no Project Settings slider could reach any part of the newest movement
+	// mechanic in the kit. These five properties are what closes that, and the summary line above is
+	// the acceptance test for them: it must read 32 bound, 0 on built-in defaults.
+	//
+	// ALL FIVE ARE RESOLVED BY NAME by UTraceCharacterMovementComponent (TraceMoveKnob), exactly like
+	// the wall-jump block above, so the spellings below are load-bearing — a rename here silently
+	// reverts surf to the component's own literals rather than failing to compile. BeginPlay prints
+	// BOUND or FALLBACK for each one every run, MOVECFG-P28 prints the resolved band and ceiling next
+	// to the numbers they derive from, and Trace.VerifyKnobs lists all five in its table.
+	//
+	// EVERY ACCESSOR CLAMPS ON READ, so nothing in this block can break the movement model. The
+	// clamps are stated on each knob and are the component's, not this page's: the ClampMin/ClampMax
+	// meta below only bounds the Project Settings spinner, and an ini file edited by hand does not go
+	// near it. The one that matters most is SurfMinNormalZ, which is clamped strictly BELOW the live
+	// walkable limit — so no value typed here can turn a floor into a surf plane.
+	// ==========================================================================================
+
+	/**
+	 * Master switch for surf. Off restores the pre-Patch-28 air game exactly: ComputeSlideVector,
+	 * LimitAirControl and CanStepUp all defer to the engine on every surface, and a steep ramp goes
+	 * back to being the scrape UE ships.
+	 *
+	 * It exists for the reason bWallJumpEnabled does, and rather more urgently: surf is a brand-new
+	 * traversal verb in an arena that was laid out, timed and bot-tested without it, and "is the surf
+	 * making this map worse" has to be answerable with one ini edit rather than a rebuild.
+	 *
+	 * NOTE FOR ANYONE TESTING THIS ON THE SHIPPED MAP. ServerDefaultMap is /Game/Maps/Arena_Baked,
+	 * and the four surf rails are built by ATraceArenaBuilder::BuildSurfRails(), which a baked level
+	 * skips. Until somebody bakes again there is nothing in the DEFAULT map to ride, so turning this
+	 * off there changes nothing you can see — launch /Game/Maps/Arena to A/B the mechanic.
+	 *
+	 * Bound BY NAME as "bSurfEnabled".
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Surf", meta = (DisplayName = "Surf Enabled [Patch 28 §5]"))
+	bool bSurfEnabled = true;
+
+	/**
+	 * FLOOR OF THE SURF BAND, as a surface normal Z. A face is surfable when
+	 *
+	 *     this  <  Normal.Z  <  GetWalkableFloorZ()
+	 *
+	 * i.e. 0.45 .. 0.710 at the shipped walkable limit, which is slopes of 44.765° .. 63.256°.
+	 *
+	 * *** ONLY THE LOWER BOUND IS A KNOB, AND THAT IS THE POINT. *** The upper bound is
+	 * GetWalkableFloorZ() read LIVE — the same number the engine uses to decide the pawn is standing
+	 * — so a walkable face can never be surfed by construction rather than by agreement, and retuning
+	 * the walkable limit moves the surf band with it. There is no second literal to forget.
+	 *
+	 * IT IS DELIBERATELY ABOVE GetWallJumpMaxNormalZ() (0.40). A face is a wall, a surf plane or a
+	 * floor and never two at once, which matters because the wall jump WANTS the engine's
+	 * HandleSlopeBoosting left on (it is what stops a player climbing a corner) and surf needs it
+	 * off. Lowering this into the wall band is the one edit on this page that could make the two
+	 * mechanics argue; the component's clamp does not stop it, because 0.05 is a legitimate value for
+	 * a build that has retuned the wall jump too.
+	 *
+	 * THE ARENA'S RAILS ARE CUT FROM THIS NUMBER, not typed: BuildSurfRails() asks
+	 * GetSurfSlopeBandDegrees() what the build will surf and cuts its five facets inside the answer
+	 * with a 2° margin. Retune this and the ramps re-cut themselves on the next build of the
+	 * procedural map — a builder that had typed "46 to 61 degrees" would be one retune away from
+	 * shipping a ramp nobody can surf, with nothing to say so.
+	 *
+	 * Bound BY NAME as "SurfMinNormalZ", clamped in the component to 0.05 .. (WalkableFloorZ - 0.01),
+	 * so a bad value can only ever make the band NARROWER.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Surf", meta = (DisplayName = "Surf Band FLOOR (surface normal Z; the ceiling is the live walkable limit) [Patch 28 §5]", ClampMin = "0.05", ClampMax = "0.9", UIMin = "0.3", UIMax = "0.7"))
+	float SurfMinNormalZ = 0.45f;
+
+	/**
+	 * Source's PM_ClipVelocity overbounce, applied when velocity is clipped against a surf plane:
+	 *
+	 *     v' = v - n * (v·n) * this
+	 *
+	 * 1.0 is Source's own player value and makes the clip a PURE PLANE PROJECTION — the pawn is
+	 * neither pushed off the ramp nor allowed to sink into it, which is exactly the behaviour that
+	 * lets gravity's along-plane component do all the work and the normal force do none.
+	 *
+	 * Above 1 the ramp bounces the player off it (Source uses 1.001 for world brushes to keep solvers
+	 * out of surfaces, and much more than that is a trampoline); below 1 the pawn sinks in and the
+	 * next sweep has to dig it out, which reads as a ramp made of glue. Neither is a tuning direction
+	 * anybody wants — this knob exists so the Source constant is visible and adjustable, not because
+	 * it is expected to move.
+	 *
+	 * Bound BY NAME as "SurfOverbounce", clamped in the component to 0.9 .. 1.2.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Surf", meta = (DisplayName = "Surf Overbounce (1.0 = Source's pure plane projection) [Patch 28 §5]", ClampMin = "0.9", ClampMax = "1.2", UIMin = "0.95", UIMax = "1.05"))
+	float SurfOverbounce = 1.0f;
+
+	/**
+	 * How long "I am surfing" survives after the last contact with a surf plane, in seconds.
+	 *
+	 * IT IS A JOINT-CROSSER, NOT A COYOTE TIME. A curved rail is a FAN OF FLAT FACETS, and a pawn
+	 * crossing from one facet to the next genuinely leaves the surface for a frame or two. Without a
+	 * grace the surf state would flicker off and on at every joint — and the speed ceiling, which
+	 * hangs off IsSurfing(), would flicker with it, so a rider would be capped and uncapped several
+	 * times per ride.
+	 *
+	 * 0.10 s is about six frames at 60 Hz: long enough to bridge a facet joint, far short of the time
+	 * it takes to fall clear of a ramp, and therefore not long enough to be a mechanic of its own.
+	 * Raising it materially would start granting the surf ceiling to players who have already left
+	 * the ramp.
+	 *
+	 * PREDICTED STATE, not a local timer: the remaining grace is one of the five surf fields carried
+	 * in the saved move. It has to be — a replayed frame that lost it runs UNCAPPED where the server
+	 * capped.
+	 *
+	 * Bound BY NAME as "SurfContactGraceSeconds", clamped in the component to 0 .. 0.5.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Surf", meta = (DisplayName = "Surf Contact Grace (s, bridges a facet joint) [Patch 28 §5]", ClampMin = "0.0", ClampMax = "0.5", UIMin = "0.0", UIMax = "0.25"))
+	float SurfContactGraceSeconds = 0.10f;
+
+	/**
+	 * The surf speed ceiling, as a MULTIPLE of the air-strafe hard cap:
+	 *
+	 *     GetSurfSpeedCeiling() = max(entry speed, GetAirStrafeHardCapSpeed() x this)
+	 *
+	 * At the shipped 1375 uu/s hard cap that is 1719 uu/s with a gun, and 2160 uu/s with a knife out
+	 * (GetAirStrafeHardCapSpeed() already folds in KnifeAirStrafeHardCapMultiplier, so a knife surfer
+	 * gets the same bonus the rest of their kit gets, automatically).
+	 *
+	 * *** IT IS A MULTIPLIER AND NOT A SPEED, WHICH IS THE PROJECT'S DEMO 21 RULE. *** Retune the air
+	 * ceiling and the surf ceiling moves with it; there is no second uu/s number on this page that
+	 * can be left behind. That was proved live rather than asserted — forcing the air hard cap down
+	 * to 1100 in an ini override moved the measured surf peaks with it, with no edit here.
+	 *
+	 * THERE HAS TO BE A CEILING AT ALL because gravity along the plane is a CONSTANT acceleration
+	 * that the clip never removes: integrated on the steepest shipped facet with no friction, an
+	 * unclamped surfer passes 29,000 uu/s in 30 s and is still gaining ~980 uu/s every second. A ramp
+	 * long enough would grow the vector without limit, so "fastest thing in the kit" has to be a
+	 * number rather than an asymptote.
+	 *
+	 * THE ENTRY SPEED IS THE FLOOR, exactly like every other ceiling in the movement component: a
+	 * player who arrives on a rail above the cap (out of a dash, or off a slide-jump chain) keeps
+	 * every unit of what they brought. The ceiling only ever refuses to let the RAMP make more.
+	 * Clamped at the BOTTOM to 1 for that reason — a value under 1 would make a surf plane a speed
+	 * PENALTY for a fast entry, which inverts the mechanic silently rather than loudly.
+	 *
+	 * Bound BY NAME as "SurfSpeedCeilingMultiplier", clamped in the component to 1 .. 3.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Surf", meta = (DisplayName = "Surf Speed Ceiling (x the air-strafe HARD cap; entry speed is the floor) [Patch 28 §5]", ClampMin = "1.0", ClampMax = "3.0", UIMin = "1.0", UIMax = "2.0"))
+	float SurfSpeedCeilingMultiplier = 1.25f;
 
 	// ==========================================================================================
 	// KNIFE MOVEMENT  (spec v10 §1)
@@ -2741,16 +2911,39 @@ public:
 	 * Verbatim: "The carrier should be able to throw the core forward by left clicking."
 	 * Fast enough to be a pass across a lane, slow enough that the "first player to contact the core
 	 * picks it up" rule has something to work with — a Core that crosses the field in half a second
-	 * cannot be intercepted by anyone, which deletes the whole point of mode B. 3000 covers ~3000uu
-	 * in the first second before gravity, roughly a dash's worth of reach per second.
+	 * cannot be intercepted by anyone, which deletes the whole point of mode B.
 	 *
-	 * THIS IS THE BASE, BEFORE WEIGHT, AND IT DELIBERATELY DID NOT MOVE THIS PASS. Spec v5 §4's
-	 * "increase the weight of the core" is CoreMassScale below, which divides this by sqrt(M) at the
-	 * point of use. Lowering this as well would apply the weight twice and the panel would no longer
-	 * describe the throw anybody is playing.
+	 * *** PATCH 28 ITEM 4: 3300 -> 2900. *** Verbatim: "Reduce core throw speed max to 2900uu/s,
+	 * adjusting Mortimer accordingly." THE "ADJUSTING MORTIMER ACCORDINGLY" HALF IS ALREADY DONE BY
+	 * ARITHMETIC AND ALWAYS WAS — this is the one case where the project's own rule paid out.
+	 * Mortimer's passive (MortimerThrowChargeHoldScale 2.0, MortimerThrowChargePastFullScale 0.6)
+	 * is a pair of scalars on ATraceCore::GetThrowChargeScaleForHold's shared curve; it produces a
+	 * POWER, and the launch is Direction x CoreThrowSpeed x Power / sqrt(CoreMassScale). He holds no
+	 * uu/s of his own anywhere in the tree, so moving this line moves him with it. Verified by
+	 * Trace.Mortimer.ThrowTest, which throws four real Cores and measures them.
+	 *
+	 * THIS IS THE BASE, BEFORE WEIGHT. Spec v5 §4's "increase the weight of the core" is
+	 * CoreMassScale below, which divides this by sqrt(M) at the point of use — it is NOT re-applied
+	 * here, so this line is still the pre-weight number the panel says it is.
+	 *
+	 * *** WHAT PATCH 28's 2900 ACTUALLY SHIPS, at CoreMassScale 1.8 (sqrt = 1.341641),
+	 * CoreThrowChargeFloorFraction 0.15, CoreThrowGravityScale 0.55 and world gravity -980: ***
+	 *
+	 *     full charge, anybody      2900 / 1.341641           = 2161.5 uu/s   (was 2459.7)
+	 *     an instant click (x0.15)                            =  324.2 uu/s   (was  369.0)
+	 *     full EXTENDED charge, MORTIMER ONLY (Power x1.51)   = 3263.9 uu/s   (was 3714.1)
+	 *
+	 * and, flat, from a standing thrower (up bias 0.12 x 1.8^1.5 = 0.289794, gravity x 1.8 x 0.55 =
+	 * -970.2 uu/s^2, so range = 2 x v^2 x bias / g):
+	 *
+	 *     full charge, anybody      3614 uu -> 2791 uu        (x0.772 = (2900/3300)^2)
+	 *     full charge, MORTIMER     8241 uu -> 6364 uu        (x2.2801 = 1.51^2 of the above, both)
+	 *
+	 * Range goes as the SQUARE of the speed, so a 12.1% speed cut is a 22.8% range cut. That is the
+	 * number to quote if anybody asks whether "2900" felt bigger than it reads.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Speed (uu/s, before weight) [mode B]", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "500.0", UIMax = "8000.0"))
-	float CoreThrowSpeed = 3300.f;
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Speed (uu/s, before weight) [mode B; Patch 28 §4: 3300 -> 2900]", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "500.0", UIMax = "8000.0"))
+	float CoreThrowSpeed = 2900.f;
 
 	/**
 	 * Fraction of the throw speed added as upward velocity, so a throw arcs instead of running flat
@@ -2787,7 +2980,8 @@ public:
 	 *
 	 * 0 replays the pre-v8 throw exactly, which is the A/B to reach for if this proves too strong.
 	 * 0.6 is the middle setting that keeps a jumping throw feeling like a jumping throw while cutting
-	 * the dash-throw tail case (dash 3300 + impulse ~= 5600 uu/s) by 40%.
+	 * the dash-throw tail case (dash 3300 + impulse ~= 5460 uu/s after Patch 28 §4; it was ~5760 at
+	 * the old 3300 base) by 40%.
 	 *
 	 * NAME IS LOAD-BEARING: ATraceCore resolves this by reflection under exactly this spelling, and
 	 * says so at runtime — the mode-B binding check prints "NO UTraceSettings PROPERTY FOUND FOR:"
@@ -2795,6 +2989,23 @@ public:
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Velocity Inheritance (fraction) [mode B]", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "1.0"))
 	float CoreThrowVelocityInheritance = 1.0f;
+
+	/**
+	 * Spec v31 §2. Multiplier applied to CoreThrowVelocityInheritance for the DOWNWARD part of the
+	 * thrower's velocity only. 0 (default): a player who throws while falling no longer has the fall
+	 * subtracted from the launch — the Core leaves with the same Z a standing throw gives it, and
+	 * still carries the whole horizontal motion. 1: the pre-v31 behaviour ("the core just drops").
+	 * Rising velocity is never touched — spec v8 §4's jumping throw still carries the jump in full.
+	 *
+	 * Declared here in the release-hygiene pass so the knob is a real settings slider; the default
+	 * matches the Trace.ModeB.ThrowVelocityInheritanceDown console default it previously lived under,
+	 * so shipped behaviour is identical.
+	 *
+	 * NAME IS LOAD-BEARING: ATraceCore resolves this by reflection under exactly this spelling, same
+	 * as CoreThrowVelocityInheritance above.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Velocity Inheritance, Downward Multiplier [mode B]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+	float CoreThrowVelocityInheritanceDown = 0.0f;
 
 	// ------------------------------------------------------------------------------------------
 	// THE CHARGE-UP THROW (spec v13 §6, new). Four knobs, and the spec asked for all four by name.
@@ -2902,8 +3113,9 @@ public:
 	 * CoreThrowSpeed, and the linear rule above is simply extrapolated.
 	 *
 	 * RAISING THIS RE-TUNES MODE B, not just the throw: CoreThrowGravityScale, the goal distance and
-	 * the 450 uu catch radius were all tuned against a 3000 uu/s ceiling. Treat it as an experiment
-	 * knob, not a difficulty dial.
+	 * the 450 uu catch radius were all tuned against a base throw ceiling that has since moved twice
+	 * (3000, then 3300, and 2900 as of Patch 28 §4). Treat it as an experiment knob, not a difficulty
+	 * dial.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Charge Max (x full, clamp off) [v13 §6]", ClampMin = "1.0", ClampMax = "4.0", UIMin = "1.0", UIMax = "2.0"))
 	float CoreThrowChargeMaxFraction = 1.0f;
@@ -2975,8 +3187,10 @@ public:
 	 *     bounce         / M          heavy things thud instead of skittering to midfield
 	 *     rest speed     x M          and they settle sooner
 	 *
-	 * At 1.8 against the base knobs above, a flat throw measures: launch 3000 -> 2236 uu/s, gravity
-	 * 539 -> 970 uu/s^2, flat range ~5000 -> ~3400 uu, apex ~120 -> ~215 uu.
+	 * At 1.8, a flat throw measures — AT THE 3000 BASE THIS WAS TUNED AGAINST, which is the honest
+	 * frame for a WEIGHT comparison: launch 3000 -> 2236 uu/s, gravity 539 -> 970 uu/s^2, flat range
+	 * ~5000 -> ~3400 uu, apex ~120 -> ~215 uu. The base is 2900 as of Patch 28 §4, where the same
+	 * M = 1.8 gives launch 2161.5 uu/s and flat range ~2791 uu; gravity and apex do not depend on it.
 	 *
 	 * INERT IN MODE A, which has no thrown Core at all. NAME IS LOAD-BEARING: ATraceCore resolves it
 	 * BY NAME as "CoreMassScale". Sane range 1.2 to 2.5; 1.0 restores the pre-v5 flight exactly,
@@ -4536,13 +4750,50 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Ring Radius (uu)", ClampMin = "10.0", ClampMax = "500.0", UIMin = "50.0", UIMax = "200.0"))
 	float RoccoRippleRingRadiusUU = 90.f;
 
-	/** §6: "the starting ring in a different colour so it is obvious where to take it." */
+	/**
+	 * §6: "the starting ring in a different colour so it is obvious where to take it."
+	 *
+	 * ROCCO'S ACCENT — acid gold #E7FF89 — and the reason it is HIS and not a generic "entrance"
+	 * colour is bible §6.2 invariant 2: an ability's world actor wears its owner's accent. The bible
+	 * blesses this exact split in as many words ("rings neutral-pale with amber start ring is
+	 * acceptable — the start ring must remain 'a different color', Demo.13"), so the entrance says
+	 * both "Rocco laid this" and "get on here".
+	 *
+	 * *** THIS IS A COPY OF THE ACCENT, AND IT IS THE ONE KIND OF COPY THAT IS ALLOWED. ***
+	 * THE SOURCE OF TRUTH IS TraceCharacterRoster::All()[Rocco].Accent (Core/TraceCharacterRoster.cpp
+	 * — which is also what generates DA_Character_Rocco and stamps MI_Body_Rocco_Accent). It is
+	 * duplicated here ONLY because a UPROPERTY(config) default cannot be a function call and because
+	 * this is a DESIGNER KNOB: the point of the property is that somebody can set the start ring to
+	 * something that is not Rocco's accent. Every OTHER copy of an accent in the FX code has been
+	 * deleted in favour of a live read (ATraceFxBurst::HueFor, ATraceMaceSpike, ATraceElleGate,
+	 * Lily's flight, the Slimewall dressing) precisely because those had no such excuse.
+	 *
+	 * *** IF THE ACCENT IS RE-TUNED, THIS LINE AND ITS Config/DefaultGame.ini OVERRIDE MOVE BY HAND.
+	 *     THEY DID NOT, ONCE, AND THAT IS WHY THIS PARAGRAPH EXISTS. *** The v25 re-space rotated all
+	 * ten accents off the two team hues (Rocco #FFEF89 -> #E7FF89, amber -> acid gold, +20.3 deg) and
+	 * this default and the ini line kept the old amber, so the ripple a player stepped onto was a
+	 * different colour from the Rocco who laid it. Trace.VerifyCharacterData does not cover this
+	 * pair; a grep for the accent literal is what catches it.
+	 *
+	 * *** A PLAIN 0..1 HUE, AND IT MUST STAY ONE. *** ATraceRippleActor pushes this into M_TraceNeon,
+	 * whose emissive is Color x Glow, and a material instance clamps vector parameters to [0,1] —
+	 * brightness put in here would not brighten the ring, it would silently rewrite its hue. The
+	 * brightness knob is the ring's Glow (bible §3.2 tier T2, 3.5), which lives in the actor. The new
+	 * accent's brightest channel is 1.00, exactly as the old one's was, so no glow moved with it.
+	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple START Ring Colour [v14 §6]"))
-	FLinearColor RoccoRippleStartRingColor = FLinearColor(1.f, 0.55f, 0.1f, 1.f);
+	FLinearColor RoccoRippleStartRingColor = FLinearColor(0.80f, 1.00f, 0.25f, 1.f);
 
-	/** Every ring after the first. */
+	/**
+	 * Every ring after the first. NeonNeutralPale #8CEBFF — the arena's own neutral neon, so the path
+	 * reads as a piece of the world that has been switched on rather than as a second coloured thing
+	 * competing with the entrance. One hue per effect (bible §6.2): the amber IS the effect's colour
+	 * and the trail is deliberately the neutral it is measured against.
+	 *
+	 * Same 0..1 rule as the start ring above.
+	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Rocco", meta = (DisplayName = "Ripple Trail Ring Colour"))
-	FLinearColor RoccoRippleTrailRingColor = FLinearColor(0.2f, 0.75f, 1.f, 1.f);
+	FLinearColor RoccoRippleTrailRingColor = FLinearColor(0.55f, 0.92f, 1.f, 1.f);
 
 	// ------------------------------------------------------------------------------------------
 	// CHUT — spec §6
@@ -4559,9 +4810,14 @@ public:
 	float ChutKnifeFrontDamage = 50.f;
 
 	/**
-	 * Chut's back-stab damage. §6 [ASSUMPTION]: "back damage stays 100." Present as a knob rather
-	 * than left implicit so that the assumption is visible and reversible in one place — and so
-	 * nobody has to work out whether Chut inherits the standard value or overrides it.
+	 * Chut's back-stab damage. §6: "back damage stays the standard number."
+	 *
+	 * *** NO READER SINCE 2026-08-24 (RESTRUCTURE C6). *** UTraceAbilitySetChut::ModifyOutgoingDamage
+	 * now PASSES THE BASE NUMBER THROUGH for a back-stab instead of returning this copy of it, so
+	 * that retuning the standard back-stab (UTraceMeleeSettings::BackstabDamage) carries Chut with it
+	 * — which is what "stays the standard" means. Retained rather than deleted for config
+	 * compatibility: an existing DefaultGame.ini or a user ini may still set it, and removing a
+	 * UPROPERTY this close to release churns ini handling for no gain. Setting it now does nothing.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Chut", meta = (DisplayName = "Knife Back Damage [v14 §6 ASSUMPTION: unchanged at 100]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "50.0", UIMax = "200.0"))
 	float ChutKnifeBackDamage = 100.f;
@@ -5008,17 +5264,26 @@ public:
 	/**
 	 * §2: "The rocket deals 100 damage on impact, ANYWHERE ON THE BODY - no headshot/body distinction."
 	 *
+	 * *** DEMO 29 §7 MAKES THIS THE DIRECT-IMPACT NUMBER, NOT THE ONLY NUMBER. *** Verbatim: "it should
+	 * only do 100 damage for direct impacts. Otherwise, the damage should fall off." A DIRECT IMPACT is
+	 * the projectile actually hitting the pawn — the flight sweep found their capsule within
+	 * RoxieRocketHitRadiusUU of the path — and that case still deals this, flat, with no hit zone.
+	 * Everybody else the detonation catches takes RoxieRocketSplashMaxFraction of this at the impact
+	 * point, falling to zero at the edge of the blast. So this knob is now the CEILING of the whole
+	 * ability, and TraceRoxieRocket clamps every damage request to it.
+	 *
 	 * *** THE SINGLE MOST DANGEROUS NUMBER IN THIS FILE. *** 100 is a full health bar, it ignores hit
 	 * zones, and the game's founding invariant is that NO ABILITY MAY DAMAGE A CORE CARRIER. It must
 	 * be dealt through UTraceCharacterAbilitySet::DealDamage, which routes to
 	 * UTraceAbilityComponent::CanAffectTarget — never by reaching for UTraceHealthComponent, and
-	 * never behind a carrier test written in Roxie's own file.
+	 * never behind a carrier test written in Roxie's own file. That is true of the falloff too: the
+	 * blast loop computes an amount and then asks the same one function whether it may land.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Damage [v18 §2: flat 100, no hit zones. DAMAGE - never a carrier]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "20.0", UIMax = "200.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Damage [v18 §2 / Demo 29 §7: 100 for a DIRECT IMPACT, the ceiling for everything else. DAMAGE - never a carrier]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "20.0", UIMax = "200.0"))
 	float RoxieRocketDamage = 100.f;
 
 	/**
-	 * How fast the rocket flies. DELIBERATELY WELL UNDER a thrown Core (3300) and nowhere near
+	 * How fast the rocket flies. DELIBERATELY WELL UNDER a thrown Core (2900 base, Patch 28 §4) and nowhere near
 	 * hitscan: §2 wants something "deliberately inaccurate and hard to aim", and a projectile that
 	 * arrives instantly cannot be either. 2600 uu/s is roughly a second to cross the gap between two
 	 * midfield cover blocks.
@@ -5031,12 +5296,68 @@ public:
 	float RoxieRocketLifetimeSeconds = 3.f;
 
 	/**
-	 * The rocket's OWN touch radius, on top of the victim's capsule — the same idea as XBeeHitRadiusUU.
-	 * IT IS NOT A SPLASH RADIUS. §2 says "on impact", once, for 100; an area-of-effect rocket would be
-	 * a different and much stronger ability than the doc describes.
+	 * *** THE ONE RADIUS. DEMO 29 §7: "Make Roxie's rocket hit radius match the model." 45 -> 72. ***
+	 *
+	 * This single number is now everything the rocket is wide by, and it is ONE number precisely so
+	 * that no two of them can be edited apart again:
+	 *
+	 *   the TOUCH radius   how close the flight path must come to a pawn's capsule to be a DIRECT
+	 *                      IMPACT and deal the full RoxieRocketDamage;
+	 *   the DRAWN body     TraceRoxieRocket::GetVisualRadiusUU() returns this unchanged, so the model
+	 *                      a player watches IS the projectile that hits them;
+	 *   the WORLD sweep    the sphere that stops the rocket on geometry, so the drawn nose and the
+	 *                      thing that touches the wall are the same size;
+	 *   the BLAST radius   how far the Demo 29 falloff reaches from the detonation point, which is also
+	 *                      exactly the radius ATraceFxBurst draws the RocketBurst at (it reads this
+	 *                      same knob live). The explosion you see is the explosion that hurts.
+	 *
+	 * *** WHY 72 AND NOT 45, AND WHY THIS IS THE OWNER OVERRULING A PASSED CHECK. *** Patch 28 asked
+	 * for a larger rocket and got it the cheap way: a x1.6 multiplier on the DRAWN side only. That left
+	 * a 72 uu model around a 45 uu projectile, and the pass defended it at length — the rocket kills a
+	 * pawn whose 34 uu capsule comes within 45 uu of the line, so the model at 72 was still inside the
+	 * 79 uu volume a player actually dies in, and Trace.Roxie.RocketFlightTest asserted exactly that
+	 * and PASSED. The owner then played it and said the hit radius did not match the model. They are
+	 * right and the check was answering a different question: "does the skin over-claim" is not "do
+	 * these two numbers match". The model was the number the owner had chosen and liked, so the model
+	 * won — 72 uu — and RoxieRocketVisualScale below has no reader any more.
+	 *
+	 * WHAT THAT COSTS. The volume a player dies in goes from 45+34 = 79 uu to 72+34 = 106 uu about the
+	 * flight line, so the rocket IS easier to land than it was in Demo 28. That is the trade Demo 29
+	 * asked for in the same sentence: it is easier to touch somebody, and only a real hit still does
+	 * 100. Trace.Roxie.RocketFlightTest re-checks that a running player still clears the wider lethal
+	 * cross-section inside the rocket's time of flight, i.e. that it is still dodgeable.
+	 *
+	 * Raising it makes the model, the hit, the wall sweep and the blast all bigger together, which is
+	 * the only honest meaning "make the rocket bigger" can have.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Hit Radius (uu, NOT splash)", ClampMin = "1.0", ClampMax = "300.0", UIMin = "10.0", UIMax = "120.0"))
-	float RoxieRocketHitRadiusUU = 45.f;
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Radius (uu) - THE ONE RADIUS: touch, drawn model, wall sweep and blast [Demo 29 §7: 45 -> 72]", ClampMin = "1.0", ClampMax = "300.0", UIMin = "10.0", UIMax = "120.0"))
+	float RoxieRocketHitRadiusUU = 72.f;
+
+	/**
+	 * DEMO 29 §7's FALLOFF, verbatim: "Otherwise, the damage should fall off."
+	 *
+	 * The fraction of RoxieRocketDamage a pawn takes standing exactly ON the detonation point — the
+	 * best possible near miss. It falls from there to ZERO at RoxieRocketHitRadiusUU, on a smoothstep,
+	 * measured from the impact point to the victim's CAPSULE SURFACE.
+	 *
+	 * 0.5 reads as "a direct hit kills you; the best near miss does exactly half", which is a sentence
+	 * a player can learn from being hit twice. At the shipped numbers that is 50 at the impact point,
+	 * 42.2 a quarter of the way out, 25.0 halfway, 7.8 at three quarters and 0.0 at the edge of the
+	 * drawn burst.
+	 *
+	 * *** THE CLAMP STOPS AT 0.95 AND THAT CEILING IS THE FEATURE, NOT A SAFETY MARGIN. *** Item 7 is
+	 * "only 100 damage for direct impacts"; a splash that could reach 1.0 would let a near miss equal a
+	 * hit and delete the distinction the owner asked for. Setting this to 0 turns the falloff off
+	 * entirely and restores Demo 28's behaviour, where a rocket landing at your feet did nothing at
+	 * all — which is also the RED ARM for any test of "the damage falls off".
+	 *
+	 * THIS IS NOT A SELF-DAMAGE KNOB AND THERE ISN'T ONE. Roxie's own blast deals her 0 at every range
+	 * because UTraceAbilityComponent::CanAffectTargetDetailed refuses a pawn damaging itself with its
+	 * own ability, so a self-damage slider would move nothing. Her rocket jump costs exactly what it
+	 * cost in Demo 28.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Blast: damage AT the impact point (x Rocket Damage; falls to 0 at the radius) [Demo 29 §7: 0.5; 0 = the Demo 28 build]", ClampMin = "0.0", ClampMax = "0.95", UIMin = "0.0", UIMax = "0.8"))
+	float RoxieRocketSplashMaxFraction = 0.5f;
 
 	/**
 	 * §2: it "WOBBLES in flight, deliberately inaccurate and hard to aim". This is how far off the
@@ -5050,17 +5371,30 @@ public:
 	float RoxieRocketWobbleAmplitudeUU = 120.f;
 
 	/**
-	 * DEMO 17 item 3, verbatim: "make the model of the rocket bigger, so it is easy to see."
+	 * *** RETAINED FOR CONFIG COMPATIBILITY. NO READER SINCE DEMO 29. ***
 	 *
-	 * A multiplier on the DRAWN body, whose base size is RoxieRocketHitRadiusUU above — so 1.0 means
-	 * "the rocket is drawn exactly as big as the thing that kills you". Before Demo 17 the body was a
-	 * fixed 13 uu dart around a 45 uu lethal radius, i.e. three and a half times narrower than its own
-	 * hit test: a near miss looked like a clean miss, which is the same class of defect as a trail
-	 * whose lethal volume is not its drawn volume.
+	 * This was the DRAWN-ONLY size multiplier on top of RoxieRocketHitRadiusUU. Demo 17 introduced it
+	 * at 1.0 (draw the rocket exactly as wide as its hit radius, replacing a fixed 13 uu dart), Patch 28
+	 * item 1 raised it to 1.6 to answer "Make Roxie's rocket larger", and that is the state the owner
+	 * played: a 72 uu model around a 45 uu projectile.
 	 *
-	 * Raise it to exaggerate the rocket further; it changes NOTHING about what the rocket hits.
+	 * DEMO 29 ITEM 7 ENDED IT: "Make Roxie's rocket hit radius match the model." A multiplier is exactly
+	 * the mechanism by which a model and a hit radius drift apart — it is the same bug class as the
+	 * ribbon's drawn-vs-lethal volume and as Chut's copied backstab number — so the two are ONE value
+	 * now. TraceRoxieRocket::GetVisualRadiusUU() returns GetHitRadiusUU() and nothing multiplies
+	 * anything. RoxieRocketHitRadiusUU went 45 -> 72 so the model kept the size the owner chose.
+	 *
+	 * IT IS UNWIRED RATHER THAN DELETED, on this pass's revert rule: a DefaultGame.ini or a saved
+	 * settings page carrying this key still loads, and the work is recoverable. Editing it now does
+	 * NOTHING — the settings panel will move the slider and the game will not change.
+	 *
+	 * TO PUT IT BACK: restore GetVisualScale() next to GetHitRadiusUU() in TraceRoxieRocket.cpp and
+	 * make GetVisualRadiusUU() return the product again. Two lines, one file. Please do not, without
+	 * telling the owner that the model and the hit radius are two numbers again.
+	 *
+	 * (Precedent for a retained, unread knob on this page: ChutKnifeBackDamage, dead since C6.)
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket: Drawn Size (x its own hit radius) [Demo 17]", ClampMin = "0.1", ClampMax = "6.0", UIMin = "0.5", UIMax = "3.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket: Drawn Size multiplier [Demo 17; Patch 28 §1. DEAD SINCE DEMO 29 §7 - retained for config compat, READ BY NOTHING]", ClampMin = "0.1", ClampMax = "6.0", UIMin = "0.5", UIMax = "3.0"))
 	float RoxieRocketVisualScale = 1.f;
 
 
@@ -5138,7 +5472,24 @@ public:
 	// 3 seconds" — semi-transparent and hard to see or aim at. [ASSUMPTION] "the trace" means THE
 	// CORE (a trail is not passed or thrown), the cloak is VISUAL ONLY (no hitbox or aim-assist
 	// change), and it drops early if she picks the Core back up.
-	// Passive 2: +40% on well-timed slide-jump momentum boosts.
+	// Passive 2: +40% on well-timed slide-jump momentum boosts — *** CUT TO +30% BY PATCH 28 ITEM 3,
+	// "Reduce Elle's bonus slide boost from 40 to 30%". *** The +40% above is what §2 ASKED for and is
+	// left in the banner because this block is a transcript of the spec; ElleSlideJumpGainBonus below
+	// is what ships, and it is 0.30.
+	//
+	// *** HER CARD SAID 40% FOR TWO PASSES. FIXED IN W9-UIFIX; THE WARNING THAT USED TO STAND HERE
+	// *** IS KEPT AS A DESCRIPTION OF THE TRAP, BECAUSE THE TRAP IS STILL OPEN FOR EVERY OTHER NUMBER.
+	// The card's MOVEMENT line comes from TraceCharacterRoster.cpp's C++ table and now reads
+	// "WELL-TIMED SLIDE JUMPS GIVE HER 30% MORE OF THE MOMENTUM BOOST THAN ANYONE ELSE";
+	// DA_Character_Elle.uasset was regenerated from it (Scripts/generate-data-assets.py) and carries
+	// the same sentence, and Trace.VerifyCharacterData is green — 31 checks, 0 failed.
+	//
+	// WHAT HAS NOT CHANGED: section D compares the card against the C++ table, and the asset is
+	// GENERATED from that table, so the two agree with each other whatever they say. Nothing in the
+	// build compares either of them to the knob beside this comment. Retune ElleSlideJumpGainBonus
+	// and you must retune the roster string by hand and re-run the generator, or the card lies again
+	// and every check stays green. See W9-UIFIX.md §1 for the check that would close the class and
+	// why it was judged too wide to author in the final wave.
 	// Activated (Snap): a portal gate where she stands; reactivate within 4 s for its pair; players
 	// teleport between them; both expire 8 s after the pair is complete. 35 s cooldown.
 	// ------------------------------------------------------------------------------------------
@@ -5167,20 +5518,38 @@ public:
 	bool bElleCloakEndsOnCorePickup = true;
 
 	/**
-	 * §2: "+40% on well-timed slide-jump momentum boosts". *** IT SCALES THE GAIN, NOT THE WHOLE
-	 * MULTIPLIER. ***
+	 * §2: "+40% on well-timed slide-jump momentum boosts", *** CUT TO +30% BY PATCH 28 ITEM 3 ***
+	 * ("Reduce Elle's bonus slide boost from 40 to 30%"). IT SCALES THE GAIN, NOT THE WHOLE
+	 * MULTIPLIER.
 	 *
-	 * Everyone's well-timed slide jump is x1.446875 today, which is 1 + 0.446875 of GAIN. +40% of the
-	 * gain is 0.446875 x 1.40 = 0.625, so Elle's is x1.625. Scaling the whole multiplier instead would
-	 * give x2.025 — an ability more than twice the size of the one asked for.
+	 * *** THE WORKED NUMBERS, RE-DERIVED AT PATCH 28 BECAUSE THE OLD ONES HAD ROTTED. *** This
+	 * comment used to say the global well-timed multiplier was x1.446875 (gain 0.446875). It has not
+	 * been that since spec v26 §3a and v28 §5 landed, and nothing re-read it — exactly the stale-copy
+	 * failure the abilities block warns about, living in a comment instead of in code. What
+	 * UTraceCharacterMovementComponent::GetSlideJumpWindowSpeedBonus() actually ships today is:
+	 *
+	 *     SlideJumpWindowSpeedBonus 1.3125, x SlideJumpBonusScale 1.50 on the GAIN  -> 1.46875
+	 *     then x SlideJumpMomentumScale 0.80 on the GAIN (v26 §3a)                  -> 1.375000
+	 *
+	 * so EVERYBODY'S well-timed slide jump is x1.375000, i.e. 1 + 0.375000 of GAIN. Against that:
+	 *
+	 *     at 0.40 (before Patch 28)   1 + 0.375000 x 1.40 = x1.525000
+	 *     at 0.30 (SHIPPED)           1 + 0.375000 x 1.30 = x1.487500
+	 *
+	 * Her edge over the other nine therefore goes from +15.00% of entry speed to +11.25%. On a
+	 * 1900 uu/s approach that is 2897.5 uu/s -> 2826.3 uu/s, against everybody's 2612.5 uu/s.
+	 * Scaling the whole multiplier instead would give x1.7875 — an ability nearly twice the size of
+	 * the one asked for, and one that would beat DashSpeed off a fast slide.
 	 *
 	 * That reading is not invented here: it is how EVERY previous slide-jump change on this project
 	 * was read, and the global switch that says so out loud is bSlideJumpBonusScalesGainOnly under
-	 * Movement|Slide. DERIVE from the shipped bonus, do not hardcode 1.625 — if the base is retuned,
-	 * Elle follows for free, which is rule 1 of the abilities block.
+	 * Movement|Slide. DERIVE from the shipped bonus, do not hardcode 1.4875 — if the base is retuned,
+	 * Elle follows for free, which is rule 1 of the abilities block. NOTHING DERIVES FROM THIS KNOB
+	 * in turn: UTraceAbilitySetElle::GetSlideJumpWindowSpeedBonusForElle is its only runtime reader,
+	 * and TraceElleVerify.cpp recomputes the same expression from the same property to check it.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Slide-Jump GAIN Bonus (fraction of the gain, not the multiplier) [v18 §2: 0.446875 -> 0.625]", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
-	float ElleSlideJumpGainBonus = 0.4f;
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Slide-Jump GAIN Bonus (fraction of the gain, not the multiplier) [v18 §2 +40%, Patch 28 §3 +30%: x1.375 -> x1.4875]", ClampMin = "0.0", ClampMax = "3.0", UIMin = "0.0", UIMax = "1.0"))
+	float ElleSlideJumpGainBonus = 0.3f;
 
 	/** §2: "she may reactivate within 4 s to place a second gate". No second gate and the first expires. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Elle", meta = (DisplayName = "Snap: Second-Gate Window (s) [v18 §2: 4]", ClampMin = "0.25", ClampMax = "30.0", UIMin = "1.0", UIMax = "10.0"))
@@ -5372,35 +5741,77 @@ public:
 	 * *** THE AXIS EACH KNOB MEANS IS AN [ASSUMPTION], and it is the one to check first if the wall
 	 * comes out the wrong shape. *** The doc's "one player height tall and wide, and about the length
 	 * of a standard in-game box" does not say which of its words is the span and which is the
-	 * thickness. The reading here: HEIGHT is vertical, WIDTH is the thickness along his aim (the part
-	 * an enemy walks THROUGH, which is what the 35% slow needs to be non-instantaneous), and LENGTH is
-	 * the span across his aim (the part you hide behind, sized by the box). Swapping Width and Length
-	 * is a two-value edit and nothing else.
+	 * thickness. The reading here: HEIGHT is vertical, WIDTH is the span ACROSS his aim, and LENGTH
+	 * runs ALONG his aim, away from him.
+	 *
+	 * *** PATCH 28 ITEM 2 TURNED THE WALL 90° AND MOVED NONE OF THESE THREE NUMBERS. *** Verbatim:
+	 * "Slimeball's slimewall should be placed forward instead of laterally in front of him." Until
+	 * that patch LENGTH was the span across his aim — an 1100 uu barrier facing him, 176 uu thick,
+	 * the wall you hide BEHIND — and WIDTH was the thickness along his aim. They have swapped roles
+	 * without swapping values: the wall is now a 176 x 176 uu cross-section (one player tall, one
+	 * player wide, which is what §2 asks for in as many words) running 1100 uu away from him. It is
+	 * the wall you run BESIDE, and it splits a lane instead of capping it.
+	 *
+	 * WHAT DID NOT CHANGE, because it is the reason WIDTH is a knob at all: 176 uu is still how far
+	 * an enemy travels while inside the slab, since an enemy meets a forward wall by CROSSING the
+	 * lane it divides. The 35% slow is still non-instantaneous for the same arithmetic it always was
+	 * (176 uu at 800 uu/s = 0.22 s inside).
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall HEIGHT (uu, vertical) [v18 §2: 176 = one player height]", ClampMin = "20.0", ClampMax = "3000.0", UIMin = "80.0", UIMax = "600.0"))
 	float SlimewallHeightUU = 176.f;
 
 	/**
-	 * SLIMEWALL, DIMENSION 2 of 3 — WIDTH, the THICKNESS along his aim direction.
+	 * SLIMEWALL, DIMENSION 2 of 3 — WIDTH, the span ACROSS his aim direction, i.e. the slab's
+	 * thickness as seen by somebody crossing the lane it divides.
 	 *
 	 * This is how far an enemy travels while inside the wall, so it is the knob that decides whether
 	 * the 35% slow is felt at all. 176 uu is the doc's "and wide", read as one player height.
+	 *
+	 * PATCH 28 ITEM 2 CHANGED THIS KNOB'S AXIS AND NOT ITS JOB — see the [ASSUMPTION] block on
+	 * SlimewallHeightUU above. It used to be the thickness ALONG his aim, because the wall stood
+	 * across the lane; the wall now runs down the lane and this is the width of the thing you cross.
+	 * The number, the meaning ("how long an enemy is inside it") and the 0.22 s that falls out of it
+	 * are all unchanged. It is handed to ATraceSlimewall::ResolveForwardRun as its ThicknessUU.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall WIDTH (uu, thickness along aim - what enemies walk through) [v18 §2: 176]", ClampMin = "10.0", ClampMax = "2000.0", UIMin = "50.0", UIMax = "500.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall WIDTH (uu, span ACROSS aim - what enemies cross) [v18 §2: 176; Patch 28 §2 turned the axis]", ClampMin = "10.0", ClampMax = "2000.0", UIMin = "50.0", UIMax = "500.0"))
 	float SlimewallWidthUU = 176.f;
 
 	/**
-	 * SLIMEWALL, DIMENSION 3 of 3 — LENGTH, the SPAN across his aim direction.
+	 * SLIMEWALL, DIMENSION 3 of 3 — LENGTH, the run ALONG his aim direction, away from him.
 	 *
 	 * §2: "about the length of a standard in-game box". The arena's one-player-height cover blocks are
 	 * 1100 x 1100 (TraceArenaConstants::ApproachCover, entry D — the low diamond), so 1100 is what "a
-	 * standard in-game box" measures on this map. It is a little over six player widths of cover.
+	 * standard in-game box" measures on this map.
+	 *
+	 * *** PATCH 28 ITEM 2: THIS IS NO LONGER "THE PART YOU HIDE BEHIND". *** It was the span across
+	 * his aim — 1100 uu of barrier facing him — and it now points down the lane, so 1100 uu is how
+	 * far the wall REACHES rather than how wide a shield it is. Combined with SlimewallRangeUU below,
+	 * the shipped wall occupies 400 uu to 1500 uu ahead of him along his aim.
+	 *
+	 * IT SHORTENS RATHER THAN RETREATING when something is in the way (a forward wall's long axis
+	 * points INTO the obstacle, so pulling back would drag the whole run over his own head to buy
+	 * 176 uu of clearance). A run shorter than the WIDTH above is refused as a free fizzle instead of
+	 * being placed as a block, so in tight spots this reads as a shorter wall, never a dead ability.
+	 * Whether 1100 is still the right number now that it points down a lane is an open tuning
+	 * question for the owner, and it is this one line.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall LENGTH (uu, span across aim - the part you hide behind) [v18 §2: ~1 cover block]", ClampMin = "50.0", ClampMax = "5000.0", UIMin = "300.0", UIMax = "2000.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall LENGTH (uu, run ALONG aim - how far it reaches) [v18 §2: ~1 cover block; Patch 28 §2 turned the axis]", ClampMin = "50.0", ClampMax = "5000.0", UIMin = "300.0", UIMax = "2000.0"))
 	float SlimewallLengthUU = 1100.f;
 
-	/** How far in front of him the wall goes up. Far enough to not be inside his own capsule. */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall: Placement Distance (uu)", ClampMin = "0.0", ClampMax = "5000.0", UIMin = "100.0", UIMax = "1500.0"))
+	/**
+	 * How far in front of him the wall goes up. Far enough to not be inside his own capsule.
+	 *
+	 * *** PATCH 28 ITEM 2 CHANGED THIS KNOB'S MEANING AND NOT ITS VALUE. *** It used to be the
+	 * distance to the wall's CENTRE; it is now the distance to its NEAR END, so "the wall starts
+	 * 400 uu in front of me" still reads the same and still ships 400. What moved is everything
+	 * behind that: the centre is now 400 + 1100/2 = 950 uu ahead and the far end 1500 uu ahead,
+	 * where the lateral wall's far edge was 400 + 176/2 = 488 uu ahead. Anyone reading the old
+	 * meaning off the name will be off by half a wall.
+	 *
+	 * The near end is the end that never moves, which is what makes the sentence above survive the
+	 * blocked-lane case: ResolveForwardRun shortens the FAR end against an obstacle.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall: Placement Distance (uu, to its NEAR END) [Patch 28 §2 changed the meaning, not the value]", ClampMin = "0.0", ClampMax = "5000.0", UIMin = "100.0", UIMax = "1500.0"))
 	float SlimewallRangeUU = 400.f;
 
 	/**
@@ -5916,11 +6327,42 @@ public:
 	float MortimerQuakeWaveSeconds = 0.90f;
 
 	/**
-	 * The shockwave's colour. Mortimer's card colour is slate (0.38, 0.52, 0.85); the ring is the
-	 * same hue pushed past 1.0 so it clears the bloom threshold the arena's neon uses.
+	 * The shockwave's colour: MORTIMER'S ACCENT — cold patinated steel #5DB5A2. The ring, the ground
+	 * cracks and the dust all wear it — one hue per effect (bible §6.2).
+	 *
+	 * *** THE SOURCE OF TRUTH IS TraceCharacterRoster::All()[Mortimer].Accent
+	 *     (Core/TraceCharacterRoster.cpp), NOT ART_BIBLE §2.3 AND NOT THIS LINE. *** It is copied
+	 * here only because a UPROPERTY(config) default cannot call a function and because this is a
+	 * designer knob that is allowed to hold something other than his accent. Re-tune the accent and
+	 * THIS LINE MOVES BY HAND — it did not, once: the v25 re-space took him from slate #A6BFED
+	 * (7.2 deg from team Blue, which is why it had to move) to #5DB5A2, and this default kept the old
+	 * slate, so his quake rang out in one colour while his body wore another for a whole wave.
+	 *
+	 * *** THE DARKER ACCENT COSTS THE RING 3.4% OF ITS BRIGHTNESS AND NOTHING ELSE, AND THAT IS
+	 *     ARITHMETIC RATHER THAN HOPE. *** ATraceMortimerQuakeWave scales its glow so that the
+	 * brightest channel x Glow lands on DefaultHueHeadroom = 2.0, capped at scale 1. Old slate:
+	 * brightest 0.85 x PeakGlow 4.2 = 3.57, scaled by 0.560 to hit exactly 2.00. New steel: brightest
+	 * 0.46 x 4.2 = 1.93, which is already under the headroom, so the scale saturates at 1.0 and the
+	 * achieved product is 1.93 instead of 2.00. Still well above the arena floor grid's ~1.5 (§3.2
+	 * T0), so the telegraph still out-reads the floor it is drawn on. It also clips LATER: red now
+	 * reaches 1.0 only at a product of 4.18, where slate's reached it at 2.24, so the white-ring
+	 * failure this knob has a paragraph about is further away than it was, not closer.
+	 *
+	 * *** IT USED TO BE (0.45, 0.70, 1.6) AND THAT WAS A BUG, NOT A BRIGHTER SLATE — a historical
+	 *     note, from back when the accent this tracks WAS slate. *** The old
+	 * comment here said the ring was "the same hue pushed past 1.0 so it clears the bloom threshold",
+	 * and that is not what a channel above 1 does. M_TraceNeon computes Emissive = Color x Glow and a
+	 * material instance CLAMPS vector parameters to [0,1], so the 1.6 clamped to 1.0 and the ring's
+	 * actual hue became (0.45, 0.70, 1.00) — a paler, bluer colour than slate, which was then
+	 * multiplied by a Glow of 6 and came back very nearly white. Bloom is cleared by GLOW and only by
+	 * Glow (UTraceFxShapes::SetGlow documents the same trap for every other effect in the project);
+	 * the wave's is now bible §3.2's FX-transient ceiling, 4.2, in ATraceMortimerQuakeWave.
+	 *
+	 * ATraceMortimerQuakeWave::BuildIfNeeded normalises anything above 1 back into a hue, so a value
+	 * set here in the old style still means what its ratios say rather than turning white.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mortimer", meta = (DisplayName = "Quake Shockwave Colour [Demo 20 item 3]"))
-	FLinearColor MortimerQuakeWaveColor = FLinearColor(0.45f, 0.70f, 1.6f, 1.f);
+	FLinearColor MortimerQuakeWaveColor = FLinearColor(0.11f, 0.46f, 0.36f, 1.f);
 
 	/**
 	 * Thickness of the ring's beads, uu. The ring is drawn as a circle of overlapping cylinders — the

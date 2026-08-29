@@ -86,11 +86,45 @@
 //                                                 ATraceMenuHUD::IsOptionsOpen() — already public —
 //                                                 instead of editing it. See the note there.
 
+// =================================================================================================
+// AND SINCE THE UI QA PASS: WHAT THE POINTER LOOKS LIKE, ONCE
+// =================================================================================================
+// This file already decided WHO owns the pointer. It now also decides WHAT IT IS, because the QA
+// pass found the answer had forked:
+//
+//     "the hardware cursor is unthemed AND the two title renderers now draw DIFFERENT pointers
+//      (white blade vs cyan cross)"
+//
+// The UMG title screen drew the artist's blade (T_MenuCursor). The CANVAS title screen — the same
+// screen, one CVar away — drew a nine-pixel cyan gap-cross left over from before the sprite existed.
+// The settings overlay and character select drew the blade again, each from its own copy of the
+// sprite's proportions, one of which disagreed with the other in the fourth decimal place. Four
+// surfaces, three pictures, one pointer.
+//
+// So the pointer is now ONE function (DrawPointer) and ONE colour (PointerTint), and every Canvas
+// surface calls them. The UMG title screen cannot call an AHUD draw, so it takes the tint and the
+// geometry constants and applies them to its own UImage — which is the same three numbers reaching
+// the same sprite by the only route a widget has.
+//
+// WHY THE POINTER IS TINTED AT ALL, since the sprite was perfectly visible white. The title palette
+// states the rule this was breaking (UI/Widgets/Menu/TraceMenuPalette.h): "the whole screen is two
+// hues — a cyan that carries the interface and an amber that only ever marks danger or the Hard
+// setting — over near-black ... the moment a third colour appears, the grid stops reading as a grid
+// and starts reading as noise." A pure-white pointer WAS that third colour, on every screen, at all
+// times. Cyan is not an invention here either: it is the colour the Canvas title screen was already
+// drawing its pointer in, so unifying on it keeps one of the two arms exactly as it shipped.
+//
+// The sprite survives the tint intact because of what is actually in it: 835 of its 1,382 opaque
+// pixels are pure white and the rim is sRGB(71,54,4), a near-black olive. A Canvas tint multiplies,
+// so the body becomes the tint and the rim stays a dark keyline — which is the thing that keeps the
+// pointer readable over the arena's white walkways on the select screen.
+
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GenericPlatform/ICursor.h"
 
+class AHUD;
 class APlayerController;
 
 namespace TraceHardwareCursor
@@ -141,4 +175,34 @@ namespace TraceHardwareCursor
 	 * Console: `Trace.UI.HardwareCursorRedArm 1`.
 	 */
 	TRACE_API bool IsRedArmed();
+
+	/**
+	 * THE ONE COLOUR TRACE'S POINTER IS DRAWN IN, on every surface and both renderers.
+	 *
+	 * A function rather than a constant so the UMG title screen and the three Canvas surfaces cannot
+	 * end up holding two copies of it — which is exactly how they ended up holding two pictures.
+	 */
+	TRACE_API FLinearColor PointerTint();
+
+	/**
+	 * The pointer's height in SCREEN pixels for a surface drawing at @p InUIScale.
+	 *
+	 * 30 reference pixels, which is what the settings overlay and character select already used; the
+	 * UMG title screen sizes its own image from this so the two renderers agree by construction
+	 * rather than by two people having typed the same number.
+	 */
+	TRACE_API float PointerHeight(float InUIScale);
+
+	/**
+	 * Draw Trace's pointer through @p HUD with its POINT on @p TipPos.
+	 *
+	 * @return false when the sprite is not available (a build with no menu art, or the frame or two
+	 *         before its RHI texture lands). The caller then draws its own fallback — every one of
+	 *         them keeps the vector cross it drew before the sprite existed.
+	 *
+	 * Tip-anchored, not centre-anchored. Every surface hit-tests at the pointer position, so an arrow
+	 * anchored anywhere but its point draws about eleven pixels from the pixel it is about to click
+	 * and every click in every screenshot looks like it landed on the wrong row.
+	 */
+	TRACE_API bool DrawPointer(AHUD* HUD, const FVector2D& TipPos, float InUIScale);
 }

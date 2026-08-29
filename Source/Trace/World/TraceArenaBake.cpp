@@ -504,14 +504,66 @@ void ATraceArenaBuilder::AdoptBakedArena()
 	BuiltFloorLampIntensity = FloorLampIntensity;
 	BuiltFloorLampRadius = FloorLampRadius;
 
+	int32 RigLightsPrioritized = 0;
 	for (TActorIterator<ADirectionalLight> It(World); It; ++It)
 	{
 		ADirectionalLight* Light = *It;
-		if (IsValid(Light) && Light->ActorHasTag(FName(TraceArenaBakeLocal::KeyLightTag)))
+		if (!IsValid(Light))
 		{
-			KeyLightComponent = Cast<UDirectionalLightComponent>(Light->GetLightComponent());
+			continue;
 		}
+
+		UDirectionalLightComponent* LightComponent = Cast<UDirectionalLightComponent>(Light->GetLightComponent());
+		if (LightComponent == nullptr)
+		{
+			continue;
+		}
+
+		if (Light->ActorHasTag(FName(TraceArenaBakeLocal::KeyLightTag)))
+		{
+			KeyLightComponent = LightComponent;
+		}
+
+		// Forward-shading priorities, pushed onto the whole baked rig at every load. The shipping
+		// level was baked BEFORE the rig learned its priorities, and ForwardShadingPriority is a
+		// serialised property — without this push the baked map would keep the four-way
+		// directional-light fight (and its on-screen red warning) until somebody re-baked. The
+		// policy is decided from the same facts the FLightSpec table encodes, which the bake
+		// serialised on the components themselves: the atmosphere sun is flagged as such, the key
+		// is the rig's only shadow caster, and the remaining pair (warm fill / cyan bounce) are
+		// rim/ambient tint that must neither win the single-light slot nor scatter into volumetric
+		// fog. Idempotent, so a level re-baked after this change is simply confirmed. Only the
+		// rig's own lights are touched — a directional light without the bake tag is a designer's
+		// hand-placed light, not this builder's business.
+		if (!Light->ActorHasTag(TraceBakedArenaTag()))
+		{
+			continue;
+		}
+
+		if (LightComponent->IsUsedAsAtmosphereSunLight())
+		{
+			LightComponent->SetForwardShadingPriority(ForwardPriorityAtmosphereSun);
+		}
+		else if (LightComponent->CastShadows != 0)
+		{
+			LightComponent->SetForwardShadingPriority(ForwardPriorityKeyLight);
+		}
+		else
+		{
+			LightComponent->SetForwardShadingPriority(ForwardPriorityRimLight);
+			LightComponent->SetVolumetricScatteringIntensity(0.f);
+		}
+		++RigLightsPrioritized;
 	}
+
+	// Said out loud (spec v17 §0 rule 1 spirit): the whole point of the push is healing a level
+	// baked before the priorities existed, and a silent heal is indistinguishable from a heal that
+	// silently stopped running. Anything but 4 here means the rig this level serialised is not the
+	// rig BuildLighting makes today.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Arena] Forward-shading priorities pushed onto %d baked directional lights at adopt ")
+		TEXT("(key %d / sun %d / rim %d, rim volumetrics zeroed)."),
+		RigLightsPrioritized, ForwardPriorityKeyLight, ForwardPriorityAtmosphereSun, ForwardPriorityRimLight);
 
 	for (TActorIterator<APostProcessVolume> It(World); It; ++It)
 	{
@@ -519,6 +571,21 @@ void ATraceArenaBuilder::AdoptBakedArena()
 		if (IsValid(Volume) && Volume->ActorHasTag(FName(TraceArenaBakeLocal::PostProcessTag)))
 		{
 			ArenaPostProcess = Volume;
+
+			// The volume's serialised settings are the art direction AS OF THE BAKE, and the
+			// ApplyFidelity call below rewrites only the settings that COST (that split is its
+			// documented contract). An art-direction change made after the bake therefore has to
+			// be pushed here, or the shipping map keeps the old look until someone re-bakes for
+			// unrelated reasons. Today that is one value: the chromatic fringe, 0.2 at bake time,
+			// now ArenaSceneFringeIntensity (0 — see BuildPostProcess for the measured history and
+			// the art bible §5.3 ruling).
+			Volume->Settings.bOverride_SceneFringeIntensity = true;
+			Volume->Settings.SceneFringeIntensity = ArenaSceneFringeIntensity;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Arena] Post-process art direction pushed onto the baked volume at adopt: ")
+				TEXT("SceneFringeIntensity=%.2f (the bake serialised 0.2)."),
+				ArenaSceneFringeIntensity);
 		}
 	}
 

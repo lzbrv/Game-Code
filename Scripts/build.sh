@@ -35,6 +35,10 @@ USAGE
 OPTIONS
   -t, --target <name>     Build target. Default: TraceEditor
                           One of: Trace | TraceEditor | TraceServer
+                          (a bare target name works too: Scripts/build.sh Trace -c Shipping)
+      --prove-shipping    Shorthand for '-t Trace -c Shipping': the release
+                          gate that proves the game target links with no dev
+                          command, harness or cheat surface compiled in
   -c, --config <name>     Build configuration. Default: Development
                           One of: Debug | DebugGame | Development | Test | Shipping
   -p, --platform <name>   Target platform. Default: this host (${TRACE_HOST_PLATFORM})
@@ -68,6 +72,7 @@ WHAT IT WRAPS
 
 EXAMPLES
   Scripts/build.sh                          # editor target, Development
+  Scripts/build.sh --prove-shipping         # game target, Shipping (release gate)
   Scripts/build.sh -t TraceServer           # dedicated server target
   Scripts/build.sh -c DebugGame             # game code with optimisations off
   Scripts/build.sh --clean -t TraceEditor   # force a full rebuild next time
@@ -83,10 +88,21 @@ while [ $# -gt 0 ]; do
         --clean)        DO_CLEAN=1; shift ;;
         --projectfiles) DO_PROJECTFILES=1; shift ;;
         --no-art)       DO_IMPORT_ART=0; shift ;;
+        --prove-shipping)
+                        # The release gate in one word: the GAME target, Shipping config -- the
+                        # build that must contain no console command, harness or cheat surface.
+                        TARGET="Trace"; CONFIG="Shipping"
+                        trace_msg "--prove-shipping: building the Trace game target in Shipping (the release gate)."
+                        shift ;;
         -n|--dry-run)   TRACE_DRY_RUN=1; shift ;;
         -h|--help)      usage; exit 0 ;;
         --)             shift; while [ $# -gt 0 ]; do EXTRA_ARGS+=("$1"); shift; done ;;
         -*)             trace_err "Unknown option: $1"; echo; usage; exit 2 ;;
+        Trace|TraceEditor|TraceServer)
+                        # Bare target name, so the documented recipes read naturally:
+                        #   Scripts/build.sh TraceEditor
+                        #   Scripts/build.sh Trace -c Shipping
+                        TARGET="$1"; shift ;;
         *)              trace_err "Unexpected argument: $1"; echo; usage; exit 2 ;;
     esac
 done

@@ -7,18 +7,97 @@
 #include "Engine/World.h"
 #include "GameFramework/PlayerState.h"
 #include "Containers/Ticker.h"
+#include "Camera/CameraActor.h"                // the parade's observer — see PlaceObserver
 #include "Engine/Engine.h"
+#include "EngineUtils.h"                      // TActorIterator — the FxTest parade counts live bursts
+#include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformTime.h"
+#include "Misc/Paths.h"
+#include "UnrealClient.h"                     // FScreenshotRequest — the parade aims its own frames
+
+#include "Components/AudioComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
+#include "Materials/MaterialInstanceDynamic.h"
 
 #include "Abilities/TraceAbilityComponent.h"
+#include "Abilities/TraceAbilityTypes.h"     // ETraceCharacterId::Mace — the id, not the colour
 #include "Abilities/Characters/TraceAbilityInputRelay.h"
 #include "Abilities/Characters/TraceMaceSpike.h"
+#include "Audio/TraceAudio.h"                 // FX §2.4's three sounds: throw (World), embed (burst), pull (loop)
+#include "Audio/TraceSoundEvents.h"
 #include "Core/TraceCharacter.h"
+#include "Core/TraceCharacterRoster.h"       // THE accent. See MaceAccent() below.
 #include "Core/TracePlayerController.h"
+#include "Gameplay/TraceFxBurst.h"            // TraceFxLoopBudget — the §1.4 attach choke point
+#include "Gameplay/TraceFxShapes.h"
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+
+// =================================================================================================
+// FX_AUDIO_PLAN §2.4 — the two WHILE-ACTIVE tells. Numbers here, mechanism at the bottom of the file.
+// =================================================================================================
+
+namespace TraceAbilitySetMaceFxFile
+{
+	/**
+	 * Mace's accent — the SAME hue the spike, the rope, the sleeve and the embed burst wear.
+	 * One hue per kit (bible §6.2), and the halo and the pull streams are part of that kit.
+	 *
+	 * *** READ FROM THE ROSTER, NOT COPIED. THIS IS A BUG FIX, NOT A REFACTOR. *** This line was
+	 * `const FLinearColor MaceViolet(0.65f, 0.55f, 1.00f, 1.f)` — ART_BIBLE §2.3's old #D3C4FF —
+	 * carrying the sentence above as a claim. When the ten accents were re-spaced away from the two
+	 * team hues, Mace moved to #DFC4FE, TraceMaceSpike.cpp was moved onto the roster with him, and
+	 * THIS copy was not. The sentence above became false: for one wave his suspend halo and his pull
+	 * streams drew 13.2 degrees of hue away from his own spike, his own rope and his own body.
+	 *
+	 * It is the drawn-vs-lethal rule wearing a different hat — never a second literal for a number
+	 * something else owns. TraceCharacterRoster is the owner: it is the table the ten
+	 * UTraceCharacterDefinition assets are generated from and the table the body materials are
+	 * stamped from, so "equals the roster row" is literally "equals the body". Falls back to white
+	 * on a roster that did not resolve, which is loud rather than subtly wrong.
+	 *
+	 * Cheap enough to call per attach: Find() is a bounds check and an index into a static table,
+	 * and both call sites run once per ability state edge, not per frame.
+	 */
+	FLinearColor MaceAccent()
+	{
+		if (const TraceCharacterRoster::FTraceCharacterEntry* Row =
+			TraceCharacterRoster::Find(static_cast<uint8>(ETraceCharacterId::Mace)))
+		{
+			return FLinearColor(Row->Accent.R, Row->Accent.G, Row->Accent.B, 1.f);
+		}
+		return FLinearColor::White;
+	}
+
+	// --- the suspend halo -------------------------------------------------------------------------
+	/** FX §2.4: "halo ring under feet (cylinder r 40 uu, h 3 uu), additive violet I 0.3". */
+	constexpr float HaloRadiusUU = 40.f;
+	constexpr float HaloHeightUU = 3.f;
+	constexpr float HaloIntensity = 0.3f;
+
+	/** How far under the capsule centre it sits: a standing pawn's feet are ~88 uu down. */
+	constexpr float HaloFeetOffsetUU = -86.f;
+
+	/** FX §2.4: "bobbing +/-4 uu @ 1.2 Hz (motion, not brightness — suspend is not a lethal telegraph)". */
+	constexpr float HaloBobAmplitudeUU = 4.f;
+	constexpr float HaloBobHz = 1.2f;
+
+	// --- the pull slip-stream ---------------------------------------------------------------------
+	/** FX §2.4: "2 trailing cylinders behind the pawn (l 140 uu, r 4 uu), additive violet I 0.4". */
+	constexpr float StreamLengthUU = 140.f;
+	constexpr float StreamRadiusUU = 4.f;
+	constexpr float StreamIntensity = 0.4f;
+
+	/** How far behind the capsule centre each piece is centred, and how far apart the two sit. */
+	constexpr float StreamTrailOffsetUU = 60.f;
+	constexpr float StreamLateralOffsetUU = 18.f;
+
+	/** Fade the pull loop out over this rather than cutting it: a loop that stops dead reads as a bug. */
+	constexpr float PullLoopFadeOutSeconds = 0.25f;
+}
 
 /**
  * THE RED ARM FOR DEMO 17 item 6 — the 3 s hidden cooldown on V.
@@ -81,6 +160,27 @@ void UTraceAbilitySetMace::OnUnequipped()
 	StopSuspend(TEXT("unequipped"));
 	StopPull(TEXT("unequipped"), /*bRemoveSpike*/ true);
 	ClearSpike();
+
+	// The pawn SURVIVES a character change, so attached FX would survive it too — onto a pawn that is
+	// no longer Mace. Cosmetics first, exactly as UTraceAbilitySetElle::OnUnequipped does it.
+	DetachAllKitFx();
+}
+
+void UTraceAbilitySetMace::OnPawnSpawned()
+{
+	// A fresh pawn carries nothing. Forget the old one rather than trying to detach from it — it is
+	// being destroyed on this same path — and then re-attach whatever the live state says is on, which
+	// is the respawn half of the §1.2 sync rule.
+	SuspendHalo = nullptr;
+	SuspendHaloMID = nullptr;
+	PullStreamA = nullptr;
+	PullStreamB = nullptr;
+	PullStreamAMID = nullptr;
+	PullStreamBMID = nullptr;
+	PullLoopAudio = nullptr;
+	FxPawn = nullptr;
+
+	ApplyKitFx(State());
 }
 
 void UTraceAbilitySetMace::OnPawnDied()
@@ -90,6 +190,11 @@ void UTraceAbilitySetMace::OnPawnDied()
 	StopSuspend(TEXT("died"));
 	StopPull(TEXT("died"), /*bRemoveSpike*/ true);
 	ClearSpike();
+
+	// §8.9: no FX component survives its pawn. On a machine that is not the server this hook is the
+	// ONLY notice — the flags are wiped by the death state wipe, but a wipe that arrives as "all bits
+	// zero" is still an edge this kit would rather not depend on for a corpse.
+	DetachAllKitFx();
 }
 
 void UTraceAbilitySetMace::OnHalfTime()
@@ -106,6 +211,7 @@ void UTraceAbilitySetMace::OnHalfTime()
 	SuspendReadyMatchTime = 0.f;
 	StopPull(TEXT("half time"), /*bRemoveSpike*/ true);
 	ClearSpike();
+	DetachAllKitFx();
 }
 
 bool UTraceAbilitySetMace::ShouldDriveMovement() const
@@ -464,6 +570,13 @@ bool UTraceAbilitySetMace::ActivateAbility()
 		SpikeEmbedEndMatchTime = 0.f;    // starts when the flight ends, not when it is thrown
 		PublishState();
 
+		// FX §5.1: MaceSpikeThrow is a WORLD event fired at the cast ACCEPT — i.e. here, after the
+		// sweep found a wall and the actor exists, never at the press. A fizzle (throwing at the sky)
+		// costs no cooldown and must make no noise either, or the sound teaches the wrong lesson about
+		// what worked. One play, on the authority, multicast to everybody: the spike's own replication
+		// carries the visual, and this carries the sound.
+		TraceAudio::PlayAt(this, TraceSoundEvents::MaceSpikeThrow, MyPawn->GetMuzzleLocation());
+
 		UE_LOG(LogTraceGame, Log, TEXT("[Mace] Spike thrown at %s (%.0f uu away); embeds for %.1fs on arrival."),
 			*Anchor.ToCompactString(), FVector::Dist(MyPawn->GetActorLocation(), Anchor),
 			UTraceSettings::Get().MaceSpikeEmbedSeconds);
@@ -803,8 +916,15 @@ void UTraceAbilitySetMace::TickAbilities(float DeltaSeconds)
 			StopSuspend(TEXT("characters disabled"));
 			StopPull(TEXT("characters disabled"), /*bRemoveSpike*/ true);
 		}
+		DetachAllKitFx();
 		return;
 	}
+
+	// EVERY MACHINE, AND BEFORE THE MOVEMENT EARLY-OUT BELOW. The two returns further down are about
+	// who may WRITE velocity; presentation is for everybody watching, which is the whole point of the
+	// router. 20 Hz is the component's tick rate (see the TickAbilities contract) — the bob and the
+	// stream aim are both continuous functions of time, so they sample cleanly at it.
+	TickKitFx(DeltaSeconds);
 
 	if (HasAuthority())
 	{
@@ -890,7 +1010,355 @@ void UTraceAbilitySetMace::PublishState()
 	MarkStateDirty();
 }
 
+// =================================================================================================
+// FX §2.4 — THE ROUTER HALF. Runs on EVERY machine, off the replicated flags.
+// =================================================================================================
+//
+// WHY THE FLAGS AND NOT THE LOCAL BOOLEANS. bSuspending and bPulling are written by StartSuspend()
+// and StartPull(), which run on the server and on the owning client and nowhere else — an opponent's
+// machine has neither, and that is precisely the class of bug F10 is about (the ability is invisible
+// to everybody except the person using it). TraceMaceFlags::Suspending / ::Pulling are the same two
+// facts, published by PublishState() and replicated to every machine, so hanging the presentation on
+// them is the difference between a tell and a private one.
+//
+// The mapping is the file's own, not TraceAbilityFlags': FX §2.4 says "router edge on MovementActive
+// (suspend flag)", and in this kit MovementActive is the PULL bit — Suspending is 1 << 0. Reading
+// the plan's generic name rather than this character's would have put the halo on the wrong ability.
+
+ATraceCharacter* UTraceAbilitySetMace::ResolveFxPawn() const
+{
+	// GetCharacter() is the same lookup, but going through it here would hide the §1.2 rule this
+	// function exists to keep: the pawn is asked for FRESH every time, so a respawn between two ticks
+	// is detected rather than leaving components parented to a corpse.
+	const UTraceAbilityComponent* Comp = GetAbilityComponent();
+	const APlayerState* OwningState = (Comp != nullptr) ? Comp->GetOwningPlayerState() : nullptr;
+	return (OwningState != nullptr) ? Cast<ATraceCharacter>(OwningState->GetPawn()) : nullptr;
+}
+
+void UTraceAbilitySetMace::SetSuspendFxAttached(bool bAttached)
+{
+	ATraceCharacter* Pawn = ResolveFxPawn();
+
+	if (!bAttached || Pawn == nullptr)
+	{
+		if (SuspendHalo != nullptr)
+		{
+			TraceFxLoopBudget::DetachLoopPrimitive(FxPawn.Get(), SuspendHalo);
+			SuspendHalo = nullptr;
+			SuspendHaloMID = nullptr;
+		}
+		return;
+	}
+
+	if (SuspendHalo != nullptr)
+	{
+		return;   // already up. SyncClientFx can run twice for one live state and must not stack.
+	}
+
+	USceneComponent* AttachTo = Pawn->GetRootComponent();
+	if (AttachTo == nullptr)
+	{
+		return;
+	}
+
+	SuspendFxSeconds = 0.f;
+	SuspendHalo = TraceFxLoopBudget::AttachLoopPrimitive(Pawn, AttachTo, UTraceFxShapes::GetCylinder(),
+		TEXT("MaceSuspendHalo"), TraceAbilitySetMaceFxFile::MaceAccent(),
+		TraceAbilitySetMaceFxFile::HaloIntensity,
+		FVector(0.f, 0.f, TraceAbilitySetMaceFxFile::HaloFeetOffsetUU),
+		TraceAbilitySetMaceFxFile::HaloRadiusUU, SuspendHaloMID);
+
+	if (SuspendHalo != nullptr)
+	{
+		// AttachLoopPrimitive gives every piece a UNIFORM scale from its radius, which is right for a
+		// blob and wrong for a disc. §2.4 asks for h 3 uu, so the Z is overwritten here — the helper
+		// owns the budget and the material, the caller owns the shape.
+		const float XY = UTraceFxShapes::ShapeScaleForRadiusUU(TraceAbilitySetMaceFxFile::HaloRadiusUU);
+		SuspendHalo->SetRelativeScale3D(FVector(XY, XY,
+			UTraceFxShapes::ShapeScaleForLengthUU(TraceAbilitySetMaceFxFile::HaloHeightUU)));
+
+		FxPawn = Pawn;
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[Mace] suspend halo up on %s (r %.0f uu, additive I %.2f, bobbing +/-%.0f uu @ %.1f Hz)."),
+			*GetNameSafe(Pawn), TraceAbilitySetMaceFxFile::HaloRadiusUU,
+			TraceAbilitySetMaceFxFile::HaloIntensity, TraceAbilitySetMaceFxFile::HaloBobAmplitudeUU,
+			TraceAbilitySetMaceFxFile::HaloBobHz);
+	}
+}
+
+void UTraceAbilitySetMace::SetPullFxAttached(bool bAttached)
+{
+	ATraceCharacter* Pawn = ResolveFxPawn();
+
+	if (!bAttached || Pawn == nullptr)
+	{
+		if (PullStreamA != nullptr || PullStreamB != nullptr)
+		{
+			TraceFxLoopBudget::DetachLoopPrimitive(FxPawn.Get(), PullStreamA);
+			TraceFxLoopBudget::DetachLoopPrimitive(FxPawn.Get(), PullStreamB);
+			PullStreamA = nullptr;
+			PullStreamB = nullptr;
+			PullStreamAMID = nullptr;
+			PullStreamBMID = nullptr;
+		}
+
+		if (PullLoopAudio != nullptr)
+		{
+			// FADED, NOT STOPPED. §1.6.4: the caller owns this component and bAutoDestroy is off, so a
+			// loop that is never faded is a loop that plays until the pawn dies.
+			PullLoopAudio->FadeOut(TraceAbilitySetMaceFxFile::PullLoopFadeOutSeconds, 0.f);
+			PullLoopAudio = nullptr;
+		}
+		return;
+	}
+
+	USceneComponent* AttachTo = Pawn->GetRootComponent();
+	if (AttachTo == nullptr)
+	{
+		return;
+	}
+
+	if (PullStreamA == nullptr && PullStreamB == nullptr)
+	{
+		const float XY = UTraceFxShapes::ShapeScaleForRadiusUU(TraceAbilitySetMaceFxFile::StreamRadiusUU);
+		const float Z = UTraceFxShapes::ShapeScaleForLengthUU(TraceAbilitySetMaceFxFile::StreamLengthUU);
+
+		auto MakeStream = [&](const TCHAR* NameHint, float Lateral,
+		                      TObjectPtr<UMaterialInstanceDynamic>& OutMID) -> UStaticMeshComponent*
+		{
+			UStaticMeshComponent* Piece = TraceFxLoopBudget::AttachLoopPrimitive(Pawn, AttachTo,
+				UTraceFxShapes::GetCylinder(), NameHint, TraceAbilitySetMaceFxFile::MaceAccent(),
+				TraceAbilitySetMaceFxFile::StreamIntensity,
+				FVector(-TraceAbilitySetMaceFxFile::StreamTrailOffsetUU, Lateral, 0.f),
+				TraceAbilitySetMaceFxFile::StreamRadiusUU, OutMID);
+			if (Piece != nullptr)
+			{
+				Piece->SetRelativeScale3D(FVector(XY, XY, Z));
+			}
+			return Piece;
+		};
+
+		PullStreamA = MakeStream(TEXT("MacePullStreamA"),
+			-TraceAbilitySetMaceFxFile::StreamLateralOffsetUU, PullStreamAMID);
+		PullStreamB = MakeStream(TEXT("MacePullStreamB"),
+			+TraceAbilitySetMaceFxFile::StreamLateralOffsetUU, PullStreamBMID);
+
+		if (PullStreamA != nullptr || PullStreamB != nullptr)
+		{
+			FxPawn = Pawn;
+		}
+	}
+
+	if (PullLoopAudio == nullptr)
+	{
+		// LOCAL TO THIS MACHINE, and started on every one of them by this same router edge — which is
+		// exactly what makes MacePullLoop a Client-side event in the table (§5.1). A World play here
+		// would multicast a second copy on top of the one every machine has already started.
+		PullLoopAudio = TraceAudio::StartLoopOn(AttachTo, TraceSoundEvents::MacePullLoop);
+	}
+}
+
+void UTraceAbilitySetMace::DetachAllKitFx()
+{
+	SetSuspendFxAttached(false);
+	SetPullFxAttached(false);
+	FxPawn = nullptr;
+}
+
+void UTraceAbilitySetMace::ApplyKitFx(const FTraceAbilityNetState& Which)
+{
+	ATraceCharacter* Pawn = ResolveFxPawn();
+
+	// RULE 1 OF THE ROUTER CONTRACT: a null pawn — or a DIFFERENT pawn from the one the pieces are
+	// parented to — means detach everything. A respawn between two edges is otherwise a set of
+	// components attached to a pawn nobody will ever ask about again.
+	if (Pawn == nullptr || (FxPawn.IsValid() && FxPawn.Get() != Pawn))
+	{
+		DetachAllKitFx();
+		if (Pawn == nullptr)
+		{
+			return;
+		}
+	}
+
+	SetSuspendFxAttached((Which.Flags & TraceMaceFlags::Suspending) != 0);
+	SetPullFxAttached((Which.Flags & TraceMaceFlags::Pulling) != 0);
+}
+
+void UTraceAbilitySetMace::OnClientStateEdge(const FTraceAbilityNetState& Old, const FTraceAbilityNetState& New)
+{
+	// Only presentation, and only when the two bits this kit draws actually moved. Everything else on
+	// the scratch pad (the embed deadline, the anchor) changes far more often and drives no FX.
+	const uint8 Watched = TraceMaceFlags::Suspending | TraceMaceFlags::Pulling;
+	if ((Old.Flags & Watched) == (New.Flags & Watched))
+	{
+		return;
+	}
+
+	ApplyKitFx(New);
+}
+
+void UTraceAbilitySetMace::SyncClientFx(const FTraceAbilityNetState& Current)
+{
+	// JOIN IN PROGRESS. A client that connects while Mace is already reeling in never saw the edge
+	// that started the slip-stream, and would watch her fly across the arena with nothing on her.
+	// Idempotent by construction: each Set*Attached returns early when its pieces are already up.
+	ApplyKitFx(Current);
+}
+
+void UTraceAbilitySetMace::TickKitFx(float DeltaSeconds)
+{
+	if (SuspendHalo == nullptr && PullStreamA == nullptr && PullStreamB == nullptr)
+	{
+		return;
+	}
+
+	ATraceCharacter* Pawn = ResolveFxPawn();
+	if (Pawn == nullptr || (FxPawn.IsValid() && FxPawn.Get() != Pawn))
+	{
+		DetachAllKitFx();
+		return;
+	}
+
+	if (SuspendHalo != nullptr)
+	{
+		// MOTION, NOT BRIGHTNESS. Bible §3.3 forbids a brightness pulse on anything a player
+		// range-finds against, and §1.4 allows a bob — so the halo moves and its intensity never does.
+		SuspendFxSeconds += DeltaSeconds;
+		const float Bob = TraceAbilitySetMaceFxFile::HaloBobAmplitudeUU
+			* FMath::Sin(2.f * PI * TraceAbilitySetMaceFxFile::HaloBobHz * SuspendFxSeconds);
+		SuspendHalo->SetRelativeLocation(TraceFxLoopBudget::ClampToFootprint(
+			FVector(0.f, 0.f, TraceAbilitySetMaceFxFile::HaloFeetOffsetUU + Bob)));
+	}
+
+	if (PullStreamA != nullptr || PullStreamB != nullptr)
+	{
+		USceneComponent* Parent = Pawn->GetRootComponent();
+		if (Parent == nullptr)
+		{
+			return;
+		}
+
+		// THE STREAM POINTS WHERE SHE HAS BEEN, which during a pull is the rope she is climbing. Taken
+		// from live velocity rather than from PullAnchor because velocity is a fact every machine has
+		// (it is replicated movement) while PullAnchor is server-and-owner only — the same reason the
+		// flags drive the attach.
+		FVector WorldBack = -Pawn->GetVelocity().GetSafeNormal();
+		if (WorldBack.IsNearlyZero())
+		{
+			WorldBack = -Pawn->GetActorForwardVector();
+		}
+
+		const FVector LocalBack = Parent->GetComponentTransform().InverseTransformVectorNoScale(WorldBack).GetSafeNormal();
+		const FRotator Aim = FRotationMatrix::MakeFromZ(LocalBack).Rotator();
+
+		auto AimStream = [&](UStaticMeshComponent* Piece, float Lateral)
+		{
+			if (Piece == nullptr)
+			{
+				return;
+			}
+			const FVector Lateral3D = FVector::CrossProduct(LocalBack, FVector::UpVector).GetSafeNormal() * Lateral;
+			Piece->SetRelativeRotation(Aim);
+			Piece->SetRelativeLocation(TraceFxLoopBudget::ClampToFootprint(
+				LocalBack * TraceAbilitySetMaceFxFile::StreamTrailOffsetUU + Lateral3D));
+		};
+
+		AimStream(PullStreamA, -TraceAbilitySetMaceFxFile::StreamLateralOffsetUU);
+		AimStream(PullStreamB, +TraceAbilitySetMaceFxFile::StreamLateralOffsetUU);
+	}
+}
+
 #if !UE_BUILD_SHIPPING
+
+FString UTraceAbilitySetMace::DebugDescribeKitFx() const
+{
+	const ATraceCharacter* Pawn = ResolveFxPawn();
+
+	auto DescribePiece = [](const UStaticMeshComponent* Piece) -> FString
+	{
+		if (Piece == nullptr)
+		{
+			return TEXT("-");
+		}
+		const FVector Scale = Piece->GetComponentScale();
+		return FString::Printf(TEXT("r%.0f/l%.0fuu%s"),
+			UTraceFxShapes::RadiusUUFromShapeScale(static_cast<float>(Scale.X)),
+			UTraceFxShapes::LengthUUFromShapeScale(static_cast<float>(Scale.Z)),
+			Piece->IsVisible() ? TEXT("") : TEXT(" HIDDEN"));
+	};
+
+	const bool bLoopPlaying = (PullLoopAudio != nullptr) && PullLoopAudio->IsPlaying();
+
+	return FString::Printf(
+		TEXT("pawn=%s | flags susp=%d pull=%d | halo %s (z %.0fuu) | streamA %s streamB %s | "
+		     "MacePullLoop=%s | attached %d/%d of the §1.4 budget"),
+		*GetNameSafe(Pawn),
+		(State().Flags & TraceMaceFlags::Suspending) != 0 ? 1 : 0,
+		(State().Flags & TraceMaceFlags::Pulling) != 0 ? 1 : 0,
+		*DescribePiece(SuspendHalo),
+		(SuspendHalo != nullptr) ? SuspendHalo->GetRelativeLocation().Z : 0.0,
+		*DescribePiece(PullStreamA), *DescribePiece(PullStreamB),
+		bLoopPlaying ? TEXT("PLAYING") : ((PullLoopAudio != nullptr) ? TEXT("component but silent") : TEXT("none")),
+		DebugAttachedFxCount(), TraceFxLoopBudget::MaxPrimitivesPerPawn);
+}
+
+double UTraceAbilitySetMace::GetSuspendHaloLocalZ() const
+{
+	return (SuspendHalo != nullptr) ? SuspendHalo->GetRelativeLocation().Z : 0.0;
+}
+
+int32 UTraceAbilitySetMace::DebugAttachedFxCount() const
+{
+	int32 Count = 0;
+	Count += (SuspendHalo != nullptr) ? 1 : 0;
+	Count += (PullStreamA != nullptr) ? 1 : 0;
+	Count += (PullStreamB != nullptr) ? 1 : 0;
+	return Count;
+}
+
+bool UTraceAbilitySetMace::DebugPieceHue(const TCHAR* Piece, FLinearColor& OutHue) const
+{
+	const UMaterialInstanceDynamic* MID = nullptr;
+	float Intensity = 1.f;
+
+	if (FCString::Stricmp(Piece, TEXT("halo")) == 0)
+	{
+		MID = SuspendHaloMID;
+		Intensity = TraceAbilitySetMaceFxFile::HaloIntensity;
+	}
+	else if (FCString::Stricmp(Piece, TEXT("streamA")) == 0)
+	{
+		MID = PullStreamAMID;
+		Intensity = TraceAbilitySetMaceFxFile::StreamIntensity;
+	}
+	else if (FCString::Stricmp(Piece, TEXT("streamB")) == 0)
+	{
+		MID = PullStreamBMID;
+		Intensity = TraceAbilitySetMaceFxFile::StreamIntensity;
+	}
+
+	if (MID == nullptr || Intensity <= UE_KINDA_SMALL_NUMBER)
+	{
+		return false;
+	}
+
+	// READ BACK, not recomputed. Asking TraceAbilitySetMaceFxFile::MaceAccent() again here would be a
+	// fixture checking its own arithmetic — the whole point is to interrogate the object the renderer
+	// is actually handed. GetVectorParameterValue answers with the value SetGlow pushed.
+	FLinearColor Stored = FLinearColor::White;
+	if (!const_cast<UMaterialInstanceDynamic*>(MID)->GetVectorParameterValue(
+			FMaterialParameterInfo(TEXT("Color")), Stored))
+	{
+		return false;
+	}
+
+	// Both pieces are ADDITIVE: SetGlow folds the intensity INTO the colour for that blend, because
+	// for additive geometry brightness and colour are the same quantity. Dividing it back out is what
+	// makes the result comparable with a roster row rather than with a roster row times 0.3.
+	OutHue = FLinearColor(Stored.R / Intensity, Stored.G / Intensity, Stored.B / Intensity, 1.f);
+	return true;
+}
 
 // =================================================================================================
 // Trace.Mace.SuspendCooldownTest — DEMO 17 item 6, two arms, RED first
@@ -1438,6 +1906,696 @@ namespace TraceAbilitySetMaceFile
 		     "from the RELEASE rather than the press (probed at press + 3.5s, which a press-timed cooldown "
 		     "would already have finished). Drives the local pawn — do not batch it with another driving test."),
 		FConsoleCommandDelegate::CreateStatic(&RunSuspendCooldownTest));
+}
+
+// =================================================================================================
+// Trace.Mace.FxTest — FX §2.4's FIVE ELEMENTS, STAGED ONE AT A TIME AND MEASURED OFF LIVE OBJECTS
+//
+// ===================================================================================================
+// WHY A STAGED PARADE AND NOT AN ASSERTION SUITE
+// ===================================================================================================
+//
+// Every element of §2.4 is a thing a player SEES, and four of the five only exist for a fraction of a
+// second at a place the camera is not pointing: the embed burst is 0.22 s at a wall, the slip-stream
+// lives for the length of a pull, the halo only exists while she is hovering. A test that spawned
+// them and asked "did the pointer become non-null" would be measuring its own call, and a screenshot
+// taken at "whatever frame that turned out to be" is not evidence of anything.
+//
+// So this stages each element, holds it, reads the LIVE components back (radii off their scales,
+// audio off IsPlaying(), bursts off a world iterator) and requests a frame while it is genuinely on
+// screen — the same shape as Trace.Fx.BurstTest's parade, for the same reason.
+//
+// IT ALSO POINTS THE CAMERA. Three of the five elements are on Mace's own body, and a first-person
+// camera cannot see the body it is inside; without an observer every third-person frame is a
+// photograph of a wall. The observer is a bare transient actor used as a view target — a purely local
+// view change, so no pawn is moved and nothing the server owns is touched.
+//
+// FIXED FILENAMES (W4KitsB_Mace_*.png), so this run takes the release capture lock.
+// =================================================================================================
+
+namespace TraceAbilitySetMaceFile
+{
+	struct FMaceFxState
+	{
+		int32 Stage = 0;
+		double StageStartReal = 0.0;
+		int32 Passed = 0;
+		int32 Failed = 0;
+		int32 Shots = 0;
+
+		TWeakObjectPtr<UTraceAbilitySetMace> Mace;
+		TWeakObjectPtr<ACameraActor> Observer;
+
+		FVector Anchor = FVector::ZeroVector;
+		bool bFoundWall = false;
+		bool bSpikeSeenEmbedded = false;
+		int32 EmbedBursts = 0;
+		int32 PullPieces = 0;
+		bool bPullLoopPlaying = false;
+		int32 HaloPieces = 0;
+		int32 SpikePiecesDrawn = 0;
+		bool  bStreamsSeen = false;
+		bool  bHaloSeen = false;
+		float HaloZ1 = 0.f;
+		float HaloZ2 = 0.f;
+		int32 HaloSamples = 0;
+		float HaloZMin = 0.f;
+		float HaloZMax = 0.f;
+
+		// ---- THE HUE, READ OFF THE LIVE MIDs -------------------------------------------------
+		//
+		// Added because this parade passed nine checks on a kit whose halo and both slip-streams were
+		// wearing LAST PALETTE'S violet: it measured radii, bob, budget and audio, and never once
+		// asked what colour anything was. See UTraceAbilitySetMace::DebugPieceHue.
+		bool bHaloHueRead = false;
+		bool bStreamHueRead = false;
+		FLinearColor HaloHue = FLinearColor::White;
+		FLinearColor StreamAHue = FLinearColor::White;
+		FLinearColor StreamBHue = FLinearColor::White;
+
+		void Check(bool bCondition, const FString& What)
+		{
+			if (bCondition) { ++Passed; UE_LOG(LogTraceGame, Display, TEXT("[MACEFX]   ok   %s"), *What); }
+			else            { ++Failed; UE_LOG(LogTraceGame, Error,   TEXT("[MACEFX]   FAIL %s"), *What); }
+		}
+
+		void Advance(int32 Next) { Stage = Next; StageStartReal = FPlatformTime::Seconds(); }
+		double In() const { return FPlatformTime::Seconds() - StageStartReal; }
+	};
+
+	/**
+	 * A camera to watch her from, because a first-person view cannot see the body it is inside.
+	 *
+	 * *** ACameraActor AND NOT A BARE AActor, AND THE DIFFERENCE COST A WHOLE CAPTURE RUN. ***
+	 * AActor has NO ROOT COMPONENT, so SpawnActor's transform has nothing to write to: the actor sits
+	 * at the world origin for ever and GetActorLocation() reports (0,0,0). Made the view target, it
+	 * produced two perfectly convincing frames of the arena seen from its own centre at floor level —
+	 * a picture of somewhere nobody was, with the right HUD on it. ACameraActor has a root and a
+	 * camera component, so it goes where it is put.
+	 */
+	ACameraActor* PlaceObserver(UWorld* WorldPtr, const FVector& At, const FVector& LookAt)
+	{
+		if (WorldPtr == nullptr)
+		{
+			return nullptr;
+		}
+		FActorSpawnParameters Params;
+		Params.ObjectFlags |= RF_Transient;
+		ACameraActor* Observer = WorldPtr->SpawnActor<ACameraActor>(ACameraActor::StaticClass(), At,
+			(LookAt - At).Rotation(), Params);
+		if (Observer != nullptr)
+		{
+			if (APlayerController* PC = WorldPtr->GetFirstPlayerController())
+			{
+				PC->SetViewTargetWithBlend(Observer, 0.f);
+			}
+		}
+		return Observer;
+	}
+
+	/** Keeps the observer over her shoulder while she moves — a pull crosses the arena in a second. */
+	void FollowWithObserver(AActor* Observer, const ATraceCharacter* Pawn, float BehindUU, float UpUU)
+	{
+		if (Observer == nullptr || Pawn == nullptr)
+		{
+			return;
+		}
+		const FVector Focus = Pawn->GetActorLocation();
+		const FVector At = Focus - Pawn->GetActorForwardVector() * BehindUU
+			+ FVector::CrossProduct(Pawn->GetActorForwardVector(), FVector::UpVector) * 90.f
+			+ FVector(0.f, 0.f, UpUU);
+		Observer->SetActorLocation(At);
+		Observer->SetActorRotation((Focus - At).Rotation());
+	}
+
+	void ReleaseObserver(UWorld* WorldPtr, AActor* Observer)
+	{
+		if (APlayerController* PC = (WorldPtr != nullptr) ? WorldPtr->GetFirstPlayerController() : nullptr)
+		{
+			PC->SetViewTargetWithBlend(PC->GetPawn(), 0.f);
+		}
+		if (Observer != nullptr)
+		{
+			Observer->Destroy();
+		}
+	}
+
+	void ShootFrame(FMaceFxState& State, const TCHAR* Tag)
+	{
+		++State.Shots;
+		const FString Path = FPaths::ConvertRelativePathToFull(
+			FPaths::ProjectSavedDir() / TEXT("Screenshots")
+			/ FString::Printf(TEXT("W4KitsB_Mace_%02d_%s.png"), State.Shots, Tag));
+		FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+		UE_LOG(LogTraceGame, Display, TEXT("[MACEFX] Screenshot requested: %s"), *Path);
+	}
+
+	/** Counts live bursts of one type. The burst actor's own replication is what put them there. */
+	int32 CountBursts(UWorld* WorldPtr, ETraceFxBurstType Type)
+	{
+		int32 Count = 0;
+		for (TActorIterator<ATraceFxBurst> It(WorldPtr); It; ++It)
+		{
+			if (IsValid(*It) && It->GetBurstType() == Type)
+			{
+				++Count;
+			}
+		}
+		return Count;
+	}
+
+	/**
+	 * Turns the pawn on the spot until the SHIPPED resolver finds a wall, and returns where.
+	 *
+	 * The shipped resolver, deliberately: a fixture with its own line trace would happily find a
+	 * surface Mace's own rules refuse, and then report the ability broken for obeying them.
+	 */
+	bool AimAtAWall(UTraceAbilitySetMace* Mace, ATraceCharacter* Pawn, UWorld* WorldPtr, FVector& OutAnchor,
+	                float PreferredDistanceUU = 1500.f)
+	{
+		APlayerController* PC = (WorldPtr != nullptr) ? WorldPtr->GetFirstPlayerController() : nullptr;
+		if (Mace == nullptr || Pawn == nullptr || PC == nullptr)
+		{
+			return false;
+		}
+
+		// *** THE WALL NEAREST A CHOSEN DISTANCE, NOT THE FIRST AND NOT THE NEAREST. ***
+		//
+		// Both of the obvious rules were tried and both produced a useless run. The FIRST yaw that
+		// answers is usually the length of the arena away: a 5,748 uu rope photographs as a line
+		// converging on a vanishing point — technically the effect, visually nothing. The NEAREST is
+		// worse in the other direction: at 297 uu the pull was over in under a tenth of a second, so
+		// the slip-stream and MacePullLoop were both gone before the parade could look at them and the
+		// run reported two failures about effects that had worked perfectly.
+		//
+		// A middling wall is the one that shows both: long enough that the rope has length and the pull
+		// has duration, short enough that the spike is a thing in frame rather than a pixel.
+		FVector Normal = FVector::ZeroVector;
+		FString Why;
+		FVector BestAnchor = FVector::ZeroVector;
+		float BestDistance = 0.f;
+		float BestScore = TNumericLimits<float>::Max();
+		float BestYaw = 0.f;
+		int32 Found = 0;
+
+		for (int32 Step = 0; Step < 24; ++Step)
+		{
+			const FRotator Aim(0.f, static_cast<float>(Step) * 15.f, 0.f);
+			PC->SetControlRotation(Aim);
+			Pawn->SetActorRotation(FRotator(0.f, Aim.Yaw, 0.f));
+
+			FVector Anchor = FVector::ZeroVector;
+			if (Mace->ResolveSpikeAnchor(Anchor, Normal, Why))
+			{
+				++Found;
+				const float Distance = FVector::Dist(Pawn->GetActorLocation(), Anchor);
+				const float Score = FMath::Abs(Distance - PreferredDistanceUU);
+				if (Score < BestScore)
+				{
+					BestScore = Score;
+					BestDistance = Distance;
+					BestAnchor = Anchor;
+					BestYaw = Aim.Yaw;
+				}
+			}
+		}
+
+		if (Found == 0)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[MACEFX] no spikeable wall from here: %s"), *Why);
+			return false;
+		}
+
+		PC->SetControlRotation(FRotator(0.f, BestYaw, 0.f));
+		Pawn->SetActorRotation(FRotator(0.f, BestYaw, 0.f));
+		OutAnchor = BestAnchor;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[MACEFX] %d of 24 yaws found a wall; the one closest to the %.0f uu the parade wants is "
+			     "yaw %.0f deg at (%s), %.0f uu away."),
+			Found, PreferredDistanceUU, BestYaw, *OutAnchor.ToCompactString(), BestDistance);
+		return true;
+	}
+
+	void RunMaceFxTest()
+	{
+		UWorld* WorldPtr = FindAuthoritativeWorldForMaceV();
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[MACEFX] no authoritative game world."));
+			return;
+		}
+
+		UTraceAbilitySetMace* Mace = MakeLocalPlayerIntoMace(WorldPtr);
+		if (Mace == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[MACEFX] the local player has no ability component."));
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[MACEFX] ===== FX §2.4 parade: spike material, rope core+sleeve, embed burst, suspend "
+			     "halo, pull slip-stream + MacePullLoop ====="));
+
+		TSharedRef<FMaceFxState> State = MakeShared<FMaceFxState>();
+		State->Mace = Mace;
+		State->StageStartReal = FPlatformTime::Seconds();
+		TWeakObjectPtr<UWorld> WeakWorld(WorldPtr);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			UTraceAbilitySetMace* Kit = State->Mace.Get();
+			if (TickWorld == nullptr || Kit == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[MACEFX] the world or the kit went away mid-run."));
+				return false;
+			}
+			ATraceCharacter* Pawn = Kit->GetCharacter();
+			if (Pawn == nullptr)
+			{
+				return true;   // between respawns; the stage clock is real time and will time out
+			}
+
+			switch (State->Stage)
+			{
+			case 0:
+				// Let ServerSetCharacter build the set and the pawn settle.
+				if (State->In() > 1.0)
+				{
+					State->bFoundWall = AimAtAWall(Kit, Pawn, TickWorld, State->Anchor);
+					State->Advance(1);
+				}
+				break;
+
+			case 1:
+				// THE REAL CAST, through the real E key: the MaceSpikeThrow sound and the cooldown are
+				// both on that path, and a DebugThrowSpikeAt here would have proven the dressing while
+				// quietly skipping the sound this tranche also owns.
+				if (State->bFoundWall)
+				{
+					if (APlayerController* PC = TickWorld->GetFirstPlayerController())
+					{
+						PC->ConsoleCommand(TEXT("Trace.SimInput E 0.05"), /*bWriteToLog=*/false);
+					}
+				}
+				State->Advance(2);
+				break;
+
+			case 2:
+			{
+				const ATraceMaceSpike* Spike = Kit->GetSpike();
+				if (Spike != nullptr && Spike->IsEmbedded())
+				{
+					State->bSpikeSeenEmbedded = true;
+					State->SpikePiecesDrawn = Spike->GetDrawnPieceCount();
+					State->EmbedBursts = CountBursts(TickWorld, ETraceFxBurstType::SpikeEmbed);
+					UE_LOG(LogTraceGame, Display, TEXT("[MACEFX] spike: %s"), *Spike->DebugDescribe());
+					ShootFrame(*State, TEXT("SpikeRope"));
+					State->Advance(3);
+				}
+				else if (State->In() > 4.0)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[MACEFX] no spike embedded within 4 s (found a wall = %d)."),
+						State->bFoundWall ? 1 : 0);
+					State->Advance(3);
+				}
+				break;
+			}
+
+			case 3:
+				// ONE FRAME OF THE EMBED BURST'S TAIL, at ~0.5 s — well past its 0.22 s animation and
+				// well inside ATraceFxBurst's 1.2 s lifespan. It is here to DOCUMENT a cross-tranche
+				// defect rather than to prove this kit's work: a burst holds alpha = 1 for the rest of
+				// its life, and an opaque emissive piece written to intensity 0 renders BLACK. See the
+				// report; the fix belongs to whoever owns TraceFxBurst.cpp, not to this file.
+				if (State->In() > 0.45 && State->Shots < 2)
+				{
+					ShootFrame(*State, TEXT("SpikeEmbedTail"));
+				}
+				// The pull soon after: the embed window is MaceSpikeEmbedSeconds and a parade that
+				// dawdled would be testing the expiry instead.
+				if (State->In() > 0.60)
+				{
+					State->Observer = PlaceObserver(TickWorld,
+						Pawn->GetActorLocation() - Pawn->GetActorForwardVector() * 300.f + FVector(0.f, 0.f, 90.f),
+						Pawn->GetActorLocation());
+					Kit->RequestSpikePull();
+					State->Advance(4);
+				}
+				break;
+
+			case 4:
+			{
+				// THE OBSERVER FOLLOWS. A pull crosses hundreds of uu in the third of a second between
+				// asking for a frame and getting one; a fixed camera photographs where she WAS.
+				FollowWithObserver(State->Observer.Get(), Pawn, 300.f, 90.f);
+
+				// POLLED, for the same reason the halo is: a pull at the momentum ceiling is over in a
+				// fraction of a second, and a fixture that sampled at a fixed delay measured an ability
+				// that had already finished and called the result a defect.
+				const FString Line = Kit->DebugDescribeKitFx();
+				if (Line.Contains(TEXT("streamA r4/l140uu")) && Line.Contains(TEXT("streamB r4/l140uu")))
+				{
+					if (!State->bStreamsSeen)
+					{
+						State->bStreamsSeen = true;
+						State->PullPieces = Kit->DebugAttachedFxCount();
+						State->bStreamHueRead =
+							Kit->DebugPieceHue(TEXT("streamA"), State->StreamAHue)
+							&& Kit->DebugPieceHue(TEXT("streamB"), State->StreamBHue);
+						UE_LOG(LogTraceGame, Display, TEXT("[MACEFX] pull: %s"), *Line);
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[MACEFX] pull hue (read off the MIDs): A (%.3f,%.3f,%.3f) B (%.3f,%.3f,%.3f)"),
+							State->StreamAHue.R, State->StreamAHue.G, State->StreamAHue.B,
+							State->StreamBHue.R, State->StreamBHue.G, State->StreamBHue.B);
+						ShootFrame(*State, TEXT("PullStream"));
+					}
+					State->bPullLoopPlaying = State->bPullLoopPlaying
+						|| Line.Contains(TEXT("MacePullLoop=PLAYING"));
+				}
+
+				if (State->bStreamsSeen && !Kit->IsPulling())
+				{
+					State->Advance(5);
+				}
+				else if (State->In() > 3.0)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[MACEFX] the pull produced no slip-stream inside 3 s. Last: %s"), *Line);
+					State->Advance(5);
+				}
+				break;
+			}
+
+			case 5:
+				// THE SUSPEND IS STAGED ONLY ONCE THE PULL IS OVER, and that is not a style point: the
+				// pull owns velocity outright and StartPull() stops a suspend, so a V pressed mid-pull
+				// is refused. The first version of this parade did exactly that, read the two SLIP-STREAM
+				// pieces still attached as "the halo is up", and printed a green line about an effect
+				// that had never been attached — a fixture passing on somebody else's evidence.
+				FollowWithObserver(State->Observer.Get(), Pawn, 300.f, 90.f);
+				if (!Kit->IsPulling() && State->In() > 0.6)
+				{
+					LiftIntoTheAir(Pawn);
+					PressSecondaryKey(TickWorld, 2.5f);
+					State->Advance(6);
+				}
+				else if (State->In() > 4.0)
+				{
+					UE_LOG(LogTraceGame, Warning, TEXT("[MACEFX] the pull never ended; staging the suspend anyway."));
+					LiftIntoTheAir(Pawn);
+					PressSecondaryKey(TickWorld, 2.5f);
+					State->Advance(6);
+				}
+				break;
+
+			case 6:
+			{
+				FollowWithObserver(State->Observer.Get(), Pawn, 260.f, 40.f);
+
+				// POLLED for the HALO ITSELF, by name, so the pieces that answer cannot be somebody
+				// else's. r40 is §2.4's radius read back off the live component's scale.
+				const FString Line = Kit->DebugDescribeKitFx();
+				if (Line.Contains(TEXT("halo r40")))
+				{
+					if (!State->bHaloSeen)
+					{
+						State->bHaloSeen = true;
+						State->HaloPieces = Kit->DebugAttachedFxCount();
+						State->bHaloHueRead = Kit->DebugPieceHue(TEXT("halo"), State->HaloHue);
+						UE_LOG(LogTraceGame, Display, TEXT("[MACEFX] suspend: %s"), *Line);
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[MACEFX] halo hue (read off the MID): (%.3f,%.3f,%.3f)"),
+							State->HaloHue.R, State->HaloHue.G, State->HaloHue.B);
+						ShootFrame(*State, TEXT("SuspendHalo"));
+					}
+
+					// THE BOB IS MOTION, so it is measured as a SPREAD over many samples rather than as
+					// two readings that could both land on the same phase of a 1.2 Hz sine.
+					const float Z = static_cast<float>(Kit->GetSuspendHaloLocalZ());
+					if (State->HaloSamples == 0) { State->HaloZMin = Z; State->HaloZMax = Z; State->HaloZ1 = Z; }
+					State->HaloZMin = FMath::Min(State->HaloZMin, Z);
+					State->HaloZMax = FMath::Max(State->HaloZMax, Z);
+					State->HaloZ2 = Z;
+					++State->HaloSamples;
+				}
+
+				if (State->In() > 1.6)
+				{
+					State->Advance(7);
+				}
+				break;
+			}
+
+			case 7:
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[MACEFX] suspend halo: %d sample(s), local z %.1f .. %.1f uu (spread %.1f uu against "
+					     "the +/-4 uu §2.4 asks for), last %s"),
+					State->HaloSamples, State->HaloZMin, State->HaloZMax,
+					State->HaloZMax - State->HaloZMin, *Kit->DebugDescribeKitFx());
+
+				ReleaseObserver(TickWorld, State->Observer.Get());
+
+				UE_LOG(LogTraceGame, Display, TEXT("[MACEFX] ===== verdict ====="));
+				State->Check(State->bFoundWall, TEXT("the SHIPPED resolver found a spikeable wall to throw at"));
+				State->Check(State->bSpikeSeenEmbedded, TEXT("the spike flew and reported itself EMBEDDED"));
+				State->Check(State->SpikePiecesDrawn == 3,
+					FString::Printf(TEXT("all THREE dressed pieces are drawn on this machine — cone, rope core, "
+					                     "rope sleeve (drawn=%d of 3)"), State->SpikePiecesDrawn));
+				State->Check(State->EmbedBursts >= 1,
+					FString::Printf(TEXT("an ATraceFxBurst(SpikeEmbed) was standing at the anchor (%d)"),
+						State->EmbedBursts));
+				State->Check(State->bStreamsSeen,
+					FString::Printf(TEXT("the pull attached BOTH slip-stream cylinders at §2.4's r 4 uu / l 140 uu "
+					                     "(%d attached piece(s))"), State->PullPieces));
+				State->Check(State->bPullLoopPlaying,
+					TEXT("MacePullLoop is a PLAYING attached audio component during the pull"));
+				State->Check(State->bHaloSeen,
+					FString::Printf(TEXT("the SUSPEND attached its own halo at §2.4's r 40 uu — asked for by name, "
+					                     "not inferred from a piece count (%d attached)"), State->HaloPieces));
+				State->Check(State->HaloSamples > 3 && (State->HaloZMax - State->HaloZMin) > 1.0f,
+					FString::Printf(TEXT("*** and it BOBS: %d samples spanning %.1f uu of travel, motion rather "
+					                     "than a brightness pulse (bible §3.3) ***"),
+						State->HaloSamples, State->HaloZMax - State->HaloZMin));
+				// ---- THE HUE, ASSERTED AGAINST THE ROSTER ROW ------------------------------------
+				//
+				// *** THE CHECK THAT WAS MISSING, AND ITS ABSENCE IS WHY A STALE VIOLET LIVED HERE FOR
+				// A WHOLE WAVE. *** Everything above measures SHAPE, MOTION, COUNT and AUDIO, all of
+				// which were correct while the halo and both slip-streams drew in the pre-re-space
+				// violet — 13.2 degrees from the one on her body, which a frame cannot adjudicate
+				// because a wrong violet still looks like violet.
+				//
+				// The instrument is the shipped path in both directions: the LEFT side is read back off
+				// the live MID the renderer was handed (DebugPieceHue), and the RIGHT side is
+				// TraceCharacterRoster's row — the same table the body material is stamped from. So
+				// "these are equal" is literally "her halo and her body are the same colour".
+				{
+					FLinearColor Accent = FLinearColor::White;
+					if (const TraceCharacterRoster::FTraceCharacterEntry* Row =
+						TraceCharacterRoster::Find(static_cast<uint8>(ETraceCharacterId::Mace)))
+					{
+						Accent = FLinearColor(Row->Accent.R, Row->Accent.G, Row->Accent.B, 1.f);
+					}
+
+					auto SameHue = [&Accent](const FLinearColor& C)
+					{
+						// 1e-3 rather than 1e-4: the additive intensity is divided back out of the
+						// stored colour, so one float division of round-off is expected and 0.001 is
+						// still two orders of magnitude tighter than the 13.2-degree bug.
+						return FMath::IsNearlyEqual(C.R, Accent.R, 1e-3f)
+							&& FMath::IsNearlyEqual(C.G, Accent.G, 1e-3f)
+							&& FMath::IsNearlyEqual(C.B, Accent.B, 1e-3f);
+					};
+
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[MACEFX] Mace's LIVE roster accent: (%.3f, %.3f, %.3f)"),
+						Accent.R, Accent.G, Accent.B);
+
+					State->Check(State->bHaloHueRead && SameHue(State->HaloHue),
+						FString::Printf(TEXT("*** the SUSPEND HALO's hue IS Mace's live roster accent — "
+						                     "read off the MID (%.3f,%.3f,%.3f) vs roster (%.3f,%.3f,%.3f) ***"),
+							State->HaloHue.R, State->HaloHue.G, State->HaloHue.B,
+							Accent.R, Accent.G, Accent.B));
+					State->Check(State->bStreamHueRead && SameHue(State->StreamAHue) && SameHue(State->StreamBHue),
+						FString::Printf(TEXT("*** BOTH PULL SLIP-STREAMS' hue IS that same accent — "
+						                     "A (%.3f,%.3f,%.3f) B (%.3f,%.3f,%.3f) ***"),
+							State->StreamAHue.R, State->StreamAHue.G, State->StreamAHue.B,
+							State->StreamBHue.R, State->StreamBHue.G, State->StreamBHue.B));
+					State->Check(State->bHaloHueRead && State->bStreamHueRead
+							&& SameHue(State->HaloHue) && SameHue(State->StreamAHue),
+						TEXT("*** and therefore the halo, the streams, the spike cone, the rope and the "
+						     "embed burst are ONE hue — bible §6.2, one hue per kit ***"));
+				}
+
+				State->Check(FMath::Max3(State->PullPieces, State->HaloPieces, Kit->DebugAttachedFxCount())
+						<= TraceFxLoopBudget::MaxPrimitivesPerPawn,
+					FString::Printf(TEXT("never over the §1.4 budget: the most this kit ever had attached at once "
+					                     "was %d of %d"),
+						FMath::Max3(State->PullPieces, State->HaloPieces, Kit->DebugAttachedFxCount()),
+						TraceFxLoopBudget::MaxPrimitivesPerPawn));
+
+				UE_LOG(LogTraceGame, Display, TEXT("[MACEFX] ===== %d passed, %d failed, %d frame(s) ====="),
+					State->Passed, State->Failed, State->Shots);
+				if (State->Failed == 0)
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("[MACEFX] VERDICT: PASS"));
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Error, TEXT("[MACEFX] VERDICT: *** FAIL *** (%d)"), State->Failed);
+				}
+				return false;
+			}
+
+			default:
+				return false;
+			}
+
+			return true;
+		}), 0.05f);
+	}
+
+// =================================================================================================
+// Trace.Mace.RopeLadder — THE HUE HEADROOM, MEASURED OFF FRAMES INSTEAD OF ARGUED ABOUT
+//
+// FX §2.4 asks for the rope core at Glow 2.6 and the spike cone at 3.0. Mace's violet is
+// (0.74, 0.55, 0.99) — read live from the roster, see MaceAccent() at the top of this file — so its
+// brightest channel is 0.99 and 2.6x it is 2.57: every channel is asked to clip and the tonemapper
+// hands back white. That is what ATraceElleGate measured for ITS purple (3.5 -> pink-white, 1.0 ->
+// purple) and what ATraceFxBurst's four-rung ladder measured again for every accent in the game.
+//
+// The headroom conclusion is stated as a MULTIPLE of the brightest channel precisely so that it
+// survives an accent re-space: the pre-W6 violet was (0.65, 0.55, 1.00), brightest 1.00, and the
+// live one is brightest 0.99 — a 1% shift in where the clip starts, not a new experiment.
+//
+// Rather than inherit either answer, this shoots Mace's OWN ladder: four spikes at four headroom
+// values, thrown at the same anchor from the same place, each photographed side-on so the rope fills
+// the frame. The value that ships is whichever of those four frames actually looks violet.
+//
+// It uses DebugThrowSpikeAt rather than the E key on purpose — the ladder is about the DRESSING, and
+// four real casts would spend four cooldowns and four MaceSpikeThrow plays for nothing.
+// =================================================================================================
+
+	void RunMaceRopeLadder()
+	{
+		UWorld* WorldPtr = FindAuthoritativeWorldForMaceV();
+		UTraceAbilitySetMace* Mace = (WorldPtr != nullptr) ? MakeLocalPlayerIntoMace(WorldPtr) : nullptr;
+		if (Mace == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[MACELADDER] no authoritative world or no ability component."));
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[MACELADDER] ===== four headroom rungs, one frame each, same anchor and same camera ====="));
+
+		TSharedRef<FMaceFxState> State = MakeShared<FMaceFxState>();
+		State->Mace = Mace;
+		State->StageStartReal = FPlatformTime::Seconds();
+		TWeakObjectPtr<UWorld> WeakWorld(WorldPtr);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld](float) -> bool
+		{
+			static const float Rungs[] = { 0.50f, 0.80f, 1.40f, 2.60f };
+			constexpr int32 RungCount = UE_ARRAY_COUNT(Rungs);
+
+			UWorld* TickWorld = WeakWorld.Get();
+			UTraceAbilitySetMace* Kit = State->Mace.Get();
+			ATraceCharacter* Pawn = (Kit != nullptr) ? Kit->GetCharacter() : nullptr;
+			if (TickWorld == nullptr || Kit == nullptr || Pawn == nullptr)
+			{
+				return true;
+			}
+
+			// Stage 0: find the wall once, and put the camera BESIDE the rope rather than behind it —
+			// a rope photographed end-on is a dot.
+			if (State->Stage == 0)
+			{
+				if (State->In() < 1.0)
+				{
+					return true;
+				}
+				State->bFoundWall = AimAtAWall(Kit, Pawn, TickWorld, State->Anchor);
+				if (!State->bFoundWall)
+				{
+					UE_LOG(LogTraceGame, Error, TEXT("[MACELADDER] no wall to throw at."));
+					return false;
+				}
+
+				const FVector From = Pawn->GetActorLocation();
+				const FVector Mid = 0.5f * (From + State->Anchor);
+				const FVector Along = (State->Anchor - From).GetSafeNormal();
+				const FVector Side = FVector::CrossProduct(Along, FVector::UpVector).GetSafeNormal();
+				const float Back = FMath::Clamp(FVector::Dist(From, State->Anchor) * 0.55f, 260.f, 900.f);
+				State->Observer = PlaceObserver(TickWorld, Mid + Side * Back + FVector(0.f, 0.f, 120.f), Mid);
+				State->Advance(1);
+				return true;
+			}
+
+			const int32 Rung = (State->Stage - 1) / 2;
+			if (Rung >= RungCount)
+			{
+				ReleaseObserver(TickWorld, State->Observer.Get());
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[MACELADDER] ===== %d rung(s) photographed. Judge the FRAMES: the rung that still "
+					     "reads VIOLET at the highest brightness is the one to ship in "
+					     "TraceMaceSpikeFile::EmissiveHueHeadroom. ====="), RungCount);
+				return false;
+			}
+
+			const bool bThrowPhase = ((State->Stage - 1) % 2) == 0;
+			if (bThrowPhase)
+			{
+				// The headroom is LATCHED when a spike builds, so it has to be set BEFORE the throw —
+				// and each rung needs its own spike for the same reason.
+				if (IConsoleVariable* CVar = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Mace.VioletHeadroom")))
+				{
+					CVar->Set(Rungs[Rung], ECVF_SetByConsole);
+				}
+				Kit->DebugThrowSpikeAt(State->Anchor, UTraceSettings::Get().MaceSpikeTravelSpeed);
+				State->Advance(State->Stage + 1);
+				return true;
+			}
+
+			if (State->In() < 0.45)
+			{
+				return true;
+			}
+
+			const ATraceMaceSpike* Spike = Kit->GetSpike();
+			UE_LOG(LogTraceGame, Display, TEXT("[MACELADDER] headroom %.2f -> %s"),
+				Rungs[Rung], Spike != nullptr ? *Spike->DebugDescribe() : TEXT("no spike"));
+			++State->Shots;
+			const FString Path = FPaths::ConvertRelativePathToFull(
+				FPaths::ProjectSavedDir() / TEXT("Screenshots")
+				/ FString::Printf(TEXT("W4KitsB_Ladder_%02d_headroom%03d.png"),
+					State->Shots, FMath::RoundToInt(Rungs[Rung] * 100.f)));
+			FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+			UE_LOG(LogTraceGame, Display, TEXT("[MACELADDER] Screenshot requested: %s"), *Path);
+
+			State->Advance(State->Stage + 1);
+			return true;
+		}), 0.05f);
+	}
+
+	FAutoConsoleCommand CmdMaceRopeLadder(
+		TEXT("Trace.Mace.RopeLadder"),
+		TEXT("Four spikes at four Trace.Mace.VioletHeadroom values, same anchor, same side-on camera, one "
+		     "frame each — so the rope's hue is chosen from photographs rather than from the recipe's "
+		     "number. Drives the local pawn and writes FIXED filenames; take the capture lock."),
+		FConsoleCommandDelegate::CreateStatic(&RunMaceRopeLadder));
+
+	FAutoConsoleCommand CmdMaceFxTest(
+		TEXT("Trace.Mace.FxTest"),
+		TEXT("FX §2.4, staged and photographed: throws a real spike at a real wall, reads the spike's three "
+		     "dressed pieces back off the live components, counts the SpikeEmbed burst, then pulls and "
+		     "suspends and measures the attached slip-stream, halo and MacePullLoop. Drives the local pawn "
+		     "and writes FIXED filenames — take the capture lock, and do not batch it with another driving test."),
+		FConsoleCommandDelegate::CreateStatic(&RunMaceFxTest));
 }
 
 #endif   // !UE_BUILD_SHIPPING

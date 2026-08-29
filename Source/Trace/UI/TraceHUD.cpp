@@ -20,9 +20,10 @@
 #include "Gameplay/TraceMelee.h"          // v10 §1 — the equipped-weapon row and its two timers
 #include "Gameplay/TraceParry.h"          // v6 §3 — the parry-kill banner and the death-panel line
 #include "Gameplay/TraceWeaponComponent.h" // v16 §1/§2 — the ammo block reads the clip through this
-// v16 §2 — the status stack. Six statuses live on four different owners, so the corner has to ask
-// four different objects; every one of these is a READ of an accessor that slice already published
-// for the HUD, and nothing here writes gameplay state.
+// v16 §2 — the status stack. ELEVEN statuses now (six from v16 §2, plus FX/AUDIO plan §7.3's five:
+// MODDED, CLOAKED, STUCK, ZIP and the slimewall half of SLOWED), living on eight different owners,
+// so the corner has to ask eight different objects; every one of these is a READ of an accessor that
+// slice already published for the HUD, and nothing here writes gameplay state.
 #include "Abilities/TraceAbilityComponent.h"
 #include "Abilities/TraceCharacterAbilitySet.h"
 #include "Abilities/Characters/TraceAbilitySetChut.h"   // Chud
@@ -30,8 +31,21 @@
 #include "Abilities/Characters/TraceAbilitySetRocco.h"  // the headshot speed stack
 #include "Abilities/Characters/TraceAbilitySetX.h"      // v16 §1 — the bee clip's loaded size
 #include "Abilities/Characters/TraceOysterPoison.h"     // poisoned + slowed
+// FX/AUDIO plan §7.3 — the five status chips the coverage matrix (code-abilities §6) was missing.
+// Each is one accessor on the character's own set, exactly as the four above are.
+#include "Abilities/Characters/TraceAbilitySetElle.h"      // CLOAKED, and the §2.5 owner vignette
+#include "Abilities/Characters/TraceAbilitySetLily.h"      // ZIP
+#include "Abilities/Characters/TraceAbilitySetRoxie.h"     // MODDED
+#include "Abilities/Characters/TraceAbilitySetSlimeball.h" // STUCK
+#include "Abilities/Characters/TraceSlimewall.h"           // the wall's own slow, for the SLOWED chip
+// FX/AUDIO plan §5.7 / §7.1 / §7.4 — the ambience and stinger call sites, UIDeny, ShieldBlock.
+#include "Audio/TraceAudio.h"
+#include "Audio/TraceMusicPlayer.h"
+#include "Audio/TraceSoundEvents.h"
+#include "Sound/SoundBase.h"                 // USoundBase::GetDuration — the results bed's own timing
 #include "Containers/Ticker.h"                          // FTSTicker — the v16 §2 shot sequence
 #include "HAL/PlatformFileManager.h"                    // the screenshot directory
+#include "Modes/TracePracticeRange.h"     // WP1 — THE practice predicate; never ask the game-mode class
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Core/TraceCharacterRoster.h"    // v14 §3 — the accent colour and the ability's name
 #include "Settings/TraceUserSettings.h"   // v14 §5 — the ability's bound key, if the input slice has one
@@ -132,6 +146,34 @@ namespace TraceHUDStyle
 	static const FLinearColor Ink        (0.95f, 0.96f, 1.00f, 1.00f);
 	static const FLinearColor InkDim     (0.68f, 0.72f, 0.78f, 1.00f);
 	static const FLinearColor PanelFill  (0.02f, 0.03f, 0.05f, 0.72f);
+	/**
+	 * The top score panel ONLY (bible §7.2), and it is now OPAQUE. Every other panel keeps PanelFill —
+	 * they sit over darker ground or exist for a moment, and a heavier scrim everywhere would deaden
+	 * the HUD.
+	 *
+	 * ---------------------------------------------------------------------------------------------
+	 * 0.72 -> 0.86 -> 1.0, AND THE THIRD STEP IS THE ONE THAT FINISHES IT
+	 * ---------------------------------------------------------------------------------------------
+	 * The visual audit measured the bleed as a LUMINANCE SPREAD across the panel's top band over
+	 * comparably bright arena geometry — p95 minus p5, in output bytes — and got 57.7 at alpha 0.72
+	 * (crop_scorebar.png). The lift to 0.86 halved it to 34.0, and the QA pass photographed what 34
+	 * still looks like: "the bright structure behind the panel reads as a pale grey rectangle stuck
+	 * inside its left third" (crop_scorepanel_now.png). Halved was not fixed.
+	 *
+	 * The arithmetic says why, and says where this ends. What survives the scrim is (1 - alpha) times
+	 * the world's own spread behind it, and 34.0 / 0.14 puts that world spread at about 243 — this
+	 * arena's white walkways against its black floor, which is very nearly the whole range there is.
+	 * So every remaining tenth of alpha buys 24 bytes of contrast back, and the only value that
+	 * reaches zero is 1.0. At 0.96 the residual would still be ~10, which is visible as a grey smudge
+	 * on a white wall; there is no defensible stopping point short of opaque.
+	 *
+	 * WHAT IT COSTS, STATED PLAINLY: the arena is no longer faintly visible behind the score bar. That
+	 * is 240 x 74 reference pixels of a 1920 x 1080 screen, at the top centre, where nothing is ever
+	 * shot — and this is the ONE panel that always has bright world behind it, which is the whole
+	 * reason it is the only one that gets this treatment. FTraceCharacterSelect's backdrop made the
+	 * same call for the same measured reason and its comment is worth reading beside this one.
+	 */
+	static const FLinearColor TopPanelFill(0.02f, 0.03f, 0.05f, 1.00f);
 	static const FLinearColor PanelBorder(0.55f, 0.62f, 0.72f, 0.35f);
 	static const FLinearColor Trough     (0.06f, 0.07f, 0.09f, 0.85f);
 	static const FLinearColor Shadow     (0.00f, 0.00f, 0.00f, 0.55f);
@@ -140,16 +182,49 @@ namespace TraceHUDStyle
 	/** Headshot hitmarker. Hot amber: distinct from both the white body tick and the red kill tick. */
 	static const FLinearColor Warning    (1.00f, 0.78f, 0.20f, 1.00f);
 
+	/**
+	 * SHIELD WHITE (bible §2.4) — the Core carrier's shield, and the ONE colour on this HUD that
+	 * means "your bullet was refused". FX/AUDIO plan §7.4.
+	 *
+	 * Cooler and cleaner than the ordinary white body tick on purpose, but the colour is the SECOND
+	 * signal: the blocked marker is a different SHAPE (a "+" of four axis-aligned ticks against the
+	 * damage marker's diagonal "X"), because a player who cannot separate two whites still has to be
+	 * able to tell "I hit them" from "I hit their shield".
+	 */
+	static const FLinearColor ShieldWhite(0.90f, 0.95f, 1.00f, 1.00f);
+
+	/**
+	 * ELLE'S CLOAK, for the owner-only screen-edge band (FX/AUDIO plan §2.5).
+	 *
+	 * Deliberately NOT one of TraceHUDStatusStyle's six status hues: those live in the bottom-right
+	 * corner as chips, this is a wash over the whole frame, and the two must not be confusable. It
+	 * is the cloak's own pale blue-grey from the bible, drawn at alpha 0.10 and no higher — an
+	 * indicator that Elle can see through, not a filter she has to play behind.
+	 */
+	static const FLinearColor Cloak      (0.60f, 0.70f, 0.85f, 1.00f);
+
 	// Shared geometry for the top-centre score panel. The Core banner hangs directly off the
 	// bottom of it, so both passes read these rather than repeating literals.
+	//
+	// 74, down from 92 (visual audit §4.6): the panel carried a ~40% dead band under the footer.
+	// Everything that hangs off the bottom edge — mercy warning, Core banner, kill-feed default —
+	// derives from TopPanelY + TopPanelH and follows automatically; the footer keeps its
+	// PanelH - 22 baseline, verified to clear the clock at UIScale 0.6 (720p).
 	static constexpr float TopPanelY = 14.f;
 	static constexpr float TopPanelW = 520.f;
-	static constexpr float TopPanelH = 92.f;
+	static constexpr float TopPanelH = 74.f;
 	static constexpr float BannerGap = 10.f;
 
 	/** Hit-marker fade-out windows, in seconds. */
 	static constexpr float HitMarkerDuration = 0.35f;
 	static constexpr float KillMarkerDuration = 0.60f;
+
+	/**
+	 * The SHIELD-BLOCKED marker (FX/AUDIO plan §7.4). Shorter than a real hit's 0.35 s, and it does
+	 * not grow: the two together are what stop a refused shot from feeling like a landed one. A
+	 * blocked shot is information, not a reward, and it must not be given the reward's animation.
+	 */
+	static constexpr float ShieldMarkerDuration = 0.25f;
 
 	/** Match clock turns red inside this many seconds. */
 	static constexpr float ClockUrgentSeconds = 30.f;
@@ -744,6 +819,26 @@ void ATraceHUD::BeginPlay()
 	// was up and gameplay input was still live — the player would be walking around behind it.
 	WireCharacterSelect();
 
+	// ---- FX/AUDIO plan §5.7 — THE MATCH AMBIENCE ------------------------------------------------
+	//
+	// W2-AUDIOBANK landed UTraceMusicSubsystem one wave ahead of its call sites; this is one of the
+	// two the plan names (the other, MusicTitle on the menu HUD, is W3-UISETTINGS's).
+	//
+	// UNCONDITIONAL AND UNGUARDED, WHICH IS SAFE BY THE SUBSYSTEM'S OWN CONTRACT: Get() returns null
+	// on a dedicated server (no audio device, no HUD there anyway) and Play() is a no-op when the
+	// track is already the playing one. So a map restart, a half-time travel, or a second HUD built
+	// after a seamless travel all re-run this line and none of them restarts the music — which is
+	// exactly the case a "have I started it yet?" bool would get wrong the first time somebody
+	// forgot to clear it. It is a GAME-INSTANCE subsystem, so the track survives the travel that
+	// destroyed this HUD.
+	//
+	// Menu -> match is therefore a CROSS-FADE, not a cut: MusicTitle is still playing when this
+	// runs, and Play() fades one into the other over its default 0.8 s.
+	if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(this))
+	{
+		Music->Play(TraceSoundEvents::AmbienceMatch);
+	}
+
 #if !UE_BUILD_SHIPPING
 	TraceAutoShot::Arm(this, TEXT("Match"));
 	// -TraceExec="a|b" -TraceExecAt=<sec>: run the in-match verification commands headlessly. See
@@ -874,6 +969,13 @@ void ATraceHUD::DrawHUD()
 	DrawnChargeRingAlpha = -1.f;
 	DrawnChargeRingSegments = 0;
 	bDrewChargeBar = false;
+
+	// The FX plan §7 half of the record, cleared with the rest and for the same reason.
+	bDrewHitMarker = false;
+	bDrewShieldBlockedMarker = false;
+	DrawnToastText.Reset();
+	DrawnSecondaryRowText.Reset();
+	DrawnVignettes.Reset();
 #endif
 
 	// Escape raises the pause menu. Polled rather than bound for the same reason the overlay itself
@@ -932,6 +1034,11 @@ void ATraceHUD::DrawHUD()
 	const bool bPostMatch = (TraceGS != nullptr) && (TraceGS->TraceMatchState == ETraceMatchState::PostMatch);
 	if (!bPostMatch)
 	{
+		// UNDER EVERYTHING ELSE, and that ordering is the whole reason it is safe to draw over the
+		// play area at all: Canvas is immediate mode, so the band goes down before the crosshair,
+		// the reticle and every panel, and none of them is tinted by it. FX plan §2.5/§2.6.
+		DrawOwnerVignettes();
+
 		// Before any pass draws: the crosshair and the pass ring have to sit on the same pixel, and
 		// the pass-target probe has to run exactly once per frame.
 		UpdateReticleAnchor();
@@ -1891,7 +1998,7 @@ namespace TraceHUDThrowRings
 		0,
 		TEXT("SPEC v28 §7. 1: screenshot the first frame the red auto-release ring is drawn, and again "
 		     "the first frame it is past a third full. bShowUI, because both rings are Canvas HUD."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/** 1 logs, at 4 Hz, the two rings' numbers side by side. Evidence that the red one is not local. */
 	static TAutoConsoleVariable<int32> CVarLog(
@@ -1900,7 +2007,7 @@ namespace TraceHUDThrowRings
 		TEXT("SPEC v28 §7. 1: log the green ring's PREDICTED charge alpha and the red ring's REPLICATED "
 		     "auto-release alpha together, at 4 Hz. A red ring that moves while the server's stamp is "
 		     "absent would show up here as alpha with no stamp."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	/** Draw-record: the CHORDS emitted, not the alpha requested. Read by Trace.HUD.ThrowRings.Report. */
 	static int32 LastChords = 0;
@@ -1925,7 +2032,13 @@ namespace TraceHUDThrowRings
 				TEXT("chords emitted %d of %d. Window %.2fs (Trace.ModeB.ThrowAutoReleaseSeconds; 0 = off)."),
 				EverDrawnFrames, LastAlpha, LastChords, Segments,
 				ATraceCore::GetThrowAutoReleaseSeconds());
-		}));
+		}),
+		// W9-SHIPGUARD: cheat-flagged with CVarShot and CVarLog above, so the whole §7 capture rig
+		// answers to one policy. Inert outside Shipping (DISABLE_CHEAT_CVARS is 0 in Development), so
+		// Demo() below still reaches it through PC->ConsoleCommand on every dev run; in a Shipping
+		// build Demo() is already inert anyway, because the Trace.Verif.GrantCore it depends on is
+		// compiled out of that target.
+		ECVF_Cheat);
 
 	static bool bShotAppeared = false;
 	static bool bShotFilling = false;
@@ -2302,6 +2415,103 @@ void ATraceHUD::DrawThrowChargeRing()
 #endif
 }
 
+FString ATraceHUD::ActionKeyLabel(const TCHAR* ConfigId, const TCHAR* Fallback)
+{
+	// BY THE STABLE CONFIG ID, never by index into ETraceInputAction: the enum is the input slice's
+	// and is free to grow. An action this build does not have simply is not found, and the caller's
+	// documented default is printed — which is what the ability row did before this was extracted,
+	// so behaviour is unchanged at every existing call site.
+	for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+	{
+		if (FCString::Stricmp(Info.ConfigId, ConfigId) == 0)
+		{
+			const FKey BoundKey = UTraceUserSettings::Get().GetKey(Info.Action);
+			if (BoundKey.IsValid())
+			{
+				return BoundKey.GetDisplayName(/*bLongDisplayName=*/false).ToString().ToUpper();
+			}
+			break;
+		}
+	}
+	return FString(Fallback);
+}
+
+// ===================================================================================================
+// FX/AUDIO PLAN §7.1 — THE REFUSAL TOAST, HUD SIDE (closes F3)
+// ===================================================================================================
+
+void ATraceHUD::ShowAbilityToast(const FText& Text, const FLinearColor& Tint, float Seconds)
+{
+	if (Text.IsEmpty())
+	{
+		// An empty chip is worse than no chip: it is a box with nothing in it, which reads as a bug.
+		// The producers already refuse to raise a wordless refusal; this is the second line of that
+		// same defence, here so it holds for every future caller too.
+		return;
+	}
+
+	ToastText = Text;
+	ToastTint = Tint;
+	ToastSeconds = FMath::Max(0.2f, Seconds);
+
+	// The WORLD's time, not the last drawn frame's: ShowAbilityToast is called from an input path,
+	// which can happen between draws, and dating the toast from a stale Now would eat part of it.
+	const UWorld* World = GetWorld();
+	ToastStartTime = (World != nullptr) ? World->GetTimeSeconds() : ToastStartTime;
+
+	// UIDeny, rate-limited HERE and only here (see the header). 0.5 s is the plan's number and it is
+	// roughly two presses of a mashed key: fast enough that a deliberate second press is still
+	// answered, slow enough that a held key is not a drone.
+	if (ToastStartTime - LastToastSoundTime >= 0.5f)
+	{
+		LastToastSoundTime = ToastStartTime;
+		TraceAudio::PlayLocal2D(this, TraceSoundEvents::UIDeny);
+	}
+
+	UE_LOG(LogTraceGame, Verbose, TEXT("[Toast] %s"), *ToastText.ToString());
+}
+
+void ATraceHUD::DrawAbilityToast(float TopY, float Margin, float RowH)
+{
+	if (ToastText.IsEmpty())
+	{
+		return;
+	}
+
+	const float Age = Now - ToastStartTime;
+	if (Age < 0.f || Age > ToastSeconds)
+	{
+		return;
+	}
+
+	// 0.3 s of fade at the END, so the chip is at full strength for the part of its life a player is
+	// actually reading it. A chip that fades from the first frame is a chip that is never quite
+	// legible, which is the failure mode of every "subtle" toast.
+	constexpr float FadeSeconds = 0.3f;
+	const float Alpha = FMath::Clamp((ToastSeconds - Age) / FadeSeconds, 0.f, 1.f);
+
+	const FString Label = ToastText.ToString();
+	const float ChipH = FMath::Max(RowH * 1.8f, 20.f * UIScale);
+	const float PadX = 10.f * UIScale;
+	const float ChipW = MeasureWidth(Label, FontSmall, UIScale) + PadX * 2.f;
+
+	// Sat directly on top of the ability row, sharing its left edge: the refusal is ABOUT that row,
+	// and a message that appeared somewhere else on screen would make the player look for what it
+	// referred to. 6 px of air so the two read as two things.
+	const float ChipY = TopY - ChipH - (6.f * UIScale);
+
+	DrawPanel(Margin, ChipY, ChipW, ChipH,
+		TraceHUDStyle::WithAlpha(TraceHUDStyle::PanelFill, TraceHUDStyle::PanelFill.A * Alpha),
+		TraceHUDStyle::WithAlpha(ToastTint, 0.75f * Alpha));
+
+	DrawTextLeft(Label, TraceHUDStyle::WithAlpha(ToastTint, Alpha),
+		Margin + PadX, VCenterTextY(Label, FontSmall, UIScale, ChipY, ChipH), FontSmall, UIScale);
+
+#if !UE_BUILD_SHIPPING
+	DrawnToastText = Label;
+#endif
+}
+
 void ATraceHUD::DrawHitMarker()
 {
 	if (TracePC == nullptr)
@@ -2309,8 +2519,28 @@ void ATraceHUD::DrawHitMarker()
 		return;
 	}
 
+	// ---- FX/AUDIO plan §7.4 — THE BLOCKED MARKER IS A DIFFERENT MARKER ------------------------
+	//
+	// RESTRUCTURE C5 put the fact on the wire (ClientNotifyHit's third argument) and parked it on the
+	// controller; this is its only consumer. A resolve that dealt 0 to a shielded Core carrier used
+	// to draw the ordinary white "I hurt them" X, which is the code-gameplay F2 finding: the shooter
+	// is told they are winning a fight they are not in.
+	//
+	// *** HOW OFTEN IT CAN ACTUALLY FIRE TODAY, STATED PLAINLY SO NOBODY READS THIS AS DEAD CODE. ***
+	// W3-RESTR-C MEASURED that UTraceLagCompensationComponent::ResolveHitscan skips a shielded
+	// carrier as a candidate outright, so an ordinary bullet at a carrier produces no confirmation
+	// at all and this branch is reached only when the shield goes up BETWEEN the resolve and the
+	// damage — a real race, but a narrow one. The melee path refuses the same way one step earlier
+	// (TraceWeaponComponent.cpp's `else if (Hit.bBlockedByCarrierShield)` deliberately notifies
+	// nothing). Both producers live in files this pass does not own; the exact two-line patches are
+	// in the W4-FXHUD report and in known-limitations item 10. The DRAW is finished and correct, and
+	// the day either producer lands it lights up with no edit here.
+	const bool bShieldBlocked = TracePC->WasLastHitMarkerShieldBlocked();
+
 	const bool bKill = TracePC->WasLastHitMarkerAKill();
-	const float Duration = bKill ? TraceHUDStyle::KillMarkerDuration : TraceHUDStyle::HitMarkerDuration;
+	const float Duration = bShieldBlocked
+		? TraceHUDStyle::ShieldMarkerDuration
+		: (bKill ? TraceHUDStyle::KillMarkerDuration : TraceHUDStyle::HitMarkerDuration);
 
 	// GetLastHitMarkerTime() is client-local world time, set by ClientNotifyHit. It starts at a
 	// large negative sentinel, so Age is enormous until the server first confirms a hit.
@@ -2321,14 +2551,63 @@ void ATraceHUD::DrawHitMarker()
 	}
 
 	// Fade out, and expand very slightly so the pop still reads at high frame rates.
+	//
+	// *** THE BLOCKED MARKER DOES NOT GROW (§7.4). *** The grow is the "that connected" punch, and
+	// giving it to a shot that dealt nothing is the same lie the shape and the colour are being
+	// changed to stop telling.
 	const float Alpha = 1.f - (Age / Duration);
-	const float Grow = 1.f + (1.f - Alpha) * 0.35f;
+	const float Grow = bShieldBlocked ? 1.f : (1.f + (1.f - Alpha) * 0.35f);
 
 	const float CX = ViewW * 0.5f;
 	const float CY = ViewH * 0.5f;
 	const float Inner = 6.f * UIScale * Grow;
 	const float Outer = 14.f * UIScale * Grow;
 	const float Thickness = FMath::Max(1.f, 2.5f * UIScale);
+
+	if (bShieldBlocked)
+	{
+		// FOUR TICKS ROTATED 45° — a "+", where a hit is an "X". Nothing else on this HUD draws a
+		// plus at the crosshair, so the two are told apart in a single frame of a screenshot, at any
+		// size, by anybody.
+		//
+		// Kill ticks and zone colours are deliberately NOT consulted: a blocked shot has no zone
+		// worth reporting (nothing was damaged) and cannot have killed. Colour is shield white and
+		// only shield white.
+		const FLinearColor BlockedColor = TraceHUDStyle::WithAlpha(TraceHUDStyle::ShieldWhite, Alpha);
+		DrawLine(CX, CY - Outer, CX, CY - Inner, BlockedColor, Thickness);
+		DrawLine(CX, CY + Inner, CX, CY + Outer, BlockedColor, Thickness);
+		DrawLine(CX - Outer, CY, CX - Inner, CY, BlockedColor, Thickness);
+		DrawLine(CX + Inner, CY, CX + Outer, CY, BlockedColor, Thickness);
+
+		// THE SOUND, ON THE ARRIVAL EDGE AND NOWHERE ELSE. This pass runs for every frame of the
+		// 0.25 s the marker is up, so the timestamp the marker is dated by IS the event: it changes
+		// exactly once per confirmation. Playing per frame would be a buzz; playing from the RPC
+		// would be in a file this pass does not own.
+		//
+		// *** THE OTHER HALF OF THE SWAP IS ONE LINE THIS PASS CANNOT WRITE. ***
+		// ATracePlayerController::ClientNotifyHit still plays Bodyshot/Headshot unconditionally, so a
+		// blocked confirmation currently plays BOTH. Suppressing it is
+		// `if (!bShieldBlocked) { TraceAudio::Play(this, ...Bodyshot); }` at that one call site, in
+		// TracePlayerController.cpp — W4-SHOTS's file this wave. Written up verbatim in the
+		// W4-FXHUD report; the sound is produced HERE precisely so that when that guard lands it is
+		// pure suppression and there is still exactly one ShieldBlock call site.
+		const float MarkerTime = TracePC->GetLastHitMarkerTime();
+		if (!FMath::IsNearlyEqual(MarkerTime, LastShieldBlockSoundMarkerTime))
+		{
+			LastShieldBlockSoundMarkerTime = MarkerTime;
+			TraceAudio::PlayLocal2D(this, TraceSoundEvents::ShieldBlock);
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("[ShieldBlock] HUD drew the blocked marker (+, shield white, %.2fs) and played "
+				     "ShieldBlock for the confirmation at t=%.3f."),
+				TraceHUDStyle::ShieldMarkerDuration, MarkerTime);
+		}
+
+#if !UE_BUILD_SHIPPING
+		bDrewHitMarker = true;
+		bDrewShieldBlockedMarker = true;
+#endif
+		return;
+	}
 
 	// Spec §6 made damage positional, so the FEEDBACK has to be positional too — otherwise the
 	// player has no way to learn the difference between a 100 and a 25. Kill still wins the colour
@@ -2355,6 +2634,10 @@ void ATraceHUD::DrawHitMarker()
 	DrawLine(CX + Inner, CY - Inner, CX + Outer, CY - Outer, Color, Thickness);
 	DrawLine(CX - Outer, CY + Outer, CX - Inner, CY + Inner, Color, Thickness);
 	DrawLine(CX + Inner, CY + Inner, CX + Outer, CY + Outer, Color, Thickness);
+
+#if !UE_BUILD_SHIPPING
+	bDrewHitMarker = true;
+#endif
 
 	// A head hit gets a second, larger ring of ticks: an unmistakable different SHAPE, so it reads
 	// even for a player who cannot separate the two colours.
@@ -2432,6 +2715,89 @@ void ATraceHUD::DrawHealthAndDash()
 	float RowY = HealthY - (14.f * UIScale) - RowH;
 
 	const FLinearColor TeamTint = TraceTeamColor(LocalTeam);
+
+	// ---- WP6.1 — the scrim under the whole block ------------------------------------------------
+	//
+	// This corner was the ONE block of HUD text sitting on the raw world (bible §7.2: "text never
+	// sits on raw world"), and over a lit walkway the labels simply vanished (visual audit §4.6,
+	// v23integ_31_dash.png). The panel has to be drawn FIRST, under everything — so the union of
+	// what the rows below will draw is computed up front by evaluating the same conditions the row
+	// draws use. Every probe is a const read of state that cannot change within this frame, so
+	// asking twice (once here, once at the row) cannot disagree with itself.
+	{
+		int32 PlannedRows = 0;
+		if (LocalChar != nullptr && LocalChar->IsAlive())
+		{
+			++PlannedRows;   // weapon row
+		}
+		if (!TraceHUDV16::IsArmed())
+		{
+			ATraceCore* const ChargeCore = (TraceGS != nullptr) ? TraceGS->Core : nullptr;
+			if (ChargeCore != nullptr && ChargeCore->IsThrowCharging())
+			{
+				++PlannedRows;   // throw-charge row (red-arm builds only)
+			}
+		}
+		if (bLocalCarrying && LocalChar != nullptr)
+		{
+			float ParryRemaining = 0.f, ParryTotal = 0.f;
+			bool bParryActive = false;
+			if (LocalChar->GetParryHudState(ParryRemaining, ParryTotal, bParryActive))
+			{
+				++PlannedRows;   // parry row
+			}
+		}
+		{
+			FTraceDashHudState Dash;
+			if (TracePC->GetDashHudState(Dash))
+			{
+				++PlannedRows;   // dash pips
+			}
+		}
+		if (const UTraceCharacterMovementComponent* const TraceMove = (LocalChar != nullptr)
+				? Cast<UTraceCharacterMovementComponent>(LocalChar->GetCharacterMovement())
+				: nullptr)
+		{
+			if (TraceMove->IsSlideJumpAvailable())
+			{
+				++PlannedRows;   // slide-jump window
+			}
+		}
+		if (LocalPS != nullptr && LocalPS->HasCharacter())
+		{
+			++PlannedRows;   // ability row — the one row that draws through death by design
+		}
+
+		// FX plan §7.2's V row is HALF height, so it cannot be counted as a row — it is measured and
+		// added to the block height directly. Same discipline as every probe above it: a const read
+		// of state that cannot change within this frame, asked here and again at the row.
+		float PlannedVRowH = 0.f;
+		float PlannedVRowAdvance = 0.f;
+		const float ExtraVRowHeight = IsSecondaryRowUp(PlannedVRowH, PlannedVRowAdvance, RowH)
+			? PlannedVRowAdvance
+			: 0.f;
+
+		const bool bHealthDraws = (LocalChar != nullptr) && (LocalChar->Health != nullptr);
+
+		// Nothing will draw at all (mode A with no pawn, pre-pick) — no rows means no scrim.
+		if (PlannedRows > 0 || bHealthDraws)
+		{
+			// Each row above the first advances the cursor by exactly RowH + RowGap (the ability
+			// row's own return step is the same 8 * UIScale gap), so the top of the block is
+			// arithmetic. The bottom is the health bar even on a frame where it does not draw:
+			// a scrim whose bottom edge flickered with death would be worse than the dead strip.
+			const float BlockTop = (PlannedRows > 0)
+				? RowY - static_cast<float>(PlannedRows - 1) * (RowH + RowGap) - ExtraVRowHeight
+				: HealthY;
+			const float BlockBottom = HealthY + HealthH;
+
+			// 134 reference px past the meters covers the right-hand row captions ("PICKLER 14.4").
+			DrawPanel(Margin - (14.f * UIScale), BlockTop - (10.f * UIScale),
+				LabelW + BarW + (134.f * UIScale),
+				(BlockBottom - BlockTop) + (20.f * UIScale),
+				TraceHUDStyle::PanelFill, TraceHUDStyle::PanelBorder);
+		}
+	}
 
 	// ---- Equipped weapon (spec v10 §1) ----------------------------------------------------------
 	//
@@ -2718,6 +3084,14 @@ void ATraceHUD::DrawHealthAndDash()
 	// frame. See DrawAbilityRow().
 	RowY = DrawAbilityRow(RowY, Margin, BarW, RowH, LabelW, TeamTint);
 
+	// ---- FX/AUDIO plan §7.1 — the refusal toast, directly above the ability row -----------------
+	//
+	// OUTSIDE the scrim planned above, and on purpose: the toast brings its own scrim (it has to,
+	// because it appears and disappears in under two seconds and a block that grew and shrank with
+	// it would make the whole stack jump). It is the only element in this corner that is allowed to
+	// move the block's apparent top edge, because it is the only one that is momentary.
+	DrawAbilityToast(RowY, Margin, RowH);
+
 	// ---- Health -----------------------------------------------------------------------------
 	if (const UTraceHealthComponent* HealthComp = (LocalChar != nullptr) ? LocalChar->Health.Get() : nullptr)
 	{
@@ -2768,6 +3142,18 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 	const uint8 CharacterId = LocalPS->GetSelectedCharacter();
 	const TraceCharacterRoster::FTraceCharacterEntry* const Entry = TraceCharacterRoster::Find(CharacterId);
 
+	// Hoisted from its old home halfway down this function: the V row below wears the same accent,
+	// and the two rows sharing one definition of "this character's colour" is the point — they are
+	// one block on screen and a player reads them as one thing.
+	const FLinearColor Accent = (Entry != nullptr) ? Entry->Accent : TeamTint;
+
+	// ---- FX/AUDIO plan §7.2 — THE V ROW, DRAWN FIRST SO IT LANDS *UNDER* THE E ROW --------------
+	//
+	// See DrawSecondaryCooldownRow(): the stack grows upward, so the slot this function was about to
+	// use is the one below where the E row will end up. Everything already drawn (weapon, dash,
+	// slide, parry) is untouched.
+	RowY = DrawSecondaryCooldownRow(RowY, Margin, BarW, RowH, LabelW, Accent);
+
 	const float Remaining = LocalPS->GetActivatedCooldownRemaining();
 	const bool  bReady    = (Remaining <= TraceHUDStyle::TimeEpsilon);
 
@@ -2786,28 +3172,16 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 	// moment that slice appends an "Ability" action to ETraceInputAction this row starts printing
 	// whatever the player actually bound — and until then it prints the documented default. A HUD
 	// that hardcodes a key is a HUD that lies to the first player who rebinds it.
-	FString KeyLabel(TEXT("E"));
-	for (const FTraceInputActionInfo& Info : TraceInputActions::All())
-	{
-		if (FCString::Stricmp(Info.ConfigId, TEXT("Ability")) == 0)
-		{
-			const FKey BoundKey = UTraceUserSettings::Get().GetKey(Info.Action);
-			if (BoundKey.IsValid())
-			{
-				KeyLabel = BoundKey.GetDisplayName(/*bLongDisplayName=*/false).ToString().ToUpper();
-			}
-			break;
-		}
-	}
-
-	const FString Label = FString::Printf(TEXT("[%s]"), *KeyLabel);
+	// EXTRACTED to ATraceHUD::ActionKeyLabel — the identical loop existed three times once the
+	// refusal toast needed to print the same key this row prints. Same lookup, same fallback.
+	const FString Label = FString::Printf(TEXT("[%s]"), *ActionKeyLabel(TEXT("Ability"), TEXT("E")));
 	DrawTextLeft(Label, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
 		Margin, VCenterTextY(Label, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 
 	// Ready pulses in the character's own accent colour; charging is a dim version of it. The accent
 	// rather than the team tint, matching the select screen — the player learned the colour there and
-	// it is the one thing on this HUD that says WHICH character they are.
-	const FLinearColor Accent = (Entry != nullptr) ? Entry->Accent : TeamTint;
+	// it is the one thing on this HUD that says WHICH character they are. (Accent itself is resolved
+	// at the top of this function now, because the V row wears it too.)
 	const FLinearColor RowColor = bReady
 		? TraceHUDStyle::WithAlpha(Accent, 0.75f + 0.25f * FMath::Sin(Now * 8.f))
 		: TraceHUDStyle::Shade(Accent, 0.40f, 0.0f);
@@ -2845,6 +3219,125 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 		VCenterTextY(StatusText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 
 	return RowY - (RowH + (8.f * UIScale));
+}
+
+// ===================================================================================================
+// FX/AUDIO PLAN §7.2 — THE V ROW (closes F2)
+//
+// THE FINDING, in one sentence: Roxie's rocket cooldown is replicated in
+// FTraceAbilitySetRoxie's AuxEndMatchTime *expressly* "so a client can grey its own V", and until
+// this row existed nothing anywhere read it. A key on a 35-second timer with no indicator is a key
+// players learn to stop pressing.
+//
+// IT IS HALF HEIGHT, AND THAT IS THE WHOLE VISUAL ARGUMENT. E is the character's ability; V is a
+// second, subordinate one. Drawing the two as identical rows would say they were equals, and the
+// stack would grow a full row for a character that has one. Half height, under the E row, sharing
+// its accent: one block, two lines, obviously related, obviously ranked.
+// ===================================================================================================
+
+bool ATraceHUD::IsSecondaryRowUp(float& OutRowH, float& OutAdvance, float RowH)
+{
+	OutRowH = FMath::Max(4.f, RowH * 0.6f);
+
+	// See the header. The E row's caption and this row's caption are both FontSmall, so the two rows
+	// have to be spaced by the FACE's line height, not by their meters — a 6 px meter under a 10 px
+	// meter puts two ~13 px lines of text 10 px apart, and they print through each other.
+	OutAdvance = FMath::Max(OutRowH + (6.f * UIScale),
+		MeasureHeight(FString(TEXT("ROCKET  00.0")), FontSmall, UIScale) + (4.f * UIScale));
+
+	if (LocalPS == nullptr || !LocalPS->HasCharacter())
+	{
+		return false;
+	}
+
+	// THROUGH THE COMPONENT ON THE PLAYER STATE, never through the pawn — the same rule the E row
+	// above is built on. A V cooldown keeps running while its owner is dead and has to keep being
+	// drawn while its owner is dead, and the pawn is the one thing that is not there then.
+	const UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(LocalPS);
+	if (Abilities == nullptr)
+	{
+		return false;
+	}
+
+	float Remaining = 0.f;
+	float Duration = 0.f;
+	FString RowLabel;
+	return Abilities->GetSecondaryCooldownDisplay(Remaining, Duration, RowLabel);
+}
+
+float ATraceHUD::DrawSecondaryCooldownRow(float RowY, float Margin, float BarW, float RowH,
+                                          float LabelW, const FLinearColor& Accent)
+{
+	float VRowH = 0.f;
+	float VRowAdvance = 0.f;
+	if (!IsSecondaryRowUp(VRowH, VRowAdvance, RowH))
+	{
+		return RowY;
+	}
+
+	const UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(LocalPS);
+	float Remaining = 0.f;
+	float Duration = 0.f;
+	FString RowLabel;
+	if (Abilities == nullptr || !Abilities->GetSecondaryCooldownDisplay(Remaining, Duration, RowLabel))
+	{
+		return RowY;   // it changed between the two asks; draw nothing rather than half a row
+	}
+
+	const bool bReady = (Remaining <= TraceHUDStyle::TimeEpsilon);
+
+	// ---- THE READY FLASH, on the RISING edge ---------------------------------------------------
+	//
+	// The row is grey for thirty-five seconds. The one moment worth an animation is the instant it
+	// stops being, and a player who was watching something else needs to be able to catch it out of
+	// the corner of their eye. A flash on the STATE (rather than the edge) would be a row that
+	// strobed for as long as V was available, which is most of the match.
+	if (bReady && bSecondaryWasCooling)
+	{
+		SecondaryReadyFlashTime = Now;
+	}
+	bSecondaryWasCooling = !bReady;
+
+	const float FlashAge = Now - SecondaryReadyFlashTime;
+	const bool  bFlashing = (FlashAge >= 0.f && FlashAge < 0.4f);
+
+	// The key, from the player's OWN binding. V is the documented default (spec §5: "Mace's suspend
+	// needs its own bind (V)"), and it is a fallback here rather than a literal for the same reason
+	// the E row's is.
+	const FString KeyText = FString::Printf(TEXT("[%s]"), *ActionKeyLabel(TEXT("AbilitySecondary"), TEXT("V")));
+
+	DrawTextLeft(KeyText, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
+		Margin, VCenterTextY(KeyText, FontSmall, UIScale, RowY, VRowH), FontSmall, UIScale);
+
+	// GREYED WHILE COOLING, and it fills toward ready like every other cooldown in this stack —
+	// which is exactly the opposite direction to the status chips in the other corner, and that
+	// contrast is spec v16 §2's rule about never letting the two read as one widget.
+	const float Fraction = FMath::Clamp(1.f - (Remaining / FMath::Max(TraceHUDStyle::TimeEpsilon, Duration)), 0.f, 1.f);
+	const FLinearColor RowColor = bFlashing
+		? TraceHUDStyle::Ink
+		: (bReady ? TraceHUDStyle::Shade(Accent, 0.85f, 0.15f)
+		          : TraceHUDStyle::Shade(Accent, 0.30f, 0.0f));
+
+	DrawMeter(Margin + LabelW, RowY, BarW - LabelW, VRowH, bReady ? 1.f : Fraction, RowColor);
+
+	// The caption states the ability by name whether it is ready or not: "ROCKET" is what the key
+	// does, and a row that only named it while it was unavailable would teach the key backwards.
+	const FString Caption = bReady
+		? RowLabel
+		: FString::Printf(TEXT("%s  %.1f"), *RowLabel, Remaining);
+
+	DrawTextLeft(Caption, bFlashing ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
+		Margin + BarW + (10.f * UIScale),
+		VCenterTextY(Caption, FontSmall, UIScale, RowY, VRowH), FontSmall, UIScale);
+
+#if !UE_BUILD_SHIPPING
+	DrawnSecondaryRowText = Caption;
+#endif
+
+	// Tighter than the stack's usual 8 px gap wherever the font allows it: the two rows are one
+	// block, and the gap inside a block has to be smaller than the gap between blocks or the
+	// grouping does not read. The floor is the measured line height (see IsSecondaryRowUp).
+	return RowY - VRowAdvance;
 }
 
 void ATraceHUD::DrawHealthBar(const UTraceHealthComponent* HealthComp, float X, float Y, float W, float H)
@@ -3002,7 +3495,8 @@ void ATraceHUD::DrawChargePips(float X, float Y, float W, float H, int32 Charges
 namespace TraceHUDStatusStyle
 {
 	/**
-	 * SIX SEPARATED HUES, AND DELIBERATELY *NOT* THE CHARACTER ACCENT COLOURS.
+	 * TEN SEPARATED HUES (six, plus FX/AUDIO plan §7.3's four), AND DELIBERATELY *NOT* THE CHARACTER
+	 * ACCENT COLOURS.
 	 *
 	 * The accents already mean something on this HUD: the ability row wears them because they say
 	 * WHICH CHARACTER YOU ARE, learned on the select screen. A status says what is HAPPENING TO YOU,
@@ -3018,6 +3512,63 @@ namespace TraceHUDStatusStyle
 	static const FLinearColor Chud       (1.00f, 0.80f, 0.30f, 1.f);   // armour gold
 	static const FLinearColor Suspend    (0.72f, 0.55f, 1.00f, 1.f);   // violet — Mace
 	static const FLinearColor Pull       (0.85f, 0.72f, 1.00f, 1.f);   // the same family: one ability
+
+	// ---- FX/AUDIO plan §7.3's four additions ----------------------------------------------------
+	//
+	// *** THESE THREE HAPPEN TO EQUAL PRE-W6 CHARACTER ACCENTS, AND THEY STAY LITERAL ON PURPOSE.
+	// *** MODDED, STUCK and ZIP were originally sampled from Roxie's, Slimeball's and Lily's accents
+	// as they stood before the ten-accent re-space. Those three accents then moved and these did not,
+	// so a sweep for "an FLinearColor that is a stale copy of an accent" finds them and they LOOK
+	// like the same defect W6-ACCENTSYNC fixed everywhere else (a kit carrying its own copy of a
+	// colour the roster owns). They are not that defect, and deriving them would be an active
+	// regression. The reasoning below is the reason, and it is MEASURED rather than asserted, because
+	// the sentence that used to sit here — "Roxie's accent is already an orange" — was written
+	// against the old palette and is now simply false: her live accent is #FF617C, hue 349.7, a
+	// crimson. A rule stated in prose that nobody re-checks is how this block went stale.
+	//
+	// THE RULE: an accent says WHICH CHARACTER YOU ARE and is learned on the select screen; a status
+	// says WHAT IS HAPPENING TO YOU, and it is frequently not your own character's doing (the poison
+	// on a Chut came from an Oyster; the STUCK on a Mace came from a Slimeball). Same rule as the six
+	// above.
+	//
+	// THE MEASUREMENT THAT MAKES IT MORE THAN A SLOGAN. What the wheel actually has to guarantee is a
+	// SET property — the eleven status hues separated from EACH OTHER — and an accent is chosen for a
+	// different set property (≥ 40° from both team hues, W5-BODYVAR §1). Two independent constraints
+	// cannot both be satisfied by one number, so wiring the wheel to the roster does not make it
+	// self-maintaining; it makes it self-breaking, on somebody else's edit. Derived, in sRGB hue:
+	//
+	//     MODDED  ember  31.1 -> Roxie's crimson    350.0 :  2.0 deg from VULNERABLE (was 43.1)
+	//     STUCK   slime  75.0 -> Slimeball's slime  100.3 :  2.5 deg from POISONED   (was 27.8)
+	//     ZIP     ice   198.1 -> Lily's ice         185.8 :  5.8 deg from SPEEDBOOST (was 18.1)
+	//
+	// All three collapse onto a status they can be up AT THE SAME TIME AS, and two of the three pairs
+	// mean opposite things: MODDED (your gun is better) would become X's VULNERABLE (you are taking
+	// extra damage), and ZIP (you are flying) would become SPEEDBOOST. POISONED and STUCK can be up
+	// together on a poisoned Slimeball, which is why slime green was pushed toward yellow in the
+	// first place — deriving STUCK undoes exactly that push. So the literals are not a stale copy of
+	// the palette; they are the wheel's own palette, and they are 41.1 / 25.3 / 12.3 degrees away
+	// from their nominal owners, which is the separation doing its job.
+	//
+	// The other side of the same ledger, checked and deliberately accepted: ember at 31.1 is 1.0 deg
+	// from team Amber (30.1). For an ACCENT that would fail W5-BODYVAR's rule outright. It does not
+	// fail here because these are not read the way an accent is read: every status draws as a chip
+	// with its NAME IN TEXT beside it ("MODDED  +12% FIRE RATE", "ZIP  1.4s", "STUCK"), in a fixed
+	// corner, never as an unlabelled colour on a body across the arena. Colour is the second channel
+	// here and the only channel there.
+	//
+	// Within the wheel: ember (1.00,0.45,0.12) against Chud's gold (1.00,0.80,0.30) differs mostly in
+	// green, the channel the eye separates best (15.4 deg apart, and 3.5x apart in the green
+	// channel); the cloak's blue-grey is the least saturated thing in the set, which is the point of
+	// a cloak; ice sits 19.2 deg from the cold blue of SLOWED but is far lighter (L 0.940 vs 0.813),
+	// and the two mean opposite things so a mistake would be expensive — hence the near-white rather
+	// than a second mid blue.
+	//
+	// Re-measure with release-impl scratch tool w7-looseends/wheel.py, which parses both this block
+	// and TraceCharacterRoster.cpp rather than trusting these numbers.
+	static const FLinearColor Modded     (1.00f, 0.45f, 0.12f, 1.f);   // ember — Roxie's mod
+	static const FLinearColor Cloaked    (0.60f, 0.70f, 0.85f, 1.f);   // the cloak's own pale blue-grey
+	static const FLinearColor Stuck      (0.66f, 0.92f, 0.16f, 1.f);   // slime
+	static const FLinearColor Zip        (0.75f, 0.92f, 1.00f, 1.f);   // ice — Lily's flight
 
 	/**
 	 * BEE AMBER — the one colour in this file whose whole job is to stop a misreading.
@@ -3042,6 +3593,107 @@ namespace TraceHUDStatusStyle
 
 	/** Below this fraction of a clip the count turns red. Two shots' worth at the shipped 30. */
 	static constexpr float LowAmmoFraction = 0.2f;
+}
+
+// ===================================================================================================
+// FX/AUDIO PLAN §2.5 / §2.6 — THE TWO OWNER-ONLY SCREEN-EDGE BANDS
+// ===================================================================================================
+
+void ATraceHUD::DrawScreenEdgeVignette(const FLinearColor& Hue, float PeakAlpha)
+{
+	if (PeakAlpha <= 0.f || ViewW <= 0.f || ViewH <= 0.f)
+	{
+		return;
+	}
+
+	// 12% of the SHORT axis, so the band is the same physical thickness top-and-bottom as it is
+	// left-and-right on any aspect ratio. Reading it off ViewH alone made it a thin stripe on the
+	// sides of an ultrawide.
+	const float Band = FMath::Min(ViewW, ViewH) * 0.14f;
+	constexpr int32 Steps = 10;
+
+	for (int32 Step = 0; Step < Steps; ++Step)
+	{
+		// T is 0 at the frame edge and 1 at the inner lip of the band. Squared, so the falloff is
+		// weighted to the very edge and the band has no visible inner boundary — a linear ramp in ten
+		// steps shows its steps at 1080p.
+		//
+		// *** THE STEPS TILE, THEY DO NOT STACK, SO EACH ONE CARRIES ITS OWN ALPHA WHOLE. *** The
+		// first version of this divided by the step count as though the rings accumulated; they do
+		// not (ring k spans exactly [Band*k/N, Band*(k+1)/N]), so the whole band came out at an
+		// eighth of its intended strength and the first captured frame showed no tint at all.
+		const float T = static_cast<float>(Step) / static_cast<float>(Steps);
+		const FLinearColor StepColor = TraceHUDStyle::WithAlpha(Hue, PeakAlpha * (1.f - T) * (1.f - T));
+
+		const float Inset = Band * T;
+		const float Thick = Band / static_cast<float>(Steps);
+
+		// Four strips per ring, and the verticals stop SHORT of the horizontals rather than crossing
+		// them. Overlapping at the corners would double the alpha there — 0.18 would land at 0.33 in
+		// four places, and the bible states 0.18 as a ceiling, not as an average.
+		const float SideY = Inset + Thick;
+		const float SideH = FMath::Max(0.f, ViewH - (Inset * 2.f) - (Thick * 2.f));
+
+		DrawRect(StepColor, Inset, Inset, ViewW - Inset * 2.f, Thick);
+		DrawRect(StepColor, Inset, ViewH - Inset - Thick, ViewW - Inset * 2.f, Thick);
+		DrawRect(StepColor, Inset, SideY, Thick, SideH);
+		DrawRect(StepColor, ViewW - Inset - Thick, SideY, Thick, SideH);
+	}
+}
+
+void ATraceHUD::DrawOwnerVignettes()
+{
+	if (LocalChar == nullptr || !bLocalAlive)
+	{
+		return;
+	}
+
+	// ---- ELLE'S CLOAK (FX plan §2.5) -----------------------------------------------------------
+	//
+	// The cloak's entire presentation is on OTHER people's screens — her own body dims for them, and
+	// nothing at all changes for her. So the one player who most needs to know she is cloaked (she
+	// is about to walk past somebody, and the cloak is on a timer) is the only one with no signal.
+	// The CLOAKED chip in the corner is the number; this is the thing she sees without looking.
+	//
+	// IsCloaked() reads the REPLICATED flag, so this is the same fact every other machine has —
+	// never the local cosmetic bCloakVisualApplied, which is deliberately allowed to be false on a
+	// machine that draws nothing.
+	if (const UTraceCharacterAbilitySet* LocalSet = UTraceAbilityComponent::GetAbilitySetFor(LocalChar))
+	{
+		if (const UTraceAbilitySetElle* ElleSet = Cast<UTraceAbilitySetElle>(LocalSet))
+		{
+			if (ElleSet->IsCloaked())
+			{
+				DrawScreenEdgeVignette(TraceHUDStyle::Cloak, 0.10f);
+#if !UE_BUILD_SHIPPING
+				DrawnVignettes.Add(TEXT("CLOAK a=0.10"));
+#endif
+			}
+		}
+	}
+
+	// ---- OYSTER'S POISON, ON THE VICTIM (FX plan §2.6; bible §6.4 fixes the 0.18) ---------------
+	//
+	// FROM THE VICTIM'S OWN COMPONENT, so it is right for whoever is poisoned rather than for Oyster
+	// — the cloud is somebody else's ability and the player wearing it is usually not him. Same
+	// source as the POISONED chip, one lookup each, and the two therefore cannot disagree about
+	// whether the poison is still on.
+	//
+	// 0.18 IS A CEILING THE BIBLE SETS, not a taste call, and it is the heavier of the two bands
+	// because being poisoned is the more urgent state: it is ticking damage, and the cloud that
+	// caused it is usually behind you by the time you notice.
+	if (const UTraceOysterPoisonComponent* PoisonComp = UTraceOysterPoisonComponent::Find(LocalChar))
+	{
+		const float MatchNow = (TraceGS != nullptr)
+			? static_cast<float>(TraceGS->GetServerWorldTimeSeconds()) : 0.f;
+		if (PoisonComp->GetEndMatchTime() - MatchNow > 0.f)
+		{
+			DrawScreenEdgeVignette(TraceHUDStatusStyle::Poisoned, 0.18f);
+#if !UE_BUILD_SHIPPING
+			DrawnVignettes.Add(TEXT("POISON a=0.18"));
+#endif
+		}
+	}
 }
 
 void ATraceHUD::DrawAmmoAndStatuses()
@@ -3169,19 +3821,9 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 			? TraceHUDStatusStyle::BeeRounds
 			: TraceHUDStyle::InkDim;
 
-		FString ReloadKeyLabel(TEXT("R"));
-		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
-		{
-			if (FCString::Stricmp(Info.ConfigId, TEXT("Reload")) == 0)
-			{
-				const FKey BoundKey = UTraceUserSettings::Get().GetKey(Info.Action);
-				if (BoundKey.IsValid())
-				{
-					ReloadKeyLabel = BoundKey.GetDisplayName(/*bLongDisplayName=*/false).ToString().ToUpper();
-				}
-				break;
-			}
-		}
+		// EXTRACTED to ATraceHUD::ActionKeyLabel — see the note at the ability row. Identical lookup,
+		// identical fallback, one definition.
+		const FString ReloadKeyLabel = ActionKeyLabel(TEXT("Reload"), TEXT("R"));
 
 		OutState.RightLabel = OutState.bReloading
 			? FString::Printf(TEXT("RELOADING  %.1f"), OutState.ReloadRemaining)
@@ -3233,12 +3875,20 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 	// same frame — so a carrier sees POISONED without SLOWED, and the pair is the only thing on
 	// screen that says the difference out loud. bSlowActive is the server's own per-frame answer,
 	// replicated, so this cannot disagree with the speed the player is actually moving at.
+	// The poison and the slimewall both replicate an ABSOLUTE match time, which is what makes them
+	// correct for a client that joined late. GetServerWorldTimeSeconds() is the clock both were
+	// written against; resolved once, here, so the two blocks below cannot read different nows.
+	const float MatchNow = (TraceGS != nullptr)
+		? static_cast<float>(TraceGS->GetServerWorldTimeSeconds()) : 0.f;
+
+	// What the player's speed is ACTUALLY being multiplied by, accumulated across every source, and
+	// how long the longest-lived of them has to run. See the SLOWED chip below.
+	float SlowMultiplier = 1.f;
+	float SlowRemaining = 0.f;
+	float SlowTotal = 1.f;
+
 	if (const UTraceOysterPoisonComponent* PoisonComp = UTraceOysterPoisonComponent::Find(LocalChar))
 	{
-		// The poison replicates an ABSOLUTE match time, which is what makes it correct for a client
-		// that joined late. GetServerWorldTimeSeconds() is the same clock it was written against.
-		const float MatchNow = (TraceGS != nullptr)
-			? static_cast<float>(TraceGS->GetServerWorldTimeSeconds()) : 0.f;
 		const float Remaining = PoisonComp->GetEndMatchTime() - MatchNow;
 		const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon,
 			UTraceSettings::Get().OysterPoisonDurationSeconds);
@@ -3251,19 +3901,74 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 
 			if (PoisonComp->IsSlowActive())
 			{
-				const float SlowPercent = 100.f * (1.f - PoisonComp->GetSpeedMultiplier());
-				OutState.Chips.Add({
-					FString::Printf(TEXT("SLOWED  -%.0f%% SPEED"), SlowPercent),
-					FString::Printf(TEXT("%.1fs"), Remaining),
-					Remaining / Total, TraceHUDStatusStyle::Slowed });
+				SlowMultiplier *= PoisonComp->GetSpeedMultiplier();
+				SlowRemaining = Remaining;
+				SlowTotal = Total;
 			}
 		}
 	}
 
-	// ---- Mace's suspend and pull, and Chut's Chud, and Rocco's speed stack ------------------------
+	// ---- SLOWED: ONE CHIP, EVERY SOURCE (FX/AUDIO plan §7.3) -------------------------------------
 	//
-	// All four hang off the local player's OWN ability set, so one lookup serves them and a character
-	// who is none of the three simply matches no branch.
+	// *** THE FINDING THIS CLOSES: the SLOWED chip was POISON-ONLY. *** Slimeball's wall slows the
+	// same 35% through a completely separate component (UTraceSlimewallSlowComponent, attached to
+	// the VICTIM exactly as the poison is), and a player walking out of a slime slab watched their
+	// speed drop with nothing on screen to explain it. §7.3 asks for the chip to key off that
+	// component directly, and this is that.
+	//
+	// *** IT IS ONE CHIP AND IT PRINTS THE COMBINED NUMBER, WHICH IS A DECISION. *** The two effects
+	// COMPOUND — TraceAbilityDebuff::GetMoveSpeedMultiplier multiplies the poison in and
+	// ATraceSlimewall's own clamp multiplies the slime in on top — so a poisoned player standing in
+	// slime is at 0.65 x 0.70, not at either number. Two chips both reading "SLOWED", in the same
+	// hue, showing two different percentages neither of which is the player's actual speed, would be
+	// this HUD's worst habit (two sources for one fact) expressed as pixels. So the chip states the
+	// product, which is the one number the player can verify by moving.
+	//
+	// THE READOUT AND THE DRAIN FOLLOW THE LONGER-LIVED SOURCE, because that is when the player gets
+	// their speed back — the shorter one expiring changes the percentage, and the chip is redrawn
+	// every frame, so it corrects itself the instant it does.
+	//
+	// NOTE FOR THE F7 LANDING (W4-KITS-C owns the aggregator line): when the slimewall is added to
+	// TraceAbilityDebuff::GetMoveSpeedMultiplier and the self-clamp in TraceSlimewall.cpp is deleted
+	// as its comment instructs, NOTHING HERE CHANGES — this reads GetSpeedMultiplier(), which is that
+	// component's one definition of "how much slower" either way.
+	if (const UTraceSlimewallSlowComponent* SlimeSlow = UTraceSlimewallSlowComponent::Find(LocalChar))
+	{
+		if (SlimeSlow->IsSlowActive())
+		{
+			SlowMultiplier *= SlimeSlow->GetSpeedMultiplier();
+
+			const float SlimeRemaining = SlimeSlow->GetEndMatchTime() - MatchNow;
+			if (SlimeRemaining > SlowRemaining)
+			{
+				SlowRemaining = SlimeRemaining;
+				SlowTotal = FMath::Max(TraceHUDStyle::TimeEpsilon,
+					UTraceSettings::Get().SlimewallSlowLingerSeconds);
+			}
+		}
+	}
+
+	if (SlowMultiplier < 1.f && SlowRemaining > 0.f)
+	{
+		OutState.Chips.Add({
+			FString::Printf(TEXT("SLOWED  -%.0f%% SPEED"), 100.f * (1.f - SlowMultiplier)),
+			FString::Printf(TEXT("%.1fs"), SlowRemaining),
+			FMath::Clamp(SlowRemaining / SlowTotal, 0.f, 1.f), TraceHUDStatusStyle::Slowed });
+	}
+
+	// ---- The OWN-ABILITY chips: Mace, Chut, Rocco, and (FX plan §7.3) Roxie, Elle, Lily, Slimeball -
+	//
+	// All of them hang off the local player's OWN ability set, so one lookup serves them all and a
+	// character who is none of them simply matches no branch.
+	//
+	// *** THE §7.3 ADDITIONS CLOSE THE code-abilities §6 COVERAGE MATRIX. *** Four of the ten
+	// characters had a timed state with no HUD at all: Roxie's MODDED (a 5 s window that changes her
+	// fire rate), Elle's CLOAK (invisible to its own owner by construction — see the vignette in
+	// DrawOwnerVignettes for the other half), Lily's ZIP (a flight timer that ends by dropping her)
+	// and Slimeball's STUCK. Every one of them is a state the player has to time something against.
+	//
+	// EACH IS ONE PUBLISHED ACCESSOR, and every one of those accessors reads the REPLICATED fact
+	// rather than a local mirror, so a chip cannot disagree with the machine that owns the rule.
 	if (const UTraceCharacterAbilitySet* LocalSet = UTraceAbilityComponent::GetAbilitySetFor(LocalChar))
 	{
 		if (const UTraceAbilitySetMace* MaceSet = Cast<UTraceAbilitySetMace>(LocalSet))
@@ -3330,6 +4035,88 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 					FString::Printf(TEXT("SPEED BOOST  x%d  +%.0f%%"), Stacks, BoostPercent),
 					FString::Printf(TEXT("%.1fs"), Remaining),
 					Remaining / Total, TraceHUDStatusStyle::SpeedBoost });
+			}
+		}
+		else if (const UTraceAbilitySetRoxie* RoxieSet = Cast<UTraceAbilitySetRoxie>(LocalSet))
+		{
+			// MODDED. The percentage is derived from the seam the GUN actually reads
+			// (GetFireIntervalScale, a period scale — so a FASTER gun returns a SMALLER number), not
+			// from the RoxieModdedFireRateMultiplier knob restated here. That inversion is the thing
+			// every note on this character warns about, and printing it from the knob would be one
+			// more place to get it backwards.
+			if (RoxieSet->IsModdedActive())
+			{
+				const float Remaining = RoxieSet->GetModdedRemainingSeconds();
+				const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon,
+					UTraceSettings::Get().RoxieModdedDurationSeconds);
+				const float RateBonus = 100.f * ((1.f / FMath::Max(0.01f, RoxieSet->GetFireIntervalScale())) - 1.f);
+
+				OutState.Chips.Add({
+					FString::Printf(TEXT("MODDED  +%.0f%% FIRE RATE"), RateBonus),
+					FString::Printf(TEXT("%.1fs"), Remaining),
+					Remaining / Total, TraceHUDStatusStyle::Modded });
+			}
+		}
+		else if (const UTraceAbilitySetElle* ElleSet = Cast<UTraceAbilitySetElle>(LocalSet))
+		{
+			// CLOAKED. *** THE ONE STATUS WHOSE OWNER CANNOT SEE IT ANY OTHER WAY. *** The cloak is
+			// entirely a change to how OTHER machines draw her; her own view is identical either
+			// way. The chip is the countdown, the screen-edge band is the glance — two signals for
+			// one state, deliberately, because it ends on a timer and she has to plan around it.
+			if (ElleSet->IsCloaked())
+			{
+				const float Remaining = ElleSet->GetCloakEndMatchTime() - MatchNow;
+				const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon,
+					UTraceSettings::Get().ElleCloakDurationSeconds);
+
+				if (Remaining > 0.f)
+				{
+					OutState.Chips.Add({
+						TEXT("CLOAKED"), FString::Printf(TEXT("%.1fs"), Remaining),
+						FMath::Clamp(Remaining / Total, 0.f, 1.f), TraceHUDStatusStyle::Cloaked });
+				}
+			}
+		}
+		else if (const UTraceAbilitySetLily* LilySet = Cast<UTraceAbilitySetLily>(LocalSet))
+		{
+			// ZIP. THE DENOMINATOR IS GetZipDurationForNow(), NOT THE RAW KNOB: a Zip started while
+			// carrying the Core is HALVED, so the knob would make a carrier's meter start at 50% and
+			// drain to zero — a bar that is already half gone the instant the ability fires reads as
+			// "it is nearly over" for the whole flight. Same class of bug the weapon row's pullout
+			// meter had (spec v31 §1) and the same fix: ask for the number that applies to THIS use.
+			if (LilySet->IsZipping())
+			{
+				const float Remaining = LilySet->GetZipRemaining();
+				const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon, LilySet->GetZipDurationForNow());
+
+				OutState.Chips.Add({
+					TEXT("ZIP"), FString::Printf(TEXT("%.1fs"), Remaining),
+					FMath::Clamp(Remaining / Total, 0.f, 1.f), TraceHUDStatusStyle::Zip });
+			}
+		}
+		else if (const UTraceAbilitySetSlimeball* SlimeSet = Cast<UTraceAbilitySetSlimeball>(LocalSet))
+		{
+			// STUCK. THE ONE CHIP WITH NO CLOCK BY DEFAULT, and the plan says so: the stick lasts as
+			// long as V is held unless SlimeballWallStickMaxSeconds caps it (the shipped knob is
+			// uncapped, and GetStickSecondsRemaining() returns 0 to say exactly that).
+			//
+			// A HELD state therefore draws a FULL drain bar rather than an empty one. Spec v16 §2's
+			// rule is that "a bare icon that never changes is not a status display" — but an
+			// indicator draining to nothing while the state persists would be worse than bare, it
+			// would be wrong. Mace's SPIKE PULL solved the same problem by draining a DISTANCE;
+			// there is no equivalent quantity here, so the honest answer is a full bar and the word
+			// HELD where the seconds would be.
+			if (SlimeSet->IsStuck())
+			{
+				const float Remaining = SlimeSet->GetStickSecondsRemaining();
+				const float Cap = UTraceSettings::Get().SlimeballWallStickMaxSeconds;
+				const bool  bCapped = (Remaining > 0.f && Cap > 0.f);
+
+				OutState.Chips.Add({
+					TEXT("STUCK"),
+					bCapped ? FString::Printf(TEXT("%.1fs"), Remaining) : FString(TEXT("HELD")),
+					bCapped ? FMath::Clamp(Remaining / Cap, 0.f, 1.f) : 1.f,
+					TraceHUDStatusStyle::Stuck });
 			}
 		}
 	}
@@ -3799,13 +4586,21 @@ bool ATraceHUD::PresentCornerUmg(bool bInLive, const FTraceHudCornerState& InSta
 
 void ATraceHUD::DrawScoresAndClock()
 {
+	// WP1 — the practice range plays ONE ENORMOUS HALF (a fortnight; ATracePracticeGameMode::
+	// GetHalfSeconds), and formatting that literally printed "20159:53" over the target row. THE
+	// one predicate is asked, never the game-mode class (TracePracticeRange.h: "a second opinion
+	// about 'am I in the range?' is how a cheat escapes"). Server-sided by construction — the range
+	// is single-player/local by spec, and the listen host of one IS the server, so this is true
+	// exactly where anyone can be standing in a range.
+	const bool bPractice = TracePracticeRange::IsActive(GetWorld());
+
 	const float CX = ViewW * 0.5f;
 	const float PanelW = TraceHUDStyle::TopPanelW * UIScale;
 	const float PanelH = TraceHUDStyle::TopPanelH * UIScale;
 	const float PanelX = CX - PanelW * 0.5f;
 	const float PanelY = TraceHUDStyle::TopPanelY * UIScale;
 
-	DrawPanel(PanelX, PanelY, PanelW, PanelH, TraceHUDStyle::PanelFill, TraceHUDStyle::PanelBorder);
+	DrawPanel(PanelX, PanelY, PanelW, PanelH, TraceHUDStyle::TopPanelFill, TraceHUDStyle::PanelBorder);
 
 	const int32 BlueScore   = (TraceGS != nullptr) ? TraceGS->GetScore(ETraceTeam::Blue) : 0;
 	const int32 OrangeScore = (TraceGS != nullptr) ? TraceGS->GetScore(ETraceTeam::Orange) : 0;
@@ -3843,6 +4638,14 @@ void ATraceHUD::DrawScoresAndClock()
 
 		case ETraceMatchState::InProgress:
 		{
+			if (bPractice)
+			{
+				// The word, not the fortnight. A practice clock is also never urgent, so the
+				// ClockUrgentSeconds red check is deliberately skipped with the number.
+				ClockText = TEXT("PRACTICE");
+				ClockColor = TraceHUDStyle::InkDim;
+				break;
+			}
 			const float Remaining = TraceGS->GetMatchTimeRemaining();
 			ClockText = FormatClock(Remaining);
 			ClockColor = (Remaining <= TraceHUDStyle::ClockUrgentSeconds) ? TraceHUDStyle::Danger : TraceHUDStyle::Ink;
@@ -3874,6 +4677,16 @@ void ATraceHUD::DrawScoresAndClock()
 	else if (TraceGS != nullptr && TraceGS->TraceMatchState == ETraceMatchState::PostMatch)
 	{
 		FooterText = TEXT("FULL TIME");
+	}
+
+	// WP1 — the range names itself instead of a half ("1ST HALF" of a fortnight is the exact line
+	// that read as a hung timer). BEFORE the mode-suffix append below, which stays: every capture
+	// must still say which scoring mode it came from, so the line reads "PRACTICE RANGE - GOALS".
+	// The pending-whistle and mercy branches below cannot fire in practice (HalvesPerMatch = 1,
+	// wipe bonus 0) and are deliberately NOT special-cased here.
+	if (bPractice)
+	{
+		FooterText = TEXT("PRACTICE RANGE");
 	}
 
 	// ---- Deferred half time / full time (spec v9 §11) --------------------------------------------
@@ -4169,6 +4982,42 @@ void ATraceHUD::DrawNetworkStatus()
 		}
 	}
 
+	// WP8.4 — remember when the panel's ANSWER last changed, which is what re-earns it a few
+	// seconds on screen. Deliberately the finished text (role, endpoint, detail INCLUDING the human
+	// count appended just above) rather than DescribeConnection's raw return: "a second human
+	// joined" is exactly the moment a host wants their address back in front of them, and it is the
+	// same fact the change log above records. Compared as a string because the point is "did any of
+	// this become different", not which field did.
+	{
+		const FString ConnectionAnswer = FString::Printf(TEXT("%d|%s|%s"),
+			static_cast<int32>(ConnectionRole), *Headline, *Detail);
+		if (ConnectionAnswer != LastConnectionAnswer)
+		{
+			LastConnectionAnswer = ConnectionAnswer;
+			LastRoleChangeTime = Now;
+		}
+	}
+
+	// ---- WP8.4 — the draw gate (visual audit §4.1: a raw IP burned into every match frame) ------
+	//
+	// Everything above ran regardless: the connection is still resolved and the human-count change
+	// log still lands (it is the two-machine triage record). Only the PANEL is now gated:
+	//   (a) the scoreboard is held — Tab is the "show me the match's paperwork" gesture, and this
+	//       pass draws after DrawScoreboard, so the panel sits above the board it annotates;
+	//   (b) the connection answer changed within RevealSeconds — match start, a player joining, a
+	//       role flip each re-introduce the address without anyone asking;
+	//   (c) the state is a WARNING — Offline here means a listen bind failed or the port was taken
+	//       (the empty-Detail ordinary-offline case returned at the top), and that shout must
+	//       never be hideable.
+	// When the panel does not draw, KillFeedTopY keeps the top-panel default DrawHUD reset it to,
+	// so the feed simply rides at the top-panel line.
+	constexpr float RevealSeconds = 10.f;
+	const bool bWarningState = (ConnectionRole == TraceNet::ERole::Offline);
+	if (!bWarningState && !IsScoreboardHeld() && (Now - LastRoleChangeTime) > RevealSeconds)
+	{
+		return;
+	}
+
 	const float HeadScale = 1.05f * UIScale;
 	const float DetailScale = 0.95f * UIScale;
 	const float PadX = 12.f * UIScale;
@@ -4248,225 +5097,155 @@ void ATraceHUD::DrawNetworkFailureBanner()
 namespace TraceKillFeedArt
 {
 	/**
-	 * THE ICONS, AS ASCII BITMAPS.
+	 * THE ICONS, AS STROKE TABLES (bible §7.3 — upgrade the glyph language, don't embrace bitmaps).
 	 *
-	 * Every glyph is a 13x13 grid, '#' lit and '.' clear, rendered as run-length integer DrawRects
-	 * with a one-cell-independent 1 px dark surround. No UMG, no texture, no imported art
-	 * (contract §2 / spec v8 §6) — and no vector maths either, because at the size a feed row can
-	 * afford (26 px) a hand-placed bitmap is the only thing that reliably reads. What you see here
+	 * Every glyph is a list of line strokes (plus DrawRect dots) authored in a 22x22 design box,
+	 * scaled into the pixel box DrawKillFeed() always sized (Cell * 13 px — the layout math and the
+	 * DrawKillIcon signature are unchanged from the bitmap era) and drawn at the HUD's own stroke
+	 * weight: 2 px at the 26 px 1080p icon, floored at 1.5 px, over a darker, thicker surround pass.
+	 * No UMG, no texture, no imported art (contract §2 / spec v8 §6) — what you see in these tables
 	 * is exactly what appears on screen, which is also why they are editable by anyone.
 	 *
-	 * The three the spec names, plus the two the cause taxonomy already implies:
+	 * WHY STROKES NOW. The 13x13 '#'-grids were authored for a renderer that had nothing better,
+	 * and they aliased into smudges at any size but their native 26 px; strokes scale to 4K without
+	 * stair-stepping and match the line weight everything else on this HUD draws with. The bitmap
+	 * drafts' hard-won rule ("interior detail two cells wide or it is nothing") survives translated:
+	 * NO STROKE PAIR CLOSER THAN 2 DESIGN UNITS, or the surround pass merges them at feed size.
 	 *
-	 *   Skull            HEADSHOT.  Silhouette + two eye sockets + a tooth row. Amber, matching the
-	 *                               headshot hit-marker this HUD already draws, so the two pieces of
+	 * The taxonomy, one glyph per cause the feed distinguishes:
+	 *
+	 *   Skull            HEADSHOT.  Octagon cranium, eye dots, jaw bar with teeth ticks. Amber,
+	 *                               matching the headshot hit-marker, so the two pieces of
 	 *                               head-shot feedback in the game agree with each other.
-	 *   Double chevron   DASH.      A trace kill. Reads as speed/direction at any size and is the
-	 *                               least confusable shape of the five.
-	 *   Shield           PARRY.     Drawn as an OUTLINE rather than filled: a solid shield at 26 px
-	 *                               degenerates into an anonymous downward blob, and the internal
-	 *                               void is what makes it a shield. Red, matching the parry flash.
-	 *   Round            BULLET.    The default for body and leg shots. Pointed right, with the
-	 *                               case/projectile groove that stops it reading as an arrow.
+	 *   Double chevron   DASH.      A trace kill. Reads as speed/direction at any size.
+	 *   Shield           PARRY.     An outline, never filled — the internal void is what makes it
+	 *                               a shield at 26 px. Red, matching the parry flash.
+	 *   Pistol           BULLET.    Body or leg shot by the sidearm: slide, grip, trigger notch.
+	 *   SMG              SMG.       Body or leg shot by the SMG: longer slide, magazine, stock —
+	 *                               the second gun earned a second glyph (UI WP6.4).
 	 *   Cross            WORLD.     Fell out of the arena, or an unattributable death.
 	 *   Blade            KNIFE.     A front swipe (30). Neutral, because it is an ordinary trade.
-	 *   Blade + chevron  BACKSTAB.  100 from the rear hemisphere. Amber, the same amber the skull
-	 *                               wears, because those two are the game's only 100-damage events.
+	 *   Blade + bar      BACKSTAB.  100 from the rear hemisphere. Amber, like the skull, because
+	 *                               those are the game's 100-damage single events.
+	 *   Rocket           ABILITY.   Roxie's rocket — fins and detached exhaust ticks are what keep
+	 *                               it from reading as "a longer bullet".
 	 */
 	static constexpr int32 GlyphGrid = 13;
 
-	// A rifle round, pointed right: base flange, straight case walls, long ogive nose.
-	//
-	// THREE DRAFTS REJECTED. Each failure is a rule about drawing at 26 px, so they are kept.
-	//
-	//   Draft 1 had a ONE-CELL dark groove through a solid body. It disappeared: DrawKillIcon's
-	//   surround pass grows every lit run by 1 px on all sides, so at Cell = 2 px a one-cell (2 px)
-	//   gap is closed by 1 px of surround from each side. That is a hard floor — INTERIOR DETAIL
-	//   MUST BE AT LEAST TWO CELLS WIDE or it is not detail, it is nothing.
-	//
-	//   Draft 2 answered that by dropping the groove for a solid body with a flat back and a long
-	//   taper. Rendered at final size it plainly read as a MOUSE CURSOR — because a cursor is a flat
-	//   back and a taper, and crucially an ASYMMETRIC one. Symmetry about the horizontal axis is what
-	//   separates the two shapes, and this glyph is exactly symmetric for that reason.
-	//
-	//   Draft 3 restored the rim as a DETACHED bar two cells clear of the case, which is the smallest
-	//   gap the dilate leaves open. It survived, and it read as a BATTERY: at 26 px a floating bar is
-	//   not a rim, it is a second object. Rendered at 1x it degenerated further, into a dot and a
-	//   blob. THE RIM HAS TO BE ATTACHED — a cartridge base is a step in one silhouette, not two
-	//   shapes with a gap.
-	//
-	// So: one connected silhouette, a one-cell step top and bottom at the base for the flange,
-	// parallel case walls, and a four-column ogive. It reads as a round at 1x, which none of the
-	// three drafts above did.
-	static const TCHAR* const GlyphBullet[GlyphGrid] =
+	/** Side of the square the strokes are authored in. Scaled onto the Cell * GlyphGrid pixel box. */
+	static constexpr float GlyphDesignBox = 22.f;
+
+	/** One straight stroke in design units, start to end. */
+	struct FGlyphStroke { float X0; float Y0; float X1; float Y1; };
+
+	/** One filled rect in design units — the dots strokes cannot make (eyes, pommel). */
+	struct FGlyphDot { float X; float Y; float W; float H; };
+
+	// A pistol pointed right: doubled slide line, raked grip, trigger notch.
+	static constexpr FGlyphStroke StrokesBullet[] =
 	{
-		TEXT("............."),
-		TEXT("............."),
-		TEXT("..##........."),
-		TEXT("..#######...."),
-		TEXT("..#########.."),
-		TEXT("..##########."),
-		TEXT("..###########"),
-		TEXT("..##########."),
-		TEXT("..#########.."),
-		TEXT("..#######...."),
-		TEXT("..##........."),
-		TEXT("............."),
-		TEXT(".............")
+		{ 2.f, 7.f, 20.f, 7.f }, { 2.f, 9.f, 20.f, 9.f },   // slide, doubled
+		{ 14.f, 9.f, 11.f, 18.f },                          // grip
+		{ 8.f, 9.f, 8.f, 12.f },                            // trigger notch
 	};
 
-	static const TCHAR* const GlyphSkull[GlyphGrid] =
+	// The SMG: longer slide, magazine dropping from mid-body, a stock at the rear.
+	static constexpr FGlyphStroke StrokesSmg[] =
 	{
-		TEXT("....#####...."),
-		TEXT("..#########.."),
-		TEXT(".###########."),
-		TEXT("#############"),
-		TEXT("###.#####.###"),
-		TEXT("##...###...##"),
-		TEXT("##...###...##"),
-		TEXT("###.#####.###"),
-		TEXT("#####...#####"),
-		TEXT(".###########."),
-		TEXT("..#########.."),
-		TEXT("..#.#.#.#.#.."),
-		TEXT("...#######...")
+		{ 1.f, 7.f, 21.f, 7.f }, { 1.f, 9.f, 16.f, 9.f },   // slide
+		{ 13.f, 9.f, 10.f, 18.f },                          // grip
+		{ 16.f, 9.f, 15.f, 15.f },                          // magazine
+		{ 1.f, 7.f, 1.f, 12.f },                            // stock
 	};
 
-	static const TCHAR* const GlyphDash[GlyphGrid] =
+	// A knife swept up-right: long blade, edge return at the tip, cross-guard, pommel dot.
+	static constexpr FGlyphStroke StrokesKnife[] =
 	{
-		TEXT("............."),
-		TEXT("............."),
-		TEXT("##.....##...."),
-		TEXT(".##.....##..."),
-		TEXT("..##.....##.."),
-		TEXT("...##.....##."),
-		TEXT("....##.....##"),
-		TEXT("...##.....##."),
-		TEXT("..##.....##.."),
-		TEXT(".##.....##..."),
-		TEXT("##.....##...."),
-		TEXT("............."),
-		TEXT(".............")
+		{ 5.f, 17.f, 16.f, 5.f },                           // blade
+		{ 16.f, 5.f, 18.f, 9.f },                           // edge return
+		{ 12.f, 12.f, 17.f, 16.f },                         // guard
+	};
+	static constexpr FGlyphDot DotsKnife[] = { { 4.f, 17.f, 2.f, 2.f } };   // pommel
+
+	// A blade driven into a vertical back bar, tip chevron marking the point of entry.
+	static constexpr FGlyphStroke StrokesBackstab[] =
+	{
+		{ 18.f, 3.f, 18.f, 19.f },                          // the back
+		{ 3.f, 11.f, 15.f, 11.f },                          // blade
+		{ 11.f, 7.f, 15.f, 11.f }, { 11.f, 15.f, 15.f, 11.f },   // tip chevron
 	};
 
-	static const TCHAR* const GlyphParry[GlyphGrid] =
+	// The double chevron — same idea it has always meant: hit from where you were not looking.
+	static constexpr FGlyphStroke StrokesDash[] =
 	{
-		TEXT(".###########."),
-		TEXT("#############"),
-		TEXT("##.........##"),
-		TEXT("##.........##"),
-		TEXT("##.........##"),
-		TEXT(".##.......##."),
-		TEXT(".##.......##."),
-		TEXT("..##.....##.."),
-		TEXT("..##.....##.."),
-		TEXT("...##...##..."),
-		TEXT("....##.##...."),
-		TEXT(".....###....."),
-		TEXT("......#......")
+		{ 5.f, 4.f, 11.f, 11.f }, { 11.f, 11.f, 5.f, 18.f },
+		{ 12.f, 4.f, 18.f, 11.f }, { 18.f, 11.f, 12.f, 18.f },
 	};
 
-	static const TCHAR* const GlyphWorld[GlyphGrid] =
+	// The shield outline: flat top, straight sides, tapering to a point.
+	static constexpr FGlyphStroke StrokesParry[] =
 	{
-		TEXT("............."),
-		TEXT(".##.......##."),
-		TEXT(".###.....###."),
-		TEXT("..###...###.."),
-		TEXT("...###.###..."),
-		TEXT("....#####...."),
-		TEXT(".....###....."),
-		TEXT("....#####...."),
-		TEXT("...###.###..."),
-		TEXT("..###...###.."),
-		TEXT(".###.....###."),
-		TEXT(".##.......##."),
-		TEXT(".............")
+		{ 5.f, 4.f, 17.f, 4.f },
+		{ 5.f, 4.f, 5.f, 12.f }, { 17.f, 4.f, 17.f, 12.f },
+		{ 5.f, 12.f, 11.f, 19.f }, { 17.f, 12.f, 11.f, 19.f },
 	};
 
-	// A knife, pointed up-right: a wide handle at the bottom-left, a guard step, then a blade whose
-	// spine is straight and whose edge tapers to a point.
-	//
-	// The bullet glyph's rules above apply and were obeyed: interior detail is at least TWO cells
-	// wide (the guard notch is two), and the silhouette is ONE connected shape (no detached guard —
-	// draft 3's battery failure is exactly what a floating cross-guard would reproduce). It is
-	// deliberately ASYMMETRIC about both axes, which is what separates it from the bullet: the round
-	// is exactly horizontally symmetric, so a symmetric blade at 26 px would collide with it.
-	static const TCHAR* const GlyphKnife[GlyphGrid] =
+	// The skull: an octagon cranium (8 chords of centre (11,9) r 6), jaw bar, two teeth ticks.
+	// The eye sockets are dots below.
+	static constexpr FGlyphStroke StrokesHeadshot[] =
 	{
-		TEXT("..........##."),
-		TEXT(".........###."),
-		TEXT("........####."),
-		TEXT(".......#####."),
-		TEXT("......#####.."),
-		TEXT(".....#####..."),
-		TEXT("....#####...."),
-		TEXT("...#####....."),
-		TEXT("..#####......"),
-		TEXT(".#######....."),
-		TEXT(".#######....."),
-		TEXT("###.........."),
-		TEXT("###..........")
+		{ 16.54f, 11.30f, 13.30f, 14.54f }, { 13.30f, 14.54f, 8.70f, 14.54f },
+		{ 8.70f, 14.54f, 5.46f, 11.30f },   { 5.46f, 11.30f, 5.46f, 6.70f },
+		{ 5.46f, 6.70f, 8.70f, 3.46f },     { 8.70f, 3.46f, 13.30f, 3.46f },
+		{ 13.30f, 3.46f, 16.54f, 6.70f },   { 16.54f, 6.70f, 16.54f, 11.30f },
+		{ 8.f, 15.f, 14.f, 15.f },                                    // jaw
+		{ 9.f, 15.f, 9.f, 17.f }, { 12.f, 15.f, 12.f, 17.f },         // teeth
+	};
+	static constexpr FGlyphDot DotsHeadshot[] =
+	{
+		{ 8.f, 8.f, 2.f, 2.f }, { 13.f, 8.f, 2.f, 2.f },              // eye sockets
 	};
 
-	// The same blade, plus a double chevron BEHIND it pointing at the handle.
-	//
-	// The chevron is the dash glyph's own shape, and reusing it is the point: a back-stab is "hit
-	// from the direction the victim was not looking", which is the same idea the dash chevron already
-	// means. Two cells thick with a two-cell gap so the dilate cannot close it (see the bullet note).
-	static const TCHAR* const GlyphBackstab[GlyphGrid] =
+	// Roxie's rocket flying right: doubled body line, nose cone, fins, detached exhaust tick —
+	// the fins and the flame are still the whole design, because the thing this has to be
+	// distinguishable from at feed size is the pistol, another right-pointing shape.
+	static constexpr FGlyphStroke StrokesRocket[] =
 	{
-		TEXT("..........##."),
-		TEXT(".........###."),
-		TEXT("........####."),
-		TEXT("##.....#####."),
-		TEXT("###...#####.."),
-		TEXT(".###.#####..."),
-		TEXT("..#######...."),
-		TEXT(".###.#####..."),
-		TEXT("###...#####.."),
-		TEXT("##...####...."),
-		TEXT(".....####...."),
-		TEXT("...###......."),
-		TEXT("...###.......")
+		{ 4.f, 10.f, 15.f, 10.f }, { 4.f, 13.f, 15.f, 13.f },         // body
+		{ 15.f, 8.f, 19.f, 11.5f }, { 19.f, 11.5f, 15.f, 15.f },      // nose
+		{ 4.f, 8.f, 7.f, 10.f }, { 4.f, 15.f, 7.f, 13.f },            // fins
+		{ 1.f, 11.5f, 3.f, 11.5f },                                   // exhaust tick
 	};
 
-	// SPEC v18 §2 — Roxie's rocket. A rocket flying right: fins at the tail, an ogive nose, and a
-	// two-cell exhaust flame separated from the body by a one-cell gap.
-	//
-	// THE FINS AND THE FLAME ARE THE WHOLE DESIGN, because the thing this glyph has to be
-	// distinguishable from at 26 px is the BULLET, which is also a right-pointing ogive. A rocket
-	// drawn as "a longer bullet" would have been indistinguishable at feed size and the row would have
-	// been a lie that looked like a typo. The flame is deliberately DETACHED — the same trick the
-	// back-stab chevron uses — because a separated element survives the dilate and reads as motion.
-	static const TCHAR* const GlyphRocket[GlyphGrid] =
+	// The cross. Two strokes; nothing to get wrong.
+	static constexpr FGlyphStroke StrokesWorld[] =
 	{
-		TEXT("............."),
-		TEXT("............."),
-		TEXT("...##........"),
-		TEXT("...###......."),
-		TEXT("...########.."),
-		TEXT("##.#########."),
-		TEXT("##.##########"),
-		TEXT("##.#########."),
-		TEXT("...########.."),
-		TEXT("...###......."),
-		TEXT("...##........"),
-		TEXT("............."),
-		TEXT(".............")
+		{ 11.f, 4.f, 11.f, 18.f }, { 4.f, 11.f, 18.f, 11.f },
 	};
 
-	static const TCHAR* const* GlyphFor(ETraceKillIcon Icon)
+	static TConstArrayView<FGlyphStroke> StrokesFor(ETraceKillIcon Icon)
 	{
 		switch (Icon)
 		{
-		case ETraceKillIcon::Headshot: return GlyphSkull;
-		case ETraceKillIcon::Dash:     return GlyphDash;
-		case ETraceKillIcon::Parry:    return GlyphParry;
-		case ETraceKillIcon::World:    return GlyphWorld;
-		case ETraceKillIcon::Knife:    return GlyphKnife;
-		case ETraceKillIcon::Backstab: return GlyphBackstab;
-		case ETraceKillIcon::Ability:  return GlyphRocket;
-		default:                       return GlyphBullet;
+		case ETraceKillIcon::Headshot: return StrokesHeadshot;
+		case ETraceKillIcon::Dash:     return StrokesDash;
+		case ETraceKillIcon::Parry:    return StrokesParry;
+		case ETraceKillIcon::World:    return StrokesWorld;
+		case ETraceKillIcon::Knife:    return StrokesKnife;
+		case ETraceKillIcon::Backstab: return StrokesBackstab;
+		case ETraceKillIcon::Ability:  return StrokesRocket;
+		case ETraceKillIcon::Smg:      return StrokesSmg;
+		default:                       return StrokesBullet;
+		}
+	}
+
+	static TConstArrayView<FGlyphDot> DotsFor(ETraceKillIcon Icon)
+	{
+		switch (Icon)
+		{
+		case ETraceKillIcon::Headshot: return DotsHeadshot;
+		case ETraceKillIcon::Knife:    return DotsKnife;
+		default:                       return TConstArrayView<FGlyphDot>();
 		}
 	}
 
@@ -4491,7 +5270,7 @@ namespace TraceKillFeedArt
 		// behind it. Same amber for the same reason — the victim needs to know instantly that this was
 		// not a fight they could have out-aimed.
 		case ETraceKillIcon::Ability:  return TraceHUDStyle::Warning;
-		default:                       return TraceHUDStyle::Ink;   // Bullet, Dash and Knife: neutral
+		default:                       return TraceHUDStyle::Ink;   // Bullet, Smg, Dash, Knife: neutral
 		}
 	}
 
@@ -4520,9 +5299,20 @@ namespace TraceKillFeedArt
 
 void ATraceHUD::DrawKillIcon(ETraceKillIcon Icon, float X, float Y, float Cell, const FLinearColor& Color)
 {
-	const TCHAR* const* Rows = TraceKillFeedArt::GlyphFor(Icon);
+	// The pixel box is the one the bitmap era always sized (Cell * 13, integer cells — see
+	// DrawKillFeed), so the feed's layout math did not move; the 22-unit design box is scaled
+	// into it here.
+	const float IconPx = Cell * static_cast<float>(TraceKillFeedArt::GlyphGrid);
+	const float Scale = IconPx / TraceKillFeedArt::GlyphDesignBox;
 
-	// Two passes: a dilated black surround, then the fill. Same reasoning as DrawAimReticle's
+	// The HUD's own stroke weight: 2 px at the 26 px 1080p icon, floored so a 720p glyph never
+	// thins into invisibility.
+	const float Thickness = FMath::Max(1.5f, 2.f * IconPx / 26.f);
+
+	const TConstArrayView<TraceKillFeedArt::FGlyphStroke> Strokes = TraceKillFeedArt::StrokesFor(Icon);
+	const TConstArrayView<TraceKillFeedArt::FGlyphDot> Dots = TraceKillFeedArt::DotsFor(Icon);
+
+	// Two passes: a thicker dark surround, then the fill. Same reasoning as DrawAimReticle's
 	// outline — the arena is a black floor plus saturated cyan and amber neon, and an unoutlined
 	// white glyph disappears the moment it crosses a lit edge.
 	const FLinearColor Surround(0.f, 0.f, 0.f, 0.80f * Color.A);
@@ -4530,32 +5320,20 @@ void ATraceHUD::DrawKillIcon(ETraceKillIcon Icon, float X, float Y, float Cell, 
 	for (int32 Pass = 0; Pass < 2; ++Pass)
 	{
 		const FLinearColor PassColor = (Pass == 0) ? Surround : Color;
+		const float PassThickness = (Pass == 0) ? Thickness + 2.f : Thickness;
 		const float Grow = (Pass == 0) ? 1.f : 0.f;
 
-		for (int32 RowIndex = 0; RowIndex < TraceKillFeedArt::GlyphGrid; ++RowIndex)
+		for (const TraceKillFeedArt::FGlyphStroke& Stroke : Strokes)
 		{
-			const TCHAR* const Row = Rows[RowIndex];
-
-			// Run-length: one DrawRect per horizontal run of lit cells rather than one per cell,
-			// which turns a worst-case 169 rects per icon into at most a handful.
-			int32 RunStart = -1;
-			for (int32 Col = 0; Col <= TraceKillFeedArt::GlyphGrid; ++Col)
-			{
-				const bool bLit = (Col < TraceKillFeedArt::GlyphGrid) && (Row[Col] == TEXT('#'));
-				if (bLit && RunStart < 0)
-				{
-					RunStart = Col;
-				}
-				else if (!bLit && RunStart >= 0)
-				{
-					DrawRect(PassColor,
-						X + RunStart * Cell - Grow,
-						Y + RowIndex * Cell - Grow,
-						(Col - RunStart) * Cell + Grow * 2.f,
-						Cell + Grow * 2.f);
-					RunStart = -1;
-				}
-			}
+			DrawLine(X + Stroke.X0 * Scale, Y + Stroke.Y0 * Scale,
+				X + Stroke.X1 * Scale, Y + Stroke.Y1 * Scale,
+				PassColor, PassThickness);
+		}
+		for (const TraceKillFeedArt::FGlyphDot& Dot : Dots)
+		{
+			DrawRect(PassColor,
+				X + Dot.X * Scale - Grow, Y + Dot.Y * Scale - Grow,
+				Dot.W * Scale + Grow * 2.f, Dot.H * Scale + Grow * 2.f);
 		}
 	}
 }
@@ -4593,9 +5371,12 @@ void ATraceHUD::DrawKillFeed()
 		return;
 	}
 
-	// INTEGER CELLS, with a floor of 2. At 1080p this is 2 px per cell (a 26 px icon); at 720p the
-	// floor keeps it at 2 rather than collapsing to a 13 px smudge, so the glyph stays legible at
-	// the resolution this project is actually played and screenshotted at.
+	// THE ICON BOX, still sized in integer 13ths of the 26 px reference (WP6.4 replaced the bitmap
+	// blitter with strokes but deliberately did not move this layout math — every row width, gap and
+	// vertical centre below is measured off IconPx, and re-deriving them would have made a drawing
+	// change into a layout change nobody could diff). The floor of 2 keeps a 26 px box at 720p
+	// rather than letting the row collapse around a 13 px glyph; strokes scale continuously inside
+	// whatever box comes out, so a fractional UIScale costs sharpness in the box size only.
 	const float Cell = FMath::Max(2.f,
 		FMath::FloorToFloat(TraceKillFeedArt::IconBoxPx * UIScale / static_cast<float>(TraceKillFeedArt::GlyphGrid)));
 	const float IconPx = Cell * static_cast<float>(TraceKillFeedArt::GlyphGrid);
@@ -4942,6 +5723,52 @@ void ATraceHUD::DrawDeathPanel()
 	DrawTextCentered(RespawnText, TraceHUDStyle::Ink, CX, PanelY + (100.f * UIScale), FontMedium, 1.05f * UIScale);
 }
 
+// ===================================================================================================
+// FX/AUDIO plan §5.7 — THE RESULTS SCREEN'S FLOOR
+//
+// The four numbers behind "the menu bed comes back under the results screen instead of at the title
+// screen". The stinger's LENGTH is deliberately not among them — it is read off the asset at the
+// call site (USoundBase::GetDuration) so that replacing the stinger cannot leave this walking on it.
+// ===================================================================================================
+namespace TraceHUDMatchEndMusic
+{
+	/**
+	 * The fallback stinger length, and it is a MEASUREMENT rather than a design number: both stingers
+	 * ran 2.80 s when the match-end seam was timed end to end over two complete menu->match->menu laps
+	 * (release-impl W5-AUDIOMIX §5). Used only when the asset cannot be resolved or reports the
+	 * looping sentinel; the live path asks the sound.
+	 */
+	constexpr float MeasuredStingerSeconds = 2.80f;
+
+	/**
+	 * Anything longer than this is not a stinger. USoundBase::GetDuration() returns the
+	 * INDEFINITELY_LOOPING sentinel (1e4) for a looping asset, and a looping "stinger" would otherwise
+	 * push the bed past the end of the results screen entirely — i.e. it would silently restore the
+	 * exact bug this block fixes. Chosen well above any credible one-shot and far below the sentinel.
+	 */
+	constexpr float MaxCredibleStingerSeconds = 30.f;
+
+	/**
+	 * How far BEFORE the stinger ends the bed starts rising, so the two overlap instead of butting.
+	 * At the measured 2.80 s the bed starts at 1.90 s and is at full by 3.30 s — the same shape as the
+	 * menu->match cross-fade, which is the transition this game already sounds like.
+	 */
+	constexpr float BedRisesUnderTailSeconds = 0.90f;
+
+	/** A floor, so a very short stinger cannot make the bed start on the same frame as the whistle. */
+	constexpr float MinResumeDelaySeconds = 0.50f;
+
+	/**
+	 * The bed's own fade-in. Longer than the subsystem's 0.8 s default on purpose: this one rises
+	 * under a decaying stinger on a frozen screen, where a fast fade reads as a second cue starting,
+	 * and 1.4 s reads as the room coming back.
+	 */
+	constexpr float BedFadeSeconds = 1.40f;
+
+	/** The ambience's stop fade at full time. The draw path's bed only has to clear this. */
+	constexpr float DrawStopFadeSeconds = 0.50f;
+}
+
 /**
  * The post-match screen.
  *
@@ -4954,7 +5781,12 @@ void ATraceHUD::DrawDeathPanel()
  */
 void ATraceHUD::DrawMatchResult()
 {
-	if (TraceGS == nullptr || TraceGS->TraceMatchState != ETraceMatchState::PostMatch)
+	// REAL time, not game time: the results screen's music timing must not be hostage to a pause or
+	// to time dilation. A drawing HUD always has a world, but the two music branches below both read
+	// it, so it is fetched with the other pre-conditions rather than mid-draw.
+	UWorld* const World = GetWorld();
+	if (World == nullptr || TraceGS == nullptr
+		|| TraceGS->TraceMatchState != ETraceMatchState::PostMatch)
 	{
 		return;
 	}
@@ -4983,6 +5815,135 @@ void ATraceHUD::DrawMatchResult()
 	if (Winner == ETraceTeam::None && Blue != Orange)
 	{
 		Winner = (Blue > Orange) ? ETraceTeam::Blue : ETraceTeam::Orange;
+	}
+
+	// ---- FX/AUDIO plan §5.7 — FULL TIME: STOP THE AMBIENCE, PLAY THE STINGER --------------------
+	//
+	// HERE, not in DrawHUD's phase edge detector, and the reason is Winner above: the stinger has to
+	// know whether the LOCAL player won, and MatchWinner can be one frame behind the state change on
+	// a client that joined mid-whistle. This pass has already resolved that (including the score
+	// fallback), so by this line the answer is as good as it is going to get.
+	//
+	// ONCE PER MATCH. bMatchEndStingerPlayed is a HUD member and a HUD is rebuilt by the travel back
+	// to the title screen, so there is nothing to reset — and a stinger that fired every frame of the
+	// full-time screen would be the loudest bug in the project.
+	//
+	// A DRAW GETS THE STOP AND NO STINGER, deliberately. There are exactly two stingers, victory and
+	// defeat, and a draw is neither; playing defeat for a drawn match would be the audio telling a
+	// player they lost. The ambience still ends and the takeover screen still lands, so the moment is
+	// not silent-as-in-broken.
+	if (!bMatchEndStingerPlayed)
+	{
+		bMatchEndStingerPlayed = true;
+
+		if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(this))
+		{
+			Music->Stop(0.5f);
+		}
+
+		bool bStingerPlayed = false;
+		FName StingerEvent = NAME_None;
+
+		if (Winner != ETraceTeam::None && LocalTeam != ETraceTeam::None)
+		{
+			const bool bWon = (Winner == LocalTeam);
+			StingerEvent = bWon ? TraceSoundEvents::StingerVictory : TraceSoundEvents::StingerDefeat;
+			bStingerPlayed = true;
+			TraceAudio::PlayLocal2D(this, StingerEvent);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Music] full time: ambience stopped (0.5s) and the %s stinger played "
+				     "(winner=%s, local team=%s)."),
+				bWon ? TEXT("VICTORY") : TEXT("DEFEAT"),
+				*TraceTeamName(Winner).ToString(), *TraceTeamName(LocalTeam).ToString());
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Music] full time: ambience stopped (0.5s), no stinger (winner=%s, local team=%s "
+				     "— a draw, or a viewer with no team, gets neither)."),
+				*TraceTeamName(Winner).ToString(), *TraceTeamName(LocalTeam).ToString());
+		}
+
+		// ---- AND THEN THE BED COMES BACK, HERE, UNDER THE RESULTS SCREEN ------------------------
+		//
+		// *** THIS SCREEN USED TO GO SILENT FOR ELEVEN TO FOURTEEN SECONDS, AT THE MOST-WATCHED
+		// MOMENT OF THE MATCH. *** §5.7 says Stop(0.5) at full time and Play(MusicTitle) on the way
+		// back to the menu, and both of those were done — but PostMatchDuration is 14 s and the
+		// stinger is under three of them, so between the stinger's decay and the title screen there
+		// was NO BED AT ALL. Measured end to end over two complete laps: 13.53 s and 13.79 s of it,
+		// with the only audio being whatever the surviving bots happened to walk on. The gap is also
+		// UNBOUNDED, because it includes the travel: it grew by 2.1 s between two passes purely
+		// because the machine was busier.
+		//
+		// Eleven seconds of nothing, over a frozen screen, reads as "the game has stopped" — which is
+		// precisely the complaint the takeover screen above exists to answer ("keeps stopping and
+		// restarting"). It is not what §5.7 intended, it is the seam nobody costed between two
+		// correct instructions.
+		//
+		// THE FIX IS THE BED THE PLAYER IS ABOUT TO BE HANDED ANYWAY. MusicTitle rises under the
+		// results screen instead of at the title screen, so:
+		//   * the results screen has a floor under it for its whole 14 s;
+		//   * the travel back stops being a gap too — ATraceMenuHUD::BeginPlay's Play(MusicTitle) is
+		//     already a no-op when that track is playing, so the bed is CONTINUOUS from the whistle
+		//     through the travel into the menu, and the 2.25-2.49 s travel seam closes with it;
+		//   * no new asset, no new mix pass, and nothing to keep in sync — the results screen and the
+		//     menu are the same bed by construction rather than by two calls that agree today.
+		//
+		// *** THE DELAY IS READ OFF THE STINGER ASSET, NOT TYPED. *** A literal 2.8 here would be the
+		// copied-constant bug this project keeps paying for: swap the stinger for a longer one and
+		// the bed would start walking on it. USoundBase::GetDuration() is the stinger's own length,
+		// and the bed is timed to RISE UNDER ITS DECAY rather than after it — a cross-fade, not a
+		// butt-join. Guarded against the looping sentinel (GetDuration returns 1e4 for a loop) and
+		// against a missing asset, both of which fall back to the measured 2.80 s.
+		float StingerSeconds = TraceHUDMatchEndMusic::MeasuredStingerSeconds;
+		if (bStingerPlayed)
+		{
+			if (UTraceAudioSubsystem* Audio = UTraceAudioSubsystem::Get(this))
+			{
+				if (const USoundBase* Asset = Audio->ResolveSound(StingerEvent))
+				{
+					const float Actual = Asset->GetDuration();
+					if (Actual > 0.f && Actual < TraceHUDMatchEndMusic::MaxCredibleStingerSeconds)
+					{
+						StingerSeconds = Actual;
+					}
+				}
+			}
+		}
+		else
+		{
+			// No stinger (a draw, or a viewer with no team). Nothing to cross-fade against, so the
+			// bed only has to clear the ambience's own 0.5 s stop fade.
+			StingerSeconds = TraceHUDMatchEndMusic::DrawStopFadeSeconds;
+		}
+
+		MatchEndBedResumeRealTime = World->GetRealTimeSeconds()
+			+ FMath::Max(TraceHUDMatchEndMusic::MinResumeDelaySeconds,
+			             StingerSeconds - TraceHUDMatchEndMusic::BedRisesUnderTailSeconds);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Music] results screen: the menu bed will rise in %.2fs (stinger %.2fs, fade %.2fs), "
+			     "so the %.0fs post-match window is not bed-less."),
+			MatchEndBedResumeRealTime - World->GetRealTimeSeconds(), StingerSeconds,
+			TraceHUDMatchEndMusic::BedFadeSeconds, TraceMatchFlow::PostMatchDuration);
+	}
+
+	// The bed itself, on a later frame. Play() is a no-op when MusicTitle is already the playing
+	// track, so the bool is belt-and-braces rather than the only guard — but it also keeps this out
+	// of the subsystem entirely on the other ~800 frames of the results screen.
+	if (bMatchEndStingerPlayed && !bMatchEndBedResumed
+		&& MatchEndBedResumeRealTime >= 0.f
+		&& World->GetRealTimeSeconds() >= MatchEndBedResumeRealTime)
+	{
+		bMatchEndBedResumed = true;
+		if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(this))
+		{
+			Music->Play(TraceSoundEvents::MusicTitle, TraceHUDMatchEndMusic::BedFadeSeconds);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Music] results screen: menu bed rising (fade %.2fs). It carries through the "
+				     "travel — the title screen's Play() will be a no-op."),
+				TraceHUDMatchEndMusic::BedFadeSeconds);
+		}
 	}
 
 	FString ResultText;
@@ -5087,12 +6048,17 @@ void ATraceHUD::DrawMatchResult()
 // Scoreboard (Tab)
 // -------------------------------------------------------------------------------------------
 
+bool ATraceHUD::IsScoreboardHeld() const
+{
+	return TracePC != nullptr && TracePC->IsScoreboardOpen();
+}
+
 void ATraceHUD::DrawScoreboard()
 {
 	// Hold-Tab only. This used to force itself open at full time as well; DrawMatchResult now owns
 	// that moment with a bigger version of the same rosters, and DrawHUD does not call this pass at
 	// all once the match is over.
-	if (TracePC == nullptr || !TracePC->IsScoreboardOpen())
+	if (!IsScoreboardHeld())
 	{
 		return;
 	}
@@ -5236,7 +6202,10 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 		// The NAME is the half that gives, because it is the only one that can: MANNEQUIN and
 		// SLIMEBALL are roster data and truncating them would make the column unscannable, while a
 		// player name is the reader's own and is still recognisable from its first characters. Two
-		// dots rather than an ellipsis, because the atlas charset is printable ASCII.
+		// dots rather than an ellipsis: the licensed sheets have no U+2026 and never will. WP12's
+		// fallback sheet does, but reaching for it here would set the one punctuation mark in an
+		// AUTHORED string in a different typeface from the row it ends — the fallback is for
+		// codepoints the game did not choose, and this is a codepoint the game chose.
 		//
 		// Measured per row rather than budgeted once: the character label differs per row, so the
 		// room a name has depends on who that player picked.
@@ -5336,20 +6305,28 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 // -------------------------------------------------------------------------------------------
 // WHAT THE ATLAS CANNOT SERVE, SAID OUT LOUD RATHER THAN LEFT AS A SILENT MIX (§A4)
 // -------------------------------------------------------------------------------------------
-// The sheet is printable ASCII only. Every AUTHORED string on this HUD is inside that set, and so
-// is every string this HUD generates — clocks, scores, cooldowns, "%.1f", the roster's ability and
-// character names, and FKey::GetDisplayName for every key a player can bind.
+// The three licensed sheets are printable ASCII only. Every AUTHORED string on this HUD is inside
+// that set, and so is every string this HUD generates — clocks, scores, cooldowns, "%.1f", the
+// roster's ability and character names, and FKey::GetDisplayName for every key a player can bind.
 //
 // The exception is the one class of string the HUD does not author: PLAYER NAMES, in the kill feed
-// and on the scoreboard. A name carrying anything outside printable ASCII has no cell to blit, and
-// TraceText::LayoutString advances the pen by a space for it rather than substituting a face — so
-// it comes out as a gap, and it MEASURES as a gap too, which at least keeps the row's box honest.
+// and on the scoreboard.
 //
-// That is a real limitation and it is not silently absorbed: WarnIfUndrawable names any such string
-// in the log the first time it is drawn. The alternative — keeping names in Lato — is precisely the
+// *** THIS BLOCK USED TO END BY SAYING THOSE NAMES DRAW AS GAPS. THEY NO LONGER DO. *** They did:
+// a codepoint outside printable ASCII had no cell to blit, TraceText::LayoutString advanced the pen
+// by a space for it, and "Björn" came out as "Bj rn" — measured as a gap too, so the row's box
+// stayed honest while the name did not. UI plan WP12 fixed that where the fix belongs, in
+// Source/Trace/UI/Text: a fourth sheet (T_FontAtlasNames, Lato, OFL) covers Latin-1 and the text
+// stack draws a missing codepoint from it, baseline-aligned into the line, or draws its '?' for one
+// missing from every sheet. Nothing on this HUD changed — it measures and draws through TraceText
+// either way, which is exactly why it did not have to.
+//
+// What survives here is the DIAGNOSTIC: WarnIfUndrawable names a string that will draw a '?' — the
+// both-sheets-miss case, which is now the only case worth a log line. The alternative that was
+// rejected then is still rejected — keeping names in Lato through AHUD::DrawText is the
 // two-typefaces defect this pass exists to remove, and it would restore the measure/draw split that
-// mis-sized the kill feed. Serving those names properly needs glyphs in the sheet, which lives in
-// Source/Trace/UI/Text and Scripts/generate_font_atlas.py, not here.
+// mis-sized the kill feed. The per-glyph fallback is a different thing: one codepoint, inside the
+// atlas path, measured and drawn by the same layout pass.
 
 namespace TraceHUDType
 {
@@ -5426,18 +6403,23 @@ namespace TraceHUDType
 	 * Says so when a string reaches the HUD that the atlas has no glyphs for. See the banner above.
 	 *
 	 * THIS IS A DIAGNOSTIC AND NOTHING ELSE. It cannot change what is drawn or how wide anything is
-	 * measured — TraceText remains the only thing that decides either — so the printable-ASCII range
-	 * repeated here is not a second metrics source, and it is deliberately the CONSERVATIVE test: if
-	 * the sheet ever gains glyphs beyond ASCII this over-reports, which costs a stray log line, while
-	 * the other direction would cost a silent gap on screen. The real charset lives in the generated
-	 * TraceFontAtlasMetrics.h, which by design only TraceText.cpp may include.
+	 * measured — TraceText remains the only thing that decides either.
+	 *
+	 * *** IT USED TO REPEAT THE PRINTABLE-ASCII RANGE HERE AND IT NO LONGER DOES. *** That test was
+	 * written as the deliberately CONSERVATIVE one, on the reasoning that "if the sheet ever gains
+	 * glyphs beyond ASCII this over-reports, which costs a stray log line". The sheet gained them
+	 * (UI plan WP12's Latin-1 fallback face) and the trade stopped being cheap: every accented name
+	 * in a kill feed would log a warning about a character that now draws perfectly, which is how a
+	 * warning nobody believes gets made. TraceText::CanDraw() is asked instead — it is the module
+	 * that owns the charset, and it still is the only thing that includes TraceFontAtlasMetrics.h.
+	 * What is left to warn about is the both-sheets-miss case, which really does draw a '?'.
 	 *
 	 * Once per distinct string, and capped: a feed of bot names must not turn into a log flood, and
 	 * a name is drawn on every frame it is on screen.
 	 */
 	static void WarnIfUndrawable(const FString& Text)
 	{
-		// The fallback face has these glyphs. Complaining while Lato is live would be a lie.
+		// The fallback FONT has these glyphs. Complaining while Lato is live would be a lie.
 		if (Text.IsEmpty() || !TraceText::IsAtlasActive())
 		{
 			return;
@@ -5446,8 +6428,10 @@ namespace TraceHUDType
 		bool bUndrawable = false;
 		for (int32 Index = 0; Index < Text.Len(); ++Index)
 		{
-			const TCHAR Char = Text[Index];
-			if (Char != TEXT('\n') && (Char < TEXT(' ') || Char > TEXT('~')))
+			// The weight this HUD is actually drawing in: whether a codepoint has a cell is a
+			// question about a FACE, and asking it of the wrong one would warn about the right
+			// string for the wrong reason.
+			if (!TraceText::CanDraw(Text[Index], HudWeight()))
 			{
 				bUndrawable = true;
 				break;
@@ -5467,11 +6451,11 @@ namespace TraceHUDType
 		Reported.Add(Text);
 
 		UE_LOG(LogTraceGame, Warning,
-			TEXT("[HUDType] \"%s\" contains characters the %s atlas has no cell for; they draw as blank ")
-			TEXT("space (and measure as blank space, so the row's box stays correct). The sheet is ")
-			TEXT("printable ASCII only — see Scripts/generate_font_atlas.py. This is expected for a ")
-			TEXT("player name and is reported once per distinct string."),
-			*Text, *TraceText::FaceName(HudWeight()));
+			TEXT("[HUDType] \"%s\" contains characters that NEITHER the %s atlas NOR the %s fallback ")
+			TEXT("sheet has a cell for, so they draw as '?'. The licensed sheets are printable ASCII ")
+			TEXT("and the fallback covers Latin-1 plus a few typographic marks — see ")
+			TEXT("Scripts/generate_font_atlas.py. Reported once per distinct string."),
+			*Text, *TraceText::FaceName(HudWeight()), TraceText::FallbackFaceSourceFile());
 	}
 
 	/**
@@ -5682,6 +6666,48 @@ void ATraceHUD::LogV16DrawRecord(const TCHAR* Tag) const
 		Record.ChargeRingAlpha,
 		Record.ChargeRingChords,
 		Record.bChargeBar ? TEXT("YES") : TEXT("no"));
+}
+
+ATraceHUD::FFxHudDrawRecord ATraceHUD::GetFxHudDrawRecord() const
+{
+	FFxHudDrawRecord Record;
+	Record.bHitMarker = bDrewHitMarker;
+	Record.bShieldBlockedMarker = bDrewShieldBlockedMarker;
+	Record.ToastText = DrawnToastText;
+	Record.SecondaryRowText = DrawnSecondaryRowText;
+	Record.ChipCount = DrawnStatusChips.Num();
+
+	for (const FString& Chip : DrawnStatusChips)
+	{
+		Record.ChipText += FString::Printf(TEXT("\n[FXHUD]     chip: %s"), *Chip);
+	}
+	if (DrawnStatusChips.Num() == 0)
+	{
+		Record.ChipText = TEXT("\n[FXHUD]     chip: <none>");
+	}
+
+	Record.Vignettes = FString::Join(DrawnVignettes, TEXT(" + "));
+	if (Record.Vignettes.IsEmpty())
+	{
+		Record.Vignettes = TEXT("<none>");
+	}
+	return Record;
+}
+
+void ATraceHUD::LogFxHudDrawRecord(const TCHAR* Tag) const
+{
+	const FFxHudDrawRecord Record = GetFxHudDrawRecord();
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[FXHUD] %s | toast='%s' | Vrow='%s' | hitMarker=%s blockedMarker=%s | vignette=%s | chips=%d%s"),
+		Tag,
+		*Record.ToastText,
+		*Record.SecondaryRowText,
+		Record.bHitMarker ? TEXT("YES") : TEXT("no"),
+		Record.bShieldBlockedMarker ? TEXT("YES") : TEXT("no"),
+		*Record.Vignettes,
+		Record.ChipCount,
+		*Record.ChipText);
 }
 
 /**
@@ -6735,6 +7761,777 @@ namespace TraceHudCornerVerify
 				     "stack because v16 put them there on purpose, so the two never read as one widget "
 				     "(statuses DRAIN, cooldowns FILL). Converting them would have been a redesign."));
 			UE_LOG(LogTraceGame, Display, TEXT("[HUDUMG] ====="));
+		}));
+}
+
+// ===================================================================================================
+// Trace.HUD.FxHudShots — THE CAPTURE RIG FOR FX/AUDIO PLAN §7 (and §2.5/§2.6)
+//
+// Modelled on TraceHUDV16Shots above, which is the pattern this project settled on for verifying a
+// DRAWING change: stage real gameplay state on a real pawn, photograph the frame, and assert against
+// the DRAW RECORD rather than against the state that fed it.
+//
+// *** EVERY SCENE IS STAGED THROUGH A SHIPPED PATH. *** The toasts come from
+// UTraceAbilityComponent::TryActivate refusing a real press; the chips come from real abilities
+// firing (Zip, MODDED) or from the same public entry points the abilities themselves use
+// (DebugStartCloak, DebugSetStuck, UTraceSlimewallSlowComponent::ApplyTo); the blocked marker comes
+// from ATracePlayerController::ClientNotifyHit, the actual RPC handler. Nothing here calls a draw
+// function directly, because a rig that did would only ever prove that drawing draws.
+//
+// TWO SCENES CANNOT BE STAGED HONESTLY IN ONE PROCESS AND SAY SO RATHER THAN FAKING IT:
+//   * the REFUSED toast needs a server disagreeing with a client's prediction, so it goes through
+//     UTraceAbilityComponent::DebugSimulateActivateRejected() — the shipped handler, called directly;
+//   * (RESOLVED, W5-KITS-E.) This used to read: "the V row's PRODUCER (Roxie's
+//     GetSecondaryCooldownDisplay override) belongs to a later wave, so the row is fed by
+//     Trace.HUD.VRowRoxieFixture, which reads her own real published cooldown." That override has
+//     landed, it answers before the fixture can, and the fixture is now dead code in
+//     Abilities/TraceAbilityComponent.cpp. The row's frames below are the shipped producer's.
+// Both are named in the verdict, every run, so a reader never has to guess which frames were free.
+// ===================================================================================================
+
+namespace TraceFxHudShots
+{
+	struct FRun
+	{
+		int32 Step = 0;
+		double NextRealTime = 0.0;
+		int32 TicksLeft = 40000;
+
+		/** Scratch for the one step that POLLS a gameplay state instead of waiting a fixed time. */
+		int32 Poll = 0;
+
+		TWeakObjectPtr<ATraceHUD> Hud;
+		TWeakObjectPtr<ATracePlayerController> PC;
+
+		TArray<FString> Passes;
+		TArray<FString> Failures;
+		TArray<FString> NotApplicable;
+
+		/** False when this world refuses characters at all (mode A is frozen — spec §2). */
+		bool bCharacters = true;
+	};
+
+	ATracePlayerController* FindLocalAuthorityPC(UWorld* WorldPtr)
+	{
+		if (WorldPtr == nullptr
+			|| (!WorldPtr->IsNetMode(NM_ListenServer) && !WorldPtr->IsNetMode(NM_Standalone)))
+		{
+			// Staging is AUTHORITATIVE and photographing is LOCAL; only these two net modes are both.
+			return nullptr;
+		}
+		for (FConstPlayerControllerIterator It = WorldPtr->GetPlayerControllerIterator(); It; ++It)
+		{
+			if (ATracePlayerController* Candidate = Cast<ATracePlayerController>(It->Get()))
+			{
+				if (Candidate->IsLocalController())
+				{
+					return Candidate;
+				}
+			}
+		}
+		return nullptr;
+	}
+
+	ATraceCharacter* PawnOf(const FRun& Run)
+	{
+		ATracePlayerController* PC = Run.PC.Get();
+		return (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+	}
+
+	UTraceAbilityComponent* AbilitiesOf(const FRun& Run)
+	{
+		ATracePlayerController* PC = Run.PC.Get();
+		return (PC != nullptr) ? UTraceAbilityComponent::Get(PC->PlayerState) : nullptr;
+	}
+
+	void Exec(UWorld* WorldPtr, const TCHAR* Command)
+	{
+		if (GEngine != nullptr && WorldPtr != nullptr)
+		{
+			GEngine->Exec(WorldPtr, Command);
+		}
+	}
+
+	void SetCVarInt(const TCHAR* Name, int32 Value)
+	{
+		if (IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name))
+		{
+			Var->Set(Value, ECVF_SetByConsole);
+		}
+	}
+
+	void Expect(FRun& Run, bool bCondition, const FString& Claim)
+	{
+		if (bCondition)
+		{
+			Run.Passes.Add(Claim);
+		}
+		else
+		{
+			Run.Failures.Add(Claim);
+			UE_LOG(LogTraceGame, Warning, TEXT("[FXHUD] *** FAIL: %s ***"), *Claim);
+		}
+	}
+
+	/** A PlayerState on the OTHER team — the only legal source for an inflicted debuff. */
+	APlayerState* FindEnemyPlayerState(UWorld* WorldPtr, const ATraceCharacter* Victim)
+	{
+		const AGameStateBase* GS = (WorldPtr != nullptr) ? WorldPtr->GetGameState() : nullptr;
+		if (GS == nullptr || Victim == nullptr)
+		{
+			return nullptr;
+		}
+		for (APlayerState* Candidate : GS->PlayerArray)
+		{
+			const ATracePlayerState* TraceState = Cast<ATracePlayerState>(Candidate);
+			if (TraceState == nullptr || TraceState == Victim->GetPlayerState())
+			{
+				continue;
+			}
+			if (TraceState->Team != Victim->GetTeam())
+			{
+				return Candidate;
+			}
+		}
+		return nullptr;
+	}
+
+	/**
+	 * bShowUI IS TRUE, for the reason TraceHUDV16Shots spells out at length: a UMG corner is a Slate
+	 * widget and a UI-less capture is blind to it. The chips are exactly that element.
+	 */
+	ATraceHUD::FFxHudDrawRecord Shot(FRun& Run, const TCHAR* Tag)
+	{
+		const FString FileName = FString::Printf(TEXT("FxHud_%s_pid%d.png"), Tag,
+			FPlatformProcess::GetCurrentProcessId());
+		const FString FullPath = FPaths::ConvertRelativePathToFull(
+			FPaths::ProjectSavedDir() / TEXT("Screenshots") / FileName);
+
+		FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*FPaths::GetPath(FullPath));
+		FScreenshotRequest::RequestScreenshot(FullPath, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+		UE_LOG(LogTraceGame, Display, TEXT("[FXHUD] shot requested: %s"), *FullPath);
+
+		ATraceHUD* HudPtr = Run.Hud.Get();
+		if (HudPtr == nullptr)
+		{
+			return ATraceHUD::FFxHudDrawRecord();
+		}
+		HudPtr->LogFxHudDrawRecord(Tag);
+		return HudPtr->GetFxHudDrawRecord();
+	}
+
+	bool SwitchCharacter(UWorld* WorldPtr, FRun& Run, const TCHAR* CharacterName, ETraceCharacterId Expected)
+	{
+		Exec(WorldPtr, *FString::Printf(TEXT("Trace.Ability.SetCharacter %s"), CharacterName));
+
+		const UTraceAbilityComponent* Comp = AbilitiesOf(Run);
+		const bool bTook = (Comp != nullptr) && (Comp->GetCharacterId() == Expected);
+		if (!bTook)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[FXHUD] switch to %s did NOT take (now %d). Whatever needed it is reported as NOT "
+				     "PHOTOGRAPHED rather than quietly skipped."),
+				CharacterName, (Comp != nullptr) ? (int32)Comp->GetCharacterId() : -1);
+		}
+		return bTook;
+	}
+
+	bool Tick(TSharedPtr<FRun> Run);
+
+	void Schedule(TSharedPtr<FRun> Run, float DelaySeconds)
+	{
+		Run->NextRealTime = FPlatformTime::Seconds() + static_cast<double>(DelaySeconds);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[Run](float) -> bool
+			{
+				if (FPlatformTime::Seconds() < Run->NextRealTime)
+				{
+					return (--Run->TicksLeft) > 0;
+				}
+				return Tick(Run);
+			}), 0.f);
+	}
+
+	bool Tick(TSharedPtr<FRun> Run)
+	{
+		ATraceHUD* HudPtr = Run->Hud.Get();
+		ATracePlayerController* PC = Run->PC.Get();
+		UWorld* WorldPtr = (PC != nullptr) ? PC->GetWorld() : nullptr;
+
+		if (HudPtr == nullptr || PC == nullptr || WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[FXHUD] *** ABORTED at step %d: the HUD or the local controller went away. NOT a pass. ***"),
+				Run->Step);
+			return false;
+		}
+
+		const int32 ThisStep = Run->Step++;
+		float NextDelay = 1.0f;
+
+		switch (ThisStep)
+		{
+		case 0:
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[FXHUD] ===== FX/AUDIO plan 7 capture sequence ===== pawn=%s alive=%d netmode=%d"),
+				*GetNameSafe(PawnOf(*Run)),
+				(PawnOf(*Run) != nullptr) ? (int32)PawnOf(*Run)->IsAlive() : 0,
+				(int32)WorldPtr->GetNetMode());
+
+			// The per-team uniqueness rule hands most of the roster to bots before this command runs,
+			// and this rig has to BE five different characters in turn. The framework's own documented
+			// dev arm, and a FIXTURE change: nothing under test reads it.
+			Exec(WorldPtr, TEXT("Trace.Characters.EnforceRosterRules 0"));
+			NextDelay = 1.0f;
+			break;
+
+		// ---- §7.1 TOAST: the COOLDOWN refusal ---------------------------------------------------
+		case 1:
+			Run->bCharacters = SwitchCharacter(WorldPtr, *Run, TEXT("Lily"), ETraceCharacterId::Lily);
+			if (!Run->bCharacters)
+			{
+				Run->NotApplicable.Add(TEXT("EVERY 7.1 toast and every 7.3 chip — this world refuses "
+					"characters outright (mode A is frozen, spec 2). Run in a mode B world."));
+				Run->Step = 40;
+			}
+			NextDelay = 1.0f;
+			break;
+
+		case 2:
+			// A REAL press, through the entry point the E key calls. It fires (Lily zips) and starts
+			// the cooldown that the next press will be refused by.
+			if (UTraceAbilityComponent* Abilities = AbilitiesOf(*Run))
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[FXHUD] Lily E press #1 fired=%d"),
+					(int32)Abilities->TryActivate());
+			}
+			NextDelay = 0.35f;
+			break;
+
+		case 3:
+		{
+			// ZIP is live for a couple of seconds, so this one frame carries the chip AND the toast.
+			const ATraceHUD::FFxHudDrawRecord Zip = Shot(*Run, TEXT("chip_ZIP"));
+			Expect(*Run, Zip.ChipText.Contains(TEXT("ZIP")),
+				TEXT("7.3: the ZIP chip drew while Lily was flying"));
+			Expect(*Run, !Zip.ChipText.Contains(TEXT("ZIP | 0.0s")),
+				TEXT("7.3: the ZIP chip's readout is a live remaining, not zero"));
+
+			// The SECOND press: the ability is on cooldown, so TryActivate takes the cooldown arm.
+			if (UTraceAbilityComponent* Abilities = AbilitiesOf(*Run))
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[FXHUD] Lily E press #2 (expect refusal) fired=%d"),
+					(int32)Abilities->TryActivate());
+			}
+			NextDelay = 0.35f;
+			break;
+		}
+
+		case 4:
+		{
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("toast_COOLDOWN"));
+			Expect(*Run, Rec.ToastText.Contains(TEXT(" IN ")) && Rec.ToastText.EndsWith(TEXT("S")),
+				FString::Printf(TEXT("7.1: the COOLDOWN refusal toast drew ('%s')"), *Rec.ToastText));
+			NextDelay = 1.0f;
+			break;
+		}
+
+		// ---- §7.1 TOAST: a character's OWN CanActivate reason (F3) ------------------------------
+		case 5:
+			SwitchCharacter(WorldPtr, *Run, TEXT("Mortimer"), ETraceCharacterId::Mortimer);
+
+			// *** THE COOLDOWN HAS TO BE CLEARED FIRST, AND THE FIRST RUN OF THIS RIG PROVED WHY. ***
+			// Changing character mid-match does NOT hand you a free E (ServerSetCharacter says so in
+			// as many words), so Lily's Zip cooldown was still running when Mortimer pressed — and
+			// TryActivate takes its refusals IN ORDER, so the frame photographed "E IN 27.2S"
+			// instead of Mortimer's posture reason. The rig was wrong, not the toast; but a fixture
+			// that cannot reach the arm it is aimed at cannot photograph it either.
+			if (UTraceAbilityComponent* Abilities = AbilitiesOf(*Run))
+			{
+				Abilities->DebugSetActivatedCooldown(0.f);
+			}
+			NextDelay = 1.0f;
+			break;
+
+		case 6:
+			// Mortimer's Quake refuses without the Core, in his own words. Before §7.1 that sentence
+			// existed only in a server log — which is the F3 finding, and this is the frame that
+			// closes it.
+			if (UTraceAbilityComponent* Abilities = AbilitiesOf(*Run))
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[FXHUD] Mortimer E press with no Core, fired=%d"),
+					(int32)Abilities->TryActivate());
+			}
+			NextDelay = 0.35f;
+			break;
+
+		case 7:
+		{
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("toast_POSTURE"));
+			Expect(*Run, Rec.ToastText.Contains(TEXT("QUAKE")),
+				FString::Printf(TEXT("7.1: Mortimer's OWN posture reason drew as a toast ('%s')"),
+					*Rec.ToastText));
+			NextDelay = 0.8f;
+			break;
+		}
+
+		// ---- §7.1 TOAST: the server's REFUSED correction ----------------------------------------
+		case 8:
+			if (UTraceAbilityComponent* Abilities = AbilitiesOf(*Run))
+			{
+				Abilities->DebugSimulateActivateRejected();
+			}
+			NextDelay = 0.35f;
+			break;
+
+		case 9:
+		{
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("toast_REJECTED"));
+			Expect(*Run, Rec.ToastText.Equals(TEXT("REFUSED")),
+				FString::Printf(TEXT("7.1: the server-rejection toast drew ('%s')"), *Rec.ToastText));
+			NextDelay = 0.8f;
+			break;
+		}
+
+		// ---- §7.2 THE V ROW ---------------------------------------------------------------------
+		case 10:
+			SwitchCharacter(WorldPtr, *Run, TEXT("Roxie"), ETraceCharacterId::Roxie);
+			SetCVarInt(TEXT("Trace.HUD.VRowRoxieFixture"), 1);
+			NextDelay = 1.0f;
+			break;
+
+		case 11:
+		{
+			// *** THE SHOT AND THE STATE CHANGE ARE ONE STEP APART, AND THE FIRST RUN OF THIS RIG IS
+			// WHY. *** Shot() requests a capture of the frame that is about to be DRAWN and reads the
+			// record of the frame that was drawn LAST. Changing the state in the same step therefore
+			// files a correct record beside a photograph of the NEXT state — the first pass produced a
+			// "vrow_READY" record and a picture of a cooling row. Every step below that photographs a
+			// state now leaves it alone until the frame is safely on disk.
+			if (Run->Poll == 0)
+			{
+				const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("vrow_READY"));
+				Expect(*Run, Rec.SecondaryRowText.Equals(TEXT("ROCKET")),
+					FString::Printf(TEXT("7.2: the V row draws its ability by NAME while ready ('%s')"),
+						*Rec.SecondaryRowText));
+				Run->Poll = 1;
+				Run->Step = ThisStep;
+				NextDelay = 0.4f;
+				break;
+			}
+
+			// Fire V for real. HandleSecondaryPressed is what the V key calls.
+			Run->Poll = 0;
+			if (UTraceAbilityComponent* Abilities = AbilitiesOf(*Run))
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[FXHUD] Roxie V press, used=%d"),
+					(int32)Abilities->HandleSecondaryPressed());
+			}
+			NextDelay = 0.5f;
+			break;
+		}
+
+		case 12:
+		{
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("vrow_COOLING"));
+			Expect(*Run, Rec.SecondaryRowText.StartsWith(TEXT("ROCKET  ")),
+				FString::Printf(TEXT("7.2: the V row draws a live countdown while cooling ('%s')"),
+					*Rec.SecondaryRowText));
+
+			// A SECOND V press while it cools — the fourth §7.1 producer, worded from the same
+			// virtual the row is drawn from.
+			if (UTraceAbilityComponent* Abilities = AbilitiesOf(*Run))
+			{
+				Abilities->HandleSecondaryPressed();
+			}
+			NextDelay = 0.35f;
+			break;
+		}
+
+		case 13:
+		{
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("toast_VCOOLDOWN"));
+			Expect(*Run, Rec.ToastText.StartsWith(TEXT("ROCKET IN ")),
+				FString::Printf(TEXT("7.1: the V-cooldown refusal toast names the ability ('%s')"),
+					*Rec.ToastText));
+			NextDelay = 0.4f;
+			break;
+		}
+
+		case 14:
+		{
+			// HALF TIME clears every cooldown including Roxie's replicated AuxEndMatchTime — a real,
+			// shipped transition from cooling to ready, which is the rising edge the row flashes on.
+			// (The alternative was waiting out a 35 s cooldown in a capture rig.) Done on its own
+			// step, one frame before the photograph, for the reason case 11 spells out.
+			if (Run->Poll == 0)
+			{
+				if (UTraceAbilityComponent* Abilities = AbilitiesOf(*Run))
+				{
+					Abilities->OnHalfTime();
+				}
+				Run->Poll = 1;
+				Run->Step = ThisStep;
+				NextDelay = 0.15f;
+				break;
+			}
+
+			Run->Poll = 0;
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("vrow_READY_FLASH"));
+			Expect(*Run, Rec.SecondaryRowText.Equals(TEXT("ROCKET")),
+				TEXT("7.2: the V row returned to its ready caption on the rising edge (the 0.4 s flash "
+				     "window opens on this frame)"));
+			NextDelay = 0.8f;
+			break;
+		}
+
+		// ---- §7.3 MODDED ------------------------------------------------------------------------
+		case 15:
+			if (UTraceAbilityComponent* Abilities = AbilitiesOf(*Run))
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[FXHUD] Roxie E (MODDED) fired=%d"),
+					(int32)Abilities->TryActivate());
+			}
+			NextDelay = 0.5f;
+			break;
+
+		case 16:
+		{
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("chip_MODDED"));
+			Expect(*Run, Rec.ChipText.Contains(TEXT("MODDED")),
+				TEXT("7.3: the MODDED chip drew while Roxie's mod was up"));
+			Expect(*Run, Rec.ChipText.Contains(TEXT("FIRE RATE")),
+				TEXT("7.3: the MODDED chip states the fire-rate bonus derived from the gun's own seam"));
+			NextDelay = 0.8f;
+			break;
+		}
+
+		// ---- §7.3 CLOAKED + §2.5 the owner vignette ---------------------------------------------
+		case 17:
+			// The V-row fixture is stood down HERE rather than at the end of the step that
+			// photographed the MODDED chip, so the frame on disk still carries the row its record
+			// describes. Roxie is also the only character it answers for, so leaving it on across the
+			// switch would change nothing anyway; it is turned off to keep the arm's blast radius as
+			// small as its comment claims.
+			SetCVarInt(TEXT("Trace.HUD.VRowRoxieFixture"), 0);
+
+			if (SwitchCharacter(WorldPtr, *Run, TEXT("Elle"), ETraceCharacterId::Elle))
+			{
+				if (UTraceAbilitySetElle* ElleSet =
+					Cast<UTraceAbilitySetElle>(UTraceAbilityComponent::GetAbilitySetFor(PawnOf(*Run))))
+				{
+					ElleSet->DebugStartCloak(8.f);
+				}
+			}
+			NextDelay = 0.6f;
+			break;
+
+		case 18:
+		{
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("chip_CLOAKED"));
+			Expect(*Run, Rec.ChipText.Contains(TEXT("CLOAKED")),
+				TEXT("7.3: the CLOAKED chip drew for the cloak's own owner"));
+			Expect(*Run, Rec.Vignettes.Contains(TEXT("CLOAK")),
+				FString::Printf(TEXT("2.5: the owner-only cloak vignette band was emitted (%s)"),
+					*Rec.Vignettes));
+			NextDelay = 0.8f;
+			break;
+		}
+
+		// ---- §7.3 POISONED/SLOWED + §2.6 the owner vignette -------------------------------------
+		case 19:
+			// APPLIED BY AN ENEMY, and that is not cosmetic: the §4 choke point correctly refuses to
+			// slow somebody on account of themselves, so a self-applied poison raises POISONED and
+			// never SLOWED. TraceHUDV16Shots learned this the hard way and says so.
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				APlayerState* Enemy = FindEnemyPlayerState(WorldPtr, Pawn);
+				UTraceOysterPoisonComponent::ApplyTo(Pawn, UTraceAbilityComponent::Get(Enemy));
+				UE_LOG(LogTraceGame, Display, TEXT("[FXHUD] poison applied by %s"), *GetNameSafe(Enemy));
+			}
+			NextDelay = 0.7f;
+			break;
+
+		case 20:
+		{
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("vignette_POISON"));
+			Expect(*Run, Rec.Vignettes.Contains(TEXT("POISON")),
+				FString::Printf(TEXT("2.6: the owner-only poison vignette band was emitted (%s)"),
+					*Rec.Vignettes));
+			Expect(*Run, Rec.ChipText.Contains(TEXT("POISONED")),
+				TEXT("7.3 (regression): the pre-existing POISONED chip still draws"));
+			NextDelay = 0.8f;
+			break;
+		}
+
+		// ---- §7.3 SLOWED, both sources at once --------------------------------------------------
+		case 21:
+			// The slime slow ON TOP of the live poison. ServerRefreshNow() runs the authority pass so
+			// bSlowActive is decided without waiting for a tick.
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				APlayerState* Enemy = FindEnemyPlayerState(WorldPtr, Pawn);
+				if (UTraceSlimewallSlowComponent* Slow = UTraceSlimewallSlowComponent::ApplyTo(
+						Pawn, Enemy, UTraceSettings::Get().SlimewallSlowLingerSeconds))
+				{
+					Slow->ServerRefreshNow();
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[FXHUD] slimewall slow applied by %s: active=%d multiplier=%.3f"),
+						*GetNameSafe(Enemy), (int32)Slow->IsSlowActive(), Slow->GetSpeedMultiplier());
+				}
+			}
+			NextDelay = 0.25f;
+			break;
+
+		case 22:
+		{
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("chip_SLOWED_combined"));
+			// THE COMBINED NUMBER, asserted WITHOUT typing it: the claim is precisely that the chip
+			// stops printing either source's own percentage once both are on. Typing "-54%" here
+			// would re-introduce the dual-source problem the chip exists to avoid.
+			const FString PoisonOnly = FString::Printf(TEXT("SLOWED  -%.0f%% SPEED"),
+				100.f * UTraceSettings::Get().OysterPoisonSlowFraction);
+			Expect(*Run, Rec.ChipText.Contains(TEXT("SLOWED  -")) && !Rec.ChipText.Contains(PoisonOnly),
+				FString::Printf(TEXT("7.3: with poison AND slime on one pawn the single SLOWED chip prints "
+					"the COMBINED slow, not either source's own (poison-only would have read '%s')"),
+					*PoisonOnly));
+
+			// ---- §7.3 STUCK, through the SHIPPED wall-stick harness ------------------------------
+			//
+			// *** NOT DebugSetStuck(), AND THE FIRST RUN OF THIS RIG IS WHY. *** Forcing the flag
+			// sets bStuck and the very next server tick calls StopStick("no longer held") because V
+			// is not down — so the flag is gone before a frame is ever drawn with it. The chip was
+			// right; the fixture was staging a state the game immediately and correctly cancelled.
+			//
+			// Trace.Slimeball.StickTest is the shipped harness for exactly this: it makes the player
+			// Slimeball, finds a real wall in this level, drops him beside it and presses V through
+			// OnSecondaryPressed. Its RED arm runs first (WallStick 0, he falls) and its GREEN arm
+			// holds a genuine stick for ~1.5 s, which is the window the poll in the next step waits
+			// for. Started on the NEXT step, because it TELEPORTS the pawn and this step's frame is
+			// still being captured — see case 11.
+			Run->Poll = 0;
+			NextDelay = 0.4f;
+			break;
+		}
+
+		case 23:
+		{
+			if (Run->Poll == 0)
+			{
+				Exec(WorldPtr, TEXT("Trace.Slimeball.StickTest"));
+				Run->Poll = 1;
+				Run->Step = ThisStep;
+				NextDelay = 0.2f;
+				break;
+			}
+
+			// POLLED, not timed: the harness's two arms take as long as this machine's frame pacing
+			// takes, and a fixed delay would land in the RED arm on a slow run and report a HUD bug.
+			const UTraceAbilitySetSlimeball* SlimeSet =
+				Cast<UTraceAbilitySetSlimeball>(UTraceAbilityComponent::GetAbilitySetFor(PawnOf(*Run)));
+			const bool bStuckNow = (SlimeSet != nullptr) && SlimeSet->IsStuck();
+
+			if (!bStuckNow)
+			{
+				if (++Run->Poll < 150)
+				{
+					Run->Step = ThisStep;   // stay on this step
+					NextDelay = 0.1f;
+					break;
+				}
+				Expect(*Run, false,
+					TEXT("7.3: the STUCK chip — NOT PHOTOGRAPHED: Trace.Slimeball.StickTest never reported "
+					     "a stick in 15 s, so there was no state to draw (fixture, not HUD)"));
+				NextDelay = 0.3f;
+				break;
+			}
+
+			// One more frame with the stick already up, so the draw record read below describes a
+			// frame that was drawn while stuck rather than the frame the poll first saw it on.
+			if (Run->Poll >= 0)
+			{
+				Run->Poll = -1;
+				Run->Step = ThisStep;
+				NextDelay = 0.12f;
+				break;
+			}
+
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("chip_STUCK"));
+			Expect(*Run, Rec.ChipText.Contains(TEXT("STUCK")),
+				TEXT("7.3: the STUCK chip drew while Slimeball was really attached to a wall"));
+			Expect(*Run, Rec.ChipText.Contains(TEXT("STUCK | HELD | drain=1.00")),
+				TEXT("7.3: an uncapped held state draws a FULL drain bar and the word HELD, never a "
+				     "countdown it does not have"));
+			NextDelay = 2.0f;
+			break;
+		}
+
+		case 24:
+		{
+			// ---- §7.3 SLOWED from the SLIMEWALL ALONE --------------------------------------------
+			//
+			// The poison has expired by now (4 s, and the two captures above spent it), so this frame
+			// isolates the source §7.3 actually adds: the chip drawing with NO poison anywhere.
+			if (ATraceCharacter* Pawn = PawnOf(*Run))
+			{
+				APlayerState* Enemy = FindEnemyPlayerState(WorldPtr, Pawn);
+				const UTraceOysterPoisonComponent* Poison = UTraceOysterPoisonComponent::Find(Pawn);
+				UE_LOG(LogTraceGame, Display, TEXT("[FXHUD] poison still attached before the slime-only arm: %d"),
+					(int32)(Poison != nullptr));
+
+				if (UTraceSlimewallSlowComponent* Slow = UTraceSlimewallSlowComponent::ApplyTo(
+						Pawn, Enemy, UTraceSettings::Get().SlimewallSlowLingerSeconds))
+				{
+					Slow->ServerRefreshNow();
+				}
+			}
+			NextDelay = 0.2f;
+			break;
+		}
+
+		case 25:
+		{
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("chip_SLOWED_slimewall_only"));
+			// DERIVED FROM THE KNOB, never typed: SlimewallSlowFraction is what the component's own
+			// GetSpeedMultiplier() is built from, so a retune moves the test with the game.
+			const FString Expected = FString::Printf(TEXT("SLOWED  -%.0f%% SPEED"),
+				100.f * UTraceSettings::Get().SlimewallSlowFraction);
+			Expect(*Run, Rec.ChipText.Contains(Expected),
+				FString::Printf(TEXT("7.3: the SLOWED chip drew from the SLIMEWALL's own component with no "
+					"poison in play — it was poison-ONLY before this pass (expected '%s')"), *Expected));
+			Expect(*Run, !Rec.ChipText.Contains(TEXT("POISONED")),
+				TEXT("7.3: ...and there really was no poison on that frame, so the chip cannot have come "
+				     "from the old source"));
+			NextDelay = 0.5f;
+			break;
+		}
+
+		// ---- §7.4 THE BLOCKED MARKER ------------------------------------------------------------
+		case 26:
+			Run->Poll = 0;
+			NextDelay = 0.05f;
+			break;
+
+		case 27:
+		{
+			// *** RE-FIRED EVERY POLL, AND THAT IS NOT CHEATING — IT IS WHAT MAKES THE FRAME AND THE
+			// RECORD THE SAME EVENT. *** The marker lives 0.25 s; on a machine sharing itself with two
+			// sibling capture runs a frame can take longer than that, and the first attempt at this
+			// arm reported "no marker" on a build whose photograph of the very same scene, taken on a
+			// quiet machine, plainly showed the '+'. So the notify is re-delivered until a DRAWN frame
+			// reports it, which is exactly what a burst of blocked shots would do anyway.
+			//
+			// THE REAL RPC HANDLER, with the flag C5 put on it: in a standalone world a Client RPC on a
+			// locally-controlled controller executes locally, so this is the identical call a
+			// server-confirmed blocked hit makes on a shooter's machine.
+			PC->ClientNotifyHit(/*bKilled=*/false, ETraceHitZone::Body, /*bShieldBlocked=*/true);
+
+			const ATraceHUD::FFxHudDrawRecord Peek = Run->Hud->GetFxHudDrawRecord();
+			if (!Peek.bShieldBlockedMarker && ++Run->Poll < 150)
+			{
+				Run->Step = ThisStep;
+				NextDelay = 0.1f;
+				break;
+			}
+
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("marker_SHIELD_BLOCKED"));
+			Expect(*Run, Rec.bShieldBlockedMarker,
+				TEXT("7.4: the BLOCKED marker (the '+', shield white, no grow) was what DrawHitMarker "
+				     "emitted — not the ordinary damage X"));
+			Run->Poll = 0;
+			NextDelay = 0.5f;
+			break;
+		}
+
+		case 28:
+		{
+			// The control: an ORDINARY confirmed hit through the same RPC must draw a marker and must
+			// NOT take the blocked branch. Asserting BOTH matters — "not blocked" alone would pass on
+			// a frame with no marker on it at all, which is precisely what a slow machine produces.
+			PC->ClientNotifyHit(/*bKilled=*/false, ETraceHitZone::Body, /*bShieldBlocked=*/false);
+
+			const ATraceHUD::FFxHudDrawRecord Peek = Run->Hud->GetFxHudDrawRecord();
+			if (!Peek.bHitMarker && ++Run->Poll < 150)
+			{
+				Run->Step = ThisStep;
+				NextDelay = 0.1f;
+				break;
+			}
+
+			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("marker_ORDINARY_control"));
+			Expect(*Run, Rec.bHitMarker && !Rec.bShieldBlockedMarker,
+				TEXT("7.4 CONTROL: an ordinary confirmed hit draws a marker, and it is NOT the blocked "
+				     "shape — so the '+' is reached by the flag and by nothing else"));
+			Run->Step = 40;
+			NextDelay = 0.3f;
+			break;
+		}
+
+		case 40:
+		default:
+		{
+			// WHAT THIS MACHINE ACTUALLY PLAYED, per event, printed straight after the verdict.
+			//
+			// The two sounds this pass owns — UIDeny on every toast (§7.1) and ShieldBlock on the
+			// blocked marker (§7.4) — are the one part of the work a SCREENSHOT cannot evidence. The
+			// audio slice already keeps a per-event play counter for exactly this, so the run's own
+			// log carries the count rather than a claim that they were "heard".
+			Exec(WorldPtr, TEXT("Trace.Audio.Heard"));
+
+			UE_LOG(LogTraceGame, Display, TEXT("[FXHUD] ===== VERDICT ====="));
+			for (const FString& Line : Run->Passes)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[FXHUD]   PASS: %s"), *Line);
+			}
+			for (const FString& Line : Run->Failures)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[FXHUD]   FAIL: %s"), *Line);
+			}
+			for (const FString& Line : Run->NotApplicable)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[FXHUD]   NOT APPLICABLE: %s"), *Line);
+			}
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[FXHUD]   STAGING NOTES (read these before trusting the verdict): the REFUSED toast "
+				     "was raised through UTraceAbilityComponent::DebugSimulateActivateRejected (the shipped "
+				     "handler; the event itself needs two processes). The V row is now fed by the SHIPPED "
+				     "producer — UTraceAbilitySetRoxie::GetSecondaryCooldownDisplay, landed in W5-KITS-E — "
+				     "which answers before Trace.HUD.VRowRoxieFixture can, so that fixture is dead code and "
+				     "this run's V-row frames are free of it."));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[FXHUD] ===== %d passed, %d failed, %d not applicable ====="),
+				Run->Passes.Num(), Run->Failures.Num(), Run->NotApplicable.Num());
+			return false;
+		}
+		}
+
+		Schedule(Run, NextDelay);
+		return false;
+	}
+
+	FAutoConsoleCommand CmdFxHudShots(
+		TEXT("Trace.HUD.FxHudShots"),
+		TEXT("Dev only, listen host or standalone. Stages and photographs every FX/AUDIO plan 7 element: "
+		     "the three refusal toasts, the V cooldown row (ready / cooling / rising edge), the five new "
+		     "status chips, the shield-blocked hit marker with its ordinary-hit control, and the two "
+		     "owner-only vignette bands. Asserts against the DRAW RECORD, never against the state that "
+		     "fed it. Frames land in Saved/Screenshots/FxHud_*_pid<N>.png."),
+		FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* WorldPtr)
+		{
+			ATracePlayerController* PC = FindLocalAuthorityPC(WorldPtr);
+			ATraceHUD* Hud = (PC != nullptr) ? Cast<ATraceHUD>(PC->GetHUD()) : nullptr;
+			if (PC == nullptr || Hud == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[FXHUD] needs a local, AUTHORITATIVE player controller with a Trace HUD "
+					     "(listen host or standalone). Nothing staged."));
+				return;
+			}
+
+			TSharedPtr<FRun> Run = MakeShared<FRun>();
+			Run->Hud = Hud;
+			Run->PC = PC;
+			Schedule(Run, 0.1f);
 		}));
 }
 

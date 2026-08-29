@@ -666,8 +666,49 @@ void ATraceGameMode::AssignTeamIfNeeded(APlayerController* NewPlayer)
 	TracePlayerState->SetTeam(PickedTeam);
 }
 
+#if !UE_BUILD_SHIPPING
+namespace TraceLogoutGuard
+{
+	/** F7. How many second Logout() calls the latch has swallowed. Read by Trace.Bounds.CoreDropClampTest. */
+	int32 GSecondCallsIgnored = 0;
+}
+#endif
+
 void ATraceGameMode::Logout(AController* Exiting)
 {
+	// F7. ONE LOGOUT PER CONTROLLER, ENFORCED. RemoveOneBotFromTeam calls this by hand and then
+	// destroys the bot, and AController::Destroyed() calls it again — see the essay there. Until now
+	// the second pass was survivable only because every step in this body happens to be idempotent.
+	// The set makes "runs once" the rule, so state that cannot be applied twice (a counter, a score
+	// adjustment, a queue push) can be added below without the double call doubling it.
+	if (Exiting != nullptr)
+	{
+		bool bAlreadyLoggedOut = false;
+		LogoutsInFlight.Add(TWeakObjectPtr<AController>(Exiting), &bAlreadyLoggedOut);
+		if (bAlreadyLoggedOut)
+		{
+#if !UE_BUILD_SHIPPING
+			++TraceLogoutGuard::GSecondCallsIgnored;
+#endif
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("[Logout] second Logout for '%s' ignored (F7 guard)."), *Exiting->GetName());
+			return;
+		}
+
+		// Prune the tombstones of controllers destroyed earlier in the match; bot churn is the only
+		// thing that fills this set and a long match can churn a lot of them.
+		if (LogoutsInFlight.Num() > 32)
+		{
+			for (auto It = LogoutsInFlight.CreateIterator(); It; ++It)
+			{
+				if (!It->IsValid())
+				{
+					It.RemoveCurrent();
+				}
+			}
+		}
+	}
+
 	if (HasAuthority() && Exiting != nullptr)
 	{
 		ClearPendingRespawn(Exiting);
@@ -679,7 +720,16 @@ void ATraceGameMode::Logout(AController* Exiting)
 			{
 				if (TheCore->GetCarrier() == TraceCharacter)
 				{
-					TheCore->DropAt(TraceCharacter->GetActorLocation(), FVector::ZeroVector);
+					// F6. The same clamp the death path uses: "where the carrier was" can be off the
+					// map (spec v19 §4.1), and a disconnect is one more way to stop existing out
+					// there. In bounds this is a no-op by construction — see ClampCoreDropLocation.
+					const FVector DropLocation = ClampCoreDropLocation(TraceCharacter->GetActorLocation());
+					UE_LOG(LogTraceGame, Verbose,
+						TEXT("[Bounds] core drop via logout: asked %s, dropping %s."),
+						*TraceCharacter->GetActorLocation().ToCompactString(),
+						*DropLocation.ToCompactString());
+
+					TheCore->DropAt(DropLocation, FVector::ZeroVector);
 				}
 			}
 
@@ -977,6 +1027,66 @@ ATraceGameState* ATraceGameMode::GetTraceGameState() const
 // Deaths and respawns
 // ---------------------------------------------------------------------------------------------
 
+FVector ATraceGameMode::ClampCoreDropLocation(const FVector& Where) const
+{
+	// SPEC v19 §4.1 MADE "WHERE THE CARRIER WAS" A PLACE THAT CAN BE OFF THE MAP. Out of bounds is
+	// now a death, and the commonest way to reach it is to be a carrier who walked out — so a raw
+	// DropAt(carrier location), unchanged, would have dropped the Core in the void the player just
+	// left. The Core's own out-of-world rescue would eventually recover it, but only after a reset
+	// timer spent watching a ball nobody can reach.
+	//
+	// Clamped, not moved: a drop inside the arena puts the Core in exactly the same place it always
+	// did, because the clamp is a no-op there. This lives in ONE helper and not in the bounds rule
+	// itself because every way the carrier can stop existing funnels through a caller of this
+	// function — death (NotifyCharacterDied) and departure (Logout) today — so a future third one is
+	// covered by calling this, without anybody having to remember the essay below.
+	//
+	// *** MEASURED 2026-08-24, AND THE ESSAY ABOVE IS CURRENTLY DESCRIBING A PROMISE RATHER THAN AN
+	// EFFECT: ATraceCore::DropAt IGNORES ITS LOCATION ARGUMENT. *** Its signature still takes one
+	// (`DropAt(const FVector& /*Location*/, ...)`), but the body queues a fallback and calls
+	// ReleaseHolder, so the Core is handed to the opposing team's nearest living player rather than
+	// placed anywhere — which is why an out-of-bounds carrier disconnect does not in fact strand the
+	// ball today. NOTHING HERE PRETENDS OTHERWISE, and the clamp is kept rather than deleted for two
+	// reasons: DropAt's parameter list still promises the caller that the point matters, and a
+	// caller that passes an off-map point to a function that starts honouring its argument is a bug
+	// that would arrive silently. If DropAt is ever made to place the Core, this is already correct.
+	// Do not "simplify" it away without changing DropAt's signature in the same edit.
+	FVector DropLocation = Where;
+
+	// GATED ON THE BOUNDS RULE ITSELF, not on a second opinion about the box. The first cut of this
+	// clamped unconditionally and moved the Core on EVERY death in the middle of the pitch, because
+	// "clamp Z to at least floor + inset" lifts a body lying at Z=90 to Z=200 — a ball left hanging
+	// in the air after any ordinary kill. Asking the one rule that defines "out of bounds" means an
+	// in-bounds drop is now not merely a no-op, it is not even considered.
+	FString BoundsReason;
+	if (ATraceCharacter::IsLocationOutOfArenaBounds(GetWorld(), DropLocation, BoundsReason))
+	{
+		if (const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(GetWorld()))
+		{
+			const FBox Field = Arena->GetFieldBounds();
+			if (Field.IsValid != 0)
+			{
+				// A little way INSIDE the wall line rather than exactly on it, so the ball is not
+				// dropped inside the wall's own collision. Z is only ever raised to the floor
+				// plane, never above it: the Core falls from wherever it is put, and a fall onto
+				// the floor is a landing the turnover rule already understands.
+				constexpr double Inset = 200.0;
+				DropLocation = FVector(
+					FMath::Clamp(DropLocation.X, Field.Min.X + Inset, Field.Max.X - Inset),
+					FMath::Clamp(DropLocation.Y, Field.Min.Y + Inset, Field.Max.Y - Inset),
+					FMath::Max(DropLocation.Z, Field.Min.Z + Inset));
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[Bounds] the carrier's drop point %s is %s - dropping the Core at %s ")
+					TEXT("instead so it stays reachable (spec v19 §4.1)."),
+					*Where.ToCompactString(), *BoundsReason, *DropLocation.ToCompactString());
+			}
+		}
+	}
+
+	return DropLocation;
+}
+
 void ATraceGameMode::NotifyCharacterDied(ATraceCharacter* Victim, AController* Killer, FName Cause)
 {
 	if (!HasAuthority() || !IsValid(Victim))
@@ -1004,49 +1114,11 @@ void ATraceGameMode::NotifyCharacterDied(ATraceCharacter* Victim, AController* K
 	{
 		if (TheCore->GetCarrier() == Victim)
 		{
-			// SPEC v19 §4.1 MADE "WHERE THE CARRIER FELL" A PLACE THAT CAN BE OFF THE MAP. Out of bounds
-			// is now a death, and the commonest way to reach it is to be a carrier who walked out — so
-			// this line, unchanged, would have dropped the Core in the void the player just died in. The
-			// Core's own out-of-world rescue would eventually recover it, but only after a reset timer
-			// spent watching a ball nobody can reach.
-			//
-			// Clamped, not moved: a death inside the arena drops the Core in exactly the same place it
-			// always did, because the clamp is a no-op there. This is deliberately here and not in the
-			// bounds rule itself — EVERY death funnels through this function, so a future way of dying
-			// somewhere silly is covered without anybody remembering to.
-			FVector DropLocation = Victim->GetActorLocation();
-
-			// GATED ON THE BOUNDS RULE ITSELF, not on a second opinion about the box. The first cut of
-			// this clamped unconditionally and moved the Core on EVERY death in the middle of the pitch,
-			// because "clamp Z to at least floor + inset" lifts a body lying at Z=90 to Z=200 — a ball
-			// left hanging in the air after any ordinary kill. Asking the one rule that defines "out of
-			// bounds" means an in-bounds death is now not merely a no-op, it is not even considered.
-			FString BoundsReason;
-			if (ATraceCharacter::IsLocationOutOfArenaBounds(GetWorld(), DropLocation, BoundsReason))
-			{
-				if (const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(GetWorld()))
-				{
-					const FBox Field = Arena->GetFieldBounds();
-					if (Field.IsValid != 0)
-					{
-						// A little way INSIDE the wall line rather than exactly on it, so the ball is not
-						// dropped inside the wall's own collision. Z is only ever raised to the floor
-						// plane, never above it: the Core falls from wherever it is put, and a fall onto
-						// the floor is a landing the turnover rule already understands.
-						constexpr double Inset = 200.0;
-						DropLocation = FVector(
-							FMath::Clamp(DropLocation.X, Field.Min.X + Inset, Field.Max.X - Inset),
-							FMath::Clamp(DropLocation.Y, Field.Min.Y + Inset, Field.Max.Y - Inset),
-							FMath::Max(DropLocation.Z, Field.Min.Z + Inset));
-
-						UE_LOG(LogTraceGame, Display,
-							TEXT("[Bounds] the carrier died at %s, which is %s - dropping the Core at %s ")
-							TEXT("instead so it stays reachable (spec v19 §4.1)."),
-							*Victim->GetActorLocation().ToCompactString(), *BoundsReason,
-							*DropLocation.ToCompactString());
-					}
-				}
-			}
+			// The clamp and the essay explaining why an in-bounds death must not be touched live in
+			// ClampCoreDropLocation, which the disconnect path (Logout) now shares.
+			const FVector DropLocation = ClampCoreDropLocation(Victim->GetActorLocation());
+			UE_LOG(LogTraceGame, Verbose, TEXT("[Bounds] core drop via death: asked %s, dropping %s."),
+				*Victim->GetActorLocation().ToCompactString(), *DropLocation.ToCompactString());
 
 			TheCore->DropAt(DropLocation, FVector::ZeroVector);
 		}
@@ -1689,9 +1761,11 @@ void ATraceGameMode::NotifyScored(ETraceTeam ScoringTeam)
 		switch (KickoffMode)
 		{
 		case ECoreKickoffMode::ScoredOnTeam:
-			// American-football logic, and the spec's stated assumption: the team that conceded
-			// restarts with the Core in their own endzone.
-			GrantCoreToTeam(TraceOpposingTeam(ScoringTeam));
+			// DEMO 29 §3(b), and it is a change of mechanism rather than of who is favoured. The
+			// American-football logic is unchanged — the team that conceded restarts with it — but the
+			// Core is no longer GRANTED to them. It spawns on the floor in front of the goal they just
+			// conceded, and the team that scored is locked out of it while they collect it.
+			KickoffCoreAfterGoal(ScoringTeam);
 			break;
 
 		case ECoreKickoffMode::AlternateTeams:
@@ -2132,15 +2206,18 @@ void ATraceGameMode::RemoveOneBotFromTeam(ETraceTeam Team)
 		//
 		// THE ENGINE WILL CALL Logout(Bot) AGAIN. AController::Destroyed() calls
 		// GameMode->Logout(this) for any controller carrying a PlayerState, and a bot controller
-		// does. So Bot->Destroy() below re-enters this same function a second time for the same
-		// controller. That is harmless today only because every step happens to be idempotent — the
-		// pawn is already null, Super::Logout casts to APlayerController and no-ops on a bot, and
-		// ClearPendingRespawn tolerates a second call — and because the only visible cost is
-		// CheckMatchStartConditions being scheduled twice.
+		// does. So Bot->Destroy() below calls Logout a second time for the same controller. That was
+		// harmless only because every step happened to be idempotent — the pawn is already null,
+		// Super::Logout casts to APlayerController and no-ops on a bot, and ClearPendingRespawn
+		// tolerates a second call — with CheckMatchStartConditions being scheduled twice as the one
+		// visible cost.
 		//
-		// LOGOUT MUST THEREFORE STAY IDEMPOTENT. If you add state to it that cannot be applied twice
-		// (a counter, a score adjustment, a queue push), this is the call site that will double it,
-		// and the symptom will show up as a bot-count drift nowhere near this line.
+		// AS OF F6/F7 THAT IS NO LONGER THE ONLY DEFENCE: Logout latches each controller in
+		// LogoutsInFlight and the second call returns immediately, so the double schedule is gone
+		// too. The latch is what makes it safe to add state to Logout that cannot be applied twice
+		// (a counter, a score adjustment, a queue push) — which is exactly what the F6 core-drop
+		// clamp above it now is. Keep the latch if you refactor this pair; without it, the symptom
+		// shows up as a bot-count drift nowhere near this line.
 		Logout(Bot);
 
 		if (APawn* BotPawn = Bot->GetPawn())
@@ -2960,16 +3037,26 @@ void ATraceGameMode::BeginHalf(int32 HalfIndex)
 	// a period of play, and it must not depend on who called it to be correct.
 	ApplyTeamSides(GetNegativeSideTeamForHalf(ClampedHalf));
 
-	// Kickoff first, pawns second: ATraceCore::KickoffTo holds the grant back for a moment exactly
-	// so the receiver is already standing on their new pad when it lands.
-	GrantCoreToTeam(GetKickoffTeamForHalf(ClampedHalf));
+	// DEMO 29 §3(a). THE HALF STARTS WITH THE CORE ON THE OCTAGON AND NOBODY HOLDING IT.
+	//
+	// This line used to be GrantCoreToTeam(GetKickoffTeamForHalf(...)) — the Core parked at the centre
+	// and appeared in a player's hands a second later. The owner's rule replaces that: "the core
+	// begins each half on top of the octagon ... Teams must climb up in order to retrieve it."
+	//
+	// Kickoff first, pawns second, exactly as before: the placement wants to be on the wire before ten
+	// pawns teleport, so a client never draws one frame of the Core where the last half left it.
+	KickoffCoreForHalf(ClampedHalf);
 	ResetPlayersToSpawns();
 
 	// The authoritative deadline is the replicated MatchEndServerTime; this timer is merely what
 	// fires on it server-side. Clients count down against the shared clock instead.
 	GetWorldTimerManager().SetTimer(MatchTimerHandle, this, &ATraceGameMode::HandleHalfExpired, Duration, false);
 
-	UE_LOG(LogTraceGame, Log, TEXT("%s started: %.0fs, %s kicks off, %s defends -X. Blue %d - Orange %d"),
+	// "kicks off" IS NO LONGER "is given the Core" — DEMO 29 §3(a). The named team is who the fallback
+	// would favour (mode A, or a deck nobody reaches); in the shipped mode the Core is on the octagon
+	// and unowned, which is what the [Core] line beside this one says.
+	UE_LOG(LogTraceGame, Log, TEXT("%s started: %.0fs, Core contested on the centre pillar (%s favoured ")
+		TEXT("if it is never retrieved), %s defends -X. Blue %d - Orange %d"),
 		*TraceGameState->GetHalfLabel(), Duration,
 		*TraceTeamName(GetKickoffTeamForHalf(ClampedHalf)).ToString(),
 		*TraceTeamName(GetNegativeSideTeamForHalf(ClampedHalf)).ToString(),
@@ -3331,6 +3418,95 @@ void ATraceGameMode::GrantCoreToTeam(ETraceTeam Team)
 	LastKickoffTeam = Team;
 
 	UE_LOG(LogTraceGame, Log, TEXT("Kickoff: the Core goes to %s."), *TraceTeamName(Team).ToString());
+}
+
+// -------------------------------------------------------------------------------------------------
+// DEMO 29 §3 — the two contested restarts
+//
+// Verbatim: "Ensure the core begins each half on top of the octagon, the newly added pillar which
+// lies in the middle of the map. Teams must climb up in order to retrieve it. After a goal, the core
+// spawns in front of the team who was scored on's goal, with the scoring team locked out."
+//
+// TWO SPAWNS, AND THEY ARE DELIBERATELY NOT ONE FUNCTION WITH A FLAG. They differ in where, in who
+// may take it, and in what happens if nobody does; writing them as one call with three arguments is
+// how the half start eventually inherits the goal's lockout by accident. Both end at
+// ATraceCore::KickoffContested, which owns the placement, the lockout and the replication — these
+// two only decide WHERE and WHO, which is the game mode's business and not the Core's.
+// -------------------------------------------------------------------------------------------------
+
+void ATraceGameMode::KickoffCoreForHalf(int32 HalfIndex)
+{
+	UWorld* World = GetWorld();
+	if (!HasAuthority() || World == nullptr)
+	{
+		return;
+	}
+
+	ATraceCore* TheCore = GetCore();
+	if (TheCore == nullptr)
+	{
+		return;
+	}
+
+	// The fallback team, NOT the receiver. Nobody receives it: it sits on the deck until somebody
+	// climbs up to it. See GetKickoffTeamForHalf's own comment for the two things this still decides.
+	const ETraceTeam FavouredTeam = GetKickoffTeamForHalf(HalfIndex);
+
+	AActor* Pillar = nullptr;
+	const FVector Surface = ATraceCore::GetHalfStartCoreSurface(World, &Pillar);
+
+	TheCore->KickoffContested(Surface, /*LockedOutTeam=*/ETraceTeam::None, FavouredTeam,
+		TEXT("half start"));
+
+	// LastKickoffTeam is bookkeeping for ECoreKickoffMode::AlternateTeams, which asks "who went last".
+	// A contested kickoff has no receiver, so the favoured team is the honest answer to that question
+	// and keeps the alternation from stalling if a match is configured that way.
+	LastKickoffTeam = FavouredTeam;
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Kickoff: half %d starts CONTESTED — the Core is on %s at %s and belongs to whoever climbs ")
+		TEXT("to it first (%s favoured only if nobody ever does)."),
+		HalfIndex,
+		(Pillar != nullptr) ? *GetNameSafe(Pillar) : TEXT("the arena's fallback spawn point"),
+		*Surface.ToCompactString(), *TraceTeamName(FavouredTeam).ToString());
+}
+
+void ATraceGameMode::KickoffCoreAfterGoal(ETraceTeam ScoringTeam)
+{
+	UWorld* World = GetWorld();
+	if (!HasAuthority() || World == nullptr || ScoringTeam == ETraceTeam::None)
+	{
+		return;
+	}
+
+	ATraceCore* TheCore = GetCore();
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TheCore == nullptr || TraceGameState == nullptr)
+	{
+		return;
+	}
+
+	const ETraceTeam ScoredOnTeam = TraceOpposingTeam(ScoringTeam);
+
+	// WHICH END, asked of the GameState and never derived from the team's colour. Sides swap at half
+	// time, so "Blue defends -X" is true for one half and false for the next; ATraceGameState's own
+	// header says outright that GetDefendedEndSign() is the only legal way to ask.
+	const float DefendedEndSign = TraceGameState->GetDefendedEndSign(ScoredOnTeam);
+	const FVector Surface = ATraceCore::GetPostGoalCoreSurface(World, DefendedEndSign);
+
+	// The scoring team is locked out; the conceding team is the fallback, because they are the side
+	// the restart is supposed to favour and the one standing nearest to it.
+	TheCore->KickoffContested(Surface, /*LockedOutTeam=*/ScoringTeam, ScoredOnTeam,
+		TEXT("after a goal"));
+
+	LastKickoffTeam = ScoredOnTeam;
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Kickoff: %s conceded, so the Core spawns in front of their own goal at %s (they defend ")
+		TEXT("%cX) and %s is locked out of it."),
+		*TraceTeamName(ScoredOnTeam).ToString(), *Surface.ToCompactString(),
+		(DefendedEndSign < 0.f) ? TEXT('-') : TEXT('+'),
+		*TraceTeamName(ScoringTeam).ToString());
 }
 
 void ATraceGameMode::FinishMatch(ETraceTeam WinningTeam, ETraceMatchEndReason Reason)
@@ -5644,6 +5820,134 @@ namespace
 		     "humans and hands every bot ROCCO, and the framework's own roster rules are cleared for the "
 		     "run so the duplicate actually lands. The ordering and uniqueness assertions MUST fail."),
 		FConsoleCommandWithWorldDelegate::CreateStatic(&TraceCharactersBotVerifyRedCommand));
+
+	// =============================================================================================
+	// RESTRUCTURE C1 (F6 + F7) — THE CORE-DROP CLAMP ON THE DEPARTURE PATH, AND THE ONE-LOGOUT LATCH
+	//
+	//   Trace.Bounds.CoreDropClampTest   Gives a BOT the Core, teleports it a long way outside the
+	//                                    field, and then puts that controller through the exact
+	//                                    departure sequence RemoveOneBotFromTeam uses — Logout(Bot)
+	//                                    by hand, followed by Bot->Destroy(), which makes
+	//                                    AController::Destroyed() call Logout a SECOND time.
+	//
+	//   Four assertions, none of which can pass vacuously:
+	//     1. the raw drop point really was out of bounds (else the clamp had nothing to do);
+	//     2. ClampCoreDropLocation, asked that same point, answers one INSIDE GetFieldBounds() —
+	//        this is the F6 fix itself, exercised on the value the Logout path passes;
+	//     3. the second Logout was swallowed by the F7 latch (TraceLogoutGuard::GSecondCallsIgnored
+	//        moved), so the departure ran once;
+	//     4. the Core did NOT leave the match with the quitter — the promise the Logout path exists
+	//        for. It is carried again, or queued for the other side's next spawn.
+	//
+	//   WHAT THIS TEST DELIBERATELY DOES NOT CLAIM: that the Core is PHYSICALLY at the clamped point.
+	//   ATraceCore::DropAt ignores its location argument (see the note in ClampCoreDropLocation) and
+	//   hands possession to the opposing team instead, so asserting a position would be asserting
+	//   ResolveFallback's behaviour and calling it a clamp — the kind of green this project has been
+	//   bitten by. The clamp is verified where it is: on the function that computes it.
+	// =============================================================================================
+	void CoreDropClampTestCommand(UWorld* World)
+	{
+		ATraceGameMode* GameMode = (World != nullptr) ? World->GetAuthGameMode<ATraceGameMode>() : nullptr;
+		ATraceCore* TheCore = (World != nullptr) ? ATraceCore::Get(World) : nullptr;
+		const ATraceArenaBuilder* Arena = (World != nullptr) ? ATraceArenaBuilder::Get(World) : nullptr;
+		if (GameMode == nullptr || TheCore == nullptr || Arena == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[CoreDropClamp] server only, and needs a Core and an arena (mode=%s core=%s arena=%s)."),
+				*GetNameSafe(GameMode), *GetNameSafe(TheCore), *GetNameSafe(Arena));
+			return;
+		}
+
+		const FBox Field = Arena->GetFieldBounds();
+		if (Field.IsValid == 0)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[CoreDropClamp] the arena has no valid field bounds."));
+			return;
+		}
+
+		ATraceBotController* Victim = nullptr;
+		ATraceCharacter* VictimPawn = nullptr;
+		for (TActorIterator<ATraceBotController> It(World); It; ++It)
+		{
+			ATraceBotController* Bot = *It;
+			ATraceCharacter* Pawn = (Bot != nullptr) ? Cast<ATraceCharacter>(Bot->GetPawn()) : nullptr;
+			if (Pawn != nullptr && Pawn->IsAlive())
+			{
+				Victim = Bot;
+				VictimPawn = Pawn;
+				break;
+			}
+		}
+		if (Victim == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[CoreDropClamp] no living bot to send home. Run this with '?bots=8'."));
+			return;
+		}
+
+		// A long way past the wall line, and ABOVE it, so both the XY clamp and the Z floor term have
+		// something to do. This is a teleport of a pawn that is about to be destroyed.
+		const FVector OutOfBounds(Field.Max.X + 6000.0, Field.Max.Y + 6000.0, Field.Max.Z + 4000.0);
+		VictimPawn->TeleportTo(OutOfBounds, VictimPawn->GetActorRotation(), /*bIsATest=*/false, /*bNoCheck=*/true);
+
+		FString BoundsReason;
+		const bool bRawWasOutOfBounds =
+			ATraceCharacter::IsLocationOutOfArenaBounds(World, VictimPawn->GetActorLocation(), BoundsReason);
+
+		TheCore->GrantTo(VictimPawn, ETraceCoreGrantReason::Debug);
+		const bool bCarrying = (TheCore->GetCarrier() == VictimPawn);
+
+		const int32 GuardBefore = TraceLogoutGuard::GSecondCallsIgnored;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CoreDropClamp] ===== %s stood at %s (out of bounds = %d: %s), carrying = %d. Field %s .. %s ====="),
+			*GetNameSafe(VictimPawn), *VictimPawn->GetActorLocation().ToCompactString(),
+			bRawWasOutOfBounds ? 1 : 0, *BoundsReason, bCarrying ? 1 : 0,
+			*Field.Min.ToCompactString(), *Field.Max.ToCompactString());
+
+		// THE REAL DEPARTURE SEQUENCE, copied from RemoveOneBotFromTeam: the manual Logout, then the
+		// destroy that makes the engine call Logout again.
+		GameMode->Logout(Victim);
+		if (APawn* Pawn = Victim->GetPawn())
+		{
+			Victim->UnPossess();
+			Pawn->Destroy();
+		}
+		Victim->Destroy();
+
+		const int32 GuardAfter = TraceLogoutGuard::GSecondCallsIgnored;
+
+		// THE CLAMP ITSELF, asked the same point the Logout path just passed it.
+		const FVector Clamped = GameMode->ClampCoreDropLocation(OutOfBounds);
+		const bool bClampInsideXY =
+			Clamped.X > Field.Min.X && Clamped.X < Field.Max.X
+			&& Clamped.Y > Field.Min.Y && Clamped.Y < Field.Max.Y;
+		const bool bClampAboveFloor = Clamped.Z >= Field.Min.Z;
+
+		// The Core must still be in the match: carried again, or owed to somebody who is respawning.
+		const bool bLostWithTheQuitter = (TheCore->GetCarrier() == VictimPawn);
+
+		const bool bPass = bRawWasOutOfBounds && bCarrying && bClampInsideXY && bClampAboveFloor
+			&& !bLostWithTheQuitter && (GuardAfter > GuardBefore);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CoreDropClamp] VERDICT: %s — rawOutOfBounds=%d carriedBeforeLogout=%d clamp(%s) -> %s ")
+			TEXT("insideFieldXY=%d aboveFloor=%d | coreNowAt=%s carrier=%s lostWithQuitter=%d | ")
+			TEXT("secondLogoutsIgnored %d -> %d."),
+			bPass ? TEXT("PASS") : TEXT("FAIL"), bRawWasOutOfBounds ? 1 : 0, bCarrying ? 1 : 0,
+			*OutOfBounds.ToCompactString(), *Clamped.ToCompactString(),
+			bClampInsideXY ? 1 : 0, bClampAboveFloor ? 1 : 0,
+			*TheCore->GetActorLocation().ToCompactString(), *GetNameSafe(TheCore->GetCarrier()),
+			bLostWithTheQuitter ? 1 : 0, GuardBefore, GuardAfter);
+	}
+
+	FAutoConsoleCommandWithWorld CmdCoreDropClampTest(
+		TEXT("Trace.Bounds.CoreDropClampTest"),
+		TEXT("Dev only, SERVER. RESTRUCTURE C1. Gives a bot the Core out of bounds and puts it through "
+		     "the real departure sequence (manual Logout + Destroy): the Core must be dropped INSIDE the "
+		     "field, and the engine's second Logout for the same controller must be swallowed by the F7 "
+		     "latch. Run with '?bots=8'."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(&CoreDropClampTestCommand));
 }
 
 #endif // !UE_BUILD_SHIPPING

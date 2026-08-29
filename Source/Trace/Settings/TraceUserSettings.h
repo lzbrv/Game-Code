@@ -695,11 +695,16 @@ public:
 	// about the third-person camera rather than about a player's eyesight, and the two MULTIPLY (see
 	// ATraceHUD::DrawAimReticle).
 	//
-	// *** THE SHIPPED DEFAULTS ARE THE EXACT NUMBERS DrawAimReticle ALREADY DREW. *** 11 px of arm,
-	// 2.5 px of bar, a 5 px gap, 94% opaque white, dot on, outline on. A player who never opens this
-	// page must get a pixel-identical crosshair to the one they had before it existed, and that is
-	// checkable: Trace.Crosshair.Status prints the live geometry, and at defaults it prints what the
-	// literals used to produce.
+	// *** THE SHIPPED DEFAULTS ARE THE GEOMETRY DrawAimReticle ALREADY DREW. *** 11 px of arm,
+	// 2.5 px of bar, a 5 px gap, 94% opaque, dot on, outline on. A player who never opens this page
+	// must get the crosshair they had before it existed, and that is checkable: Trace.Crosshair.Status
+	// prints the live geometry, and at defaults it prints what the literals used to produce.
+	//
+	// ONE DELIBERATE DEPARTURE, and it is a COLOUR and not a shape: the release art bible's §2.4
+	// guard rail puts the default on the interface's own `Ink` off-white rather than on the flat
+	// (1,1,1) the literals carried. Every number above is untouched; palette entry 0 moved by 10% of
+	// red. The reasoning, the measurement and why it is written as literals rather than as the UI
+	// token live at TraceCrosshairPalette in the .cpp.
 	//
 	// EVERY NUMBER IS IN 1080p-REFERENCE PIXELS, exactly like the literals it replaced — the HUD
 	// multiplies by UIScale (ViewH / 1080) and by the third-person scale at draw time. Storing screen
@@ -873,6 +878,143 @@ public:
 
 	/** True when every crosshair field is on its shipped default. Drives the crosshair page's reset row. */
 	bool IsCrosshairAtDefaults() const;
+
+	// ---------------------------------------------------------------------------------------------
+	// UI PLAN WP2 — THE CALL SIGN
+	//
+	// Until this shipped, no human player ever got a name: only bots called SetPlayerName, so the
+	// scoreboard drew the engine's fallback — "Mac-3249D6BCCE489DF8" — for the person actually
+	// playing (frames/v23integ_35_scoreboard.png). Every surface that names a player already reads
+	// APlayerState::GetPlayerName (scoreboard, kill feed, taken-by strip, pass reticle, select
+	// screen), so the whole feature is: store a string, let the player type it, and hand it to
+	// AGameModeBase::ChangeName once. Nothing downstream changes.
+	//
+	// IT LIVES HERE, not in UTraceSettings, for the reason this file's header gives about mouse
+	// sensitivity: a call sign is per-machine, written at runtime by the player, and must never
+	// appear in a diff. UCLASS(config = TraceUserSettings) plus the existing Save() is the entire
+	// persistence story.
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * *** SIXTEEN CHARACTERS. *** Long enough for a real handle, short enough that a kill-feed row
+	 * built from two names plus an icon still fits the feed's column at 720p, and short enough that
+	 * the settings row can draw the whole thing inside its value chip rather than eliding it.
+	 */
+	static constexpr int32 MaxCallSignLength = 16;
+
+	/** What a player with no call sign is called. Never empty — an empty name draws as a hole. */
+	static constexpr const TCHAR* DefaultCallSign = TEXT("PLAYER");
+
+	/**
+	 * The player's chosen name. Empty means "never set one", which is NOT the same as "PLAYER":
+	 * a player who deliberately types PLAYER keeps it through a reset-detection pass, and the empty
+	 * state is what lets the row draw a real default rather than a value the player never chose.
+	 *
+	 * Stored RAW and read through GetCallSignOrDefault(). Same discipline as every crosshair field:
+	 * this .ini is hand-editable, so it is also a supported way to arrive here with nonsense.
+	 */
+	UPROPERTY(config)
+	FString CallSign;
+
+	/**
+	 * Trim, upper-case, filter to the WP2.3 call-sign charset, truncate to MaxCallSignLength.
+	 *
+	 * STATIC AND PUBLIC because it is the ONE definition of "what a call sign may contain", and three
+	 * places need it: this class's accessor, the settings row that writes it, and any future
+	 * validation of a name that arrived over the wire. The text field enforces the same alphabet
+	 * while typing (ETraceTextCharset::CallSign) — this is the backstop for the hand-edited .ini and
+	 * for a string that arrived some other way.
+	 *
+	 * UPPER CASE because every string this game draws is upper case: the atlases are typeset that
+	 * way and a lower-case name in the kill feed reads as a different game's text.
+	 *
+	 * @return the cleaned name, or an EMPTY string when nothing legal survived. Callers who need a
+	 *         name to draw use GetCallSignOrDefault().
+	 */
+	static FString SanitizeCallSign(const FString& Raw);
+
+	/** The name to show. SanitizeCallSign(CallSign), or DefaultCallSign when that is empty. */
+	FString GetCallSignOrDefault() const;
+
+	// ---------------------------------------------------------------------------------------------
+	// UI PLAN WP3 — PLAYER VOLUME
+	//
+	// *** WHY THESE ARE NOT UTraceAudioSettings::MasterVolume. *** That one is a UDeveloperSettings
+	// (config=Game, defaultconfig — Audio/TraceSoundBank.h), i.e. the DESIGNER's mix: it is checked
+	// in, it is the same for everybody, and it is where the relative level of a gunshot against a
+	// footstep is decided. A player turning the music down is not editing the mix; they are editing
+	// their own machine. So the player's three faders live here and MULTIPLY into the mix at the one
+	// choke point every sound already passes through (UTraceAudioSubsystem::VolumeFor).
+	//
+	// MULTIPLY, not replace — the project's standing rule, stated twice already in this file (the
+	// crosshair outline's alpha fraction) and once in TraceSoundBank.h: a value that MODIFIES a base
+	// is stored relative to that base. A player at 100% therefore hears exactly the designer's mix,
+	// and no event can escape a fader by carrying an absolute level of its own.
+	// ---------------------------------------------------------------------------------------------
+
+	/** Shipped defaults, in one place, so the property, the reset and the at-defaults test cannot drift. */
+	static constexpr float DefaultAudioMasterVolume = 1.00f;
+	static constexpr float DefaultAudioSfxVolume    = 1.00f;
+
+	/**
+	 * MUSIC STARTS BELOW THE OTHER TWO, at 0.80.
+	 *
+	 * A title loop and a match ambience bed are the two things in this game a player hears for
+	 * minutes at a time rather than for a fifth of a second, and a bed mixed at the same nominal
+	 * level as the combat one-shots is the classic reason a first-time player's first act is to go
+	 * looking for the audio settings. This is a starting point, not a ceiling — the slider reaches
+	 * 100 like the others.
+	 */
+	static constexpr float DefaultAudioMusicVolume  = 0.80f;
+
+	/**
+	 * The faders reach ZERO, and that is the point: "off" must be reachable from the slider.
+	 *
+	 * Master at 0 is silence — verified by Trace.Audio.Loudness, which reads the same VolumeFor these
+	 * multiply into. That is why the floor is a real 0 and not the crosshair opacity's 0.20: an
+	 * invisible crosshair reads as a broken game, an inaudible game is a choice people make on
+	 * purpose.
+	 */
+	static constexpr float MinAudioVolume = 0.00f;
+	static constexpr float MaxAudioVolume = 1.00f;
+
+	/** 0..1. Multiplies EVERY event's gain, music and effects alike. */
+	UPROPERTY(config)
+	float AudioMasterVolume = DefaultAudioMasterVolume;
+
+	/** 0..1. Multiplies everything that is not music — including footsteps, which are effects. */
+	UPROPERTY(config)
+	float AudioSfxVolume = DefaultAudioSfxVolume;
+
+	/** 0..1. Multiplies the four ETraceSoundFamily::Music events (title, ambience, both stingers). */
+	UPROPERTY(config)
+	float AudioMusicVolume = DefaultAudioMusicVolume;
+
+	// The clamped accessors. Every one of them clamps, for the reason the crosshair block gives: a
+	// hand-edited .ini is a supported way to configure this game and therefore a supported way to
+	// arrive here with an AudioMasterVolume of 40.
+	float GetAudioMasterVolume() const;
+	float GetAudioSfxVolume() const;
+	float GetAudioMusicVolume() const;
+
+	/**
+	 * The whole player gain for one event, in one call: master x (music ? music : sfx).
+	 *
+	 * *** ASKED FOR BY FAMILY, NOT BY NAME. *** Mirrors the footstep branch it sits beside in
+	 * VolumeFor: an event is music because the TABLE says so (ETraceSoundFamily::Music), so a stinger
+	 * added tomorrow gets the music fader by being declared music, and an event called "MusicalHit"
+	 * never gets it by accident.
+	 *
+	 * Lives here rather than in the audio subsystem so that Trace.Audio.UserGain and VolumeFor cannot
+	 * disagree about what the player's setting means.
+	 */
+	float GetUserGainForFamily(bool bIsMusic) const;
+
+	/** Puts ONLY the three faders back to their shipped defaults, and saves. */
+	void ResetAudioToDefaults();
+
+	/** True when all three faders are on their shipped defaults. Drives the audio page's reset row. */
+	bool IsAudioAtDefaults() const;
 
 private:
 	/**

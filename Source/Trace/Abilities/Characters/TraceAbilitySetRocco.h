@@ -43,6 +43,24 @@ public:
 	virtual void OnHalfTime() override;
 	virtual void TickAbilities(float DeltaSeconds) override;
 
+	// --- the §1.2 client FX router ----------------------------------------------------------------
+	//
+	// ROCCO'S ONLY ROUTED ELEMENT IS THE STACK TELL, and the other two §2.9 loops are deliberately
+	// somewhere else:
+	//
+	//   the RIDE FX and the RIDE LOOP live on ATraceRippleActor, because the rider may be any of the
+	//   ten characters and this state pad belongs to exactly one of them. That file's header carries
+	//   the full argument; it is not an optimisation, it is the only correct home for them.
+	//
+	//   the SECOND JUMP's ring is a one-shot, not a loop, so it is an ATraceFxBurst fired from the
+	//   server at the accept site — the burst actor's replication IS the multicast and a router edge
+	//   would be a second, later copy of the same beat.
+	//
+	// What IS here is the accent lift, which is a while-active presentation of a replicated number
+	// (Stacks) and therefore exactly what §1.2 was written for.
+	virtual void OnClientStateEdge(const FTraceAbilityNetState& Old, const FTraceAbilityNetState& New) override;
+	virtual void SyncClientFx(const FTraceAbilityNetState& Current) override;
+
 	// --- activated: Ripple ------------------------------------------------------------------------
 	virtual bool  ActivateAbility() override;
 	virtual float GetActivatedCooldownSeconds() const override;
@@ -68,6 +86,20 @@ public:
 	/** True while this airtime's extra jump is still available. */
 	bool IsSecondJumpAvailable() const { return !bSecondJumpUsed; }
 
+	/**
+	 * FX_AUDIO_PLAN §2.9's stack tell, as a number: what his body's accent Glow is being multiplied
+	 * by right now. 1.0 = no lift. Pure, and safe on any machine — it reads the replicated stack.
+	 *
+	 * §2.9: "body accent-stripe Glow scales 1.7 + 0.35/stack, cap 3.0, while stacks > 0". 1.7 is
+	 * ART_BIBLE §4.5's body-accent tier, so the lift tops out at a little under 1.8x and a full stack
+	 * of ten looks the same as a stack of four — which is correct, because the tell says "he is
+	 * boosted", not "he is boosted by exactly seven".
+	 */
+	float GetAccentGlowMultiplier() const;
+
+	/** True while this set is holding the accent lifted on its pawn. For the harness. */
+	bool IsAccentLifted() const { return bAccentLifted; }
+
 	/** The path a Ripple fired RIGHT NOW would take. Pure; used by the harness and by ActivateAbility. */
 	bool ComputeRipplePath(FVector& OutStart, FVector& OutDirection, float& OutLength) const;
 
@@ -85,4 +117,37 @@ private:
 
 	/** Destroys the live ripple, if any. Idempotent. */
 	void DestroyActiveRipple();
+
+	// --- FX_AUDIO_PLAN §2.9's stack tell ----------------------------------------------------------
+	//
+	// *** WHY THIS IS A POLLED WRITE AND NOT A ONE-SHOT ON THE EDGE. ***
+	//
+	// The lift is a scalar ("AccentGlow") on the pawn's body MIDs, and those MIDs are STOMPED by
+	// ATraceCharacter::ApplyColorToSkeletalMesh on every team change, carrier change, death and
+	// visual poll — that function writes AccentGlow = EmissivePower unconditionally, because the
+	// accent is a state read (8 normal / 30 carrier / 0 dead) and not a per-effect knob.
+	//
+	// So an edge-only write would survive exactly until Rocco picked up the Core, and the tell would
+	// silently vanish for the rest of the boost. MASTER_PLAN's risk 4 names this class of failure and
+	// names the mitigation: kit accent lifts are STOMP-REFRESH-TOLERANT, and the restore goes back
+	// through ApplyTeamColors() rather than through a remembered number.
+	//
+	// ApplyStackAccentTell therefore re-asserts the lift from TickAbilities (20 Hz, every machine)
+	// while the stack is up, LATCHING whatever base value it finds so a stomp mid-boost simply moves
+	// the base rather than fighting the lift. ClearStackAccentTell calls ApplyTeamColors() once, so
+	// the pawn returns to the canonical value the stomp would have given it and this file never has
+	// to know what EmissiveNormal, EmissiveCarrier or EmissiveDead are.
+
+	/** Re-asserts the lift on the pawn's body MIDs. Cheap and idempotent; safe when there is no lift. */
+	void ApplyStackAccentTell();
+
+	/** Puts the accent back through ATraceCharacter::ApplyTeamColors(). Idempotent. */
+	void ClearStackAccentTell();
+
+	/** True while this set has the accent lifted, so the restore runs exactly once. */
+	bool bAccentLifted = false;
+
+	/** The stomp base last observed on the body MIDs, and the value last written over it. */
+	float AccentBaseGlow = 0.f;
+	float LastWrittenAccentGlow = -1.f;
 };

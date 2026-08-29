@@ -130,12 +130,14 @@ public:
 	//
 	// Authored by Scripts/generate-menu-widgets.py, editable in the editor afterwards. They are
 	// Box-draw brushes with the margin and image size TraceMenuArtStyle::ButtonFrame derives, which is
-	// what lets one 512 px texture be a 720-wide row without the corner stretching with the width.
+	// what lets one 256 px texture be a 720-wide row without the corner stretching with the width.
 	//
 	// It is NOT what keeps the corner circular, and this comment used to claim it was. Spec v28 §1
 	// measured the drawn plate: Slate slices a Box brush against the texture's own pixel size rather
-	// than against the brush's ImageSize, the slices do not fit in a 60-unit row, and the corner is
-	// drawn as an ellipse 28 x 23.03. TraceMenuArtStyle.h has the derivation and what would fix it.
+	// than against the brush's ImageSize; at the original 512-wide cut the slices did not fit in a
+	// 60-unit row and the corner drew as an ellipse 28 x 23.03. The release pass re-cut the source to
+	// 256 wide (UI plan WP7), whose 22 px slices fit, so the corner now ships circular.
+	// TraceMenuArtStyle.h has the derivation and the proof arithmetic.
 
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Menu Row|Art")
 	FSlateBrush PlateDefaultBrush;

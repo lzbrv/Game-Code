@@ -17,7 +17,13 @@
 #include "UObject/ConstructorHelpers.h"
 
 #include "Abilities/TraceAbilityComponent.h"
+#include "Abilities/TraceAbilityTypes.h"   // ETraceCharacterId::Elle — the id, not the colour
+#include "Audio/TraceAudio.h"              // ElleSnap — replicated-local, because THIS ACTOR is the multicast
+#include "Audio/TraceSoundEvents.h"
 #include "Core/TraceCharacter.h"
+#include "Core/TraceCharacterRoster.h"     // THE accent. See ElleAccent() below.
+#include "Gameplay/TraceFxBurst.h"         // the ElleTeleport flash, at BOTH mouths
+#include "Gameplay/TraceFxShapes.h"        // ShapeScaleFor* — one conversion, used everywhere
 #include "Trace.h"
 #include "TraceSettings.h"
 
@@ -165,6 +171,81 @@ namespace TraceElleGateFile
 	 * inside the floor and have TeleportTo refuse the whole move.
 	 */
 	constexpr float ArrivalLiftUU = 12.f;
+
+	// =============================================================================================
+	// FX_AUDIO_PLAN §2.5 — THE POLISH. The measured purples above are CANON and are not touched here.
+	// =============================================================================================
+
+	/**
+	 * "The middle bead-ring of a PAIRED gate rotates 12 deg/s."
+	 *
+	 * MOTION, NOT BRIGHTNESS, and that is the whole reason the polish is a rotation. Bible §3.3 puts
+	 * gates on the no-pulse list — a lethal or navigational volume that breathes is a volume lying
+	 * about its size — so the "this one is live" signal has to be carried by something else, and the
+	 * only channels left are hue (already spent telling the two mouths apart) and movement.
+	 *
+	 * A LONE MOUTH NEVER TURNS. That is the same question the brightness split already answers ("is
+	 * this a portal yet?"), asked on a second channel, so the answer survives bloom swallowing the
+	 * first one at range.
+	 */
+	constexpr float PairedRingSpinDegPerSecond = 12.f;
+
+	/**
+	 * "Expiry: 0.3 s dim-out instead of vanish."
+	 *
+	 * The gate still DIES on its own deadline — the server destroys the actor at ExpireMatchTime and
+	 * nothing here delays that by a frame, because the deadline is a rule and this is paint. What the
+	 * fade buys is that the last thing a player sees is the mouth CLOSING rather than a frame where a
+	 * portal was and a frame where it was not; bible §6.4's "never pop-out".
+	 *
+	 * It runs on every machine from the same match clock the deadline is expressed in, so a client's
+	 * fade and the server's destroy agree without either being told about the other.
+	 */
+	constexpr float ExpiryFadeSeconds = 0.3f;
+
+	/** FX §2.5's snap cast ring: "r 30 -> 80 uu ground ring at the placed mouth, orchid, 0.3 s". */
+	constexpr float CastRingSeconds = 0.3f;
+	constexpr float CastRingStartRadiusUU = 30.f;
+	constexpr float CastRingEndRadiusUU = 80.f;
+	constexpr int32 CastRingBeads = BeadsPerRing;   // AddRing lays exactly BeadsPerRing of them
+
+	/**
+	 * Elle's accent. The CAST ring wears it; the mouths keep their own measured purples.
+	 *
+	 * *** READ FROM THE ROSTER, NOT COPIED. *** This was
+	 * `const FLinearColor ElleOrchid(0.85f, 0.42f, 1.00f, 1.f)` quoting ART_BIBLE §2.3's #EDADFF.
+	 * The W5 re-space moved every accent off the two team hues (Elle #EDADFF -> #FAADFF) and this
+	 * copy stayed behind, so the cast ring drew in last wave's orchid on a body wearing this wave's.
+	 * A duplicated constant is a thing that CAN drift, so the fix is to stop duplicating it rather
+	 * than to re-transcribe it and hope.
+	 *
+	 * The mouths are deliberately NOT this: their purples were measured against the arena in this
+	 * file's own RingGlow block and they are a different fact.
+	 */
+	FLinearColor ElleAccent()
+	{
+		if (const TraceCharacterRoster::FTraceCharacterEntry* Row =
+			TraceCharacterRoster::Find(static_cast<uint8>(ETraceCharacterId::Elle)))
+		{
+			return FLinearColor(Row->Accent.R, Row->Accent.G, Row->Accent.B, 1.f);
+		}
+		return FLinearColor::White;
+	}
+
+	/**
+	 * ...at the same brightest-channel PRODUCT the mouths were measured at (0.90 x 1.0 = 0.90).
+	 *
+	 * Orchid's brightest channel is 1.0, so 0.9 lands on the same product the purple rings above were
+	 * photographed as purple at. Anything near the §2.2-3.2 tier the recipe would suggest clips every
+	 * channel and hands back the white ring this file already has a paragraph about.
+	 */
+	constexpr float CastRingGlow = 0.9f;
+
+	/**
+	 * Below this fade alpha the rings are HIDDEN rather than dimmed further. See TickGateFx: an unlit
+	 * opaque material does not fade to nothing, it fades to black.
+	 */
+	constexpr float FadeHideBelow = 0.12f;
 }
 
 namespace TraceElleGateFile
@@ -213,14 +294,28 @@ ATraceElleGate::ATraceElleGate()
 	// NO COLLISION OF ANY KIND, exactly like the Ripple and the Spike. A gate is a place. A collider
 	// here would let it stop a bullet, break an Oyster jar or become a movement base — three bugs for
 	// nothing gained, because entry is a proximity poll rather than an overlap.
-	RingMesh = CreateDefaultSubobject<UInstancedStaticMeshComponent>(TEXT("RingMesh"));
-	RingMesh->SetupAttachment(Root);
-	RingMesh->SetCollisionEnabled(ECollisionEnabled::NoCollision);
-	RingMesh->SetCollisionProfileName(TEXT("NoCollision"));
-	RingMesh->SetGenerateOverlapEvents(false);
-	RingMesh->SetCanEverAffectNavigation(false);
-	RingMesh->SetCastShadow(false);
-	RingMesh->bReceivesDecals = false;
+	auto MakeRingComponent = [this](const TCHAR* Name) -> UInstancedStaticMeshComponent*
+	{
+		UInstancedStaticMeshComponent* Made = CreateDefaultSubobject<UInstancedStaticMeshComponent>(Name);
+		Made->SetupAttachment(Root);
+		Made->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+		Made->SetCollisionProfileName(TEXT("NoCollision"));
+		Made->SetGenerateOverlapEvents(false);
+		Made->SetCanEverAffectNavigation(false);
+		Made->SetCastShadow(false);
+		Made->bReceivesDecals = false;
+		return Made;
+	};
+
+	RingMesh = MakeRingComponent(TEXT("RingMesh"));
+
+	// The waist ring, alone so it can turn (FX §2.5). See the header for why it is its own component.
+	SpinRingMesh = MakeRingComponent(TEXT("SpinRingMesh"));
+
+	// The cast ring. Hidden until BeginPlay starts it and hidden again the moment it finishes, so a
+	// gate standing in the arena is never carrying a stale ring at its final radius.
+	CastRingMesh = MakeRingComponent(TEXT("CastRingMesh"));
+	CastRingMesh->SetVisibility(false);
 
 	// /Engine/BasicShapes ships with every install; M_TraceNeon is generated content and may not.
 	// Both lookups are static so the cost is paid once per process, exactly as the Ripple does it.
@@ -325,6 +420,13 @@ void ATraceElleGate::BeginPlay()
 	// may not have landed yet, so the rings are built from Tick instead — BuildRingsIfNeeded is
 	// idempotent and cheap until the mouth arrives.
 	BuildRingsIfNeeded();
+
+	// The cast ring and the ElleSnap play are both started from the FIRST TICK THAT HAS A MOUTH rather
+	// than from here, for the reason on bSnapSoundPlayed: on a client this function runs before one
+	// replicated property has arrived, and a ring drawn at the world origin with a sound to match is
+	// worse than the same pair a frame later. Nothing about the trigger changes — it is still "the
+	// gate came into existence on this machine", which is what §2.5 and §5.1 both name.
+	CastRingElapsed = 0.f;
 }
 
 float ATraceElleGate::MatchTimeNow() const
@@ -343,11 +445,143 @@ void ATraceElleGate::Tick(float DeltaSeconds)
 	Super::Tick(DeltaSeconds);
 
 	BuildRingsIfNeeded();
+	TickGateFx(DeltaSeconds);
 
 	if (HasAuthority())
 	{
 		ServerTickGate();
 	}
+}
+
+// =================================================================================================
+// FX §2.5 — the cosmetic half. EVERY MACHINE, every frame, and it decides nothing.
+// =================================================================================================
+
+void ATraceElleGate::TickGateFx(float DeltaSeconds)
+{
+	if (!bRingsBuilt || RadiusUU <= 0.f)
+	{
+		return;   // nothing built yet: on a client, until the replicated mouth arrives
+	}
+
+	// ---- the snap cast ring, and the sound that goes with it -------------------------------------
+	if (!bSnapSoundPlayed)
+	{
+		bSnapSoundPlayed = true;
+
+		// PlayReplicatedLocal, NOT Play: this actor's own replication already put the gate on every
+		// machine, so a multicast here would be a second broadcast of the same fact — §8.7's
+		// double-audio failure, and the reason ElleSnap is declared Client-side in the table.
+		TraceAudio::PlayReplicatedLocal(this, TraceSoundEvents::ElleSnap, FVector(MouthLocation));
+	}
+
+	if (CastRingElapsed < TraceElleGateFile::CastRingSeconds)
+	{
+		CastRingElapsed += DeltaSeconds;
+		UpdateCastRing();
+	}
+
+	// ---- the paired gate's turning waist ring -----------------------------------------------------
+	if (SpinRingMesh != nullptr && IsPaired())
+	{
+		SpinRingMesh->AddLocalRotation(
+			FRotator(0.f, TraceElleGateFile::PairedRingSpinDegPerSecond * DeltaSeconds, 0.f));
+	}
+
+	// ---- the 0.3 s dim-out ------------------------------------------------------------------------
+	const float Fade = GetExpiryFadeAlpha();
+	if (!FMath::IsNearlyEqual(Fade, LastFadeWritten, 0.01f))
+	{
+		LastFadeWritten = Fade;
+		PushRingColour();
+
+		// *** AND THE LAST SLIVER IS HIDDEN, NOT DIMMED, BECAUSE M_TraceNeon IS OPAQUE. ***
+		//
+		// Dimming an unlit OPAQUE material toward zero does not fade it out — it fades it to BLACK, and
+		// a black bead ring on the arena's pale floor is more visible than the lit one was. Photographed
+		// (frames-W4-KITS-B/solo4/W4KitsB_Elle_06_TeleportFlash.png shows exactly that failure happening
+		// to a burst's ring). Below the threshold the rings are simply switched off: at 12% of a Glow of
+		// 1.0 they are already the dimmest thing in frame, so the step down to nothing is invisible,
+		// while the step down to black would not be.
+		const bool bBrightEnoughToDraw = Fade > TraceElleGateFile::FadeHideBelow;
+		RingMesh->SetVisibility(bBrightEnoughToDraw);
+		SpinRingMesh->SetVisibility(bBrightEnoughToDraw);
+		if (!bBrightEnoughToDraw && CastRingMesh != nullptr)
+		{
+			CastRingMesh->SetVisibility(false);
+		}
+	}
+}
+
+void ATraceElleGate::UpdateCastRing()
+{
+	if (CastRingMesh == nullptr || CastRingMesh->GetInstanceCount() <= 0)
+	{
+		return;
+	}
+
+	const float Alpha = FMath::Clamp(CastRingElapsed / TraceElleGateFile::CastRingSeconds, 0.f, 1.f);
+	if (Alpha >= 1.f)
+	{
+		CastRingMesh->SetVisibility(false);
+		return;
+	}
+
+	// EASED OUT, so the ring leaves fast and settles — the shape of a thing opening rather than a
+	// thing travelling. The same 1-(1-a)^2 the burst timeline uses, for the same reason.
+	const float Eased = 1.f - FMath::Square(1.f - Alpha);
+	const float Radius = FMath::Lerp(TraceElleGateFile::CastRingStartRadiusUU,
+		TraceElleGateFile::CastRingEndRadiusUU, Eased);
+
+	const float ArcLength = (2.f * PI * Radius / static_cast<float>(TraceElleGateFile::CastRingBeads)) * 1.2f;
+	const FVector BeadScale(
+		UTraceFxShapes::ShapeScaleForRadiusUU(TraceElleGateFile::BeadThicknessUU * 0.5f),
+		UTraceFxShapes::ShapeScaleForRadiusUU(TraceElleGateFile::BeadThicknessUU * 0.5f),
+		UTraceFxShapes::ShapeScaleForLengthUU(ArcLength));
+
+	// The ring lies at the ANKLE, not at the mouth: §2.5 calls it a GROUND ring, and the mouth is
+	// stored at the placer's capsule centre — half a pawn up.
+	const float GroundZ = -0.5f * TraceElleGateFile::ColumnHeightUU;
+
+	const int32 Count = FMath::Min(CastRingMesh->GetInstanceCount(), TraceElleGateFile::CastRingBeads);
+	for (int32 Bead = 0; Bead < Count; ++Bead)
+	{
+		const float Angle = (2.f * PI * static_cast<float>(Bead)) / static_cast<float>(TraceElleGateFile::CastRingBeads);
+		const float SinA = FMath::Sin(Angle);
+		const float CosA = FMath::Cos(Angle);
+
+		const FVector Offset(CosA * Radius, SinA * Radius, GroundZ);
+		const FVector Tangent(-SinA, CosA, 0.f);
+
+		CastRingMesh->UpdateInstanceTransform(Bead,
+			FTransform(FRotationMatrix::MakeFromZ(Tangent).Rotator(), Offset, BeadScale),
+			/*bWorldSpace=*/false, /*bMarkRenderStateDirty=*/(Bead == Count - 1), /*bTeleport=*/true);
+	}
+}
+
+float ATraceElleGate::GetRingSpinDegrees() const
+{
+	return (SpinRingMesh != nullptr) ? SpinRingMesh->GetRelativeRotation().Yaw : 0.f;
+}
+
+bool ATraceElleGate::IsCastRingPlaying() const
+{
+	return CastRingElapsed < TraceElleGateFile::CastRingSeconds;
+}
+
+float ATraceElleGate::GetExpiryFadeAlpha() const
+{
+	if (ExpireMatchTime <= 0.f)
+	{
+		return 1.f;
+	}
+
+	const float Remaining = ExpireMatchTime - MatchTimeNow();
+	if (Remaining >= TraceElleGateFile::ExpiryFadeSeconds)
+	{
+		return 1.f;
+	}
+	return FMath::Clamp(Remaining / TraceElleGateFile::ExpiryFadeSeconds, 0.f, 1.f);
 }
 
 void ATraceElleGate::ServerTickGate()
@@ -522,6 +756,22 @@ void ATraceElleGate::CommitTeleport(ATraceCharacter* Candidate)
 
 	ApplyLockout(Candidate);
 
+	// ---- FX §2.5: THE TELEPORT FLASH, AT BOTH MOUTHS ---------------------------------------------
+	//
+	// Both, and that is the whole point: a flash only at the destination tells the arriving player
+	// something they already know and tells the people watching the ENTRANCE nothing. A gate that
+	// swallowed somebody has to say so at the mouth it swallowed them from, or the pair reads as
+	// teleporting people out of nowhere.
+	//
+	// Server-side, spawning the replicated burst actor, which IS the multicast — the visual and the
+	// ElleTeleport sound land frame-synced on every machine with no RPC of this actor's own. The
+	// spawn point is the MOUTH, which this class already stores at the placer's capsule centre, and
+	// that is exactly where W3-FXBURST documents the ElleTeleport column expecting to be given.
+	ATraceFxBurst::Burst(GetWorld(), ETraceFxBurstType::ElleTeleport,
+		FVector(MouthLocation), FVector::UpVector);
+	ATraceFxBurst::Burst(GetWorld(), ETraceFxBurstType::ElleTeleport,
+		Partner->GetMouthLocation(), FVector::UpVector);
+
 	// THE ARRIVAL IS NOT AN ENTRY. They were PUT in the far mouth; they did not step into it. Without
 	// this the far gate sees a body appear inside itself and, one lockout later, sends it straight back
 	// — which is the ping-pong the edge rule exists to end.
@@ -563,11 +813,20 @@ int32 ATraceElleGate::GetDrawnBeadCount() const
 	// Both halves are now required: instances AND a mesh for the renderer to draw them with. Under
 	// Trace.Elle.GateVisible 0 this returns 0 and that assertion fails, which is what makes the fix
 	// measurable rather than merely asserted.
-	if (RingMesh == nullptr || RingMesh->GetStaticMesh() == nullptr)
+	//
+	// IT SUMS BOTH RING COMPONENTS. FX §2.5 moved the waist ring into SpinRingMesh so it can turn, and
+	// a counter that kept asking only RingMesh would have quietly reported two thirds of the gate as
+	// the whole of it — the same class of half-true number this comment exists about.
+	auto DrawnIn = [](const UInstancedStaticMeshComponent* Component) -> int32
 	{
-		return 0;
-	}
-	return RingMesh->GetInstanceCount();
+		return (Component != nullptr && Component->GetStaticMesh() != nullptr)
+			? Component->GetInstanceCount() : 0;
+	};
+
+	// The CAST ring is deliberately NOT counted: it is a 0.3 s transient, and a bead count that
+	// changed depending on how recently the gate was placed would make every assertion built on it
+	// depend on the fixture's timing.
+	return DrawnIn(RingMesh) + DrawnIn(SpinRingMesh);
 }
 
 ETraceAbilityEffect ATraceElleGate::ClassifyEntry(const ATraceCharacter* Candidate) const
@@ -685,7 +944,8 @@ void ATraceElleGate::BuildRingsIfNeeded()
 	{
 		return;
 	}
-	if (RadiusUU <= 0.f || BeadMesh == nullptr || RingMesh == nullptr)
+	if (RadiusUU <= 0.f || BeadMesh == nullptr || RingMesh == nullptr
+		|| SpinRingMesh == nullptr || CastRingMesh == nullptr)
 	{
 		return;   // on a client, until the replicated mouth arrives
 	}
@@ -713,11 +973,9 @@ void ATraceElleGate::BuildRingsIfNeeded()
 	if (CVarElleGateVisible.GetValueOnGameThread() != 0)
 	{
 		RingMesh->SetStaticMesh(BeadMesh);
+		SpinRingMesh->SetStaticMesh(BeadMesh);
+		CastRingMesh->SetStaticMesh(BeadMesh);
 	}
-
-	const FLinearColor Color = !bPairedNow
-		? TraceElleGateFile::UnpairedColor
-		: (bSecondOfPair ? TraceElleGateFile::SecondMouthColor : TraceElleGateFile::FirstMouthColor);
 
 	if (RingMID == nullptr)
 	{
@@ -727,22 +985,35 @@ void ATraceElleGate::BuildRingsIfNeeded()
 			RingMID = UMaterialInstanceDynamic::Create(Parent, this);
 			if (RingMID != nullptr)
 			{
+				// ONE MID ACROSS BOTH MOUTH COMPONENTS. The colour is a fact about the GATE, and two
+				// instances would be two places the pairing recolour could half-land.
 				RingMesh->SetMaterial(0, RingMID);
+				SpinRingMesh->SetMaterial(0, RingMID);
 			}
 		}
 	}
 
-	if (RingMID != nullptr)
+	// The CAST ring gets its own instance: it is orchid rather than either mouth purple, it fades on
+	// its own 0.3 s clock, and it must not be dragged around by the pairing recolour.
+	if (CastRingMID == nullptr)
 	{
-		// "Color" is what both M_TraceNeon and BasicShapeMaterial call it; "Glow" is neon only and is a
-		// silent no-op on the fallback, which is why the fallback also gets a matte roughness. It will
-		// not bloom, and that is the cost of not having generated the content pack.
-		RingMID->SetVectorParameterValue(TEXT("Color"), Color);
-		RingMID->SetVectorParameterValue(TEXT("BaseColor"), Color);
-		RingMID->SetScalarParameterValue(TEXT("Glow"),
-			bPairedNow ? TraceElleGateFile::RingGlow : TraceElleGateFile::UnpairedGlow);
-		RingMID->SetScalarParameterValue(TEXT("Roughness"), 0.9f);
+		UMaterialInterface* Parent = (NeonMaterial != nullptr) ? NeonMaterial.Get() : FallbackMaterial.Get();
+		if (Parent != nullptr)
+		{
+			CastRingMID = UMaterialInstanceDynamic::Create(Parent, this);
+			if (CastRingMID != nullptr)
+			{
+				CastRingMesh->SetMaterial(0, CastRingMID);
+				const FLinearColor CastRingHue = TraceElleGateFile::ElleAccent();
+				CastRingMID->SetVectorParameterValue(TEXT("Color"), CastRingHue);
+				CastRingMID->SetVectorParameterValue(TEXT("BaseColor"), CastRingHue);
+				CastRingMID->SetScalarParameterValue(TEXT("Glow"), TraceElleGateFile::CastRingGlow);
+				CastRingMID->SetScalarParameterValue(TEXT("Roughness"), 0.9f);
+			}
+		}
 	}
+
+	PushRingColour();
 
 	if (!bFirstBuild)
 	{
@@ -758,24 +1029,76 @@ void ATraceElleGate::BuildRingsIfNeeded()
 		// The mouth is stored at the placer's capsule CENTRE, so the column is hung around it rather
 		// than stacked up from it: half a pawn down to the ankles, half a pawn up to the head.
 		const float ZOffset = (Alpha - 0.5f) * TraceElleGateFile::ColumnHeightUU;
-		AddRing(FVector(MouthLocation) + FVector(0.f, 0.f, ZOffset), RadiusUU);
+
+		// THE MIDDLE RING GOES IN THE SPINNING COMPONENT. Its Z offset is 0 by construction (it is the
+		// centre of a column hung around the mouth), which is what lets the component be rotated about
+		// its own origin and have the beads ORBIT the mouth rather than swing on an arm.
+		const bool bIsMiddle = (Index * 2 == TraceElleGateFile::RingCount - 1);
+		AddRing(bIsMiddle ? SpinRingMesh : RingMesh,
+			FVector(MouthLocation) + FVector(0.f, 0.f, ZOffset), RadiusUU);
 	}
+
+	// The cast ring's beads are laid ONCE, here, and only their transforms are rewritten per frame by
+	// UpdateCastRing — clearing and re-adding twenty instances every frame of a 0.3 s animation is
+	// allocation churn for a thing that never changes count.
+	AddRing(CastRingMesh, FVector(MouthLocation), TraceElleGateFile::CastRingStartRadiusUU);
+	CastRingMesh->SetVisibility(true);
+	UpdateCastRing();
 
 	// Display, not Verbose, and it says whether there is a MESH. "Rings built" was printed on every
 	// invisible build there has ever been, so the log line that was supposed to be the evidence was
 	// the same on the broken build as on the fixed one. Beads drawn is the honest number.
 	UE_LOG(LogTraceGame, Display,
 		TEXT("[Elle] gate rings built: %d rings x %d beads at radius %.0f uu, colour %s, glow %.1f "
-		     "(paired=%d, second=%d) — mesh=%s, beads DRAWN=%d."),
-		TraceElleGateFile::RingCount, TraceElleGateFile::BeadsPerRing, RadiusUU, *Color.ToString(),
+		     "(paired=%d, second=%d) — mesh=%s, beads DRAWN=%d (%d static + %d spinning at %.0f deg/s). "
+		     "Cast ring %d beads, %.0f -> %.0f uu over %.1fs."),
+		TraceElleGateFile::RingCount, TraceElleGateFile::BeadsPerRing, RadiusUU,
+		*(!bPairedNow ? TraceElleGateFile::UnpairedColor
+			: (bSecondOfPair ? TraceElleGateFile::SecondMouthColor : TraceElleGateFile::FirstMouthColor)).ToString(),
 		bPairedNow ? TraceElleGateFile::RingGlow : TraceElleGateFile::UnpairedGlow,
 		bPairedNow ? 1 : 0, bSecondOfPair ? 1 : 0,
-		*GetNameSafe(RingMesh->GetStaticMesh()), GetDrawnBeadCount());
+		*GetNameSafe(RingMesh->GetStaticMesh()), GetDrawnBeadCount(),
+		RingMesh->GetInstanceCount(), SpinRingMesh->GetInstanceCount(),
+		bPairedNow ? TraceElleGateFile::PairedRingSpinDegPerSecond : 0.f,
+		CastRingMesh->GetInstanceCount(), TraceElleGateFile::CastRingStartRadiusUU,
+		TraceElleGateFile::CastRingEndRadiusUU, TraceElleGateFile::CastRingSeconds);
 }
 
-void ATraceElleGate::AddRing(const FVector& Center, float Radius) const
+void ATraceElleGate::PushRingColour()
 {
-	if (RingMesh == nullptr || Radius <= 0.f)
+	if (RingMID == nullptr)
+	{
+		return;
+	}
+
+	const bool bPairedNow = IsPaired();
+	const FLinearColor Color = !bPairedNow
+		? TraceElleGateFile::UnpairedColor
+		: (bSecondOfPair ? TraceElleGateFile::SecondMouthColor : TraceElleGateFile::FirstMouthColor);
+
+	// THE FADE MULTIPLIES THE GLOW, NOT THE COLOUR. M_TraceNeon is Colour x Glow and a material
+	// instance clamps vector parameters to [0,1] — dimming through the colour would desaturate on the
+	// way down and the gate would close through grey instead of through its own hue.
+	const float Fade = GetExpiryFadeAlpha();
+
+	// "Color" is what both M_TraceNeon and BasicShapeMaterial call it; "Glow" is neon only and is a
+	// silent no-op on the fallback, which is why the fallback also gets a matte roughness. It will
+	// not bloom, and that is the cost of not having generated the content pack.
+	RingMID->SetVectorParameterValue(TEXT("Color"), Color);
+	RingMID->SetVectorParameterValue(TEXT("BaseColor"), Color);
+	RingMID->SetScalarParameterValue(TEXT("Glow"),
+		(bPairedNow ? TraceElleGateFile::RingGlow : TraceElleGateFile::UnpairedGlow) * Fade);
+	RingMID->SetScalarParameterValue(TEXT("Roughness"), 0.9f);
+
+	if (CastRingMID != nullptr)
+	{
+		CastRingMID->SetScalarParameterValue(TEXT("Glow"), TraceElleGateFile::CastRingGlow * Fade);
+	}
+}
+
+void ATraceElleGate::AddRing(UInstancedStaticMeshComponent* Into, const FVector& Center, float Radius) const
+{
+	if (Into == nullptr || Radius <= 0.f)
 	{
 		return;
 	}
@@ -801,6 +1124,6 @@ void ATraceElleGate::AddRing(const FVector& Center, float Radius) const
 
 		const FTransform BeadTransform(FRotationMatrix::MakeFromZ(Tangent).Rotator(),
 		                               CenterRelative + Offset, BeadScale);
-		RingMesh->AddInstance(BeadTransform);
+		Into->AddInstance(BeadTransform);
 	}
 }

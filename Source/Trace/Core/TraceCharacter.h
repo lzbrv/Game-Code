@@ -1352,6 +1352,24 @@ protected:
 	void ApplyHandsGloveFloor(float Multiplier);
 
 	/**
+	 * CHARACTER_SHEETS §1 — writes @p CharacterId's accent HUE onto the sleeve cuff rings.
+	 *
+	 * ONE WRITER FOR TWO CALLERS, the same rule ApplyHandsGloveFloor states: BuildHandsEmissive
+	 * establishes the state at build time, UpdateHandsEmissive re-writes it on the frame the pawn's
+	 * character changes, and neither computes the colour itself.
+	 *
+	 * *** THE HUE MOVES, THE BRIGHTNESS DOES NOT. *** The accent is rescaled to the luminance the
+	 * pack authored into `circuit_cyan` before it is written, so ten characters produce ten cuffs of
+	 * the same VALUE in ten hues. Without that, Lily's near-white ice would out-glow Mortimer's slate
+	 * by better than two to one and the ring would read as a brightness tell rather than an identity
+	 * one — and every one of the frame-fraction measurements on TraceCharacterLayout::
+	 * HandsArmCuffAlongUU was made against one fixed brightness.
+	 *
+	 * @param CharacterId  A roster id, or TraceCharacterRoster::NoneId for the pack's own cyan.
+	 */
+	void ApplyHandsCuffAccent(uint8 CharacterId);
+
+	/**
 	 * SPEC v32 §5 — writes EmissiveIntensity on the gloves every frame.
 	 *
 	 * IDLE IS A STATELESS FUNCTION OF WALL TIME, for the reason ATraceCore::UpdateCoreArtEmissive
@@ -1780,6 +1798,51 @@ private:
 	 */
 	UPROPERTY(Transient)
 	TObjectPtr<UMaterialInstanceDynamic> HandsArmMID;
+
+	/**
+	 * *** THE SLEEVE CUFF RING, AND IT IS THE ONLY THING IN FIRST PERSON THAT IS PER CHARACTER. ***
+	 * (CHARACTER_SHEETS.md §1: "the per-character element is exactly one".)
+	 *
+	 * A third sibling of `circuit_cyan`, made for the same reason HandsArmMID is a sibling of
+	 * `shell`: the two lit rings need a different HUE from the rest of the glove's circuit, and one
+	 * MID cannot carry two. Everything else about them is unchanged — same parent, same
+	 * EmissiveIntensity written from the same breath-and-flare curve every frame — so the cuffs still
+	 * breathe at rest and still flare on an action WITH the glove they sit under, which is the half of
+	 * this that would have been lost by painting them from the arena's neon instead.
+	 *
+	 * *** AND THE HUE IS THE ROSTER'S ACCENT, NOT THE TEAM COLOUR. *** The team is already answered in
+	 * first person by the gun's light channels (ApplyTeamColors writes ViewModelNeonMID); the cuff
+	 * answers the other question — WHO you are — and it is the first-person mirror of the third-person
+	 * service ring. It is deliberately outside ApplyColorToSkeletalMesh's stomp list for the same
+	 * reason the body's `accent` slot is: an accent that could be repainted team colour is not an
+	 * identity (PIPELINE_DESIGN.md §4.1).
+	 *
+	 * Null on the procedural cube fallback and null when `circuit_cyan` did not resolve — in both
+	 * cases EnsureViewModelBuilt leaves the cuffs on whatever they wore before, which is the shipped
+	 * look, and no frame changes.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UMaterialInstanceDynamic> HandsCuffMID;
+
+	/**
+	 * The pack's OWN authored circuit colours, read off the glove's instance at build time and kept
+	 * so that "no character selected" can be restored exactly rather than approximated by a literal.
+	 * A re-export that re-tunes MI_Pack_circuit_cyan therefore moves the cuff's neutral state with it,
+	 * which a hardcoded cyan would not.
+	 */
+	FLinearColor HandsCuffCyanEmissive = FLinearColor::White;
+	FLinearColor HandsCuffCyanAlbedo = FLinearColor::White;
+
+	/**
+	 * Which character's accent is on HandsCuffMID right now. Compared against the pawn's applied body
+	 * id once per frame in UpdateHandsEmissive and re-written only on a change — the same
+	 * poll-with-a-remembered-answer shape UpdateCharacterBodyMesh uses, and for the same reason: the
+	 * selection can arrive after the viewmodel is built, can change at the select screen, and there is
+	 * no single event that is guaranteed to happen after both.
+	 *
+	 * TraceCharacterRoster::NoneId (0) means the cuffs are wearing the pack's own cyan.
+	 */
+	uint8 HandsCuffAccentId = 0;
 
 	/**
 	 * Whether ApplyHandsOffHandVisibility has hidden the pack's left glove for the clip that is

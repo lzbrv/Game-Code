@@ -186,6 +186,7 @@ FString TraceDescribeTeamColors()
 		AmberBytes.R, AmberBytes.G, AmberBytes.B);
 }
 
+#if !UE_BUILD_SHIPPING
 namespace TraceTypesFile
 {
 	static void ReportTeamColors()
@@ -198,3 +199,4 @@ namespace TraceTypesFile
 		TEXT("Spec v26 §5. Prints the live team palette and the menu constants it is derived from."),
 		FConsoleCommandDelegate::CreateStatic(&TraceTypesFile::ReportTeamColors));
 }
+#endif // !UE_BUILD_SHIPPING

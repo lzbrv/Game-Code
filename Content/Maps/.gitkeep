@@ -1,17 +1,42 @@
 This file exists only to keep Content/Maps/ in Git — Git tracks files, not
 directories, and an empty directory would vanish on clone.
 
-Arena.umap is NOT committed by default: it is generated on demand with
+WHAT IS ACTUALLY COMMITTED HERE (checked with `git ls-files Content/Maps`, and
+this paragraph replaces a note that said the opposite):
 
-    Scripts/generate-map.sh
+  Arena.umap         COMMITTED. Deliberately EMPTY — the whole arena (floor,
+                     walls, cover, endzones, lights, player starts, skyline) is
+                     built in C++ by ATraceArenaBuilder at BeginPlay, so the
+                     asset carries no content. Scripts/generate-map.sh recreates
+                     it from scratch if it is ever lost, which is why the old
+                     note called it "generated on demand" — but it is in the
+                     repo, and a clone does not have to run anything.
+  Arena_Baked.umap   COMMITTED — the SHIPPING map, and the only one with real
+                     content. It is Arena run once and written down: ~590
+                     editable actors, One File Per Actor, so the .umap itself is
+                     a few KB and the actors live in
+                     Content/__ExternalActors__/Maps/Arena_Baked/ (~600 packages,
+                     also committed).
+  MainMenu.umap      COMMITTED.
+  Fish_*.umap        COMMITTED — a collaborator's test maps. Kept, not touched.
 
-which creates a deliberately empty level. The whole arena (floor, walls,
-endzones, lights, player starts) is built in C++ by ATraceArenaBuilder at
-BeginPlay, so the map asset carries no content and nothing in the game depends
-on a .uasset we author.
+HOW Arena_Baked IS REGENERATED, and the rule that governs it:
 
-If the team ever does commit Arena.umap, it goes through Git LFS and is
-`lockable` (see .gitattributes) — .umap files cannot be merged, so lock before
-you edit:
+  /Game/Maps/Arena is the source of truth for every PROCEDURAL family. Builder
+  changes are never hand-copied into Arena_Baked; they arrive via a re-bake.
+  Arena_Baked is also the only home of the HAND layer (the centre kit and its
+  dress strips, hand-placed lamps, hand-moved pieces).
 
-    git lfs lock Content/Maps/Arena.umap
+  Scripts/bake-arena.sh --force            destroys the hand layer. Use it only
+                                           on a level nobody has edited.
+  Scripts/rebake-arena-preserving.py       the one to use: census -> force bake
+                                           -> replay deletions and hand
+                                           transforms -> restore the hand layer
+                                           -> reconciliation. See MAP plan §10.
+
+.umap and .uasset go through Git LFS and are `lockable` (see .gitattributes),
+which means git-lfs checks them out read-only until somebody takes a lock —
+lock before you edit, and note that the bake scripts clear the read-only bit on
+exactly the two things they rewrite:
+
+    git lfs lock Content/Maps/Arena_Baked.umap

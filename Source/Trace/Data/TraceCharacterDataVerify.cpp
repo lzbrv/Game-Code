@@ -49,6 +49,8 @@
 #include "Trace.h"
 #include "UObject/UObjectGlobals.h"
 
+#if !UE_BUILD_SHIPPING
+
 // Named after the file. The module is a unity/jumbo build and this project has already lost a
 // Windows build to four verify files that each defined the same helper in `namespace { }`.
 namespace TraceCharacterDataVerify
@@ -378,7 +380,6 @@ namespace TraceCharacterDataVerify
 	}
 }
 
-#if !UE_BUILD_SHIPPING
 namespace TraceCharacterDataVerify
 {
 	FAutoConsoleCommand CmdVerifyCharacterData(
@@ -399,4 +400,4 @@ namespace TraceCharacterDataVerify
 		     "Use it after regenerating the assets without restarting."),
 		FConsoleCommandDelegate::CreateStatic(&ReloadCharacters));
 }
-#endif
+#endif // !UE_BUILD_SHIPPING

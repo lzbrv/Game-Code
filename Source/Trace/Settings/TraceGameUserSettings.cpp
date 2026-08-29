@@ -880,6 +880,8 @@ void UTraceGameUserSettings::SetToDefaults()
 	bResolutionOptionsBuilt = false;
 }
 
+#if !UE_BUILD_SHIPPING
+
 // =================================================================================================
 // Console commands
 //
@@ -1172,3 +1174,5 @@ namespace
 		TEXT("Restores the shipped video defaults. Does not touch controls and does not re-benchmark."),
 		FConsoleCommandDelegate::CreateStatic(&CmdResetImpl));
 }
+
+#endif // !UE_BUILD_SHIPPING

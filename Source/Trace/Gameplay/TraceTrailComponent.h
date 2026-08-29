@@ -761,6 +761,26 @@ public:
 		double& OutWorstUncovered, int32& OutVisiblePieces) const;
 
 	/**
+	 * W9 §1: HOW MANY RIBBON ELEMENTS THE LAST REBUILD NEEDED AND HOW MANY IT WAS ALLOWED.
+	 *
+	 * Wanted > Budget means PlaceRibbon ran out of pool and dropped elements, and because element 0 is
+	 * the oldest sample what it dropped is the NEWEST trace — lethal, undrawn, and immediately behind
+	 * the carrier. That is the defect this pass fixed, and this pair is how the two live harnesses
+	 * (Trace.Trail.Geometry, Trace.Trail.WallClip) can now NAME it instead of measuring a number and
+	 * guessing at the cause. On a healthy build the two are equal on every frame.
+	 *
+	 * Replicated ribbon only. The owner-only predicted stub is not lethal and is not graded here.
+	 */
+	void GetRibbonBudget(int32& OutWanted, int32& OutBudget) const
+	{
+		OutWanted = RibbonElementsWanted;
+		OutBudget = RibbonElementBudgetUsed;
+	}
+
+	/** W9 §1: true when the last rebuild wanted more elements than its budget. See GetRibbonBudget. */
+	bool WasRibbonTruncated() const { return RibbonElementsWanted > RibbonElementBudgetUsed; }
+
+	/**
 	 * v13 §7: distance in uu from a world point to the nearest VISIBLE replicated ribbon piece, 0 when
 	 * the point is inside one. -1 when nothing is drawn at all.
 	 *
@@ -936,8 +956,27 @@ public:
 		 * and the tail. That is a real defect and it is NOT this section's — a wall fix cannot cause it
 		 * and cannot cure it — so it has to be nameable rather than turning up as an unexplained number
 		 * that makes every arm look broken.
+		 *
+		 * *** W9 §1 ADDED A MAGNITUDE TEST, AND WITHOUT IT THIS FLAG WAS ACTIVELY MISLEADING. ***
+		 * Proximity to an end was the whole test, and a ribbon TRUNCATED at its pool has a new end
+		 * that trivially satisfies it — so when W8-ADVERSARIAL reproduced 229.6uu of undrawn kill
+		 * volume, this flag was set and the report confidently blamed the end cap and told the reader
+		 * to check Trace.Trail.FlatEndCaps. The end-cap defect is a radial bulge of at most
+		 * TrailRadius (22.5uu) past a flat cap; it CANNOT produce 229.6, and a diagnosis that cannot
+		 * be true is worse than no diagnosis at all because it points away from the real cause. The
+		 * flag now requires both: near an end AND small enough for an end to explain.
 		 */
 		bool bLethalOutsideDrawnIsEndCap = false;
+
+		/**
+		 * W9 §1: the element count the ribbon rebuild wanted this frame, and the pool it was given.
+		 *
+		 * Wanted > Budget is a TRUNCATED ribbon, which is a complete explanation for any amount of
+		 * undrawn kill volume and is the one the report reaches for first. Copied off the component
+		 * (GetRibbonBudget) rather than recomputed, so the report describes the ribbon on screen.
+		 */
+		int32 RibbonElementsWanted = 0;
+		int32 RibbonElementBudget = 0;
 	};
 
 	/**
@@ -1195,9 +1234,13 @@ private:
 	TObjectPtr<UMaterialInterface> TrailMaterial = nullptr;
 
 	/**
-	 * True when TrailMaterial resolved to /Game/Generated/Materials/M_TraceNeon (unlit, Color * Glow)
-	 * rather than to the BasicShapeMaterial fallback. Only the neon material has a Glow parameter,
-	 * and only it can be pushed past the bloom threshold.
+	 * True when TrailMaterial resolved to /Game/Trace/Materials/Parents/M_TraceNeon (unlit,
+	 * Color * Glow) rather than to the BasicShapeMaterial fallback. Only the neon material has a Glow
+	 * parameter, and only it can be pushed past the bloom threshold.
+	 *
+	 * The path in this line used to read /Game/Generated/Materials, which was the gitignored
+	 * per-developer generator output; MAP_PLAN §9 moved every load site to the committed parent and
+	 * deleted that tree.
 	 */
 	bool bTrailMaterialIsNeon = false;
 
@@ -1246,9 +1289,15 @@ private:
 	//
 	// Deliberately not slots at the end of the main pool. The main pool is rebuilt only when the
 	// replicated point set changes; the predicted stub has to be re-placed EVERY FRAME because it
-	// tracks a moving pawn, and putting it in the same array would mean either a full 96-element
+	// tracks a moving pawn, and putting it in the same array would mean either a full whole-ribbon
 	// rebuild every frame or index bookkeeping that the "grow one whole element at a time" invariant
-	// in EnsureSmearElement was written to make impossible. Four elements is the whole cost.
+	// in EnsureSmearElement was written to make impossible. A handful of elements is the whole cost.
+	//
+	// The figure that used to stand here — "a full 96-element rebuild" — was the old FIXED main pool,
+	// and W9 §1 removed the fixedness rather than the size: the main pool is now one element per
+	// lethal segment (RibbonElementBudget), which at the shipping ~21 points is the same ~27 elements
+	// it always was and on a long trace is more. The argument is unaffected and stronger — sharing
+	// the array would now mean a rebuild whose cost tracks the trace's LENGTH every frame.
 	// ------------------------------------------------------------------------------------------
 
 	UPROPERTY(Transient)
@@ -1514,14 +1563,21 @@ private:
 		float GlowScale,
 		bool bOnlyOwnerSees);
 
-	/** Layer 1: the continuous body-shaped extrusion along every lethal segment. */
+#if !UE_BUILD_SHIPPING
+	/**
+	 * Layer 1: the continuous body-shaped extrusion along every lethal segment. Legacy renderer
+	 * (Trace.Trail.Renderer 0) — kept in Development as Trace.Trail.PerfAB's live before-arm,
+	 * compiled out of Shipping along with RebuildPoseGhosts and their pool growers.
+	 */
 	void RebuildSmear(int32 LethalPointCount, float InvulnerableScale);
+#endif
 
 	// ------------------------------------------------------------------------------------------
 	// THE RIBBON (spec v6 §2). Read the block comment above RebuildRibbon().
 	// ------------------------------------------------------------------------------------------
 
-	/** True when the ribbon is the active renderer (Trace.Trail.Renderer 1, the default). */
+	/** True when the ribbon is the active renderer (Trace.Trail.Renderer 1, the default).
+	 *  In Shipping it is a compile-time `true`: the lever and both other arms are Development-only. */
 	static bool IsRibbonRenderer();
 
 	/** Pooled meshes per drawn element: 1 for the ribbon, 2 for the legacy smear. */
@@ -1603,6 +1659,22 @@ private:
 	TArray<float> RibbonSampleSlack;
 
 	/**
+	 * W9 §1: the element count the last REPLICATED ribbon rebuild needed, and the budget it got.
+	 *
+	 * Written by RebuildRibbon, read by GetRibbonBudget()/WasRibbonTruncated(). They are equal by
+	 * construction now — RibbonElementBudget() derives the budget from the polyline — and the pair is
+	 * kept so the harnesses can prove it every frame rather than take the constructor's word for it.
+	 */
+	int32 RibbonElementsWanted = 0;
+	int32 RibbonElementBudgetUsed = 0;
+
+	/**
+	 * One [RIBBONPOOL] Warning per component, ever. PlaceRibbon sets it when it runs out of pool; see
+	 * the comment at that break for why a truncation must never be silent again.
+	 */
+	bool bRibbonTruncationReported = false;
+
+	/**
 	 * Places the elements of RibbonSamples into @p Pieces. Shared by the replicated ribbon and by the
 	 * owner-only predicted head, so the stub is the same shape at the same width from the same
 	 * numbers as the ribbon it continues.
@@ -1628,11 +1700,14 @@ private:
 		int32 MaxElements,
 		bool bOnlyOwnerSees);
 
+#if !UE_BUILD_SHIPPING
 	/**
 	 * Layer 2: retire the after-images whose stretch of trace has expired, drop a new one when the
-	 * path has moved on far enough, and push colour/brightness at all of them.
+	 * path has moved on far enough, and push colour/brightness at all of them. Legacy renderer —
+	 * Development only, like RebuildSmear.
 	 */
 	void RebuildPoseGhosts(int32 LethalPointCount, float InvulnerableScale);
+#endif
 
 	/**
 	 * Spec v5 §2. Every frame, on the carrier's OWN machine only: continue the drawn trace from the
@@ -1679,11 +1754,15 @@ private:
 	 */
 	void ApplyProximityGlowFade();
 
-	/** Grows the smear pool to cover element @p ElementIndex. False once the pool cap is hit. */
+#if !UE_BUILD_SHIPPING
+	/** Grows the smear pool to cover element @p ElementIndex. False once the pool cap is hit.
+	 *  Legacy-arm only (RebuildSmear is its one caller), so it is compiled out of Shipping with it. */
 	bool EnsureSmearElement(int32 ElementIndex);
 
-	/** Grows the ghost pool to cover ghost @p GhostIndex. False once the pool cap is hit. */
+	/** Grows the ghost pool to cover ghost @p GhostIndex. False once the pool cap is hit.
+	 *  Legacy-arm only (RebuildPoseGhosts is its one caller), compiled out of Shipping with it. */
 	bool EnsurePoseGhost(int32 GhostIndex);
+#endif
 
 	/** Shared setup for one pooled smear piece. */
 	UStaticMeshComponent* CreatePooledMesh(UStaticMesh* SourceMesh, UMaterialInstanceDynamic*& OutMaterial);

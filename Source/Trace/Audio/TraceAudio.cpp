@@ -16,6 +16,7 @@
 #include "UObject/UObjectGlobals.h"
 
 #include "Audio/TraceAudioRelay.h"
+#include "Settings/TraceUserSettings.h"   // UI plan WP3 - the player's three volume faders
 #include "Audio/TraceSoundBank.h"
 #include "Trace.h"
 
@@ -24,6 +25,36 @@
 // already shipped a Windows-only break that way.
 namespace TraceAudioLocal
 {
+	/**
+	 * DEMO 29 — which unwired events this process has already explained.
+	 *
+	 * ONCE PER EVENT PER PROCESS, not once per call and not a rate limiter, exactly like the
+	 * missing-sound warning: "DeathBurst is switched off" is a fact about the build, so it wants to
+	 * be in the log one time. Without it a bot match would print twenty-nine identical lines for the
+	 * death burst alone. A TSet and not a bool, so each unwired event gets its own sentence.
+	 */
+	static TSet<FName> GUnwiredExplained;
+
+	/**
+	 * Log, once, that @p Event's trigger fired and the sound deliberately did not follow.
+	 *
+	 * Log level and not Verbose: the whole point is that somebody reading an ordinary log after the
+	 * owner says "the death sound is gone" finds the reason and the way back without having to know
+	 * that a list exists.
+	 */
+	static void ExplainUnwiredOnce(FName Event)
+	{
+		if (GUnwiredExplained.Contains(Event))
+		{
+			return;
+		}
+		GUnwiredExplained.Add(Event);
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[Audio] '%s' is UNWIRED: its trigger fired and the sound did not play. %s. ")
+			TEXT("`Trace.Audio.UnwiredEvents 0` brings it (and every other unwired event) back."),
+			*Event.ToString(), TraceSoundEvents::UnwiredReason(Event));
+	}
+
 	/** The world behind any context object, or null. Never asserts, never warns. */
 	static UWorld* WorldOf(const UObject* WorldContext)
 	{
@@ -194,14 +225,37 @@ float UTraceAudioSubsystem::VolumeFor(FName Event) const
 	// Reading the family from the event TABLE and not from the string "Step" is the difference
 	// between a rule and a coincidence: Step12 added tomorrow gets the knob by being declared a
 	// footstep, and an event called "Steppe" never gets it by accident.
-	const bool bFootstep = (TraceSoundEvents::FamilyOf(Event) == ETraceSoundFamily::Footstep);
+	const ETraceSoundFamily Family = TraceSoundEvents::FamilyOf(Event);
+	const bool bFootstep = (Family == ETraceSoundFamily::Footstep);
 	const float Base = bFootstep ? Settings.GetFootstepVolume() : FMath::Max(0.f, Settings.MasterVolume);
 
 	// The per-event trim MULTIPLIES the base (this project's standing rule: a value that modifies a
 	// base is stored relative to it), so turning the master down turns everything down and no event
 	// can escape it by carrying an absolute level of its own.
 	const float Trim = (Bank != nullptr) ? Bank->VolumeFor(Event) : 1.f;
-	return Base * Trim;
+
+	// ---- UI PLAN WP3 — THE PLAYER'S OWN FADERS, AND THE MUSIC BED'S DESIGNER TRIM ----------------
+	//
+	// TWO DIFFERENT KINDS OF NUMBER MEET HERE, and keeping them apart is the whole design:
+	//
+	//   MusicVolumeScale (UTraceAudioSettings, config=Game, checked in) is the DESIGNER saying how
+	//   far under the effects a 64-second bed should sit. It ships at 0.7 and is the same on every
+	//   machine — part of the mix, exactly like FootstepVolumeScale one line up.
+	//
+	//   The three UTraceUserSettings faders are the PLAYER saying how loud their machine should be.
+	//   Per-machine, written at runtime, never in a diff.
+	//
+	// Both multiply, so a player at 100% hears precisely the designer's mix and a player at 0% hears
+	// silence — and neither can be expressed by editing the other. Asked for BY FAMILY, from the
+	// event table, for the same reason the footstep branch is: a stinger added tomorrow gets the
+	// music fader by being DECLARED music (FX_AUDIO_PLAN §5.1 puts MusicTitle, AmbienceMatch and both
+	// stingers in ETraceSoundFamily::Music), and an event whose name merely contains "music" never
+	// gets it by accident.
+	const bool bMusic = (Family == ETraceSoundFamily::Music);
+	const float MusicTrim = bMusic ? FMath::Clamp(Settings.MusicVolumeScale, 0.f, 1.f) : 1.f;
+	const float UserGain = UTraceUserSettings::Get().GetUserGainForFamily(bMusic);
+
+	return Base * Trim * MusicTrim * UserGain;
 }
 
 USoundAttenuation* UTraceAudioSubsystem::GetWorldAttenuation()
@@ -240,6 +294,52 @@ USoundAttenuation* UTraceAudioSubsystem::GetWorldAttenuation()
 	return WorldAttenuation;
 }
 
+bool UTraceAudioSubsystem::IsBigWorldEvent(FName Event)
+{
+	// FX_AUDIO_PLAN §1.6.5. THE WHOLE LIST, and it is a code set rather than a knob on purpose: "this
+	// one is important" is not a claim a call site gets to make, or every call site eventually makes
+	// it. Three events, each of which the far side of the arena is meant to hear.
+	return Event == TraceSoundEvents::MortimerQuake
+		|| Event == TraceSoundEvents::RoxieRocketBurst
+		|| Event == TraceSoundEvents::Goal;
+}
+
+USoundAttenuation* UTraceAudioSubsystem::GetBigWorldAttenuation()
+{
+	if (BigWorldAttenuation != nullptr)
+	{
+		return BigWorldAttenuation;
+	}
+
+	BigWorldAttenuation = NewObject<USoundAttenuation>(this, NAME_None, RF_Transient);
+	if (BigWorldAttenuation == nullptr)
+	{
+		return nullptr;
+	}
+
+	const UTraceAudioSettings& Settings = UTraceAudioSettings::Get();
+
+	FSoundAttenuationSettings& Shape = BigWorldAttenuation->Attenuation;
+	Shape.bAttenuate = true;
+	Shape.bSpatialize = true;
+	Shape.AttenuationShape = EAttenuationShape::Sphere;
+
+	// DERIVED from the ordinary shape's numbers rather than typed in, for the same reason
+	// GetWorldFalloffDistanceUU() is derived: the owner retunes ONE pair in Project Settings and both
+	// shapes follow. x2 on the inner radius (1200 -> 2400) and x8 rather than x5 on the falloff, per
+	// §1.6.5.
+	constexpr float BigInnerScale = 2.f;
+	constexpr float BigFalloffScale = 8.f;
+	const float InnerRadius = FMath::Max(1.f, Settings.WorldInnerRadiusUU) * BigInnerScale;
+
+	Shape.AttenuationShapeExtents = FVector(InnerRadius, 0.f, 0.f);
+	Shape.FalloffDistance = InnerRadius * BigFalloffScale;
+	Shape.DistanceAlgorithm = EAttenuationDistanceModel::NaturalSound;
+	Shape.dBAttenuationAtMax = -60.f;
+
+	return BigWorldAttenuation;
+}
+
 ATraceAudioRelay* UTraceAudioSubsystem::GetRelay()
 {
 	if (IsValid(Relay))
@@ -265,6 +365,17 @@ UAudioComponent* UTraceAudioSubsystem::PlayLocalNow(FName Event)
 {
 	if (!UTraceAudioSettings::Get().bSoundEffectsEnabled)
 	{
+		return nullptr;
+	}
+
+	// DEMO 29 items 9 and 11. Ahead of the device test and the resolve so an unwired event costs
+	// nothing and, more importantly, so PlaysByEvent never counts it: Trace.Audio.EventPlays is the
+	// ledger that answers "did this sound?", and a silent event that appears in it with a count
+	// would be a lie in the one instrument built to catch exactly this class of bug.
+	if (TraceSoundEvents::IsUnwired(Event))
+	{
+		++Tally.RefusedUnwired;
+		TraceAudioLocal::ExplainUnwiredOnce(Event);
 		return nullptr;
 	}
 
@@ -314,6 +425,17 @@ UAudioComponent* UTraceAudioSubsystem::PlayWorldNow(FName Event, const FVector& 
 		return nullptr;
 	}
 
+	// DEMO 29 items 9 and 11, and this is the copy that matters most: every game-side route funnels
+	// through here (Play, PlayAt's multicast body, PlayReplicatedLocal, PlayPredictedLocal), so one
+	// test covers all four and a machine RECEIVING a multicast for an unwired event stays silent
+	// even when the sender is an older build that still broadcasts it.
+	if (TraceSoundEvents::IsUnwired(Event))
+	{
+		++Tally.RefusedUnwired;
+		TraceAudioLocal::ExplainUnwiredOnce(Event);
+		return nullptr;
+	}
+
 	UWorld* World = GetWorld();
 	if (World == nullptr)
 	{
@@ -335,9 +457,15 @@ UAudioComponent* UTraceAudioSubsystem::PlayWorldNow(FName Event, const FVector& 
 		return nullptr;
 	}
 
+	// FX_AUDIO_PLAN §1.6.5: the shape is chosen from the EVENT, here, once — not by the call site and
+	// not by a parameter. Every game-side route (Play, PlayAt, the relay's multicast,
+	// PlayReplicatedLocal, PlayPredictedLocal) funnels through this function, so the three big events
+	// carry their reach whichever door they came in by.
+	USoundAttenuation* const Shape = IsBigWorldEvent(Event) ? GetBigWorldAttenuation() : GetWorldAttenuation();
+
 	UAudioComponent* Component = UGameplayStatics::SpawnSoundAtLocation(World, Sound, WorldLocation,
 		FRotator::ZeroRotator, VolumeFor(Event), /*PitchMultiplier=*/1.f, /*StartTime=*/0.f,
-		GetWorldAttenuation(), /*ConcurrencySettings=*/nullptr, /*bAutoDestroy=*/true);
+		Shape, /*ConcurrencySettings=*/nullptr, /*bAutoDestroy=*/true);
 
 	++Tally.WorldPlays;
 	++PlaysByEvent.FindOrAdd(Event);
@@ -353,6 +481,7 @@ void UTraceAudioSubsystem::ForgetResolvedSounds()
 	Bank = nullptr;
 	bBankResolved = false;
 	WorldAttenuation = nullptr;
+	BigWorldAttenuation = nullptr;   // rebuilt on next use, so Trace.Audio.Reload picks up retuned radii
 }
 
 // =================================================================================================
@@ -397,6 +526,16 @@ namespace TraceAudio
 		UTraceAudioSubsystem* Audio = UTraceAudioSubsystem::Get(WorldContext);
 		if (Audio == nullptr)
 		{
+			return;
+		}
+
+		// DEMO 29 items 9 and 11. PlayWorldNow would refuse this on every machine anyway; catching it
+		// HERE, on the authority, is what stops the multicast being SENT — twenty-nine unreliable
+		// RPCs per match for DeathBurst alone, to say something no receiver is allowed to play.
+		if (TraceSoundEvents::IsUnwired(Event))
+		{
+			++Audio->Counters().RefusedUnwired;
+			TraceAudioLocal::ExplainUnwiredOnce(Event);
 			return;
 		}
 
@@ -511,5 +650,213 @@ namespace TraceAudio
 		{
 			Audio->PlayLocalNow(Event);
 		}
+	}
+
+	// =============================================================================================
+	// THE FOUR NARROW BYPASSES — FX_AUDIO_PLAN §1.6. See the header for what each one is FOR; the
+	// bodies below are only about being safe when they are called wrongly.
+	// =============================================================================================
+
+	void PlayPredictedLocal(const AActor* Shooter, FName Event, const FVector& Where)
+	{
+		UTraceAudioSubsystem* Audio = UTraceAudioSubsystem::Get(Shooter);
+		if (Audio == nullptr)
+		{
+			return;
+		}
+
+		// THE ONE GUARD, and it is the client-side gate's guard for the client-side gate's reason: a
+		// bot's pawn is "locally controlled" on a listen server, so a plain locality test would give
+		// the host a point-blank copy of every bot's gunshot on top of the multicast it already gets.
+		if (!IsLocalPlayerActor(Shooter))
+		{
+			++Audio->Counters().RefusedNotLocalPlayer;
+			return;
+		}
+
+		// Spatialised, at the muzzle, with no side check: this is deliberately the same PlayWorldNow
+		// the relay's multicast calls, so the predicted copy and everybody else's copy are the same
+		// sound with the same gain and the same attenuation curve. The exclusion (below) is what stops
+		// this machine hearing it twice.
+		Audio->PlayWorldNow(Event, Where);
+	}
+
+	void PlayAtExcluding(const UObject* WorldContext, FName Event, const FVector& Where, APawn* Excluded)
+	{
+		UTraceAudioSubsystem* Audio = UTraceAudioSubsystem::Get(WorldContext);
+		if (Audio == nullptr)
+		{
+			return;
+		}
+
+		if (Excluded == nullptr)
+		{
+			// Not fatal — it is PlayAt with extra steps — but it is always a mistake at a call site
+			// whose whole point is the exclusion, so it says so once and then behaves.
+			static bool bWarnedNullExclusion = false;
+			if (!bWarnedNullExclusion)
+			{
+				bWarnedNullExclusion = true;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Audio] PlayAtExcluding('%s') was given a null Excluded pawn — every machine "
+					     "will play it, including the one that predicted it. Use TraceAudio::PlayAt if "
+					     "that is what you meant."),
+					*Event.ToString());
+			}
+			PlayAt(WorldContext, Event, Where);
+			return;
+		}
+
+		if (TraceSoundEvents::SideOf(Event) != ETraceSoundSide::World)
+		{
+			static bool bWarnedClientEventOnExcludingRoute = false;
+			if (!bWarnedClientEventOnExcludingRoute)
+			{
+				bWarnedClientEventOnExcludingRoute = true;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Audio] TraceAudio::PlayAtExcluding refused '%s': it is declared client-side in "
+					     "Audio/TraceSoundEvents.h, so there is nobody to exclude it FROM."),
+					*Event.ToString());
+			}
+			++Audio->Counters().RefusedNotAuthority;
+			return;
+		}
+
+		UWorld* World = Audio->GetWorld();
+		if (World == nullptr)
+		{
+			return;
+		}
+
+		// Authority only, exactly like PlayAt: a client that reached here forgot its HasAuthority()
+		// test, and the server's multicast is already on its way.
+		if (World->GetNetMode() == NM_Client)
+		{
+			++Audio->Counters().RefusedNotAuthority;
+			return;
+		}
+
+		if (ATraceAudioRelay* Relay = Audio->GetRelay())
+		{
+			++Audio->Counters().MulticastsSent;
+			Relay->MulticastPlaySoundExcluding(Event, FVector_NetQuantize(Where), Excluded);
+			return;
+		}
+
+		// No relay — the Error is already in the log from GetOrSpawn. Standalone still wants the
+		// sound, and standalone is exactly the case where "everyone except the predictor" means
+		// "nobody", so the honest degradation is silence on this machine if the excluded pawn is ours.
+		if (!IsLocalPlayerActor(Excluded))
+		{
+			Audio->PlayWorldNow(Event, Where);
+		}
+	}
+
+	void PlayReplicatedLocal(const UObject* WorldContext, FName Event, const FVector& Where)
+	{
+		UTraceAudioSubsystem* Audio = UTraceAudioSubsystem::Get(WorldContext);
+		if (Audio == nullptr)
+		{
+			return;
+		}
+
+		// A WORLD-side event down this route is a doctrine break rather than a crash: the actor's
+		// replication already put this call on every machine, so whoever ALSO calls Play() on the same
+		// event will multicast it on top and everyone hears it twice. Said once, and then played,
+		// because silence would be a worse way to find out.
+		if (TraceSoundEvents::SideOf(Event) == ETraceSoundSide::World)
+		{
+			static bool bWarnedWorldEventOnReplicatedRoute = false;
+			if (!bWarnedWorldEventOnReplicatedRoute)
+			{
+				bWarnedWorldEventOnReplicatedRoute = true;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Audio] TraceAudio::PlayReplicatedLocal('%s'): that event is declared GAME-side "
+					     "in Audio/TraceSoundEvents.h. Events that ride a replicated actor must be "
+					     "declared client-side (§1.6.3) or a stray Play() will multicast them as well."),
+					*Event.ToString());
+			}
+		}
+
+		// No authority test on purpose: the point of this call is that it runs on the authority AND on
+		// every client, once each, from code they all run.
+		Audio->PlayWorldNow(Event, Where);
+	}
+
+	UAudioComponent* StartLoopOn(USceneComponent* AttachTo, FName Event, float FadeInSeconds)
+	{
+		if (!IsValid(AttachTo))
+		{
+			return nullptr;
+		}
+
+		UTraceAudioSubsystem* Audio = UTraceAudioSubsystem::Get(AttachTo);
+		if (Audio == nullptr)
+		{
+			return nullptr;
+		}
+
+		if (!UTraceAudioSettings::Get().bSoundEffectsEnabled)
+		{
+			return nullptr;
+		}
+
+		// DEMO 29 items 9 and 11. None of the three events unwired TODAY is a loop, so this test
+		// costs one compare and changes nothing — it is here so that "an unwired event cannot be
+		// heard" is a property of the module rather than a property of which three names happen to
+		// be on the list. Returning null is the same answer a dedicated server gets, and every
+		// caller already survives it.
+		if (TraceSoundEvents::IsUnwired(Event))
+		{
+			++Audio->Counters().RefusedUnwired;
+			TraceAudioLocal::ExplainUnwiredOnce(Event);
+			return nullptr;
+		}
+
+		UWorld* World = Audio->GetWorld();
+		if (World == nullptr || World->GetAudioDeviceRaw() == nullptr)
+		{
+			// A dedicated server has no device. Returning null rather than a dead component keeps the
+			// caller's "if (Loop != nullptr) Loop->FadeOut(...)" honest on every machine.
+			return nullptr;
+		}
+
+		USoundBase* Sound = Audio->ResolveSound(Event);
+		if (Sound == nullptr)
+		{
+			return nullptr;
+		}
+
+		const float Volume = Audio->VolumeFor(Event);
+
+		// bAutoDestroy FALSE: the caller owns this one. A looping component that destroyed itself
+		// would leave the caller holding a dangling pointer at exactly the moment it wants to fade it
+		// out. bStopWhenAttachedToDestroyed TRUE so a loop can never outlive the pawn it hangs on —
+		// the corpse case the §1.2 router's detach rule is also about.
+		UAudioComponent* Loop = UGameplayStatics::SpawnSoundAttached(Sound, AttachTo, NAME_None,
+			FVector::ZeroVector, EAttachLocation::KeepRelativeOffset,
+			/*bStopWhenAttachedToDestroyed=*/true, Volume, /*PitchMultiplier=*/1.f, /*StartTime=*/0.f,
+			Audio->GetWorldAttenuation(), /*ConcurrencySettings=*/nullptr, /*bAutoDestroy=*/false);
+
+		if (Loop == nullptr)
+		{
+			++Audio->Counters().NoAudioDevice;
+			return nullptr;
+		}
+
+		if (FadeInSeconds > 0.f)
+		{
+			// FadeIn re-starts the sound from the top with a volume ramp; it has been playing for a
+			// fraction of a millisecond at this point, so there is nothing to hear in the restart, and
+			// the ramp is what stops a state that switches on during a fight from clicking.
+			Loop->FadeIn(FadeInSeconds, /*FadeVolumeLevel=*/1.f);
+		}
+
+		// Counted like every other play that reached the engine, so Trace.Audio.Report and
+		// Trace.Audio.Integ see loops as well as one-shots.
+		Audio->CountAttachedPlay(Event);
+		UE_LOG(LogTraceGame, Verbose, TEXT("[Audio] loop '%s' attached to %s (gain %.3f, fade %.2fs)."),
+			*Event.ToString(), *GetNameSafe(AttachTo->GetOwner()), Volume, FadeInSeconds);
+		return Loop;
 	}
 }

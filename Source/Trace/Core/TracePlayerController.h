@@ -32,6 +32,7 @@
 
 #pragma once
 
+#include "Camera/CameraModifier.h"       // UTraceViewKickModifier, the §1.5 view kick's carrier
 #include "CoreMinimal.h"
 #include "Delegates/IDelegateInstance.h"  // FDelegateHandle
 #include "Engine/EngineTypes.h"          // EEndPlayReason
@@ -47,6 +48,30 @@
 enum class ETraceEquippedWeapon : uint8;
 
 #include "TracePlayerController.generated.h"
+
+/**
+ * FX_AUDIO_PLAN §1.5 — the four view kicks, and there are deliberately only four.
+ *
+ * A kick is the VICTIM's feedback for something that happened TO them: it is sent by the server to
+ * one player, it never leaves the camera, and it never means "you did something". The values live in
+ * ATracePlayerController::KickValuesFor(), one table, so a designer retunes them in one place.
+ *
+ * The enum is the RPC's payload (one byte on the wire) rather than three floats for the ordinary
+ * reason: three floats sent from the server is three chances for a call site to invent its own feel,
+ * and the fifth kick somebody adds would then be untunable from anywhere.
+ */
+UENUM()
+enum class ETraceViewKick : uint8
+{
+	/** Chut's bash landed on you. 3.5 deg / 0.25 s / 9 Hz — short, sharp, over before you turn. */
+	BashVictim = 0,
+	/** Mortimer's quake, inside the ring. 4.0 deg / 0.35 s / 7 Hz — the biggest kick in the game. */
+	QuakeNear = 1,
+	/** Mortimer's quake, outside the ring. 1.5 deg / 0.30 s / 7 Hz — you felt it, you were not in it. */
+	QuakeFar = 2,
+	/** Your own rocket went off near you. 2.5 deg / 0.30 s / 8 Hz. */
+	RocketSelf = 3,
+};
 
 class APawn;
 class ATraceCharacter;
@@ -153,9 +178,69 @@ public:
 	/**
 	 * Shooter-side hit confirmation, sent by the server once a hitscan resolves.
 	 * Reliable: a dropped hit marker reads as a missed shot, which is worse than a late one.
+	 *
+	 * @param bShieldBlocked C5 (code-gameplay F2). TRUE when the resolve found a victim the damage
+	 *        could not touch — the Core carrier's shield. UTraceHealthComponent::ApplyDamage no-ops
+	 *        for an invulnerable target, so without this the shooter was sent the same white marker
+	 *        for 0 damage as for a real hit: the one piece of feedback in the game that was allowed
+	 *        to lie. The fact is DERIVED at the resolve site from the victim's own
+	 *        IsInvulnerable() — the same query ApplyDamage consults, never a second carrier test.
+	 *
+	 * NO DEFAULT ARGUMENT: UFUNCTION RPCs may not have one, so every call site names all three.
 	 */
 	UFUNCTION(Client, Reliable)
-	void ClientNotifyHit(bool bKilled, ETraceHitZone Zone);
+	void ClientNotifyHit(bool bKilled, ETraceHitZone Zone, bool bShieldBlocked);
+
+	/**
+	 * FX_AUDIO_PLAN §1.5 — SERVER -> VICTIM: shake their view.
+	 *
+	 * Reliable, like its neighbour above and for a related reason: a kick is the only confirmation
+	 * some abilities give the person on the receiving end (Mortimer's far ring does no damage at all),
+	 * and a dropped one reads as an ability that did nothing.
+	 *
+	 * TAKES THE ENUM, NOT A RAW uint8. §1.5 spells the parameter `uint8 KickType`; the enum is one
+	 * byte on the wire just the same and cannot be called with the wrong number. Call it as
+	 * `PC->ClientAbilityKick(ETraceViewKick::QuakeNear)`.
+	 */
+	UFUNCTION(Client, Reliable)
+	void ClientAbilityKick(ETraceViewKick KickType);
+
+	/**
+	 * LOCAL. Starts (or restarts) the view kick on this machine's camera.
+	 *
+	 * @param PitchAmplitudeDeg  peak pitch offset in degrees, at t = 0.
+	 * @param DurationSeconds    total length; the kick is gone, exactly, at the end of it.
+	 * @param NoiseHz            oscillations per second.
+	 *
+	 * THE SHAPE: Pitch(t) = sin(2*PI*NoiseHz*t) * Amplitude * (1 - t/Duration)^2 — a damped
+	 * oscillation that starts at zero, peaks in the first quarter cycle and returns to exactly zero at
+	 * the end rather than being cut off. Squared decay because a linear one still has visible motion
+	 * when it ends.
+	 *
+	 * IT NEVER TOUCHES THE AIM. The offset is applied by a UCameraModifier on the camera manager,
+	 * i.e. to the POV the camera manager hands the renderer, AFTER the pawn's camera has computed it.
+	 * The control rotation — which is what ATraceCharacter::GetAimDirection samples, what the shot ray
+	 * is built from and what the server validates against — is not written to at any point. This is
+	 * the viewmodel-kick contract (ATraceCharacter::ViewModelKick), not the gun-recoil contract
+	 * (UTraceWeaponComponent::ApplyRecoilKick, which deliberately DOES move the aim and is off).
+	 *
+	 * A second kick during a first replaces it (the loudest recent event wins) rather than summing:
+	 * two quakes 50 ms apart must not stack into a 8 degree lurch.
+	 */
+	void AddViewKick(float PitchAmplitudeDeg, float DurationSeconds, float NoiseHz);
+
+	/**
+	 * The kick's pitch offset in degrees RIGHT NOW, or 0 when none is running.
+	 *
+	 * Read by UTraceViewKickModifier every frame the camera updates, and by the dev harness. Pure: it
+	 * is a function of the clock and the three stored values, so nothing has to tick to keep it right
+	 * and a paused world holds still.
+	 */
+	float GetViewKickPitchOffset() const;
+
+	/** The kick table (§1.5): amplitude in degrees, duration in seconds, frequency in Hz. */
+	static void KickValuesFor(ETraceViewKick KickType, float& OutAmplitudeDeg, float& OutDurationSeconds,
+	                          float& OutNoiseHz);
 
 	/** Which zone the last confirmed hit landed on. Drives the hitmarker's colour and shape. */
 	ETraceHitZone GetLastHitMarkerZone() const { return LastHitMarkerZone; }
@@ -212,6 +297,17 @@ public:
 
 	/** True if the last confirmed hit was a kill — the HUD draws that marker differently. */
 	bool WasLastHitMarkerAKill() const { return bLastHitMarkerWasKill; }
+
+	/**
+	 * C5 / ART_BIBLE §2.4 last row. True if the last confirmed hit was stopped by the Core carrier's
+	 * shield and therefore dealt nothing.
+	 *
+	 * The HUD's contract (FX plan §7.4, wave 4): draw the blocked marker in shield white
+	 * (0.90, 0.95, 1.00) with a different shape from the damage marker, and swap the hit sound for
+	 * ShieldBlock. It is read alongside GetLastHitMarkerTime(), so it means "…about the hit that
+	 * timestamp is about" and nothing else; it is cleared by the next unblocked hit.
+	 */
+	bool WasLastHitMarkerShieldBlocked() const { return bLastHitMarkerWasShieldBlocked; }
 
 	/** True while the scoreboard key is held. */
 	bool IsScoreboardOpen() const { return bScoreboardOpen; }
@@ -301,6 +397,13 @@ public:
 	int32 DebugPullPressCount = 0;
 	/** Bumped by ClientNotifyHit — a server-confirmed hitscan resolution credited to us. */
 	int32 DebugHitConfirmCount = 0;
+
+	/**
+	 * C5. Bumped by ClientNotifyHit when the confirmed hit was stopped by the carrier's shield.
+	 * DebugHitConfirmCount still counts it — it WAS a confirmed resolve — so the two together read
+	 * as "N hits, of which M did nothing", which is what the harness asserts on.
+	 */
+	int32 DebugShieldBlockedHitCount = 0;
 
 	/**
 	 * Spec v13 §2. Bumped on the FIRST LINE of the weapon handler, before any gate, so it counts
@@ -652,6 +755,21 @@ protected:
 	 */
 	void ApplyGameInputMode();
 
+	/**
+	 * UI PLAN WP2.4 — pushes the player's stored CALL SIGN at the server, once, on the owning client.
+	 *
+	 * Until this existed no human ever got a name: only bots called SetPlayerName, so every human
+	 * scoreboard row read `Mac-3249D6BCCE489DF8`. It goes through the engine's own rename path
+	 * (APlayerController::ServerChangeName -> AGameModeBase::ChangeName -> the replicated
+	 * APlayerState::SetPlayerName), NOT a local SetPlayerName, because the point is that the name
+	 * reaches every machine and not just the one that typed it.
+	 *
+	 * RETRIES, because PlayerState is null in BeginPlay on a client that has not been welcomed yet —
+	 * exactly the machine the whole feature is about. A no-op when the stored name already matches,
+	 * so a respawn or a travel does not send a rename per pawn.
+	 */
+	void ApplyStoredCallSign(int32 AttemptsLeft);
+
 	// ---- Input handlers -----------------------------------------------------------------------
 	void OnMoveInput(const FInputActionValue& Value);
 	void OnLookInput(const FInputActionValue& Value);
@@ -836,6 +954,8 @@ private:
 
 	float LastHitMarkerTime = NeverHitSentinel;
 	bool bLastHitMarkerWasKill = false;
+	/** C5. Written by every ClientNotifyHit, so it always describes the hit LastHitMarkerTime dates. */
+	bool bLastHitMarkerWasShieldBlocked = false;
 	ETraceHitZone LastHitMarkerZone = ETraceHitZone::None;
 
 	bool bScoreboardOpen = false;
@@ -863,6 +983,55 @@ private:
 	/** Registration with UTraceUserSettings::OnChanged, released in EndPlay. */
 	FDelegateHandle SettingsChangedHandle;
 
+	/** WP2.4. Retry timer for the call-sign push while the client is still waiting for a PlayerState. */
+	FTimerHandle CallSignRetryHandle;
+
 	/** Server-side: world time of the last respawn request we acted on. */
 	float LastRespawnRequestTime = NeverHitSentinel;
+
+	// -----------------------------------------------------------------------------------------
+	// VIEW KICK (FX_AUDIO_PLAN §1.5) — three numbers and a start time, all local to this machine.
+	// -----------------------------------------------------------------------------------------
+
+	/** Peak degrees of the running kick. 0 = nothing running, which is the common case. */
+	float ViewKickAmplitudeDeg = 0.f;
+
+	/** Total length of the running kick, in seconds. */
+	float ViewKickDurationSeconds = 0.f;
+
+	/** Oscillations per second of the running kick. */
+	float ViewKickNoiseHz = 0.f;
+
+	/**
+	 * UNPAUSED WORLD TIME the kick started at.
+	 *
+	 * World time rather than FPlatformTime so a paused or dilated world holds the kick still instead
+	 * of running it out behind a menu — the same clock choice the rest of this file's timers make.
+	 */
+	float ViewKickStartTime = NeverHitSentinel;
+
+	/** The camera-manager modifier that applies the offset. Created lazily on the first kick. */
+	UPROPERTY(Transient)
+	TObjectPtr<class UTraceViewKickModifier> ViewKickModifier = nullptr;
+};
+
+/**
+ * FX_AUDIO_PLAN §1.5 — the one-line camera modifier the kick rides on.
+ *
+ * WHY A MODIFIER AND NOT A CONTROL-ROTATION OFFSET: the camera manager applies modifiers to the POV
+ * *after* the view target has produced it (APlayerCameraManager::DoUpdateCamera ->
+ * ApplyCameraModifiers), so this moves the rendered view and nothing else. Writing the same offset
+ * into the control rotation would move the crosshair, the aim ray and the server's validation with
+ * it — which is gun recoil, a mechanic spec v25 §5 deliberately removed.
+ *
+ * It holds no state: it asks its owning controller for the offset each frame, so a kick that is
+ * cancelled, replaced or expired needs no bookkeeping here.
+ */
+UCLASS(NotBlueprintable)
+class TRACE_API UTraceViewKickModifier : public UCameraModifier
+{
+	GENERATED_BODY()
+
+public:
+	virtual bool ModifyCamera(float DeltaTime, FMinimalViewInfo& InOutPOV) override;
 };

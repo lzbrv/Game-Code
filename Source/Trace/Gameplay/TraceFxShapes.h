@@ -31,7 +31,7 @@ enum class ETraceFxBlend : uint8
 	None = 0,
 
 	/**
-	 * /Game/Generated/Materials/M_TraceNeon — unlit, OPAQUE, EmissiveColor = Color * Glow.
+	 * /Game/Trace/Materials/Parents/M_TraceNeon — unlit, OPAQUE, EmissiveColor = Color * Glow.
 	 * "Color" is a plain 0..1 hue and "Glow" is the multiplier that pushes it past the arena's
 	 * bloom threshold. This is the project's own material and the only one that can be pushed far
 	 * past white, so it is what every hot core is made of.

@@ -76,6 +76,37 @@ public:
 	/** Human-readable reason the UMG corner was not adopted, or empty while it is in use. */
 	const FString& GetCornerFallbackReason() const { return CornerFallbackReason; }
 
+	/**
+	 * THE REFUSAL TOAST (release FX/AUDIO plan §7.1, closes F3). One chip directly above the
+	 * bottom-left ability row, for @p Seconds, fading out over the last 0.3 s.
+	 *
+	 * *** ONE SLOT, AND A NEW TOAST REPLACES THE OLD. *** A player mashing a cooling key produces a
+	 * refusal per press; a stack would fill the corner with the same sentence written six times, and
+	 * a queue would show them a message about a press they made two seconds ago. The newest refusal
+	 * is the only one that describes the world they are in now.
+	 *
+	 * Called from the OWNING PLAYER'S machine only — UTraceAbilityComponent::TryActivate's three
+	 * refusal arms and the V-cooldown arm (see TraceAbilityToast there, which does the filtering).
+	 * This function does not re-check that: it draws what it is told, on the HUD it was called on,
+	 * and a HUD only exists on a machine with a screen.
+	 *
+	 * IT ALSO OWNS THE SOUND. UIDeny plays here, rate-limited to one per 0.5 s, so a held key cannot
+	 * machine-gun it and so there is exactly one rate limiter rather than one per producer.
+	 */
+	void ShowAbilityToast(const FText& Text, const FLinearColor& Tint, float Seconds = 1.6f);
+
+	/**
+	 * The player's OWN binding for the input action with config id @p ConfigId, upper case, or
+	 * @p Fallback when the input slice has no such action or nothing is bound.
+	 *
+	 * Static and public because the refusal toast is worded in Abilities/ and has to print the same
+	 * key the ability row prints. Three call sites had the identical lookup loop copied out before
+	 * this existed (the ability row's "[E]", the ammo block's "[R] RELOAD", and the toast); a
+	 * hardcoded key is a HUD that lies to the first player who rebinds it, and three copies of the
+	 * lookup is three places to forget.
+	 */
+	static FString ActionKeyLabel(const TCHAR* ConfigId, const TCHAR* Fallback);
+
 #if !UE_BUILD_SHIPPING
 	/**
 	 * Spec v16 §2 — prints WHAT THE LAST DRAWN FRAME ACTUALLY CONTAINED, for Trace.HUD.V16.Report
@@ -106,6 +137,28 @@ public:
 		bool  bChargeBar = false;
 	};
 	FV16DrawRecord GetV16DrawRecord() const;
+
+	/**
+	 * The FX/AUDIO plan §7 half of the draw record, for Trace.HUD.FxHudShots.
+	 *
+	 * Separate from FV16DrawRecord rather than bolted onto it: that struct is spec v16 §2's contract
+	 * with a harness that predates this pass, and widening it would silently change what every
+	 * existing assertion in TraceHUDV16Shots is reading.
+	 */
+	struct FFxHudDrawRecord
+	{
+		bool  bHitMarker = false;
+		bool  bShieldBlockedMarker = false;
+		FString ToastText;
+		FString SecondaryRowText;
+		FString Vignettes;
+		FString ChipText;
+		int32 ChipCount = 0;
+	};
+	FFxHudDrawRecord GetFxHudDrawRecord() const;
+
+	/** Prints the record above with @p Tag, so a screenshot and a line of log are the same event. */
+	void LogFxHudDrawRecord(const TCHAR* Tag) const;
 #endif
 
 protected:
@@ -206,6 +259,30 @@ protected:
 	void DrawHitMarker();
 
 	/**
+	 * OWNER-ONLY SCREEN-EDGE TINTS (FX/AUDIO plan §2.5 and §2.6; bible §6.4).
+	 *
+	 * Two states are invisible to the player they are happening to unless the screen says so: Elle's
+	 * cloak (which changes nothing about her own view) and Oyster's poison (whose cloud is behind
+	 * you the moment you run out of it). Both get a band around the frame edge, in the effect's own
+	 * hue, at the alpha the bible fixes — 0.10 for the cloak, 0.18 for the poison.
+	 *
+	 * A BAND, NOT A FULL-SCREEN WASH, and the alphas are ceilings rather than suggestions: this is
+	 * the one HUD element drawn over the whole play area, and a tint heavy enough to be pretty is a
+	 * tint heavy enough to hide an enemy against a wall.
+	 */
+	void DrawOwnerVignettes();
+
+	/**
+	 * One vignette band: @p Hue fading from @p PeakAlpha at the frame edge to nothing inboard.
+	 *
+	 * Drawn as concentric single-colour frames because this HUD has no material and no gradient
+	 * primitive — Canvas gives it DrawRect and nothing else. The step count is chosen so the ramp
+	 * reads as smooth at 1080p and costs four rects per step; a real gradient would be a material,
+	 * and a material would be an asset, and FX §0 keeps this pass asset-free.
+	 */
+	void DrawScreenEdgeVignette(const FLinearColor& Hue, float PeakAlpha);
+
+	/**
 	 * Health, the EQUIPPED WEAPON, dash CHARGES and the parry cooldown: the bottom-left ability
 	 * stack. (Boost is gone.)
 	 *
@@ -232,6 +309,42 @@ protected:
 	 * @param RowY  top of the row to draw at.
 	 */
 	float DrawAbilityRow(float RowY, float Margin, float BarW, float RowH, float LabelW, const FLinearColor& TeamTint);
+
+	/**
+	 * FX/AUDIO plan §7.2 (closes F2) — the V row: a HALF-HEIGHT row UNDER the E row, drawn only for
+	 * a character whose ability set overrides GetSecondaryCooldownDisplay().
+	 *
+	 * *** UNDER, WHICH MEANS IT IS DRAWN FIRST AND THE E ROW MOVES UP. *** The bottom-left stack
+	 * grows upward from the health bar, so "under the E row" is the slot the E row was going to use.
+	 * The rows BELOW (weapon, dash, slide) were already drawn and never move — which is the stack's
+	 * standing rule: only the top of the stack is allowed to shuffle.
+	 *
+	 * @param RowY  top of the half-height row. @return the Y the E row should now draw at.
+	 */
+	float DrawSecondaryCooldownRow(float RowY, float Margin, float BarW, float RowH, float LabelW,
+		const FLinearColor& Accent);
+
+	/**
+	 * True when DrawSecondaryCooldownRow() will draw this frame.
+	 *
+	 * @param OutRowH     the half-height row's own height.
+	 * @param OutAdvance  how far up the stack cursor moves past it — MEASURED off the font, not
+	 *                    derived from the row box. The first capture of this row photographed the V
+	 *                    caption printed through the E caption: both are FontSmall, and a text line
+	 *                    is TALLER than a 6 px meter, so spacing the rows by their boxes overlapped
+	 *                    their words. Every other consumer of a width on this HUD measures rather
+	 *                    than assumes (see the label-gutter note in DrawHealthAndDash); this is the
+	 *                    same rule applied to a height.
+	 *
+	 * Not const because measuring text is not: it goes through the atlas.
+	 */
+	bool IsSecondaryRowUp(float& OutRowH, float& OutAdvance, float RowH);
+
+	/**
+	 * The §7.1 refusal toast's draw pass. @p TopY is the top of the ability block, i.e. the Y
+	 * DrawAbilityRow() returned, so the chip sits directly above the row the refusal was about.
+	 */
+	void DrawAbilityToast(float TopY, float Margin, float RowH);
 
 	/**
 	 * The health bar itself, split out of DrawHealthAndDash() because regeneration (spec v13 §1)
@@ -355,8 +468,14 @@ protected:
 	 *
 	 * "HOSTING — 100.101.102.103:7777" is a headline feature of spec v5 §0, not chrome. The reported
 	 * bug was two machines each running a private match and nobody able to tell whether their setup
-	 * worked; a host who can read their own address off their own screen, mid-match, while somebody
-	 * asks them for it over voice, is the affordance that makes the rest of this usable.
+	 * worked; a host who can read their own address off their own screen, while somebody asks them
+	 * for it over voice, is the affordance that makes the rest of this usable.
+	 *
+	 * NO LONGER PINNED TO EVERY FRAME (visual audit §4.1: "raw IPs" in all match footage). The
+	 * panel now draws only while Tab holds the scoreboard, for a few seconds after the connection
+	 * answer changes, or when the state is a warning (the failed-bind shout, which must never be
+	 * hidden). The connection LOGIC and the human-count change log run every frame regardless —
+	 * the log is load-bearing for two-machine triage and does not care whether the panel is up.
 	 *
 	 * It reads the world's ACTUAL net mode, never what the menu intended — so a listen server whose
 	 * bind failed says OFFLINE rather than repeating a promise the process did not keep.
@@ -382,17 +501,20 @@ protected:
 	 * arrangement of this HUD in which the host has a feed and a client does not. See TraceKillFeed.h.
 	 *
 	 * Drawn AFTER DrawNetworkStatus() so it can hang off the bottom of the "HOSTING — <address>"
-	 * panel that already owns the top-right corner (that panel publishes KillFeedTopY).
+	 * panel that shares the top-right corner (that panel publishes KillFeedTopY on the frames it
+	 * draws; since WP8.4 gated it, most match frames leave the feed at the top-panel line).
 	 */
 	void DrawKillFeed();
 
 	/**
-	 * One kill-feed glyph, drawn from a 13x13 bitmap at @p Cell pixels per cell, top-left at @p X,@p Y.
+	 * One kill-feed glyph, stroke-drawn into the box whose top-left is @p X,@p Y and whose side is
+	 * @p Cell * 13 px (the legacy bitmap-grid box — the layout math in DrawKillFeed() is unchanged).
 	 *
-	 * NO IMPORTED ART AND NO UMG (contract §2 / spec v8 §6): every icon is an ASCII bitmap in the
-	 * .cpp, emitted as run-length integer DrawRects with a one-pixel dark surround. Integer cells
-	 * for the same reason the crosshair uses them — a fractional-width rect on a half-pixel boundary
-	 * is anti-aliased into a smudge, and these are 26 px tall shapes that have to read at a glance.
+	 * NO IMPORTED ART AND NO UMG (contract §2 / spec v8 §6): every icon is a table of line strokes
+	 * (plus DrawRect dots) authored in a 22x22 design box in the .cpp, scaled into the pixel box and
+	 * drawn at the HUD's own stroke weight — 2 px at the 26 px 1080p icon, floored at 1.5 px — over
+	 * a darker, thicker surround pass so the glyph survives crossing lit neon (bible §7.3: upgrade
+	 * the glyph language to strokes, don't embrace the bitmaps).
 	 */
 	void DrawKillIcon(ETraceKillIcon Icon, float X, float Y, float Cell, const FLinearColor& Color);
 
@@ -426,6 +548,15 @@ protected:
 	void DrawDeathPanel();
 	void DrawMatchResult();
 	void DrawScoreboard();
+
+	/**
+	 * True while the local player is holding the scoreboard open (Tab).
+	 *
+	 * THE one answer to that question on this HUD: DrawScoreboard() draws on it, and
+	 * DrawNetworkStatus() uses it as a reveal gate — extracting it keeps the two passes from
+	 * ever disagreeing about whether the board is up.
+	 */
+	bool IsScoreboardHeld() const;
 
 	/** Draws one team's column of the scoreboard. Returns the height consumed, in pixels. */
 	float DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Width);
@@ -658,6 +789,19 @@ private:
 	 */
 	int32 LastLoggedHumanCount = -1;
 
+	/**
+	 * The network panel's last answer (role|headline|detail, human count included), and when it
+	 * changed.
+	 *
+	 * The HOSTING panel is no longer pinned to the screen for the whole match (a raw IP burned
+	 * into every frame was the visual audit's §4.1 complaint): it draws while the scoreboard is
+	 * held, for RevealSeconds after this answer changes (match start, a player joining, a role
+	 * flip), and always for a warning state. Empty string means "no answer seen yet", which
+	 * counts as a change so the first frames of a match still introduce the address.
+	 */
+	FString LastConnectionAnswer;
+	float LastRoleChangeTime = -1000.f;
+
 	// ---- Kill feed (spec v8 §6) ----------------------------------------------------------------
 
 	/**
@@ -676,11 +820,10 @@ private:
 	float LastKillFeedRelayPollTime = -1000.f;
 
 	/**
-	 * Y the kill feed may start at, published by DrawNetworkStatus() each frame.
-	 *
-	 * The network panel and the feed both want the top-right corner, and the panel's height depends
-	 * on its text (an address, a human count) — so the feed cannot hardcode a clearance. Set every
-	 * frame before the feed draws; defaults to the top margin when the panel drew nothing.
+	 * Y the kill feed may start at. Reset to the top-panel line by DrawHUD every frame, and pushed
+	 * down by DrawNetworkStatus() on the frames its panel actually draws (the panel is gated —
+	 * see DrawNetworkStatus). The panel's height depends on its text (an address, a human count),
+	 * so the feed cannot hardcode a clearance; on panel-less frames the feed rides at the default.
 	 */
 	float KillFeedTopY = 0.f;
 
@@ -717,6 +860,68 @@ private:
 	ETraceMatchState LastSeenMatchState = ETraceMatchState::WaitingForPlayers;
 	bool bMatchStateCacheValid = false;
 
+	// ---- FX/AUDIO plan §7.1 — the refusal toast's one slot -------------------------------------
+
+	/** What the toast says. Empty means no toast has ever been raised on this HUD. */
+	FText ToastText;
+
+	/** The chip's hairline and text tint: dim ink for "not yet", danger red for "no". */
+	FLinearColor ToastTint = FLinearColor::White;
+
+	/** Client-local time ShowAbilityToast() was last called, and for how long it asked to stay up. */
+	float ToastStartTime = -1000.f;
+	float ToastSeconds = 0.f;
+
+	/**
+	 * Client-local time UIDeny last played for a toast. THE ONE RATE LIMITER for the whole feature.
+	 *
+	 * A held ability key produces a refusal every frame it is down. The chip replacing itself is
+	 * free (it is the same pixels), but the sound is not — unlimited it becomes a buzz, which is how
+	 * a piece of feedback turns into a thing players mute the game to escape.
+	 */
+	float LastToastSoundTime = -1000.f;
+
+	// ---- FX/AUDIO plan §7.2 — the V row's ready flash ------------------------------------------
+
+	/**
+	 * Client-local time the V cooldown was last observed crossing from cooling to ready, so the row
+	 * can flash once. A RISING EDGE, not a state: the row is greyed for thirty-five seconds and the
+	 * one moment worth an animation is the instant it stops being.
+	 */
+	float SecondaryReadyFlashTime = -1000.f;
+
+	/** Whether the V cooldown was cooling on the previous drawn frame. Feeds the edge above. */
+	bool bSecondaryWasCooling = false;
+
+	// ---- FX/AUDIO plan §7.4 — the shield-blocked marker's sound --------------------------------
+
+	/**
+	 * The hit-marker timestamp the ShieldBlock sound was last played for.
+	 *
+	 * The marker is drawn from a TIME plus a flag, so "a new blocked hit arrived" is that timestamp
+	 * changing — there is no event to bind to. Stored rather than recomputed because DrawHitMarker
+	 * runs every frame for the whole 0.25 s the marker is up, and a sound per frame is a buzz.
+	 */
+	float LastShieldBlockSoundMarkerTime = -1000.f;
+
+	// ---- FX/AUDIO plan §5.7 — the match-end stinger --------------------------------------------
+
+	/** True once the full-time stinger has played on this HUD. One per match, never per frame. */
+	bool bMatchEndStingerPlayed = false;
+
+	/**
+	 * WHEN THE MENU BED COMES BACK UP UNDER THE RESULTS SCREEN — world REAL time, so a pause cannot
+	 * strand it. Negative = the match has not ended on this HUD yet.
+	 *
+	 * The results screen is 14 s long (TraceMatchFlow::PostMatchDuration) and the stinger is under
+	 * three of them, so bringing the bed back only at the title screen left 11-14 s in which the only
+	 * audio was whatever the surviving bots happened to walk on. See DrawMatchResult.
+	 */
+	float MatchEndBedResumeRealTime = -1.f;
+
+	/** True once the results-screen bed has been asked for. Pairs with the timestamp above. */
+	bool bMatchEndBedResumed = false;
+
 #if !UE_BUILD_SHIPPING
 	// ---- Spec v16 §2 draw record ----------------------------------------------------------------
 	//
@@ -741,5 +946,25 @@ private:
 	float DrawnChargeRingAlpha = -1.f;
 	int32 DrawnChargeRingSegments = 0;  // filled chords emitted; 0 with a positive alpha is a lie
 	bool  bDrewChargeBar = false;       // the SUPERSEDED bottom-left row. Must be false when armed.
+
+	// ---- FX/AUDIO plan §7 draw record -----------------------------------------------------------
+	//
+	// Same rule as the block above and for the same reason: every field is written where the pixels
+	// are emitted, never from the state that fed the pass. Trace.HUD.FxHudShots asserts on these.
+
+	/** §7.4 — a hit marker of EITHER kind was emitted this frame. */
+	bool bDrewHitMarker = false;
+
+	/** §7.4 — the BLOCKED marker (the "+") was what DrawHitMarker actually emitted this frame. */
+	bool bDrewShieldBlockedMarker = false;
+
+	/** §7.1 — the toast chip's text as drawn, empty on a frame with no toast up. */
+	FString DrawnToastText;
+
+	/** §7.2 — the V row's caption as drawn ("ROCKET  12.4"), empty when the row did not draw. */
+	FString DrawnSecondaryRowText;
+
+	/** §2.5/§2.6 — the owner vignettes actually emitted, e.g. "CLOAK a=0.10". */
+	TArray<FString> DrawnVignettes;
 #endif
 };

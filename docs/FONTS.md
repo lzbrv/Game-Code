@@ -17,9 +17,12 @@ Text is drawn from a **bitmap glyph atlas** — a texture of every letter plus a
 metrics file — by two renderers in `Source/Trace/UI/Text/`: a Canvas blitter and
 a UMG widget. Neither constructs an `FSlateFontInfo`, deliberately (see below).
 
-**The font files are NOT in this repository and must never be committed.** They
-are gitignored. To work on the UI, put your own licensed copies in `Art/Fonts/`
-and run:
+**The licensed font FILES (Sofachrome, Erbaum) are not in this repository and must never be
+committed** — they are gitignored (`Art/Fonts/*.otf` / `*.ttf`, with an exception only for
+SIL-OFL Lato). The **baked glyph atlases** (`T_FontAtlas*` under `Content/Trace/UI/Fonts/`) ARE
+committed, and whether the Sofachrome EULA permits redistributing rasterised atlases is an
+owner-level verification task, tracked separately — typography is frozen meanwhile. To work on
+the UI, put your own licensed copies in `Art/Fonts/` and run:
 
     python3 Scripts/generate_font_atlas.py --font "Art/Fonts/Sofachrome W05 ExtraLight.ttf" --name T_FontAtlas --preview
     python3 Scripts/generate_font_atlas.py --font "Art/Fonts/Sofachrome Rg.otf"            --name T_FontAtlasBold

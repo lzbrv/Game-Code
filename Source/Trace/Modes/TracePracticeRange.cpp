@@ -564,9 +564,15 @@ void UTracePracticeRangeSubsystem::BuildRange()
 	// ---- *** THE CORE STARTS ON THE RACK — DEMO 19 ITEM 3 *** -------------------------------------
 	//
 	// MEASURED, not anticipated. Saved/Logs/v22range-knife-red.log: the range's ordinary start-of-half
-	// kickoff (ATraceGameMode::BeginHalf -> GrantCoreToTeam -> KickoffTo(Blue)) hands the Core to Blue
-	// — and in a solo practice session the player IS Blue, so they are handed the Core about nine
-	// seconds in and never put it down. A CARRIER CANNOT DRAW THE KNIFE AND CANNOT SWING IT
+	// kickoff handed the Core to Blue — and in a solo practice session the player IS Blue, so they
+	// were handed the Core about nine seconds in and never put it down.
+	//
+	// (THE ROUTE IN THAT MEASUREMENT NO LONGER EXISTS, AND THE PROBLEM DOES. It was
+	// ATraceGameMode::BeginHalf -> GrantCoreToTeam -> KickoffTo(Blue); DEMO 29 §3 replaced it with
+	// BeginHalf -> KickoffCoreForHalf -> ATraceCore::KickoffContested, which puts the Core LOOSE on
+	// the centre octagon and grants it to nobody. A range player who walks over it still picks it up,
+	// and KeepCoreParked() below still takes it back — that poll watches the Core's STATE, not the
+	// call that changed it, which is why it needed no edit for either behaviour.) A CARRIER CANNOT DRAW THE KNIFE AND CANNOT SWING IT
 	// (UTraceWeaponComponent::RequestEquip and CanSwing both refuse with ETraceMeleeRefusal::Carrying,
 	// silently), and cannot fire the gun either. That is the whole of "knife backstabs don't work" as
 	// seen from the practice range: the knife never comes out at all.
@@ -973,10 +979,17 @@ void UTracePracticeRangeSubsystem::KeepCoreParked()
 	// MEASURED RED, not anticipated. Trace.Practice.Verify failed here with the Core racked and then
 	// gone: Saved/Logs/practice-verify-range.log shows "[Practice] ... racked the Core" at t=16.5 s,
 	// then "Core: kickoff queued for Blue in 1.0s" / "Kickoff: the Core goes to Blue." at t=17.7 s,
-	// and four seconds later the Core was in a player's hands 15864 uu away. The source is
-	// ATraceGameMode::BeginHalf -> GrantCoreToTeam -> ATraceCore::KickoffTo(Blue) — the ordinary
-	// start-of-half kickoff, which is entirely correct for a match and simply does not know that in
-	// here the Core was put down on purpose.
+	// and four seconds later the Core was in a player's hands 15864 uu away. The source was the
+	// ordinary start-of-half kickoff, which is entirely correct for a match and simply does not know
+	// that in here the Core was put down on purpose.
+	//
+	// SINCE DEMO 29 §3 THAT KICKOFF PLACES RATHER THAN GRANTS — BeginHalf -> KickoffCoreForHalf ->
+	// ATraceCore::KickoffContested leaves the Core LOOSE on the centre octagon with no holder — so
+	// the two log lines quoted above are no longer what a half start prints. Both arms below still
+	// catch it: the held arm covers a range player who walks onto the loose Core, and the drift arm
+	// covers the placement itself, which moves the Core off the rack whether or not anybody takes it.
+	// The rack therefore holds against the new restart for the same reason it held against the old
+	// one — it watches where the Core IS.
 	//
 	// This version therefore RE-PARKS instead of surrendering. It is not a fork of the kickoff rule:
 	// KickoffTo(None) is the same shipped call HandleCoreRack makes, and parking clears

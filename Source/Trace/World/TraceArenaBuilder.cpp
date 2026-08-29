@@ -34,6 +34,7 @@
 #include "Engine/World.h"
 #include "GameFramework/Character.h"                   // Trace.Arena.CoveWalk steers the local pawn
 #include "GameFramework/CharacterMovementComponent.h"   // Trace.Arena.WallStick reads wish vs actual velocity
+#include "Movement/TraceCharacterMovementComponent.h"   // Patch 28 §5 - the surf slope band the rails are cut from
 #include "GameFramework/PlayerController.h"             // Trace.Arena.CoveWalk / Trace.Arena.Pose
 #include "EngineUtils.h"                       // TActorIterator
 #include "Materials/MaterialInstanceDynamic.h"
@@ -127,12 +128,101 @@ namespace TraceArenaConstants
 	static constexpr float PatchThickness = 8.f;
 	static constexpr float GoalLineZ = 7.f;
 	static constexpr float GoalLineThickness = 14.f;
-	static constexpr float GoalLineWidth = 44.f;
+
+	// --- The endzone floor's own value band ------------------------------------------------------
+	//
+	// THE THREE LARGE TEAM-COLOURED FLOOR SURFACES A CHARACTER STANDS ON INSIDE ITS OWN ENDZONE, and
+	// the one number that keeps the character readable on all of them (release overhaul;
+	// W4-CENSUS's T3 finding).
+	//
+	// WHAT WAS WRONG, MEASURED. W4-CENSUS photographed it and named it: "the back team bars ...
+	// collapse inside a team's own endzone, where floor, walls and team panel are the same hue and
+	// the character becomes a yellow smear on a yellow floor", and called it an arena result rather
+	// than a body result. Re-shot here as a deterministic frame - a character held at the centre of
+	// the endzone its own team defends (frames-W5-MAPFINISH/bE_blue_01.png, and the same framing on
+	// the procedural map in p1E_legacy_01.png) - the ground beside the feet measured relative
+	// luminance 0.0399-0.0402 against a character at 0.0565. That is a luminance ratio of 1.4:1, and
+	// a few metres further out the floor measured 0.0867, i.e. BRIGHTER than the figure standing on
+	// it. A silhouette with no value edge against its own ground, at any range.
+	//
+	// WHICH SURFACE IS ACTUALLY UNDERFOOT DEPENDS ON THE SCORING MODE, and getting that wrong is how
+	// a fix like this misses. The arena builds both shapes and presents one:
+	//   * mode A (ENDZONES): `EndzonePatch`, Depth x ZoneWidth, the full-width floor paint.
+	//   * mode B (GOALS, the shipped mode): the endzone paint is tagged EndzoneModePieces and
+	//     HIDDEN. What a player stands on is `GoalMouthPatch` - one Depth-deep lane each side of
+	//     the goal line - and the two `GoalRamp` faces. Measured on the procedural map in GOALS
+	//     mode, the 0.0402 above IS the goal-mouth patch; dimming only the endzone paint changed
+	//     the frame by 0.0002 relL, which is nothing.
+	// So all three move together, or the fix only works in the mode nobody plays.
+	//
+	// WHY THE FLOOR GIVES WAY AND NOT THE CHARACTER. ART_BIBLE §2.2's territory rule requires these
+	// surfaces to wear the defending team's colour, so hue separation is not on the table - value
+	// is. And the floor is the half that should move: it is ground, the character is figure, and
+	// §2.1's albedo band (0.004-0.032) has room BELOW where these sat, while a lit character wearing
+	// the lifted team colour has none above it.
+	//
+	// ONE SCALE, NOT SIX NEW NUMBERS. The three surfaces already sit in a deliberate order - the
+	// goal mouth is the brightest because it is the thing being aimed at, the ramp next, the
+	// full-width paint faintest - and that order is worth keeping. So the authored values stay
+	// exactly as they were and one factor moves all of them, which is also the only form of this
+	// change an owner can re-judge by turning a single dial.
+	//
+	// THE TERRITORY READ IS NOT LOST, IT MOVES ONTO THE LINES. The goal line, the goal sill, the two
+	// goal side rails and the endzone edge rails are neon (GlowGoalLine / GlowGoalFrame), the gate
+	// is 2,600 uu of team-lit structure with its beam and finials, and the end wall carries
+	// EndTrim/EndBand/EndKick/EndRib - none of which change here. A darker floor makes every one of
+	// them read BETTER against it, not worse; V1's "three amber far reads" gate is re-judged on that
+	// basis rather than assumed.
+	//
+	// ROUGHNESS IS DELIBERATELY NOT ONE OF THESE KNOBS. These are floor decals at 0.20-0.30 and
+	// MakeSurfaceMID uses roughness > 0.3 as its test for "this is not the floor, give it the
+	// Fresnel rim". Raising roughness to cut their screen-space reflections would arm a rim term on
+	// surfaces seen at a grazing angle across half the frame, which that function's own comment
+	// documents as a white wash rather than an edge.
+	static constexpr float EndzonePatchBaseDim = 0.020f;   // mode A, the full-width endzone paint
+	static constexpr float EndzonePatchGlow    = 0.100f;
+	static constexpr float GoalMouthBaseDim    = 0.030f;   // mode B, the approach lane on the floor
+	static constexpr float GoalMouthGlow       = 0.160f;
+	static constexpr float GoalRampBaseDim     = 0.035f;   // mode B, the two walkable ramp faces
+	static constexpr float GoalRampGlow        = 0.100f;
+
+	/**
+	 * What those six are multiplied by, and therefore the whole of this fix.
+	 *
+	 * 0.30 rather than a rounder number because of how the tonemapper behaves down here. The goal
+	 * mouth's blue channel encodes at sRGB 189 (linear 0.503) before the change, which is well up
+	 * the curve, so the mapping from radiance to what a screenshot measures is strongly compressive:
+	 * a 0.30x cut in radiance is a little under a 2x cut in encoded luminance, which is what takes
+	 * the ground from 1.4x BELOW the character to comfortably above 2x below it. The AFTER
+	 * measurement is in the tranche report; if this is ever re-tuned, re-measure rather than
+	 * reasoning from the ratio, because none of this is linear.
+	 */
+	static constexpr float EndzoneFloorValueScale = 0.30f;
+
+	/**
+	 * 44 -> 64 for the release overhaul (MAP plan §7): the goal line is a T3 read that has to
+	 * survive the CROSS-ARENA sightline, and at 44 uu it dissolved into the audit's dashed/moiré
+	 * garbage past mid-distance (the AA-safety table wants ≥ 56 at that range; 64 gives margin).
+	 * Floor-flat strips are exempt from the 36 uu whiteout cap — at grazing incidence a floor strip
+	 * cannot fill the view (the shipped 44–48 uu floor lines never needed a standoff either).
+	 */
+	static constexpr float GoalLineWidth = 64.f;
 
 	// --- Neon trim geometry ----------------------------------------------------------------------
 
 	/** Bright strip running along the top inner edge of each wall - the Tron read from a distance. */
 	static constexpr float WallTrimSize = 46.f;
+
+	/**
+	 * The END walls' top trim and band/kick are WIDER than the side walls' since the release
+	 * overhaul (MAP plan §7). The side-wall dressing reads along its own wall from ≤ 12,000 uu and
+	 * 46/30 survive that; the end-wall dressing is the territory read from the OPPOSITE end of the
+	 * field — 26,000+ uu — where 46 uu lands under the ~2.2 px TSR survival width and the amber wall
+	 * simply vanished from the blue spawn (visual-audit §2.5). 72/56 clear the cross-arena minimums
+	 * with margin. Floor-height and rib rhythm are untouched: T0/T1 detail is allowed to dissolve.
+	 */
+	static constexpr float EndTrimSize = 72.f;
+	static constexpr float EndBandSize = 56.f;
 
 	// --- POINT-BLANK STANDOFF --------------------------------------------------------------------
 	//
@@ -469,8 +559,8 @@ namespace TraceArenaConstants
 
 	/**
 	 * The lowest terrace stops this far short of the goal line too, so it cannot bury the goal line
-	 * decal. GoalLineWidth is 44 uu centred on the line, so anything over 22 clears it; 60 leaves a
-	 * visible dark gutter between the bank's toe and the lit line.
+	 * decal. GoalLineWidth is 64 uu centred on the line, so anything over 32 clears it; 60 still
+	 * clears and leaves a visible dark gutter between the bank's toe and the lit line.
 	 */
 	static constexpr float BankGoalClearance = 60.f;
 
@@ -899,6 +989,148 @@ namespace TraceArenaConstants
 	static constexpr float LaneStripeYFracs[] = { 0.4200f, 0.6600f };   // 2016, 3168
 	static constexpr float LaneStripeWidth = 72.f;
 
+	// --- PATCH 28 §5: THE SURF RAILS --------------------------------------------------------------
+	//
+	// Every number a rail needs that is NOT derived from the movement component's surf band or from
+	// the field's own dimensions. See ATraceArenaBuilder::BuildSurfRails() for the level-design
+	// argument and for the clearance arithmetic these were chosen against.
+
+	/**
+	 * |X| of the rail's ends, as fractions of the half length. 5601 and 11700 on the shipped field.
+	 *
+	 * THE FAR ONE IS NOW A CEILING, NOT THE ANSWER. DEMO 29 item 4: a surfer leaves the exit nose as a
+	 * projectile, and at the 11700 this asks for the flight landed inside the innermost approach cover
+	 * — measured at 1469 uu/s on the last frame of the ride and 52 uu/s on the floor. SurfRailRunX()
+	 * therefore clamps it against SurfRailExitObstacleX() minus SurfRailExitClearance(), which on the
+	 * shipped field brings the far end to |X| 10610 and costs 1090 uu of main run (4868 -> 3778).
+	 *
+	 * The near one is untouched: the inner lane pylon stands at |X| 4690..4910 in this rail's Y band,
+	 * so there is only ~600 uu to be had inboard and taking it would move the access ramp's foot into
+	 * ground this pass did not measure.
+	 */
+	static constexpr float SurfRailNearXFrac = 0.2917f;
+	static constexpr float SurfRailFarXFrac  = 0.6094f;
+
+	/** |Y| of the rail's inboard TOE, as a fraction of the half width. 2700 on the shipped field. */
+	static constexpr float SurfRailToeYFrac = 0.5625f;
+
+	/** How far the rail's solid back reaches PAST the corner bank's toe, uu. */
+	static constexpr float SurfRailBackOverlap = 200.f;
+
+	/** Crest height, as a multiple of one player height. 3.5x is the arena's landmark tier. */
+	static constexpr float SurfRailHeightMult = StructureHeight35x;
+
+	/**
+	 * Degrees of margin kept INSIDE the movement component's surf band at each end.
+	 *
+	 * The band is (walkable limit, wall limit) and a face exactly on either boundary is a coin flip
+	 * decided by float noise — on the shallow end it would be walkable on some frames, on the steep end
+	 * it would be a wall the wall jump answers instead. Two degrees is far more than the noise and far
+	 * less than the band.
+	 */
+	static constexpr float SurfRailBandMarginDegrees = 2.f;
+
+	/**
+	 * Facets the arc is cut into. FIVE, and the number is a legibility/cost trade, not a guess.
+	 *
+	 * The band is ~14.5 degrees wide on the shipped tuning, so five facets put a 2.9-degree crease
+	 * between neighbours — under the angular resolution of anything a player can see at the speeds
+	 * this is ridden at, and small enough that crossing one costs nothing (the velocity is re-clipped
+	 * against the new plane, which is the whole "transitions between ramp faces" case). Ten facets
+	 * would halve that and double the collision-box count of the largest new structure in the arena;
+	 * three would put a 5-degree kink in a surface players ride at 1500 uu/s.
+	 */
+	static constexpr int32 SurfRailFacets = 5;
+
+	/**
+	 * Thickness of a main-run facet slab, measured along its own normal.
+	 *
+	 * 200 rather than something thinner because it is half of the SEAL. Under each facet sits an
+	 * axis-aligned filler box whose top is level with that facet's LOW end (which can never poke
+	 * through the arc, since the arc only rises from there); the slab above has to reach down far
+	 * enough to overlap that filler across the whole facet, and 200 uu along the normal covers the
+	 * ~123 uu a facet rises with ~120 uu of vertical reach to spare. Together they make the rail SOLID
+	 * in cross-section, which is what stops the space behind the plates being a 6,100 uu long tunnel a
+	 * player could walk into and hide in.
+	 */
+	static constexpr float SurfRailFacetThickness = 200.f;
+
+	/**
+	 * How far each facet slab is extended PAST its chord at both ends, uu.
+	 *
+	 * WHY IT IS SAFE IN BOTH DIRECTIONS, which is the only thing that matters here: the profile is
+	 * concave, so the slope strictly increases up the arc. Extending a facet UP past a joint continues
+	 * it at a SHALLOWER angle than the true surface, which puts the extension underneath. Extending it
+	 * DOWN past a joint continues it at a STEEPER angle, which also puts it underneath (tan is
+	 * increasing). So the overlap can only ever add material below the ridable surface, never a lip on
+	 * it — and a lip on a surf face is a pawn catching at 1500 uu/s.
+	 *
+	 * The TOP facet gets no upward extension: above it the surface is the FLAT crest, which is
+	 * shallower than the facet, so an extension there WOULD stand proud. That exception is the one
+	 * case the rule above does not cover and it is handled explicitly in the build.
+	 */
+	static constexpr float SurfRailFacetOverlap = 45.f;
+
+	/**
+	 * How many LEVEL steps the exit nose is built from.
+	 *
+	 * The nose could have been one swept section descending smoothly, and the first version was. It
+	 * did not survive measurement: a swept section's slabs are boxes whose local axes no longer line
+	 * up with the vertical cross-section, so consecutive facets stop sharing an edge and leave ~10 uu
+	 * lips, and the rig caught rides losing 400-850 uu/s in a single frame at the junction, in both
+	 * halves of the field, every run.
+	 *
+	 * A staircase that only ever steps DOWN cannot do that, and the reason is a proof rather than a
+	 * tuning: every step's far end face has its outward normal pointing along the direction of travel,
+	 * so a surfer LEAVES that solid through it instead of arriving at it, and the next step is strictly
+	 * lower. Nothing is in front of the player to hit, at any height, on any facet, at any speed.
+	 *
+	 * Three steps of Height/4 leave a terminal face one quarter of the crest — 154 uu on the shipped
+	 * field, under one player height, and standing over the outermost ~90 uu of the face band only,
+	 * because by that offset the rest of the arc is under the floor.
+	 */
+	static constexpr int32 SurfRailNoseSteps = 3;
+
+	/**
+	 * Run per unit rise of the EXIT NOSE at the outboard end — the whole cross-section sinking into the
+	 * floor rather than the crest stepping down.
+	 *
+	 * THIS EXISTS BECAUSE THE FIRST BUILD ENDED IN A WALL AND THE RIG HIT IT. A surfer holding a good
+	 * strafe rode the full 5,880 uu face in 3.9 s and met the end rib at 1,300 uu/s; measured exit
+	 * speeds collapsed from ~1,300 to ~150 uu/s. A fast lane that terminates in a flat face is a
+	 * mechanic that punishes the players who are best at it.
+	 *
+	 * IT FIXED THE RAIL'S OWN END AND NOT THE LANE BEYOND IT, and DEMO 29 item 4 is that second half.
+	 * Removing the wall at the end of the structure turned the exit into a LAUNCH, and the launch was
+	 * landing inside the innermost approach cover 1300 uu further out — the identical failure one
+	 * structure downrange, with identical numbers (1469 uu/s on the ride's last frame, 52 on the
+	 * floor). The nose is unchanged; what changed is that SurfRailRunX() now places the far end from
+	 * the ballistic envelope of the exit rather than from a fraction of the field.
+	 *
+	 * The nose is the SAME cross-section swept along a descending line, not a stepped-down second
+	 * ridge: the surface is continuous through the junction (only its slope kinks, which is one more
+	 * facet transition and is exactly the case the movement code handles), and by the far end the whole
+	 * profile has sunk to the floor, so there is nothing left to hit. 2.0 gives 27 degrees of descent
+	 * over 1,232 uu, which is walkable if you are on the crest and a free 616 uu of drop if you are on
+	 * the face.
+	 */
+	static constexpr float SurfRailNoseRunPerRise = 2.0f;
+
+	/**
+	 * Run per unit rise of the walkable access ramp at the rail's inboard end. 2.6 -> 21 degrees, well
+	 * inside the walkable limit, which is what makes the crest a route rather than a place you can
+	 * only reach with a dash.
+	 */
+	static constexpr float SurfRailAccessRunPerRise = 2.6f;
+
+	/** Emissive tint on the face and body. */
+	static constexpr float SurfRailBodyEmissive = 0.014f;
+
+	/** The flush crest line and the floor line at the toe. */
+	static constexpr float SurfRailCrestLineWidth = 34.f;
+	static constexpr float SurfRailCrestLineHeight = 14.f;
+	static constexpr float SurfRailToeLineWidth = 56.f;
+
 	/**
 	 * Corner pylons, in the dead space behind each goal line.
 	 *
@@ -912,7 +1144,14 @@ namespace TraceArenaConstants
 	 */
 	static constexpr float CornerPylonYFrac = 0.8500f;   // 4080
 	static constexpr float CornerPylonSide = 300.f;
-	static constexpr float CornerPylonHeight = 1900.f;
+
+	/**
+	 * 1900 -> 3000 for the release overhaul (MAP plan §4.4): every structure used to terminate at or
+	 * under the 2600 uu wall top, so the arena's whole silhouette was one flat line. The corner
+	 * pylons now break OVER it — one of the five distinct termination heights (2600 wall / 2800 gate
+	 * finials / 3000 pylons / 3200 centre beacon / 4200 goal beacons) that give the skyline a shape.
+	 */
+	static constexpr float CornerPylonHeight = 3000.f;
 
 	// --- Floor lamps -----------------------------------------------------------------------------
 	//
@@ -935,6 +1174,43 @@ namespace TraceArenaConstants
 	// point lights.
 	static constexpr float LampXFracs[] = { 0.1400f, 0.3800f, 0.6200f, 0.8600f };   // 2352, 6384, 10416, 14448
 	static constexpr float LampYFracs[] = { 0.3600f, 0.8000f };                     // 1728, 3840
+
+	/**
+	 * How far a lamp's colour is pulled from the neutral cool white toward its half's team colour.
+	 *
+	 * 0.55 for the field at large: a fully saturated team lamp repaints every surface it touches and
+	 * the two halves stop looking like the same arena; blending to white keeps the tint as a hint
+	 * and lets the neon keep ownership of the colour. The OUTERMOST row (LampXFracs[3], mid-endzone)
+	 * runs deeper at 0.70 (release overhaul, MAP plan §8.6): that row lights the territory the
+	 * territory read is ABOUT, and at 0.55 the far end's ambient wash was not readable as a colour
+	 * at all from the opposite spawn. Judged on the platform-top palette rule (§ the palette block
+	 * above): no surface leaves the measured band.
+	 */
+	static constexpr float LampTeamBlend = 0.55f;
+	static constexpr float LampTeamBlendOuterRow = 0.70f;
+
+	/**
+	 * The blend for a lamp at |X| = @p XFracAbs of the half length. One function, used by BOTH the
+	 * build-time tint (BuildFloorLamps) and the half-time repaint (ApplyTeamSides), so the two can
+	 * never disagree about which rows run deep. The threshold is the midpoint of the outer two rows.
+	 */
+	static float LampTeamBlendForXFrac(float XFracAbs)
+	{
+		return (XFracAbs > 0.74f) ? LampTeamBlendOuterRow : LampTeamBlend;
+	}
+
+	/**
+	 * The lamp lattice's one colour formula: neutral cool white (0.72, 0.78, 1.00) lerped per
+	 * channel toward the team colour. ApplyTeamSides recomputes THIS at every side switch — a light
+	 * is not a MID, so lamps are the one team-coloured family the SideMIDs push cannot reach.
+	 */
+	static FLinearColor LampColorFor(const FLinearColor& TeamColor, float BlendFrac)
+	{
+		return FLinearColor(
+			FMath::Lerp(0.72f, TeamColor.R, BlendFrac),
+			FMath::Lerp(0.78f, TeamColor.G, BlendFrac),
+			FMath::Lerp(1.00f, TeamColor.B, BlendFrac));
+	}
 
 	/**
 	 * Lamp height. MEASURED: this started at 500 and the floor directly beneath a lamp came back as a
@@ -1041,6 +1317,20 @@ namespace TraceArenaConstants
 	static constexpr int32 GoalRingSegments = 16;
 	static constexpr float GoalRingOuterScale = 1.55f;   // annulus outer radius / mouth radius, before the float clamp
 	static constexpr float GoalRingSpokeOverlap = 1.12f; // tangential slop so adjacent spokes meet
+
+	/**
+	 * The bright HOOP is rounder than the annulus behind it — 24 rim bars over 16 spokes (release
+	 * overhaul, MAP plan §7). The ring's tube widths were already AA-safe (≥ 64 uu), so the audit's
+	 * dashed-arc read at range was polygonal FACET moiré: sixteen chords breaking the brightest
+	 * circle in the arena into visible straights whose joins shimmer under TSR. Only the RIM is
+	 * bright enough to moiré — the near-black annulus body reads as mass at any facet count, and
+	 * the collision polygon must not change shape (the physical hole is a gameplay contract) — so
+	 * the extra facets go exactly where the eye sees them and nowhere else. 24 at the rim radius
+	 * reads as a circle from the halfway line; the 1.06 rim overlap is per-seam and holds at any
+	 * count. (The MAP plan asked for the whole annulus at 24; splitting rim from spokes buys the
+	 * same visible fix for half the instances, which is what keeps §4.5's +80 budget honest.)
+	 */
+	static constexpr int32 GoalRingRimSegments = 24;
 
 	/** Radial depth and forward proudness of the glowing hoop laid on the annulus's inner rim. */
 	static constexpr float GoalRingRimDepth = 64.f;
@@ -1269,6 +1559,83 @@ namespace
 	 * BEFORE arm in the same binary is not a fix anybody can check. 0 rebuilds the arena the way it
 	 * was - straight bank terraces, no cove - so Trace.Arena.CrossSection can be run against both.
 	 */
+	/**
+	 * PATCH 28 §5. THE SURF RAILS' OWN BEFORE ARM, IN THE SAME BINARY.
+	 *
+	 * 0 (or -TraceNoSurfRails) builds the arena exactly as it was before this patch, which is what
+	 * makes "the movement battery is still green" a comparison instead of an assertion: several
+	 * AuditV16 rows are measured by driving the local pawn across whatever ground it happens to be
+	 * standing on, so a row that reads differently after four new structures appear in the outer lanes
+	 * has to be checked against the same row with them switched off, in the same build, on the same
+	 * map.
+	 *
+	 * Read ONCE when the arena is built, like the two arms below it, so a mid-match flip cannot produce
+	 * half an arena. The command-line switch is the one that actually works for a measured run: the
+	 * arena is built from ATraceGameMode::PreInitializeComponents, earlier than any console command.
+	 */
+	int32 GArenaSurfRails = 1;
+	FAutoConsoleVariableRef CVarArenaSurfRails(
+		TEXT("Trace.Arena.SurfRails"),
+		GArenaSurfRails,
+		TEXT("1 (default) = build the four curved surf rails in the outer lanes (Patch 28 sec 5). 0 = the "
+		     "pre-patch arena, kept as the BEFORE arm. Read once when the arena is built - use "
+		     "-TraceNoSurfRails to get it in place before the game mode builds the arena."),
+		ECVF_Default);
+
+	/**
+	 * DEMO 29 ITEM 4(a). 1 restores the Patch 28 rail EXTENTS — the far end at 0.6094 of the half
+	 * length, with no exit-lane clearance derived at all.
+	 *
+	 * That is the arm in which a surfer leaving the nose at 1469 uu/s flies 1300 uu and hits the
+	 * innermost approach bar at 52 uu/s, which is the largest single cause of the owner's "a player
+	 * loses all momentum at the end of the curve". It exists so the fix can be shown rather than
+	 * asserted: one binary, one map, two runs of -TraceSurfExitTest.
+	 *
+	 * Like Trace.Arena.SurfRails above it, the arena is built once at BeginPlay, so use
+	 * -TraceSurfRailLegacyRun to get it in place before the game mode builds the arena.
+	 */
+	int32 GArenaSurfRailLegacyRun = 0;
+
+	// THE REGISTRATION IS DEV-ONLY AND THE READER BELOW CARRIES ITS OWN GUARD, which is the pair
+	// W9-SHIPGUARD's finding demands: guarding only one of the two is how the last legacy arm in this
+	// project shipped a live command-line switch. With both in place a UTF-16LE search of the linked
+	// Trace-Mac-Shipping finds neither "Trace.Arena.SurfRailLegacyRun" nor "TraceSurfRailLegacyRun".
+	// The int32 itself is defined unconditionally and costs four bytes: a global that only exists in
+	// one configuration is the "Shipping compiles a reader and finds no definition" link failure this
+	// project has already had once.
+#if !UE_BUILD_SHIPPING
+	FAutoConsoleVariableRef CVarArenaSurfRailLegacyRun(
+		TEXT("Trace.Arena.SurfRailLegacyRun"),
+		GArenaSurfRailLegacyRun,
+		TEXT("Demo 29 item 4 A/B. 1 restores the Patch 28 surf rail extents, whose exit lane ends in "
+		     "the innermost approach bar. Set with -TraceSurfRailLegacyRun; the arena is built once."),
+		ECVF_Cheat);
+#endif
+
+	/**
+	 * True while the Patch 28 rail extents are in force.
+	 *
+	 * THE SHIPPING GUARD IS ON THE READER AND NOT ONLY ON THE REGISTRATION, and that distinction is
+	 * not decoration — it is the exact bug W9-SHIPGUARD found in the movement slice's last legacy arm,
+	 * where a bare FParse::Param on the read line put the switch literal into the linked Shipping
+	 * artefact and left the whole arm reachable from a command line. Verified the same way: a UTF-16LE
+	 * search of Binaries/Mac/Trace-Mac-Shipping finds no "TraceSurfRailLegacyRun".
+	 *
+	 * It matters more here than for a movement knob. This one changes the LEVEL: a shipped server
+	 * launched with the switch would build rails whose exit lane ends in a wall while every client
+	 * that joined it saw the same geometry and wondered why the fast route was a trap.
+	 */
+	bool IsSurfRailLegacyRun()
+	{
+#if UE_BUILD_SHIPPING
+		return false;
+#else
+		static const bool bFromCommandLine =
+			FParse::Param(FCommandLine::Get(), TEXT("TraceSurfRailLegacyRun"));
+		return GArenaSurfRailLegacyRun != 0 || bFromCommandLine;
+#endif
+	}
+
 	int32 GArenaWallCove = 1;
 	FAutoConsoleVariableRef CVarArenaWallCove(
 		TEXT("Trace.Arena.WallCove"),
@@ -1278,6 +1645,59 @@ namespace
 		TEXT("join, kept as the BEFORE arm. Read once when the arena is built - use -TraceArenaSquareCorners ")
 		TEXT("to get it in place before the game mode builds the arena."),
 		ECVF_Default);
+
+	/**
+	 * THE ENDZONE-CONTRAST A/B (release overhaul; W4-CENSUS's T3 endzone finding). Same shape as
+	 * the two knobs above and for the same reason: a fix with no BEFORE arm in the same binary is
+	 * not a fix anybody can check.
+	 *
+	 * AND IT ONLY WORKS ON THE PROCEDURAL MAP, which is worth stating plainly rather than letting a
+	 * screenshot imply the fix did not land. `/Game/Maps/Arena` is BUILT, so this decides what
+	 * BuildEndzones and BuildGoals register. `/Game/Maps/Arena_Baked` is ADOPTED - nothing is built
+	 * and each surface's colour arrives from its piece's FTraceBakedSideTint, written at bake time -
+	 * so flipping this on the shipping map changes nothing at all. Run the A/B on
+	 * `/Game/Maps/Arena` with -TraceLegacyEndzoneFloor, which is the only form that is in place
+	 * before ATraceGameMode::PreInitializeComponents builds the arena.
+	 */
+	int32 GArenaEndzoneContrast = 1;
+	FAutoConsoleVariableRef CVarArenaEndzoneContrast(
+		TEXT("Trace.Arena.EndzoneContrast"),
+		GArenaEndzoneContrast,
+		TEXT("1 (default) = the three large team-coloured endzone floor surfaces (the mode-A endzone ")
+		TEXT("paint, the mode-B goal-mouth lane, the goal ramps) are scaled by ")
+		TEXT("EndzoneFloorValueScale, which is the value separation that keeps a character readable ")
+		TEXT("while standing on its own endzone. 0 = the authored values, kept as the BEFORE arm. ")
+		TEXT("Read when the arena is BUILT, so it does nothing on /Game/Maps/Arena_Baked, whose ")
+		TEXT("numbers are baked into each piece's side tints - A/B it on /Game/Maps/Arena with ")
+		TEXT("-TraceLegacyEndzoneFloor."),
+		ECVF_Default);
+
+	/**
+	 * One team-coloured floor surface's (albedo scale, emissive strength), for whichever arm is live.
+	 *
+	 * IT IS A FUNCTION AND NOT SIX SCALED LITERALS because every one of these numbers is used
+	 * TWICE - once to build the MID and once in the RegisterSideMID call the half-time switch and
+	 * the bake read back. Scale them separately at each site and the two eventually disagree, and
+	 * the way that shows up is the ugliest kind: the arena looks right until half time, then
+	 * repaints itself to a value nobody chose.
+	 *
+	 * THREE READERS, all of which run once per build (BuildEndzones' floor patch, BuildGoals' mouth
+	 * patch, BuildGoalRing's ramp), so unlike the two latched knobs above this needs no member to
+	 * stop the arena coming out half one way and half the other.
+	 */
+	struct FEndzoneFloorPaint
+	{
+		float BaseDim;
+		float Glow;
+	};
+
+	FEndzoneFloorPaint EndzoneFloorPaint(float AuthoredBaseDim, float AuthoredGlow)
+	{
+		const bool bLegacy = (GArenaEndzoneContrast == 0)
+			|| FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyEndzoneFloor"));
+		const float Scale = bLegacy ? 1.f : TraceArenaConstants::EndzoneFloorValueScale;
+		return FEndzoneFloorPaint{ AuthoredBaseDim * Scale, AuthoredGlow * Scale };
+	}
 }
 
 ATraceArenaBuilder::ATraceArenaBuilder()
@@ -1369,6 +1789,19 @@ ATraceArenaBuilder::ATraceArenaBuilder()
 	if (NeonFinder.Succeeded())
 	{
 		NeonMaterial = NeonFinder.Object;
+	}
+
+	// The hand-authored micro-grid floor instance (release overhaul, MAP plan §6.3). Committed under
+	// Authored/ (Scripts/author_mics.py), so it gets the same constructor-finder treatment as the
+	// parents for the same cooking reason. There is deliberately NO /Game/Generated legacy arm for
+	// it — the asset never lived there — and no warning when it is missing: the fallback (the floor
+	// MID parents to the bare SurfaceMaterial and renders grid-less, exactly as it always did) is
+	// named in BuildArena's one materials line, which reports the floor's parent next to the
+	// surface and neon parents precisely so a screenshot's floor is never a guess.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> FloorGridFinder(TEXT("/Game/Trace/Materials/Authored/MI_Surface_Floor_Grid.MI_Surface_Floor_Grid"));
+	if (FloorGridFinder.Succeeded())
+	{
+		FloorGridMaterial = FloorGridFinder.Object;
 	}
 }
 
@@ -1997,9 +2430,14 @@ void ATraceArenaBuilder::BuildArena()
 	}
 	else if (bBuildVisuals)
 	{
+		// The floor names its parent too: whether a given screenshot's floor carried the micro-grid
+		// (MI_Surface_Floor_Grid present) or fell back to the bare surface parent is otherwise
+		// unanswerable from the image — GridStrength 0.06 is deliberately near the eye's floor.
 		UE_LOG(LogTraceGame, Log,
-			TEXT("[Arena] Materials: surface '%s', neon '%s'."),
-			*GetPathNameSafe(SurfaceMaterial), *GetPathNameSafe(NeonMaterial));
+			TEXT("[Arena] Materials: surface '%s', neon '%s', floor '%s'%s."),
+			*GetPathNameSafe(SurfaceMaterial), *GetPathNameSafe(NeonMaterial),
+			(FloorGridMaterial != nullptr) ? *GetPathNameSafe(FloorGridMaterial) : *GetPathNameSafe(SurfaceMaterial),
+			(FloorGridMaterial != nullptr) ? TEXT(" (micro-grid)") : TEXT(" (no authored grid MIC; grid-less fallback)"));
 	}
 
 	BuildFloorAndWalls(bBuildVisuals);
@@ -2036,11 +2474,29 @@ void ATraceArenaBuilder::BuildArena()
 		BuildFlanks(bBuildVisuals);
 	}
 
+	// PATCH 28 §5. After the flanks because a rail lives in the lane the flanks dress, and its own log
+	// line reads better next to theirs; before the scoring shapes because it is ordinary interior
+	// geometry and must be swept into neither GoalModePieces nor EndzoneModePieces. Its own switch,
+	// like the banks' and the flanks'.
+	if (bBuildSurfRails && GArenaSurfRails != 0
+		&& !FParse::Param(FCommandLine::Get(), TEXT("TraceNoSurfRails")))
+	{
+		BuildSurfRails(bBuildVisuals);
+	}
+
 	// BOTH scoring shapes, always. See the two-modes note in the header: the A/B toggle has to be
 	// survivable mid-match, and the only way to do that safely is to have already built what the
 	// other mode needs.
 	BuildEndzones(bBuildVisuals);
 	BuildGoals(bBuildVisuals);
+
+	// AFTER BuildGoals on purpose, twice over: the goal beacons stand on the rings' measured tops,
+	// and running after BuildGoals' CollectPiecesSince is what keeps the sky (which serves both
+	// modes) out of GoalModePieces. Inside bBuildVisuals — sky dressing has no server-side existence.
+	if (bBuildVisuals && bBuildSkyline)
+	{
+		BuildSkyline(bBuildVisuals);
+	}
 
 	if (HasAuthority())
 	{
@@ -2133,7 +2589,16 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 		// Roughness 0.16: the floor is a near-black mirror. Almost everything you see on the ground is
 		// the screen-space reflection of the neon above it, not the albedo - that reflected glow is
 		// what a Tron floor actually is. Raise the roughness and the whole arena goes matte and dead.
-		UMaterialInstanceDynamic* FloorMID = MakeSurfaceMID(TraceArenaConstants::FloorColor, 0.16f, 0.f);
+		//
+		// PARENTED TO THE MICRO-GRID MIC, not the bare surface parent (release overhaul, MAP plan
+		// §6.3): MI_Surface_Floor_Grid arms M_TraceSurface's bUseGrid static switch (GridScale 256,
+		// GridWidth 0.012, GridStrength 0.06), and a MID inherits its MIC parent's static switches,
+		// so the whole floor — practice pockets included, they are this same plane — gains the faint
+		// cyan micro-grid for zero per-piece cost and ONE shader permutation. The featureless
+		// near-mirror was the last of the "mauve floor" (P1v verdict): warm fill + amber emissive GI
+		// had nothing on the surface to break them up. Null parent = grid-less fallback, as before.
+		UMaterialInstanceDynamic* FloorMID = MakeSurfaceMID(TraceArenaConstants::FloorColor, 0.16f, 0.f,
+			FLinearColor::Black, 1.f, FloorGridMaterial);
 		AddMeshBlock(CubeMesh, FloorCenter, FloorSize, FloorMID, /*bCastShadow=*/false, TEXT("Floor"));
 	}
 
@@ -2282,11 +2747,19 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 		RegisterSideMID(Sign, TeamTrimMID, /*bNeon=*/true, TraceArenaConstants::GlowTrim);
 		RegisterSideMID(Sign, TeamRibMID, /*bNeon=*/true, TraceArenaConstants::GlowRib);
 
+		// The end-wall dressing is built at its OWN widths (EndTrimSize/EndBandSize, 72/56) rather
+		// than the side walls' 46/30: these four strips are the territory read from the opposite end
+		// of the field, 26,000+ uu away, and at the side-wall widths they dissolved into sub-pixel
+		// noise long before that (MAP plan §7 — the amber wall was invisible from the blue spawn).
+		// Same flush placement arithmetic, just against the wider size.
+		const float EndTrimZ = WallHeight - TraceArenaConstants::EndTrimSize * 0.5f;
+		const float EndTrimInset = TraceArenaConstants::EndTrimSize * 0.5f;
+
 		// The top strip: the line that reads the end of the field from midfield in both modes. It was
 		// the only piece of end-wall dressing that was permanent while the wall had a hole in it; the
 		// three below it join it now (spec v28 §8).
-		AddMeshBlock(CubeMesh, FVector(Sign * (HalfX - TrimInset), 0.f, TrimZ),
-			FVector(TraceArenaConstants::WallTrimSize, FieldWidth, TraceArenaConstants::WallTrimSize),
+		AddMeshBlock(CubeMesh, FVector(Sign * (HalfX - EndTrimInset), 0.f, EndTrimZ),
+			FVector(TraceArenaConstants::EndTrimSize, FieldWidth, TraceArenaConstants::EndTrimSize),
 			TeamTrimMID, false, TEXT("EndTrim"));
 
 		// THE BAND, THE KICK BAND AND THE RIBS ARE NOW PERMANENT TOO (spec v28 §8). They used to be
@@ -2295,12 +2768,12 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 		// goal line now, a whole pocket in front of this wall, and nothing on the wall is behind it -
 		// so the end wall gets its full dressing in both modes, which is what the pocket needs: it is
 		// the only structure a player standing at their own spawn is looking at.
-		AddMeshBlock(CubeMesh, FVector(Sign * (HalfX - TraceArenaConstants::WallBandSize * 0.5f), 0.f, BandZ),
-			FVector(TraceArenaConstants::WallBandSize, FieldWidth, TraceArenaConstants::WallBandSize),
+		AddMeshBlock(CubeMesh, FVector(Sign * (HalfX - TraceArenaConstants::EndBandSize * 0.5f), 0.f, BandZ),
+			FVector(TraceArenaConstants::EndBandSize, FieldWidth, TraceArenaConstants::EndBandSize),
 			TeamRibMID, false, TEXT("EndBand"));
 
-		AddMeshBlock(CubeMesh, FVector(Sign * (HalfX - TraceArenaConstants::WallBandSize * 0.5f), 0.f, KickZ),
-			FVector(TraceArenaConstants::WallBandSize, FieldWidth, TraceArenaConstants::WallBandSize),
+		AddMeshBlock(CubeMesh, FVector(Sign * (HalfX - TraceArenaConstants::EndBandSize * 0.5f), 0.f, KickZ),
+			FVector(TraceArenaConstants::EndBandSize, FieldWidth, TraceArenaConstants::EndBandSize),
 			TeamRibMID, false, TEXT("EndKick"));
 
 		const int32 RibsPerHalf = FMath::Clamp(FMath::FloorToInt(HalfY / TraceArenaConstants::WallRibSpacing), 0, 4);
@@ -2324,10 +2797,14 @@ void ATraceArenaBuilder::BuildGrid()
 
 	// Territory is readable off the floor: a line's colour is the colour of the team that DEFENDS the
 	// half it lies in, so from anywhere on the field you can tell which way you are attacking without
-	// looking up at the walls. The halfway line is neutral and much brighter.
+	// looking up at the walls. The halfway line is neutral and much brighter — and it BREATHES
+	// (0.20 Hz / ±8%, MAP plan §6.2): the centre line and the centre ring pad are the two marks of
+	// the contested middle, and the slow shared pulse is what separates "objective furniture" from
+	// the static territory trim without adding a single instance. Territory lines never pulse.
 	UMaterialInstanceDynamic* BlueGridMID = MakeNeonMID(TraceTeamColor(ETraceTeam::Blue), TraceArenaConstants::GlowGrid);
 	UMaterialInstanceDynamic* OrangeGridMID = MakeNeonMID(TraceTeamColor(ETraceTeam::Orange), TraceArenaConstants::GlowGrid);
-	UMaterialInstanceDynamic* CenterMID = MakeNeonMID(TraceArenaConstants::NeonNeutralPale, TraceArenaConstants::GlowCentreLine);
+	UMaterialInstanceDynamic* CenterMID = MakeNeonMID(TraceArenaConstants::NeonNeutralPale, TraceArenaConstants::GlowCentreLine,
+		/*PulseRate=*/0.20f, /*PulseAmp=*/0.08f);
 
 	const float HalfX = HalfLength();
 	const float HalfY = HalfWidth();
@@ -2362,9 +2839,13 @@ void ATraceArenaBuilder::BuildGrid()
 		}
 
 		const bool bCenter = (Index == 0);
+		// The centre line is 4.5 x the strip width (72 uu; was 3 x = 48) since the release overhaul,
+		// MAP plan §7: it is a T2 read from the spawns ~16,800 uu away, where the AA-safety table
+		// wants ≥ 44 uu — 72 gives margin and matches the lane stripes. Floor-flat, so the whiteout
+		// cap does not apply. The ordinary grid strips stay 16 uu: near-field detail may dissolve.
 		AddMeshBlock(CubeMesh,
 			FVector(X, 0.f, TraceArenaConstants::GridZ),
-			FVector(bCenter ? GridStripWidth * 3.f : GridStripWidth, GridHalfY * 2.f, TraceArenaConstants::GridThickness),
+			FVector(bCenter ? GridStripWidth * 4.5f : GridStripWidth, GridHalfY * 2.f, TraceArenaConstants::GridThickness),
 			bCenter ? CenterMID : HalfColorMID(X),
 			/*bCastShadow=*/false,
 			TEXT("GridX"));
@@ -2430,7 +2911,10 @@ void ATraceArenaBuilder::BuildCentreDais(bool bBuildVisuals)
 		// a neon disc with a slightly smaller floor-coloured disc laid a hair above it. Two draws,
 		// exact control of the ring width, no new asset.
 		const float PadDiameter = HalfY * TraceArenaConstants::CentrePadDiameterFrac * 2.f;
-		UMaterialInstanceDynamic* PadMID = MakeNeonMID(TraceArenaConstants::NeonNeutral, TraceArenaConstants::GlowRing);
+		// 0.20 Hz / ±8%, phase-shared with the centre line (MAP plan §6.2): the two marks of the
+		// contested middle breathe together. See the pulse note in BuildGrid.
+		UMaterialInstanceDynamic* PadMID = MakeNeonMID(TraceArenaConstants::NeonNeutral, TraceArenaConstants::GlowRing,
+			/*PulseRate=*/0.20f, /*PulseAmp=*/0.08f);
 		AddMeshBlock(CylinderMesh, FVector(0.f, 0.f, TraceArenaConstants::PadZ),
 			FVector(PadDiameter, PadDiameter, TraceArenaConstants::GridThickness),
 			PadMID, /*bCastShadow=*/false, TEXT("CentreRing"));
@@ -2700,11 +3184,15 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 	{
 		// The bank wears the colour of the half it lies in, exactly like the floor grid and the
 		// flank dressing: a player who has lost their bearings on a bank can still read which way
-		// they are attacking off the contour lines under their feet.
+		// they are attacking off the contour lines under their feet — which is exactly why the
+		// contours are REGISTERED for the half-time repaint (release overhaul, MAP plan §5.2): a
+		// contour still saying "blue half" after the sides swap misinforms the player it exists to
+		// orient. The bank BODY stays structural; it was never team-tinted.
 		const ETraceTeam HalfTeam = (XSign < 0.f) ? ETraceTeam::Blue : ETraceTeam::Orange;
 		UMaterialInstanceDynamic* NeonMID = bBuildVisuals
 			? MakeNeonMID(TraceTeamColor(HalfTeam), TraceArenaConstants::GlowLip)
 			: nullptr;
+		RegisterSideMID(XSign, NeonMID, /*bNeon=*/true, TraceArenaConstants::GlowLip);
 
 		for (const float YSign : { -1.f, 1.f })
 		{
@@ -2913,8 +3401,15 @@ void ATraceArenaBuilder::BuildWallFillets(bool bBuildVisuals)
 	// number (0.012): a cove is a large up-facing surface like a terrace, but unlike a terrace it is
 	// something a first-person eye ends up pressed into while sliding along a wall, and emissive is
 	// the only term that does not depend on an angle of incidence at that range.
+	//
+	// Roughness 0.45 -> 0.55 (release overhaul, MAP plan §3.1). MEASURED, twice: the audit's "tan
+	// balcony" was mostly broken lighting, and the P1v re-shoot after that fix showed the residual —
+	// a warm grey-tan cast that is the raking warm FillLight speculating off this up-facing curve.
+	// The four-light balance is measured and kept (bible §5.1), so the treatment is on the SURFACE:
+	// 0.55 diffuses the raking highlight the way the perimeter walls' own 0.55 already does. The hue
+	// stays neutral — the neutral-cove decision above is untouched.
 	UMaterialInstanceDynamic* BodyMID = bBuildVisuals
-		? MakeSurfaceMID(TraceArenaConstants::WallColor, 0.45f, 0.f, TraceArenaConstants::NeonNeutral, 0.022f)
+		? MakeSurfaceMID(TraceArenaConstants::WallColor, 0.55f, 0.f, TraceArenaConstants::NeonNeutral, 0.022f)
 		: nullptr;
 	UMaterialInstanceDynamic* NeonMID = bBuildVisuals
 		? MakeNeonMID(TraceArenaConstants::NeonNeutral, TraceArenaConstants::GlowLip)
@@ -3092,6 +3587,14 @@ void ATraceArenaBuilder::BuildCoverField(bool bBuildVisuals)
 			? MakeNeonMID(TraceTeamColor(HalfTeam), TraceArenaConstants::GlowFace)
 			: nullptr;
 
+		// REGISTERED for the half-time repaint (release overhaul, MAP plan §5.1). The cover carries
+		// the same territory read as the floor grid — that is the whole reason it is team-coloured —
+		// and it was one of the four families the side switch could not reach, so after half time a
+		// player could stand in one half and see two teams' colours on adjacent surfaces. The
+		// top-centre tower below stays out of this on purpose: it is neutral, it marks the line.
+		RegisterSideMID(XSign, NeonMID, /*bNeon=*/true, TraceArenaConstants::GlowLip);
+		RegisterSideMID(XSign, FaceMID, /*bNeon=*/true, TraceArenaConstants::GlowFace);
+
 		// MIRRORED IN X. The sketch's two halves are different; this builds the same half twice,
 		// because the match switches sides at half time and an asymmetric field would hand one team
 		// the better ground for a full half. See the header. Also mirrored in Y, which the sketch's
@@ -3176,6 +3679,23 @@ void ATraceArenaBuilder::BuildCoverField(bool bBuildVisuals)
 		FVector(0.f, HalfY * TraceArenaConstants::TopCentreTowerYFrac, TowerHeight * 0.5f),
 		FVector(TowerSide, TowerSide, TowerHeight), 45.f,
 		BodyMID, TowerNeonMID, /*bCollide=*/true, TEXT("TopCentreTower"), TowerFaceMID);
+
+	// A vertical beacon riding the tower up to 3200 uu (release overhaul, MAP plan §4.4): the
+	// tallest INTERIOR mark in the arena and one of the five silhouette heights that break the flat
+	// 2600 uu wall-top line. Neutral like the tower under it — it marks the halfway line, the same
+	// call the centre grid strip and the midfield buttress make — so it is NOT registered for the
+	// side switch. Visuals only, no shadow, no collision: it starts at the tower's top, where no
+	// pawn can be.
+	if (bBuildVisuals)
+	{
+		const float BeaconTopZ = 3200.f;
+		UMaterialInstanceDynamic* TowerBeaconMID =
+			MakeNeonMID(TraceArenaConstants::NeonNeutralPale, TraceArenaConstants::GlowPylon);
+		AddMeshBlock(CubeMesh,
+			FVector(0.f, HalfY * TraceArenaConstants::TopCentreTowerYFrac, (TowerHeight + BeaconTopZ) * 0.5f),
+			FVector(64.f, 64.f, BeaconTopZ - TowerHeight),
+			TowerBeaconMID, /*bCastShadow=*/false, TEXT("TowerBeacon"));
+	}
 }
 
 void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
@@ -3193,7 +3713,11 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 
 	// Per-half neon, so the flank dressing carries the same territory read as the floor grid and the
 	// walls: everything in the -X half is blue, everything in the +X half is orange. A player who has
-	// lost their bearings in a corner can work out which way they are attacking from the wall alone.
+	// lost their bearings in a corner can work out which way they are attacking from the wall alone —
+	// so the three MIDs are REGISTERED for the half-time repaint (release overhaul, MAP plan §5.3),
+	// or that player would be reading the FIRST half's answer for the whole of the second. This one
+	// registration also covers the corner pylons and the end buttresses, which share HalfNeon. The
+	// on-axis centreline buttress makes its own neutral MID below and stays out of the repaint.
 	UMaterialInstanceDynamic* HalfNeon[2] = { nullptr, nullptr };
 	UMaterialInstanceDynamic* HalfBridge[2] = { nullptr, nullptr };
 	UMaterialInstanceDynamic* HalfStripe[2] = { nullptr, nullptr };
@@ -3206,6 +3730,11 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 			HalfNeon[Index] = MakeNeonMID(Color, TraceArenaConstants::GlowPylon);
 			HalfBridge[Index] = MakeNeonMID(Color, TraceArenaConstants::GlowBridge);
 			HalfStripe[Index] = MakeNeonMID(Color, TraceArenaConstants::GlowLaneStripe);
+
+			const float EndSign = (Index == 0) ? -1.f : 1.f;
+			RegisterSideMID(EndSign, HalfNeon[Index], /*bNeon=*/true, TraceArenaConstants::GlowPylon);
+			RegisterSideMID(EndSign, HalfBridge[Index], /*bNeon=*/true, TraceArenaConstants::GlowBridge);
+			RegisterSideMID(EndSign, HalfStripe[Index], /*bNeon=*/true, TraceArenaConstants::GlowLaneStripe);
 		}
 	}
 	auto HalfIndex = [](float XSign) { return (XSign < 0.f) ? 0 : 1; };
@@ -3360,6 +3889,11 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	// out here but at GlowGrid (1.5) they are a whisper; these are lane markings, and the near-mirror
 	// floor doubles every one of them into the black space underneath. This is what stops the bottom
 	// third of a flank frame being empty.
+	//
+	// PATCH 28 §5: the OUTER stripe (|Y| 3168) now runs UNDER a surf rail for the 6,100 uu the rail
+	// occupies, as any floor decal does under any structure. It is still built full length and still
+	// reads either side of the rail; the rail draws its own toe line on the floor in the same colour
+	// and the same idiom, so the lane does not lose its marking where it is covered.
 	for (const float YSign : { -1.f, 1.f })
 	{
 		for (const float YFrac : TraceArenaConstants::LaneStripeYFracs)
@@ -3374,6 +3908,787 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 		}
 	}
 
+}
+
+// =================================================================================================
+// PATCH 28 §5 — THE SURF RAILS
+// =================================================================================================
+//
+// "Players should be able to accelerate using curved ramps, in accordance with source movement
+// standards (kind of like surfing in CS:GO)."
+//
+// The movement half of that lives in UTraceCharacterMovementComponent (see its header block). This
+// is the other half: the arena's ramps are all FLAT-FACED and all WALKABLE, so before this function
+// there was not one surface in the level a player could have surfed. Four rails fix that, one per
+// quadrant.
+//
+// WHAT A RAIL IS. A long solid ridge lying along the field in the outer lane, with:
+//   * a CURVED, UNWALKABLE INBOARD FACE — a circular arc cut into SurfRailFacets planar facets, the
+//     shallowest at the toe and the steepest at the crest. This is the ridable surface.
+//   * a WALKABLE CREST at 3.5 player heights, the arena's landmark tier — the same height as the
+//     top-centre tower and the goal-approach tower, so the rail reads as a member of the existing
+//     height language rather than as a prop.
+//   * a WALKABLE ACCESS RAMP at the inboard end, 21 degrees, so the crest is a route you can take on
+//     foot and not just a shape.
+//   * an END RIB at each end of the face, which caps the run and closes the void behind the facets.
+//
+// WHY THE FACE IS CURVED AND NOT FLAT, which is the actual request. On a flat ramp there is one
+// slope, so there is one correct strafe angle and holding it is the whole skill. On an arc the slope
+// changes as the player rises and falls across it, so the strafe has to be re-aimed continuously —
+// that is what surf is, and it is why every surf map in the genre is built out of curves. It is also
+// what exercises the movement code's hardest case: crossing a facet joint re-clips the velocity
+// against a NEW plane, and "speed is preserved across a transition between ramp faces" is only a
+// claim worth testing if there are transitions.
+//
+// THE FACE ANGLES ARE DERIVED, NOT TYPED — THE DEMO 21 RULE, APPLIED TO GEOMETRY.
+// UTraceCharacterMovementComponent::GetSurfSlopeBandDegrees() is asked what this build will actually
+// surf, and the arc is cut inside that band with SurfRailBandMarginDegrees at each end. So:
+//   * the shallowest facet is provably steeper than the pawn can walk on (the shallow end of the band
+//     IS the engine's walkable limit), and
+//   * the steepest facet is provably not a wall (the steep end IS where the wall jump's band starts).
+// Retune either limit and the ramps re-cut themselves. A builder that typed "46 to 61 degrees" here
+// would be one movement retune away from shipping a ramp nobody can surf, and nothing would say so.
+//
+// WHERE THEY GO, AND WHY IT IS NOT A TEST RIG.
+//
+//   The outer lane between the two LANE PYLONS was the emptiest ground in the arena: 6100 uu of flat
+//   floor with two thin columns and a floor stripe on it, in the lane the flank route is supposed to
+//   be. A rail fills it with the one thing the flank did not have — a reason to be there. It gives
+//   the lane a high route with a real sightline onto the spine, a run-up to reach it, a fast way back
+//   down, and a body of cover for anyone crossing underneath. And it is a genuine alternative to the
+//   spine for a carrier: the spine is short and contested, the rail is long and fast.
+//
+//   MIRRORED INTO ALL FOUR QUADRANTS, which is this file's own rule (see the header): the match
+//   switches sides at half time, so anything that helps one half has to exist in the other.
+//
+//   CLEARANCES, measured against the shipped 38400 x 9600 field rather than eyeballed:
+//     lane pylons (|X| 4690..4910 and 12690..12910)   the run is 5600..11700: 690 uu and 990 uu clear
+//     approach cover C (|X| 11800..12200, |Y| 1850..3150)  the run stops at 11700: 100 uu clear in X
+//     midfield cover G (diamond, |Y| up to 2548)       the toe is at 2700: 152 uu clear, i.e. more
+//                                                     than two capsule diameters, so the lane between
+//                                                     the spine and the rail stays passable
+//     corner bank toe (|Y| 3300)                      the rail's back reaches 3500, i.e. 200 uu INTO
+//                                                     the bank, on purpose: the alternative is a
+//                                                     200 uu slot between two solids, which is a bot
+//                                                     trap and a place to get stuck. The bank's first
+//                                                     collision terrace out there is ~20 uu tall and
+//                                                     is simply swallowed by the rail's body — the
+//                                                     union of the two is the rail, unchanged.
+//     floor lamps (|Y| 1728 and 3840, Z 900)          none is inside a rail; the outer row lights it
+//     light bridges / flank rail (Z 1240 / 1640)      the crest is 616: nothing to cross
+//
+//   WHAT IT COSTS THE FLOOR. The outer LaneStripe (|Y| 3168) runs under the rail for the 6100 uu of
+//   its length, as any floor decal does under any structure. The rail draws its own toe line on the
+//   floor in the same colour and the same idiom, so the lane still reads as a lane.
+//
+// NEON, AND WHY THERE IS SO LITTLE OF IT ON THE FACE: THERE IS NONE.
+//   Every neon element in this file is built PROUD of the surface it decorates, and a proud strip on
+//   a surf face is a 12 uu lip across a surface players cross at 1500 uu/s — it would catch a capsule
+//   and end a ride. So the rail's two lines are placed where they cannot: one FLUSH in the crest's
+//   top surface (walkable ground, nothing rides it) and one on the FLOOR at the toe (a decal, no
+//   collision). Together they read as two parallel glowing lines the length of the lane, which is the
+//   same read the LaneStripes and the FlankRail already give the flank. Both wear the half's team
+//   colour and both are registered for the half-time repaint, like the cover and the floor grid.
+//
+// THE EXIT LANE (DEMO 29 ITEM 4). A rail's clearances are not only the ones beside it. A surfer
+// leaves the nose as a PROJECTILE and lands somewhere out in the lane, so the clearance that decides
+// whether the fast route is fun or a punishment is "what is in the LANDING zone" — and Patch 28's
+// table, which recorded 100 uu of X clear between the run's end and the innermost approach bar, was
+// answering a different question. Measured with -TraceSurfExitTest: rides left the nose at 1164, 1469
+// and 1894 uu/s and arrived on the floor at 183, 52 and 62, having flown ~1300 uu into that bar.
+// SurfRailRunX() now derives the far end from SurfRailExitObstacleX() and SurfRailExitClearance(), the
+// latter asking UTraceCharacterMovementComponent::GetSurfExitReach() how far the fastest possible
+// surfer can fly. It costs 1090 uu of main run on the shipped field and is printed at build time with
+// both numbers and a CLEAR / ENDS IN A WALL verdict, so it can never quietly stop being true.
+//
+// THE BAKE. This runs on the PROCEDURAL map only. Arena_Baked was baked before these existed and is
+// deliberately NOT re-baked here (W5-MAPFINISH records what a forced re-bake costs), so a baked level
+// has no rails until somebody bakes again — at which point these pieces come along for free, because
+// the bake watches the same four primitive factories this function calls and nothing here is special.
+
+float ATraceArenaBuilder::SurfRailMinFaceAngleDegrees() const
+{
+	// ASK THE MOVEMENT COMPONENT, do not assume. Cached statically for PlayerHeightUU()'s reason: the
+	// CDO cannot change within a process and this is read once per facet.
+	static const FVector2D Band = []() -> FVector2D
+	{
+		const UTraceCharacterMovementComponent* CDO =
+			UTraceCharacterMovementComponent::StaticClass()->GetDefaultObject<UTraceCharacterMovementComponent>();
+		if (CDO == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("ATraceArenaBuilder: could not read the surf slope band off the movement CDO; the surf "
+				     "rails fall back to 46-61 degrees, which is correct for the SHIPPED walkable limit and "
+				     "wrong the moment anybody changes it."));
+			return FVector2D(44.765f, 63.256f);
+		}
+
+		float Lo = 0.f;
+		float Hi = 0.f;
+		CDO->GetSurfSlopeBandDegrees(Lo, Hi);
+
+		UE_LOG(LogTraceGame, Log,
+			TEXT("Surf rails keyed to the movement component: this build surfs slopes %.2f..%.2f degrees, "
+			     "so the rail faces are cut %.2f..%.2f (a %.0f degree margin at each end)."),
+			Lo, Hi, Lo + TraceArenaConstants::SurfRailBandMarginDegrees,
+			Hi - TraceArenaConstants::SurfRailBandMarginDegrees,
+			TraceArenaConstants::SurfRailBandMarginDegrees);
+
+		return FVector2D(Lo, Hi);
+	}();
+
+	const float MinDegrees = static_cast<float>(Band.X);
+	const float MaxDegrees = static_cast<float>(Band.Y);
+
+	// The margin is applied at BOTH ends, and the pair is kept ordered even if a pathological band
+	// (somebody sets the walkable limit to 70 degrees) would otherwise invert it.
+	const float Margin = TraceArenaConstants::SurfRailBandMarginDegrees;
+	return FMath::Min(MinDegrees + Margin, FMath::Max(MinDegrees + 0.5f, MaxDegrees - Margin - 4.f));
+}
+
+float ATraceArenaBuilder::SurfRailHeight() const
+{
+	return PlayerHeightUU() * TraceArenaConstants::SurfRailHeightMult;
+}
+
+/** The steepest facet slope, in degrees. Kept next to its partner so the pair cannot drift. */
+static float TraceSurfRailMaxFaceAngleDegrees(float MinDegrees)
+{
+	float BandLo = 44.765f;
+	float BandHi = 63.256f;
+	if (const UTraceCharacterMovementComponent* CDO =
+		UTraceCharacterMovementComponent::StaticClass()->GetDefaultObject<UTraceCharacterMovementComponent>())
+	{
+		CDO->GetSurfSlopeBandDegrees(BandLo, BandHi);
+	}
+
+	// At least four degrees of arc, or the "curved" ramp is a flat one with extra collision boxes.
+	return FMath::Max(MinDegrees + 4.f, BandHi - TraceArenaConstants::SurfRailBandMarginDegrees);
+}
+
+float ATraceArenaBuilder::SurfRailFaceRadius() const
+{
+	const float MinDeg = SurfRailMinFaceAngleDegrees();
+	const float MaxDeg = TraceSurfRailMaxFaceAngleDegrees(MinDeg);
+
+	// A circular arc of radius R rising from slope MinDeg to slope MaxDeg gains R*(cos Min - cos Max)
+	// of height. Invert that for the R that gains exactly the crest height, and the whole profile
+	// follows from one number.
+	const float RiseFactor = FMath::Cos(FMath::DegreesToRadians(MinDeg)) - FMath::Cos(FMath::DegreesToRadians(MaxDeg));
+	if (RiseFactor <= UE_KINDA_SMALL_NUMBER)
+	{
+		return 0.f;
+	}
+
+	return SurfRailHeight() / RiseFactor;
+}
+
+float ATraceArenaBuilder::SurfRailFaceSpan() const
+{
+	const float MinDeg = SurfRailMinFaceAngleDegrees();
+	const float MaxDeg = TraceSurfRailMaxFaceAngleDegrees(MinDeg);
+	return SurfRailFaceRadius()
+		* (FMath::Sin(FMath::DegreesToRadians(MaxDeg)) - FMath::Sin(FMath::DegreesToRadians(MinDeg)));
+}
+
+float ATraceArenaBuilder::SurfRailToeY() const
+{
+	return HalfWidth() * TraceArenaConstants::SurfRailToeYFrac;
+}
+
+float ATraceArenaBuilder::SurfRailBackY() const
+{
+	// Past the bank toe on purpose — see the clearance table above. Clamped so the crest is never
+	// narrower than a comfortable walk (two capsule diameters) and never wider than the field.
+	const float CrestY = SurfRailToeY() + SurfRailFaceSpan();
+	const float Wanted = BankInnerHalfWidth() + TraceArenaConstants::SurfRailBackOverlap;
+	return FMath::Clamp(Wanted, CrestY + 160.f, HalfWidth() - 200.f);
+}
+
+float ATraceArenaBuilder::SurfRailExitObstacleX() const
+{
+	// =============================================================================================
+	// DEMO 29 ITEM 4(a) — THE FIRST SOLID A SURFER LEAVING THIS RAIL CAN FLY INTO.
+	//
+	// A surfer does not stop at the end of the rail; they leave the nose as a projectile and land
+	// somewhere out in the lane. So the quantity that matters is not "how much X is clear beside the
+	// structure" (Patch 28 checked that, and got 100 uu) but "what is in the LANDING lane".
+	//
+	// Only blocks whose Y band actually overlaps the rail's own are candidates: the goal-approach
+	// diamonds sit in the spine and a surfer passes well outboard of them. The pieces returned by
+	// this sweep on the shipped field are the innermost approach bar (|X| 11800..12200, |Y| 1850..
+	// 3150) and the outer lane pylon (|X| 12690..12910, |Y| 2790..3010) — the bar is nearer, so it is
+	// the answer, and it is the thing the exit rig measured rides hitting at 1469 uu/s.
+	//
+	// Everything is measured with the SAME accessors the build uses, so a layout change moves this
+	// with it rather than leaving a stale literal behind.
+	// =============================================================================================
+	const float HalfX = HalfLength();
+	const float HalfY = HalfWidth();
+	const float RailNearY = SurfRailToeY();
+	const float RailFarY = SurfRailBackY();
+
+	// OUTBOARD OF THE RAIL'S OWN START, AND THIS TEST IS LOAD-BEARING. Without it the sweep returns
+	// the INNER lane pylon at |X| 4690, which is behind the rail's near end and in nobody's exit lane
+	// — and the clamp derived from it cut the main run from 4868 uu to 900. A surfer travels away from
+	// the halfway line, so only what is in FRONT of the run can ever be flown into.
+	//
+	// The cut-off is the near end rather than the junction because the junction is what this
+	// computation is on its way to deciding, and a rail's own body is never a candidate anyway: the
+	// sweep only looks at cover and pylons.
+	const float RunStartX = HalfX * TraceArenaConstants::SurfRailNearXFrac;
+
+	// Nothing beyond the goal line is in a surfer's way: the endzone is 2400 uu of empty approach and
+	// a rail that reached it would have other problems. It is the backstop, not a real candidate.
+	float Nearest = GoalLineX();
+
+	auto Consider = [&Nearest, RailNearY, RailFarY, RunStartX](float CentreX, float ExtentX, float CentreY, float ExtentY)
+	{
+		// Y bands are compared as |Y| bands: everything in this file is mirrored, so a block at +Y and
+		// the rail at +Y are the pair that can collide.
+		const float BlockLoY = FMath::Abs(CentreY) - ExtentY;
+		const float BlockHiY = FMath::Abs(CentreY) + ExtentY;
+		if (BlockHiY < RailNearY || BlockLoY > RailFarY)
+		{
+			return;
+		}
+
+		const float NearFaceX = FMath::Abs(CentreX) - ExtentX;
+		if (NearFaceX <= RunStartX)
+		{
+			return;
+		}
+		Nearest = FMath::Min(Nearest, NearFaceX);
+	};
+
+	const float GoalX = GoalLineX();
+	for (const TraceArenaConstants::FCoverSpec& Spec : TraceArenaConstants::ApproachCover)
+	{
+		// A 45-degree footprint reaches further in both axes than its side length; using the
+		// half-diagonal is the conservative reading and it is the only one that is right for a
+		// clearance.
+		const bool bDiamond = !FMath::IsNearlyZero(Spec.Yaw);
+		const float ExtentX = (bDiamond ? UE_SQRT_2 : 1.f) * Spec.SizeX * 0.5f;
+		const float ExtentY = (bDiamond ? UE_SQRT_2 : 1.f) * Spec.SizeY * 0.5f;
+		Consider(FMath::Max(0.f, GoalX - Spec.XAnchor), ExtentX, HalfY * Spec.YFrac, ExtentY);
+	}
+
+	for (const float XFrac : TraceArenaConstants::LanePylonXFracs)
+	{
+		Consider(HalfX * XFrac, TraceArenaConstants::LanePylonSide * 0.5f,
+			HalfY * TraceArenaConstants::LanePylonYFrac, TraceArenaConstants::LanePylonSide * 0.5f);
+	}
+
+	return Nearest;
+}
+
+float ATraceArenaBuilder::SurfRailExitClearance() const
+{
+	// =============================================================================================
+	// DEMO 29 ITEM 4(a) — HOW MUCH LANE THE RAIL'S EXIT NEEDS, ASKED OF THE MOVEMENT COMPONENT.
+	//
+	// The measurement that produced this function: -TraceSurfExitTest, five rides on the shipped
+	// rail. The three fastest left the nose at 1164, 1469 and 1894 uu/s planar and arrived on the
+	// floor at 183, 52 and 62. They did not lose it to friction or to the landing — they flew about
+	// 1300 uu and hit the innermost approach bar. "A player loses all momentum at the end of the
+	// curve" was, first and largest, a fast lane that ends in a wall. AGAIN: Patch 28 already fixed
+	// one of those (the rail's own end rib, which is why the stepped nose exists) and its rig could
+	// not see this one, because it closed its sample the frame the SURF STATE closed — in mid-air,
+	// several hundred uu before the impact.
+	//
+	// The envelope is maximised ALONG THE NOSE rather than taken at the junction, and that is not
+	// pedantry: leaving later means leaving lower, which shortens the flight, but it also starts the
+	// flight further down the lane. The two trade off and the worst case is in the middle. On the
+	// shipped numbers the junction gives 2287 uu and the midpoint of the nose gives 2234, so the
+	// junction wins here — but a shallower nose would move the maximum and nothing would say so.
+	//
+	// Speed comes from UTraceCharacterMovementComponent::GetSurfExitReach(), which uses the ceiling
+	// for the FASTEST weapon profile. Retune the air cap and the rail re-cuts itself; that is the
+	// DEMO 21 rule, and it is the same rule that already derives the face angles.
+	// =============================================================================================
+	const UWorld* World = GetWorld();
+	const UTraceCharacterMovementComponent* CDO =
+		UTraceCharacterMovementComponent::StaticClass()->GetDefaultObject<UTraceCharacterMovementComponent>();
+	if (World == nullptr || CDO == nullptr)
+	{
+		return 0.f;
+	}
+
+	const float Height = SurfRailHeight();
+	const float NoseRun = Height * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	if (Height <= 1.f || NoseRun <= 1.f)
+	{
+		return 0.f;
+	}
+
+	const float Gravity = World->GetGravityZ();
+
+	// Sixteen stations along the nose. The profile is smooth and single-peaked, so this is far finer
+	// than it needs to be and costs nothing — it runs once per rail at build time.
+	float Worst = 0.f;
+	for (int32 Station = 0; Station <= 16; ++Station)
+	{
+		const float Along = NoseRun * (static_cast<float>(Station) / 16.f);
+		const float LaunchHeight = Height * (1.f - static_cast<float>(Station) / 16.f);
+		Worst = FMath::Max(Worst, Along + CDO->GetSurfExitReach(LaunchHeight, Gravity));
+	}
+
+	return Worst;
+}
+
+void ATraceArenaBuilder::SurfRailRunX(float& OutNearX, float& OutFarX) const
+{
+	OutNearX = HalfLength() * TraceArenaConstants::SurfRailNearXFrac;
+	OutFarX  = HalfLength() * TraceArenaConstants::SurfRailFarXFrac;
+
+	// DEMO 29 ITEM 4(a). The A/B arm restores the Patch 28 extents so "the exit lane is clear" and
+	// "the exit lane ends in a wall" are two columns of one table on one binary. Asked through
+	// IsSurfRailLegacyRun(), never read here: that function carries the Shipping guard, and a bare
+	// FParse on this line is precisely how the last legacy arm in this project shipped.
+	if (IsSurfRailLegacyRun())
+	{
+		return;
+	}
+
+	const float Height = SurfRailHeight();
+	const float NoseRun = Height * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	const float Clearance = SurfRailExitClearance();
+	if (Height <= 1.f || Clearance <= 0.f)
+	{
+		return;
+	}
+
+	// The JUNCTION is where a surfer can first leave the surface, so the clearance is measured from
+	// there — and the far end of the structure is the junction plus its own nose.
+	const float MaxJunctionX = SurfRailExitObstacleX() - Clearance;
+	const float ClampedFarX = MaxJunctionX + NoseRun;
+
+	// Never shorten the rail into something that is not a ramp. If the field genuinely cannot fit a
+	// rail with a safe exit, BuildSurfRails' own guard skips it and says so — a rail that fits by
+	// being cut to nothing would be worse than none.
+	OutFarX = FMath::Max(OutNearX + NoseRun + 900.f, FMath::Min(OutFarX, ClampedFarX));
+}
+
+ATraceArenaBuilder::FTraceSurfRailProbe ATraceArenaBuilder::GetSurfRailProbe(float XSign, float YSign) const
+{
+	FTraceSurfRailProbe Probe;
+
+	const float Height = SurfRailHeight();
+	const float Radius = SurfRailFaceRadius();
+	const float Span = SurfRailFaceSpan();
+	if (!bBuildSurfRails || Height <= 1.f || Radius <= 1.f || Span <= 1.f)
+	{
+		return Probe;
+	}
+
+	float NearX = 0.f;
+	float FarX = 0.f;
+	SurfRailRunX(NearX, FarX);
+
+	// The LEVEL main run is what the rig should be measuring. Past JunctionX the surface sinks into the
+	// floor by design (the exit nose), and a rig that started a ride in there would be timing a landing.
+	const float NoseRun = Height * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	const float MainRun = (FarX - NearX) - NoseRun;
+	if (MainRun <= 600.f)
+	{
+		return Probe;
+	}
+
+	const float MinDeg = SurfRailMinFaceAngleDegrees();
+	const float MaxDeg = TraceSurfRailMaxFaceAngleDegrees(MinDeg);
+	const float ToeY = SurfRailToeY();
+	const float CrestY = ToeY + Span;
+	const float SignY = (YSign < 0.f) ? -1.f : 1.f;
+	const float SignX = (XSign < 0.f) ? -1.f : 1.f;
+
+	// THE ENTRY POINT IS TWO THIRDS UP THE ARC, which is where a player who has just stepped off the
+	// crest actually lands, and it is well clear of both ends of the band: a rig that dropped a pawn
+	// on the very first facet would be measuring the shallowest slope in the arena and calling it
+	// surf. The angle, the height and the offset all come from the same arc the build uses.
+	const float EntryAngleRad = FMath::DegreesToRadians(FMath::Lerp(MinDeg, MaxDeg, 0.667f));
+	const float MinRad = FMath::DegreesToRadians(MinDeg);
+	const float EntryOffsetY = Radius * (FMath::Sin(EntryAngleRad) - FMath::Sin(MinRad));
+	const float EntryZ = Radius * (FMath::Cos(MinRad) - FMath::Cos(EntryAngleRad));
+
+	// The facet normal at that station: inboard and up, mirrored with the quadrant.
+	const FVector Normal(0.f, -SignY * FMath::Sin(EntryAngleRad), FMath::Cos(EntryAngleRad));
+
+	// A quarter of the way along the run, so a ride has three quarters of the rail ahead of it.
+	const float EntryX = SignX * (NearX + MainRun * 0.15f);
+
+	Probe.bValid = true;
+	Probe.FaceNormal = Normal.GetSafeNormal();
+	// 120 uu OFF the face along its normal, not 40: the capsule is 34 uu in radius and 88 uu in half
+	// height, so anything closer starts the rig with the pawn already inside the ramp and the first
+	// thing measured is a depenetration rather than a ride.
+	Probe.FaceEntry = FVector(EntryX, SignY * (ToeY + EntryOffsetY), EntryZ) + Probe.FaceNormal * 120.f;
+	Probe.RunDirection = FVector(SignX, 0.f, 0.f);
+	Probe.RunLength = MainRun;
+	Probe.Height = Height;
+	Probe.MinFaceAngleDegrees = MinDeg;
+	Probe.MaxFaceAngleDegrees = MaxDeg;
+	Probe.CrestStand = FVector(SignX * (NearX + MainRun * 0.5f),
+		SignY * (CrestY + (SurfRailBackY() - CrestY) * 0.5f), Height);
+
+	// DEMO 29 ITEM 4. The toe, ON THE FLOOR, a third of the way along the level main run — the place a
+	// player running the outer lane meets the rail. The arc's first station is Z = 0 at Y = ToeY by
+	// construction (StationY/StationZ are both zero at MinDeg), so this is the arc's own start point
+	// and not a second guess at it.
+	Probe.ToeOnFloor = FVector(SignX * (NearX + MainRun * 0.333f), SignY * ToeY, 0.f);
+
+	return Probe;
+}
+
+void ATraceArenaBuilder::BuildSurfRails(bool bBuildVisuals)
+{
+	const float Height = SurfRailHeight();
+	const float Radius = SurfRailFaceRadius();
+	const float Span = SurfRailFaceSpan();
+
+	float NearX = 0.f;
+	float FarX = 0.f;
+	SurfRailRunX(NearX, FarX);
+
+	const float NoseRun = Height * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	if (Height <= 1.f || Radius <= 1.f || Span <= 1.f || (FarX - NearX) <= (NoseRun + 600.f))
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Arena] Surf rails skipped: the field cannot fit one (height %.0f, arc radius %.0f, "
+			     "face span %.0f, run %.0f uu, nose %.0f uu)."),
+			Height, Radius, Span, FarX - NearX, NoseRun);
+		return;
+	}
+
+	const float MinDeg = SurfRailMinFaceAngleDegrees();
+	const float MaxDeg = TraceSurfRailMaxFaceAngleDegrees(MinDeg);
+	const float MinRad = FMath::DegreesToRadians(MinDeg);
+	const float ToeY = SurfRailToeY();
+	const float CrestY = ToeY + Span;
+	const float BackY = SurfRailBackY();
+
+	// The ridable main run, then the stepped nose that lets a surfer off the end of it.
+	const int32 NoseSteps = FMath::Clamp(TraceArenaConstants::SurfRailNoseSteps, 1, 8);
+	const float MainRun = (FarX - NearX) - NoseRun;
+	const float JunctionX = NearX + MainRun;
+	const float StepRun = NoseRun / static_cast<float>(NoseSteps);
+	const float StepDrop = Height / static_cast<float>(NoseSteps + 1);
+
+	const float AccessRun = Height * FMath::Max(1.f, TraceArenaConstants::SurfRailAccessRunPerRise);
+	const float AccessSlopeRad = FMath::Atan2(Height, AccessRun);
+	const float AccessSlopeDeg = FMath::RadiansToDegrees(AccessSlopeRad);
+	const float AccessSlopeLength = FMath::Sqrt(AccessRun * AccessRun + Height * Height);
+
+	const float NoseCrestRad = FMath::Atan2(Height, NoseRun);
+	const float NoseCrestDeg = FMath::RadiansToDegrees(NoseCrestRad);
+	const float NoseCrestLength = FMath::Sqrt(NoseRun * NoseRun + Height * Height);
+
+	// Arc stations, in the cross-section's own (outboard from the toe, up from the floor) frame. ONE
+	// definition, used by the face, by the fillers and by GetSurfRailProbe().
+	auto StationY = [Radius, MinRad](float Degrees)
+	{
+		return Radius * (FMath::Sin(FMath::DegreesToRadians(Degrees)) - FMath::Sin(MinRad));
+	};
+	auto StationZ = [Radius, MinRad](float Degrees)
+	{
+		return Radius * (FMath::Cos(MinRad) - FMath::Cos(FMath::DegreesToRadians(Degrees)));
+	};
+	auto FacetAngle = [MinDeg, MaxDeg](int32 Index)
+	{
+		return FMath::Lerp(MinDeg, MaxDeg,
+			static_cast<float>(Index) / static_cast<float>(TraceArenaConstants::SurfRailFacets));
+	};
+
+	// THE FACE gets the DAIS/BANK emissive, not the cover blocks'. It is by area the largest new
+	// surface in the arena and it is INCLINED toward the key light, which is the same term the palette
+	// note one screen up records as blowing platform tops out to a flat pale sheet. The body, the
+	// fillers and the two ramps are small or vertical faces a player ends up nose-to-nose with, which
+	// is the cover blocks' case, so they take the cover blocks' number.
+	UMaterialInstanceDynamic* FaceMID = bBuildVisuals
+		? MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.50f, 0.f,
+			TraceArenaConstants::NeonNeutral, TraceArenaConstants::SurfRailBodyEmissive)
+		: nullptr;
+	UMaterialInstanceDynamic* BodyMID = bBuildVisuals
+		? MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.52f, 0.05f,
+			TraceArenaConstants::NeonNeutral, 0.026f)
+		: nullptr;
+
+	int32 CollisionBoxes = 0;
+
+	for (const float XSign : { -1.f, 1.f })
+	{
+		// The half's colour, and REGISTERED for the half-time repaint like the cover and the grid: a
+		// rail still saying "blue half" after the sides swap misinforms the player it exists to orient.
+		const ETraceTeam HalfTeam = (XSign < 0.f) ? ETraceTeam::Blue : ETraceTeam::Orange;
+		UMaterialInstanceDynamic* CrestLineMID = bBuildVisuals
+			? MakeNeonMID(TraceTeamColor(HalfTeam), TraceArenaConstants::GlowLip)
+			: nullptr;
+		UMaterialInstanceDynamic* ToeLineMID = bBuildVisuals
+			? MakeNeonMID(TraceTeamColor(HalfTeam), TraceArenaConstants::GlowLaneStripe)
+			: nullptr;
+		RegisterSideMID(XSign, CrestLineMID, /*bNeon=*/true, TraceArenaConstants::GlowLip);
+		RegisterSideMID(XSign, ToeLineMID, /*bNeon=*/true, TraceArenaConstants::GlowLaneStripe);
+
+		for (const float YSign : { -1.f, 1.f })
+		{
+			// =====================================================================================
+			// ONE LEVEL SECTION OF RAIL: the curved face, and the fillers that make it SOLID.
+			//
+			// Called once for the main run at Z offset 0, and once per nose step at a NEGATIVE offset
+			// — the identical cross-section, sunk further into the floor each time. Reusing the level
+			// builder rather than sweeping the section along a descending line is a deliberate
+			// retreat from a version that DID sweep it, and the reason is worth recording: a swept
+			// section's slabs are boxes whose local axes no longer line up with the vertical
+			// cross-section, so consecutive facets stop sharing an edge and leave ~10 uu lips. The rig
+			// found it — rides that were holding 1,500 uu/s lost 400-850 of it in a single frame at
+			// the junction, every time, in both halves of the field.
+			//
+			// A STAIRCASE THAT ONLY EVER STEPS DOWN CANNOT DO THAT, and it is a proof rather than a
+			// tuning: each step's far end face has its outward normal pointing ALONG the direction of
+			// travel, so a surfer leaves that solid through it rather than arriving at it, and the
+			// next step is strictly lower. There is nothing in front of the player to hit at any
+			// height, on any facet, at any speed.
+			//
+			// @param SectionNearX |X| where the section starts
+			// @param SectionRun   |X| length of the section
+			// @param ZOffset      how far the whole cross-section is sunk. 0 for the main run.
+			// =====================================================================================
+			auto BuildLevelSection = [&](float SectionNearX, float SectionRun, float ZOffset)
+			{
+				const float CentreX = XSign * (SectionNearX + SectionRun * 0.5f);
+
+				for (int32 Facet = 0; Facet < TraceArenaConstants::SurfRailFacets; ++Facet)
+				{
+					const float Alpha0 = FacetAngle(Facet);
+					const float Alpha1 = FacetAngle(Facet + 1);
+
+					const float LowY = StationY(Alpha0);
+					const float LowZ = StationZ(Alpha0) + ZOffset;
+					const float HighY = StationY(Alpha1);
+					const float HighZ = StationZ(Alpha1) + ZOffset;
+
+					// Entirely under the floor: this facet is not part of the arena at this offset.
+					if (HighZ <= 1.f)
+					{
+						continue;
+					}
+
+					// A chord of a circle has the arc's MID angle as its slope, exactly, so the whole
+					// facet is one plane and there is no fitting to do.
+					const float MidRad = FMath::DegreesToRadians((Alpha0 + Alpha1) * 0.5f);
+					const float ChordLength = FMath::Sqrt(FMath::Square(HighY - LowY) + FMath::Square(HighZ - LowZ));
+
+					// The top facet gets no upward extension: above it the surface is the FLAT crest,
+					// which is SHALLOWER, so an extension there would stand proud of walkable ground.
+					// Everywhere else the concave profile puts both extensions underneath — see the
+					// constant.
+					const float LowerOverlap = TraceArenaConstants::SurfRailFacetOverlap;
+					const float UpperOverlap = (Facet == TraceArenaConstants::SurfRailFacets - 1)
+						? 0.f : TraceArenaConstants::SurfRailFacetOverlap;
+
+					// Up-slope unit vector along the chord, and the face normal, both mirrored in Y.
+					const FVector UpSlope(0.f, YSign * FMath::Cos(MidRad), FMath::Sin(MidRad));
+					const FVector Normal(0.f, -YSign * FMath::Sin(MidRad), FMath::Cos(MidRad));
+
+					// Centre of the chord, then shifted for the asymmetric overlap and dropped half a
+					// thickness along the normal so the TOP FACE is the chord rather than the middle of
+					// the slab. Same construction the goal ramps use, one dimension further.
+					const FVector ChordMid(CentreX, YSign * (ToeY + (LowY + HighY) * 0.5f),
+						(LowZ + HighZ) * 0.5f);
+
+					const FVector Centre = ChordMid
+						+ UpSlope * ((UpperOverlap - LowerOverlap) * 0.5f)
+						- Normal * (TraceArenaConstants::SurfRailFacetThickness * 0.5f);
+
+					const FVector Size(SectionRun, ChordLength + LowerOverlap + UpperOverlap,
+						TraceArenaConstants::SurfRailFacetThickness);
+
+					// MakeFromZX puts the slab's own +Z on the face normal and its +X along the rail,
+					// which is the only orientation that makes the box's TOP the surface a player rides.
+					const FRotator FacetRotation =
+						FRotationMatrix::MakeFromZX(Normal, FVector(XSign, 0.f, 0.f)).Rotator();
+
+					AddCollisionBlockRotated(Centre, Size, TEXT("SurfRailFace"), FacetRotation);
+					++CollisionBoxes;
+
+					if (bBuildVisuals)
+					{
+						AddMeshBlockRotated(CubeMesh, Centre, Size, FaceMID, /*bCastShadow=*/true,
+							TEXT("SurfRailFace"), FacetRotation);
+					}
+				}
+
+				// THE FILLERS, AND WHY EACH ONE CAN NEVER POKE THROUGH THE FACE. Filler k spans the Y
+				// band of facet k and stands from the floor to that facet's LOW end. The arc is
+				// monotone, so everywhere inside that band the real surface is at or above the filler's
+				// top BY CONSTRUCTION — no fitting, no tolerance, and no way for a geometry retune to
+				// break it. The slab above reaches 200 uu down its own normal, which overlaps the
+				// filler across the whole band, so between them the cross-section is SOLID: there is no
+				// 6,100 uu tunnel behind the plates for a player to walk into and hide in.
+				for (int32 Facet = 1; Facet < TraceArenaConstants::SurfRailFacets; ++Facet)
+				{
+					const float LowY = StationY(FacetAngle(Facet));
+					const float HighY = StationY(FacetAngle(Facet + 1));
+					const float FillTop = StationZ(FacetAngle(Facet)) + ZOffset;
+					if (FillTop <= 1.f || HighY - LowY <= 1.f)
+					{
+						continue;
+					}
+
+					const FVector FillCentre(CentreX, YSign * (ToeY + (LowY + HighY) * 0.5f), FillTop * 0.5f);
+					const FVector FillSize(SectionRun, HighY - LowY, FillTop);
+
+					AddCollisionBlock(FillCentre, FillSize, TEXT("SurfRailFill"));
+					++CollisionBoxes;
+
+					if (bBuildVisuals)
+					{
+						AddMeshBlock(CubeMesh, FillCentre, FillSize, FaceMID, /*bCastShadow=*/false,
+							TEXT("SurfRailFill"));
+					}
+				}
+			};
+
+			// --- 1. The level main run ---------------------------------------------------------------
+			BuildLevelSection(NearX, MainRun, /*ZOffset=*/0.f);
+
+			// --- 2. The stepped exit nose --------------------------------------------------------------
+			//
+			// THIS EXISTS BECAUSE THE FIRST BUILD ENDED IN A WALL AND THE RIG HIT IT. A surfer holding a
+			// good strafe rode the full face in 3.9 s and met the end at 1,300 uu/s. A fast lane that
+			// terminates in a flat face is a mechanic that punishes the players who are best at it.
+			for (int32 Step = 0; Step < NoseSteps; ++Step)
+			{
+				BuildLevelSection(JunctionX + StepRun * static_cast<float>(Step), StepRun,
+					-StepDrop * static_cast<float>(Step + 1));
+			}
+
+			// --- 3. The body behind the crest, over the main run ---------------------------------------
+			const FVector BodyCentre(XSign * (NearX + MainRun * 0.5f), YSign * (CrestY + BackY) * 0.5f,
+				Height * 0.5f);
+			AddCollisionBlock(BodyCentre, FVector(MainRun, BackY - CrestY, Height), TEXT("SurfRailBody"));
+			++CollisionBoxes;
+			if (bBuildVisuals)
+			{
+				AddMeshBlock(CubeMesh, BodyCentre, FVector(MainRun, BackY - CrestY, Height),
+					BodyMID, /*bCastShadow=*/true, TEXT("SurfRailBody"));
+			}
+
+			// --- 4. The crest's own way down, over the nose --------------------------------------------
+			//
+			// One pitched slab across the crest band, from the crest to the floor over the nose run.
+			// 27 degrees is walkable, so the high route has an exit at BOTH ends rather than a drop at
+			// one — and it is the piece that makes the stepped face underneath read as a prow rather
+			// than as a mistake.
+			{
+				const FRotator NoseRotation(-XSign * NoseCrestDeg, 0.f, 0.f);
+				const FVector NoseNormal(XSign * FMath::Sin(NoseCrestRad), 0.f, FMath::Cos(NoseCrestRad));
+				const FVector NoseTopCentre(XSign * (JunctionX + NoseRun * 0.5f),
+					YSign * (CrestY + BackY) * 0.5f, Height * 0.5f);
+				const FVector NoseCentre = NoseTopCentre
+					- NoseNormal * (TraceArenaConstants::SurfRailFacetThickness * 0.5f);
+				const FVector NoseSize(NoseCrestLength, BackY - CrestY,
+					TraceArenaConstants::SurfRailFacetThickness);
+
+				AddCollisionBlockRotated(NoseCentre, NoseSize, TEXT("SurfRailNose"), NoseRotation);
+				++CollisionBoxes;
+				if (bBuildVisuals)
+				{
+					AddMeshBlockRotated(CubeMesh, NoseCentre, NoseSize, BodyMID, /*bCastShadow=*/true,
+						TEXT("SurfRailNose"), NoseRotation);
+				}
+			}
+
+			// --- 5. The walkable access ramp at the inboard end -----------------------------------------
+			//
+			// WITHOUT THIS THE CREST IS NOT A ROUTE. 616 uu is over three times the jump apex, so a
+			// player on foot could not reach the top of their own team's rail and the whole structure
+			// would be scenery with a fast surface on one side of it. 21 degrees is well inside the
+			// walkable limit, and the ramp is built exactly as the goal ramps are: a slab rotated in
+			// pitch, dropped half a thickness along its own normal so its TOP is the walking surface.
+			{
+				const FRotator AccessRotation(XSign * AccessSlopeDeg, 0.f, 0.f);
+				const float FootX = NearX - AccessRun;
+				const FVector TopFaceCentre(
+					XSign * (FootX + AccessRun * 0.5f),
+					YSign * (CrestY + BackY) * 0.5f,
+					Height * 0.5f);
+				const FVector AccessNormal(-XSign * FMath::Sin(AccessSlopeRad), 0.f, FMath::Cos(AccessSlopeRad));
+				const FVector AccessCentre = TopFaceCentre
+					- AccessNormal * (TraceArenaConstants::SurfRailFacetThickness * 0.5f);
+				const FVector AccessSize(AccessSlopeLength, BackY - CrestY,
+					TraceArenaConstants::SurfRailFacetThickness);
+
+				AddCollisionBlockRotated(AccessCentre, AccessSize, TEXT("SurfRailAccess"), AccessRotation);
+				++CollisionBoxes;
+				if (bBuildVisuals)
+				{
+					AddMeshBlockRotated(CubeMesh, AccessCentre, AccessSize, BodyMID, /*bCastShadow=*/true,
+						TEXT("SurfRailAccess"), AccessRotation);
+				}
+			}
+
+			if (!bBuildVisuals)
+			{
+				continue;   // Dedicated server: collision only, byte-identical to a client's.
+			}
+
+			// --- 6. The two lines. Neither can be ridden, which is why they are where they are ----------
+			//
+			// FLUSH, not proud. Every other neon element in this file stands off the surface it
+			// decorates by LipOut (12 uu); on a rail that would be a 12 uu lip, and a lip on a surf face
+			// catches a capsule at 1500 uu/s. The crest line's top sits exactly at the crest, on ground
+			// nobody rides, and the toe line is a floor decal outside the structure entirely.
+			AddMeshBlock(CubeMesh,
+				FVector(XSign * (NearX + MainRun * 0.5f), YSign * (CrestY + BackY) * 0.5f,
+					Height - TraceArenaConstants::SurfRailCrestLineHeight * 0.5f),
+				FVector(MainRun, TraceArenaConstants::SurfRailCrestLineWidth,
+					TraceArenaConstants::SurfRailCrestLineHeight),
+				CrestLineMID, /*bCastShadow=*/false, TEXT("SurfRailCrestLine"));
+
+			AddMeshBlock(CubeMesh,
+				FVector(XSign * (NearX + (MainRun + NoseRun) * 0.5f),
+					YSign * (ToeY - TraceArenaConstants::SurfRailToeLineWidth * 0.5f),
+					TraceArenaConstants::GoalLineZ),
+				FVector(MainRun + NoseRun, TraceArenaConstants::SurfRailToeLineWidth,
+					TraceArenaConstants::GoalLineThickness),
+				ToeLineMID, /*bCastShadow=*/false, TEXT("SurfRailToeLine"));
+		}
+	}
+
+	// Spelled out at Log for the reason the corner banks' line is: the numbers anybody asks about a
+	// surf ramp are how steep it is, how long the ridable band is, whether the shallowest part of it is
+	// genuinely un-walkable, and what happens at the end of it. All of them are derived here rather
+	// than read off a screenshot.
+	// DEMO 29 ITEM 4(a), SAID OUT LOUD. "The exit lane is clear" is the claim this patch makes about
+	// the rails, and it is a comparison between two numbers, so both of them are printed next to the
+	// verdict rather than left for a reader to reconstruct from the geometry.
+	{
+		const float ObstacleX = SurfRailExitObstacleX();
+		const float Clearance = SurfRailExitClearance();
+		const float Reach = JunctionX + Clearance;
+		UE_LOG(LogTraceGame, Log,
+			TEXT("Surf rail EXIT LANE: a surfer can leave the nose and travel up to %.0f uu past the "
+			     "junction at |X| %.0f, i.e. as far as |X| %.0f; the first solid in the lane is at |X| "
+			     "%.0f -> %s. (Demo 29 item 4: before this clamp the far end stood at |X| %.0f and rides "
+			     "measured at 1469 uu/s arrived on the floor at 52.)"),
+			Clearance, JunctionX, Reach, ObstacleX,
+			(Reach <= ObstacleX) ? TEXT("CLEAR") : TEXT("*** THE EXIT ENDS IN A WALL ***"),
+			HalfLength() * TraceArenaConstants::SurfRailFarXFrac);
+	}
+
+	const float ArcLength = Radius * FMath::DegreesToRadians(MaxDeg - MinDeg);
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Surf rails: 4 x (%d facets %.2f..%.2f deg [DERIVED from the movement surf band, margin "
+		     "%.0f deg], arc R=%.0f uu, %.0f uu of ridable band across the face, %.0f uu face span, crest "
+		     "%.0f uu | main run %.0f uu level + a %d-step nose over %.0f uu dropping %.0f uu a step to a "
+		     "%.0f uu terminal face | %.0f uu walkable crest, access ramp %.1f deg over %.0f uu, crest "
+		     "descent %.1f deg). |X| %.0f..%.0f (junction %.0f), |Y| toe %.0f crest %.0f back %.0f. "
+		     "%d collision boxes in total."),
+		TraceArenaConstants::SurfRailFacets, MinDeg, MaxDeg,
+		TraceArenaConstants::SurfRailBandMarginDegrees, Radius, ArcLength, Span, Height,
+		MainRun, NoseSteps, NoseRun, StepDrop, Height - StepDrop * static_cast<float>(NoseSteps),
+		BackY - CrestY, AccessSlopeDeg, AccessRun, NoseCrestDeg,
+		NearX, FarX, JunctionX, ToeY, CrestY, BackY, CollisionBoxes);
 }
 
 void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
@@ -3427,9 +4742,19 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 			// is the one who scores on it - see ATraceEndzone's class comment. It is a lit surface
 			// with a faint emissive term rather than a neon block, so it reads as a floor that glows
 			// rather than as a light panel, and the goal line in front of it stays the bright thing.
+			//
+			// HOW FAINT IS THE WHOLE POINT: in mode A this is the ground a character stands on
+			// inside its own endzone, and both numbers come from one place so the built MID and the
+			// registration the half-time switch repaints from cannot drift apart. The measurement
+			// that set the scale, and why the answer is value and not hue, is on
+			// EndzonePatchBaseDim.
+			const FEndzoneFloorPaint FloorPaint = EndzoneFloorPaint(
+				TraceArenaConstants::EndzonePatchBaseDim, TraceArenaConstants::EndzonePatchGlow);
 			UMaterialInstanceDynamic* PatchMID = MakeSurfaceMID(
-				TraceArenaConstants::Dim(TeamColor, 0.020f), 0.20f, 0.f, TeamColor, 0.10f);
-			RegisterSideMID(Sign, PatchMID, /*bNeon=*/false, /*Intensity=*/0.10f, /*BaseDim=*/0.020f);
+				TraceArenaConstants::Dim(TeamColor, FloorPaint.BaseDim), 0.20f, 0.f,
+				TeamColor, FloorPaint.Glow);
+			RegisterSideMID(Sign, PatchMID, /*bNeon=*/false,
+				/*Intensity=*/FloorPaint.Glow, /*BaseDim=*/FloorPaint.BaseDim);
 			AddMeshBlock(CubeMesh,
 				FVector(CenterX, 0.f, TraceArenaConstants::PatchZ),
 				FVector(Depth, ZoneWidth, TraceArenaConstants::PatchThickness),
@@ -3502,6 +4827,19 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 				FVector(TraceArenaConstants::GateBeamSize, ZoneWidth, TraceArenaConstants::GateBeamSize),
 				0.f, GateBodyMID, GateNeonMID, /*bCollide=*/false, TEXT("GateBeam"),
 				GateFaceMID, /*bVerticalTrim=*/false);   // a horizontal beam has no vertical corners worth lighting
+
+			// One finial on the beam over each tower (release overhaul, MAP plan §4.4): a 120 uu
+			// post rising 200 uu above the 2600 beam top, so the gate breaks the wall-top line at
+			// 2800 — the second of the five silhouette heights. It wears the gate's own registered
+			// neon MID, so the side switch repaints it for free with zero new registrations. No
+			// collision (it is 2600 uu up), no shadow.
+			const float FinialZ = TraceArenaConstants::GateTowerHeight + TraceArenaConstants::GateBeamSize + 100.f;
+			for (const float YSign : { -1.f, 1.f })
+			{
+				AddMeshBlock(CubeMesh, FVector(GateX, YSign * TowerY, FinialZ),
+					FVector(120.f, 120.f, 200.f),
+					GateNeonMID, /*bCastShadow=*/false, TEXT("GateFinial"));
+			}
 		}
 
 		// The trigger itself is server-only: scoring is an authority decision, and a client copy
@@ -3609,11 +4947,18 @@ void ATraceArenaBuilder::BuildGoalRing(float Sign, bool bBuildVisuals)
 	// The ring body and its rim take the colour of the team that DEFENDS this end, exactly as the
 	// endzone patch does, and are registered for the half-time repaint so the sides swap with
 	// everything else.
+	//
+	// The hoop PULSES — 0.25 Hz / ±12% (release overhaul, MAP plan §6.2): the goal is the one thing
+	// in the arena that is an OBJECTIVE rather than architecture, and the slow breath is what says
+	// so at any distance. The goal beacon above it runs the same rate off the same Time uniform, so
+	// the pillar and the ring are phase-locked for free. The repaint only touches Color/Glow
+	// (ApplyTeamSides), so the pulse survives every side switch; the bake copies scalar parameters,
+	// so it survives the re-bake too.
 	UMaterialInstanceDynamic* RingBodyMID = bBuildVisuals
 		? MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.50f, 0.f, TeamColor, 0.035f)
 		: nullptr;
 	UMaterialInstanceDynamic* RingNeonMID = bBuildVisuals
-		? MakeNeonMID(TeamColor, TraceArenaConstants::GlowGoalRing)
+		? MakeNeonMID(TeamColor, TraceArenaConstants::GlowGoalRing, /*PulseRate=*/0.25f, /*PulseAmp=*/0.12f)
 		: nullptr;
 
 	RegisterSideMID(Sign, RingBodyMID, /*bNeon=*/false, /*Intensity=*/0.035f, /*BaseDim=*/-1.f);
@@ -3660,13 +5005,23 @@ void ATraceArenaBuilder::BuildGoalRing(float Sign, bool bBuildVisuals)
 		// darkest.
 		AddMeshBlockRotated(CubeMesh, SpokeCentre, SpokeSize, RingBodyMID, /*bCastShadow=*/false,
 			TEXT("GoalRingSpoke"), SpokeRotation);
+	}
 
-		// THE HOOP. A thin bright band wrapped round the annulus's inner rim, standing GoalRingRimProud
-		// past EACH face so the ring is visible edge-on from the halfway line and from the pocket
-		// alike. This is the entire answer to "make it visually obvious what and where the goal is",
-		// and since spec v28 §8 it is ONE band through the whole thickness rather than one strip on the
-		// field-facing side - a goal you can score through from either side may not be brighter from
-		// one of them.
+	// THE HOOP. A thin bright band wrapped round the annulus's inner rim, standing GoalRingRimProud
+	// past EACH face so the ring is visible edge-on from the halfway line and from the pocket
+	// alike. This is the entire answer to "make it visually obvious what and where the goal is",
+	// and since spec v28 §8 it is ONE band through the whole thickness rather than one strip on the
+	// field-facing side - a goal you can score through from either side may not be brighter from
+	// one of them.
+	//
+	// ITS OWN LOOP AT ITS OWN SEGMENT COUNT since the release overhaul: GoalRingRimSegments (24)
+	// bars against the annulus's 16 spokes — see the facet-moiré note on the constant. Purely
+	// visual, so the whole loop sits behind bBuildVisuals; the scoring disc and the physical hole
+	// are untouched.
+	if (bBuildVisuals)
+	{
+		const int32 RimSegments = TraceArenaConstants::GoalRingRimSegments;
+		const float RimSectorHalfAngle = PI / static_cast<float>(RimSegments);
 		const float RimRadius = Radius + TraceArenaConstants::GoalRingRimDepth * 0.5f;
 
 		// SIZED AT THE RIM'S OWN RADIUS, not at the spoke's. MEASURED: reusing SpokeWidth here (which
@@ -3674,16 +5029,24 @@ void ATraceArenaBuilder::BuildGoalRing(float Sign, bool bBuildVisuals)
 		// uu long on a circle that only needs 410 at that radius - so they overshot each other by 68%
 		// and the hoop photographed as a jagged pinwheel of crossing bars rather than as a ring. The
 		// 1.06 is the seam overlap and nothing more.
-		const float RimWidth = 2.f * RimRadius * FMath::Tan(SectorHalfAngle) * 1.06f;
+		const float RimWidth = 2.f * RimRadius * FMath::Tan(RimSectorHalfAngle) * 1.06f;
 
-		const FVector RimCentre(PlaneX, RimRadius * CosA, CentreZ + RimRadius * SinA);
-		const FVector RimSize(
-			HalfThickness * 2.f + TraceArenaConstants::GoalRingRimProud * 2.f,
-			TraceArenaConstants::GoalRingRimDepth,
-			RimWidth);
+		for (int32 Index = 0; Index < RimSegments; ++Index)
+		{
+			const float Angle = (2.f * PI * static_cast<float>(Index)) / static_cast<float>(RimSegments);
+			const FRotator RimRotation(0.f, 0.f, FMath::RadiansToDegrees(Angle));
 
-		AddMeshBlockRotated(CubeMesh, RimCentre, RimSize, RingNeonMID, /*bCastShadow=*/false,
-			TEXT("GoalRingRim"), SpokeRotation);
+			const FVector RimCentre(PlaneX,
+				RimRadius * FMath::Cos(Angle),
+				CentreZ + RimRadius * FMath::Sin(Angle));
+			const FVector RimSize(
+				HalfThickness * 2.f + TraceArenaConstants::GoalRingRimProud * 2.f,
+				TraceArenaConstants::GoalRingRimDepth,
+				RimWidth);
+
+			AddMeshBlockRotated(CubeMesh, RimCentre, RimSize, RingNeonMID, /*bCastShadow=*/false,
+				TEXT("GoalRingRim"), RimRotation);
+		}
 	}
 
 	// --- 2. The approach ramps, ONE ON EACH FACE ---------------------------------------------------
@@ -3711,10 +5074,16 @@ void ATraceArenaBuilder::BuildGoalRing(float Sign, bool bBuildVisuals)
 		const float SlopeRadians = FMath::Atan2(RampTop, Run);
 		const float SlopeDegrees = FMath::RadiansToDegrees(SlopeRadians);
 
+		// Scaled with the goal mouth and the endzone paint: this is a WALKABLE face inside the
+		// endzone, so a character standing on it needs the same value edge. See EndzonePatchBaseDim.
+		const FEndzoneFloorPaint RampPaint = EndzoneFloorPaint(
+			TraceArenaConstants::GoalRampBaseDim, TraceArenaConstants::GoalRampGlow);
 		UMaterialInstanceDynamic* RampMID = bBuildVisuals
-			? MakeSurfaceMID(TraceArenaConstants::Dim(TeamColor, 0.035f), 0.30f, 0.f, TeamColor, 0.10f)
+			? MakeSurfaceMID(TraceArenaConstants::Dim(TeamColor, RampPaint.BaseDim), 0.30f, 0.f,
+				TeamColor, RampPaint.Glow)
 			: nullptr;
-		RegisterSideMID(Sign, RampMID, /*bNeon=*/false, /*Intensity=*/0.10f, /*BaseDim=*/0.035f);
+		RegisterSideMID(Sign, RampMID, /*bNeon=*/false,
+			/*Intensity=*/RampPaint.Glow, /*BaseDim=*/RampPaint.BaseDim);
 
 		// FaceSign is the direction the ramp FALLS AWAY from the ring, in world X: -Sign runs back down
 		// the pitch, +Sign runs back into the pocket.
@@ -3830,9 +5199,18 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 		UMaterialInstanceDynamic* FrameMID = MakeNeonMID(TeamColor, TraceArenaConstants::GlowGoalFrame);
 		RegisterSideMID(Sign, FrameMID, /*bNeon=*/true, TraceArenaConstants::GlowGoalFrame);
 
+		// THE FLOOR A PLAYER ACTUALLY STANDS ON IN THE SHIPPED MODE. Mode B hides the full-width
+		// endzone paint, so this lane and the two ramps below are the endzone's ground - and this
+		// is the brightest of the three, because it is the thing being aimed at. Scaled with them
+		// so a character keeps a value edge against it; see EndzonePatchBaseDim for the
+		// measurement, and note that the number quoted there was measured on THIS surface.
+		const FEndzoneFloorPaint MouthPaint = EndzoneFloorPaint(
+			TraceArenaConstants::GoalMouthBaseDim, TraceArenaConstants::GoalMouthGlow);
 		UMaterialInstanceDynamic* MouthMID = MakeSurfaceMID(
-			TraceArenaConstants::Dim(TeamColor, 0.030f), 0.20f, 0.f, TeamColor, 0.16f);
-		RegisterSideMID(Sign, MouthMID, /*bNeon=*/false, /*Intensity=*/0.16f, /*BaseDim=*/0.030f);
+			TraceArenaConstants::Dim(TeamColor, MouthPaint.BaseDim), 0.20f, 0.f,
+			TeamColor, MouthPaint.Glow);
+		RegisterSideMID(Sign, MouthMID, /*bNeon=*/false,
+			/*Intensity=*/MouthPaint.Glow, /*BaseDim=*/MouthPaint.BaseDim);
 
 		// --- The approach lane on the floor, ON BOTH SIDES OF THE GOAL LINE -----------------------
 		//
@@ -3860,9 +5238,12 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 
 			for (const float YSign : { -1.f, 1.f })
 			{
+				// 0.6 -> 0.7 x the sill width (= 63 uu; was 54) for the release overhaul, MAP plan
+				// §7: the side rails are a T3 cross-arena read like the goal line, and 54 uu sat
+				// under the 56 uu the AA-safety table wants at that distance. Floor-flat, cap-exempt.
 				AddMeshBlock(CubeMesh,
 					FVector(LaneCentreX, YSign * MouthHalfY, TraceArenaConstants::GoalLineZ + 4.f),
-					FVector(Depth, TraceArenaConstants::GoalSillWidth * 0.6f, TraceArenaConstants::GoalLineThickness),
+					FVector(Depth, TraceArenaConstants::GoalSillWidth * 0.7f, TraceArenaConstants::GoalLineThickness),
 					FrameMID, /*bCastShadow=*/false, TEXT("GoalSideRail"));
 			}
 		}
@@ -3929,6 +5310,191 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 
 		SpawnedActors.Add(Goal);
 	}
+}
+
+void ATraceArenaBuilder::BuildSkyline(bool bBuildVisuals)
+{
+	// ---------------------------------------------------------------------------------------------
+	// THE SKY DRESSING — release overhaul, MAP plan §4. Three answers to two audit findings ("the
+	// sky is an empty gradient" and "orange territory does not read at distance"):
+	//
+	//   1. A ring of 24 dark towers 8,200–14,600 uu beyond the walls — inside the bible's
+	//      8,000–20,000 band, far enough that parallax is minimal and nobody asks to visit, close
+	//      enough to register as a city rather than a texture. The EIGHT towers behind each goal
+	//      wear rooftop neon in that end's defending colour; the eight along the flanks stay
+	//      neutral, staggered rather than mirrored so the two horizons are not twins.
+	//   2. One horizon glow band behind each skyline group, at Glow 0.8 — the "which way am I
+	//      facing" read for a viewer with no arena surface in frame. It is a SKY read, so it is
+	//      answerable only where sky is visible: from midfield and back it clears the wall-top
+	//      sightline (see the arithmetic where it is built), and close to an end wall it does not —
+	//      which is where the beacon and the end wall's own dressing are doing the talking anyway.
+	//   3. A 90 uu pillar of light from each goal ring's top up to 4,200 uu — wayfinding for the
+	//      objective itself (Glow 4.5, the T2 ceiling: the beacon points at the goal, it is not the
+	//      goal), pulsing in phase with the ring below it.
+	//
+	// Nothing else goes in the sky — no stars, no grid, an otherwise empty dark dome (bible §5.4.4).
+	//
+	// Everything here is pooled ISM instances via AddMeshBlock (MEASURED: 53 instances in 9 pools
+	// against a ~1,300-instance arena — the census line at the end of this function is what says so
+	// in every build log), bCastShadow=false, and NO COLLISION ANYWHERE: this function is called
+	// inside the bBuildVisuals gate, so a dedicated server never builds a sky at all. Tower bases
+	// extend to Z -2,000 so no base edge is ever visible over the 2,600 wall from any playable eye
+	// height. The beacon is deliberately built HERE and not in BuildGoals: it is sky furniture that
+	// serves BOTH scoring modes, so it must not be collected into GoalModePieces/EndzoneModePieces
+	// (BuildSkyline runs after BuildGoals' CollectPiecesSince, which is what keeps it out).
+	// ---------------------------------------------------------------------------------------------
+	if (!bBuildVisuals)
+	{
+		return;
+	}
+
+	// The cost guardrail of MAP plan §4.5 is a NUMBER, so the build states it rather than leaving
+	// every later tranche to difference two whole-arena totals from two different runs. Instances
+	// are appended to BuiltInstances in order by the pooled arm, so the delta across this function
+	// is exactly what the sky costs.
+	const int32 InstancesBeforeSkyline = BuiltInstances.Num();
+	const int32 PoolsBeforeSkyline = InstancePools.Num();
+
+	struct FSkyTower
+	{
+		float X;          // uu, the -X end's set; mirrored in X for the +X end
+		float Y;
+		float Footprint;  // square, uu
+		float Height;     // roof Z, uu
+	};
+
+	// Behind-goal towers, one end's worth (MAP plan §4.1 table, S1–S8). Heights 3,000–8,800 are what
+	// puts a jagged second line above the arena's own five termination heights.
+	static const FSkyTower EndTowers[] =
+	{
+		{ -28800.f,  -7200.f, 1600.f, 5200.f },
+		{ -31500.f,  -3600.f, 2400.f, 8800.f },
+		{ -27800.f,  -1000.f, 1000.f, 3400.f },
+		{ -33800.f,   1800.f, 2000.f, 7000.f },
+		{ -29400.f,   4400.f, 1400.f, 4600.f },
+		{ -27800.f,   7800.f,  800.f, 3000.f },
+		{ -32600.f,   8600.f, 1800.f, 6200.f },
+		{ -30000.f,  12000.f, 1200.f, 4000.f },
+	};
+
+	// Flank towers (F1–F8): absolute positions, both sides listed — the +Y four are the -Y four
+	// STAGGERED, not mirrored, so the two side horizons differ.
+	static const FSkyTower FlankTowers[] =
+	{
+		{ -12000.f, -14500.f, 1600.f, 4800.f },
+		{  -4000.f, -16500.f, 2200.f, 6600.f },
+		{   4800.f, -13600.f, 1000.f, 3600.f },
+		{  13200.f, -15800.f, 1800.f, 5600.f },
+		{ -13200.f,  15800.f, 1800.f, 5600.f },
+		{  -4800.f,  13600.f, 1000.f, 3600.f },
+		{   4000.f,  16500.f, 2200.f, 6600.f },
+		{  12000.f,  14500.f, 1600.f, 4800.f },
+	};
+
+	// One body MID for all 24 towers: they are distant mass at the terrace emissive (0.012), not
+	// close-up cover, and one MID means one ISM pool for every body.
+	UMaterialInstanceDynamic* TowerBodyMID = MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.50f, 0.f,
+		TraceArenaConstants::NeonNeutral, 0.012f);
+
+	// Rooftop lips barely breathe — 0.05 Hz / ±5% (MAP plan §6.2): a city glows, it does not blink.
+	// All lip widths are ≥ 56 uu by construction (the smallest footprint is 800), so the roofs pass
+	// the AA-safety minimums outright.
+	const float RoofLipHeight = 64.f;
+
+	auto AddTower = [&](const FSkyTower& Tower, float MirrorX, UMaterialInstanceDynamic* RoofMID)
+	{
+		const FVector Centre(Tower.X * MirrorX, Tower.Y, 0.f);
+
+		// Body: from Z -2000 (the base is never visible over the wall) up to the roof.
+		AddMeshBlock(CubeMesh,
+			FVector(Centre.X, Centre.Y, (Tower.Height - 2000.f) * 0.5f),
+			FVector(Tower.Footprint, Tower.Footprint, Tower.Height + 2000.f),
+			TowerBodyMID, /*bCastShadow=*/false, TEXT("SkylineTower"));
+
+		// Rooftop lip: footprint x 64 uu, top flush with the roof.
+		AddMeshBlock(CubeMesh,
+			FVector(Centre.X, Centre.Y, Tower.Height - RoofLipHeight * 0.5f),
+			FVector(Tower.Footprint, Tower.Footprint, RoofLipHeight),
+			RoofMID, /*bCastShadow=*/false, TEXT("SkylineRoof"));
+	};
+
+	// The neutral flank set: NeonNeutral at Glow 1.4, NOT registered — the flanks belong to neither
+	// end and must hold their colour through every side switch (the A/B's control group).
+	UMaterialInstanceDynamic* FlankRoofMID = MakeNeonMID(TraceArenaConstants::NeonNeutral, 1.4f,
+		/*PulseRate=*/0.05f, /*PulseAmp=*/0.05f);
+	for (const FSkyTower& Tower : FlankTowers)
+	{
+		AddTower(Tower, 1.f, FlankRoofMID);
+	}
+
+	for (const float Sign : { -1.f, 1.f })
+	{
+		// Which team defends THIS end, asked the same way BuildGoalRing asks it, so the sky is
+		// painted consistently with the goal it stands behind.
+		const ETraceTeam DefendingTeam = (TeamEndSign(ETraceTeam::Blue) == Sign) ? ETraceTeam::Blue : ETraceTeam::Orange;
+		const FLinearColor TeamColor = TraceTeamColor(DefendingTeam);
+
+		// Glow 1.4 is the bible's "Dim(lifted, 0.5)" horizon brightness implemented on the Glow
+		// SCALAR — brightness never rides the colour vector (the SetGlow law: a MID clamps vector
+		// parameters to [0,1], so a pre-multiplied colour flattens to white). Registered, so the
+		// eight roofs repaint with the end they stand behind.
+		UMaterialInstanceDynamic* RoofMID = MakeNeonMID(TeamColor, 1.4f, /*PulseRate=*/0.05f, /*PulseAmp=*/0.05f);
+		RegisterSideMID(Sign, RoofMID, /*bNeon=*/true, 1.4f);
+
+		// The table IS the -X set, so the -X end takes it verbatim (MirrorX +1) and the +X end takes
+		// it mirrored in X (MirrorX -1) — i.e. MirrorX = -Sign.
+		for (const FSkyTower& Tower : EndTowers)
+		{
+			AddTower(Tower, -Sign, RoofMID);
+		}
+
+		// The horizon glow band, BEHIND its skyline group: 26,000 uu wide, dim (Glow 0.8) — the sky
+		// itself catching the territory's colour, so "which way am I facing" has an answer even when
+		// no arena surface is in frame.
+		//
+		// THE HEIGHT IS A CORRECTION, and it is arithmetic rather than taste. The map plan put this
+		// band at Z −200..+400 "below the horizon line from any arena eye height" — but from INSIDE
+		// this arena the visual horizon is not Z 0, it is the 2,600 uu wall top, and the wall is
+		// 19,200 uu away while the band is 36,000. A sightline from an eye at height e grazing the
+		// wall top arrives at the band's plane at Z = e + (2600 − e) · 36000/19200 = 4,875 − 0.875e:
+		// 4,726 uu for a standing eye at midfield, 3,650 uu from the elevated capture pose, and
+		// LOWER than that only as the viewer backs further away (3,680 uu from the far spawn). A
+		// band topping out at +400 is therefore behind solid wall from every playable position — it
+		// would have shipped invisible. So the band spans Z 1,000 → 7,000 instead: the top clears the
+		// wall-top sightline from midfield and everywhere behind it, and the bottom runs far enough
+		// down that the visible edge always emerges FROM the wall line with no dark gap between them,
+		// whatever the viewer's height. The occluded lower half costs nothing — it is one instance.
+		UMaterialInstanceDynamic* BandMID = MakeNeonMID(TeamColor, 0.8f);
+		RegisterSideMID(Sign, BandMID, /*bNeon=*/true, 0.8f);
+		AddMeshBlock(CubeMesh,
+			FVector(Sign * 36000.f, 0.f, 4000.f),
+			FVector(500.f, 26000.f, 6000.f),
+			BandMID, /*bCastShadow=*/false, TEXT("HorizonBand"));
+
+		// The goal beacon: a 90 uu pillar from the ring's top to 4,200 uu — the tallest thing on the
+		// field and the one that says THE GOAL IS HERE from anywhere, pockets included. 90 uu clears
+		// the 72 uu goal-to-goal AA minimum. Same pulse as the ring (0.25/0.12) off the same Time
+		// uniform, so the phase lock costs nothing.
+		const float BeaconBottomZ = GoalRingCentreZ() + GoalRingOuterRadius();
+		const float BeaconTopZ = 4200.f;
+		if (BeaconTopZ > BeaconBottomZ + 1.f)
+		{
+			UMaterialInstanceDynamic* BeaconMID = MakeNeonMID(TeamColor, 4.5f, /*PulseRate=*/0.25f, /*PulseAmp=*/0.12f);
+			RegisterSideMID(Sign, BeaconMID, /*bNeon=*/true, 4.5f);
+			AddMeshBlock(CubeMesh,
+				FVector(Sign * GoalLineX(), 0.f, (BeaconBottomZ + BeaconTopZ) * 0.5f),
+				FVector(90.f, 90.f, BeaconTopZ - BeaconBottomZ),
+				BeaconMID, /*bCastShadow=*/false, TEXT("GoalBeacon"));
+		}
+	}
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[Arena] Skyline (MAP plan §4): 24 towers (8 team-tinted per end, 8 neutral flank), 2 horizon ")
+		TEXT("bands, 2 goal beacons (ring top %.0f -> 4200 uu). Visuals only, no shadows, no collision. ")
+		TEXT("Cost: %d instances in %d new pools (§4.5 budget is +80 instances for the whole pass)."),
+		GoalRingCentreZ() + GoalRingOuterRadius(),
+		BuiltInstances.Num() - InstancesBeforeSkyline,
+		InstancePools.Num() - PoolsBeforeSkyline);
 }
 
 void ATraceArenaBuilder::BuildPlayerStarts()
@@ -4084,22 +5650,28 @@ void ATraceArenaBuilder::BuildLighting()
 		FLinearColor Color;
 		bool bCastShadows;
 		bool bAtmosphereSun;
+		// One of the ForwardPriority* header constants: forward shading, translucency, water and
+		// volumetric fog honour exactly ONE directional light, and before this column existed the
+		// engine printed a red on-screen warning every frame and picked a winner by brightness.
+		// AdoptBakedArena applies the same constants to a baked level's lights at load.
+		int32 ForwardPriority;
 		const TCHAR* Name;
 	};
 
 	const FLightSpec Lights[] =
 	{
 		// The atmosphere's sun. Dim and below the horizon; it is here for the sky, not for the arena.
-		{ AtmosphereSunRotation, AtmosphereSunIntensity, FLinearColor(0.55f, 0.68f, 1.00f), false, true, TEXT("AtmosphereSun") },
-		// Key. The only shadow caster in the scene - one shadow pass, one shadow per character.
-		{ KeyLightRotation, KeyLightIntensity, FLinearColor(0.62f, 0.78f, 1.00f), true, false, TEXT("KeyLight") },
+		{ AtmosphereSunRotation, AtmosphereSunIntensity, FLinearColor(0.55f, 0.68f, 1.00f), false, true, ForwardPriorityAtmosphereSun, TEXT("AtmosphereSun") },
+		// Key. The only shadow caster in the scene - one shadow pass, one shadow per character - and
+		// the single directional identity forward shading honours (art bible §5.1: THE light).
+		{ KeyLightRotation, KeyLightIntensity, FLinearColor(0.62f, 0.78f, 1.00f), true, false, ForwardPriorityKeyLight, TEXT("KeyLight") },
 		// Warm rim from the opposite azimuth. Two of the four wall inner faces have a negative N.L
 		// against the key and would otherwise be lit by ambient alone; this also gives characters a
 		// warm edge that separates them from a cyan background.
-		{ FillLightRotation, FillLightIntensity, FLinearColor(1.00f, 0.46f, 0.22f), false, false, TEXT("FillLight") },
+		{ FillLightRotation, FillLightIntensity, FLinearColor(1.00f, 0.46f, 0.22f), false, false, ForwardPriorityRimLight, TEXT("FillLight") },
 		// Faint cyan travelling upward - the bounce a floor covered in glowing lines would give if
 		// this project had global illumination. Without it every underside is pure black.
-		{ BounceLightRotation, BounceLightIntensity, FLinearColor(0.20f, 0.62f, 0.95f), false, false, TEXT("BounceLight") }
+		{ BounceLightRotation, BounceLightIntensity, FLinearColor(0.20f, 0.62f, 0.95f), false, false, ForwardPriorityRimLight, TEXT("BounceLight") }
 	};
 
 	for (const FLightSpec& Spec : Lights)
@@ -4130,6 +5702,15 @@ void ATraceArenaBuilder::BuildLighting()
 			LightComponent->SetLightColor(Spec.Color);
 			LightComponent->SetCastShadows(Spec.bCastShadows);
 			LightComponent->SetAtmosphereSunLight(Spec.bAtmosphereSun);
+			LightComponent->SetForwardShadingPriority(Spec.ForwardPriority);
+
+			// The rim/ambient pair (fill and bounce - the two that neither cast shadows nor drive
+			// the atmosphere) are colour, not direction: they must also stay out of volumetric fog,
+			// or the fog picks up a warm/cyan directionality the art never asked for.
+			if (!Spec.bCastShadows && !Spec.bAtmosphereSun)
+			{
+				LightComponent->SetVolumetricScatteringIntensity(0.f);
+			}
 
 			// The one shadow caster is the one the Shadows quality row drives - see ApplyFidelity.
 			// Remembered here rather than re-found later, because "which light casts the shadows" is
@@ -4302,19 +5883,22 @@ void ATraceArenaBuilder::BuildPostProcess()
 	PP.bOverride_VignetteIntensity = true;
 	PP.VignetteIntensity = 0.34f;
 
-	// Barely-there chromatic aberration: it stops the neon edges reading as perfectly clean vector
-	// graphics.
+	// Chromatic aberration: gone. The history, because each step was measured: 0.6 -> 0.2 during
+	// integration (the fringe smears colour across edges, and dropping most of it was worth +59%
+	// high-frequency detail on matched frames), then 0.2 -> 0.0 for the release overhaul. The
+	// release visual audit's distance crops showed the remaining 0.2 still compounding with TSR
+	// into green/magenta fringes exactly where this art most needs clean lines — thin distant neon
+	// (goal-ring arc, wall trim) dissolving into dashed rainbow noise — and the art bible (§5.3)
+	// rules that the neon look does not need the film-lens texture at all. The 0.2-era observation
+	// that the fringe was also dithering SSR noise in the near-black floor still holds; that grain
+	// is the accepted price of clean distant edges, and the planned micro-grid floor treatment
+	// (map plan §6.3) gives the floor real detail to read instead.
 	//
-	// Cut 0.6 -> 0.2 during integration. Chromatic aberration works by sampling the R and B channels
-	// at different radii, i.e. it SMEARS COLOUR ACROSS EDGES — and this scene is made of almost
-	// nothing but coloured edges, so it was paying for its texture with the exact defect the user
-	// reported ("it's also kinda blurry right now"). Measured on matched frames, dropping it was
-	// worth +59% high-frequency detail on top of the TSR/native-resolution fixes in DefaultEngine.ini,
-	// the largest single win left in the frame. Not zero: at 0 the floor grain roughly doubles,
-	// because the fringe was also dithering the SSR noise in the near-black floor. 0.2 keeps that
-	// and stops the smearing.
+	// Kept as an explicit override at 0 (not removed) so both paths stomp the 0.2 serialised into
+	// the existing baked level: the value lives in ArenaSceneFringeIntensity (header) because
+	// AdoptBakedArena must push the same number onto an already-baked post-process volume.
 	PP.bOverride_SceneFringeIntensity = true;
-	PP.SceneFringeIntensity = 0.2f;
+	PP.SceneFringeIntensity = ArenaSceneFringeIntensity;
 
 	// Everything above is the art direction and is the same at every quality level. Everything that
 	// COSTS - ambient occlusion, Lumen, the bloom method, SSR quality - is written by ApplyFidelity
@@ -4664,6 +6248,22 @@ void ATraceArenaBuilder::ApplyFidelity()
 
 		if (bLumenGI)
 		{
+			// Surface-cache atlas 4096 -> 8192. At the engine default this arena oversubscribed the
+			// atlas by a MEASURED 92-147% (release visual audit §1.1 — every emissive strip is a
+			// surface-cache card), and the engine burned that deficit onto the screen as red warning
+			// text while the starved cache drew soft white blobs across the hero floor. 8192 is the
+			// art bible's ruling (§5.2); if a residual oversubscription ever reappears, the emissive
+			// card count is the driver and the correct trade is capping the ladder's Lumen arm
+			// (raise ArenaLumenMinGITier) — not chasing the atlas further. Only set while Lumen is
+			// actually armed: the cvar is inert without Lumen, and a game-setting write has no
+			// business touching it then.
+			static IConsoleVariable* SurfaceCacheAtlas =
+				IConsoleManager::Get().FindConsoleVariable(TEXT("r.LumenScene.SurfaceCache.AtlasSize"));
+			if (SurfaceCacheAtlas != nullptr)
+			{
+				SurfaceCacheAtlas->Set(8192, ECVF_SetByGameSetting);
+			}
+
 			// Always true while ArenaLumenMinGITier is 3, and kept as a named condition rather than
 			// folded away so that the two-rung Lumen ladder below survives intact if a future map
 			// with real art ever earns a cheaper Lumen at High.
@@ -5526,15 +7126,14 @@ void ATraceArenaBuilder::BuildFloorLamps()
 	{
 		for (const float XSign : { -1.f, 1.f })
 		{
-			// Half-tinted, but only halfway there. A fully saturated team-coloured lamp repaints every
-			// surface it touches and the two halves stop looking like the same arena; blending to
-			// white keeps the tint as a hint and lets the neon keep ownership of the colour.
+			// Half-tinted, but only halfway there — and one notch deeper on the outermost row. See
+			// LampTeamBlend/LampColorFor in TraceArenaConstants for both numbers and the reasoning;
+			// the formula lives there because ApplyTeamSides recomputes exactly this blend at every
+			// half-time side switch (a light is not a MID) and the two must never disagree.
 			const ETraceTeam HalfTeam = (XSign < 0.f) ? ETraceTeam::Blue : ETraceTeam::Orange;
 			const FLinearColor TeamColor = TraceTeamColor(HalfTeam);
-			const FLinearColor LampColor(
-				FMath::Lerp(0.72f, TeamColor.R, 0.55f),
-				FMath::Lerp(0.78f, TeamColor.G, 0.55f),
-				FMath::Lerp(1.00f, TeamColor.B, 0.55f));
+			const FLinearColor LampColor = TraceArenaConstants::LampColorFor(
+				TeamColor, TraceArenaConstants::LampTeamBlendForXFrac(XFrac));
 
 			for (const float YFrac : TraceArenaConstants::LampYFracs)
 			{
@@ -5699,9 +7298,15 @@ void ATraceArenaBuilder::AddPylon(const FVector2D& LocalCentre, float Side, floa
 }
 
 UMaterialInstanceDynamic* ATraceArenaBuilder::MakeSurfaceMID(const FLinearColor& BaseColor, float Roughness,
-	float Metallic, const FLinearColor& Emissive, float EmissiveStrength)
+	float Metallic, const FLinearColor& Emissive, float EmissiveStrength, UMaterialInterface* ParentOverride)
 {
-	UMaterialInterface* Parent = (SurfaceMaterial != nullptr) ? SurfaceMaterial.Get() : BaseMaterial.Get();
+	// ParentOverride is how the floor parents to MI_Surface_Floor_Grid (whose armed bUseGrid static
+	// switch the MID inherits) instead of the bare surface parent. Every parameter set below exists
+	// on M_TraceSurface and therefore on any MIC derived from it, so the override changes only the
+	// static-switch inheritance, never which pushes land.
+	UMaterialInterface* Parent = (ParentOverride != nullptr)
+		? ParentOverride
+		: ((SurfaceMaterial != nullptr) ? SurfaceMaterial.Get() : BaseMaterial.Get());
 	if (Parent == nullptr)
 	{
 		return nullptr;
@@ -5777,6 +7382,26 @@ UMaterialInstanceDynamic* ATraceArenaBuilder::MakeNeonMID(const FLinearColor& Co
 	MID->SetFlags(BuiltObjectFlags());
 
 	TintMIDs.Add(MID);
+	return MID;
+}
+
+UMaterialInstanceDynamic* ATraceArenaBuilder::MakeNeonMID(const FLinearColor& Color, float Glow,
+	float PulseRate, float PulseAmp)
+{
+	// The pulse chain in M_TraceNeon is 1 + PulseAmp * sin(2π * Time * PulseRate), multiplied into
+	// the Glow term — all uniform expressions, CPU-folded, zero per-pixel cost. Both parents default
+	// both parameters to 0 (the identity), which is what keeps everything NOT built through this
+	// overload static: the must-not-pulse list is enforced by omission, not by a lock. Every pulsing
+	// MID shares the same Time uniform, so same-rate assignments (ring + beacon) phase-lock for free.
+	// Harmless on the BasicShapeMaterial fallback — the parameters simply do not exist there.
+	UMaterialInstanceDynamic* MID = MakeNeonMID(Color, Glow);
+	if (MID != nullptr)
+	{
+		MID->SetScalarParameterValue(TEXT("PulseRate"), FMath::Max(0.f, PulseRate));
+		MID->SetScalarParameterValue(TEXT("PulseAmp"), FMath::Max(0.f, PulseAmp));
+		// (Trace.Arena.PulseTest drives these same two parameters to visible values on every MID at
+		// once — the only way a still photograph can prove the chain is alive; see the dev lever.)
+	}
 	return MID;
 }
 
@@ -5869,9 +7494,35 @@ void ATraceArenaBuilder::ApplyTeamSides(ETraceTeam TeamOnNegativeSide)
 		++Repainted;
 	}
 
+	// The floor lamps (release overhaul, MAP plan §5.4). BuildFloorLamps tints the lattice toward
+	// each half's DEFENDING team, and lights are not MIDs, so the loop above cannot reach them —
+	// they were the one family that kept the first half's colour through every side switch, leaving
+	// the ambient wash contradicting the repainted neon. Recompute the exact build-time blend for
+	// the CURRENT defender of each lamp's side. FloorLamps is filled on both build paths (procedural
+	// AddPointLight, baked adopt), so this needs no re-bake and works on both maps; positions are
+	// read back in builder-local space so a translated builder cannot mis-side a lamp. Idempotent —
+	// the colour is re-derived, never toggled.
+	int32 LampsRepainted = 0;
+	const FTransform ToBuilderLocal = GetActorTransform();
+	const float LampHalfLength = FMath::Max(1.f, HalfLength());
+	for (const TWeakObjectPtr<UPointLightComponent>& LampPtr : FloorLamps)
+	{
+		UPointLightComponent* Lamp = LampPtr.Get();
+		if (Lamp == nullptr)
+		{
+			continue;
+		}
+
+		const FVector LocalPos = ToBuilderLocal.InverseTransformPosition(Lamp->GetComponentLocation());
+		const ETraceTeam DefendingTeam = (LocalPos.X < 0.f) ? TeamOnNegativeSide : TeamOnPositiveSide;
+		const float BlendFrac = TraceArenaConstants::LampTeamBlendForXFrac(FMath::Abs(LocalPos.X) / LampHalfLength);
+		Lamp->SetLightColor(TraceArenaConstants::LampColorFor(TraceTeamColor(DefendingTeam), BlendFrac));
+		++LampsRepainted;
+	}
+
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[Arena] Sides applied: %s now defends -X. Repainted %d of %d surfaces."),
-		*TraceTeamName(TeamOnNegativeSide).ToString(), Repainted, SideMIDs.Num());
+		TEXT("[Arena] Sides applied: %s now defends -X. Repainted %d of %d surfaces and %d floor lamps."),
+		*TraceTeamName(TeamOnNegativeSide).ToString(), Repainted, SideMIDs.Num(), LampsRepainted);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -6125,6 +7776,40 @@ void ATraceArenaBuilder::ApplyTeamSidesInWorld(const UWorld* World, ETraceTeam T
 		It->ApplyTeamSides(TeamOnNegativeSide);
 	}
 }
+
+#if !UE_BUILD_SHIPPING
+int32 ATraceArenaBuilder::ForcePulseOnAllMIDs(float PulseRate, float PulseAmp)
+{
+	// Read before write: a MID whose parent has no pulse chain answers false here, which is the
+	// whole diagnostic value of the lever — "0 of N MIDs carry PulseRate" says the parent material
+	// was never regenerated with MAP plan §6.1's chain, and no amount of C++ can make it breathe.
+	int32 Carrying = 0;
+	for (UMaterialInstanceDynamic* MID : TintMIDs)
+	{
+		if (MID == nullptr)
+		{
+			continue;
+		}
+
+		float Existing = 0.f;
+		if (!MID->GetScalarParameterValue(FMaterialParameterInfo(TEXT("PulseRate")), Existing))
+		{
+			continue;   // surface MIDs and the BasicShapeMaterial fallback have no pulse parameters
+		}
+
+		MID->SetScalarParameterValue(TEXT("PulseRate"), FMath::Max(0.f, PulseRate));
+		MID->SetScalarParameterValue(TEXT("PulseAmp"), FMath::Max(0.f, PulseAmp));
+		++Carrying;
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[PULSETEST] Forced PulseRate=%.2f PulseAmp=%.2f onto %d of %d builder MIDs "
+		     "(the rest are surface MIDs or a parent with no pulse chain)."),
+		PulseRate, PulseAmp, Carrying, TintMIDs.Num());
+
+	return Carrying;
+}
+#endif // !UE_BUILD_SHIPPING
 
 // -------------------------------------------------------------------------------------------------
 // Teardown
@@ -6407,6 +8092,12 @@ void ATraceArenaBuilder::PostEditChangeProperty(FPropertyChangedEvent& PropertyC
 }
 
 #endif // WITH_EDITOR
+
+// Release-hygiene pass (RESTRUCTURE tranche A, A7 fix-until-green): the whole SPEC v7 §8
+// measurement harness below is dev evidence and calls RebuildForMeasurement(), whose definition
+// is dev-only (guarded above) — in Shipping this section did not compile. Fenced wholesale;
+// nothing inside the fence changed.
+#if !UE_BUILD_SHIPPING
 
 // =================================================================================================
 // SPEC v7 §8 - THE MEASUREMENT: Trace.Arena.Perf and Trace.Arena.PerfAB
@@ -7457,8 +9148,9 @@ namespace
 	 */
 	FAutoConsoleCommand CmdArenaPose(
 		TEXT("Trace.Arena.Pose"),
-		TEXT("Trace.Arena.Pose X Y Z [Pitch] [Yaw] - teleport the local pawn to a world position and aim it, "
-		     "so the arena can be photographed from somewhere useful (spec v9 10)."),
+		TEXT("Trace.Arena.Pose X Y Z [Pitch] [Yaw] - teleport the local pawn to a world position, aim it, "
+		     "and HOLD it there (flying, zero velocity), so the arena can be photographed from somewhere "
+		     "useful - including above the deck (spec v9 10)."),
 		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
 		{
 			if (Args.Num() < 3)
@@ -7485,8 +9177,107 @@ namespace
 			const bool bMoved = TestPawn->TeleportTo(Where, Aim);
 			TestController->SetControlRotation(Aim);
 
-			UE_LOG(LogTraceGame, Display, TEXT("[POSE] %s -> %s aim %s (moved=%d)"),
-				*GetNameSafe(TestPawn), *Where.ToCompactString(), *Aim.ToCompactString(), bMoved ? 1 : 0);
+			// AND HELD THERE, which the first version of this command did not do. MEASURED twice on
+			// the same framing: the sky/silhouette shot poses the camera 1,400 uu up, and a teleport
+			// alone leaves the pawn in mid-air with gravity on, so by the time -TraceAutoShot fires
+			// seconds later it has fallen to the deck and the frame photographs the floor
+			// (W1-LIGHT's P_V7a log: posed to Z=1400, photographed at Z=90). A pose is a CAMERA,
+			// not a spawn, so the pawn goes flying with its velocity zeroed: no gravity, no drift,
+			// the shot lands where the framing asked for. Ground-level poses are unchanged in every
+			// way a photograph can see - the pawn hovers at floor height instead of standing on it,
+			// and walking (which no posed capture does) would re-enter walking on the first input.
+			bool bHeld = false;
+			if (ACharacter* PosedCharacter = Cast<ACharacter>(TestPawn))
+			{
+				if (UCharacterMovementComponent* Movement = PosedCharacter->GetCharacterMovement())
+				{
+					Movement->StopMovementImmediately();
+					Movement->SetMovementMode(MOVE_Flying);
+					bHeld = true;
+				}
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("[POSE] %s -> %s aim %s (moved=%d, held=%d)"),
+				*GetNameSafe(TestPawn), *Where.ToCompactString(), *Aim.ToCompactString(),
+				bMoved ? 1 : 0, bHeld ? 1 : 0);
+		}));
+
+	/**
+	 * The side-switch A/B lever (release overhaul, MAP plan §5): drive the EXACT half-time repaint
+	 * path — ApplyTeamSidesInWorld -> ApplyTeamSides, the same call ATraceGameState's OnRep makes —
+	 * without waiting out a half. Every registered family (grid halves, end walls, endzone/goal
+	 * dressing, gates, rings, cover lips and face trim, bank contours, flank dressing, skyline
+	 * roofs, horizon bands, goal beacons) and the floor lamps must flip; the cove, the centre line,
+	 * the top-centre tower and the flank skyline must hold. Dev tooling like its neighbours; the
+	 * real match path is Trace.HalfTime.Verify's business.
+	 */
+	FAutoConsoleCommand CmdArenaSides(
+		TEXT("Trace.Arena.Sides"),
+		TEXT("Trace.Arena.Sides Blue|Orange - repaint every registered arena surface (and the floor lamps) "
+		     "as if the named team defended the -X end, via the exact half-time repaint path "
+		     "(ApplyTeamSidesInWorld). Build-time paint is Blue on -X."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			ETraceTeam Team = ETraceTeam::None;
+			if (Args.Num() >= 1)
+			{
+				if (Args[0].Equals(TEXT("Blue"), ESearchCase::IgnoreCase))
+				{
+					Team = ETraceTeam::Blue;
+				}
+				else if (Args[0].Equals(TEXT("Orange"), ESearchCase::IgnoreCase))
+				{
+					Team = ETraceTeam::Orange;
+				}
+			}
+
+			if (Team == ETraceTeam::None)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[SIDES] usage: Trace.Arena.Sides Blue|Orange"));
+				return;
+			}
+
+			UWorld* World = FindArenaPerfWorld();
+			if (World == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[SIDES] no play world."));
+				return;
+			}
+
+			// ApplyTeamSides logs the repaint census itself ("[Arena] Sides applied: ...").
+			ATraceArenaBuilder::ApplyTeamSidesInWorld(World, Team);
+		}));
+
+	/**
+	 * The pulse lever (release overhaul, MAP plan §6.2). The shipped breaths are deliberately at the
+	 * edge of perception — 0.25 Hz / ±12% on an emissive already several times the tonemapper's
+	 * white point — so a screenshot PAIR cannot distinguish "animating correctly" from "not
+	 * animating at all": both look identical to within a code value. This drives the same two
+	 * parameters on every builder MID to whatever is asked, so one capture run answers the question
+	 * outright, and its log line reports how many MIDs even CARRY the parameters — which is the
+	 * check that catches a parent material regenerated without the §6.1 pulse chain.
+	 *
+	 * Defaults are 1 Hz / ±90%: unmissable, and nothing to do with what ships.
+	 */
+	FAutoConsoleCommand CmdArenaPulseTest(
+		TEXT("Trace.Arena.PulseTest"),
+		TEXT("Trace.Arena.PulseTest [RateHz] [Amp] - force the M_TraceNeon pulse parameters onto every "
+		     "arena MID (default 1.0 Hz, 0.9) so a capture pair can prove the pulse chain is alive. "
+		     "Trace.Arena.PulseTest 0 0 restores static. Dev only."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Rate = (Args.Num() > 0) ? FCString::Atof(*Args[0]) : 1.0f;
+			const float Amp = (Args.Num() > 1) ? FCString::Atof(*Args[1]) : 0.9f;
+
+			UWorld* World = FindArenaPerfWorld();
+			ATraceArenaBuilder* Builder = (World != nullptr) ? ATraceArenaBuilder::Get(World) : nullptr;
+			if (Builder == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[PULSETEST] no arena builder in the play world."));
+				return;
+			}
+
+			Builder->ForcePulseOnAllMIDs(Rate, Amp);   // logs the census itself
 		}));
 
 	FAutoConsoleCommand CmdArenaPerfAB(
@@ -8242,6 +10033,7 @@ namespace
 		}));
 
 }
+#endif // !UE_BUILD_SHIPPING — end of the SPEC v7 §8 measurement harness
 
 // =================================================================================================
 // SPEC v28 INTEGRATION — THE GUN'S REACH IS DERIVED FROM THE ARENA'S SIZE, AND NOTHING CHECKED IT.
@@ -8283,7 +10075,7 @@ namespace
 		GTraceHitscanReachArmUU,
 		TEXT("Trace: force Trace.Arena.VerifyHitscanReach to measure a given range in uu instead of the "
 		     "shipped UTraceSettings::HitscanRange. 36000 reproduces the pre-v28-integration defect. 0 = off."),
-		ECVF_Default);
+		ECVF_Cheat);
 
 	ATraceArenaBuilder* FindHitscanReachArena(UWorld*& OutWorld)
 	{
@@ -8525,5 +10317,11 @@ namespace
 
 			UE_LOG(LogTraceGame, Display,
 				TEXT("================================================================================"));
-		}));
+		}),
+		// W9-SHIPGUARD: cheat-flagged with its own arm above. The pair is a harness and the switch
+		// that makes the harness go red; neither is a player-facing option, and ECVF_Cheat is what
+		// keeps both out of reach of a shipped build's one surviving injection path (the
+		// [ConsoleVariables] section of a user-writable Engine.ini). Inert outside Shipping —
+		// DISABLE_CHEAT_CVARS is 0 in Development, so every dev run still reaches both.
+		ECVF_Cheat);
 }

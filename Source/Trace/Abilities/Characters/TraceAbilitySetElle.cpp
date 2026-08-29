@@ -4,6 +4,7 @@
 
 #include "Abilities/Characters/TraceAbilitySetElle.h"
 
+#include "Camera/CameraActor.h"          // the FX parade's observer — a bare AActor has no root
 #include "Camera/PlayerCameraManager.h"   // Trace.Elle.PortalShot frames the two mouths against the FOV
 #include "Components/MeshComponent.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -16,12 +17,21 @@
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
 #include "HAL/IConsoleManager.h"
+#include "HAL/PlatformTime.h"
+#include "Misc/Paths.h"
+#include "UnrealClient.h"                 // FScreenshotRequest — the FX parade aims its own frames
+
+#include "Materials/MaterialInstanceDynamic.h"
 
 #include "Abilities/Characters/TraceElleGate.h"
 #include "Abilities/TraceAbilityComponent.h"
+#include "Audio/TraceAudio.h"                // ElleCloak / ElleDecloak — World, server, at the two edges
+#include "Audio/TraceSoundEvents.h"
 #include "Core/TraceCharacter.h"
 #include "Core/TracePlayerController.h"
 #include "Gameplay/TraceCore.h"
+#include "Gameplay/TraceFxBurst.h"           // TraceFxLoopBudget — the §1.4 attach choke point
+#include "Gameplay/TraceFxShapes.h"
 #include "Trace.h"
 #include "TraceSettings.h"
 
@@ -105,13 +115,46 @@ namespace TraceAbilitySetElleFile
 
 	const FName EmissiveParams[] =
 	{
-		FName(TEXT("EmissivePower")),       // M_Mannequin
+		FName(TEXT("EmissivePower")),       // M_Mannequin, and M_TraceBodyGlow (the team panels)
 		FName(TEXT("EmissiveStrength")),    // M_TraceSurface
-		FName(TEXT("Glow"))                 // M_TraceNeon
+		FName(TEXT("Glow")),                // M_TraceNeon
+		// M_TraceBodyAccent (generated bodies). Killing the glow IS the whole cloak effect for the
+		// accent, which is why "AccentColor" is deliberately NOT in ColourParams above: the hue has
+		// to survive so that restore needs no memory of what it was. Restore is the same
+		// ApplyTeamColors() every other parameter here comes back through — see
+		// ATraceCharacter::ApplyColorToSkeletalMesh, which writes this scalar from the same
+		// 8/30/0 state value it writes EmissivePower from (PIPELINE_DESIGN.md §4.4).
+		FName(TEXT("AccentGlow"))
 	};
 
 	/** The hook a translucent character material would pick up for free. No-op on every material today. */
 	const FName OpacityParam(TEXT("Opacity"));
+
+	// =============================================================================================
+	// FX_AUDIO_PLAN §2.5 — THE TWO CLOAK SWEEPS
+	// =============================================================================================
+
+	/** Bible §2's semantic Cloak hue, #C9D8ED. NOT Elle's orchid accent: the state beats the owner. */
+	const FLinearColor CloakSilver(0.60f, 0.70f, 0.85f, 1.f);
+
+	/** §2.5: both sweeps run for 0.3 s. */
+	constexpr float SweepSeconds = 0.3f;
+
+	/** §2.5: "one flat ring (cylinder shell r 50 uu, h 4 uu)". */
+	constexpr float SweepRadiusUU = 50.f;
+	constexpr float SweepHeightUU = 4.f;
+
+	/**
+	 * §2.5's two intensities, and the asymmetry is the design: 0.5 going IN, 0.35 coming OUT, because
+	 * "decloak must not out-shout the player it reveals". The reveal is information the enemy is owed;
+	 * it is not a firework.
+	 */
+	constexpr float SweepOnIntensity = 0.5f;
+	constexpr float SweepOffIntensity = 0.35f;
+
+	/** Head and feet, uu relative to the capsule CENTRE — a standing Trace pawn is 88 uu each way. */
+	constexpr float SweepTopUU = 88.f;
+	constexpr float SweepBottomUU = -88.f;
 
 	/** The pawn's THIRD-PERSON body, i.e. the parts other players see. Not the first-person viewmodel. */
 	void GatherBodyMeshes(ATraceCharacter* Pawn, TArray<UMeshComponent*, TInlineAllocator<3>>& Out)
@@ -187,6 +230,11 @@ namespace TraceAbilitySetElleFile
 void UTraceAbilitySetElle::OnUnequipped()
 {
 	// Cosmetics first: the pawn survives the character change, so a dimmed body would survive it too.
+	// The sweep is silenced BEFORE the visual comes down, so a character swap does not flash a decloak
+	// on somebody who is no longer Elle: clearing the wanted flag means the call below sees no edge.
+	bCloakVisualWanted = false;
+	DetachCloakSweep();
+
 	ApplyCloakVisual(false);
 	DestroyGates();
 	LocalFirstGatePredictionEnd = 0.f;
@@ -199,6 +247,14 @@ void UTraceAbilitySetElle::OnPawnSpawned()
 	bCloakVisualApplied = false;
 	CloakVisualPawn = nullptr;
 	bHeldCoreLastTick = false;
+
+	// The ring belonged to the pawn that is being destroyed on this same path; forget it rather than
+	// trying to detach from it, exactly as the dim is forgotten rather than restored.
+	bCloakVisualWanted = false;
+	CloakSweep = nullptr;
+	CloakSweepMID = nullptr;
+	CloakSweepPawn = nullptr;
+	bCloakSweepRunning = false;
 }
 
 void UTraceAbilitySetElle::OnPawnDied()
@@ -210,6 +266,11 @@ void UTraceAbilitySetElle::OnPawnDied()
 	{
 		EndCloak(TEXT("died"));
 	}
+
+	// §8.9: no FX component survives its pawn — and a decloak flash on a corpse would be a lie about
+	// where she went. Both are settled before the visual half runs.
+	bCloakVisualWanted = false;
+	DetachCloakSweep();
 
 	ApplyCloakVisual(false);
 	bHeldCoreLastTick = false;
@@ -226,6 +287,10 @@ void UTraceAbilitySetElle::OnHalfTime()
 	// already false. What is left is the world actors and the cosmetic half, which is exactly what
 	// this hook is documented to be for.
 	DestroyGates();
+
+	bCloakVisualWanted = false;
+	DetachCloakSweep();
+
 	ApplyCloakVisual(false);
 	bHeldCoreLastTick = false;
 	LocalFirstGatePredictionEnd = 0.f;
@@ -244,8 +309,17 @@ void UTraceAbilitySetElle::TickAbilities(float DeltaSeconds)
 	// completes — and it would otherwise repaint her at full brightness for the rest of the cloak.
 	// Re-pushing at 20 Hz costs a handful of parameter writes and cannot lose that race by more than
 	// one tick.
+	// THE SWEEP IS TICKED FIRST, so the tick on which the on-sweep FINISHES is the tick the dim lands
+	// — §2.5's "body dim applies at sweep end" with no frame of bright pawn in between.
+	TickCloakSweep(DeltaSeconds);
+
 	const bool bWantCloak = IsCloaked();
-	if (bWantCloak || bCloakVisualApplied)
+
+	// bCloakVisualWanted is in the condition as well as the other two, and it has to be: while the
+	// on-sweep is delaying the dim, bCloakVisualApplied is still false, so a cloak that ENDS inside
+	// those 0.3 s would otherwise never reach ApplyCloakVisual(false) — leaving the wanted flag set
+	// and eating the NEXT cloak's rising edge.
+	if (bWantCloak || bCloakVisualApplied || bCloakVisualWanted)
 	{
 		ApplyCloakVisual(bWantCloak);
 	}
@@ -261,15 +335,33 @@ void UTraceAbilitySetElle::TickAbilities(float DeltaSeconds)
 	// ---- SERVER: the cloak's trigger, its early-out and its expiry --------------------------------
 	TickCloakTrigger();
 
-	if (IsCloaked())
+	// Read ONCE, here, and used by the cloak expiry below as well as by the two SNAP blocks: the
+	// scratch pad is a reference, so a second binding further down would be the same object under a
+	// second name and an invitation to write through one while reading the other.
+	const FTraceAbilityNetState& Current = State();
+
+	// *** THE GUARD IS THE FLAG, NOT IsCloaked(), AND THE DIFFERENCE IS A DEAD BRANCH. ***
+	//
+	// IsCloaked() is "the flag is up AND the deadline has not passed". Nesting the expiry test inside
+	// it therefore asked whether the deadline had passed at a point where it provably had not, so
+	// EndCloak(TEXT("expired")) — the way a cloak ends in almost every real match — was UNREACHABLE.
+	// Nothing looked broken, because everything a player or a bot reads goes through IsCloaked() and
+	// that answer was always right; what actually happened is that the EffectActive bit stayed set,
+	// with a deadline in the past, until the next death wipe or half time.
+	//
+	// It surfaced here because FX §5.1 puts ElleDecloak at EndCloak, and a decloak sound that only
+	// fires when she picks the Core back up or dies is a sound nobody would ever hear. Fixing the
+	// guard is the whole fix: the two branches inside are unchanged, and the Core-pickup branch keeps
+	// its own IsCloaked() test so an already-expired cloak cannot be reported as "took the Core back".
+	if ((Current.Flags & TraceAbilityFlags::EffectActive) != 0)
 	{
 		// §2 [ASSUMPTION]: picking the Core back up drops the cloak early. The reading is that the
 		// cloak is a getaway, and a player who has the Core again is not getting away from anything.
-		if (Settings.bElleCloakEndsOnCorePickup && ATraceCore::IsCoreHolder(GetCharacter()))
+		if (Settings.bElleCloakEndsOnCorePickup && IsCloaked() && ATraceCore::IsCoreHolder(GetCharacter()))
 		{
 			EndCloak(TEXT("took the Core back"));
 		}
-		else if (Now >= State().EffectEndMatchTime)
+		else if (Now >= Current.EffectEndMatchTime)
 		{
 			EndCloak(TEXT("expired"));
 		}
@@ -280,7 +372,6 @@ void UTraceAbilitySetElle::TickAbilities(float DeltaSeconds)
 	// §2: "If no second gate inside 4 s the first expires." The GATE expires itself, on its own
 	// deadline — what happens here is the COOLDOWN, which is charged in full from the first press so
 	// that a fluffed cast is not a free gate every four seconds.
-	const FTraceAbilityNetState& Current = State();
 	if ((Current.Flags & TraceAbilityFlags::AuxActive) != 0 && Now >= Current.AuxEndMatchTime)
 	{
 		const float ReadyAt = GetSnapReadyMatchTime();
@@ -382,6 +473,14 @@ void UTraceAbilitySetElle::StartCloak(const TCHAR* Why)
 	Writable.EffectEndMatchTime = EndAt;
 	MarkStateDirty();
 
+	// FX §5.1: ElleCloak is a WORLD event at the authority's own StartCloak. One play, multicast, at
+	// her body — the cosmetic half is driven from the replicated flag on every machine, so a second
+	// local play anywhere would be the §8.7 double-audio failure.
+	if (const ATraceCharacter* MyPawn = GetCharacter())
+	{
+		TraceAudio::Play(MyPawn, TraceSoundEvents::ElleCloak);
+	}
+
 	UE_LOG(LogTraceGame, Log,
 		TEXT("[Elle] CLOAK up for %.1fs (%s): opacity %.2f, ends at match time %.2f."),
 		Duration, Why, UTraceSettings::Get().ElleCloakOpacity, EndAt);
@@ -389,7 +488,11 @@ void UTraceAbilitySetElle::StartCloak(const TCHAR* Why)
 
 void UTraceAbilitySetElle::EndCloak(const TCHAR* Why)
 {
-	if (!HasAuthority() || !IsCloaked())
+	// THE FLAG, not IsCloaked(), for the reason written out at the expiry test in TickAbilities: an
+	// EXPIRED cloak is one whose flag is still up and whose deadline has passed, and IsCloaked() is
+	// false for exactly that state — so this guard used to refuse the one call that most needed to
+	// get through. Idempotent either way: with the bit already clear this is still a no-op.
+	if (!HasAuthority() || (State().Flags & TraceAbilityFlags::EffectActive) == 0)
 	{
 		return;
 	}
@@ -398,6 +501,19 @@ void UTraceAbilitySetElle::EndCloak(const TCHAR* Why)
 	Writable.Flags &= static_cast<uint8>(~TraceAbilityFlags::EffectActive);
 	Writable.EffectEndMatchTime = 0.f;
 	MarkStateDirty();
+
+	// AND THE DECLOAK IS AUDIBLE ON PURPOSE (§2.5, §5.1): it is information the people hunting her are
+	// owed. It is quieter than the cloak (-10 dBFS against -12 at render) for the same reason the
+	// decloak SWEEP is quieter than the cloak sweep — a reveal must not out-shout the player it
+	// reveals. Not played for a death: OnPawnDied's EndCloak runs after the pawn is already dead and
+	// the death burst is the sound of that moment.
+	if (const ATraceCharacter* MyPawn = GetCharacter())
+	{
+		if (MyPawn->IsAlive())
+		{
+			TraceAudio::Play(MyPawn, TraceSoundEvents::ElleDecloak);
+		}
+	}
 
 	UE_LOG(LogTraceGame, Verbose, TEXT("[Elle] CLOAK down (%s)."), Why);
 }
@@ -418,6 +534,19 @@ void UTraceAbilitySetElle::ApplyCloakVisual(bool bCloakOn)
 {
 	ATraceCharacter* MyPawn = GetCharacter();
 	ATraceCharacter* PreviouslyDimmed = CloakVisualPawn.Get();
+
+	// ---- FX §2.5: THE SWEEPS, ON THE EDGE AND ONLY ON THE EDGE ----------------------------------
+	//
+	// This function is called at 20 Hz for the whole cloak (see the re-push comment in TickAbilities),
+	// so anything that fires unconditionally here fires sixty times per cloak. The edge is against the
+	// last value asked for, and a DEAD pawn is never asked: a sweep on a corpse is a lie about where
+	// she went, and OnPawnDied comes through here.
+	const bool bAlive = (MyPawn != nullptr) && MyPawn->IsAlive();
+	if (bAlive && bCloakOn != bCloakVisualWanted)
+	{
+		StartCloakSweep(bCloakOn);
+	}
+	bCloakVisualWanted = bAlive && bCloakOn;
 
 	// Restore first when the cloak is coming down, and ALSO when the pawn has changed underneath us:
 	// a respawn between two ability ticks would otherwise leave a pawn dimmed with nothing left
@@ -445,9 +574,158 @@ void UTraceAbilitySetElle::ApplyCloakVisual(bool bCloakOn)
 		return;
 	}
 
+	// *** §2.5: "body dim (shipped treatment) applies at SWEEP END." ***
+	//
+	// The ring is the transition and the dim is the state, and running them together would put the
+	// sweep on a pawn that had already gone dark — decoration on an event nobody can see happen. So
+	// the dim is held for the 0.3 s the on-sweep runs.
+	//
+	// IT COSTS HER 0.3 s OF THE 3 s CLOAK, and that is a real, deliberate, spec-directed change rather
+	// than an oversight: she is visible for those 0.3 s. bCloakVisualApplied stays FALSE across the
+	// window on purpose — that accessor's contract is "the paint is on", and reporting it early would
+	// make the one query that can distinguish a missed repaint start lying.
+	if (bCloakSweepRunning && bCloakSweepIsOn)
+	{
+		return;
+	}
+
 	TraceAbilitySetElleFile::DimForCloak(MyPawn, UTraceSettings::Get().ElleCloakOpacity);
 	bCloakVisualApplied = true;
 	CloakVisualPawn = MyPawn;
+}
+
+// =================================================================================================
+// FX §2.5 — the two cloak sweeps. EVERY MACHINE.
+// =================================================================================================
+
+void UTraceAbilitySetElle::StartCloakSweep(bool bCloakOn)
+{
+	ATraceCharacter* MyPawn = GetCharacter();
+	if (MyPawn == nullptr)
+	{
+		return;
+	}
+
+	// A dedicated server draws nothing and has no cooked shaders. The FACT still replicates from
+	// there; only the paint is skipped, exactly as the dim already does it a few lines below.
+	const UWorld* WorldPtr = GetWorld();
+	if (WorldPtr != nullptr && WorldPtr->GetNetMode() == NM_DedicatedServer)
+	{
+		return;
+	}
+
+	// A second sweep replaces the first rather than stacking: cloak-on immediately followed by a death
+	// or a Core pickup is a real sequence, and two rings travelling in opposite directions at once is
+	// not a thing §2.5 describes.
+	DetachCloakSweep();
+
+	USceneComponent* AttachTo = MyPawn->GetRootComponent();
+	if (AttachTo == nullptr)
+	{
+		return;
+	}
+
+	const float Intensity = bCloakOn
+		? TraceAbilitySetElleFile::SweepOnIntensity
+		: TraceAbilitySetElleFile::SweepOffIntensity;
+	const float StartZ = bCloakOn ? TraceAbilitySetElleFile::SweepTopUU : TraceAbilitySetElleFile::SweepBottomUU;
+
+	CloakSweep = TraceFxLoopBudget::AttachLoopPrimitive(MyPawn, AttachTo, UTraceFxShapes::GetCylinder(),
+		TEXT("ElleCloakSweep"), TraceAbilitySetElleFile::CloakSilver, Intensity,
+		FVector(0.f, 0.f, StartZ), TraceAbilitySetElleFile::SweepRadiusUU, CloakSweepMID);
+
+	if (CloakSweep == nullptr)
+	{
+		return;   // refused (budget, or no additive material). Documented degradation: no ring.
+	}
+
+	// AttachLoopPrimitive scales every piece uniformly off its radius, which is right for a blob and
+	// wrong for a flat ring. §2.5 asks for h 4 uu; the helper owns the budget and the material, the
+	// caller owns the shape.
+	const float XY = UTraceFxShapes::ShapeScaleForRadiusUU(TraceAbilitySetElleFile::SweepRadiusUU);
+	CloakSweep->SetRelativeScale3D(FVector(XY, XY,
+		UTraceFxShapes::ShapeScaleForLengthUU(TraceAbilitySetElleFile::SweepHeightUU)));
+
+	CloakSweepPawn = MyPawn;
+	CloakSweepElapsed = 0.f;
+	bCloakSweepRunning = true;
+	bCloakSweepIsOn = bCloakOn;
+
+	// The travel summary starts here and is closed by TickCloakSweep. See GetLastSweepStartZ.
+	LastSweepStartZ = static_cast<float>(CloakSweep->GetRelativeLocation().Z);
+	LastSweepEndZ = LastSweepStartZ;
+	bLastSweepWasCloakOn = bCloakOn;
+
+	UE_LOG(LogTraceGame, Verbose,
+		TEXT("[Elle] cloak sweep %s on %s: r %.0f uu, additive I %.2f, %.0f -> %.0f uu over %.1fs."),
+		bCloakOn ? TEXT("ON (head->feet)") : TEXT("OFF (feet->head)"), *GetNameSafe(MyPawn),
+		TraceAbilitySetElleFile::SweepRadiusUU, Intensity, StartZ,
+		bCloakOn ? TraceAbilitySetElleFile::SweepBottomUU : TraceAbilitySetElleFile::SweepTopUU,
+		TraceAbilitySetElleFile::SweepSeconds);
+}
+
+void UTraceAbilitySetElle::TickCloakSweep(float DeltaSeconds)
+{
+	if (!bCloakSweepRunning)
+	{
+		return;
+	}
+
+	ATraceCharacter* SweepPawn = CloakSweepPawn.Get();
+	if (CloakSweep == nullptr || SweepPawn == nullptr || SweepPawn != GetCharacter())
+	{
+		// The pawn was replaced under us mid-sweep. Rule 1 of the router contract, and it applies to a
+		// transient exactly as it applies to a loop.
+		DetachCloakSweep();
+		return;
+	}
+
+	CloakSweepElapsed += DeltaSeconds;
+	const float Alpha = FMath::Clamp(CloakSweepElapsed / TraceAbilitySetElleFile::SweepSeconds, 0.f, 1.f);
+
+	const float FromZ = bCloakSweepIsOn ? TraceAbilitySetElleFile::SweepTopUU : TraceAbilitySetElleFile::SweepBottomUU;
+	const float ToZ   = bCloakSweepIsOn ? TraceAbilitySetElleFile::SweepBottomUU : TraceAbilitySetElleFile::SweepTopUU;
+
+	CloakSweep->SetRelativeLocation(TraceFxLoopBudget::ClampToFootprint(
+		FVector(0.f, 0.f, FMath::Lerp(FromZ, ToZ, Alpha))));
+
+	// Read BACK off the component, not from the Lerp: the clamp above is allowed to move it, and a
+	// summary of what the recipe asked for would not notice if it had.
+	LastSweepEndZ = static_cast<float>(CloakSweep->GetRelativeLocation().Z);
+
+	// MONOTONIC: the ring travels and its intensity only ever falls. §2.5 asks for I -> 0, and bible
+	// §3.3's no-pulse rule is satisfied by construction rather than by promise.
+	const float Peak = bCloakSweepIsOn
+		? TraceAbilitySetElleFile::SweepOnIntensity
+		: TraceAbilitySetElleFile::SweepOffIntensity;
+
+	// AttachLoopPrimitive only ever hands back a piece whose blend resolved to Additive (it refuses
+	// the opaque rungs outright), so this is the achieved blend and not a hopeful guess.
+	UTraceFxShapes::SetGlow(CloakSweepMID, ETraceFxBlend::Additive,
+		TraceAbilitySetElleFile::CloakSilver, TraceFxLoopBudget::ClampIntensity(Peak * (1.f - Alpha)));
+
+	if (Alpha >= 1.f)
+	{
+		DetachCloakSweep();
+	}
+}
+
+void UTraceAbilitySetElle::DetachCloakSweep()
+{
+	if (CloakSweep != nullptr)
+	{
+		TraceFxLoopBudget::DetachLoopPrimitive(CloakSweepPawn.Get(), CloakSweep);
+	}
+	CloakSweep = nullptr;
+	CloakSweepMID = nullptr;
+	CloakSweepPawn = nullptr;
+	CloakSweepElapsed = 0.f;
+	bCloakSweepRunning = false;
+}
+
+float UTraceAbilitySetElle::GetCloakSweepHeightUU() const
+{
+	return (CloakSweep != nullptr) ? static_cast<float>(CloakSweep->GetRelativeLocation().Z) : 0.f;
 }
 
 #if !UE_BUILD_SHIPPING
@@ -516,12 +794,17 @@ float UTraceAbilitySetElle::GetSlideJumpWindowSpeedBonusForElle(const AActor* Ac
 		return GlobalWellTimedBonus;
 	}
 
-	// THE GAIN IS SCALED, THE MULTIPLIER IS NOT. 1.446875 is 1 + 0.446875 of gain; +40% of the gain is
-	// 0.446875 x 1.40 = 0.625, so Elle's is 1.625. Scaling the whole multiplier would give 2.025 — an
-	// ability more than twice the size of the one §2 asked for, and one that would beat DashSpeed off
-	// a fast slide, which is the inversion spec v9 §7 already refused for everybody.
+	// THE GAIN IS SCALED, THE MULTIPLIER IS NOT. The shipped global is 1.375000, i.e. 1 + 0.375000 of
+	// gain (v8 §8's 1.3125 base, x v28 §5's 1.50 scale on the gain, x v26 §3a's 0.80 on the gain).
+	// PATCH 28 ITEM 3 cuts her share of it from +40% to +30%: 0.375000 x 1.30 = 0.487500, so Elle's
+	// is 1.487500 (it was 1.525000). Scaling the whole multiplier would give 1.7875 — an ability that
+	// would beat DashSpeed off a fast slide, which is the inversion spec v9 §7 already refused for
+	// everybody.
 	//
-	// Never floored below the global: a passive that says "+40%" must not be able to punish her if
+	// NOT ONE OF THOSE NUMBERS IS TYPED BELOW, which is why Patch 28 item 3 was a one-knob edit: the
+	// global arrives as a parameter and Elle's share is the live property.
+	//
+	// Never floored below the global: a passive that says "+30%" must not be able to punish her if
 	// somebody sets the bonus negative.
 	const float Gain = FMath::Max(0.f, GlobalWellTimedBonus - 1.f);
 	const float Scaled = 1.f + Gain * (1.f + FMath::Max(0.f, UTraceSettings::Get().ElleSlideJumpGainBonus));
@@ -1741,6 +2024,721 @@ namespace TraceAbilitySetElleFile
 		     "mouth's drawn-bead count and angle off camera so a screenshot can be checked against the log. Pair "
 		     "up ~1.5 s after it starts; shoot within the 8 s pair lifetime. Red arm: Trace.Elle.GateVisible 0."),
 		FConsoleCommandWithArgsDelegate::CreateStatic(&RunEllePortalShot));
+}
+
+// =================================================================================================
+// Trace.Elle.FxTest — FX §2.5's FIVE ELEMENTS, STAGED, MEASURED AND PHOTOGRAPHED
+//
+// ===================================================================================================
+// THE TWO THINGS A SCREENSHOT CANNOT PROVE, AND HOW THEY ARE PROVED INSTEAD
+// ===================================================================================================
+//
+// §2.5 asks for two effects whose whole content is MOTION — a ring that travels head-to-feet in 0.3 s
+// and a bead ring that turns at 12 deg/s. A photograph of either is a photograph of a ring, and a
+// fixture that spawned one and reported "not null" would have measured its own call.
+//
+// So both are measured with TWO SAMPLES and a comparison:
+//   the cloak sweep  -> GetCloakSweepHeightUU() twice, and the second must be LOWER going in and
+//                       HIGHER coming out. That is the direction claim, which is the claim §2.5
+//                       actually makes ("head->feet" / "feet->head"), rather than "a ring existed".
+//   the portal ring  -> GetRingSpinDegrees() twice a second apart, against 12 deg/s.
+//
+// The rest — the cast ring, the teleport flash at BOTH mouths, the expiry dim-out — are read off live
+// objects (an instance count, a world iterator, the fade alpha) and photographed while held.
+//
+// FIXED FILENAMES (W4KitsB_Elle_*.png), so this run takes the release capture lock.
+// =================================================================================================
+
+namespace TraceAbilitySetElleFile
+{
+	struct FElleFxState
+	{
+		int32 Stage = 0;
+		double StageStartReal = 0.0;
+		int32 Passed = 0;
+		int32 Failed = 0;
+		int32 Shots = 0;
+
+		TWeakObjectPtr<UTraceAbilitySetElle> Elle;
+		TWeakObjectPtr<ACameraActor> Observer;
+
+		float CloakSweepZ1 = 0.f;
+		float CloakSweepZ2 = 0.f;
+		int32 CloakSweepSamples = 0;
+		float CloakTravelStart = 0.f;
+		float CloakTravelEnd = 0.f;
+		bool  bCloakSweepSeen = false;
+		bool  bDimLandedAfterSweep = false;
+
+		float DecloakSweepZ1 = 0.f;
+		float DecloakSweepZ2 = 0.f;
+		int32 DecloakSweepSamples = 0;
+		float DecloakTravelStart = 0.f;
+		float DecloakTravelEnd = 0.f;
+		bool  bDecloakSweepSeen = false;
+
+		FVector MouthA = FVector::ZeroVector;
+		FVector MouthB = FVector::ZeroVector;
+		bool  bPairPlaced = false;
+		int32 PairBeads = 0;
+		int32 CastRingsPlaying = 0;
+		float Spin1 = 0.f;
+		float Spin2 = 0.f;
+		double SpinSampledAt1 = 0.0;
+		double SpinSampledAt2 = 0.0;
+		int32 TeleportBursts = 0;
+		float MinFadeSeen = 1.f;
+		bool  bFadeShot = false;
+
+		void Check(bool bCondition, const FString& What)
+		{
+			if (bCondition) { ++Passed; UE_LOG(LogTraceGame, Display, TEXT("[ELLEFX]   ok   %s"), *What); }
+			else            { ++Failed; UE_LOG(LogTraceGame, Error,   TEXT("[ELLEFX]   FAIL %s"), *What); }
+		}
+
+		void Advance(int32 Next) { Stage = Next; StageStartReal = FPlatformTime::Seconds(); }
+		double In() const { return FPlatformTime::Seconds() - StageStartReal; }
+
+		/** Is this one of the two mouths THIS parade placed? See the filter's comment in stage 7. */
+		bool IsMyMouth(const FVector& Where) const
+		{
+			return FVector::Dist(Where, MouthA) < 400.f || FVector::Dist(Where, MouthB) < 400.f;
+		}
+	};
+
+	UTraceAbilitySetElle* MakeLocalPlayerIntoElle(UWorld* WorldPtr)
+	{
+		UTraceAbilityComponent* Comp = FindLocalAbilityComponent(WorldPtr);
+		if (Comp == nullptr)
+		{
+			return nullptr;
+		}
+		if (Comp->GetCharacterId() != ETraceCharacterId::Elle)
+		{
+			Comp->ServerSetCharacter(ETraceCharacterId::Elle);
+		}
+		return Comp->GetAbilitySetAs<UTraceAbilitySetElle>();
+	}
+
+	/**
+	 * A camera to watch her from: a purely local view change, so no pawn is moved.
+	 *
+	 * ACameraActor and NOT a bare AActor — AActor has no root component, so SpawnActor's transform
+	 * has nothing to write to and the "observer" sits at the world origin reporting (0,0,0). It does
+	 * not fail loudly; it produces convincing frames of somewhere nobody was.
+	 */
+	ACameraActor* PlaceElleObserver(UWorld* WorldPtr, const FVector& At, const FVector& LookAt)
+	{
+		if (WorldPtr == nullptr)
+		{
+			return nullptr;
+		}
+		FActorSpawnParameters Params;
+		Params.ObjectFlags |= RF_Transient;
+		ACameraActor* Observer = WorldPtr->SpawnActor<ACameraActor>(ACameraActor::StaticClass(), At,
+			(LookAt - At).Rotation(), Params);
+		if (Observer != nullptr)
+		{
+			if (APlayerController* PC = WorldPtr->GetFirstPlayerController())
+			{
+				PC->SetViewTargetWithBlend(Observer, 0.f);
+			}
+		}
+		return Observer;
+	}
+
+	void AimElleObserver(AActor* Observer, const FVector& At, const FVector& LookAt)
+	{
+		if (Observer != nullptr)
+		{
+			Observer->SetActorLocation(At);
+			Observer->SetActorRotation((LookAt - At).Rotation());
+		}
+	}
+
+	void ShootElleFrame(FElleFxState& State, const TCHAR* Tag)
+	{
+		++State.Shots;
+		const FString Path = FPaths::ConvertRelativePathToFull(
+			FPaths::ProjectSavedDir() / TEXT("Screenshots")
+			/ FString::Printf(TEXT("W4KitsB_Elle_%02d_%s.png"), State.Shots, Tag));
+		FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+		UE_LOG(LogTraceGame, Display, TEXT("[ELLEFX] Screenshot requested: %s"), *Path);
+	}
+
+	/** Only the ones standing at THIS parade's two mouths — a bot Elle's pair would otherwise count. */
+	int32 CountElleTeleportBursts(UWorld* WorldPtr, const FVector& MouthA, const FVector& MouthB)
+	{
+		int32 Count = 0;
+		for (TActorIterator<ATraceFxBurst> It(WorldPtr); It; ++It)
+		{
+			const ATraceFxBurst* Burst = *It;
+			if (!IsValid(Burst) || Burst->GetBurstType() != ETraceFxBurstType::ElleTeleport)
+			{
+				continue;
+			}
+			const FVector Where = Burst->GetActorLocation();
+			if (FVector::Dist(Where, MouthA) < 400.f || FVector::Dist(Where, MouthB) < 400.f)
+			{
+				++Count;
+			}
+		}
+		return Count;
+	}
+
+	void RunElleFxTest()
+	{
+		UWorld* WorldPtr = FindLocalGameWorldForPressTest();
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[ELLEFX] no local game world."));
+			return;
+		}
+
+		UTraceAbilitySetElle* Elle = MakeLocalPlayerIntoElle(WorldPtr);
+		if (Elle == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[ELLEFX] the local player has no ability component."));
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ELLEFX] ===== FX §2.5 parade: cloak sweep, decloak sweep, snap cast ring, paired-ring "
+			     "rotation, teleport flash at both mouths, expiry dim-out ====="));
+
+		TSharedRef<FElleFxState> State = MakeShared<FElleFxState>();
+		State->Elle = Elle;
+		State->StageStartReal = FPlatformTime::Seconds();
+		TWeakObjectPtr<UWorld> WeakWorld(WorldPtr);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			UTraceAbilitySetElle* Kit = State->Elle.Get();
+			if (TickWorld == nullptr || Kit == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[ELLEFX] the world or the kit went away mid-run."));
+				return false;
+			}
+			ATraceCharacter* Pawn = Kit->GetCharacter();
+			if (Pawn == nullptr)
+			{
+				return true;
+			}
+
+			switch (State->Stage)
+			{
+			case 0:
+				if (State->In() > 1.0)
+				{
+					// Behind and slightly above: the sweep travels the LENGTH of her, so the camera has
+					// to see the whole silhouette or the direction claim is unphotographable.
+					State->Observer = PlaceElleObserver(TickWorld,
+						Pawn->GetActorLocation() - Pawn->GetActorForwardVector() * 240.f + FVector(0.f, 0.f, 40.f),
+						Pawn->GetActorLocation());
+					Kit->DebugStartCloak(2.5f);
+					State->Advance(1);
+				}
+				break;
+
+			case 1:
+				// SAMPLED EVERY TICK WHILE IT IS ALIVE, never at two fixed delays. The sweep is 0.3 s
+				// long and this ticker is at the mercy of the frame rate: the first version of this
+				// fixture asked for a second reading 0.14 s later, got it 0.31 s later — after the ring
+				// had been detached — and read the accessor's "no ring" ZERO as travel. It printed
+				// "z 73 -> 0 uu: it travelled head to feet" about a component that no longer existed.
+				if (Kit->IsCloakSweepPlaying())
+				{
+					const float Z = Kit->GetCloakSweepHeightUU();
+					if (!State->bCloakSweepSeen)
+					{
+						State->bCloakSweepSeen = true;
+						State->CloakSweepZ1 = Z;
+						ShootElleFrame(*State, TEXT("CloakSweep"));
+					}
+					State->CloakSweepZ2 = Z;
+					++State->CloakSweepSamples;
+					return true;
+				}
+
+				if (State->bCloakSweepSeen || State->In() > 1.5)
+				{
+					State->CloakTravelStart = Kit->GetLastSweepStartZ();
+					State->CloakTravelEnd = Kit->GetLastSweepEndZ();
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[ELLEFX] cloak sweep: travel summary z %.0f -> %.0f uu (%d live sample(s) caught, "
+						     "z %.0f -> %.0f), dim applied=%d."),
+						State->CloakTravelStart, State->CloakTravelEnd, State->CloakSweepSamples,
+						State->CloakSweepZ1, State->CloakSweepZ2, Kit->IsCloakVisualApplied() ? 1 : 0);
+					State->Advance(3);
+				}
+				break;
+
+			case 2:
+				State->Advance(3);   // folded into stage 1; kept so the stage numbers below do not move
+				break;
+
+			case 3:
+				if (State->In() > 0.45)
+				{
+					// §2.5: the dim lands at SWEEP END, so this is the assertion that the delay is a
+					// delay and not a removal.
+					State->bDimLandedAfterSweep = Kit->IsCloakVisualApplied() && !Kit->IsCloakSweepPlaying();
+					ShootElleFrame(*State, TEXT("CloakDim"));
+
+					// A 0.05 s cloak, so it EXPIRES on its own — the shipped route out, through
+					// EndCloak, which is where FX §5.1 hangs ElleDecloak. Calling a debug "stop" would
+					// have proved the sweep while skipping the sound and the state clear with it.
+					Kit->DebugStartCloak(0.05f);
+					State->Advance(4);
+				}
+				break;
+
+			case 4:
+				if (Kit->IsCloakSweepPlaying())
+				{
+					const float Z = Kit->GetCloakSweepHeightUU();
+					if (!State->bDecloakSweepSeen)
+					{
+						State->bDecloakSweepSeen = true;
+						State->DecloakSweepZ1 = Z;
+						ShootElleFrame(*State, TEXT("DecloakSweep"));
+					}
+					State->DecloakSweepZ2 = Z;
+					++State->DecloakSweepSamples;
+					return true;
+				}
+
+				if (State->bDecloakSweepSeen || State->In() > 1.5)
+				{
+					State->DecloakTravelStart = Kit->GetLastSweepStartZ();
+					State->DecloakTravelEnd = Kit->GetLastSweepEndZ();
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[ELLEFX] decloak sweep: travel summary z %.0f -> %.0f uu (%d live sample(s) caught, "
+						     "z %.0f -> %.0f)."),
+						State->DecloakTravelStart, State->DecloakTravelEnd, State->DecloakSweepSamples,
+						State->DecloakSweepZ1, State->DecloakSweepZ2);
+					State->Advance(6);
+				}
+				break;
+
+			case 5:
+				State->Advance(6);   // folded into stage 4
+				break;
+
+			case 6:
+			{
+				if (State->In() < 0.40)
+				{
+					break;
+				}
+
+				// BOTH MOUTHS ARE PLACED AWAY FROM HER, deliberately: PairWith seeds the re-entry
+				// lockout for anybody standing in a mouth as it opens, so a pair placed under her feet
+				// cannot be stepped into for a second and the teleport stage below would measure the
+				// lockout instead of the flash.
+				const FVector Side = FVector::CrossProduct(Pawn->GetActorForwardVector(), FVector::UpVector)
+					.GetSafeNormal();
+				State->MouthA = Pawn->GetActorLocation() + Side * 340.f;
+				State->MouthB = State->MouthA + Pawn->GetActorForwardVector() * 420.f;
+				State->bPairPlaced = Kit->DebugPlaceGatePair(State->MouthA, State->MouthB);
+
+				const FVector Mid = 0.5f * (State->MouthA + State->MouthB);
+				AimElleObserver(State->Observer.Get(), Mid + Side * 700.f + FVector(0.f, 0.f, 260.f), Mid);
+				State->Advance(7);
+				break;
+			}
+
+			case 7:
+				if (State->In() > 0.10)
+				{
+					State->PairBeads = 0;
+					State->CastRingsPlaying = 0;
+					State->Spin1 = 0.f;
+					for (TActorIterator<ATraceElleGate> It(TickWorld); It; ++It)
+					{
+						const ATraceElleGate* Gate = *It;
+						if (!IsValid(Gate) || !Gate->IsPaired() || !State->IsMyMouth(Gate->GetMouthLocation()))
+						{
+							// BOTS RUN ELLE TOO. A census of every gate in the arena counts another
+							// Elle's live pair as this fixture's evidence — measured, one run reported
+							// 240 beads and 4 teleport bursts for a two-mouth pair. The filter is the
+							// two points this parade itself asked for.
+							continue;
+						}
+						State->PairBeads += Gate->GetDrawnBeadCount();
+						State->CastRingsPlaying += Gate->IsCastRingPlaying() ? 1 : 0;
+						State->Spin1 = Gate->GetRingSpinDegrees();
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[ELLEFX] gate at (%s): beads DRAWN=%d, cast ring playing=%d, spin %.2f deg, "
+							     "fade %.2f."),
+							*Gate->GetMouthLocation().ToCompactString(), Gate->GetDrawnBeadCount(),
+							Gate->IsCastRingPlaying() ? 1 : 0, Gate->GetRingSpinDegrees(),
+							Gate->GetExpiryFadeAlpha());
+					}
+					State->SpinSampledAt1 = FPlatformTime::Seconds();
+					ShootElleFrame(*State, TEXT("GatePairCastRing"));
+					State->Advance(8);
+				}
+				break;
+
+			case 8:
+				if (State->In() > 1.20)
+				{
+					for (TActorIterator<ATraceElleGate> It(TickWorld); It; ++It)
+					{
+						const ATraceElleGate* Gate = *It;
+						if (IsValid(Gate) && Gate->IsPaired() && State->IsMyMouth(Gate->GetMouthLocation()))
+						{
+							State->Spin2 = Gate->GetRingSpinDegrees();
+						}
+					}
+					State->SpinSampledAt2 = FPlatformTime::Seconds();
+					ShootElleFrame(*State, TEXT("GatePairSpun"));
+
+					// STEP IN. She is 340 uu from mouth A, i.e. outside it on the previous server look,
+					// so this is a genuine step-in EDGE and not a proximity poll.
+					Pawn->TeleportTo(State->MouthA, Pawn->GetActorRotation(), false, true);
+					State->Advance(9);
+				}
+				break;
+
+			case 9:
+				if (State->In() > 0.35)
+				{
+					State->TeleportBursts = CountElleTeleportBursts(TickWorld, State->MouthA, State->MouthB);
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[ELLEFX] after the step-in: %d live ElleTeleport burst(s); she is at (%s)."),
+						State->TeleportBursts, *Pawn->GetActorLocation().ToCompactString());
+					ShootElleFrame(*State, TEXT("TeleportFlash"));
+					State->Advance(10);
+				}
+				break;
+
+			case 10:
+			{
+				// The dim-out: poll until a gate reports itself fading, or give up after the pair's own
+				// lifetime plus a margin. Reported either way — an un-measured claim is a failed one.
+				bool bAnyGate = false;
+				for (TActorIterator<ATraceElleGate> It(TickWorld); It; ++It)
+				{
+					const ATraceElleGate* Gate = *It;
+					if (IsValid(Gate) && State->IsMyMouth(Gate->GetMouthLocation()))
+					{
+						bAnyGate = true;
+						State->MinFadeSeen = FMath::Min(State->MinFadeSeen, Gate->GetExpiryFadeAlpha());
+					}
+				}
+				// KEEP POLLING TO THE END. Stopping at the first sub-1 reading reports whatever the
+				// first sample happened to catch (0.91 on the run that motivated this note) and calls
+				// it a dim-out; the honest number is the LOWEST the gates ever got to before they were
+				// destroyed, which is what says whether they closed or blinked.
+				if (State->MinFadeSeen < 1.f && !State->bFadeShot)
+				{
+					State->bFadeShot = true;
+					// RE-AIMED FIRST. The step-in teleported her, and possessing/repossessing a pawn
+					// hands the view target back to it — so without this the "expiry fade" frame is a
+					// first-person photograph of wherever she landed, which was the solo4 run's one
+					// useless frame.
+					const FVector Mid = 0.5f * (State->MouthA + State->MouthB);
+					const FVector At = Mid + FVector(0.f, 700.f, 260.f);
+					AimElleObserver(State->Observer.Get(), At, Mid);
+					if (APlayerController* PC = TickWorld->GetFirstPlayerController())
+					{
+						PC->SetViewTargetWithBlend(State->Observer.Get(), 0.f);
+					}
+					ShootElleFrame(*State, TEXT("ExpiryFade"));
+				}
+				if (bAnyGate && State->In() < 14.0)
+				{
+					return true;
+				}
+				State->Advance(11);
+				break;
+			}
+
+			case 11:
+			{
+				if (APlayerController* PC = TickWorld->GetFirstPlayerController())
+				{
+					PC->SetViewTargetWithBlend(PC->GetPawn(), 0.f);
+				}
+				if (AActor* Obs = State->Observer.Get())
+				{
+					Obs->Destroy();
+				}
+
+				const double SpinWindow = FMath::Max(0.01, State->SpinSampledAt2 - State->SpinSampledAt1);
+				const float SpinRate = static_cast<float>((State->Spin2 - State->Spin1) / SpinWindow);
+
+				UE_LOG(LogTraceGame, Display, TEXT("[ELLEFX] ===== verdict ====="));
+				State->Check(State->bCloakSweepSeen, TEXT("a cloak-on sweep ring was attached to the pawn"));
+				State->Check(State->CloakTravelEnd < State->CloakTravelStart - 20.f,
+					FString::Printf(TEXT("*** it travelled HEAD -> FEET: the ring's own travel summary says "
+					                     "z %.0f uu -> %.0f uu (the %d live sample(s) this fixture happened to "
+					                     "catch said %.0f -> %.0f) ***"),
+						State->CloakTravelStart, State->CloakTravelEnd, State->CloakSweepSamples,
+						State->CloakSweepZ1, State->CloakSweepZ2));
+				State->Check(State->bDimLandedAfterSweep,
+					TEXT("the body dim landed AT SWEEP END (§2.5), not before it"));
+				State->Check(State->bDecloakSweepSeen, TEXT("a decloak sweep ring was attached to the pawn"));
+				State->Check(State->DecloakTravelEnd > State->DecloakTravelStart + 20.f,
+					FString::Printf(TEXT("*** it travelled FEET -> HEAD: the ring's own travel summary says "
+					                     "z %.0f uu -> %.0f uu (the %d live sample(s) said %.0f -> %.0f) ***"),
+						State->DecloakTravelStart, State->DecloakTravelEnd, State->DecloakSweepSamples,
+						State->DecloakSweepZ1, State->DecloakSweepZ2));
+				// 120 = two mouths x three rings x twenty beads, and it only reaches 120 if BOTH ring
+				// components report — which is the assertion that the waist ring did not fall out of
+				// the count when §2.5 moved it into its own component.
+				State->Check(State->bPairPlaced && State->PairBeads == 120,
+					FString::Printf(TEXT("the pair is standing and DRAWN across both ring components "
+					                     "(%d beads of the 120 two full mouths carry)"), State->PairBeads));
+				State->Check(State->CastRingsPlaying >= 1,
+					FString::Printf(TEXT("the snap cast ring was still expanding when the pair was photographed "
+					                     "(%d gate(s))"), State->CastRingsPlaying));
+				// §2.5's number, restated here rather than reached for: ATraceElleGate's constants are
+				// file-local by design, and a harness that shared them could not tell a wrong constant
+				// from a wrong rate. The tolerance is wide because the sample window is real time on a
+				// headless machine, not match time.
+				constexpr float ExpectedSpinDegPerSecond = 12.f;
+				State->Check(FMath::Abs(SpinRate - ExpectedSpinDegPerSecond) < 6.f,
+					FString::Printf(TEXT("*** the paired gate's middle ring TURNED: %.2f -> %.2f deg over %.2fs "
+					                     "= %.1f deg/s against the %.0f deg/s §2.5 asks for ***"),
+						State->Spin1, State->Spin2, SpinWindow, SpinRate, ExpectedSpinDegPerSecond));
+				State->Check(State->TeleportBursts == 2,
+					FString::Printf(TEXT("the teleport lit BOTH mouths: %d live ElleTeleport burst(s)"),
+						State->TeleportBursts));
+				State->Check(State->MinFadeSeen < 0.5f,
+					FString::Printf(TEXT("the gates DIMMED OUT rather than vanishing — they got at least halfway "
+					                     "down before they were destroyed (lowest fade alpha seen %.2f)"),
+						State->MinFadeSeen));
+
+				UE_LOG(LogTraceGame, Display, TEXT("[ELLEFX] ===== %d passed, %d failed, %d frame(s) ====="),
+					State->Passed, State->Failed, State->Shots);
+				if (State->Failed == 0)
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("[ELLEFX] VERDICT: PASS"));
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Error, TEXT("[ELLEFX] VERDICT: *** FAIL *** (%d)"), State->Failed);
+				}
+				return false;
+			}
+
+			default:
+				return false;
+			}
+
+			return true;
+		}), 0.05f);
+	}
+
+	FAutoConsoleCommand CmdElleFxTest(
+		TEXT("Trace.Elle.FxTest"),
+		TEXT("FX §2.5, staged and photographed: cloaks and decloaks her and measures the sweep's DIRECTION "
+		     "from two samples of the live ring, places a real pair and measures the middle ring's rotation "
+		     "rate, steps into a mouth and counts the ElleTeleport bursts at both, and watches the expiry "
+		     "dim-out. Drives the local pawn and writes FIXED filenames — take the capture lock."),
+		FConsoleCommandDelegate::CreateStatic(&RunElleFxTest));
+}
+
+// =================================================================================================
+// Trace.Elle.GateWatch — THE CLIENT HALF. Decides nothing, drives nothing, MEASURES.
+//
+// Trace.Elle.FxTest needs authority: it places the pair and moves the pawn. That makes it exactly the
+// wrong tool for the question this tranche has to answer — "is any of this visible on a machine that
+// is not the server?" — and it is the same trap Trace.Elle.SnapPressTest's own header describes
+// (a harness that only ever ran where the answer was guaranteed).
+//
+// So this runs ANYWHERE and asks only what a client can know: are the replicated gates DRAWN here, is
+// the paired middle ring turning here, did the ElleTeleport bursts arrive here. It points this
+// machine's camera at the pair — a purely local view change — and takes frames while they are alive.
+//
+// FIXED FILENAMES (W4KitsB_Client_*.png): take the capture lock.
+// =================================================================================================
+
+namespace TraceAbilitySetElleFile
+{
+	void RunElleGateWatch(UWorld* WorldPtr, float Seconds)
+	{
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[GATEWATCH] no world."));
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[GATEWATCH] watching for %.0fs on netmode=%d (0 standalone, 2 listen, 3 client)."),
+			Seconds, static_cast<int32>(WorldPtr->GetNetMode()));
+
+		struct FWatchState
+		{
+			double EndReal = 0.0;
+			bool bSeenGate = false;
+			bool bViewed = false;
+			int32 Shots = 0;
+			double NextShotReal = 0.0;
+			int32 BestBeads = 0;
+			int32 BestPaired = 0;
+			int32 CastRingsSeen = 0;
+			int32 MostTeleportBursts = 0;
+			float MinFade = 1.f;
+			float SpinFirst = 0.f;
+			double SpinFirstAt = 0.0;
+			float SpinLast = 0.f;
+			double SpinLastAt = 0.0;
+			bool bSpinSampled = false;
+			int32 PairedWhenSampled = 0;
+		};
+
+		TSharedRef<FWatchState> W = MakeShared<FWatchState>();
+		W->EndReal = FPlatformTime::Seconds() + FMath::Clamp(Seconds, 1.f, 120.f);
+		TWeakObjectPtr<UWorld> WeakWorld(WorldPtr);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([W, WeakWorld](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			if (TickWorld == nullptr)
+			{
+				return false;
+			}
+
+			int32 Beads = 0;
+			int32 Paired = 0;
+			int32 CastRings = 0;
+			FVector MouthSum = FVector::ZeroVector;
+			int32 Mouths = 0;
+			float Spin = 0.f;
+
+			for (TActorIterator<ATraceElleGate> It(TickWorld); It; ++It)
+			{
+				const ATraceElleGate* Gate = *It;
+				if (!IsValid(Gate))
+				{
+					continue;
+				}
+				Beads += Gate->GetDrawnBeadCount();
+				Paired += Gate->IsPaired() ? 1 : 0;
+				CastRings += Gate->IsCastRingPlaying() ? 1 : 0;
+				MouthSum += Gate->GetMouthLocation();
+				++Mouths;
+				W->MinFade = FMath::Min(W->MinFade, Gate->GetExpiryFadeAlpha());
+				if (Gate->IsPaired())
+				{
+					Spin = Gate->GetRingSpinDegrees();
+				}
+			}
+
+			int32 Bursts = 0;
+			for (TActorIterator<ATraceFxBurst> It(TickWorld); It; ++It)
+			{
+				if (IsValid(*It) && It->GetBurstType() == ETraceFxBurstType::ElleTeleport)
+				{
+					++Bursts;
+				}
+			}
+			W->MostTeleportBursts = FMath::Max(W->MostTeleportBursts, Bursts);
+			W->BestBeads = FMath::Max(W->BestBeads, Beads);
+			W->BestPaired = FMath::Max(W->BestPaired, Paired);
+			W->CastRingsSeen = FMath::Max(W->CastRingsSeen, CastRings);
+
+			if (Paired >= 1)
+			{
+				// THE BASELINE RESETS WHEN THE PAIR CHANGES. A 40 s window outlives an 8 s pair, so a
+				// rate taken across two different pairs is arithmetic about two unrelated actors —
+				// measured, one run reported 3.2 deg/s that way while the same build measured 12.0
+				// deg/s within a single pair.
+				if (!W->bSpinSampled || Paired != W->PairedWhenSampled || Spin < W->SpinLast - 1.f)
+				{
+					W->bSpinSampled = true;
+					W->PairedWhenSampled = Paired;
+					W->SpinFirst = Spin;
+					W->SpinFirstAt = FPlatformTime::Seconds();
+				}
+				W->SpinLast = Spin;
+				W->SpinLastAt = FPlatformTime::Seconds();
+			}
+
+			if (Mouths > 0 && !W->bSeenGate)
+			{
+				W->bSeenGate = true;
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[GATEWATCH] *** FIRST FRAME WITH A GATE *** %d mouth(s), %d paired, beads DRAWN=%d, "
+					     "cast ring(s) expanding=%d, spin %.2f deg."),
+					Mouths, Paired, Beads, CastRings, Spin);
+			}
+
+			if (Mouths > 0 && !W->bViewed)
+			{
+				const FVector Mid = MouthSum / static_cast<float>(Mouths);
+				if (APlayerController* PC = TickWorld->GetFirstPlayerController())
+				{
+					// Local view only: no pawn is moved, so nothing the server owns is touched and no
+					// correction can fight it. Same trick Trace.Mace.RopeProbeWatch uses.
+					FActorSpawnParameters Params;
+					Params.ObjectFlags |= RF_Transient;
+					const FVector At = Mid + FVector(0.f, 700.f, 320.f);
+					// ACameraActor, not AActor: AActor has no root component, so a spawn transform has
+					// nothing to write to and the "observer" reports (0,0,0) for ever. Photographed —
+					// join2's client gate frames are the arena seen from its own centre at floor level.
+					if (ACameraActor* Observer = TickWorld->SpawnActor<ACameraActor>(ACameraActor::StaticClass(), At,
+						(Mid - At).Rotation(), Params))
+					{
+						PC->SetViewTargetWithBlend(Observer, 0.f);
+						W->bViewed = true;
+						W->NextShotReal = FPlatformTime::Seconds() + 0.3;
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[GATEWATCH] camera -> the pair's midpoint (%s), from (%s)."),
+							*Mid.ToCompactString(), *At.ToCompactString());
+					}
+				}
+			}
+
+			// SPACED ACROSS THE WHOLE WINDOW, not bunched into the first four seconds: the teleport
+			// flash is a 1.2 s actor somewhere inside 40 s, and four frames taken in a row at the start
+			// photograph the same instant four times.
+			if (W->bViewed && W->Shots < 6 && FPlatformTime::Seconds() >= W->NextShotReal)
+			{
+				const FString Path = FPaths::ConvertRelativePathToFull(
+					FPaths::ProjectSavedDir() / TEXT("Screenshots")
+					/ FString::Printf(TEXT("W4KitsB_Client_%02d.png"), W->Shots + 1));
+				FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+				++W->Shots;
+				W->NextShotReal = FPlatformTime::Seconds() + ((W->Shots < 2) ? 1.1 : 6.0);
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[GATEWATCH] Screenshot requested: %s  (beads DRAWN=%d, paired=%d, bursts=%d)"),
+					*Path, Beads, Paired, Bursts);
+			}
+
+			if (FPlatformTime::Seconds() < W->EndReal)
+			{
+				return true;
+			}
+
+			const double Window = FMath::Max(0.01, W->SpinLastAt - W->SpinFirstAt);
+			const float Rate = static_cast<float>((W->SpinLast - W->SpinFirst) / Window);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[GATEWATCH] VERDICT on this machine: gates seen=%d | most beads DRAWN=%d | most paired=%d "
+				     "| cast rings caught expanding=%d | most live ElleTeleport bursts=%d | middle-ring spin "
+				     "%.2f -> %.2f deg over %.1fs = %.1f deg/s | lowest expiry fade %.2f | %d frame(s)."),
+				W->bSeenGate ? 1 : 0, W->BestBeads, W->BestPaired, W->CastRingsSeen, W->MostTeleportBursts,
+				W->SpinFirst, W->SpinLast, Window, Rate, W->MinFade, W->Shots);
+			return false;
+		}), 0.f);
+	}
+
+	FAutoConsoleCommandWithWorld CmdElleGateWatch(
+		TEXT("Trace.Elle.GateWatch"),
+		TEXT("Dev only, runs ANYWHERE and is meant for a CLIENT. Watches for 40 s and reports what THIS "
+		     "machine can see of Elle's gates — drawn beads, the paired middle ring's rotation rate, the cast "
+		     "ring, the expiry fade and the live ElleTeleport bursts — then photographs the pair. Writes "
+		     "FIXED filenames; take the capture lock."),
+		FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* World)
+		{
+			RunElleGateWatch(World, 40.f);
+		}));
 }
 
 #endif   // !UE_BUILD_SHIPPING

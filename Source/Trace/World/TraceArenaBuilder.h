@@ -201,6 +201,64 @@ public:
 	FVector GetCoreSpawnLocation() const;
 
 	/**
+	 * PATCH 28 §5. ONE SURF RAIL, DESCRIBED, SO NOTHING ELSE HAS TO KNOW WHERE IT IS.
+	 *
+	 * The movement slice's speed-gain rig (-TraceSurfTest) has to put a pawn on a real ramp, and the
+	 * only honest way to do that is to ASK the thing that built it. A rig holding its own copy of the
+	 * rail's coordinates would keep passing after the level moved — this project's standing lesson
+	 * about two copies of one rule, applied to geometry.
+	 */
+	struct FTraceSurfRailProbe
+	{
+		/** False if the rails are switched off, or the field is too small to fit one. */
+		bool bValid = false;
+
+		/** A point a few uu OFF the ridable face, high on the arc, near the entry end. */
+		FVector FaceEntry = FVector::ZeroVector;
+
+		/** Outward normal of the facet under FaceEntry. Unit length. */
+		FVector FaceNormal = FVector::ZeroVector;
+
+		/** Unit vector along the rail, pointing AWAY from the halfway line (the run direction). */
+		FVector RunDirection = FVector::ZeroVector;
+
+		/** Length of the ridable run, uu. */
+		float RunLength = 0.f;
+
+		/** Crest height above the floor, uu. */
+		float Height = 0.f;
+
+		/** The arc's shallowest and steepest facet slopes, in degrees from horizontal. */
+		float MinFaceAngleDegrees = 0.f;
+		float MaxFaceAngleDegrees = 0.f;
+
+		/**
+		 * A point standing on the WALKABLE crest, mid-run. The negative control: a pawn dropped here
+		 * must never enter the surf state, because the crest is flat and the floor is flat and neither
+		 * is a surf plane.
+		 */
+		FVector CrestStand = FVector::ZeroVector;
+
+		/**
+		 * DEMO 29 ITEM 4. Where the arc's TOE meets the arena FLOOR, a third of the way along the run.
+		 *
+		 * This is the point a player running along the outer lane actually arrives at, and it exists
+		 * because the owner's second complaint ("it still doesn't feel like you can surf INTO curves")
+		 * is a claim about the APPROACH, not about a ride already in progress. A rig that can only
+		 * start a ride by teleporting a pawn onto the face cannot measure it. Z is the floor, so a
+		 * capsule is placed by adding its own half height and nothing else.
+		 */
+		FVector ToeOnFloor = FVector::ZeroVector;
+	};
+
+	/**
+	 * Describes the surf rail in the quadrant (@p XSign, @p YSign). Safe to call before or after the
+	 * build: it derives everything from the same accessors the build uses, so it cannot disagree with
+	 * what was actually constructed.
+	 */
+	FTraceSurfRailProbe GetSurfRailProbe(float XSign, float YSign) const;
+
+	/**
 	 * The placed Core spawn marker, or null when the level has none (which is the normal state of
 	 * /Game/Maps/Arena). Warns, once per resolve, if there is more than one.
 	 */
@@ -829,10 +887,10 @@ public:
 	 *
 	 * THE COST, STATED PLAINLY: at WalkSpeed 800 a wall-to-wall run is now 48 seconds (42 of them
 	 * goal to goal, 3 in each pocket). UTraceSettings::HitscanRange has to clear the field DIAGONAL
-	 * and no longer does: 38400 x 9600 is 39581 uu against a shipped 36000, so a shot down the long
-	 * diagonal now dies 3581 uu short of a target the player can see. That property lives in
-	 * UTraceSettings and in Config/DefaultGame.ini, neither of which this pass owns; it is called out
-	 * in the report and it wants 39600.
+	 * (38400 x 9600 -> 39581 uu) and DOES: Config/DefaultGame.ini ships HitscanRange=39600, raised
+	 * from the 36000 that covered the old 33600 field when the pockets landed, and
+	 * WarnIfHitscanRangeIsShort() re-checks the pairing in the log of every match — so a future
+	 * resize here cannot silently strand the long diagonal again.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float FieldLength = 38400.f;
@@ -849,13 +907,13 @@ public:
 	 * mode-B goal mouths, the spawn fan, GetFieldBounds() (which is what the bots steer inside and
 	 * what the half-time side switch measures against), the grid, the flanks and the corner banks.
 	 *
-	 * THE ONE NUMBER THAT DOES NOT LIVE HERE and must be re-checked by hand is
-	 * UTraceSettings::HitscanRange, which has to clear the field diagonal. Spec v28 §8 lengthened the
-	 * field to 38400 x 9600 for the two hockey pockets, i.e. a 39581 uu diagonal, so the 36000 that
-	 * covered the 33600 field NO LONGER REACHES: a shot down the long diagonal dies 3581 uu short of
-	 * a target the player can plainly see. That property lives in UTraceSettings (and, because the
-	 * ini wins, in Config/DefaultGame.ini as well), neither of which the map pass owns; it needs to
-	 * go to 39600 and it is called out in that pass's report.
+	 * THE ONE NUMBER THAT DOES NOT LIVE HERE and must move with these two is
+	 * UTraceSettings::HitscanRange, which has to clear the field diagonal. Spec v28 §8 lengthened
+	 * the field to 38400 x 9600 for the two hockey pockets (a 39581 uu diagonal) and the range
+	 * followed: Config/DefaultGame.ini now ships HitscanRange=39600 (the ini wins over the
+	 * UTraceSettings default), clearing the diagonal with 19 uu to spare. The pairing is guarded at
+	 * runtime by WarnIfHitscanRangeIsShort(), so a field resize shows up in every match log rather
+	 * than as shots dying short of targets the player can plainly see.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float FieldWidth = 9600.f;
@@ -911,6 +969,16 @@ public:
 	/** Master switch for the interior layout (centre diamond, cover scatter, gates). */
 	UPROPERTY(EditAnywhere, Category = "Trace|Layout")
 	bool bBuildInteriorLayout = true;
+
+	/**
+	 * Master switch for the sky dressing (release overhaul, MAP plan §4): the 24-tower skyline ring
+	 * beyond the walls, the horizon glow band behind each end, and the goal beacons over the rings.
+	 *
+	 * Visuals only — BuildSkyline is called inside the bBuildVisuals gate, builds no collision and
+	 * casts no shadows, so a dedicated server has no sky at all and nothing here can affect play.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Layout")
+	bool bBuildSkyline = true;
 
 	// --- Corner banks (the sketch's green arrows) ------------------------------------------------
 	//
@@ -1042,6 +1110,17 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Trace|Layout")
 	bool bBuildFlankStructures = true;
 
+	/**
+	 * PATCH 28 §5. The four curved SURF RAILS in the outer lanes. See BuildSurfRails().
+	 *
+	 * Its own switch, like the banks' and the flanks', for the same reason: "the arena with the rails"
+	 * and "the arena without them" both have to be lookable-at while the movement feature they exist
+	 * for is being tuned, and an A/B of a movement mechanic against the geometry it runs on is worth
+	 * one bool.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Layout")
+	bool bBuildSurfRails = true;
+
 	UPROPERTY(EditAnywhere, Category = "Trace|Spawns")
 	int32 StartsPerTeam = 5;
 
@@ -1051,6 +1130,31 @@ public:
 	// tonemapper sees scene radiance unscaled and every intensity below is an absolute number rather
 	// than something auto-exposure will normalise away. Measure with -TraceAutoShot after changing
 	// any of them; do not assume.
+
+	/**
+	 * Forward-shading priorities for the four-light rig (art bible §5.1). Forward shading,
+	 * translucency, water and volumetric fog honour exactly ONE directional light; with four spawned
+	 * and no priorities declared the engine warned on screen every frame and picked a winner by
+	 * overall brightness. The KeyLight is THE light (the rig's sole shadow caster), the atmosphere
+	 * sun exists only to feed the sky capture, and Fill/Bounce are rim/ambient TINT that must never
+	 * win the single-light slot. Static members rather than table literals because two translation
+	 * units apply them: BuildLighting's FLightSpec table (TraceArenaBuilder.cpp) on the procedural
+	 * map, and AdoptBakedArena (TraceArenaBake.cpp), which pushes the same policy onto a baked
+	 * level's serialised lights at load so a stale bake self-heals without a re-bake.
+	 */
+	static constexpr int32 ForwardPriorityKeyLight = 10;
+	static constexpr int32 ForwardPriorityAtmosphereSun = 5;
+	static constexpr int32 ForwardPriorityRimLight = 0;
+
+	/**
+	 * Chromatic fringe, shared by BuildPostProcess (which owns the history comment, next to the
+	 * setting) and AdoptBakedArena (which pushes it over the value serialised into a baked level's
+	 * post-process volume — ApplyFidelity rewrites only the COST settings, so an art-direction
+	 * change made after a bake reaches the shipping map through the adopt push, not a re-bake).
+	 * 0.2 -> 0.0 for the release overhaul: at distance the fringe compounded TSR into green/magenta
+	 * edges on thin neon (art bible §5.3).
+	 */
+	static constexpr float ArenaSceneFringeIntensity = 0.f;
 
 	/**
 	 * Illuminance of the light that drives ASkyAtmosphere, in lux. Very low, and aimed from BELOW
@@ -1204,6 +1308,50 @@ protected:
 
 	void BuildCoverField(bool bBuildVisuals);
 	void BuildFlanks(bool bBuildVisuals);
+
+	/**
+	 * PATCH 28 §5 — THE SURF RAILS. Four of them, one per quadrant, in the outer lane between the two
+	 * lane pylons. Read the block comment on the definition before moving one: the rail's face angles
+	 * are DERIVED from the movement component's walkable limit, not typed beside it.
+	 */
+	void BuildSurfRails(bool bBuildVisuals);
+
+	/** Shallowest facet slope on a surf rail, degrees. Derived from the pawn's walkable limit. */
+	float SurfRailMinFaceAngleDegrees() const;
+
+	/** Crest height of a surf rail above the floor, uu. */
+	float SurfRailHeight() const;
+
+	/** Radius of the circular arc the rail's face is cut from, uu. */
+	float SurfRailFaceRadius() const;
+
+	/** How far the face reaches outboard from its toe, uu. */
+	float SurfRailFaceSpan() const;
+
+	/** |Y| of the rail's inboard toe, uu. */
+	float SurfRailToeY() const;
+
+	/** |Y| of the rail's outboard back face, uu. */
+	float SurfRailBackY() const;
+
+	/** |X| of the rail's two ends: [0] nearest the halfway line, [1] nearest the goal. */
+	void SurfRailRunX(float& OutNearX, float& OutFarX) const;
+
+	/**
+	 * DEMO 29 ITEM 4(a). |X| of the nearest solid a surfer leaving a rail can fly into — the first
+	 * approach block or lane pylon whose Y band overlaps the rail's own, or the goal line if there is
+	 * none. Swept off the same specs the build places, so a layout change moves it.
+	 */
+	float SurfRailExitObstacleX() const;
+
+	/**
+	 * DEMO 29 ITEM 4(a). How much clear lane a rail's exit needs, in uu of |X| past the junction.
+	 *
+	 * Maximised along the nose (leaving later means leaving lower AND further out, and the worst case
+	 * is not always at either end) using UTraceCharacterMovementComponent::GetSurfExitReach(), so it
+	 * tracks the movement tuning instead of carrying a copy of it.
+	 */
+	float SurfRailExitClearance() const;
 	void BuildEndzones(bool bBuildVisuals);
 
 	/**
@@ -1226,6 +1374,21 @@ protected:
 	 * modes.
 	 */
 	void BuildGoalRing(float Sign, bool bBuildVisuals);
+
+	/**
+	 * The sky dressing (release overhaul, MAP plan §4): a 24-tower silhouette ring 8,200–14,600 uu
+	 * beyond the walls, a horizon glow band behind each end, and a 90 uu pillar of light over each
+	 * goal ring. All of it is pooled ISM instances via AddMeshBlock, bCastShadow=false, no collision
+	 * — pure wayfinding: the behind-goal skyline roofs, the bands and the beacons wear the defending
+	 * team's colour (registered for the half-time repaint), so the sky itself answers "which way am
+	 * I facing". The sky read needs visible sky, which the 2,600 uu wall takes away as you approach
+	 * an end (the sightline arithmetic is stated where the band is built); the beacon, which stands
+	 * INSIDE the arena over the ring, is the one that still answers from the pockets.
+	 *
+	 * Called inside the bBuildVisuals gate (a server has no sky) behind bBuildSkyline; @p
+	 * bBuildVisuals is passed anyway so the signature matches its siblings if the gate ever moves.
+	 */
+	void BuildSkyline(bool bBuildVisuals);
 
 	void BuildPlayerStarts();
 	void BuildLighting();
@@ -1573,12 +1736,31 @@ protected:
 	 */
 	void ResolveArenaMaterials();
 
-	/** Dark lit structural surface. All parameters are M_TraceSurface's; see generate_content.py. */
+	/**
+	 * Dark lit structural surface. All parameters are M_TraceSurface's; see generate_content.py.
+	 *
+	 * @param ParentOverride an M_TraceSurface-derived MIC to parent the MID to instead of the bare
+	 *                       SurfaceMaterial — how the floor picks up MI_Surface_Floor_Grid's armed
+	 *                       static switch. Null (every other call site) means SurfaceMaterial.
+	 */
 	UMaterialInstanceDynamic* MakeSurfaceMID(const FLinearColor& BaseColor, float Roughness,
-		float Metallic = 0.f, const FLinearColor& Emissive = FLinearColor::Black, float EmissiveStrength = 1.f);
+		float Metallic = 0.f, const FLinearColor& Emissive = FLinearColor::Black, float EmissiveStrength = 1.f,
+		UMaterialInterface* ParentOverride = nullptr);
 
 	/** Unlit neon. @p Glow multiplies @p Color; > 1 is what pushes it over the bloom threshold. */
 	UMaterialInstanceDynamic* MakeNeonMID(const FLinearColor& Color, float Glow);
+
+	/**
+	 * As above, plus M_TraceNeon's uniform pulse: the emissive term is multiplied by
+	 * 1 + PulseAmp * sin(2π * Time * PulseRate) — entirely CPU-folded uniform expressions, zero
+	 * per-pixel cost (see the pulse chain in generate_content.py). BOTH parameters must be non-zero
+	 * for any motion; the parents default both to 0, which is how the must-not-pulse list (trails,
+	 * parry, territory trim, cover lips, every T0/T1 surface) is enforced without a lock.
+	 *
+	 * @param PulseRate cycles per second (Hz).
+	 * @param PulseAmp  swing as a fraction of Glow (0.12 = ±12%).
+	 */
+	UMaterialInstanceDynamic* MakeNeonMID(const FLinearColor& Color, float Glow, float PulseRate, float PulseAmp);
 
 	// --- Derived layout --------------------------------------------------------------------------
 	float HalfLength() const { return FieldLength * 0.5f; }
@@ -1699,7 +1881,10 @@ protected:
 
 public:
 	/**
-	 * Repaints both endzones for a new side assignment (spec §1 half-time switch).
+	 * Repaints every team-coloured arena surface for a new side assignment (spec §1 half-time
+	 * switch): endzones, goals, gates, end walls, floor grid halves, cover lips and face trim,
+	 * bank contours, flank dressing, corner pylons, skyline roofs, horizon bands, goal beacons —
+	 * and the floor-lamp lattice, which is lights rather than materials and is re-blended directly.
 	 *
 	 * Without this, a Blue player spends the second half standing in an orange-painted endzone
 	 * defending it — the arena is the single largest piece of "which way am I attacking" signage in
@@ -1720,6 +1905,24 @@ public:
 	 * authoritative call site that could cover both.
 	 */
 	static void ApplyTeamSidesInWorld(const UWorld* World, ETraceTeam TeamOnNegativeSide);
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * DEV LEVER for Trace.Arena.PulseTest: force PulseRate/PulseAmp onto every material instance the
+	 * builder made, and report how many took the parameters.
+	 *
+	 * It exists because a still photograph cannot prove a 0.25 Hz breath: the shipped amplitudes are
+	 * ±12% of an emissive value that is already several times over the tonemapper's white point, so
+	 * two frames half a period apart differ by a fraction of a display code value even when the
+	 * material is animating perfectly. Driving the same parameters to an unmissable rate/amplitude
+	 * for one capture run turns "is the pulse chain alive at all?" into a question a screenshot pair
+	 * can answer — without a rebuild, and without shipping test values in the build.
+	 *
+	 * @return the number of MIDs that reported the parameters present (0 means the parent has no
+	 *         pulse chain: the assignments in MakeNeonMID are landing on nothing).
+	 */
+	int32 ForcePulseOnAllMIDs(float PulseRate, float PulseAmp);
+#endif
 
 private:
 	/**
@@ -1753,7 +1956,12 @@ private:
 	/** Registers @p MID as belonging to the end at @p EndSign. No-op on null. */
 	void RegisterSideMID(float EndSign, UMaterialInstanceDynamic* MID, bool bNeon, float Intensity, float BaseDim = 0.f);
 
-	/** Endzone surfaces whose colour follows the side assignment. Built once, repainted at half time. */
+	/**
+	 * Every arena surface whose colour follows the side assignment — the endzone/goal/gate/end-wall
+	 * set that always registered, plus (release overhaul, MAP plan §5) the cover lips and face trim,
+	 * the bank contours, the flank dressing (with the corner pylons and end buttresses that share
+	 * its MIDs) and the new sky pieces. Built once, repainted at half time.
+	 */
 	TArray<FTraceSideMID> SideMIDs;
 
 	/** The side assignment currently painted, so ApplyTeamSides can skip redundant work. */
@@ -1842,6 +2050,17 @@ private:
 	UPROPERTY()
 	TObjectPtr<UMaterialInterface> NeonMaterial;
 
+	/**
+	 * /Game/Trace/Materials/Authored/MI_Surface_Floor_Grid — the hand-authored micro-grid floor
+	 * instance (parent M_TraceSurface, bUseGrid armed; see Scripts/author_mics.py). The main floor
+	 * MID is created with THIS as its parent, so the floor carries the faint cyan micro-grid on both
+	 * maps: MIDs inherit a MIC parent's static switches, and the re-bake writes the baked floor MIC
+	 * with the same parent. Absent (older content), the floor falls back to SurfaceMaterial and
+	 * renders exactly as it did before the grid existed — see ResolveArenaMaterials.
+	 */
+	UPROPERTY()
+	TObjectPtr<UMaterialInterface> FloorGridMaterial;
+
 	/** Keeps the tint instances alive independently of the components they are assigned to. */
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<UMaterialInstanceDynamic>> TintMIDs;
@@ -1906,6 +2125,11 @@ private:
 	 * a full deferred lighting pass over its screen footprint, and at FloorLampRadius 4200 that
 	 * footprint is large. Turning half of them off is one of the few Low-preset levers this file
 	 * owns that costs no geometry - see ApplyFidelity.
+	 *
+	 * Also the half-time repaint's lamp list (MAP plan §5.4): lamps are tinted toward the half's
+	 * defending team at build, and a light is not a MID, so ApplyTeamSides re-blends these directly.
+	 * Both build paths fill the array — AddPointLight on the procedural map, AdoptBakedArena's
+	 * FloorLamp-tagged collection on the baked one — so the repaint needs no third bookkeeping list.
 	 */
 	TArray<TWeakObjectPtr<UPointLightComponent>> FloorLamps;
 

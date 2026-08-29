@@ -34,6 +34,12 @@
 // -TraceNoFontAtlas, or `Trace.Text.Atlas 0`) these functions typeset Lato through the same
 // FCanvasTextItem path the rest of the Canvas menus use, and MEASURE it in Lato too, so a centred
 // label stays centred in the degraded path.
+//
+// SO IS THE PER-GLYPH ONE (UI plan WP12), and it is a different mechanism for a different problem:
+// with the atlas perfectly healthy, a codepoint the drawing face has no cell for — the ö of a
+// player called "Björn" — is taken from the Latin-1 sheet and dropped into the line. That happens
+// inside TraceText::LayoutString and inside the loop below; a caller passes the same string it
+// always did and gets letters instead of holes. See the banner in TraceText.h.
 
 #pragma once
 

@@ -221,8 +221,16 @@ public:
 	 */
 	bool ProbeForWall(FVector& OutPoint, FVector& OutNormal, float& OutDistance, FString& OutWhy) const;
 
-	/** The placement sweep on its own: "where would a Slimewall go from here?" */
-	bool ResolveSlimewallPlacement(FVector& OutCenter, FVector& OutPlanarAim, FVector& OutHalfExtents,
+	/**
+	 * The placement sweep on its own: "where would a Slimewall go from here?"
+	 *
+	 * PATCH 28 ITEM 2: @p OutSlabNormal is the wall's NORMAL (its thin axis), which since the wall
+	 * runs FORWARD is the LATERAL vector — perpendicular to his aim, not along it. It is handed
+	 * straight to ATraceSlimewall::ServerSpawn as InPlanarAim, whose contract has always been "the
+	 * slab's local +X". @p OutHalfExtents carries the ACHIEVED forward span in Y, which is shorter
+	 * than SlimewallLengthUU when something in the lane cut the run short.
+	 */
+	bool ResolveSlimewallPlacement(FVector& OutCenter, FVector& OutSlabNormal, FVector& OutHalfExtents,
 	                               FString& OutWhy) const;
 
 	/**

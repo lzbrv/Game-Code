@@ -204,6 +204,8 @@ float FTraceHitZoneModel::DamageForZone(ETraceHitZone Zone)
 	}
 }
 
+#if !UE_BUILD_SHIPPING
+
 // -------------------------------------------------------------------------------------------
 // Self test
 //
@@ -351,3 +353,5 @@ static FAutoConsoleCommand GTraceHitZoneTestCmd(
 	TEXT("Runs the offline self test of the head/body/legs damage zone model and logs the result."),
 	FConsoleCommandDelegate::CreateStatic(
 		[]() { TraceRunHitZoneSelfTest(); }));
+
+#endif // !UE_BUILD_SHIPPING

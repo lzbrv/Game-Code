@@ -5,8 +5,11 @@
 #include "Camera/PlayerCameraManager.h"
 #include "Components/SceneComponent.h"
 #include "Containers/Ticker.h"
+#include "CollisionQueryParams.h"           // FX_AUDIO_PLAN §3 — the impact plane's one short normal probe
 #include "Engine/Engine.h"
+#include "Engine/HitResult.h"
 #include "EngineUtils.h"                      // TActorIterator — Trace.Fx.Beam follows the newest shot
+#include "UObject/ObjectKey.h"                // FX_AUDIO_PLAN §4.1 — one tracer pool per world
 #include "HAL/IConsoleManager.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
@@ -79,7 +82,7 @@ static TAutoConsoleVariable<float> GCVarTracerBeamScale(
 	TEXT("1.0 is the doc's authored size, which photographs as a plank at viewmodel range. Clamped ")
 	TEXT("0.05..4.0. Trace.Fx.Beam's three ABSOLUTE rows grade doc x this; its two RATIO rows are ")
 	TEXT("scale-invariant and grade the doc's raw proportions whatever this is set to."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /**
  * DEMO 27 — HOW FAST THE BOLT CROSSES THE GAP. See ATraceTracer::BoltBaseSpeedUU for the bracket.
@@ -100,7 +103,7 @@ static TAutoConsoleVariable<float> GCVarBoltSpeed(
 	TEXT("60 Hz. Clamped 2000..200000. THE SHOT ITSELF IS HITSCAN AND INSTANT — this is the speed ")
 	TEXT("of a picture of a shot that has already been resolved, and nothing about damage, timing ")
 	TEXT("or the aim ray reads it."),
-	ECVF_Default);
+	ECVF_Cheat);
 
 /**
  * *** THE RED ARM FOR THE TRAVEL RULE. *** 0 restores the pre-Demo-27 beam: laid full length from
@@ -379,6 +382,94 @@ namespace
 	TWeakObjectPtr<ATraceTracer> GFirstPersonFlashOwner;
 } // namespace
 
+// -------------------------------------------------------------------------------------------------
+// FX_AUDIO_PLAN §4.1 — THE POOL ITSELF. Read the pool block in TraceTracer.h first: the policy and
+// the harness hazard it is written around are argued there, and this is only the bookkeeping.
+//
+// Named for this file, never anonymous, for the jumbo-build reason every other block here carries.
+// -------------------------------------------------------------------------------------------------
+namespace TraceTracerPool
+{
+	/**
+	 * 0 — off: every shot spawns and destroys its own actor, exactly as before this pass. The RED ARM
+	 *     for Trace.Fx.TracerPool.Report, which must then show reuses 0.
+	 * 1 — default: park and reuse, but only once TracerPoolEngageLive tracers are in flight at
+	 *     once. See that constant for why the threshold is not the pool's capacity.
+	 * 2 — always reuse when a parked tracer exists. The pure form §4.1 describes, for measurement.
+	 */
+	static TAutoConsoleVariable<int32> CVarTracerPool(
+		TEXT("Trace.Fx.TracerPool"),
+		1,
+		TEXT("FX_AUDIO_PLAN s4.1 tracer pooling. 0 = off (spawn and destroy per shot). 1 = default: ")
+		TEXT("recycle only once 8 tracers are in flight at once, so light fire behaves exactly as ")
+		TEXT("before and a real firefight costs no actor churn. 2 = always recycle when one is ")
+		TEXT("parked. Purely a lifetime policy: nothing about the beam's appearance reads this."),
+		ECVF_Cheat);
+
+	struct FWorldPool
+	{
+		/** Parked tracers, oldest release first — see PopFree for why the order is load-bearing. */
+		TArray<TWeakObjectPtr<ATraceTracer>> Free;
+
+		ATraceTracer::FPoolStats Stats;
+	};
+
+	/** One pool per world. Keyed so two PIE worlds in one process cannot trade actors. */
+	static TMap<FObjectKey, FWorldPool> GPools;
+
+	FWorldPool& PoolFor(const UWorld* World)
+	{
+		return GPools.FindOrAdd(FObjectKey(World));
+	}
+
+	FWorldPool* FindPool(const UWorld* World)
+	{
+		return (World != nullptr) ? GPools.Find(FObjectKey(World)) : nullptr;
+	}
+
+	/**
+	 * The oldest parked tracer, or null.
+	 *
+	 * *** FIFO, AND THAT IS NOT AN AESTHETIC CHOICE. *** Taking from the FRONT means consecutive
+	 * shots cycle through every parked tracer before any one of them is used twice, so a burst of up
+	 * to TracerPoolSize shots is still that many DISTINCT actors — which is what keeps the input
+	 * harness's "Shots > 1" (a union of unique ids over a held burst) measuring the gun rather than
+	 * the pool even in the loaded case. A LIFO stack would hand back the same actor for every shot.
+	 */
+	ATraceTracer* PopFree(FWorldPool& Pool)
+	{
+		while (Pool.Free.Num() > 0)
+		{
+			TWeakObjectPtr<ATraceTracer> Candidate = Pool.Free[0];
+			Pool.Free.RemoveAt(0);
+
+			if (ATraceTracer* Tracer = Candidate.Get())
+			{
+				return Tracer;
+			}
+			// A drained entry. It already decremented Live in EndPlay; just skip it.
+		}
+		return nullptr;
+	}
+} // namespace TraceTracerPool
+
+FLinearColor ATraceTracer::TracerFamilyHue()
+{
+	// The family sRGB (169, 229, 254), converted once. See FTraceTracerImpact::Hue.
+	return FLinearColor(0.40f, 0.78f, 0.99f, 1.f);
+}
+
+ATraceTracer::FPoolStats ATraceTracer::GetPoolStats(const UWorld* World)
+{
+	if (const TraceTracerPool::FWorldPool* Pool = TraceTracerPool::FindPool(World))
+	{
+		FPoolStats Out = Pool->Stats;
+		Out.Free = Pool->Free.Num();
+		return Out;
+	}
+	return FPoolStats();
+}
+
 ATraceTracer::ATraceTracer()
 {
 	// Ticks for a fraction of a second to fly the bolt down the shot, then deletes itself.
@@ -432,11 +523,30 @@ ATraceTracer::ATraceTracer()
 	BeamHalo    = MakePiece(TEXT("BeamHalo"), Cylinder);
 	MuzzleFlash = MakePiece(TEXT("MuzzleFlash"), UTraceFxShapes::GetCone());
 
-	// No ImpactFlash: spec v4 §4 deleted the sphere at the far end of the beam. And no sphere at the
-	// near end either since v32 — the muzzle flash is the FX doc's cone now.
+	// FX_AUDIO_PLAN §3 — the two faces of the one impact quad. Created here as default subobjects,
+	// like every other piece, so a pooled tracer carries them for free (§4.1) and a shot that leaves
+	// no mark pays nothing but a hidden component. See ImpactPlanes in the header for why there are
+	// two of them and why walking up to one and rotating it is not an alternative.
+	UStaticMesh* Plane = UTraceFxShapes::GetPlane();
+	ImpactPlanes[0] = MakePiece(TEXT("ImpactPlaneFront"), Plane);
+	ImpactPlanes[1] = MakePiece(TEXT("ImpactPlaneBack"), Plane);
+	for (UStaticMeshComponent* Face : ImpactPlanes)
+	{
+		if (Face != nullptr)
+		{
+			Face->SetVisibility(false);
+		}
+	}
+
+	// No ImpactFlash: spec v4 §4 deleted the SPHERE at the far end of the beam, and it stays deleted.
+	// The quad above is not that sphere returning under another name — it is drawn only where a shot
+	// hit the WORLD, i.e. exactly the case the sphere's deletion was not about. FTraceTracerImpact carries
+	// the whole argument; ATraceTracer::MinLengthForMuzzleFlashUU's neighbourhood is where the near
+	// end's sphere used to be and it is not coming back either.
 }
 
-ATraceTracer* ATraceTracer::Spawn(UWorld* World, const FVector& From, const FVector& To, const FLinearColor& Color, bool bImpacted)
+ATraceTracer* ATraceTracer::Spawn(UWorld* World, const FVector& From, const FVector& To, const FLinearColor& Color,
+	bool bImpacted, const FTraceTracerImpact& Impact)
 {
 	if (World == nullptr)
 	{
@@ -459,16 +569,185 @@ ATraceTracer* ATraceTracer::Spawn(UWorld* World, const FVector& From, const FVec
 		return nullptr;
 	}
 
-	FActorSpawnParameters SpawnParams;
-	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
-	SpawnParams.ObjectFlags |= RF_Transient;
+	// --- FX_AUDIO_PLAN §4.1: ACQUIRE ------------------------------------------------------------
+	//
+	// The policy — spawn below the pool size, recycle at or above it — is argued in full in the pool
+	// block in TraceTracer.h. The one thing worth repeating here is that the reuse branch changes
+	// nothing about what happens NEXT: both branches hand the same InitTracer the same arguments, and
+	// a recycled tracer has been put back into a fresh actor's state by RestoreForReuse first.
+	TraceTracerPool::FWorldPool& Pool = TraceTracerPool::PoolFor(World);
+	const int32 PoolMode = TraceTracerPool::CVarTracerPool.GetValueOnAnyThread();
+	const bool bMayRecycle = (PoolMode == 2) || (PoolMode == 1 && Pool.Stats.Live >= TracerPoolEngageLive);
 
-	ATraceTracer* Tracer = World->SpawnActor<ATraceTracer>(ATraceTracer::StaticClass(), FTransform::Identity, SpawnParams);
+	ATraceTracer* Tracer = nullptr;
+	if (bMayRecycle)
+	{
+		Tracer = TraceTracerPool::PopFree(Pool);
+		if (Tracer != nullptr)
+		{
+			Tracer->RestoreForReuse();
+			++Pool.Stats.Reuses;
+		}
+	}
+
+	if (Tracer == nullptr)
+	{
+		FActorSpawnParameters SpawnParams;
+		SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		SpawnParams.ObjectFlags |= RF_Transient;
+
+		Tracer = World->SpawnActor<ATraceTracer>(ATraceTracer::StaticClass(), FTransform::Identity, SpawnParams);
+		if (Tracer != nullptr)
+		{
+			++Pool.Stats.Spawns;
+			++Pool.Stats.Live;
+		}
+	}
+
 	if (Tracer != nullptr)
 	{
-		Tracer->InitTracer(From, To, Color, bImpacted);
+		Tracer->InitTracer(From, To, Color, bImpacted, Impact);
 	}
 	return Tracer;
+}
+
+void ATraceTracer::RestoreForReuse()
+{
+	bPooledDormant = false;
+
+	// THE DRAIN IS CANCELLED FIRST. A parked tracer is carrying a life span that would destroy it
+	// mid-flight; SetLifeSpan(0) is the engine's own "no timer" and it must happen before anything
+	// else here can matter.
+	SetLifeSpan(0.f);
+
+	// *** RE-STAMPED SO NOTHING CAN TELL THIS FROM A FRESH ACTOR BY ITS AGE. ***
+	// AActor::GetGameTimeSinceCreation() is CreationTime against the world clock, and it is read
+	// outside this file — Trace.Smg.Verify picks "the newest tracer" with it. A recycled actor that
+	// still claimed its original birth would make that harness follow the wrong beam, and would make
+	// every other age reader quietly wrong in the same direction.
+	if (const UWorld* ReuseWorld = GetWorld())
+	{
+		CreationTime = ReuseWorld->GetTimeSeconds();
+	}
+
+	SetActorTickEnabled(true);
+	SetActorHiddenInGame(false);
+
+	// Every per-shot flag back to its constructed value. InitTracer rewrites the geometry, the
+	// colours and the MIDs from scratch, so what has to be undone here is only the STATE that says
+	// "this shot is over": the hide-once latches, and the impact plane's two-stage reveal.
+	bBoltVisible = false;
+	bHaloVisible = false;
+	bMuzzleVisible = false;
+	bImpactArmed = false;
+	bImpactShown = false;
+	ImpactShownTimeSeconds = 0.0;
+	bFirstPersonShot = false;
+	bSmgProfile = false;
+	ProfileGunMesh = NAME_None;
+	GeometryAgeSeconds = 0.f;
+	ShotLifeSeconds = 0.f;
+
+	for (UStaticMeshComponent* Face : ImpactPlanes)
+	{
+		if (Face != nullptr)
+		{
+			Face->SetVisibility(false);
+		}
+	}
+	for (UStaticMeshComponent* Segment : BeamSegments)
+	{
+		if (Segment != nullptr)
+		{
+			Segment->SetVisibility(true);
+		}
+	}
+	if (BeamHalo != nullptr)
+	{
+		BeamHalo->SetVisibility(true);
+	}
+	if (MuzzleFlash != nullptr)
+	{
+		MuzzleFlash->SetVisibility(true);
+	}
+}
+
+void ATraceTracer::ReleaseToPool()
+{
+	if (bPooledDormant)
+	{
+		return;
+	}
+
+	UWorld* ReleaseWorld = GetWorld();
+	if (ReleaseWorld == nullptr)
+	{
+		Destroy();
+		return;
+	}
+
+	// POOLING OFF: the pre-§4.1 ending, unchanged — the actor simply dies when its shot is over.
+	if (TraceTracerPool::CVarTracerPool.GetValueOnAnyThread() == 0)
+	{
+		Destroy();
+		return;
+	}
+
+	TraceTracerPool::FWorldPool& Pool = TraceTracerPool::PoolFor(ReleaseWorld);
+
+	// A FULL FREE LIST IS A FIXED POOL DOING ITS JOB. §4.1 asks for 24, not for "as many as the worst
+	// frame ever needed": a spike that briefly put thirty tracers in the air must not leave thirty
+	// dormant actors behind it for the rest of the match.
+	if (Pool.Free.Num() >= TracerPoolSize)
+	{
+		++Pool.Stats.Overflows;
+		Destroy();
+		return;
+	}
+
+	bPooledDormant = true;
+	++Pool.Stats.Releases;
+
+	// Nothing drawn, nothing ticking. Hiding the ACTOR as well as the pieces is belt and braces: a
+	// future beat that forgets to hide its own component cannot leak a stale transform into the world
+	// through a parked tracer.
+	SetActorTickEnabled(false);
+	SetActorHiddenInGame(true);
+	RetireMuzzleFlash();
+	for (UStaticMeshComponent* Segment : BeamSegments)
+	{
+		if (Segment != nullptr) { Segment->SetVisibility(false); }
+	}
+	if (BeamHalo != nullptr) { BeamHalo->SetVisibility(false); }
+	for (UStaticMeshComponent* Face : ImpactPlanes)
+	{
+		if (Face != nullptr) { Face->SetVisibility(false); }
+	}
+
+	// THE IDLE DRAIN, AND IT IS THE ENGINE'S OWN TIMER RATHER THAN A SWEEPER OF OURS. A parked tracer
+	// that nobody reclaims within TracerPoolIdleSeconds destroys itself, so a world that stops
+	// shooting empties its pool with no ticker, no bookkeeping and nothing to forget to cancel — the
+	// reclaim path's first line is SetLifeSpan(0), which is the cancel.
+	SetLifeSpan(TracerPoolIdleSeconds);
+
+	Pool.Free.Add(this);
+}
+
+void ATraceTracer::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// The pool's Live count is what the acquire policy reads, so it has to be right whichever way an
+	// actor leaves: drained on its idle timer, destroyed as an overflow, or taken with the world.
+	if (TraceTracerPool::FWorldPool* Pool = TraceTracerPool::FindPool(GetWorld()))
+	{
+		Pool->Stats.Live = FMath::Max(0, Pool->Stats.Live - 1);
+		if (bPooledDormant)
+		{
+			++Pool->Stats.Drains;
+			Pool->Free.Remove(TWeakObjectPtr<ATraceTracer>(this));
+		}
+	}
+
+	Super::EndPlay(EndPlayReason);
 }
 
 bool ATraceTracer::GetGunMuzzleLandmark(FName StaticMeshName, FVector& OutMeshLocalCm)
@@ -644,6 +923,16 @@ ATraceTracer* ATraceTracer::GetNewestTracer(const UWorld* World, bool bFirstPers
 		{
 			continue;
 		}
+		// A PARKED TRACER IS NOT A SHOT (FX_AUDIO_PLAN §4.1). Since pooling, a tracer whose shot is
+		// over stays in the world for up to TracerPoolIdleSeconds waiting to be reclaimed; it is
+		// hidden and not ticking and it is drawing nothing, so handing one to Trace.Fx.Beam would
+		// give the probe a beam that is not on screen — with SpawnTimeSeconds still pointing at the
+		// shot that finished. Skipped here rather than in each caller, because "the newest tracer"
+		// has only ever meant "the newest LIVE one".
+		if (Candidate->bPooledDormant)
+		{
+			continue;
+		}
 		// "Mine", read off the beam itself: bFirstPersonShot is set only when this machine's own
 		// viewmodel muzzle was resolved and the beam was moved onto it, which no remote shooter's
 		// tracer can ever satisfy. See the parameter's note in the header for why the probe needs it.
@@ -670,12 +959,17 @@ void ATraceTracer::RetireMuzzleFlash()
 	bMuzzleVisible = false;
 }
 
-void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLinearColor& Color, bool bImpacted)
+void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLinearColor& Color, bool bImpacted,
+	const FTraceTracerImpact& Impact)
 {
 	FVector Delta = To - From;
 	double Length = Delta.Size();
 	if (Length < static_cast<double>(MinTracerLengthUU))
 	{
+		// NEVER DRAWN, AND IT MUST STILL END. A recycled tracer arrives here with no life span (the
+		// reclaim cancelled the drain), so returning bare would leave it in the world for ever with
+		// nothing to expire it. Releasing hands it straight back to the pool as a free tracer.
+		ReleaseToPool();
 		return;
 	}
 	const FVector Dir = Delta / Length;
@@ -764,6 +1058,8 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 	Length = Delta.Size();
 	if (Length < static_cast<double>(MinTracerLengthUU))
 	{
+		// As above: the relocation onto the viewmodel collapsed the segment. Ended, not abandoned.
+		ReleaseToPool();
 		return;
 	}
 	const FVector BeamDir = Delta / Length;
@@ -956,25 +1252,55 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 		GFirstPersonFlashOwner = this;
 	}
 
+	// --- FX_AUDIO_PLAN §3: DOES THIS SHOT LEAVE A MARK? -----------------------------------------
+	//
+	// TWO CONDITIONS AND THEY ARE DIFFERENT QUESTIONS. bImpacted says the beam stopped on SOMETHING
+	// rather than dying at maximum range; Impact.bDraw says the something was the WORLD and not a
+	// person. Only both together earn a plane — see FTraceTracerImpact in the header for why the second one
+	// is a rule rather than a taste, and note that the whole beat is resolved HERE, at spawn, and
+	// merely revealed later: the probe and the world transform are cheap and exactly right now, and
+	// the arrival frame should not be doing a line trace.
+	if (bImpacted && Impact.bDraw)
+	{
+		ResolveImpactPlane(To, BeamDir, Impact);
+	}
+
 	// --- HOW LONG THIS ACTOR ACTUALLY LIVES ------------------------------------------------------
 	//
-	// The bolt's own life, or the muzzle flash's authored 0.28 s window if the flash outlasts it.
-	// Both, because they are on different clocks ON PURPOSE (see the flash paragraph in the class
-	// comment): the bolt is what "lingers on the field" and it is now over in 0.10..0.30 s, while
-	// the flash is a small cone at the shooter's own barrel whose expansion curve pops if it is cut
-	// short. Whichever is longer is when there is nothing left to draw.
+	// The bolt's own life, the muzzle flash's authored 0.28 s window, or the impact mark's arrival
+	// plus its 0.18 s fade — whichever outlasts the others. They are on different clocks ON PURPOSE
+	// (see the flash paragraph in the class comment): the bolt is what "lingers on the field" and is
+	// over in 0.10..0.30 s, the flash is a small cone at the shooter's own barrel whose expansion
+	// curve pops if it is cut short, and the mark cannot start until the bolt gets there. Whichever
+	// is longer is when there is nothing left to draw.
 	//
-	// SetLifeSpan rather than InitialLifeSpan: this runs after the actor has begun play, so the
-	// constructor's ceiling is already ticking and this restarts it at the right figure.
-	const float ActorLifeSeconds =
-		FMath::Max(BoltTravel.LifeSeconds, bMuzzleVisible ? MuzzleFlashSeconds : 0.f);
-	SetLifeSpan(ActorLifeSeconds);
+	// THE ARRIVAL IS THE HEAD'S, NOT THE BOLT'S WHOLE LIFE: the head reaches the impact at
+	// shot / speed and the tail then takes one bolt-length longer to be swallowed, so a mark that
+	// waited for the bolt's full life would appear late on every long shot. FMax against 0 because a
+	// solved speed is always positive but a divide is a divide.
+	const float ImpactArrivalSeconds = bImpactArmed
+		? (BeamLengthUU / FMath::Max(1.f, BoltTravel.SpeedUU))
+		: 0.f;
+
+	ShotLifeSeconds = FMath::Max3(
+		BoltTravel.LifeSeconds,
+		bMuzzleVisible ? MuzzleFlashSeconds : 0.f,
+		bImpactArmed ? (ImpactArrivalSeconds + ImpactPlaneSeconds) : 0.f);
+
+	// *** NO SetLifeSpan HERE ANY MORE (FX_AUDIO_PLAN §4.1). *** The actor's end is now a RELEASE
+	// rather than a destruction — Tick calls ReleaseToPool() when this figure is up — because an
+	// actor that destroys itself cannot be recycled. The engine's life-span timer is still used, but
+	// for the pool's idle DRAIN (see ReleaseToPool), which is a different clock with a different job.
+	// SetLifeSpan(0) cancels the constructor's ceiling, which would otherwise still be running.
+	SetLifeSpan(0.f);
 
 	// NO IMPACT POP. Spec v4 §4: "Remove the sphere from the end of the bullet tracer hitscan
-	// animation, so it's just a bullet trace." The beam still terminates exactly on the impact
-	// point, which is the information the sphere was covering up. bImpacted is now unused; see the
-	// note on Spawn() in the header for why the parameter survives.
-	(void)bImpacted;
+	// animation, so it's just a bullet trace." That deletion stands and the sphere is not back: the
+	// §3 plane above is drawn only where the shot MISSED every player, i.e. exactly the case the
+	// ruling was not about, and it is a flat 26 uu scuff on architecture rather than 52 uu of unlit
+	// emissive sitting on the point you were aiming at. bImpacted, unused between v4 and this pass,
+	// is read again as one half of that gate.
+	const float ActorLifeSeconds = ShotLifeSeconds;
 
 	// THE CLOCK. Absolute, sampled once, never advanced — see SpawnTimeSeconds in the header.
 	const UWorld* ShotWorld = GetWorld();
@@ -1000,6 +1326,154 @@ void ATraceTracer::InitTracer(const FVector& From, const FVector& To, const FLin
 		BoltTravel.LengthUU, BoltTravel.SpeedUU, BoltTravel.LifeSeconds, ActorLifeSeconds,
 		UTraceFxShapes::BlendName(CoreBlend), UTraceFxShapes::BlendName(HaloBlend),
 		UTraceFxShapes::BlendName(FlashBlend));
+}
+
+void ATraceTracer::ResolveImpactPlane(const FVector& ImpactPoint, const FVector& BeamDir, const FTraceTracerImpact& Impact)
+{
+	if (ImpactPlanes[0] == nullptr || ImpactPlanes[1] == nullptr)
+	{
+		return;
+	}
+
+	// --- ADDITIVE OR NOTHING, exactly as the halo and the muzzle cone decide it ------------------
+	//
+	// A mark on a wall is a mark on a wall whichever material it is drawn with, but the OPAQUE rungs
+	// of UTraceFxShapes' ladder would put a 26 uu unlit disc on the surface that stays there at full
+	// size while its emissive fades — the dark-matte-disc failure a verifier photographed on this
+	// effect's own muzzle cone. Additive writes no depth, sums with what is behind it, and a mark
+	// faded to zero adds zero and is genuinely gone. If the additive material is unavailable, no
+	// mark: a shot with no scuff is what shipped for the whole of this project's life so far.
+	UMaterialInstanceDynamic* Made = UTraceFxShapes::MakeGlowMID(ImpactPlanes[0], 0, ETraceFxBlend::Translucent, ImpactBlend);
+	if (Made == nullptr || (ImpactBlend != ETraceFxBlend::Additive && ImpactBlend != ETraceFxBlend::Translucent))
+	{
+		ImpactMID = nullptr;
+		return;
+	}
+
+	ImpactMID = Made;
+	ImpactPlanes[1]->SetMaterial(0, ImpactMID);   // ONE MID, TWO FACES — see ImpactPlanes in the header.
+
+	// --- THE NORMAL, PROBED ---------------------------------------------------------------------
+	//
+	// One 16 uu line trace straddling the impact point along the shot. See ResolveImpactPlane's
+	// header comment for why ECC_Visibility is the correct channel and why it cannot return a body.
+	// The fallback — face straight back down the beam — is exactly right for a head-on hit and only
+	// wrong by the surface's own slope, which is the case the probe exists to catch.
+	FVector Normal = -BeamDir;
+	if (const UWorld* ProbeWorld = GetWorld())
+	{
+		FHitResult Probe;
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceTracerImpactNormal), /*bTraceComplex=*/false);
+		Params.bReturnPhysicalMaterial = false;
+		if (ProbeWorld->LineTraceSingleByChannel(Probe,
+				ImpactPoint - BeamDir * ImpactProbeUU, ImpactPoint + BeamDir * ImpactProbeUU,
+				ECC_Visibility, Params)
+			&& !Probe.ImpactNormal.IsNearlyZero())
+		{
+			Normal = Probe.ImpactNormal.GetSafeNormal();
+		}
+	}
+
+	// The BasicShape plane lies in its own local XY with its face along +Z, so aiming local +Z at the
+	// surface normal is the whole placement. The second face is the same quad turned over, which is
+	// what makes the mark readable from both sides of a wall you shot past.
+	const FQuat Facing = FRotationMatrix::MakeFromZ(Normal).ToQuat();
+	const FVector Where = ImpactPoint + Normal * ImpactPlaneOffsetUU;
+
+	// WORLD SPACE, not relative: the tracer actor's own transform is the BEAM's (origin at the
+	// muzzle, +Z down the shot) and the mark belongs to the wall, not to the beam.
+	ImpactPlanes[0]->SetWorldLocationAndRotation(Where, Facing);
+	ImpactPlanes[1]->SetWorldLocationAndRotation(Where, Facing * FQuat(FRotator(180.f, 0.f, 0.f)));
+
+	for (UStaticMeshComponent* Face : ImpactPlanes)
+	{
+		UTraceFxShapes::SizePlane(Face, ImpactPlaneSizeUU, ImpactPlaneSizeUU);
+		Face->SetVisibility(false);   // armed, not shown: it appears when the bolt gets there.
+	}
+
+	ImpactColor = Impact.Hue;
+	bImpactArmed = true;
+	bImpactShown = false;
+}
+
+bool ATraceTracer::DescribeImpactPlane(FVector& OutWorldLocation, float& OutWidthUU, float& OutOpacity) const
+{
+	OutWorldLocation = FVector::ZeroVector;
+	OutWidthUU = 0.f;
+	OutOpacity = 0.f;
+
+	const UStaticMeshComponent* Face = ImpactPlanes[0];
+	if (!bImpactArmed || !bImpactShown || Face == nullptr || !Face->IsVisible())
+	{
+		return false;
+	}
+
+	OutWorldLocation = Face->GetComponentLocation();
+
+	// THE WIDTH OUT OF THE LIVE SCALE, through the library's own conversion — the same one SizePlane
+	// used to write it. If the quad is ever silently 100x wrong this says 2600, not 26.
+	OutWidthUU = UTraceFxShapes::LengthUUFromShapeScale(static_cast<float>(Face->GetRelativeScale3D().X));
+
+	// RECOMPUTED, and labelled as such wherever it is printed: a MID does not give a scalar back.
+	// Same expression UpdateImpactPlane writes, evaluated at the age the geometry was last laid at.
+	const float Alpha = FMath::Clamp(
+		(GeometryAgeSeconds - static_cast<float>(ImpactShownTimeSeconds)) / ImpactPlaneSeconds, 0.f, 1.f);
+	OutOpacity = ImpactPlaneOpacity * (1.f - Alpha);
+	return true;
+}
+
+void ATraceTracer::UpdateImpactPlane(float AgeSeconds)
+{
+	if (!bImpactArmed || ImpactMID == nullptr)
+	{
+		return;
+	}
+
+	// THE REVEAL IS THE ARRIVAL. The head's law is the one the whole effect is built on
+	// (BoltHeadZUU), so asking it is what keeps the mark and the bolt from disagreeing about when
+	// the shot got there — and it means Trace.Fx.BoltTravel 0, which lays the beam instantly,
+	// correctly puts the mark up on frame one too.
+	if (!bImpactShown)
+	{
+		if (BoltHeadZUU(BoltTravel, BeamLengthUU, AgeSeconds) < BeamLengthUU)
+		{
+			return;
+		}
+
+		bImpactShown = true;
+		ImpactShownTimeSeconds = static_cast<double>(AgeSeconds);
+		for (UStaticMeshComponent* Face : ImpactPlanes)
+		{
+			if (Face != nullptr)
+			{
+				Face->SetVisibility(true);
+			}
+		}
+	}
+
+	// LINEAR, which is §3's word. The mark is small, flat and short-lived, and an eased fade on a
+	// 0.18 s additive quad is a curve nobody can see the difference in — so the plan's simplest
+	// reading is the one implemented, and the opacity a probe measures is the one it asks for.
+	const float Alpha = FMath::Clamp(
+		(AgeSeconds - static_cast<float>(ImpactShownTimeSeconds)) / ImpactPlaneSeconds, 0.f, 1.f);
+
+	if (Alpha >= 1.f)
+	{
+		for (UStaticMeshComponent* Face : ImpactPlanes)
+		{
+			if (Face != nullptr)
+			{
+				Face->SetVisibility(false);
+			}
+		}
+		bImpactArmed = false;
+		return;
+	}
+
+	// Intensity 1.0 and the fade in the OPACITY argument, the same idiom the halo and the cone use:
+	// on an additive blend the opacity IS how much of this colour is added to what is behind it, and
+	// a material instance clamps a vector parameter to [0,1] so brightness cannot ride in the colour.
+	UTraceFxShapes::SetGlow(ImpactMID, ImpactBlend, ImpactColor, 1.f, ImpactPlaneOpacity * (1.f - Alpha));
 }
 
 void ATraceTracer::UpdateEffect(float AgeSeconds)
@@ -1130,12 +1604,23 @@ void ATraceTracer::UpdateEffect(float AgeSeconds)
 		}
 	}
 
-	// The impact beat used to be here: an expanding sphere at the hit point. Deleted, spec v4 §4.
+	// The impact beat used to be an expanding SPHERE at the hit point, and that is still deleted
+	// (spec v4 §4). What is here now is FX_AUDIO_PLAN §3's flat 26 uu scuff, drawn only where the
+	// shot hit the world and never where it hit a player — the distinction the deletion turned on.
+	UpdateImpactPlane(AgeSeconds);
 }
 
 void ATraceTracer::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+
+	// A PARKED TRACER DRAWS NOTHING (FX_AUDIO_PLAN §4.1). ReleaseToPool disables this tick, so this
+	// is a belt-and-braces guard for the one frame an in-flight tick could land in: nothing below
+	// must run against a shot that is over.
+	if (bPooledDormant)
+	{
+		return;
+	}
 
 	// A STATELESS FUNCTION OF AN ABSOLUTE CLOCK, not an accumulator. DeltaSeconds is deliberately
 	// unused: an `Age += Delta` here would double-advance across a hitch, and since Demo 27 age is a
@@ -1150,6 +1635,18 @@ void ATraceTracer::Tick(float DeltaSeconds)
 		: 0.f;
 
 	UpdateEffect(AgeSeconds);
+
+	// --- FX_AUDIO_PLAN §4.1: RELEASE, WHERE SetLifeSpan USED TO DO THE ENDING -------------------
+	//
+	// The shot's own figure, computed by InitTracer from the same three clocks the effect runs on.
+	// AFTER UpdateEffect, so the last frame of the beam is drawn rather than skipped — the previous
+	// life-span ending had that property for free and losing it would shorten every effect by a
+	// frame. ShotLifeSeconds is 0 only for a tracer that never reached InitTracer, and the guard
+	// keeps such an actor on the constructor's ceiling instead of releasing it instantly.
+	if (ShotLifeSeconds > 0.f && AgeSeconds >= ShotLifeSeconds)
+	{
+		ReleaseToPool();
+	}
 }
 
 bool ATraceTracer::DescribeShot(FTraceTracerShotDebug& OutInfo) const
@@ -2163,5 +2660,212 @@ static FAutoConsoleCommand GTraceFxBeamRopeArmCmd(
 			     "frame one exactly as it was before Demo 27. The five profile rows should stay "
 			     "green and the two travel rows must go red. This does not restore itself."));
 		TraceTracerFxProbe::ArmScripted(/*bExpectSmg=*/false, TEXT("One"));
+	}));
+
+// -------------------------------------------------------------------------------------------------
+// FX_AUDIO_PLAN §4.1 — THE POOL'S EVIDENCE, WHICH IS A COUNT AND NOT AN ASSERTION
+//
+// "Pooling soak showing no per-shot actor churn" is the acceptance line, and the only honest way to
+// show it is to fire a lot of tracers and then print how many ACTORS that cost. Two commands:
+//
+//   Trace.Fx.TracerPool.Report        prints the live counters for this world.
+//   Trace.Fx.TracerPool.Soak N        drives N tracers through ATraceTracer::Spawn as fast as the
+//                                     frame allows and reports the spawn/reuse split.
+//
+// THE SOAK DRIVES Spawn() AND NOT THE GUN, deliberately. What is under test is the ACQUIRE/RELEASE
+// policy, not the trigger — the gun's own path into Spawn is one line and is exercised by every
+// other harness in the project — and reproducing a ten-player SMG ceiling (~100 rounds/s) through
+// real fire would need ten pawns, ten clips and a minute. The beams it draws are real beams at real
+// geometry: the soak is visible, and the report at the end is what it is for.
+//
+// Both inside !UE_BUILD_SHIPPING, which is this project's rule for every new console command (the
+// unguarded harness sprawl in TraceCore is the named anti-pattern).
+// -------------------------------------------------------------------------------------------------
+namespace TraceTracerPoolProbe
+{
+	FTSTicker::FDelegateHandle GTicker;
+	int32 GRemaining = 0;
+	float GPerSecond = 0.f;
+	float GCarry = 0.f;
+	ATraceTracer::FPoolStats GStart;
+
+	UWorld* SoakWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			if (Context.World() != nullptr && Context.World()->IsGameWorld())
+			{
+				return Context.World();
+			}
+		}
+		return nullptr;
+	}
+
+	void Report(const TCHAR* Label)
+	{
+		UWorld* World = SoakWorld();
+		const ATraceTracer::FPoolStats Now = ATraceTracer::GetPoolStats(World);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("TRACERPOOL %s: spawns %d, reuses %d, releases %d, overflows %d, drains %d | live %d, free %d (pool size %d, mode %d)"),
+			Label, Now.Spawns, Now.Reuses, Now.Releases, Now.Overflows, Now.Drains, Now.Live, Now.Free,
+			ATraceTracer::TracerPoolSize, TraceTracerPool::CVarTracerPool.GetValueOnAnyThread());
+	}
+
+	void Finish()
+	{
+		UWorld* World = SoakWorld();
+		const ATraceTracer::FPoolStats Now = ATraceTracer::GetPoolStats(World);
+		const int32 Spawned = Now.Spawns - GStart.Spawns;
+		const int32 Reused = Now.Reuses - GStart.Reuses;
+		const int32 Total = Spawned + Reused;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("TRACERPOOL SOAK: %d tracer(s) drawn -> %d NEW ACTOR(S) and %d reuse(s). ")
+			TEXT("Churn is %d actor(s) per 100 shots."),
+			Total, Spawned, Reused, (Total > 0) ? FMath::RoundToInt(100.f * Spawned / Total) : 0);
+		Report(TEXT("after soak"));
+
+		// --- THE VERDICT, AND WHAT ITS BAR IS AND IS NOT ------------------------------------------
+		//
+		// *** THE BAR IS NOT "spawns <= pool size", AND THE FIRST DRAFT'S WAS, AND IT WAS WRONG. ***
+		// TracerPoolSize caps how many tracers may be PARKED, not how many may be alive: a pool
+		// cannot recycle a tracer whose bolt is still crossing the arena, so a soak firing faster
+		// than tracers expire must create at least as many actors as are simultaneously in flight.
+		// At this probe's own default (240/s against a 0.10..0.30 s life) that is fifty-odd, and a
+		// verdict that called fifty-odd a failure would be grading the arithmetic of the soak rather
+		// than the behaviour of the pool.
+		//
+		// WHAT §4.1 ACTUALLY ASKS FOR IS THAT CHURN STOP BEING PER-SHOT — "acquire/release instead of
+		// spawn/SetLifeSpan" — so the quantity to grade is ACTORS PER SHOT, and the discriminator is
+		// sharp rather than a judgement call: with pooling off it is exactly 1.00 by construction, and
+		// with it on it is bounded by concurrency divided by the number of shots, which falls as the
+		// soak gets longer. A quarter is far above anything the pool produces (this soak measures
+		// about a twentieth) and far below the red arm's 1.00, so nothing lands near the line.
+		if (Total > ATraceTracer::TracerPoolSize * 2)
+		{
+			const bool bBounded = (Spawned * 4 <= Total);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("TRACERPOOL VERDICT: %s — %d shot(s) cost %d actor(s), i.e. %.2f actors per shot "
+				     "against 1.00 with Trace.Fx.TracerPool 0 (bar: at most 0.25)."),
+				bBounded ? TEXT("PASS (no per-shot actor churn)") : TEXT("FAIL (actors grew with shots)"),
+				Total, Spawned, static_cast<float>(Spawned) / static_cast<float>(FMath::Max(1, Total)));
+		}
+	}
+
+	bool Tick(float Delta)
+	{
+		UWorld* World = SoakWorld();
+		if (World == nullptr || GRemaining <= 0)
+		{
+			GRemaining = 0;
+			FTSTicker::GetCoreTicker().RemoveTicker(GTicker);
+			GTicker.Reset();
+			Finish();
+			return false;
+		}
+
+		// *** PACED IN TIME, NOT PER FRAME, AND THE FIRST DRAFT WAS THE OTHER WAY AND MEASURED
+		// NOTHING. *** A tracer lives 0.10..0.30 s, so CONCURRENCY — which is the only quantity a
+		// pool responds to — is a rate times a life. Twelve per FRAME under -nullrhi, where the frame
+		// rate is thousands, drew all six hundred tracers in 145 ms: not one of them had reached the
+		// end of its own bolt, so not one was ever released, so nothing could possibly be recycled
+		// and the soak reported 600 actors for 600 shots. Firing at a rate in SECONDS reproduces
+		// §4.1's actual scenario ("~100 rounds/s x 0.2 s visible life") at any frame rate, on any
+		// machine, with or without a renderer.
+		//
+		// The carry is what makes a fractional rate exact: at 240/s and a 1 ms frame this fires on
+		// roughly one frame in four rather than rounding up to 240 per frame.
+		GCarry += GPerSecond * FMath::Max(0.f, Delta);
+		const int32 ThisTick = FMath::Min(FMath::FloorToInt(GCarry), GRemaining);
+		if (ThisTick <= 0)
+		{
+			return true;
+		}
+		GCarry -= static_cast<float>(ThisTick);
+
+		// Beams laid across the arena in front of the origin, long enough to be real shots with real
+		// travel rules rather than degenerate segments the early-outs would reject.
+		for (int32 Index = 0; Index < ThisTick; ++Index)
+		{
+			const float Offset = 40.f * static_cast<float>(Index % 16);
+			const FVector From(0.f, Offset, 220.f);
+			const FVector To(3000.f, Offset, 220.f);
+			ATraceTracer::Spawn(World, From, To, FLinearColor(0.2f, 0.6f, 1.f), /*bImpacted=*/true);
+		}
+		GRemaining -= ThisTick;
+		return true;
+	}
+
+	void Arm(int32 Count, float PerSecond)
+	{
+		if (GTicker.IsValid())
+		{
+			FTSTicker::GetCoreTicker().RemoveTicker(GTicker);
+			GTicker.Reset();
+		}
+		GRemaining = FMath::Clamp(Count, 1, 20000);
+		GPerSecond = FMath::Clamp(PerSecond, 1.f, 5000.f);
+		GCarry = 0.f;
+		GStart = ATraceTracer::GetPoolStats(SoakWorld());
+
+		Report(TEXT("before soak"));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("TRACERPOOL SOAK: arming %d tracer(s) at %.0f per second (~%.1fs, expected steady-state "
+			     "concurrency ~%.0f against an engage threshold of %d)."),
+			GRemaining, GPerSecond, GRemaining / GPerSecond, GPerSecond * 0.2f,
+			ATraceTracer::TracerPoolEngageLive);
+
+		GTicker = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateStatic(&Tick), 0.f);
+	}
+} // namespace TraceTracerPoolProbe
+
+static FAutoConsoleCommand GTraceTracerPoolReportCmd(
+	TEXT("Trace.Fx.TracerPool.Report"),
+	TEXT("FX_AUDIO_PLAN s4.1: print the tracer pool's counters for the live world — spawns, reuses, "
+	     "releases, overflows, drains, and how many actors are live and parked right now."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		TraceTracerPoolProbe::Report(TEXT("now"));
+	}));
+
+static FAutoConsoleCommand GTraceTracerPoolRedArmCmd(
+	TEXT("Trace.Fx.TracerPool.RedArm"),
+	TEXT("RED ARM for the s4.1 pooling soak: switch Trace.Fx.TracerPool off and run the same soak. It "
+	     "must report 1.00 actors per shot and FAIL — if it passes, the soak is not measuring the "
+	     "pool. Does not restore itself."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		// A COMMAND AND NOT -dpcvars, because -dpcvars did not take: the device-profile pass runs
+		// before this module's CVars are registered, so the assignment lands on nothing and the soak
+		// then quietly measures the GREEN arm while its log says "red". This is the same idiom
+		// Trace.Fx.BeamRopeArm above uses, for the same reason, and it also keeps the arm reachable
+		// through -TraceExec, which must be one unquoted argv token and therefore cannot pass "0".
+		//
+		// The string overload: the one IConsoleVariable declares virtually on every engine version
+		// this project has been built against.
+		TraceTracerPool::CVarTracerPool->Set(TEXT("0"), ECVF_SetByConsole);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("TRACERPOOL: RED ARM — Trace.Fx.TracerPool is now 0, so every shot spawns and destroys "
+			     "its own actor exactly as it did before FX_AUDIO_PLAN s4.1. The soak must now report "
+			     "1.00 actors per shot."));
+		TraceTracerPoolProbe::Arm(1200, 240.f);
+	}));
+
+static FAutoConsoleCommand GTraceTracerPoolSoakCmd(
+	TEXT("Trace.Fx.TracerPool.Soak"),
+	TEXT("Trace.Fx.TracerPool.Soak [count] [perSecond] — draw `count` tracers (default 1200) at "
+	     "`perSecond` (default 240, i.e. ~48 concurrent against the 10-player SMG ceiling's ~20) and "
+	     "report how many ACTORS they cost. PACED IN SECONDS on purpose: concurrency is a rate times "
+	     "a life, and a per-frame soak under -nullrhi finishes before the first tracer expires. "
+	     "Trace.Fx.TracerPool 0 is the RED ARM: it must then report one new actor per shot."),
+	FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+	{
+		const int32 Count = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 1200;
+		const float PerSecond = (Args.Num() > 1) ? FCString::Atof(*Args[1]) : 240.f;
+		TraceTracerPoolProbe::Arm(Count, PerSecond);
 	}));
 #endif // !UE_BUILD_SHIPPING

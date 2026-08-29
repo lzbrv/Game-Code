@@ -34,19 +34,24 @@
 // THE SLOW IS APPLIED BY CLAMPING VELOCITY, AND THAT IS A COMPROMISE
 // ===================================================================================================
 //
-// The framework's intended path for a speed change is UTraceCharacterAbilitySet::GetMoveSpeedMultiplier
-// -> UTraceAbilityComponent::GetMoveSpeedMultiplierFor -> the movement component. It cannot carry a
-// poison slow for two independent reasons:
-//   1. NOTHING CALLS IT. Movement/TraceCharacterMovementComponent.cpp has no such call yet; it is a
-//      cross-file need both foundation reports already filed, and this slice does not own that file.
-//   2. Even when it does, that hook asks the VICTIM'S OWN character. The victim is usually a
-//      Mannequin (ETraceCharacterId::None) or somebody else's character, and neither has any reason
-//      to know about Oyster's poison. A debuff another player applied is not a passive of the victim.
+// The framework's per-character path — UTraceCharacterAbilitySet::GetMoveSpeedMultiplier ->
+// UTraceAbilityComponent::GetMoveSpeedMultiplierFor -> the movement component — cannot carry a poison
+// slow, and that is still true: THAT hook asks the VICTIM'S OWN character, and the victim is usually a
+// Mannequin (ETraceCharacterId::None) or somebody else's character, neither of which has any reason to
+// know about Oyster's poison. A debuff another player applied is not a passive of the victim.
 //
-// So the slow is a per-frame clamp on planar velocity, run on the server AND on the owning client
-// (this component replicates its two fields precisely so the owner can clamp too, which is what keeps
-// the correction path quiet). The proper fix is an external debuff multiplier inside
-// UTraceCharacterMovementComponent::GetMaxSpeed(); it is named in the report as a cross-file need.
+// *** SO THE EXTERNAL AGGREGATOR WAS BUILT, AND IT IS LIVE. *** TraceAbilityDebuff::
+// GetMoveSpeedMultiplier is read by UTraceCharacterMovementComponent::GetMaxSpeed()
+// (TraceCharacterMovementComponent.cpp, ~:4191, beside the per-character multiplier), so GetMaxSpeed()
+// IS the slowed ceiling on the ground. This block used to say "NOTHING CALLS IT" and name the fix as a
+// cross-file need; the fix landed, and TraceOysterPoison.cpp's clamp carries the same correction beside
+// the arithmetic that would otherwise double-apply the fraction.
+//
+// The per-frame clamp on planar velocity survives — on the server AND on the owning client (this
+// component replicates its two fields precisely so the owner can clamp too, which is what keeps the
+// correction path quiet) — but its job is now only to stop the ACCELERATION model overshooting a
+// ceiling GetMaxSpeed already knows about. It does NOT re-apply the fraction; doing so would compound
+// 0.70 into 0.49.
 
 #pragma once
 
@@ -130,6 +135,8 @@ public:
 
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void OnComponentDestroyed(bool bDestroyingHierarchy) override;
 
 	/**
 	 * SERVER ONLY. Poisons @p Target on behalf of @p SourceComp, or refreshes an existing poison.
@@ -177,6 +184,14 @@ public:
 	 */
 	float GetSpeedMultiplier() const;
 
+	/**
+	 * FX_AUDIO_PLAN §2.6 "victim drip (loop)". How many drip spheres this MACHINE is currently drawing
+	 * on this victim. Zero on a dedicated server, zero while the victim is cloaked, zero if the loop
+	 * budget refused them — all three of which are correct answers, and all three are why the harness
+	 * reads this rather than assuming three.
+	 */
+	int32 GetDripPieceCount() const;
+
 private:
 	/** REPLICATED. Absolute match-clock time, never a duration — the framework's rule, everywhere. */
 	UPROPERTY(Replicated)
@@ -205,6 +220,45 @@ private:
 
 	/** Every machine that simulates the victim. The clamp itself. */
 	void ApplySlowClamp();
+
+	// ---------------------------------------------------------------------------------------------
+	// FX_AUDIO_PLAN §2.6 — THE VICTIM DRIP, AND WHY IT LIVES ON THIS COMPONENT
+	// ---------------------------------------------------------------------------------------------
+	//
+	// §2.6 puts the hook here in as many words: "UTraceOysterPoisonComponent lives on the victim and
+	// REPLICATES — attach/detach in its OnRep/activation on EVERY MACHINE". This component already
+	// satisfies both halves of that: it is a replicated sub-object, so a client gets one the moment
+	// the server attaches one, and its TickComponent already runs on every machine (that is what
+	// ApplySlowClamp needs). So the drip needs no router edge, no RPC and no new replicated field —
+	// the existence of the component IS the replicated fact, and three spheres hang off it.
+	//
+	// The pieces go through TraceFxLoopBudget::AttachLoopPrimitive (FX_AUDIO_PLAN §1.4), which is what
+	// enforces "additive only, intensity <= 0.5, inside the capsule footprint, max 4 per pawn" at one
+	// choke point. A victim who is ALSO standing in a slime wall would want a fourth piece (the
+	// SLOWED ring) and gets it; a fifth is refused with a log rather than silently drawn.
+
+	/** Every machine that draws. Creates the drips on the first eligible tick and animates them. */
+	void UpdateDripFx();
+
+	/** Idempotent. Called on expiry, on death, on cloak, and from both destruction paths. */
+	void DetachDripFx();
+
+	/** The falling spheres. Empty until the first drawing tick; never populated on a dedicated server. */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UStaticMeshComponent>> DripPieces;
+
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UMaterialInstanceDynamic>> DripMIDs;
+
+	/**
+	 * Local seconds since the drips were attached, driving the chest->feet fall.
+	 *
+	 * REAL-TIME AND LOCAL, not the match clock, and deliberately: this is a purely cosmetic loop that
+	 * every machine runs for itself, and running it off the replicated clock would make it stutter
+	 * with the same clock smoothing the gameplay timers are deliberately built on. Nothing reads it
+	 * but the drips.
+	 */
+	float DripElapsed = 0.f;
 };
 
 /**
@@ -288,6 +342,21 @@ public:
 	 */
 	static ATraceOysterPoisonCloud* ServerSpawnForBurst(UWorld* WorldPtr, const FVector& Origin,
 	                                                    float RadiusUU, float DurationSeconds);
+
+	/**
+	 * *** THE ONE DEFINITION OF "POISONED", FOR EVERY EFFECT THAT MEANS IT. ***
+	 *
+	 * ART_BIBLE §2.5's semantic wheel, `Poisoned` = linear (0.35, 0.95, 0.20) = #A0F97C, and
+	 * FX_AUDIO_PLAN §2.6 spends it on FOUR separate pieces of geometry in three different files: this
+	 * cloud, the jar-break pop, the victim's drips and the Pickler pull link. §6.2's "one hue per
+	 * effect" is only true if all four are the same bytes, so all four call this and none of them
+	 * types the numbers.
+	 *
+	 * It is the SEMANTIC hue and not Oyster's cyan accent, which is §6.2's stated priority — "semantic
+	 * beats team beats accent: poison is always poison green even though the jar is Oyster cyan". The
+	 * jar wears the accent (ATraceOysterJar), and the moment it breaks what stands there is poison.
+	 */
+	static const FLinearColor& GetPoisonedHue();
 
 	/** The burst radius this cloud was built for. Replicated, so a client draws the server's number. */
 	float GetCloudRadiusUU() const { return CloudRadius; }

@@ -1,5 +1,11 @@
 # Design — rules, tunables, class map
 
+> **HISTORICAL — this document predates the ability system (Demo.13+) and the thrown-Core goals
+> mode.** It still describes the endzone ruleset (mode A) and pre-character tuning. Tuning truth
+> is `Source/Trace/TraceSettings.h` + `Config/DefaultGame.ini`; roster truth is
+> `Source/Trace/Core/TraceCharacterRoster.cpp`; the shipped rules summary is in the
+> [README](../README.md#the-game). Kept for the rationale it records, not as a current reference.
+
 Everything about how Trace plays, and how to change it without touching C++.
 
 New to the Unreal Editor, or wondering why the arena viewport is empty? Read
