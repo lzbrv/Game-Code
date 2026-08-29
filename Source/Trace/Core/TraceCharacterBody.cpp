@@ -740,10 +740,12 @@ bool ATraceCharacter::ApplyCharacterBodyMesh(uint8 CharacterId)
 	}
 
 	// EMPTY PATH MEANS THE MANNEQUIN — NoneId, and every pawn between spawn and lock-in. Find()
-	// returns null for NoneId, which lands in the same place. Since PIPELINE_DESIGN.md §9.1 all ten
-	// roster rows name a body, so the empty case is no longer "nine of the ten characters": it is a
-	// pawn that has not chosen yet. A character whose asset is missing takes the branch below and
-	// fails the LOAD, which is a different and separately reported thing.
+	// returns null for NoneId, which lands in the same place. *** SINCE DEMO 29 ITEM 1 THE EMPTY CASE
+	// IS EVERY PAWN AND EVERY CHARACTER: *** all ten roster rows have their body path shelved (the
+	// block above GetCppTable() in Core/TraceCharacterRoster.cpp says why and how to restore them),
+	// so this branch is the one the whole game takes. Between PIPELINE_DESIGN.md §9.1 and Demo 29 it
+	// meant only "a pawn that has not chosen yet". A character whose asset is missing takes the
+	// branch below and fails the LOAD, which is a different and separately reported thing.
 	FString WantedPath;
 	FString WantedAnimPath;
 	float WantedYaw = TraceCharacterLayout::MeshYaw;

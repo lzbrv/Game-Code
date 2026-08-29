@@ -76,6 +76,34 @@ namespace TraceXBeeFx
 	 */
 	constexpr float CoreGlow = 2.6f;
 
+	/**
+	 * *** DEMO 29 ITEM 5 — "REVERT X'S BEES TO THE OLD MODEL." ***
+	 *
+	 * false (shipped) is the model the swarm had before the overhaul: N plain spheres, 16 uu across,
+	 * in M_TraceNeon at LegacyBeeAmber, and NOTHING ELSE around them. The two pieces §2.7 added on
+	 * top of that model — the additive halo sleeve and the three-segment tangent trail — are not
+	 * built at all, so they cost nothing and draw nothing.
+	 *
+	 * true restores §2.7's five-piece swarm exactly as it shipped in the overhaul. Everything it
+	 * needs is still in this file: the halo and trail construction, their placement, their MIDs and
+	 * their measurements are all still here, still compiled and still measured by Trace.X.BeeFxTest,
+	 * which reads this gate and checks whichever model is actually on screen.
+	 *
+	 * WHAT IS *NOT* GATED, deliberately: the orbit arithmetic, the contact test and §2.7's 0.3 s
+	 * sting-load converge. None of those is "the model" — the orbit is where the bees sting from and
+	 * the converge is an animation of the same spheres — and the owner asked for the model.
+	 */
+	constexpr bool bBeePolish = false;
+
+	/**
+	 * THE OLD BEES' AMBER, restored with the old model: linear (1.00, 0.72, 0.12), set on both
+	 * "Color" and "BaseColor" because M_TraceNeon and the engine's BasicShapeMaterial name it
+	 * differently. BeeAmber above is the overhaul's slightly different amber and is what the halo,
+	 * the trail and the bee-round tracer use; with the gate off, none of those three is drawn, so
+	 * there is nothing for this to disagree with.
+	 */
+	const FLinearColor LegacyBeeAmber(1.00f, 0.72f, 0.12f, 1.f);
+
 	/** §2.7: "additive halo sleeve x1.8 scale ... I 0.3". */
 	constexpr float HaloScaleMultiple = 1.8f;
 	constexpr float HaloIntensity = 0.3f;
@@ -825,12 +853,24 @@ ATraceBeeSwarm::ATraceBeeSwarm()
 		TrailMesh = CylinderFinder.Object;
 	}
 
-	// *** THE MATERIALS ARE NO LONGER FOUND HERE. *** They used to be two FObjectFinders for
-	// M_TraceNeon with a BasicShapeMaterial fallback, and every bee got an opaque MID with "Color"
-	// set and nothing else — no Glow, no way to ask for ADDITIVE, and no way to report a fallback.
-	// §2.7's halo and trail are additive by specification, so all five pieces now go through
-	// UTraceFxShapes::MakeGlowMID, whose own CDO holds the cook references for the same three
-	// materials and which hands back the blend it ACHIEVED.
+	// *** THE OLD BEE MATERIAL IS FOUND HERE AGAIN — DEMO 29 ITEM 5. *** These two finders are the
+	// pair the swarm carried before the overhaul: M_TraceNeon, with the engine's BasicShapeMaterial
+	// as the fallback, giving every bee one opaque MID with its colour set. The overhaul removed them
+	// because §2.7's halo and trail are ADDITIVE by specification and needed UTraceFxShapes'
+	// blend ladder — which the halo and the trail still use. The cores use these again while
+	// TraceXBeeFx::bBeePolish is false, because "the old model" is this material as much as it is
+	// this sphere.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon"));
+	if (NeonFinder.Succeeded())
+	{
+		LegacyBeeMaterial = NeonFinder.Object;
+	}
+
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> BasicFinder(TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
+	if (LegacyBeeMaterial == nullptr && BasicFinder.Succeeded())
+	{
+		LegacyBeeMaterial = BasicFinder.Object;
+	}
 }
 
 void ATraceBeeSwarm::EnsureBeeInstances(int32 DesiredCount)
@@ -841,7 +881,7 @@ void ATraceBeeSwarm::EnsureBeeInstances(int32 DesiredCount)
 		return;
 	}
 
-	// ---- build the five pieces, once ------------------------------------------------------------
+	// ---- build the pieces, once (five with the polish gate on, one with it off) -----------------
 	if (Cores == nullptr && BeeMesh != nullptr)
 	{
 		Cores = NewObject<UInstancedStaticMeshComponent>(this, TEXT("BeeCores"));
@@ -852,13 +892,36 @@ void ATraceBeeSwarm::EnsureBeeInstances(int32 DesiredCount)
 			UTraceFxShapes::ConfigureFxComponent(Cores);
 			Cores->RegisterComponent();
 
-			// EMISSIVE, not additive, and that is the shipped look preserved rather than a choice
-			// made afresh: the bees are the small, thin, hot element of the effect and ATraceTracer's
-			// rule is that thin hot pieces are emissive (they can push a hue past a lit background,
-			// which additive — clamped at 1.0 and able only to ADD — cannot). The halo around them is
-			// the big soft volume, and it is additive for the mirror-image reason.
-			CoreMID = UTraceFxShapes::MakeGlowMID(Cores, 0, ETraceFxBlend::Emissive, CoreBlend);
-			UTraceFxShapes::SetGlow(CoreMID, CoreBlend, TraceXBeeFx::BeeAmber, TraceXBeeFx::CoreGlow);
+			if (TraceXBeeFx::bBeePolish)
+			{
+				// EMISSIVE, not additive, and that is §2.7's look: the bees are the small, thin, hot
+				// element of the effect and ATraceTracer's rule is that thin hot pieces are emissive
+				// (they can push a hue past a lit background, which additive — clamped at 1.0 and
+				// able only to ADD — cannot). The halo around them is the big soft volume, and it is
+				// additive for the mirror-image reason.
+				CoreMID = UTraceFxShapes::MakeGlowMID(Cores, 0, ETraceFxBlend::Emissive, CoreBlend);
+				UTraceFxShapes::SetGlow(CoreMID, CoreBlend, TraceXBeeFx::BeeAmber, TraceXBeeFx::CoreGlow);
+			}
+			else
+			{
+				// THE OLD MODEL (Demo 29 item 5): one opaque MID on M_TraceNeon with the colour set
+				// and nothing else — no Glow scalar, no blend ladder. Reported as Emissive rather
+				// than None because that is what M_TraceNeon IS and because CoreBlend is what
+				// SetPiecesVisible and DebugDescribe read; a bee that reported None would be hidden.
+				// If the material is missing entirely the blend stays None and the ladder ends where
+				// it always did — at "no effect", never at a grey primitive orbiting a player's head.
+				if (LegacyBeeMaterial != nullptr)
+				{
+					CoreMID = Cores->CreateDynamicMaterialInstance(0, LegacyBeeMaterial);
+					if (CoreMID != nullptr)
+					{
+						CoreMID->SetVectorParameterValue(TEXT("Color"), TraceXBeeFx::LegacyBeeAmber);
+						CoreMID->SetVectorParameterValue(TEXT("BaseColor"), TraceXBeeFx::LegacyBeeAmber);
+						CoreBlend = ETraceFxBlend::Emissive;
+					}
+				}
+			}
+
 			if (CoreBlend == ETraceFxBlend::None)
 			{
 				Cores->SetVisibility(false, true);
@@ -866,7 +929,11 @@ void ATraceBeeSwarm::EnsureBeeInstances(int32 DesiredCount)
 		}
 	}
 
-	if (Halos == nullptr && BeeMesh != nullptr)
+	// *** DEMO 29 ITEM 5: THE HALO AND THE TRAIL ARE NOT BUILT AT ALL WHILE THE GATE IS OFF. ***
+	// Not built rather than built-and-hidden: an unbuilt component costs no instances, no MID, no
+	// render state and no per-frame transform write, and PlaceBees/SetPiecesVisible/DebugDescribe all
+	// already handle a null piece because a missing material could always produce one.
+	if (TraceXBeeFx::bBeePolish && Halos == nullptr && BeeMesh != nullptr)
 	{
 		Halos = NewObject<UInstancedStaticMeshComponent>(this, TEXT("BeeHalos"));
 		if (Halos != nullptr)
@@ -885,7 +952,7 @@ void ATraceBeeSwarm::EnsureBeeInstances(int32 DesiredCount)
 		}
 	}
 
-	if (TrailParts[0] == nullptr && TrailMesh != nullptr)
+	if (TraceXBeeFx::bBeePolish && TrailParts[0] == nullptr && TrailMesh != nullptr)
 	{
 		for (int32 Part = 0; Part < UE_ARRAY_COUNT(TrailParts); ++Part)
 		{
@@ -1220,8 +1287,9 @@ FString ATraceBeeSwarm::DebugDescribe() const
 	}
 
 	return FString::Printf(
-		TEXT("pieces=%d visible=%d | cores=%d (%s) halos=%d (%s) x%.2f scale | trail 3 x (%s) r=%.1fuu "
-		     "total len=%.0fuu | phase=%s"),
+		TEXT("model=%s | pieces=%d visible=%d | cores=%d (%s) halos=%d (%s) x%.2f scale | trail 3 x (%s) "
+		     "r=%.1fuu total len=%.0fuu | phase=%s"),
+		TraceXBeeFx::bBeePolish ? TEXT("POLISH(2.7)") : TEXT("OLD(demo29-5)"),
 		Pieces, Visible,
 		CoreCount, UTraceFxShapes::BlendName(CoreBlend),
 		HaloCount, UTraceFxShapes::BlendName(HaloBlend), HaloMultiple,
@@ -2033,11 +2101,16 @@ namespace TraceXMarkProbe
 }
 
 // =================================================================================================
-// Trace.X.BeeFxTest — FX_AUDIO_PLAN §2.7's bee polish and sting-load converge, MEASURED
+// Trace.X.BeeFxTest — X's bee swarm and its sting-load converge, MEASURED
 //
 // Everything it asserts is read back off the live components (ATraceBeeSwarm::DebugDescribe and
 // DebugGetBeeWorldLocation), never recomputed from TraceXBeeFx — a verifier that re-derives its own
 // expectations is checking its arithmetic, not the picture.
+//
+// *** IT CHECKS WHICHEVER MODEL IS BUILT. *** Demo 29 item 5 put the OLD bee model back
+// (TraceXBeeFx::bBeePolish false) — N plain amber spheres and nothing around them — so step 1 runs
+// the old model's checklist and says so. With the gate on it runs §2.7's five-piece checklist
+// unchanged. The converge half below is common to both, because the converge is not the model.
 //
 // The converge half is the one that needed a red arm: "the bees fly to the gun" is an ANIMATION, and
 // an animation is exactly the kind of claim that passes by accident. Trace.X.BeeConverge 0 restores
@@ -2071,6 +2144,10 @@ namespace TraceXBeeFxTest
 		State->List.Tag = TEXT("XBEEFX");
 		State->Deadline = FPlatformTime::Seconds() + 45.0;
 
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[XBEEFX] ===== model=%s (Demo 29 item 5: bBeePolish=%d). The §2.7 numbers below are what\n")
+			TEXT("[XBEEFX]       the halo and trail WOULD be built to; with the gate off they are not built.\n"),
+			TraceXBeeFx::bBeePolish ? TEXT("POLISH(2.7)") : TEXT("OLD"), TraceXBeeFx::bBeePolish ? 1 : 0);
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[XBEEFX] ===== FX plan §2.7: %d bees, halo x%.2f at I %.2f, trail %.0f uu at I %.2f/%.2f/%.2f, "
 			     "converge %.2fs. arm 0 = RED (Trace.X.BeeConverge 0): the swarm vanishes with no flight. ====="),
@@ -2162,18 +2239,44 @@ namespace TraceXBeeFxTest
 				const FString Described = SwarmActor->DebugDescribe();
 				UE_LOG(LogTraceGame, Display, TEXT("[XBEEFX] live swarm: %s"), *Described);
 
-				State->List.Check(Described.Contains(TEXT("pieces=5 visible=5")),
-					TEXT("§2.7: five instanced pieces — cores, halos and three trail segments — all visible"),
-					FString::Printf(TEXT("%s. Five per-bee meshes became five INSTANCED pieces, so the halo and "
-					                     "the trail cost no net components"), *Described));
+				// *** THIS BLOCK CHECKS WHICHEVER MODEL IS ACTUALLY ON SCREEN — DEMO 29 ITEM 5. ***
+				// Asserting §2.7's five pieces on a build that deliberately does not build them would
+				// be a harness reporting a fault it was told to expect, which is worse than no
+				// harness. So the gate picks the checklist, and the checklist SAYS which one it ran.
+				if (TraceXBeeFx::bBeePolish)
+				{
+					State->List.Check(Described.Contains(TEXT("pieces=5 visible=5")),
+						TEXT("§2.7: five instanced pieces — cores, halos and three trail segments — all visible"),
+						FString::Printf(TEXT("%s. Five per-bee meshes became five INSTANCED pieces, so the halo and "
+						                     "the trail cost no net components"), *Described));
 
-				State->List.Check(Described.Contains(TEXT("x1.80 scale")),
-					TEXT("§2.7: the halo sleeve is x1.8 the core's scale, read off instance 0 of BOTH"),
-					*Described);
+					State->List.Check(Described.Contains(TEXT("x1.80 scale")),
+						TEXT("§2.7: the halo sleeve is x1.8 the core's scale, read off instance 0 of BOTH"),
+						*Described);
 
-				State->List.Check(!Described.Contains(TEXT("(None)")),
-					TEXT("no piece degraded to None — nothing is hidden and nothing is drawing grey"),
-					*Described);
+					State->List.Check(!Described.Contains(TEXT("(None)")),
+						TEXT("no piece degraded to None — nothing is hidden and nothing is drawing grey"),
+						*Described);
+				}
+				else
+				{
+					State->List.Check(Described.Contains(TEXT("model=OLD(demo29-5)")),
+						TEXT("Demo 29 item 5: the swarm reports the OLD bee model, not §2.7's polish"),
+						*Described);
+
+					State->List.Check(Described.Contains(TEXT("pieces=1 visible=1")),
+						TEXT("Demo 29 item 5: ONE piece — the bee cores. No halo component, no trail components"),
+						FString::Printf(TEXT("%s. The halo and the three trail segments are not built at all "
+						                     "while TraceXBeeFx::bBeePolish is false"), *Described));
+
+					State->List.Check(Described.Contains(TEXT("halos=0")) && Described.Contains(TEXT("len=0uu")),
+						TEXT("Demo 29 item 5: no halo instances and no trail length — nothing is drawn around a bee"),
+						*Described);
+
+					State->List.Check(!Described.Contains(TEXT("cores=0")),
+						TEXT("the bees themselves are still there and still instanced"),
+						*Described);
+				}
 
 				State->DistanceAtStart = 0.f;
 				FVector BeeZero = FVector::ZeroVector;

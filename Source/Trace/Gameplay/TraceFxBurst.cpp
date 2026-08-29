@@ -1388,13 +1388,18 @@ void ATraceFxBurst::UpdateBurst(float Alpha)
 		{
 			// (b) THE SPOKES ARE DECORATION AND ARE CAPPED SO THEY STAY THAT WAY.
 			//
-			// §2.3 asks for 90 uu, which is exactly TWICE the shipped 45 uu blast. Photographed at
-			// that length (frames-W3-FXBURST/run2-mid, crop_RocketBurst.png) the eight spokes are the
-			// loudest thing in the burst and the blast reads as twice the size that can actually kill
-			// you — which is bible §6.2 invariant 1 failing in the direction that matters, because a
-			// player learns the wrong distance to stand at. Capped at 1.5x the REAL radius: still a
-			// spray that leaves the shell, no longer a claim about reach. The two radius-true
-			// elements, (a) and (c), remain the volume read.
+			// §2.3 asks for 90 uu, which was exactly TWICE the 45 uu blast shipping when this cap was
+			// written. Photographed at that length (frames-W3-FXBURST/run2-mid, crop_RocketBurst.png)
+			// the eight spokes are the loudest thing in the burst and the blast reads as twice the
+			// size that can actually kill you — which is bible §6.2 invariant 1 failing in the
+			// direction that matters, because a player learns the wrong distance to stand at. Capped
+			// at 1.5x the REAL radius: still a spray that leaves the shell, no longer a claim about
+			// reach. The two radius-true elements, (a) and (c), remain the volume read.
+			//
+			// DEMO 29 §7 RAISED RoxieRocketHitRadiusUU 45 -> 72 AND MADE IT A REAL BLAST RADIUS, so
+			// the cap no longer binds on the rocket: 1.5 x 72 = 108, the §2.3 literal of 90 is the
+			// smaller of the two, and the spokes now reach 1.25x the shell instead of 2x. Nothing here
+			// changed — the cap is written against the LIVE radius on purpose, so it followed.
 			const float SpokeAlpha = FMath::Clamp(A / RocketSpokeLife, 0.f, 1.f);
 			const float SpokeLength = FMath::Min(RocketSpokeLengthUU, RocketSpokeReachFactor * ResolvedRadiusUU);
 			PlaceSpokes(ScatterMesh, ScatterDirs,

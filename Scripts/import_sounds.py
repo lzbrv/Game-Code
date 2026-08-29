@@ -31,6 +31,12 @@
 #
 # No C++ edit. No rebuild. Nothing to remember about which file references it.
 #
+# ONE CAVEAT SINCE DEMO 29: three events (DeathBurst, CountdownTick, CountdownGo)
+# are UNWIRED — declared, imported and resolvable, but not allowed to sound. A
+# replacement WAV for one of them imports exactly as above and is still silent in
+# game until `Trace.Audio.UnwiredEvents 0`. The manifest flags them; the reasons
+# are in Source/Trace/Audio/TraceSoundEvents.cpp and on the sound-test page.
+#
 # THE SET OF SOUNDS IS DISCOVERED, NOT LISTED. This script globs Art/Sounds
 # RECURSIVELY rather than carrying a table of names, so a new wav is a new bank
 # row with no edit here either. The event name is simply the file's stem, and it
@@ -188,6 +194,27 @@ LOOPING_STEMS = {
     "RoccoRideLoop",
     "MusicTitle",
     "AmbienceMatch",
+}
+
+# DEMO 29 items 9 and 11 — events that are DECLARED and DELIBERATELY SILENT.
+#
+# A MIRROR of TraceSoundEvents::Unwired(), for the printed manifest ONLY, exactly
+# like SIDES above and for the same reason: C++ is the authority and nothing here
+# is read at runtime. It earns its place because the manifest is what somebody
+# reads after dropping in a replacement WAV, and "I swapped DeathBurst and the
+# game still makes no noise" is the confusion this list creates.
+#
+#   DeathBurst      played at the body on every kill, on top of the owner's
+#                   Kill.wav, and changed what a kill sounds like (item 9).
+#   CountdownTick   ATraceCore drives the kickoff countdown off a field that is
+#   CountdownGo     not a kickoff deadline, so both beeped with no kickoff (item 11).
+#
+# Their WAVs, their .uassets and their trigger sites are all untouched:
+# `Trace.Audio.UnwiredEvents 0` in the console brings every one of them back.
+UNWIRED_STEMS = {
+    "DeathBurst",
+    "CountdownTick",
+    "CountdownGo",
 }
 
 # The FOOTSTEP family, spelled once. §1b gives footsteps their own volume knob,
@@ -378,12 +405,22 @@ def manifest(entries, selected):
                 quietest_other = (peak_db, stem)
 
         mark = "" if (selected is None or stem in selected) else "   (skipped this run)"
+        if stem in UNWIRED_STEMS:
+            mark += "   [UNWIRED - imports fine, does not sound; see UNWIRED_STEMS above]"
         rel = os.path.relpath(path, SOURCE_DIR)
         log("  {0:<18}{1:<12}{2:>7}{3:>4}{4:>8.2f}{5:>10}{6:>10}   {7}{8}".format(
             stem, side, rate, channels, seconds,
             "n/a" if peak_db is None else "{0:.2f}".format(peak_db),
             "n/a" if rms_db is None else "{0:.2f}".format(rms_db),
             rel, mark))
+
+    present_unwired = sorted(UNWIRED_STEMS.intersection(stem for stem, _ in entries))
+    if present_unwired:
+        log("")
+        log("  {0} event(s) are UNWIRED as of Demo 29 and will NOT sound in a match even after a "
+            "clean import: {1}.".format(len(present_unwired), ", ".join(present_unwired)))
+        log("  Replacing their WAVs still works and is still worth doing; "
+            "`Trace.Audio.UnwiredEvents 0` is what makes them audible again.")
 
     # ---------------------------------------------------------------------
     # §1b, stated in numbers rather than in adjectives.

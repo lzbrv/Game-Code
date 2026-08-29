@@ -346,13 +346,17 @@ private:
 		Loaded
 	};
 
-	/** Builds the five instanced pieces once, and re-counts instances when XBeeCount is retuned. */
+	/**
+	 * Builds the pieces once, and re-counts instances when XBeeCount is retuned. FIVE pieces with
+	 * TraceXBeeFx::bBeePolish on; ONE — the bee cores — with it off, which is the shipped state since
+	 * Demo 29 item 5.
+	 */
 	void EnsureBeeInstances(int32 DesiredCount);
 
-	/** Places every instance of every piece for one frame. @p Alpha 0..1 is the converge progress. */
+	/** Places every instance of every piece that EXISTS, for one frame. @p Alpha 0..1 is the converge. */
 	void PlaceBees(const FVector& Centre, float MatchTimeSeconds, int32 BeeCount, float ConvergeAlpha);
 
-	/** Shows or hides all five pieces at once. */
+	/** Shows or hides every piece that exists, at once. */
 	void SetPiecesVisible(bool bVisible);
 
 	// =============================================================================================
@@ -369,8 +373,13 @@ private:
 	// and the trail's fade is three stacked segment components at three intensities rather than a
 	// gradient no material here can express.
 	//
-	// THE NET COMPONENT COUNT IS UNCHANGED: this replaces five per-bee UStaticMeshComponents with
-	// five instanced pieces, and buys the halo and the trail for nothing.
+	// THE NET COMPONENT COUNT WAS UNCHANGED: it replaced five per-bee UStaticMeshComponents with
+	// five instanced pieces, and bought the halo and the trail for nothing.
+	//
+	// *** DEMO 29 ITEM 5 TURNED THE HALO AND THE TRAIL OFF AGAIN. *** TraceXBeeFx::bBeePolish is
+	// false, so only the CORES are built and the swarm is one component drawing N spheres — fewer
+	// than the five per-bee components the old model used, and the same picture. Everything below
+	// still describes what is built when the gate is on.
 	//
 	// The swarm is NOT counted against TraceFxLoopBudget's four-per-pawn ceiling, and that is not an
 	// oversight: §1.4's budget counts primitives ATTACHED TO A PAWN, and this is a separate,
@@ -378,11 +387,16 @@ private:
 	// budget is defined in terms of. It predates the budget and is X's passive rather than a
 	// while-active loop FX.
 
-	/** The bees themselves: N spheres 16 uu across, emissive amber. The shipped look, preserved. */
+	/** The bees themselves: N spheres 16 uu across. This piece is drawn whatever the polish gate says. */
 	UPROPERTY(Transient)
 	TObjectPtr<UInstancedStaticMeshComponent> Cores;
 
-	/** §2.7's "additive halo sleeve x1.8 scale BeeRounds amber I 0.3". N instances, one per bee. */
+	/**
+	 * §2.7's "additive halo sleeve x1.8 scale BeeRounds amber I 0.3". N instances, one per bee.
+	 *
+	 * *** NULL WHILE TraceXBeeFx::bBeePolish IS FALSE — DEMO 29 ITEM 5. *** The owner asked for the
+	 * old bee model back, and the halo is one of the two things the overhaul added on top of it.
+	 */
 	UPROPERTY(Transient)
 	TObjectPtr<UInstancedStaticMeshComponent> Halos;
 
@@ -392,6 +406,9 @@ private:
 	 * Three components because the fade is real: each holds N instances covering one third of the
 	 * trail's length, at its own intensity. One component could hold all 3N instances but would have
 	 * one MID and therefore one brightness, which is a streak rather than a trail.
+	 *
+	 * *** ALL THREE ARE NULL WHILE TraceXBeeFx::bBeePolish IS FALSE — DEMO 29 ITEM 5. *** The trail is
+	 * the other thing the overhaul added on top of the old bee model.
 	 */
 	UPROPERTY(Transient)
 	TObjectPtr<UInstancedStaticMeshComponent> TrailParts[3];
@@ -417,9 +434,10 @@ private:
 	 * property is what stops the garbage collector from taking it out from under a function-local
 	 * static.
 	 *
-	 * The MATERIALS no longer come from here: both blends are resolved through UTraceFxShapes, whose
-	 * own CDO holds the cook references and which degrades down a defined ladder instead of silently
-	 * producing an opaque piece where an additive one was wanted.
+	 * The POLISH materials do not come from here: the halo's and the trail's blends are resolved
+	 * through UTraceFxShapes, whose own CDO holds the cook references and which degrades down a
+	 * defined ladder instead of silently producing an opaque piece where an additive one was wanted.
+	 * The OLD bee material does come from here again — see LegacyBeeMaterial.
 	 */
 	UPROPERTY(Transient)
 	TObjectPtr<class UStaticMesh> BeeMesh;
@@ -427,6 +445,15 @@ private:
 	/** The cylinder the trail segments are made of. Same constructor-time policy as BeeMesh. */
 	UPROPERTY(Transient)
 	TObjectPtr<class UStaticMesh> TrailMesh;
+
+	/**
+	 * THE OLD BEE MATERIAL, BACK FOR DEMO 29 ITEM 5 — M_TraceNeon with an engine BasicShapeMaterial
+	 * fallback, exactly the pair the swarm carried before the overhaul, and found in the constructor
+	 * for exactly the reason BeeMesh is. Only read while TraceXBeeFx::bBeePolish is false; with the
+	 * gate on, the cores go back through UTraceFxShapes like the other pieces.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<class UMaterialInterface> LegacyBeeMaterial;
 
 	EPhase Phase = EPhase::Orbiting;
 

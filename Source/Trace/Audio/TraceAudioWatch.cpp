@@ -1140,15 +1140,35 @@ static FAutoConsoleCommand GTraceAudioEventPlaysCmd(
 		const FTraceAudioCounters& Tally = Audio->GetCounters();
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[EventPlays] %d distinct event(s) reached the engine here. local=%d world=%d "
-			     "multicastsSent=%d refusedNotAuthority=%d refusedNotLocalPlayer=%d missingSound=%d noDevice=%d"),
+			     "multicastsSent=%d refusedNotAuthority=%d refusedNotLocalPlayer=%d missingSound=%d "
+			     "noDevice=%d refusedUnwired=%d"),
 			Rows.Num(), Tally.LocalPlays, Tally.WorldPlays, Tally.MulticastsSent,
-			Tally.RefusedNotAuthority, Tally.RefusedNotLocalPlayer, Tally.MissingSound, Tally.NoAudioDevice);
+			Tally.RefusedNotAuthority, Tally.RefusedNotLocalPlayer, Tally.MissingSound,
+			Tally.NoAudioDevice, Tally.RefusedUnwired);
 		for (const TPair<FName, int32>& Row : Rows)
 		{
 			const ETraceSoundSide Side = TraceSoundEvents::SideOf(Row.Key);
 			UE_LOG(LogTraceGame, Display, TEXT("[EventPlays]   %-22s %5d play(s)   side=%s"),
 				*Row.Key.ToString(), Row.Value,
 				(Side == ETraceSoundSide::World) ? TEXT("World") : TEXT("Client"));
+		}
+
+		// DEMO 29 items 9 and 11. An event that is ABSENT from the list above means one of two very
+		// different things - "its trigger never fired" or "it is switched off" - and this ledger's
+		// whole job is to tell those apart. So the unwired rows are printed here, by name, whether
+		// or not their trigger fired, rather than leaving the reader to notice a gap.
+		const TConstArrayView<FName> UnwiredRows = TraceSoundEvents::Unwired();
+		if (UnwiredRows.Num() > 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[EventPlays] %d event(s) are UNWIRED and could not have sounded here "
+				     "(Trace.Audio.UnwiredEvents 0 restores them):"),
+				UnwiredRows.Num());
+			for (const FName& Name : UnwiredRows)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[EventPlays]   %-22s UNWIRED   %s"),
+					*Name.ToString(), TraceSoundEvents::UnwiredReason(Name));
+			}
 		}
 	}));
 

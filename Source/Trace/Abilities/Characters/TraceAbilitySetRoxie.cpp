@@ -445,9 +445,23 @@ void UTraceAbilitySetRoxie::ApplySelfLaunch()
 	Move->Velocity = NewVelocity;
 }
 
-float UTraceAbilitySetRoxie::ApplyRocketDamageTo(ATraceCharacter* Victim)
+float UTraceAbilitySetRoxie::ApplyRocketDamageTo(ATraceCharacter* Victim, float DamageAmount)
 {
 	if (!HasAuthority() || Victim == nullptr)
+	{
+		return 0.f;
+	}
+
+	// *** THE CEILING IS ENFORCED HERE, NOT PROMISED BY THE CALLERS. ***
+	//
+	// DEMO 29 item 7: "it should only do 100 damage for direct impacts. Otherwise, the damage should
+	// fall off." The direct hit asks for exactly TraceRoxieRocket::GetDamage() and the blast asks for
+	// a fraction of it, but neither of those facts is what makes the sentence true — this clamp is.
+	// Nothing in the game can route more than the direct-hit knob through the rocket, whatever a
+	// future caller computes or an .ini says, which is the same reasoning that makes every knob read
+	// in this feature a clamped accessor rather than a bare property dereference.
+	const float Requested = FMath::Clamp(DamageAmount, 0.f, TraceRoxieRocket::GetDamage());
+	if (Requested <= KINDA_SMALL_NUMBER)
 	{
 		return 0.f;
 	}
@@ -457,27 +471,64 @@ float UTraceAbilitySetRoxie::ApplyRocketDamageTo(ATraceCharacter* Victim)
 	// DealDamage forwards to UTraceAbilityComponent::ApplyAbilityDamage, whose FIRST act is
 	// CanAffectTargetDetailed(Target, Damage) — the one function in this project that answers "may an
 	// ability touch this player". It returns 0 for a Core carrier unconditionally, with no knob and no
-	// exception, and also for a team-mate while friendly fire is off and for the dead.
+	// exception; for a team-mate while friendly fire is off; for the dead; and for the instigator's
+	// OWN PAWN (ETraceAbilityBlockReason::Self).
+	//
+	// THAT LAST CLAUSE IS ROXIE'S ROCKET-JUMP ANSWER AND IT IS WORTH NAMING. Demo 29 added a blast at
+	// the detonation point, and ATraceRoxieRocket::ApplySplashDamage deliberately does NOT skip the
+	// shooter — she is offered here like anybody else and refused by the framework. So her own rocket
+	// deals her 0 at every range including a rocket jump fired into the floor at her feet, and that is
+	// structural rather than a special case somebody could delete or an .ini could flip.
 	//
 	// There is NO carrier test in this file and none in ATraceRoxieRocket, deliberately: spec §4 asks
-	// for one choke point rather than fifteen call sites each remembering, and a flat 100 that ignores
-	// hit zones is the single worst thing to have a second opinion about.
+	// for one choke point rather than fifteen call sites each remembering, and a 100 that ignores hit
+	// zones is the single worst thing to have a second opinion about.
 	//
-	// bHeadshot AND bMelee ARE BOTH FALSE, ALWAYS. §2: "100 damage on impact, ANYWHERE ON THE BODY — no
-	// headshot/body distinction." Nothing in this feature ever resolves a hit zone, so there is no
-	// place a zone could leak in.
-	const float Dealt = DealDamage(Victim, TraceRoxieRocket::GetDamage(), TraceRoxieRocket::GetKillCause(),
+	// bHeadshot AND bMelee ARE BOTH FALSE, ALWAYS. §2: "100 damage on impact, ANYWHERE ON THE BODY —
+	// no headshot/body distinction." Nothing in this feature ever resolves a hit zone, on either the
+	// direct path or the falloff — the blast varies with DISTANCE, never with where on a body it
+	// lands, so there is no place a zone could leak in.
+	const float Dealt = DealDamage(Victim, Requested, TraceRoxieRocket::GetKillCause(),
 		/*bMelee*/ false, /*bHeadshot*/ false);
 
 	if (Dealt <= 0.f)
 	{
 		UE_LOG(LogTraceGame, Verbose,
-			TEXT("[Roxie] rocket refused on %s (carrier, team-mate or dead) — it flies ON rather than "
-			     "detonating, so an immune body cannot become a rocket shield."),
-			*GetNameSafe(Victim));
+			TEXT("[Roxie] rocket refused %.1f on %s (carrier, team-mate, dead, or Roxie herself) — on a "
+			     "DIRECT hit it flies ON rather than detonating, so an immune body cannot become a "
+			     "rocket shield; in a BLAST it simply takes nothing."),
+			Requested, *GetNameSafe(Victim));
 	}
 
 	return Dealt;
+}
+
+void UTraceAbilitySetRoxie::BeginDetonationRecord()
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	// RESET, not Empty: the allocation is kept so the second and every later rocket of a match costs
+	// nothing. See the member's comment.
+	LastDetonationRecord.Reset();
+}
+
+void UTraceAbilitySetRoxie::RecordDetonationHit(ATraceCharacter* Victim, float SurfaceGapUU,
+                                                float RequestedDamage, float DealtDamage, bool bDirect)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	FRocketDetonationHit& Entry = LastDetonationRecord.AddDefaulted_GetRef();
+	Entry.Victim = Victim;
+	Entry.SurfaceGapUU = SurfaceGapUU;
+	Entry.RequestedDamage = RequestedDamage;
+	Entry.DealtDamage = DealtDamage;
+	Entry.bDirect = bDirect;
 }
 
 ATraceRoxieRocket* UTraceAbilitySetRoxie::DebugFireRocket(float WobbleSeedTurns, bool bAlsoSelfLaunch)
@@ -1040,6 +1091,13 @@ void UTraceAbilitySetRoxie::TickAbilities(float DeltaSeconds)
 //   Trace.Roxie.RocketFlightTest   "It WOBBLES in flight, deliberately inaccurate". Pure arithmetic
 //                                  on the shipped path function; needs no world. Red arm:
 //                                  Trace.Roxie.RocketWobble 0, which must produce a dead-straight line.
+//                                  It also checks the SHAPE of Demo 29 §7's falloff curve, for the
+//                                  same reason: an arithmetic claim belongs in the worldless test.
+//   Trace.Roxie.RocketFalloffTest  *** DEMO 29 §7. *** The damage table, MEASURED: a real flown
+//                                  DIRECT impact, then the blast at 0/25/50/75/100% of the radius and
+//                                  just outside it, every row a health bar that actually moved. It
+//                                  reports Roxie's own self-damage at rocket-jump range too. Red arm:
+//                                  RoxieRocketSplashMaxFraction 0, i.e. the Demo 28 build.
 //   Trace.Roxie.JumpTest           "Jumps 15% higher" — measured as a HEIGHT ratio, which is the only
 //                                  way the sqrt-vs-linear mistake is visible. Red arm:
 //                                  Trace.Roxie.JumpPassive 0.
@@ -1329,7 +1387,7 @@ namespace TraceRoxieVerify
 			{
 				SetArm(TEXT("Trace.Ability.CarrierImmune"), 0);
 
-				State->RedArmCarrierDamage = RoxieSet->ApplyRocketDamageTo(Carrier);
+				State->RedArmCarrierDamage = RoxieSet->ApplyRocketDamageTo(Carrier, TraceRoxieRocket::GetDamage());
 				State->bRedReproduced = (State->RedArmCarrierDamage > 0.f);
 
 				State->List.Check(State->bRedReproduced,
@@ -1356,8 +1414,8 @@ namespace TraceRoxieVerify
 				State->CarrierHealthBefore = (Carrier->Health != nullptr) ? Carrier->Health->Health : -1.f;
 				State->ControlHealthBefore = (Control->Health != nullptr) ? Control->Health->Health : -1.f;
 
-				State->GreenArmCarrierDamage = RoxieSet->ApplyRocketDamageTo(Carrier);
-				State->GreenArmControlDamage = RoxieSet->ApplyRocketDamageTo(Control);
+				State->GreenArmCarrierDamage = RoxieSet->ApplyRocketDamageTo(Carrier, TraceRoxieRocket::GetDamage());
+				State->GreenArmControlDamage = RoxieSet->ApplyRocketDamageTo(Control, TraceRoxieRocket::GetDamage());
 
 				State->Step = 3;
 				State->NextStepRealTime = NowReal + 0.20;
@@ -1735,6 +1793,507 @@ namespace TraceRoxieVerify
 		FConsoleCommandDelegate::CreateStatic(&RunLiveFireTest));
 
 	// =============================================================================================
+	// Trace.Roxie.RocketFalloffTest — DEMO 29 ITEM 7, MEASURED
+	//
+	// "Make Roxie's rocket hit radius match the model, but it should only do 100 damage for direct
+	// impacts. Otherwise, the damage should fall off."
+	//
+	// This produces the TABLE the owner has to judge the feel from, and every row of it is a health
+	// bar that actually moved on a live pawn — not a reading of GetSplashDamageAtGapUU(). The shape of
+	// that function is checked separately, without a world, by Trace.Roxie.RocketFlightTest; this is
+	// the proof that the shape reaches health.
+	//
+	// TWO KINDS OF ROW, AND THE DIFFERENCE IS DELIBERATE:
+	//
+	//   THE DIRECT ROW is a real rocket. It is fired down her aim line with the wobble disarmed, at a
+	//   target pinned onto that line, and it flies, sweeps and detonates on the pawn exactly as it
+	//   would in a match. That is the only way to prove "direct impact" means what the words mean —
+	//   THE PROJECTILE HIT THEM — rather than being a distance threshold in the splash loop.
+	//
+	//   THE FALLOFF ROWS command the end point (ATraceRoxieRocket::DebugDetonateAt) and place the
+	//   target at an exact gap from it. Everything below that call is the shipped path: the same
+	//   ApplySplashDamage, the same clamp, the same choke point, the same health component. What is
+	//   removed is the frame-rate quantisation in WHERE a flown rocket stops — 43 uu per tick at the
+	//   shipped speed — which would make each row's x-axis a different number on a different machine
+	//   and turn a damage table into a scatter plot. The gap printed in every row is nevertheless READ
+	//   BACK from the record the shipped code wrote, never from the number the fixture asked for.
+	//
+	// THE RED ARM is RoxieRocketSplashMaxFraction 0, which is the Demo 28 build: a rocket landing at
+	// your feet does nothing at all. It is not a cvar because the falloff is a settings knob, so the
+	// arm is stated here and in the ini rather than automated — the checks below fail loudly on it
+	// (every falloff row reads 0.0 and the "it falls off" check has nothing to fall from).
+	// =============================================================================================
+
+	/** One row of the table. Gap and damage are both READ BACK, never assumed. */
+	struct FFalloffRow
+	{
+		FString Label;
+		float AskedGapUU = 0.f;
+		float RecordedGapUU = -1.f;
+		float RecordedRequested = -1.f;
+		float RecordedDealt = -1.f;
+		float HealthLost = -1.f;
+		bool  bDirect = false;
+		bool  bFound = false;
+	};
+
+	struct FFalloffState
+	{
+		int32 Step = 0;
+		int32 Sample = 0;
+		double NextReal = 0.0;
+		double Deadline = 0.0;
+		double FlightDeadline = 0.0;
+		FChecklist List;
+
+		TWeakObjectPtr<ATraceCharacter> Target;
+		FVector PinLocation = FVector::ZeroVector;
+		float TargetHealthBefore = -1.f;
+
+		TArray<FFalloffRow> Rows;
+		float SelfGapUU = -1.f;
+		float SelfRequested = -1.f;
+		float SelfDealt = -1.f;
+		bool  bSelfSampled = false;
+	};
+
+	/**
+	 * The gaps to sample, as fractions of the blast radius, plus one outside it.
+	 *
+	 * The edge row is pulled 0.5 uu inside the radius on purpose: at exactly the radius the shipped
+	 * code returns 0 and skips the victim entirely, so the row would be indistinguishable from the
+	 * one outside. 0.5 uu inside asks "what does the very last uu of the blast do", which is the
+	 * question — and the answer at a smoothstep is "essentially nothing", which is the point.
+	 */
+	const float FalloffSampleFractions[] = { 0.f, 0.25f, 0.5f, 0.75f, 0.993f, 1.11f };
+	const TCHAR* FalloffSampleLabels[] = {
+		TEXT("at the impact point"), TEXT("25% of the radius"), TEXT("50% of the radius"),
+		TEXT("75% of the radius"), TEXT("the edge of the radius"), TEXT("just OUTSIDE the radius")
+	};
+	static_assert(UE_ARRAY_COUNT(FalloffSampleFractions) == UE_ARRAY_COUNT(FalloffSampleLabels),
+		"every sampled gap needs a label for the table");
+
+	/** A horizontal unit vector perpendicular to @p Forward. Any one will do; this one is repeatable. */
+	FVector HorizontalSideOf(const FVector& Forward)
+	{
+		FVector Side = FVector::CrossProduct(FVector::UpVector, Forward).GetSafeNormal2D();
+		if (Side.IsNearlyZero())
+		{
+			Side = FVector::RightVector;
+		}
+		return Side;
+	}
+
+	/** The victim's capsule radius, off the live component, with the class default as the fallback. */
+	float CapsuleRadiusOf(const ATraceCharacter* Pawn)
+	{
+		if (const UCapsuleComponent* Capsule = (Pawn != nullptr) ? Pawn->GetCapsuleComponent() : nullptr)
+		{
+			return Capsule->GetScaledCapsuleRadius();
+		}
+		return 34.f;
+	}
+
+	/** Pulls this victim's line out of the last detonation's record, or leaves the row not-found. */
+	void HarvestRow(FFalloffRow& Row, const UTraceAbilitySetRoxie* RoxieSet, const ATraceCharacter* Victim)
+	{
+		if (RoxieSet == nullptr)
+		{
+			return;
+		}
+		for (const UTraceAbilitySetRoxie::FRocketDetonationHit& Hit : RoxieSet->GetLastDetonationRecord())
+		{
+			if (Hit.Victim.Get() != Victim)
+			{
+				continue;
+			}
+			Row.bFound = true;
+			Row.RecordedGapUU = Hit.SurfaceGapUU;
+			Row.RecordedRequested = Hit.RequestedDamage;
+			Row.RecordedDealt = Hit.DealtDamage;
+			Row.bDirect = Hit.bDirect;
+			return;
+		}
+	}
+
+	void RunFalloffTest()
+	{
+		UWorld* WorldPtr = FindAuthoritativeWorld();
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[ROXIEFALLOFF] no authoritative game world — run this on the server."));
+			return;
+		}
+
+		TSharedPtr<FFalloffState> State = MakeShared<FFalloffState>();
+		State->List.Tag = TEXT("ROXIEFALLOFF");
+		State->Deadline = FPlatformTime::Seconds() + 90.0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ROXIEFALLOFF] ===== DEMO 29 §7: %.0f for a DIRECT IMPACT, falling off to 0 at %.0f uu "
+			     "from the detonation point (x%.2f of the direct damage at the impact point itself). "
+			     "Every number below is a health bar that moved. ====="),
+			TraceRoxieRocket::GetDamage(), TraceRoxieRocket::GetHitRadiusUU(),
+			TraceRoxieRocket::GetSplashMaxFraction());
+
+		SetArm(TEXT("Trace.Roxie.RocketWobble"), 0);
+		SetArm(TEXT("Trace.Roxie.SelfLaunch"), 0);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, WeakWorld = TWeakObjectPtr<UWorld>(WorldPtr)](float) -> bool
+		{
+			UWorld* TickWorld = WeakWorld.Get();
+			const double NowReal = FPlatformTime::Seconds();
+			if (TickWorld == nullptr)
+			{
+				RestoreLiveFireArms();
+				return false;
+			}
+			if (NowReal < State->NextReal)
+			{
+				return true;
+			}
+
+			FString Why;
+			UTraceAbilitySetRoxie* RoxieSet = MakePlayerIntoRoxie(TickWorld, Why);
+			UTraceAbilityComponent* RoxieComp = (RoxieSet != nullptr) ? RoxieSet->GetAbilityComponent() : nullptr;
+			ATraceCharacter* RoxiePawn = (RoxieSet != nullptr) ? RoxieSet->GetCharacter() : nullptr;
+			if (RoxieSet == nullptr || RoxieComp == nullptr || RoxiePawn == nullptr || !RoxiePawn->IsAlive())
+			{
+				if (State->Step == 0 && NowReal <= State->Deadline)
+				{
+					return true;
+				}
+				State->List.Invalidate(FString::Printf(TEXT("could not stage or hold Roxie: %s"), *Why));
+				State->List.Report();
+				RestoreLiveFireArms();
+				return false;
+			}
+
+			// ---- step 0: find a living non-carrier enemy to measure on ------------------------------
+			if (State->Step == 0)
+			{
+				ATraceCharacter* Candidate = FindLivingEnemy(TickWorld, RoxieComp, nullptr);
+				ATraceCore* CoreActor = ATraceCore::Get(TickWorld);
+				if (Candidate != nullptr && CoreActor != nullptr && CoreActor->Carrier == Candidate)
+				{
+					// A carrier takes nothing from ANY of these rows by the founding invariant, which
+					// would make the whole table read zero for entirely the right reason and the wrong
+					// test. That case is Trace.Roxie.RocketCarrierTest's.
+					Candidate = FindLivingEnemy(TickWorld, RoxieComp, Candidate);
+				}
+				if (Candidate == nullptr)
+				{
+					if (NowReal <= State->Deadline)
+					{
+						return true;
+					}
+					State->List.Invalidate(TEXT("no living NON-CARRIER enemy of Roxie to measure on"));
+					State->List.Report();
+					RestoreLiveFireArms();
+					return false;
+				}
+
+				State->Target = Candidate;
+				State->Step = 1;
+				UE_LOG(LogTraceGame, Display, TEXT("[ROXIEFALLOFF] staged: Roxie %s, target %s."),
+					*GetNameSafe(RoxiePawn), *GetNameSafe(Candidate));
+				return true;
+			}
+
+			ATraceCharacter* Target = State->Target.Get();
+			if (Target == nullptr)
+			{
+				State->List.Invalidate(TEXT("the target actor went away mid-table"));
+				State->List.Report();
+				RestoreLiveFireArms();
+				return false;
+			}
+
+			// *** A DEAD TARGET IS EXPECTED HERE, NOT EXCEPTIONAL, AND THE FIRST VERSION OF THIS
+			// *** FIXTURE INVALIDATED ITSELF ON IT. *** Two things kill it: eight bots shooting at each
+			// other around the measurement, and the DIRECT row, which deals a full health bar on
+			// purpose. So the rows that need a living pawn heal it back, and the rows after the direct
+			// hit stop caring. Healing rather than re-staging keeps every row on the SAME pawn, which
+			// is what makes the table comparable line to line.
+			if (State->Step <= 3)
+			{
+				if (!Target->IsAlive() && Target->Health != nullptr)
+				{
+					Target->Health->ResetHealth();
+				}
+				if (!Target->IsAlive())
+				{
+					State->List.Invalidate(TEXT("the target died and could not be healed back — the table "
+					                            "needs one pawn alive for every row"));
+					State->List.Report();
+					RestoreLiveFireArms();
+					return false;
+				}
+			}
+
+			// ---- step 1: the FALLOFF rows, one commanded detonation each ----------------------------
+			if (State->Step == 1)
+			{
+				const int32 Index = State->Sample;
+				if (Index < UE_ARRAY_COUNT(FalloffSampleFractions))
+				{
+					const float BlastRadius = TraceRoxieRocket::GetHitRadiusUU();
+					const float AskedGap = BlastRadius * FalloffSampleFractions[Index];
+
+					if (Target->Health != nullptr)
+					{
+						Target->Health->ResetHealth();
+					}
+					const float Before = (Target->Health != nullptr) ? Target->Health->Health : -1.f;
+
+					// THE DETONATION POINT SITS AT THE TARGET'S CAPSULE-CENTRE HEIGHT. That is what makes
+					// the gap exact: the closest point on a vertical capsule axis to a point at the same
+					// Z is that point's own height, so the axis distance is the horizontal offset and the
+					// surface gap is that minus the capsule radius. Offsetting vertically instead would
+					// put the closest point at an axis END and make the gap a Pythagorean surprise.
+					const FVector TargetCentre = Target->GetActorLocation();
+					const FVector Side = HorizontalSideOf(RoxiePawn->GetActorForwardVector());
+					const FVector DetonateAt = TargetCentre + Side * (CapsuleRadiusOf(Target) + AskedGap);
+
+					RoxieSet->DebugClearRocketCooldown();
+					ATraceRoxieRocket* Rocket = RoxieSet->DebugFireRocket(0.f, /*bAlsoSelfLaunch*/ false);
+					if (Rocket == nullptr)
+					{
+						State->List.Invalidate(TEXT("could not spawn a rocket for a falloff row"));
+						State->List.Report();
+						RestoreLiveFireArms();
+						return false;
+					}
+					Rocket->DebugDetonateAt(DetonateAt);
+
+					FFalloffRow Row;
+					Row.Label = FalloffSampleLabels[Index];
+					Row.AskedGapUU = AskedGap;
+					Row.HealthLost = Before - ((Target->Health != nullptr) ? Target->Health->Health : -1.f);
+					HarvestRow(Row, RoxieSet, Target);
+
+					// ROXIE'S OWN SHARE, HARVESTED FROM THE SAME RECORD. Sampled on the row whose
+					// detonation is nearest her — in practice whichever one the arena geometry allows —
+					// and reported whether or not she was reached. See the check below.
+					for (const UTraceAbilitySetRoxie::FRocketDetonationHit& Hit : RoxieSet->GetLastDetonationRecord())
+					{
+						if (Hit.Victim.Get() == RoxiePawn)
+						{
+							State->bSelfSampled = true;
+							State->SelfGapUU = Hit.SurfaceGapUU;
+							State->SelfRequested = Hit.RequestedDamage;
+							State->SelfDealt = Hit.DealtDamage;
+						}
+					}
+
+					State->Rows.Add(Row);
+					++State->Sample;
+					State->NextReal = NowReal + 0.10;
+					return true;
+				}
+
+				State->Step = 2;
+				return true;
+			}
+
+			// ---- step 2: ROXIE'S OWN BLAST, at rocket-jump range ------------------------------------
+			//
+			// A rocket jump is fired into the floor at her feet, so the detonation lands about one
+			// capsule radius from her capsule's bottom cap — i.e. a gap of roughly ZERO, the MAXIMUM the
+			// falloff can deal. That is the worst case and it is the one worth measuring.
+			if (State->Step == 2)
+			{
+				RoxieSet->DebugClearRocketCooldown();
+				if (ATraceRoxieRocket* Rocket = RoxieSet->DebugFireRocket(0.f, /*bAlsoSelfLaunch*/ false))
+				{
+					const FVector Feet = RoxiePawn->GetActorLocation()
+					                   - FVector(0.f, 0.f, CapsuleRadiusOf(RoxiePawn));
+					Rocket->DebugDetonateAt(Feet);
+
+					State->bSelfSampled = false;
+					State->SelfGapUU = -1.f;
+					State->SelfRequested = -1.f;
+					State->SelfDealt = -1.f;
+					for (const UTraceAbilitySetRoxie::FRocketDetonationHit& Hit : RoxieSet->GetLastDetonationRecord())
+					{
+						if (Hit.Victim.Get() == RoxiePawn)
+						{
+							State->bSelfSampled = true;
+							State->SelfGapUU = Hit.SurfaceGapUU;
+							State->SelfRequested = Hit.RequestedDamage;
+							State->SelfDealt = Hit.DealtDamage;
+						}
+					}
+				}
+
+				State->Step = 3;
+				State->NextReal = NowReal + 0.10;
+				return true;
+			}
+
+			// ---- step 3: the DIRECT row, from a real flight -----------------------------------------
+			if (State->Step == 3)
+			{
+				if (Target->Health != nullptr)
+				{
+					Target->Health->ResetHealth();
+				}
+				State->TargetHealthBefore = (Target->Health != nullptr) ? Target->Health->Health : -1.f;
+
+				const FVector AimAt = RoxiePawn->GetPawnViewLocation()
+				                    + RoxiePawn->GetActorForwardVector() * LiveFireTargetRangeUU;
+				AimRoxieAt(RoxiePawn, AimAt);
+
+				RoxieSet->DebugClearRocketCooldown();
+				ATraceRoxieRocket* Rocket = RoxieSet->DebugFireRocket(0.f, /*bAlsoSelfLaunch*/ false);
+				if (Rocket == nullptr)
+				{
+					State->List.Invalidate(TEXT("could not spawn the rocket for the DIRECT row"));
+					State->List.Report();
+					RestoreLiveFireArms();
+					return false;
+				}
+
+				// Pinned squarely ON the launch line: an ACharacter's origin is its capsule centre, so
+				// this puts the capsule on the path and the sweep resolves a real direct impact.
+				State->PinLocation = Rocket->GetLaunchOrigin()
+				                   + Rocket->GetLaunchDirection() * LiveFireTargetRangeUU;
+				Target->SetActorLocation(State->PinLocation, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+
+				State->Step = 4;
+				State->FlightDeadline = NowReal + 2.0;
+				return true;
+			}
+
+			// ---- step 4: hold the target on the line until the rocket resolves ----------------------
+			if (State->Step == 4)
+			{
+				if (RoxieSet->GetLiveRocket() != nullptr && NowReal < State->FlightDeadline)
+				{
+					Target->SetActorLocation(State->PinLocation, /*bSweep*/ false, nullptr, ETeleportType::TeleportPhysics);
+					return true;
+				}
+
+				FFalloffRow Row;
+				Row.Label = TEXT("DIRECT IMPACT (the projectile hit them)");
+				Row.AskedGapUU = 0.f;
+				Row.HealthLost = State->TargetHealthBefore
+				               - ((Target->Health != nullptr) ? Target->Health->Health : -1.f);
+				HarvestRow(Row, RoxieSet, Target);
+				State->Rows.Insert(Row, 0);
+
+				State->Step = 5;
+				State->NextReal = NowReal + 0.10;
+				return true;
+			}
+
+			// ---- step 5: the table, and the checks -------------------------------------------------
+			const float BlastRadius = TraceRoxieRocket::GetHitRadiusUU();
+			const float Direct = TraceRoxieRocket::GetDamage();
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ROXIEFALLOFF] ---- MEASURED DAMAGE TABLE (blast radius %.0f uu = the drawn body = the "
+				     "drawn burst) ----"), BlastRadius);
+			for (const FFalloffRow& Row : State->Rows)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[ROXIEFALLOFF]   %-40s | gap asked %6.1f uu | gap RECORDED %6.1f uu | asked %6.1f | "
+					     "dealt %6.1f | HEALTH LOST %6.1f%s"),
+					*Row.Label, Row.AskedGapUU, Row.RecordedGapUU, Row.RecordedRequested, Row.RecordedDealt,
+					Row.HealthLost, Row.bDirect ? TEXT("  <- DIRECT") : TEXT(""));
+			}
+
+			// --- the checks, all against the MEASURED health loss ---------------------------------
+			const FFalloffRow* DirectRow = State->Rows.FindByPredicate(
+				[](const FFalloffRow& R) { return R.bDirect; });
+			const FFalloffRow* CentreRow = State->Rows.FindByPredicate(
+				[](const FFalloffRow& R) { return !R.bDirect && R.AskedGapUU <= 0.01f; });
+			const FFalloffRow* EdgeRow = State->Rows.FindByPredicate(
+				[BlastRadius](const FFalloffRow& R)
+				{ return !R.bDirect && R.AskedGapUU > BlastRadius * 0.9f && R.AskedGapUU < BlastRadius; });
+			const FFalloffRow* OutsideRow = State->Rows.FindByPredicate(
+				[BlastRadius](const FFalloffRow& R) { return R.AskedGapUU > BlastRadius; });
+
+			State->List.Check(DirectRow != nullptr && DirectRow->bFound
+				&& FMath::IsNearlyEqual(DirectRow->HealthLost, Direct, 0.5f),
+				TEXT("*** DEMO 29 §7: A DIRECT IMPACT DEALS THE FULL DAMAGE ***"),
+				(DirectRow != nullptr)
+					? FString::Printf(TEXT("a real rocket flown %.0f uu into a pinned pawn took %.1f health "
+					                       "against the %.0f knob, and the record marks it DIRECT — i.e. the "
+					                       "SWEEP found them, which is what 'direct impact' means here"),
+						LiveFireTargetRangeUU, DirectRow->HealthLost, Direct)
+					: TEXT("no direct row was produced at all"));
+
+			State->List.Check(CentreRow != nullptr && CentreRow->HealthLost > 0.5f
+				&& CentreRow->HealthLost < Direct - 0.5f,
+				TEXT("...and the BEST possible near miss does strictly less"),
+				(CentreRow != nullptr)
+					? FString::Printf(TEXT("standing ON the detonation point cost %.1f health against a direct "
+					                       "hit's %.1f (x%.2f of it). Non-zero, so the blast is real; below "
+					                       "100, so 'only 100 for direct impacts' holds"),
+						CentreRow->HealthLost, Direct, (Direct > 0.f) ? CentreRow->HealthLost / Direct : 0.f)
+					: TEXT("no gap-0 row was produced"));
+
+			bool bMonotone = true;
+			float PreviousLoss = TNumericLimits<float>::Max();
+			for (const FFalloffRow& Row : State->Rows)
+			{
+				if (Row.bDirect)
+				{
+					continue;
+				}
+				bMonotone = bMonotone && (Row.HealthLost <= PreviousLoss + 0.01f);
+				PreviousLoss = Row.HealthLost;
+			}
+			State->List.Check(bMonotone,
+				TEXT("*** 'OTHERWISE, THE DAMAGE SHOULD FALL OFF' — it falls, at every step out ***"),
+				FString::Printf(TEXT("%d measured rows, each one at or below the row inside it, across a %.0f uu "
+				                     "blast. The curve is a smoothstep: flat-shouldered at the centre so a good "
+				                     "near miss pays consistently, flat-tailed at the edge so there is no cliff "
+				                     "to be killed by 1 uu on either side of"),
+					State->Rows.Num() - 1, BlastRadius));
+
+			State->List.Check(EdgeRow != nullptr && OutsideRow != nullptr
+				&& EdgeRow->HealthLost < 2.f && OutsideRow->HealthLost <= 0.01f && !OutsideRow->bFound,
+				TEXT("*** THE BLAST ENDS EXACTLY WHERE THE DRAWN BURST ENDS ***"),
+				(EdgeRow != nullptr && OutsideRow != nullptr)
+					? FString::Printf(TEXT("%.1f health at the last uu inside %.0f uu, and %.1f (no record line "
+					                       "at all) at %.0f uu. ATraceFxBurst draws the RocketBurst at this same "
+					                       "%.0f uu, so there is no invisible kill volume and no visible ring "
+					                       "that does nothing"),
+						EdgeRow->HealthLost, BlastRadius, OutsideRow->HealthLost, OutsideRow->AskedGapUU,
+						BlastRadius)
+					: TEXT("the edge or outside row was not produced"));
+
+			// --- SELF-DAMAGE. The number the owner asked for, stated whether or not it is zero. ----
+			State->List.Check(State->SelfDealt <= 0.01f,
+				TEXT("*** ROXIE'S ROCKET JUMP IS STILL FREE — her own blast deals her NOTHING ***"),
+				State->bSelfSampled
+					? FString::Printf(TEXT("a rocket detonated at her own feet put her %.1f uu from the blast "
+					                       "(the falloff asked for %.1f, the most it can ask for) and dealt her "
+					                       "%.1f. The framework refuses it: CanAffectTargetDetailed returns "
+					                       "Self for a pawn damaging itself with its own ability, so this is "
+					                       "structural and no knob can change it"),
+						State->SelfGapUU, State->SelfRequested, State->SelfDealt)
+					: TEXT("she was not even reached by a blast at her own feet — which is the same answer, "
+					       "0 self-damage, arrived at one step earlier"));
+
+			State->List.Report();
+			RestoreLiveFireArms();
+			return false;
+		}));
+	}
+
+	FAutoConsoleCommand CmdRocketFalloffTest(
+		TEXT("Trace.Roxie.RocketFalloffTest"),
+		TEXT("Dev only, SERVER. DEMO 29 §7: prints a MEASURED damage table for Roxie's rocket — a real "
+		     "flown DIRECT impact, then the blast at 0/25/50/75/100% of the radius and just outside it, "
+		     "every row a health bar that moved. Also reports her own self-damage at rocket-jump range. "
+		     "Red arm: RoxieRocketSplashMaxFraction 0 (the Demo 28 build)."),
+		FConsoleCommandDelegate::CreateStatic(&RunFalloffTest));
+
+	// =============================================================================================
 	// Trace.Roxie.RocketFlightTest — "it WOBBLES in flight, deliberately inaccurate and hard to aim"
 	//
 	// Pure arithmetic on the SHIPPED path function, so it needs no world, no pawn and no match — which
@@ -1878,37 +2437,90 @@ namespace TraceRoxieVerify
 					SidestepUU, DodgeSpeed, LethalHalfWidth, TraceRoxieRocket::GetHitRadiusUU(),
 					PawnCapsuleRadius));
 
-			// AND THE DRAWN SIZE, WHICH IS THE PART OF ITEM 3 THAT WAS ACTUALLY MISSING, now carrying
-			// PATCH 28 ITEM 1 ("Make Roxie's rocket larger") as well. The body is sized off the hit
-			// radius, so "as big as the thing that kills you" is a property of the code rather than of
-			// two numbers somebody keeps in step by hand.
+			// ---- DEMO 29 ITEM 7: "MAKE ROXIE'S ROCKET HIT RADIUS MATCH THE MODEL" ------------------
+			//
+			// This used to be two checks around two numbers: "the model is at least 90% as wide as the
+			// hit" and "the model is no wider than hit + capsule". Both PASSED at the Patch 28 numbers
+			// (a 72 uu model around a 45 uu hit radius) and the owner still played it and reported the
+			// model and the hit radius did not match, because 72 != 45 and no amount of arguing about
+			// the capsule term changes that. So the two numbers are one number now, and this is the
+			// check that says so.
+			//
+			// *** IT IS NOT A TAUTOLOGY EVEN THOUGH GetVisualRadiusUU() RETURNS GetHitRadiusUU(). ***
+			// This command has no world, so it can only compare the two accessors — which is a real
+			// check of the ARITHMETIC (a reintroduced multiplier fails it immediately) but not of the
+			// MESH. The mesh half is Trace.Roxie.RocketShot, which reads the radius back off a live
+			// rocket's component scale through ATraceRoxieRocket::GetDrawnBodyRadiusUU() and prints it
+			// on the photographed frame. Both halves are needed; neither is sufficient.
 			const float DrawnRadius = TraceRoxieRocket::GetVisualRadiusUU();
-			const float DrawnDiameter = DrawnRadius * 2.f;
-			List.Check(DrawnDiameter >= TraceRoxieRocket::GetHitRadiusUU() * 2.f * 0.9f,
-				TEXT("DEMO 17: the MODEL IS AS BIG AS THE HIT — 'make the model bigger, so it is easy to see'"),
-				FString::Printf(TEXT("drawn %.0f uu across against a %.0f uu hit radius (x%.2f). It was a fixed "
-				                     "13 uu before Demo 17, i.e. narrower than its own hit test"),
-					DrawnDiameter, TraceRoxieRocket::GetHitRadiusUU(), TraceRoxieRocket::GetVisualScale()));
+			List.Check(FMath::IsNearlyEqual(DrawnRadius, TraceRoxieRocket::GetHitRadiusUU(), 0.01f),
+				TEXT("*** DEMO 29 §7: THE DRAWN RADIUS AND THE HIT RADIUS ARE ONE NUMBER ***"),
+				FString::Printf(TEXT("drawn r %.1f uu vs hit r %.1f uu, i.e. %.0f uu across. Patch 28 "
+				                     "drew 72 around a hit of 45; the multiplier that did that "
+				                     "(RoxieRocketVisualScale) has no reader any more, so these cannot "
+				                     "drift apart again by editing one of them"),
+					DrawnRadius, TraceRoxieRocket::GetHitRadiusUU(), DrawnRadius * 2.f));
 
-			// *** THE CEILING, AND THE WHOLE OF WHY PATCH 28 ITEM 1 IS NOT A DRAWN/LETHAL DRIFT. ***
-			//
-			// The drawn body may be WIDER than the touch radius — it is 72 uu against 45 at the shipped
-			// scale — but it must never be wider than the volume the rocket actually kills a PLAYER in,
-			// which is LethalHalfWidth above (touch radius + the victim's capsule). Both sides of this
-			// comparison are live reads: raise RoxieRocketHitRadiusUU and the ceiling rises with it;
-			// retune the capsule and it moves too. Nothing here is a literal to be kept in step by hand.
-			//
-			// THIS IS THE ARM THAT FAILS IF SOMEBODY ANSWERS THE NEXT "make it bigger" WITH A BIG
-			// NUMBER: at RoxieRocketVisualScale above 1.76 the drawn skin starts claiming kills the
-			// rocket does not have, and this line says so with both numbers.
+			// AND IT MUST STILL NOT OUT-CLAIM THE KILL. The volume a PLAYER dies in is wider than the
+			// rocket, because the test is (rocket radius + the victim's own capsule): both sides here
+			// are live reads, so a capsule retune moves the ceiling with it and nothing is a literal.
+			// This is now a large margin rather than a near miss, which is the correct direction — the
+			// drawn skin under-claims by exactly one capsule radius, forever, by construction.
 			List.Check(DrawnRadius <= LethalHalfWidth + 0.01f,
 				TEXT("*** DRAWN == LETHAL: the drawn body never claims more than the rocket kills ***"),
 				FString::Printf(TEXT("drawn radius %.1f uu against a %.1f uu lethal half-width (hit %.0f + "
-				                     "capsule %.0f). The ceiling on RoxieRocketVisualScale is x%.2f and it "
-				                     "is x%.2f"),
-					DrawnRadius, LethalHalfWidth, TraceRoxieRocket::GetHitRadiusUU(), PawnCapsuleRadius,
-					LethalHalfWidth / FMath::Max(1.f, TraceRoxieRocket::GetHitRadiusUU()),
-					TraceRoxieRocket::GetVisualScale()));
+				                     "capsule %.0f). The margin is exactly one capsule radius and moves "
+				                     "with both knobs"),
+					DrawnRadius, LethalHalfWidth, TraceRoxieRocket::GetHitRadiusUU(), PawnCapsuleRadius));
+
+			// ---- DEMO 29 ITEM 7: "ONLY 100 FOR DIRECT IMPACTS. OTHERWISE THE DAMAGE SHOULD FALL OFF"
+			//
+			// The SHAPE of the falloff, on the shipped pure function, with no world — the same reason
+			// the wobble is measured here. Trace.Roxie.RocketFalloffTest fires real rockets and checks
+			// these same numbers came out of the live damage path; this checks the curve itself.
+			{
+				const float BlastRadius = TraceRoxieRocket::GetHitRadiusUU();
+				const float Direct = TraceRoxieRocket::GetDamage();
+				const float AtCentre = TraceRoxieRocket::GetSplashDamageAtGapUU(0.f);
+				const float AtQuarter = TraceRoxieRocket::GetSplashDamageAtGapUU(BlastRadius * 0.25f);
+				const float AtHalf = TraceRoxieRocket::GetSplashDamageAtGapUU(BlastRadius * 0.5f);
+				const float AtThreeQuarter = TraceRoxieRocket::GetSplashDamageAtGapUU(BlastRadius * 0.75f);
+				const float AtEdge = TraceRoxieRocket::GetSplashDamageAtGapUU(BlastRadius);
+				const float Outside = TraceRoxieRocket::GetSplashDamageAtGapUU(BlastRadius + 8.f);
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[ROXIEFLIGHT] DEMO 29 §7 FALLOFF TABLE (arithmetic; the live one is "
+					     "Trace.Roxie.RocketFalloffTest): direct %.1f | gap 0 %.1f | 25%% (%.0f uu) %.1f | "
+					     "50%% (%.0f uu) %.1f | 75%% (%.0f uu) %.1f | edge (%.0f uu) %.1f | outside %.1f"),
+					Direct, AtCentre, BlastRadius * 0.25f, AtQuarter, BlastRadius * 0.5f, AtHalf,
+					BlastRadius * 0.75f, AtThreeQuarter, BlastRadius, AtEdge, Outside);
+
+				List.Check(AtCentre < Direct - 0.5f && AtCentre > 0.f,
+					TEXT("*** DEMO 29 §7: ONLY A DIRECT IMPACT DOES THE FULL DAMAGE ***"),
+					FString::Printf(TEXT("the BEST possible near miss — standing exactly on the impact "
+					                     "point — takes %.1f against the direct hit's %.1f (x%.2f). A "
+					                     "splash that could equal a direct hit would delete the "
+					                     "distinction the owner asked for; the fraction is clamped below "
+					                     "1.0 so an .ini cannot do it either"),
+						AtCentre, Direct, TraceRoxieRocket::GetSplashMaxFraction()));
+
+				List.Check(AtCentre > AtQuarter && AtQuarter > AtHalf && AtHalf > AtThreeQuarter
+					&& AtThreeQuarter > AtEdge,
+					TEXT("...and it FALLS OFF, strictly, all the way out"),
+					FString::Printf(TEXT("%.1f -> %.1f -> %.1f -> %.1f -> %.1f across 0, 25%%, 50%%, 75%% "
+					                     "and 100%% of a %.0f uu blast. Smoothstep, so the slope is zero "
+					                     "at both ends: no cliff at the boundary and a consistent payout "
+					                     "for the best near miss"),
+						AtCentre, AtQuarter, AtHalf, AtThreeQuarter, AtEdge, BlastRadius));
+
+				List.Check(AtEdge <= KINDA_SMALL_NUMBER && Outside <= KINDA_SMALL_NUMBER,
+					TEXT("*** THE BLAST ENDS EXACTLY WHERE THE DRAWN BURST ENDS ***"),
+					FString::Printf(TEXT("%.3f at the edge and %.3f 8 uu outside it. The RocketBurst is "
+					                     "drawn at this same %.0f uu (ATraceFxBurst reads the same knob), "
+					                     "so there is no invisible kill volume and no visible ring that "
+					                     "does nothing"),
+						AtEdge, Outside, BlastRadius));
+			}
 		}
 
 		List.Report();
@@ -2781,7 +3393,11 @@ namespace TraceRoxieRocketFx
 	// THE DISTANCE IS FIXED AND THE FRAMING IS BROADSIDE ON PURPOSE. A rocket photographed from
 	// behind Roxie is a dot whose size is a fact about where the bots pushed her, not about the knob;
 	// two such frames cannot be compared. At a fixed range, two runs of this command differ by exactly
-	// what RoxieRocketVisualScale did.
+	// what RoxieRocketHitRadiusUU did.
+	//
+	// DEMO 29 §7 GAVE IT A SECOND JOB: the drawn radius printed beside the picture is now MEASURED OFF
+	// THE LIVE MESH (ATraceRoxieRocket::GetDrawnBodyRadiusUU) and compared against the hit radius, so
+	// the frame is evidence for "the hit radius matches the model" rather than just for "it is big".
 	void RunRocketShot()
 	{
 		UWorld* WorldPtr = TraceRoxieVerify::FindAuthoritativeWorld();
@@ -2914,7 +3530,18 @@ namespace TraceRoxieRocketFx
 				// checked with a ruler rather than believed.
 				const float Fov = (Camera->GetCameraComponent() != nullptr)
 					? Camera->GetCameraComponent()->FieldOfView : 90.f;
-				const float DrawnRadius = TraceRoxieRocket::GetVisualRadiusUU();
+
+				// *** DEMO 29 §7's PROOF, AND IT IS A READ-BACK RATHER THAN A RE-DERIVATION. ***
+				//
+				// MeasuredRadius comes off the LIVE component's world scale through the inverse of the
+				// conversion ApplyVisualSize used; HitRadius is the number the flight sweep and the
+				// blast both use. If they agree, the thing in this photograph is the thing that hits
+				// you. Comparing GetVisualRadiusUU() against GetHitRadiusUU() instead would compare a
+				// function with itself and would pass on a build where ApplyVisualSize never ran.
+				const float MeasuredRadius = Rocket->GetDrawnBodyRadiusUU();
+				const float HitRadius = TraceRoxieRocket::GetHitRadiusUU();
+				const bool bAgree = FMath::IsNearlyEqual(MeasuredRadius, HitRadius, 0.51f);
+				const float DrawnRadius = MeasuredRadius;
 				const float DrawnLength = DrawnRadius * 3.f;   // VisualLengthPerRadius, stated in the log
 				float ViewportW = 1920.f;
 				if (PC->GetLocalPlayer() != nullptr && PC->GetLocalPlayer()->ViewportClient != nullptr)
@@ -2930,15 +3557,18 @@ namespace TraceRoxieRocketFx
 				const float PixelsAcross = ViewportW * (DrawnRadius / ViewDistanceUU) / HalfTan;
 
 				UE_LOG(LogTraceGame, Display,
-					TEXT("[ROXIESHOT] ON SCREEN: drawn body r %.1f uu (hit %.0f x scale %.2f), %.0f uu across "
-					     "and %.0f uu long, photographed BROADSIDE at %.0f uu on a %.0f px frame at %.0f deg "
-					     "FOV = %.0f px across. Live FX: %s"),
-					DrawnRadius, TraceRoxieRocket::GetHitRadiusUU(), TraceRoxieRocket::GetVisualScale(),
+					TEXT("[ROXIESHOT] ON SCREEN: drawn body r %.1f uu MEASURED OFF THE LIVE MESH vs hit "
+					     "radius %.1f uu — %s. %.0f uu across and %.0f uu long, photographed BROADSIDE at "
+					     "%.0f uu on a %.0f px frame at %.0f deg FOV = %.0f px across. The %.0f uu blast "
+					     "radius and the RocketBurst are the same number again. Live FX: %s"),
+					MeasuredRadius, HitRadius,
+					bAgree ? TEXT("*** DEMO 29 §7 PASS: THE MODEL IS THE HIT RADIUS ***")
+					       : TEXT("*** FAIL: the model and the hit radius have drifted apart ***"),
 					DrawnRadius * 2.f, DrawnLength, ViewDistanceUU, ViewportW, Fov, PixelsAcross,
-					*Rocket->DebugDescribeFx());
+					HitRadius, *Rocket->DebugDescribeFx());
 
-				const FString FileName = FString::Printf(TEXT("RoxieRocket_scale%.2f_pid%d.png"),
-					TraceRoxieRocket::GetVisualScale(), FPlatformProcess::GetCurrentProcessId());
+				const FString FileName = FString::Printf(TEXT("RoxieRocket_r%.0f_pid%d.png"),
+					HitRadius, FPlatformProcess::GetCurrentProcessId());
 				State->ShotPath = FPaths::ConvertRelativePathToFull(
 					FPaths::ProjectSavedDir() / TEXT("Screenshots") / FileName);
 				FPlatformFileManager::Get().GetPlatformFile().CreateDirectoryTree(*FPaths::GetPath(State->ShotPath));
@@ -2971,10 +3601,10 @@ namespace TraceRoxieRocketFx
 
 	FAutoConsoleCommand CmdRocketShot(
 		TEXT("Trace.Roxie.RocketShot"),
-		TEXT("Dev only, SERVER, needs a rendering process. PATCH 28 §1: fires one rocket, photographs it "
-		     "BROADSIDE at a fixed 900 uu, and prints the drawn radius in uu AND the diameter it covers "
-		     "in pixels on this frame. Two runs at different RoxieRocketVisualScale values are directly "
-		     "comparable."),
+		TEXT("Dev only, SERVER, needs a rendering process. PATCH 28 §1 / DEMO 29 §7: fires one rocket, "
+		     "photographs it BROADSIDE at a fixed 900 uu, and prints the drawn radius MEASURED OFF THE "
+		     "LIVE MESH against RoxieRocketHitRadiusUU — they must be equal — plus the diameter it covers "
+		     "in pixels on this frame. Two runs at different hit radii are directly comparable."),
 		FConsoleCommandDelegate::CreateStatic(&RunRocketShot));
 
 	FAutoConsoleCommand CmdRocketFxTest(

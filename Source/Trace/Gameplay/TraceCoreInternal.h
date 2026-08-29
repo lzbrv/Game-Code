@@ -93,6 +93,31 @@ namespace TraceCoreTuning
 	/** §1: the Core starts with Team A. Blue is Team A. */
 	constexpr ETraceTeam DefaultKickoffTeam = ETraceTeam::Blue;
 
+	/**
+	 * DEMO 29 §3. How long a CONTESTED kickoff Core may lie unretrieved before it is granted anyway.
+	 *
+	 * NOT the loose-Core reset timer, and it deliberately replaces it for this one case. That timer
+	 * (UTraceSettings::CoreLooseResetSeconds, 12 s) exists to rescue a THROW nobody collected, and
+	 * measures from the moment the Core went loose — which for a kickoff is the moment the half
+	 * started, before anybody has taken a step. Twelve seconds is not long enough to cross the field
+	 * and climb the octagon, so leaving that timer armed would hand the Core out from under the
+	 * mechanic the owner asked for, every single half.
+	 *
+	 * 60 s IS A MEASURED NUMBER, NOT A ROUND ONE, and the first draft of it (30 s) was wrong. The
+	 * shipped arena is 38,400 uu goal to goal and the spawn pads sit behind the goal plane, so a
+	 * player starts roughly 17,000-19,000 uu from the centre pillar. At UTraceSettings::WalkSpeed
+	 * (800 uu/s) that crossing alone is 21-24 s BEFORE the climb, before being shot at, and before
+	 * anybody dies on the way. A headless 8-bot run of the first draft tripped this backstop on every
+	 * half — the bots entered ChaseLooseCore within a tenth of a second of the whistle and were still
+	 * short of the deck half a minute later — which is a timer measuring the pitch, not the rule.
+	 * Doubling the crossing gives the sprint, the climb and one bad fight room, and it is still two
+	 * orders of magnitude inside the 480 s half, so a genuinely unreachable deck costs one Warning and
+	 * a playable match rather than a dead one.
+	 *
+	 * WHEN IT FIRES IT IS A BUG REPORT, NOT A FEATURE — see the log line, which says so.
+	 */
+	constexpr float ContestedKickoffBackstopSeconds = 60.0f;
+
 	// --- Cosmetics --------------------------------------------------------------------------------
 
 	/**

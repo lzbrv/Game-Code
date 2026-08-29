@@ -61,9 +61,15 @@ namespace TraceRoxieRocketFile
 	// FX_AUDIO_PLAN §2.3 — THE FLASH AND THE TRAIL, EVERY SIZE AS A FRACTION OF ONE RADIUS
 	//
 	// *** READ TraceRoxieRocket::GetVisualRadiusUU()'s comment BEFORE ADDING A NUMBER HERE. *** Every
-	// constant below is a MULTIPLE of the drawn body radius, never a literal in uu, because the owner
-	// has a queued request to make the rocket model larger and this is what makes that a one-line
-	// change instead of a hunt for four numbers that must all move together.
+	// constant below is a MULTIPLE of the drawn body radius, never a literal in uu. That has paid for
+	// itself twice now — Patch 28 made the model larger and Demo 29 made the model AND the hit radius
+	// one number at 72 uu, and on both passes the flash, the trail length and both trail radii moved
+	// with it from a single edit instead of being four numbers somebody had to find.
+	//
+	// The ratios below were calibrated against the 45 uu rocket §2.3 was written for. They are kept as
+	// RATIOS rather than resolved to uu for exactly that reason: at the Demo 29 size the same plan
+	// draws the same shape one size up. Measured back off the live components on a shipped rocket
+	// (Trace.Roxie.RocketShot): "body r=72.0uu | trail 3/3 visible r=12.7->5.7uu len=352uu".
 	//
 	// The two exceptions are ceilings rather than sizes — the muzzle's 40 uu and the 8 uu emissive
 	// width floor — and they belong to the bible rather than to the rocket, so they do NOT scale.
@@ -84,9 +90,11 @@ namespace TraceRoxieRocketFile
 
 	/**
 	 * The launch flash's radius AT FULL GROWTH, as a fraction of the body radius — subject to the
-	 * bible §6.4 muzzle ceiling below. 0.9 x 45 uu = 40.5 uu, i.e. the ceiling is what actually
-	 * decides it at the shipped size, which is the correct relationship: a flash on the scale of the
-	 * projectile, capped by the rule that caps every muzzle in the game.
+	 * bible §6.4 muzzle ceiling below. 0.9 x 72 uu = 64.8 uu, so the 40 uu CEILING is what actually
+	 * decides it, which is the correct relationship: a flash on the scale of the projectile, capped by
+	 * the rule that caps every muzzle in the game. (It was already the ceiling that decided it at the
+	 * old 45 uu size, where this worked out at 40.5 uu — Demo 29's bigger rocket did not change which
+	 * of the two rules wins, only by how much.)
 	 */
 	constexpr float FlashPeakRadiusPerBodyRadius = 0.9f;
 
@@ -96,10 +104,10 @@ namespace TraceRoxieRocketFile
 	/** The cone's length as a multiple of its own peak radius. Stubby: a flash, not a jet. */
 	constexpr float FlashLengthPerRadius = 1.6f;
 
-	/** §2.3: the trail is 220 uu long behind a 45 uu rocket. 220 / 45 = 4.889. */
+	/** §2.3: 220 uu of trail behind the 45 uu rocket of the day, kept as the RATIO 220 / 45 = 4.889. */
 	constexpr float TrailLengthPerBodyRadius = 220.f / 45.f;
 
-	/** §2.3: "r 9 -> 2 uu" behind a 45 uu rocket. 9 / 45 and 2 / 45. */
+	/** §2.3: "r 9 -> 2 uu" behind that same 45 uu rocket, kept as the ratios 9 / 45 and 2 / 45. */
 	constexpr float TrailStartRadiusPerBodyRadius = 9.f / 45.f;
 	constexpr float TrailEndRadiusPerBodyRadius = 2.f / 45.f;
 
@@ -140,16 +148,42 @@ namespace TraceRoxieRocket
 		return FMath::Clamp(UTraceSettings::Get().RoxieRocketHitRadiusUU, 1.f, 300.f);
 	}
 
-	float GetVisualScale()
-	{
-		return FMath::Clamp(UTraceSettings::Get().RoxieRocketVisualScale, 0.1f, 6.f);
-	}
-
 	float GetVisualRadiusUU()
 	{
-		// THE ONE SIZE. Both terms are live clamped reads, so a retune during PIE reaches the next
-		// rocket — body, flash and trail together, because all three are expressed in this.
-		return GetHitRadiusUU() * GetVisualScale();
+		// *** DEMO 29 ITEM 7. THE DRAWN BODY IS THE HIT RADIUS. ONE CALL, NO MULTIPLIER. ***
+		//
+		// Not "the hit radius times 1.0" — the same function, so there is no second number that could
+		// be edited on its own and no arithmetic to get wrong. RoxieRocketVisualScale is retained in
+		// UTraceSettings for config compatibility and is READ BY NOTHING; put the multiply back here
+		// and restore GetVisualScale() beside GetHitRadiusUU() if the owner ever wants the two
+		// decoupled again.
+		return GetHitRadiusUU();
+	}
+
+	float GetSplashMaxFraction()
+	{
+		// CLAMPED BELOW 1.0 AND THAT CEILING IS THE FEATURE. Item 7 says 100 is for direct impacts; a
+		// splash that could reach 1.0 would let a near miss equal a hit and delete the distinction the
+		// owner asked for. The clamp is what stops an ini line from doing that silently.
+		return FMath::Clamp(UTraceSettings::Get().RoxieRocketSplashMaxFraction, 0.f, 0.95f);
+	}
+
+	float GetSplashDamageAtGapUU(float SurfaceGapUU)
+	{
+		const float BlastRadius = GetHitRadiusUU();
+		const float Gap = FMath::Max(0.f, SurfaceGapUU);
+		if (Gap >= BlastRadius)
+		{
+			return 0.f;
+		}
+
+		// SMOOTHSTEP (3t^2 - 2t^3), zero-sloped at both ends. See the header for why that shape and
+		// not a straight line: no felt cliff at the boundary, and a consistent payout for the best
+		// near miss, which matters because the rocket wobbles on purpose and a linear ramp would
+		// charge a player twice for the same inaccuracy.
+		const float T = Gap / FMath::Max(1.f, BlastRadius);
+		const float Eased = T * T * (3.f - 2.f * T);
+		return GetDamage() * GetSplashMaxFraction() * (1.f - Eased);
 	}
 
 	float GetWobbleAmplitudeUU()
@@ -650,17 +684,29 @@ FString ATraceRoxieRocket::DebugDescribeFx() const
 		UTraceFxShapes::BlendName(TrailBlend));
 }
 
-void ATraceRoxieRocket::DetonateAndDestroy(const FVector& Location, const FVector& Normal)
+void ATraceRoxieRocket::DetonateAndDestroy(const FVector& Location, const FVector& Normal,
+                                          ATraceCharacter* DirectVictim, float DirectDealt)
 {
 	if (!HasAuthority())
 	{
 		return;
 	}
 
+	// *** DEMO 29 ITEM 7: "OTHERWISE, THE DAMAGE SHOULD FALL OFF." ***
+	//
+	// The falloff is applied HERE, at the one function all three of §2.3's endings already come
+	// through, for exactly the reason that function exists: the burst plays on "any end: body, wall,
+	// expiry", and a blast that only happened on one of the three would be an explosion a player
+	// watches doing nothing on the other two. It runs BEFORE the burst is spawned so that the frame
+	// the shell appears on is the frame the health moved.
+	ApplySplashDamage(Location, DirectVictim, DirectDealt);
+
 	// RADIUS 0 = "the type's own default", and for RocketBurst that default is READ LIVE from
-	// RoxieRocketHitRadiusUU — the identical clamped read ApplyRocketDamageTo's own hit test makes
-	// (ATraceFxBurst::DefaultRadiusUUFor). Passing a number from here would be exactly the copy the
-	// drawn-equals-lethal invariant forbids, so this deliberately passes nothing.
+	// RoxieRocketHitRadiusUU — the identical clamped read the flight sweep, the drawn body and the
+	// splash above all make (ATraceFxBurst::DefaultRadiusUUFor). Passing a number from here would be
+	// exactly the copy the drawn-equals-lethal invariant forbids, so this deliberately passes nothing.
+	// Since Demo 29 that shared radius is also the blast radius, so the ring the player sees is not a
+	// decoration around the damage — it is its outline.
 	//
 	// It also carries the RoxieRocketBurst sound with it, locally on every machine, through the
 	// burst's own PlayReplicatedLocal — which is why nothing here plays a sound.
@@ -668,6 +714,97 @@ void ATraceRoxieRocket::DetonateAndDestroy(const FVector& Location, const FVecto
 		Normal.GetSafeNormal(1.e-4f, FVector::UpVector));
 
 	Destroy();
+}
+
+void ATraceRoxieRocket::DebugDetonateAt(const FVector& Location)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	// Straight through the shipped ending, with no direct victim: a commanded detonation is a WALL
+	// ending, which is exactly the case Trace.Roxie.RocketFalloffTest wants to tabulate. The normal is
+	// world up because there is no surface; RocketBurst only uses it to lay its ring.
+	DetonateAndDestroy(Location, FVector::UpVector, /*DirectVictim*/ nullptr, /*DirectDealt*/ 0.f);
+}
+
+void ATraceRoxieRocket::ApplySplashDamage(const FVector& Location, ATraceCharacter* DirectVictim,
+                                         float DirectDealt)
+{
+	UWorld* RocketWorld = GetWorld();
+	UTraceAbilitySetRoxie* Roxie = OwnerSet.Get();
+	if (!HasAuthority() || RocketWorld == nullptr || Roxie == nullptr)
+	{
+		// No owner means no instigator, and an ability effect with no instigator is the "orphaned world
+		// effect" spec §4 warns about. The two teardown paths that lose the owner (the fizzle and the
+		// local-time backstop) never reach here anyway — they call Destroy() without a detonation.
+		return;
+	}
+
+	const float BlastRadius = TraceRoxieRocket::GetHitRadiusUU();
+
+	Roxie->BeginDetonationRecord();
+
+	// THE DIRECT HIT IS LINE ONE OF THE RECORD, at gap 0. It is written here rather than at the call
+	// site because BeginDetonationRecord above would otherwise wipe it, and because a table whose
+	// first row is the direct impact is the table Demo 29 item 7 asks a reader to compare against.
+	if (DirectVictim != nullptr)
+	{
+		Roxie->RecordDetonationHit(DirectVictim, /*SurfaceGapUU*/ 0.f, TraceRoxieRocket::GetDamage(),
+			DirectDealt, /*bDirect*/ true);
+	}
+
+	for (TActorIterator<ATraceCharacter> It(RocketWorld); It; ++It)
+	{
+		ATraceCharacter* Candidate = *It;
+		if (!IsValid(Candidate) || Candidate == DirectVictim || !Candidate->IsAlive())
+		{
+			continue;
+		}
+
+		// THE GAP IS TO THE CAPSULE SURFACE, NOT TO THE ACTOR ORIGIN — an ACharacter's origin is its
+		// capsule centre, roughly 88 uu above its feet, so a rocket landing between somebody's boots
+		// would score as 88 uu away and do nothing. Measured against the capsule the same way the
+		// flight sweep measures against it: the axis segment, then subtract the radius.
+		float CapsuleRadius = 34.f;
+		float CapsuleHalfHeight = 88.f;
+		if (const UCapsuleComponent* Capsule = Candidate->GetCapsuleComponent())
+		{
+			CapsuleRadius = Capsule->GetScaledCapsuleRadius();
+			CapsuleHalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+		}
+
+		const FVector BodyCentre = Candidate->GetActorLocation();
+		const float HalfSegment = FMath::Max(0.f, CapsuleHalfHeight - CapsuleRadius);
+		const FVector ClosestOnAxis = FMath::ClosestPointOnSegment(Location,
+			BodyCentre - FVector(0.f, 0.f, HalfSegment), BodyCentre + FVector(0.f, 0.f, HalfSegment));
+
+		const float SurfaceGap = FMath::Max(0.f,
+			static_cast<float>(FVector::Dist(Location, ClosestOnAxis)) - CapsuleRadius);
+		if (SurfaceGap >= BlastRadius)
+		{
+			continue;   // outside the drawn burst, and therefore outside the damage. Same number.
+		}
+
+		const float Requested = TraceRoxieRocket::GetSplashDamageAtGapUU(SurfaceGap);
+		if (Requested <= KINDA_SMALL_NUMBER)
+		{
+			continue;
+		}
+
+		// THE CHOKE POINT, once per victim, exactly as the direct hit uses it. THE SHOOTER IS OFFERED
+		// HERE TOO and is refused for ETraceAbilityBlockReason::Self — see the file header. That is
+		// what makes "the rocket jump is still free" structural rather than a skip somebody could
+		// delete, and it is why there is no self-damage knob: it would move nothing.
+		const float Dealt = Roxie->ApplyRocketDamageTo(Candidate, Requested);
+
+		Roxie->RecordDetonationHit(Candidate, SurfaceGap, Requested, Dealt, /*bDirect*/ false);
+
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[Roxie] rocket SPLASH on %s: gap %.1f uu of %.0f -> %.1f asked, %.1f dealt."),
+			*GetNameSafe(Candidate), SurfaceGap, BlastRadius, Requested, Dealt);
+	}
 }
 
 void ATraceRoxieRocket::InitialiseFlight(UTraceAbilitySetRoxie* InOwnerSet, const FVector& InOrigin,
@@ -734,36 +871,44 @@ void ATraceRoxieRocket::ApplyVisualSize()
 	}
 
 	// *** DEMO 17 item 3: "the model gets BIGGER so it is easy to see."
-	// *** PATCH 28 item 1: "Make Roxie's rocket larger." RoxieRocketVisualScale 1.0 -> 1.6. ***
+	// *** PATCH 28 item 1: "Make Roxie's rocket larger." A x1.6 multiplier, 45 uu hit -> 72 uu model.
+	// *** DEMO 29 item 7: "Make Roxie's rocket hit radius match the model." ONE NUMBER, at 72 uu. ***
 	//
-	// The size is DERIVED FROM THE HIT RADIUS rather than being a second free number, and that is the
-	// whole point of this function. The rocket kills anything whose capsule comes within
-	// RoxieRocketHitRadiusUU of the path; drawing a 13 uu dart around a 45 uu touch radius meant the
-	// thing a player was dodging was three and a half times wider than the thing they could see — which
-	// is the "the lethal volume is not the drawn volume" defect this project already spent a pass
-	// removing from the ribbon.
+	// The three requests are one story and it is worth carrying whole, because the middle step is the
+	// mistake. Demo 17 replaced a fixed 13 uu dart with the 45 uu touch radius, which made the model
+	// the size of the hit for the first time. Patch 28 asked for bigger and got it the cheap way — a
+	// multiplier on the DRAWN side only — so the picture grew to 72 uu and the projectile stayed at 45.
+	// The old code justified that gap at length (the rocket kills a pawn whose 34 uu capsule comes
+	// within the touch radius, so 72 < 45+34 = 79 and the skin still "under-claimed"), and the argument
+	// was airtight and still wrong in the way that matters: the owner played it and said the hit radius
+	// did not match the model.
 	//
-	// *** THE BODY IS NOW WIDER THAN THE TOUCH RADIUS, DELIBERATELY, AND HERE IS WHY THAT IS STILL
-	// *** DRAWN == LETHAL. *** The touch radius is not the volume a PLAYER is killed in: the body test
-	// below (ApplyRocketDamageTo's segment-vs-segment) compares against HitRadius + the victim's own
-	// CAPSULE RADIUS, which is 45 + 34 = 79 uu at the shipped numbers. A 72 uu drawn body is inside
-	// that, so the ember shape a player watches still cannot claim a kill the rocket does not have.
-	// 79/45 = 1.76 is the ceiling on RoxieRocketVisualScale and Trace.Roxie.RocketFlightTest asserts
-	// it against the LIVE capsule, so a capsule or hit-radius retune moves the ceiling with it.
+	// So there is no multiplier any more. GetVisualRadiusUU() IS GetHitRadiusUU(), which means:
+	//   * the ember shape a player watches is the projectile that touches them;
+	//   * the sphere that sweeps for geometry is the same radius as the drawn nose, so the rocket no
+	//     longer detonates 27 uu before its own cone reaches a wall (or, at the old numbers, sails 27 uu
+	//     of visible cone into one);
+	//   * the RocketBurst is drawn at this radius too, because ATraceFxBurst reads the same knob, and
+	//     since Demo 29 that radius is also the blast's falloff radius — so the explosion a player sees
+	//     is the explosion that hurt them.
+	// "Make it bigger" is still one edit, RoxieRocketHitRadiusUU, and now it correctly makes the
+	// dangerous part bigger as well as the picture.
 	//
-	// The one place drawn and lethal genuinely differ is the WORLD sweep, which is a 45 uu sphere: a
-	// 72 uu cone touches a wall about 27 uu before that sphere does. Harmless direction, stated on the
-	// knob, not a second literal — both numbers still come from GetVisualRadiusUU / GetHitRadiusUU.
-	//
-	// RoxieRocketVisualScale is the tuning dial on top of that; 1.0 would be "draw the touch radius".
-	// /Engine/BasicShapes/Cone is 100 uu across and 100 uu tall, so a scale of 1 is 100 uu.
-	// ONE READ, and every other piece of the rocket's presentation is a fraction of the same number
-	// (see TraceRoxieRocket::GetVisualRadiusUU). This used to multiply the two knobs inline; it now
-	// asks the accessor, so there is exactly one place the drawn size is decided.
+	// /Engine/BasicShapes/Cone is 100 uu across and 100 uu tall, hence the /100 below.
 	const float Radius = TraceRoxieRocket::GetVisualRadiusUU();
 	const float Length = Radius * TraceRoxieRocketFile::VisualLengthPerRadius;
 
 	Body->SetRelativeScale3D(FVector((Radius * 2.f) / 100.f, (Radius * 2.f) / 100.f, Length / 100.f));
+}
+
+float ATraceRoxieRocket::GetDrawnBodyRadiusUU() const
+{
+	// READ BACK OFF THE LIVE COMPONENT, through the inverse of the conversion ApplyVisualSize used —
+	// the same route DebugDescribeFx takes. Re-deriving it from the knob would be checking a function
+	// against itself and would pass on a build where ApplyVisualSize never ran at all.
+	return (Body != nullptr)
+		? (Body->GetComponentScale().X * UTraceFxShapes::BasicShapeExtentUU * 0.5f)
+		: 0.f;
 }
 
 void ATraceRoxieRocket::UpdateVisual(const FVector& AtPosition)
@@ -1002,18 +1147,32 @@ void ATraceRoxieRocket::TickFlightAuthority(const FVector& FromPosition, const F
 			break;   // the wall is in front of this body; the rocket never reaches them
 		}
 
-		const float Dealt = Roxie->ApplyRocketDamageTo(Entry.Victim);
+		// *** THIS IS THE DIRECT IMPACT, AND IT IS THE ONLY PLACE THE FULL 100 IS DEALT. ***
+		//
+		// DEMO 29 item 7 needed "direct impact" to mean something, and this is the definition it got:
+		// THE PROJECTILE ACTUALLY HIT THE PAWN. Not "the explosion was near them" — the swept path of
+		// the rocket's own body came within GetHitRadiusUU() of their capsule, which is the sweep
+		// result the loop above computed, on live poses, on the server. Everything else in this feature
+		// is the blast (ApplySplashDamage) and falls off.
+		//
+		// That distinction is the reason the flat number survives Demo 29 intact: §2's "100 damage on
+		// impact, ANYWHERE ON THE BODY — no headshot/body distinction" is a statement about a hit, and a
+		// hit is still exactly 100 wherever on the body it lands.
+		const float Dealt = Roxie->ApplyRocketDamageTo(Entry.Victim, TraceRoxieRocket::GetDamage());
 		if (Dealt > 0.f)
 		{
 			UE_LOG(LogTraceGame, Log,
-				TEXT("[Roxie] rocket hit %s for %.0f (flat, no hit zone) after %.2fs of flight."),
+				TEXT("[Roxie] rocket DIRECT IMPACT on %s for %.0f (flat, no hit zone) after %.2fs of "
+				     "flight; everyone else in the blast falls off from here."),
 				*GetNameSafe(Entry.Victim), Dealt, GetSecondsInFlight());
 
 			// §2.3's first ending. The burst goes at the CONTACT POINT on the path — not at the
 			// victim's origin, which is between their feet — and its normal faces back down the
-			// flight line, so the shell grows out of where the rocket actually touched them.
+			// flight line, so the shell grows out of where the rocket actually touched them. It is
+			// also the centre the falloff is measured from, which is why it matters that it is the
+			// contact point and not the victim's feet.
 			const FVector Backwards = (FromPosition - ToPosition).GetSafeNormal(1.e-4f, FVector::UpVector);
-			DetonateAndDestroy(Entry.ImpactPoint, Backwards);
+			DetonateAndDestroy(Entry.ImpactPoint, Backwards, Entry.Victim, Dealt);
 			return;
 		}
 	}

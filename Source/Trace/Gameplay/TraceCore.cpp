@@ -45,6 +45,7 @@ using namespace TraceCoreLocal;
 #include "Components/SkeletalMeshComponent.h"   // spec v31 §4: SK_TraceCore
 #include "Components/StaticMeshComponent.h"
 #include "Engine/SkeletalMesh.h"                // spec v31 §4: GetImportedBounds() for the art scale
+#include "Engine/StaticMeshActor.h"             // DEMO 29 §3(a): the hand-placed centre octagon pillar
 #include "CollisionQueryParams.h"
 #include "CollisionShape.h"
 #include "Engine/Engine.h"                      // GEngine->GetWorldContexts() (Trace.ModeB.CoreProbe)
@@ -211,6 +212,165 @@ namespace TraceCoreFile
 
 		Last = Second;
 		TraceAudio::PlayLocal2D(Core, TraceSoundEvents::CountdownTick);
+	}
+
+	// =============================================================================================
+	// DEMO 29 §3(a) — FINDING THE OCTAGON
+	//
+	// "the newly added pillar which lies in the middle of the map". It is a hand-placed
+	// AStaticMeshActor in Arena_Baked wearing /Game/Trace/Art/Pack/MapGeometry/SM_KitOctagon, one of
+	// the collaborator's centre-kit pieces that Scripts/theme_center_kit.py labels Kit_Octagon_01 and
+	// tags TraceCenterKit. It is NOT a Trace class, it has no component the code can ask, and it can
+	// be dragged anywhere at any time.
+	//
+	// SO IT IS IDENTIFIED BY ITS MESH, WHICH IS THE ONLY THING ABOUT IT THAT SURVIVES A COOK.
+	// The actor LABEL does not: AActor::GetActorLabel is WITH_EDITOR only, so a name test would work
+	// in the editor and quietly fail in the shipped game, which is the worst of the available
+	// failures. The mesh asset's name is a runtime fact on every configuration. The TraceCenterKit
+	// tag is checked too — Tags DO survive a cook — but only as a tie-break, because a re-authored
+	// map may skip the script that adds it.
+	//
+	// AND IT IS THE ONE NEAREST THE MIDDLE. "lies in the middle of the map" is part of the
+	// description, so a second octagon dropped in a corner as scenery cannot become the kickoff spot:
+	// candidates outside the middle band of the field are refused by name in the log rather than
+	// silently ignored.
+	// =============================================================================================
+
+	/** Actor tag Scripts/theme_center_kit.py stamps on every centre-kit piece. */
+	static const FName CentreKitTag(TEXT("TraceCenterKit"));
+
+	/** True when @p Mesh is one of the octagon pillar's meshes, pre- or post-rename. */
+	static bool IsOctagonMesh(const UStaticMesh* MeshAsset)
+	{
+		if (MeshAsset == nullptr)
+		{
+			return false;
+		}
+
+		// Substring, case-insensitive, on the ASSET name: SM_KitOctagon today, plain "octagon" on any
+		// checkout older than W5-MAPFINISH's rename pass, and anything an author calls the same shape
+		// tomorrow. Matching the name rather than a hard asset path is what lets the map be
+		// re-authored without a code change.
+		return MeshAsset->GetName().Contains(TEXT("octagon"), ESearchCase::IgnoreCase);
+	}
+
+	/**
+	 * The centre octagon pillar in @p World, or null.
+	 *
+	 * @param Arena  used only to know where the middle of the field is and how big it is. Null is
+	 *               tolerated: with no arena every candidate is accepted and the nearest to the world
+	 *               origin wins, which is what a bare test map wants.
+	 */
+	AActor* FindCentrePillar(const UWorld* World, const ATraceArenaBuilder* Arena)
+	{
+		if (World == nullptr)
+		{
+			return nullptr;
+		}
+
+		FVector FieldCentre = FVector::ZeroVector;
+		double MaxOffsetX = TNumericLimits<double>::Max();
+		double MaxOffsetY = TNumericLimits<double>::Max();
+
+		if (Arena != nullptr)
+		{
+			const FBox Field = Arena->GetFieldBounds();
+			if (Field.IsValid != 0)
+			{
+				FieldCentre = Field.GetCenter();
+
+				// THE MIDDLE BAND. Half the field's half-length either side of the centre line, and
+				// most of its width: generous enough that a designer nudging the pillar off centre
+				// keeps it, tight enough that a decorative octagon in an end pocket cannot win.
+				MaxOffsetX = Field.GetExtent().X * 0.5;
+				MaxOffsetY = Field.GetExtent().Y * 0.9;
+			}
+		}
+
+		AActor* Best = nullptr;
+		double BestDistSq = TNumericLimits<double>::Max();
+		int32 Considered = 0;
+		int32 RefusedOffCentre = 0;
+
+		for (TActorIterator<AStaticMeshActor> It(const_cast<UWorld*>(World)); It; ++It)
+		{
+			AStaticMeshActor* Candidate = *It;
+			if (!IsValid(Candidate))
+			{
+				continue;
+			}
+
+			const UStaticMeshComponent* MeshComponent = Candidate->GetStaticMeshComponent();
+			const UStaticMesh* MeshAsset = (MeshComponent != nullptr) ? MeshComponent->GetStaticMesh() : nullptr;
+
+			// THE MESH ALONE DECIDES. The centre-kit tag is not an AND here and must not become one:
+			// the four ramps and the four platforms wear it too, so it cannot select the pillar, and a
+			// map re-authored without Scripts/theme_center_kit.py would have the mesh and not the tag.
+			// It is read below only to say, in the log, whether this placement came from that pass.
+			if (!IsOctagonMesh(MeshAsset))
+			{
+				continue;
+			}
+
+			++Considered;
+
+			const FVector Location = Candidate->GetActorLocation();
+			const double OffsetX = FMath::Abs(Location.X - FieldCentre.X);
+			const double OffsetY = FMath::Abs(Location.Y - FieldCentre.Y);
+			if (OffsetX > MaxOffsetX || OffsetY > MaxOffsetY)
+			{
+				++RefusedOffCentre;
+				UE_LOG(LogTraceGame, Verbose,
+					TEXT("[Core] DEMO 29 §3(a): '%s' wears an octagon mesh but sits %.0f/%.0f uu off the ")
+					TEXT("field centre (band %.0f/%.0f); not the middle pillar."),
+					*GetNameSafe(Candidate), OffsetX, OffsetY, MaxOffsetX, MaxOffsetY);
+				continue;
+			}
+
+			const double DistSq = FVector::DistSquaredXY(Location, FieldCentre);
+			if (DistSq < BestDistSq)
+			{
+				BestDistSq = DistSq;
+				Best = Candidate;
+			}
+		}
+
+		if (Considered > 1 || RefusedOffCentre > 0)
+		{
+			UE_LOG(LogTraceGame, Log,
+				TEXT("[Core] DEMO 29 §3(a): %d octagon-mesh actors in this level (%d refused as off ")
+				TEXT("centre); '%s' is the middle one and the Core starts on it."),
+				Considered, RefusedOffCentre, *GetNameSafe(Best));
+		}
+		else if (Best != nullptr)
+		{
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("[Core] DEMO 29 §3(a): centre pillar '%s'%s."),
+				*GetNameSafe(Best),
+				Best->ActorHasTag(CentreKitTag) ? TEXT(", tagged TraceCenterKit") : TEXT(""));
+		}
+
+		return Best;
+	}
+
+	/**
+	 * The pawn capsule's radius, read off the class default object.
+	 *
+	 * ATraceArenaBuilder sizes the whole arena off this same capsule (see its PlayerHeightUU), and
+	 * the post-goal spawn has to keep pace with it: the number is a term in "how far in front of the
+	 * goal is clear of the ramp", so a typed constant here would go stale the moment the pawn was
+	 * resized. TraceCharacterLayout is private to Source/Trace/Core, so the CDO is the seam.
+	 */
+	float GetPawnCapsuleRadius()
+	{
+		static const float Cached = []() -> float
+		{
+			const ATraceCharacter* CDO = ATraceCharacter::StaticClass()->GetDefaultObject<ATraceCharacter>();
+			const UCapsuleComponent* Capsule = (CDO != nullptr) ? CDO->GetCapsuleComponent() : nullptr;
+			return (Capsule != nullptr) ? FMath::Max(1.f, Capsule->GetUnscaledCapsuleRadius()) : 34.f;
+		}();
+
+		return Cached;
 	}
 }
 
@@ -4477,6 +4637,13 @@ void ATraceCore::ReleaseHolder()
 
 void ATraceCore::KickoffTo(ETraceTeam ReceivingTeam)
 {
+	// The destination has been the arena centre since the class existed; DEMO 29 §3 gave the other
+	// entry point (KickoffContested) a destination of its own, so the two now share one body.
+	KickoffAt(GetHomeLocation(), ReceivingTeam, TEXT("kickoff"));
+}
+
+void ATraceCore::KickoffAt(const FVector& Where, ETraceTeam ReceivingTeam, const TCHAR* Why)
+{
 	if (!HasAuthority())
 	{
 		return;
@@ -4511,7 +4678,7 @@ void ATraceCore::KickoffTo(ETraceTeam ReceivingTeam)
 	// site is "kickoff, centre reset, half-time, match start" — four of the six paths §10 lists.
 	// ServerTeleport is what puts the destination on the wire; before it, this was a bare
 	// SetActorLocation and the clients were left holding a Core in the endzone.
-	ServerTeleport(GetHomeLocation(), TEXT("kickoff"));
+	ServerTeleport(Where, TEXT("kickoff"));
 	SetActorRotation(FRotator::ZeroRotator);
 
 	OnRep_Carrier();
@@ -4519,13 +4686,291 @@ void ATraceCore::KickoffTo(ETraceTeam ReceivingTeam)
 
 	if (bOutOfPlay)
 	{
-		UE_LOG(LogTraceGame, Log, TEXT("Core: parked out of play (no holder)."));
+		UE_LOG(LogTraceGame, Log, TEXT("Core: parked out of play (no holder) at %s (%s)."),
+			*Where.ToCompactString(), Why);
 	}
 	else
 	{
-		UE_LOG(LogTraceGame, Log, TEXT("Core: kickoff queued for %s in %.1fs"),
-			*TraceTeamName(PendingGrantTeam).ToString(), TraceCoreTuning::KickoffDelaySeconds);
+		UE_LOG(LogTraceGame, Log, TEXT("Core: kickoff queued for %s in %.1fs at %s (%s)"),
+			*TraceTeamName(PendingGrantTeam).ToString(), TraceCoreTuning::KickoffDelaySeconds,
+			*Where.ToCompactString(), Why);
 	}
+}
+
+// =================================================================================================
+// DEMO 29 §3 — the contested kickoff, and where its two spawns are
+//
+// Read the block on KickoffContested in TraceCore.h first. In one line: the Core is no longer HANDED
+// to a team at a restart, it is PUT somewhere and left to be retrieved, and after a goal the side
+// that scored may not go and get it.
+// =================================================================================================
+
+void ATraceCore::KickoffContested(const FVector& SurfacePoint, ETraceTeam LockedOutTeam,
+	ETraceTeam FavouredTeam, const TCHAR* Why)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	// The Core rests ON the surface: its centre is one collision radius above it, which is exactly
+	// what ServerProbeRestingSurface sweeps with, so the ball the players see is touching the deck
+	// and the at-rest probe agrees with them. Callers hand over the FACE and never have to know how
+	// big the ball is — the same division of labour the arena's other placements use.
+	const FVector Where = SurfacePoint + FVector(0.0, 0.0, static_cast<double>(TraceModeBTuning::CollisionRadius));
+
+	// --- MODE A HAS NO LOOSE CORE, SO IT GETS THE PLACEMENT AND NOT THE CONTEST. ------------------
+	//
+	// In mode A (endzones) the Core is a possession STATUS that never lies on the ground: bLoose is
+	// normalised back to false by OnScoringModeChanged the moment it is set, and ServerTickLooseCore
+	// refuses to integrate. So "climb up and take it" is not a thing that can happen there. The half
+	// still starts with the Core on the octagon — the visible half of the owner's rule holds in both
+	// modes — and it is granted exactly as it always was. The shipped default is mode B
+	// (DefaultGame.ini, ScoringMode=ThrownCoreAndGoals), which is the mode the rule was written for.
+	if (!IsModeB())
+	{
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[Core] DEMO 29 §3: mode A has no loose Core, so this kickoff (%s) is placed at %s and ")
+			TEXT("granted to %s as before."),
+			Why, *Where.ToCompactString(), *TraceTeamName(FavouredTeam).ToString());
+
+		KickoffAt(Where, FavouredTeam, Why);
+		return;
+	}
+
+	// Everything a kickoff has always done to the OUTGOING possession, in the same order KickoffAt
+	// does it: end the pass, take the Core off its holder (which stops their trail and clears the
+	// carrier mirror), then discard any flight in progress. Only then is it safe to flip to loose —
+	// doing it the other way round leaves ReleaseHolder's DetachFromActor snapping the Core back onto
+	// the holder's transform, which is the bug ThrowFromHolder's own ordering note warns about.
+	CancelPass(nullptr);
+	ReleaseHolder();
+
+	if (bLoose)
+	{
+		ClearLooseState();
+	}
+
+	// UNCONDITIONALLY, not only on the loose path above. A window cannot outlive a possession today
+	// (every route that takes a loose Core runs ClearLooseState, which clears it), but "cannot happen"
+	// is the class of invariant a later edit breaks silently — and the failure here would be a fresh
+	// half opening with a five-second lockout inherited from the last one, which is invisible until
+	// somebody complains that they could not pick the Core up at kickoff. Costs one early-out when
+	// there is nothing to clear.
+	ClearTurnover(TEXT("a contested kickoff supersedes it"));
+
+	// A queued death fallback is superseded too. It is resolved from Tick's non-loose branch, which
+	// this placement is about to skip past for as long as the Core stays on its spot; leaving it armed
+	// would let a death that happened before the whistle hand the Core to a team afterwards.
+	bFallbackQueued = false;
+	FallbackTeam = ETraceTeam::None;
+
+	// Nobody threw it, so there is nobody to award it to on a landing and nobody to deny the grace
+	// to on a pickup. LooseFromTeam = None makes TakeLooseCore call the take a RECOVERY for whoever
+	// gets there first, which is the honest description of retrieving a ball off a pillar.
+	LooseFromTeam = ETraceTeam::None;
+	LastCarrierGoalTestLocation = FVector::ZeroVector;
+
+	// Not "out of play": play is on and the Core is on the field. bOutOfPlay is the half-time /
+	// post-match state and must stay clear, or Tick's out-of-play recovery would force a grant
+	// fifteen seconds in and undo the whole rule.
+	bOutOfPlay = false;
+	PendingGrantTeam = ETraceTeam::None;
+	PendingGrantTime = 0.f;
+	TraceCoreFile::ResetKickoffCountdown(this);
+
+	const float Now = GetServerTimeSeconds();
+
+	bLoose = true;
+	bLooseAtRest = true;          // It is placed on a surface, not dropped onto one.
+	bLooseFromThrow = false;      // Spec v6 §4.2's landing turnover is about THROWS; this is not one.
+	bTurnoverRegisteredThisFlight = false;
+	CatchZoneTarget = nullptr;
+	bCatchZoneContested = false;
+	ForgetLastContact();
+	ClearPendingTurnover();
+	LooseThrower = nullptr;
+	LooseStartServerTime = Now;
+	LooseLocation = Where;
+	LooseVelocity = FVector::ZeroVector;
+
+	bContestedKickoff = true;
+	ContestedFallbackTeam = FavouredTeam;
+
+	// SPEC v10 §10's funnel, for the same reason a throw uses it: this is a discontinuity, and a
+	// client that is not TOLD keeps drawing the Core wherever its own copy happened to be.
+	ServerTeleport(Where, Why);
+	SetActorRotation(FRotator::ZeroRotator);
+
+	// The Core belongs to nobody, so it must be visible to everybody — including whoever was carrying
+	// it a frame ago, for whom it was hidden by bOwnerNoSee through the owner chain ReleaseHolder has
+	// just cleared.
+	ApplyAttachment();
+	UpdateVisuals();
+	OnRep_Carrier();
+	ForceNetUpdate();
+
+	// --- THE LOCKOUT, AND IT IS SPEC v25 §2's, NOT A NEW ONE. -------------------------------------
+	//
+	// After the loose state is set, never before: ClearLooseState() above clears any window that was
+	// open, and RegisterTurnover writes LooseLocation and bLooseAtRest itself, so it has to run on the
+	// Core it is describing. Registered against the team that SCORED, which is the same shape of
+	// sentence as "the team that threw it away" — they lost the right to contest it for the window.
+	if (LockedOutTeam != ETraceTeam::None)
+	{
+		RegisterTurnover(LockedOutTeam, Where, Why);
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Core] DEMO 29 §3: contested kickoff (%s) — the Core rests at %s, held by nobody. ")
+		TEXT("Locked out: %s%s. Backstop: %s after %.0fs."),
+		Why, *Where.ToCompactString(),
+		(LockedOutTeam == ETraceTeam::None) ? TEXT("nobody, both teams may take it")
+										    : *TraceTeamName(LockedOutTeam).ToString(),
+		(LockedOutTeam == ETraceTeam::None) ? TEXT("")
+										    : *FString::Printf(TEXT(" for %.1fs"), GetTurnoverLockoutSeconds()),
+		*TraceTeamName(FavouredTeam).ToString(), TraceCoreTuning::ContestedKickoffBackstopSeconds);
+}
+
+FVector ATraceCore::GetHalfStartCoreSurface(const UWorld* World, AActor** OutPillar)
+{
+	if (OutPillar != nullptr)
+	{
+		*OutPillar = nullptr;
+	}
+
+	const ATraceArenaBuilder* Arena = (World != nullptr) ? ATraceArenaBuilder::Get(World) : nullptr;
+
+	// The fallback, resolved first so every early return has one: exactly where the Core started
+	// before DEMO 29 §3 — the placed ATraceCoreSpawn marker if the level has one, otherwise the top
+	// of the centre pedestal. Already a Core CENTRE rather than a surface, so the caller's radius is
+	// backed off it to keep this function's contract ("a face to rest on") true for both answers.
+	const FVector Fallback = (Arena != nullptr)
+		? (Arena->GetCoreSpawnLocation() - FVector(0.0, 0.0, static_cast<double>(TraceModeBTuning::CollisionRadius)))
+		: FVector::ZeroVector;
+
+	if (World == nullptr)
+	{
+		return Fallback;
+	}
+
+	AActor* Pillar = TraceCoreFile::FindCentrePillar(World, Arena);
+	if (Pillar == nullptr)
+	{
+		// NOT AN ERROR, and it must not read as one: the procedural arena has no kit at all, and a
+		// re-authored map may name its centre piece something else. Log at Warning rather than Error
+		// because the rule the owner asked for silently does not apply here, which is worth seeing in
+		// a capture log, and then behave exactly as the build before this one did.
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Core] DEMO 29 §3(a): no centre octagon pillar in this level — the half-start Core ")
+			TEXT("falls back to the arena's own spawn point at %s. Nothing to climb."),
+			*Fallback.ToCompactString());
+		return Fallback;
+	}
+
+	if (OutPillar != nullptr)
+	{
+		*OutPillar = Pillar;
+	}
+
+	const FBox Bounds = Pillar->GetComponentsBoundingBox(/*bNonColliding=*/true);
+	if (!Bounds.IsValid)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Core] DEMO 29 §3(a): '%s' has no bounds to stand the Core on; falling back to %s."),
+			*GetNameSafe(Pillar), *Fallback.ToCompactString());
+		return Fallback;
+	}
+
+	const FVector Centre = Bounds.GetCenter();
+	FVector Surface(Centre.X, Centre.Y, Bounds.Max.Z);
+
+	// THE BOUNDING BOX IS THE BROAD PHASE, NOT THE ANSWER. A rotated or domed pillar has a box lid
+	// well above anything a player could stand on, and the Core would hang in the air over it. Probe
+	// straight down onto the pillar's own geometry and take the face that is actually there; the box
+	// lid is only used when the probe finds nothing, which on a solid octagon it cannot.
+	{
+		const double Height = FMath::Max(1.0, Bounds.GetSize().Z);
+		const FVector From = Surface + FVector(0.0, 0.0, 200.0);
+		const FVector To = Surface - FVector(0.0, 0.0, Height + 200.0);
+
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceCoreOctagonDeck), /*bTraceComplex=*/false);
+
+		FHitResult Hit;
+		if (World->LineTraceSingleByChannel(Hit, From, To, ECC_Visibility, Params)
+			&& Hit.GetActor() == Pillar)
+		{
+			Surface.Z = Hit.ImpactPoint.Z;
+		}
+	}
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[Core] DEMO 29 §3(a): the half-start Core rests on '%s' at %s — deck %.0f uu above the ")
+		TEXT("pillar's base (%.0f uu of climb from the field floor), on a deck %.0f x %.0f uu across."),
+		*GetNameSafe(Pillar), *Surface.ToCompactString(),
+		Surface.Z - Bounds.Min.Z,
+		(Arena != nullptr) ? (Surface.Z - Arena->GetFieldBounds().Min.Z) : Surface.Z,
+		Bounds.GetSize().X, Bounds.GetSize().Y);
+
+	return Surface;
+}
+
+FVector ATraceCore::GetPostGoalCoreSurface(const UWorld* World, float DefendedEndSign)
+{
+	const ATraceArenaBuilder* Arena = (World != nullptr) ? ATraceArenaBuilder::Get(World) : nullptr;
+	if (Arena == nullptr)
+	{
+		// No arena to ask. The centre is the only point that is certainly on the field.
+		return FVector::ZeroVector;
+	}
+
+	const float Sign = (DefendedEndSign < 0.f) ? -1.f : 1.f;
+
+	// IN FRONT OF THE GOAL = the mirror of the near edge of the spawn band behind it. The hoop's own
+	// face, plus the run-up ramp that leans on it, plus a capsule diameter so the Core is on flat
+	// floor rather than balanced on the foot of the slope — the same three terms, in the same order,
+	// that ATraceArenaBuilder::GetSpawnLineX() adds on the pocket side. Reproducing the ARGUMENT and
+	// not the number is what keeps the two symmetric when the goal is retuned.
+	const double PawnDiameter = 2.0 * static_cast<double>(TraceCoreFile::GetPawnCapsuleRadius());
+	const double Inset = static_cast<double>(Arena->GoalRingHalfThickness())
+		+ static_cast<double>(Arena->GoalRampRun())
+		+ PawnDiameter;
+
+	const double PlaneX = static_cast<double>(Arena->GetGoalPlaneX());
+
+	// Clamped so a silly goal geometry cannot push the spawn past the halfway line and into the other
+	// team's half, which would be the opposite of the rule.
+	const double FrontX = FMath::Max(PlaneX - Inset, PlaneX * 0.25);
+
+	// Y is the goal's own centre line, which is the arena's, and Z is resolved by the floor probe
+	// below - the local point starts on the nominal deck.
+	const FVector Local(Sign * FrontX, 0.0, 0.0);
+	FVector Surface = Arena->GetActorTransform().TransformPosition(Local);
+
+	// THE FLOOR IS PROBED, NOT ASSUMED. Local Z 0 is the arena's nominal deck, and a baked map may
+	// have anything under this point - a tread, a repainted floor slab, a ramp skirt. Take what is
+	// actually there so the Core rests on it instead of hovering over it or sinking into it.
+	if (World != nullptr)
+	{
+		const FVector From = Surface + FVector(0.0, 0.0, 600.0);
+		const FVector To = Surface - FVector(0.0, 0.0, 600.0);
+
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceCoreGoalFrontFloor), /*bTraceComplex=*/false);
+
+		FHitResult Hit;
+		if (World->LineTraceSingleByChannel(Hit, From, To, ECC_Visibility, Params))
+		{
+			Surface.Z = Hit.ImpactPoint.Z;
+		}
+	}
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[Core] DEMO 29 §3(b): the post-goal Core rests at %s — %.0f uu out from the goal plane ")
+		TEXT("at |X| %.0f, clear of the hoop face (%.0f) and its ramp (%.0f)."),
+		*Surface.ToCompactString(), PlaneX - FrontX, PlaneX,
+		Arena->GoalRingHalfThickness(), Arena->GoalRampRun());
+
+	return Surface;
 }
 
 void ATraceCore::ResolveFallback(ETraceTeam LostTeam)
@@ -6569,6 +7014,40 @@ void ATraceCore::ServerTickLooseCore(float DeltaSeconds)
 	if (bOutOfWorld)
 	{
 		ResetLooseCore(TEXT("left the field"));
+		return;
+	}
+
+	// --- DEMO 29 §3. A KICKOFF CORE IS SUPPOSED TO BE LYING THERE. --------------------------------
+	//
+	// The reset timer below is a rescue for a THROW nobody collected, and it counts from the moment
+	// the Core went loose. For a contested kickoff that moment is the whistle, before anybody has
+	// taken a step — so at the shipped 12 s it would sweep the Core off the octagon and hand it to a
+	// team every half, which is exactly the mechanic the owner asked for, deleted. The rescue itself
+	// is not deleted, only lengthened and re-aimed: see ContestedKickoffBackstopSeconds, and note
+	// that the out-of-world check above still runs on this Core like any other.
+	if (bContestedKickoff)
+	{
+		const float Backstop = TraceCoreTuning::ContestedKickoffBackstopSeconds;
+		if (Backstop > 0.f && !IsTurnoverActive() && (Now - LooseStartServerTime) >= Backstop)
+		{
+			// The team recorded when it was placed — the half's kickoff team, or the team that was
+			// scored on. NOT the opposite of LooseFromTeam, which ResetLooseCore would use: nobody
+			// threw this one, so there is no side to punish for wasting a possession.
+			const ETraceTeam Owed = (ContestedFallbackTeam != ETraceTeam::None)
+				? ContestedFallbackTeam
+				: TraceCoreTuning::DefaultKickoffTeam;
+
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Core] DEMO 29 §3: nobody retrieved the Core from %s in %.0fs — granting it to %s ")
+				TEXT("so play continues. If this keeps firing the kickoff spot is unreachable and the ")
+				TEXT("LEVEL is the bug, not this rule."),
+				*FVector(LooseLocation).ToCompactString(), Backstop, *TraceTeamName(Owed).ToString());
+
+			ClearLooseState();          // clears bContestedKickoff with it — see that function
+			LooseFromTeam = ETraceTeam::None;
+			KickoffTo(Owed);
+		}
+
 		return;
 	}
 

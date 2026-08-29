@@ -45,7 +45,15 @@ enum class ETraceCharacterPickResult : uint8;
 UENUM()
 enum class ECoreKickoffMode : uint8
 {
-	/** Kickoff to the team that was scored on, at their own endzone. The shipped assumption. */
+	/**
+	 * The restart favours the team that was scored on, at their own end. The shipped assumption.
+	 *
+	 * DEMO 29 §3 CHANGED WHAT "FAVOURS" MEANS AND THE NAME NO LONGER READS QUITE RIGHT. It used to
+	 * GRANT the Core to that team. It now SPAWNS it on the floor in front of the goal they just
+	 * conceded, held by nobody, with the scoring team locked out of it for the reset window — so the
+	 * conceding side still gets it, but by walking onto it (or pulling it) rather than by having it
+	 * appear in somebody's hands. See ATraceGameMode::KickoffCoreAfterGoal.
+	 */
 	ScoredOnTeam = 0,
 	/** Strict alternation regardless of who scored, starting from the team that kicked off the half. */
 	AlternateTeams = 1,
@@ -237,6 +245,33 @@ public:
 
 	/** Called by ATraceEndzone when a carrier reaches the opposing endzone. */
 	void NotifyScored(ETraceTeam ScoringTeam);
+
+	// --- DEMO 29 §3. The Core is RETRIEVED at a restart, not handed out. --------------------------
+	//
+	// Two functions because the owner's note describes two different restarts, and conflating them is
+	// the mistake they are shaped to prevent: a half starts CONTESTED at the centre, a goal restarts
+	// with the conceding team favoured at their own end. Both funnel into
+	// ATraceCore::KickoffContested, which is where the placement, the lockout and the replication
+	// live; these two decide only WHERE and WHO.
+	//
+	// PUBLIC, ALONGSIDE NotifyScored, AND FOR THE SAME REASON. They are match-flow entry points, and
+	// Trace.Core.KickoffProbe drives THESE rather than re-deriving "which end, which team" for
+	// itself — a verification that computed its own expected answer would agree with itself forever.
+
+	/**
+	 * Half start (either half). Puts the Core on top of the centre octagon, held by nobody, with no
+	 * team locked out — both sides climb for it.
+	 *
+	 * @p HalfIndex is read only for the mode-A fallback and the log: with no loose Core to leave
+	 * lying about, mode A still grants to GetKickoffTeamForHalf() exactly as it always did.
+	 */
+	void KickoffCoreForHalf(int32 HalfIndex);
+
+	/**
+	 * After a goal. Puts the Core on the floor in front of the goal the team @p ScoringTeam just
+	 * scored in defends, and locks @p ScoringTeam out of it for the reset window.
+	 */
+	void KickoffCoreAfterGoal(ETraceTeam ScoringTeam);
 
 	/**
 	 * Server: award a point if @p InCharacter is the Core carrier RIGHT NOW and is standing inside an
@@ -598,8 +633,12 @@ protected:
 	// --- Halves ------------------------------------------------------------------------------
 
 	/**
-	 * Starts period @p HalfIndex: assigns sides, resets the field, restarts the clock and hands the
-	 * Core to whichever team kicks off this half. Idempotent enough to be safe from a timer.
+	 * Starts period @p HalfIndex: assigns sides, resets the field, restarts the clock and puts the
+	 * Core on top of the centre octagon for both teams to climb for. Idempotent enough to be safe
+	 * from a timer.
+	 *
+	 * IT NO LONGER HANDS THE CORE TO ANYBODY — DEMO 29 §3(a) replaced the grant with a placement.
+	 * See KickoffCoreForHalf().
 	 */
 	void BeginHalf(int32 HalfIndex);
 
@@ -678,7 +717,15 @@ protected:
 	/** Sides for @p HalfIndex: Blue on -X in odd halves, swapped in even ones. */
 	ETraceTeam GetNegativeSideTeamForHalf(int32 HalfIndex) const;
 
-	/** The team the Core is granted to at the start of @p HalfIndex (FirstHalfCoreTeam, alternating). */
+	/**
+	 * The team associated with the start of @p HalfIndex (FirstHalfCoreTeam, alternating).
+	 *
+	 * DEMO 29 §3 DEMOTED THIS FROM A RULE TO A FALLBACK, and the old comment ("the team the Core is
+	 * granted to") is no longer true in the shipped mode. A half now starts with the Core on top of
+	 * the octagon and NOBODY holding it — the owner's rule is that teams climb for it. This answer is
+	 * still what mode A grants to (mode A has no loose Core to climb for), what the contested kickoff
+	 * falls back to if nobody reaches the deck at all, and what the half-start log line names.
+	 */
 	ETraceTeam GetKickoffTeamForHalf(int32 HalfIndex) const;
 
 	/**
@@ -710,6 +757,7 @@ protected:
 
 	/** Kicks off to @p Team: the Core is released and granted to one of their living players. */
 	void GrantCoreToTeam(ETraceTeam Team);
+
 
 	// --- Wipe bonus (spec §1) ------------------------------------------------------------------
 

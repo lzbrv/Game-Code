@@ -33,6 +33,18 @@ Stdlib only (wave, struct, math, random, array) -- runs on any machine that can
 run import_sounds.py.  No engine, no Content/ writes: Wave-2's W2-AUDIOBANK owns
 the import and the C++ event-table rows.
 
+DEMO 29, and it matters when reading this table: three of the stems below --
+DeathBurst, CountdownTick and CountdownGo -- are still rendered, still imported
+and still resolvable, but are UNWIRED in TraceSoundEvents::Unwired() and do not
+sound in a match.  Nothing here changes for them; re-render and re-import work
+exactly as before, and `Trace.Audio.UnwiredEvents 0` makes them audible again.
+The reasons are on the unwire list in Source/Trace/Audio/TraceSoundEvents.cpp.
+
+The 28 pre-existing stems in EXISTING_STEMS below (Kill among them) have never
+been written by this script and the collision check is what guarantees it -- see
+Demo 29 item 9, where "the kill sound changed" turned out to be a NEW event
+playing over the top rather than Kill.wav being touched.
+
 Usage:
   python3 Scripts/generate_sounds.py            # render all 43 WAVs
   python3 Scripts/generate_sounds.py --only LilyZip

@@ -49,6 +49,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Engine/EngineTypes.h"        // FTimerHandle (DEMO 29 §3's Trace.Core.KickoffProbe)
 #include "Engine/NetSerialization.h"   // FVector_NetQuantizeNormal
 #include "GameFramework/Actor.h"
 #include "TraceTypes.h"
@@ -470,20 +471,127 @@ public:
 	void GrantTo(ATraceCharacter* NewHolder, ETraceCoreGrantReason Reason);
 
 	/**
-	 * Server. Drops possession and queues a kickoff to @p ReceivingTeam after a short delay.
+	 * Server. Drops possession, parks the Core at home, and queues a grant to @p ReceivingTeam after
+	 * a short delay.
 	 *
-	 * The delay exists because every caller (a score, match start, half time) teleports ten pawns
-	 * immediately afterwards; granting first would lay a trace across the teleport.
+	 * The delay exists because the callers that grant teleport ten pawns immediately afterwards;
+	 * granting first would lay a trace across the teleport.
 	 *
 	 * ETraceTeam::None means OUT OF PLAY: park the Core at the centre, holderless, and grant it to
 	 * nobody. That is what a half-time interval and a finished match need, and it is deliberately
 	 * the same entry point as a kickoff so ATraceGameMode has exactly one function to call.
 	 * The next KickoffTo() with a real team puts it back in play.
+	 *
+	 * DEMO 29 §3 TOOK TWO OF ITS CALLERS AWAY. A HALF START and a GOAL no longer grant the Core to
+	 * anybody — they place it and let a team go and get it, through KickoffContested() below. What
+	 * still arrives here is everything that ends play rather than restarting it (half-time interval,
+	 * match end, the practice range's rack), the mode-A arm of a contested kickoff, the loose-Core
+	 * reset, and the harnesses that drive the clear-the-trail routes directly.
 	 */
 	void KickoffTo(ETraceTeam ReceivingTeam);
 
 	/** True while the Core is deliberately out of play (see KickoffTo). */
 	bool IsOutOfPlay() const { return bOutOfPlay; }
+
+	// =============================================================================================
+	// DEMO 29 §3 — THE CORE IS RETRIEVED, NOT HANDED OUT
+	//
+	// The owner's rule, verbatim: "Ensure the core begins each half on top of the octagon, the newly
+	// added pillar which lies in the middle of the map. Teams must climb up in order to retrieve it.
+	// After a goal, the core spawns in front of the team who was scored on's goal, with the scoring
+	// team locked out."
+	//
+	// That is TWO spawns and they are deliberately not the same:
+	//
+	//   (a) HALF START. The Core rests on the TOP FACE of the centre octagon, granted to NOBODY, and
+	//       both teams race to climb it. GetHalfStartCoreSurface() answers where, and it answers by
+	//       finding the pillar rather than by holding a copy of its coordinates — move the pillar in
+	//       the level and the Core moves with it.
+	//   (b) AFTER A GOAL. The Core rests on the floor in front of the goal the CONCEDING team
+	//       defends, and the team that just scored is LOCKED OUT of it for the reset window.
+	//
+	// WHAT "LOCKED OUT" MEANS, AND WHY THERE IS NO NEW STATE MACHINE FOR IT. The project already has
+	// exactly this rule: spec v25 §2's turnover window. RegisterTurnover(DroppingTeam) refuses that
+	// team the loose Core in ServerTryLoosePickup, refuses them the pull in CanPullNow, and makes
+	// ATraceBotController::ApplyLockoutKeepOut steer their bots physically out of a radius around it.
+	// A post-goal lockout is the same sentence with "the team that just scored" in place of "the team
+	// that just threw it away", so it is registered through the same function and carried by the same
+	// five-second clock. See IsTeamLockedOutOfCore().
+	//
+	// BOTH ARE SERVER-AUTHORITATIVE AND BOTH REPLICATE. The placement rides bLoose / LooseLocation and
+	// the teleport funnel (ServerTeleport), the lockout rides TurnoverLockoutTeam /
+	// TurnoverStartServerTime. Every one of those is a replicated property written on the server and
+	// nowhere else; a client is told, never asked.
+	// =============================================================================================
+
+	/**
+	 * Server. DEMO 29 §3. Park the Core, held by nobody, ON @p SurfacePoint, and leave it there to be
+	 * RETRIEVED rather than granted.
+	 *
+	 * @param SurfacePoint    The face the Core rests on — the top of the octagon, or the floor in
+	 *                        front of a goal. The Core's own collision radius is added here, so
+	 *                        callers hand over the SURFACE and never have to know the ball's size.
+	 * @param LockedOutTeam   Refused the Core for the reset window (spec v25 §2's turnover clock).
+	 *                        ETraceTeam::None at a half start, where both teams may contest it.
+	 * @param FavouredTeam    Mode A has no loose Core at all (the Core is a possession status there),
+	 *                        so mode A parks at the same point and grants to this team exactly as it
+	 *                        always did. It is also the backstop in mode B: see
+	 *                        TraceCoreTuning::ContestedKickoffBackstopSeconds. NOT named FallbackTeam:
+	 *                        ATraceCore already has a member of that name and MSVC C4458 makes the
+	 *                        shadow a hard error on Windows, which macOS cannot even warn about.
+	 */
+	void KickoffContested(const FVector& SurfacePoint, ETraceTeam LockedOutTeam,
+		ETraceTeam FavouredTeam, const TCHAR* Why);
+
+	/**
+	 * True while the Core is lying on a DEMO 29 §3 kickoff spot waiting to be retrieved.
+	 *
+	 * Distinguishes it from a thrown Core lying on the ground, which is what the loose-Core reset
+	 * timer exists for. A kickoff Core is SUPPOSED to be lying there — that is the mechanic — so the
+	 * 12 s timer must not sweep it up while a team is still climbing. Server-only state.
+	 */
+	bool IsContestedKickoff() const { return bContestedKickoff; }
+
+	/**
+	 * DEMO 29 §3(b). True when @p Team is refused the loose Core by the lockout that is open now.
+	 *
+	 * THE ONE COPY OF THE RULE. ServerTryLoosePickup asks it, the lockout probe asks it, and anything
+	 * that grows a third opinion later asks it too — the alternative is two tests that agree until
+	 * the day they do not. ETraceTeam::None is locked out along with the losing side, which is what
+	 * the hand-written test it replaced already did (a teamless pawn is not a legal receiver).
+	 */
+	bool IsTeamLockedOutOfCore(ETraceTeam Team) const
+	{
+		return IsTurnoverActive() && (Team != GetTurnoverPullingTeam());
+	}
+
+	/**
+	 * DEMO 29 §3(a). World point on the TOP FACE of the centre octagon pillar — where the Core rests
+	 * at the start of every half.
+	 *
+	 * DERIVED FROM THE ACTOR, NOT TYPED IN. The octagon is a hand-placed StaticMeshActor in
+	 * Arena_Baked (Kit_Octagon_01, mesh SM_KitOctagon, tagged TraceCenterKit), so a coordinate
+	 * written here would be correct until somebody nudged it and silently wrong afterwards. This
+	 * finds the actor, takes its world bounds and probes straight down onto its deck, so moving the
+	 * pillar moves the kickoff.
+	 *
+	 * FALLS BACK, LOUDLY, when there is no such pillar — the procedural arena has none, and the map
+	 * may be re-authored. The fallback is ATraceArenaBuilder::GetCoreSpawnLocation(), i.e. exactly
+	 * where the Core started before this rule existed.
+	 *
+	 * @param OutPillar  Optionally receives the actor the answer came from; null when it fell back.
+	 */
+	static FVector GetHalfStartCoreSurface(const UWorld* World, AActor** OutPillar = nullptr);
+
+	/**
+	 * DEMO 29 §3(b). World point on the floor IN FRONT OF the goal defended at @p DefendedEndSign —
+	 * where the Core spawns after a goal is conceded there.
+	 *
+	 * "In front of" means on the PITCH side of the goal plane and clear of the hoop's run-up ramp:
+	 * the exact mirror of the near edge ATraceArenaBuilder::GetSpawnLineX() already uses behind it,
+	 * so the two are one argument about the same geometry rather than two numbers that can drift.
+	 */
+	static FVector GetPostGoalCoreSurface(const UWorld* World, float DefendedEndSign);
 
 #if !UE_BUILD_SHIPPING
 	/**
@@ -492,6 +600,28 @@ public:
 	 * 40 ms client to have seen them there — fire the SAME KickoffTo() a scored goal fires.
 	 */
 	bool RequestGoalRepro();
+
+	/**
+	 * Server, diagnostics only (Trace.Core.KickoffProbe). DEMO 29 §3's scripted proof.
+	 *
+	 * WHAT IT IS FOR. Two of the three things §3 asks for are invisible in a log by construction. "The
+	 * Core is on the octagon" can be read off a screenshot, but "teams must climb up to RETRIEVE it"
+	 * and "the scoring team is LOCKED OUT" are rules about what happens when a player walks onto the
+	 * ball — and in a headless run of a real match nobody may ever do that at the moment it matters.
+	 * So this stages the moment: it drives the two shipping restarts, walks a pawn from each side onto
+	 * the Core, and runs the REAL pickup poll on them.
+	 *
+	 * IT CALLS THE SHIPPED FUNCTIONS AND ASSERTS NOTHING IT COMPUTED ITSELF. The placements come from
+	 * ATraceGameMode::KickoffCoreForHalf / KickoffCoreAfterGoal, the refusal from
+	 * ServerTryLoosePickup, the lockout from IsTeamLockedOutOfCore. A probe that worked out its own
+	 * expected answer would agree with itself on a build where the rule had been deleted — this
+	 * project has shipped exactly that mistake before.
+	 *
+	 * IT DISTURBS THE MATCH ON PURPOSE and puts it back: pawns are returned to where they were and
+	 * the half-start placement is re-run at the end. It does NOT touch the scoreboard — it drives the
+	 * restart directly rather than through NotifyScored, so a probe cannot change who is winning.
+	 */
+	void StartKickoffProbe();
 #endif // !UE_BUILD_SHIPPING
 
 	// =============================================================================================
@@ -532,6 +662,15 @@ public:
 
 	/** MODE B. True while the Core is loose in the world with no holder. Always false in mode A. */
 	bool IsLoose() const { return bLoose; }
+
+	/**
+	 * MODE B. True while a loose Core is sitting still on something rather than flying.
+	 *
+	 * Server truth. Exposed for DEMO 29 §3's capture log line, which has to be able to say that the
+	 * ball in the photograph is PARKED on the pillar and not caught mid-bounce over it — a
+	 * screenshot cannot tell those two apart and the difference is the whole of "it rests there".
+	 */
+	bool IsLooseAtRest() const { return bLooseAtRest; }
 
 	/** MODE B. Velocity of the loose Core, uu/s. Zero when held or at rest. */
 	FVector GetLooseVelocity() const { return LooseVelocity; }
@@ -2068,10 +2207,23 @@ private:
 	/**
 	 * SERVER. Registers a turnover: the Core STAYS where it landed and the window opens.
 	 *
-	 * The one writer of TurnoverLockoutTeam / TurnoverStartServerTime, called from exactly one place
-	 * (ServerSurfaceTurnover), so "when does a turnover start" has one answer and one log line.
+	 * The one writer of TurnoverLockoutTeam / TurnoverStartServerTime, called from two places now —
+	 * ServerSurfaceTurnover (a throw that came down uncaught) and KickoffContested (DEMO 29 §3(b),
+	 * the goal that has just been conceded) — so "when does a turnover start" still has one answer
+	 * and one log line, and the post-goal lockout is the SAME rule rather than a lookalike.
 	 */
 	void RegisterTurnover(ETraceTeam DroppingTeam, const FVector& Where, const TCHAR* Why);
+
+	/**
+	 * SERVER. The body of KickoffTo(), with the destination passed in.
+	 *
+	 * KickoffTo() is "park at home and grant"; DEMO 29 §3 needs "park HERE and grant" for the mode-A
+	 * arm of KickoffContested, where there is no loose Core to leave lying about but the Core must
+	 * still start the half on the octagon. Splitting the destination out is the whole of the change:
+	 * every line of the release/park/queue sequence stays in one place, so the two entry points
+	 * cannot drift apart.
+	 */
+	void KickoffAt(const FVector& Where, ETraceTeam ReceivingTeam, const TCHAR* Why);
 
 	// --- SPEC v28 §2 — THE TURNOVER SOUND FIRES ON THE WRONG EVENT --------------------------------
 	//
@@ -2252,6 +2404,22 @@ private:
 	bool bTurnoverVerifySawWinner = false;
 	TWeakObjectPtr<ATraceCharacter> TurnoverVerifyPuller;
 	TWeakObjectPtr<ATraceCharacter> TurnoverVerifyLocked;
+
+	// --- DEMO 29 §3 scenario state (Trace.Core.KickoffProbe, diagnostics only) ---------------------
+
+	/** One step per timer beat. -1 is "not running"; see RunKickoffProbeStep for the script. */
+	int32 KickoffProbeStep = -1;
+	int32 KickoffProbePassCount = 0;
+	int32 KickoffProbeFailCount = 0;
+	int32 KickoffProbeSkipCount = 0;
+	FTimerHandle KickoffProbeHandle;
+
+	/** The pawn currently standing where the probe put it, and where it was standing before that. */
+	TWeakObjectPtr<ATraceCharacter> KickoffProbeSubject;
+	FVector KickoffProbeSubjectHome = FVector::ZeroVector;
+
+	/** Server. One beat of the DEMO 29 §3 script. See StartKickoffProbe(). */
+	void RunKickoffProbeStep();
 
 	/**
 	 * EVERY MACHINE, diagnostics only (Trace.ModeB.FlightLog). Logs this machine's own view of the
@@ -2467,6 +2635,42 @@ private:
 
 	/** Shared-clock time the Core went loose: drives the self-pickup lockout and the reset timer. */
 	float LooseStartServerTime = 0.f;
+
+	/**
+	 * DEMO 29 §3. This loose Core was PLACED by a kickoff, not thrown by a player.
+	 *
+	 * Two rules read it, and both are about the fact that a kickoff Core is SUPPOSED to be lying
+	 * there:
+	 *   1. the 12 s loose-Core reset timer is held off, because it exists to rescue a throw nobody
+	 *      collected and a team climbing the octagon is not that;
+	 *   2. the backstop that replaces it grants to ContestedFallbackTeam rather than to the opposite
+	 *      of whoever threw it — nobody threw it.
+	 * Cleared by ClearLooseState(), i.e. by every path that ends the placement, so the flag can never
+	 * outlive the Core it describes.
+	 */
+	bool bContestedKickoff = false;
+
+	/**
+	 * DEMO 29 §3(b). Server-only instrumentation for the lockout, and nothing reads them as rules.
+	 *
+	 * LockoutRefusalCount is how many times ServerTryLoosePickup has turned a locked-out player away
+	 * from a Core they were standing on during the CURRENT window; the timestamp is what rate-limits
+	 * the log line to one a second. Both are reset by RegisterTurnover, so the number on the line is
+	 * always about the window it is describing. See the block in ServerTryLoosePickup for why a rule
+	 * whose only effect is silence needs a line at all.
+	 */
+	float LastLockoutRefusalLogServerTime = -1.f;
+	int32 LockoutRefusalCount = 0;
+
+	/**
+	 * DEMO 29 §3. Who the Core goes to if a contested kickoff is never retrieved by anybody.
+	 *
+	 * The team that kicks off that half, or the team that was scored on. NOT a design feature: it is
+	 * the last-ditch guarantee this class makes everywhere else too — the Core never goes missing —
+	 * and when it fires it says so at Warning, because a Core nobody could reach in half a minute is
+	 * a level bug worth reading about.
+	 */
+	ETraceTeam ContestedFallbackTeam = ETraceTeam::None;
 
 	/** Shared-clock time the holder may next throw. Mirrors the pass cooldown's role in mode A. */
 	float ThrowCooldownEndServerTime = 0.f;

@@ -5264,13 +5264,22 @@ public:
 	/**
 	 * §2: "The rocket deals 100 damage on impact, ANYWHERE ON THE BODY - no headshot/body distinction."
 	 *
+	 * *** DEMO 29 §7 MAKES THIS THE DIRECT-IMPACT NUMBER, NOT THE ONLY NUMBER. *** Verbatim: "it should
+	 * only do 100 damage for direct impacts. Otherwise, the damage should fall off." A DIRECT IMPACT is
+	 * the projectile actually hitting the pawn — the flight sweep found their capsule within
+	 * RoxieRocketHitRadiusUU of the path — and that case still deals this, flat, with no hit zone.
+	 * Everybody else the detonation catches takes RoxieRocketSplashMaxFraction of this at the impact
+	 * point, falling to zero at the edge of the blast. So this knob is now the CEILING of the whole
+	 * ability, and TraceRoxieRocket clamps every damage request to it.
+	 *
 	 * *** THE SINGLE MOST DANGEROUS NUMBER IN THIS FILE. *** 100 is a full health bar, it ignores hit
 	 * zones, and the game's founding invariant is that NO ABILITY MAY DAMAGE A CORE CARRIER. It must
 	 * be dealt through UTraceCharacterAbilitySet::DealDamage, which routes to
 	 * UTraceAbilityComponent::CanAffectTarget — never by reaching for UTraceHealthComponent, and
-	 * never behind a carrier test written in Roxie's own file.
+	 * never behind a carrier test written in Roxie's own file. That is true of the falloff too: the
+	 * blast loop computes an amount and then asks the same one function whether it may land.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Damage [v18 §2: flat 100, no hit zones. DAMAGE - never a carrier]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "20.0", UIMax = "200.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Damage [v18 §2 / Demo 29 §7: 100 for a DIRECT IMPACT, the ceiling for everything else. DAMAGE - never a carrier]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "20.0", UIMax = "200.0"))
 	float RoxieRocketDamage = 100.f;
 
 	/**
@@ -5287,12 +5296,68 @@ public:
 	float RoxieRocketLifetimeSeconds = 3.f;
 
 	/**
-	 * The rocket's OWN touch radius, on top of the victim's capsule — the same idea as XBeeHitRadiusUU.
-	 * IT IS NOT A SPLASH RADIUS. §2 says "on impact", once, for 100; an area-of-effect rocket would be
-	 * a different and much stronger ability than the doc describes.
+	 * *** THE ONE RADIUS. DEMO 29 §7: "Make Roxie's rocket hit radius match the model." 45 -> 72. ***
+	 *
+	 * This single number is now everything the rocket is wide by, and it is ONE number precisely so
+	 * that no two of them can be edited apart again:
+	 *
+	 *   the TOUCH radius   how close the flight path must come to a pawn's capsule to be a DIRECT
+	 *                      IMPACT and deal the full RoxieRocketDamage;
+	 *   the DRAWN body     TraceRoxieRocket::GetVisualRadiusUU() returns this unchanged, so the model
+	 *                      a player watches IS the projectile that hits them;
+	 *   the WORLD sweep    the sphere that stops the rocket on geometry, so the drawn nose and the
+	 *                      thing that touches the wall are the same size;
+	 *   the BLAST radius   how far the Demo 29 falloff reaches from the detonation point, which is also
+	 *                      exactly the radius ATraceFxBurst draws the RocketBurst at (it reads this
+	 *                      same knob live). The explosion you see is the explosion that hurts.
+	 *
+	 * *** WHY 72 AND NOT 45, AND WHY THIS IS THE OWNER OVERRULING A PASSED CHECK. *** Patch 28 asked
+	 * for a larger rocket and got it the cheap way: a x1.6 multiplier on the DRAWN side only. That left
+	 * a 72 uu model around a 45 uu projectile, and the pass defended it at length — the rocket kills a
+	 * pawn whose 34 uu capsule comes within 45 uu of the line, so the model at 72 was still inside the
+	 * 79 uu volume a player actually dies in, and Trace.Roxie.RocketFlightTest asserted exactly that
+	 * and PASSED. The owner then played it and said the hit radius did not match the model. They are
+	 * right and the check was answering a different question: "does the skin over-claim" is not "do
+	 * these two numbers match". The model was the number the owner had chosen and liked, so the model
+	 * won — 72 uu — and RoxieRocketVisualScale below has no reader any more.
+	 *
+	 * WHAT THAT COSTS. The volume a player dies in goes from 45+34 = 79 uu to 72+34 = 106 uu about the
+	 * flight line, so the rocket IS easier to land than it was in Demo 28. That is the trade Demo 29
+	 * asked for in the same sentence: it is easier to touch somebody, and only a real hit still does
+	 * 100. Trace.Roxie.RocketFlightTest re-checks that a running player still clears the wider lethal
+	 * cross-section inside the rocket's time of flight, i.e. that it is still dodgeable.
+	 *
+	 * Raising it makes the model, the hit, the wall sweep and the blast all bigger together, which is
+	 * the only honest meaning "make the rocket bigger" can have.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Hit Radius (uu, NOT splash)", ClampMin = "1.0", ClampMax = "300.0", UIMin = "10.0", UIMax = "120.0"))
-	float RoxieRocketHitRadiusUU = 45.f;
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Radius (uu) - THE ONE RADIUS: touch, drawn model, wall sweep and blast [Demo 29 §7: 45 -> 72]", ClampMin = "1.0", ClampMax = "300.0", UIMin = "10.0", UIMax = "120.0"))
+	float RoxieRocketHitRadiusUU = 72.f;
+
+	/**
+	 * DEMO 29 §7's FALLOFF, verbatim: "Otherwise, the damage should fall off."
+	 *
+	 * The fraction of RoxieRocketDamage a pawn takes standing exactly ON the detonation point — the
+	 * best possible near miss. It falls from there to ZERO at RoxieRocketHitRadiusUU, on a smoothstep,
+	 * measured from the impact point to the victim's CAPSULE SURFACE.
+	 *
+	 * 0.5 reads as "a direct hit kills you; the best near miss does exactly half", which is a sentence
+	 * a player can learn from being hit twice. At the shipped numbers that is 50 at the impact point,
+	 * 42.2 a quarter of the way out, 25.0 halfway, 7.8 at three quarters and 0.0 at the edge of the
+	 * drawn burst.
+	 *
+	 * *** THE CLAMP STOPS AT 0.95 AND THAT CEILING IS THE FEATURE, NOT A SAFETY MARGIN. *** Item 7 is
+	 * "only 100 damage for direct impacts"; a splash that could reach 1.0 would let a near miss equal a
+	 * hit and delete the distinction the owner asked for. Setting this to 0 turns the falloff off
+	 * entirely and restores Demo 28's behaviour, where a rocket landing at your feet did nothing at
+	 * all — which is also the RED ARM for any test of "the damage falls off".
+	 *
+	 * THIS IS NOT A SELF-DAMAGE KNOB AND THERE ISN'T ONE. Roxie's own blast deals her 0 at every range
+	 * because UTraceAbilityComponent::CanAffectTargetDetailed refuses a pawn damaging itself with its
+	 * own ability, so a self-damage slider would move nothing. Her rocket jump costs exactly what it
+	 * cost in Demo 28.
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket Blast: damage AT the impact point (x Rocket Damage; falls to 0 at the radius) [Demo 29 §7: 0.5; 0 = the Demo 28 build]", ClampMin = "0.0", ClampMax = "0.95", UIMin = "0.0", UIMax = "0.8"))
+	float RoxieRocketSplashMaxFraction = 0.5f;
 
 	/**
 	 * §2: it "WOBBLES in flight, deliberately inaccurate and hard to aim". This is how far off the
@@ -5306,44 +5371,31 @@ public:
 	float RoxieRocketWobbleAmplitudeUU = 120.f;
 
 	/**
-	 * DEMO 17 item 3, verbatim: "make the model of the rocket bigger, so it is easy to see."
-	 * PATCH 28 ITEM 1, verbatim: "Make Roxie's rocket larger." 1.0 -> 1.6.
+	 * *** RETAINED FOR CONFIG COMPATIBILITY. NO READER SINCE DEMO 29. ***
 	 *
-	 * A multiplier on the DRAWN body, whose base size is RoxieRocketHitRadiusUU above.
+	 * This was the DRAWN-ONLY size multiplier on top of RoxieRocketHitRadiusUU. Demo 17 introduced it
+	 * at 1.0 (draw the rocket exactly as wide as its hit radius, replacing a fixed 13 uu dart), Patch 28
+	 * item 1 raised it to 1.6 to answer "Make Roxie's rocket larger", and that is the state the owner
+	 * played: a 72 uu model around a 45 uu projectile.
 	 *
-	 * *** WHAT DEMO 17 ACTUALLY LANDED, BEFORE RAISING THIS AGAIN. *** Demo 17 did not add a scale on
-	 * top of an already-large rocket: it replaced a FIXED 13 uu dart with "the hit radius", i.e. 45 uu,
-	 * a 3.46x widening, and this knob shipped at 1.0 as the honest default. Then FX_AUDIO_PLAN §2.3
-	 * (W5-KITS-E) found the second, larger half of "it is hard to see" — the body had never actually
-	 * been EMBER. The Demo 17 code wrapped /Engine/BasicShapes/Cone's own LIT BasicShapeMaterial and
-	 * wrote EmissiveColor / Glow / EmissiveStrength / EmissivePower onto it; all four were silent
-	 * no-ops, so the rocket flew as a MATTE cone, which on this arena's black floor is a dark cone.
-	 * That is fixed and the body is emissive ember now. So this patch is the third and smallest of
-	 * three visibility changes, not the first — which is why it is 1.6 and not 3.
+	 * DEMO 29 ITEM 7 ENDED IT: "Make Roxie's rocket hit radius match the model." A multiplier is exactly
+	 * the mechanism by which a model and a hit radius drift apart — it is the same bug class as the
+	 * ribbon's drawn-vs-lethal volume and as Chut's copied backstab number — so the two are ONE value
+	 * now. TraceRoxieRocket::GetVisualRadiusUU() returns GetHitRadiusUU() and nothing multiplies
+	 * anything. RoxieRocketHitRadiusUU went 45 -> 72 so the model kept the size the owner chose.
 	 *
-	 *     1.0  ->  45.0 uu drawn radius,  90 uu across, 135 uu long
-	 *     1.6  ->  72.0 uu drawn radius, 144 uu across, 216 uu long
+	 * IT IS UNWIRED RATHER THAN DELETED, on this pass's revert rule: a DefaultGame.ini or a saved
+	 * settings page carrying this key still loads, and the work is recoverable. Editing it now does
+	 * NOTHING — the settings panel will move the slider and the game will not change.
 	 *
-	 * *** WHY 1.6 IS THE LARGEST HONEST NUMBER, AND WHY IT IS NOT A DRAWN/LETHAL DRIFT. *** The
-	 * rocket kills a PAWN whose capsule comes within RoxieRocketHitRadiusUU of the flight line, and a
-	 * pawn's capsule is 34 uu of radius — so the volume in which this rocket kills a player is
-	 * 45 + 34 = 79 uu about the line, not 45. A drawn body of 72 uu is still INSIDE that 79 uu, so the
-	 * ember skin the player watches STILL never claims a kill the rocket does not have. Above ~1.76
-	 * (= 79/45) it would, and that is the number to respect if this is raised again.
-	 * Trace.Roxie.RocketFlightTest asserts it against the LIVE capsule rather than against 34.
+	 * TO PUT IT BACK: restore GetVisualScale() next to GetHitRadiusUU() in TraceRoxieRocket.cpp and
+	 * make GetVisualRadiusUU() return the product again. Two lines, one file. Please do not, without
+	 * telling the owner that the model and the hit radius are two numbers again.
 	 *
-	 * Against GEOMETRY the sweep is a 45 uu sphere, so the drawn cone is 27 uu wider than the sphere
-	 * that detonates it on a wall and will visibly touch the wall a frame before the burst. That is
-	 * the ONE deliberate difference between drawn and lethal on this actor, it is in the harmless
-	 * direction (the rocket looks like it reached the wall it did in fact reach), and it is stated
-	 * here rather than discovered.
-	 *
-	 * Raise it to exaggerate the rocket further; it changes NOTHING about what the rocket hits. Body
-	 * length, launch-flash radius, trail length and both trail radii are named fractions of
-	 * TraceRoxieRocket::GetVisualRadiusUU(), so they all moved with this one edit.
+	 * (Precedent for a retained, unread knob on this page: ChutKnifeBackDamage, dead since C6.)
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket: Drawn Size (x its own hit radius) [Demo 17; Patch 28 §1: 1.0 -> 1.6]", ClampMin = "0.1", ClampMax = "6.0", UIMin = "0.5", UIMax = "3.0"))
-	float RoxieRocketVisualScale = 1.6f;
+	UPROPERTY(config, EditAnywhere, Category = "Abilities|Roxie", meta = (DisplayName = "Rocket: Drawn Size multiplier [Demo 17; Patch 28 §1. DEAD SINCE DEMO 29 §7 - retained for config compat, READ BY NOTHING]", ClampMin = "0.1", ClampMax = "6.0", UIMin = "0.5", UIMax = "3.0"))
+	float RoxieRocketVisualScale = 1.f;
 
 
 	/** Wobbles per second. With the amplitude above, these two ARE "hard to aim" — tune them together. */

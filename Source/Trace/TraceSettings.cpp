@@ -1568,7 +1568,15 @@ namespace
 			{ TEXT("RoxieRocketDamage"),               EKnobType::Float, TEXT("v18 §2: flat 100 'anywhere on the body', no headshot zone. DAMAGE - never reaches a carrier") },
 			{ TEXT("RoxieRocketSpeed"),                EKnobType::Float, TEXT("v18 §2: how fast the rocket travels; slow enough to be dodged is the point of the wobble") },
 			{ TEXT("RoxieRocketLifetimeSeconds"),      EKnobType::Float, TEXT("v18 §2: a projectile needs an end. Speed x this is the effective range") },
-			{ TEXT("RoxieRocketHitRadiusUU"),          EKnobType::Float, TEXT("v18 §2: the rocket's OWN radius on top of the victim capsule. Not a splash radius - there is no splash") },
+			// --- Demo 29 §7: the rocket's ONE radius, and the falloff -------------------------------
+			//
+			// The radius row is not new but its MEANING moved this pass, which the v8 rule treats the
+			// same as a new knob. It was "the rocket's own radius on top of the victim capsule, and NOT
+			// a splash radius - there is no splash"; both halves of that are now wrong. It is one number
+			// for four things and one of them is a blast.
+			{ TEXT("RoxieRocketHitRadiusUU"),          EKnobType::Float, TEXT("Demo 29 §7: THE ONE RADIUS - the touch radius, the DRAWN model, the wall sweep and the blast falloff, all this number. 45 -> 72 so the hit radius matches the model the owner chose in Patch 28") },
+			{ TEXT("RoxieRocketSplashMaxFraction"),    EKnobType::Float, TEXT("Demo 29 §7: 'otherwise the damage should fall off'. Fraction of RoxieRocketDamage taken AT the impact point, smoothstepping to 0 at the radius. 0 = the Demo 28 build = the RED arm. Clamped below 1.0 so a near miss can never equal a direct impact") },
+			{ TEXT("RoxieRocketVisualScale"),          EKnobType::Float, TEXT("Patch 28 §1's drawn-size multiplier - RETAINED FOR CONFIG COMPAT, no reader since Demo 29 §7 folded the drawn radius into the hit radius. Listed so this table says OK on a key that still exists and moves nothing") },
 			{ TEXT("RoxieRocketWobbleAmplitudeUU"),    EKnobType::Float, TEXT("v18 §2: 'wobbles in flight, deliberately inaccurate'. 0 = a straight, easily-aimed rocket = the RED arm") },
 			{ TEXT("RoxieRocketWobbleFrequencyHz"),    EKnobType::Float, TEXT("v18 §2: wobbles per second. With the amplitude, this is the whole 'hard to aim'") },
 			{ TEXT("RoxieRocketSelfLaunchImpulse"),    EKnobType::Float, TEXT("v18 §2: 'launches her backwards, fast and far'. Applied to ROXIE, opposite her aim") },

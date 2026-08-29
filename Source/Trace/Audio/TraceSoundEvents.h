@@ -66,6 +66,14 @@
 //     row-declared-family shape §1b gave footsteps, for the same "no name matching" reason.
 //
 // ---------------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------------------------------
+// DEMO 29 — THREE ROWS BELOW ARE DECLARED AND DELIBERATELY SILENT
+// ---------------------------------------------------------------------------------------------------
+// DeathBurst (item 9) and CountdownTick / CountdownGo (item 11) are still rows, still have WAVs and
+// still have assets; TraceSoundEvents::Unwired() lists them and TraceAudio refuses to sound them.
+// Reading a row here therefore answers "who would hear this", not "will anybody hear this" — check
+// IsUnwired() for the second question, or read the [UNWIRED] column in Trace.Audio.Report.
+//
 // An event NOT in this table (a WAV somebody drops into Art/Sounds/ tomorrow) is not an error:
 // TraceSoundEvents::SideOf() answers Client for it, which is the safe default — the worst case is
 // that one machine hears a new sound instead of all of them, never that a client-side sound is
@@ -251,7 +259,14 @@ namespace TraceSoundEvents
 	/** YOUR health dropped. Client — the victim's own machine only. */
 	TRACE_API extern const FName DamageTaken;
 
-	/** A death burst at the body. Game-side. */
+	/**
+	 * A death burst at the body. Game-side.
+	 *
+	 * *** UNWIRED SINCE DEMO 29 (item 9) — see Unwired() at the bottom of this file. *** The trigger
+	 * in UTraceHealthComponent::BroadcastDeath still runs on every death; the sound does not follow.
+	 * It landed on top of the owner's Kill.wav on every kill, which is what "revert the kill noise to
+	 * my old one" was about. `Trace.Audio.UnwiredEvents 0` brings it back.
+	 */
 	TRACE_API extern const FName DeathBurst;
 
 	/** You respawned. Client, at the possession point. */
@@ -350,10 +365,22 @@ namespace TraceSoundEvents
 	/** A refusal — the §7.1 toast, an unbindable key. */
 	TRACE_API extern const FName UIDeny;
 
-	/** The kickoff countdown's last three seconds, one tick each. */
+	/**
+	 * The kickoff countdown's last three seconds, one tick each.
+	 *
+	 * *** UNWIRED SINCE DEMO 29 (item 11) — see Unwired() at the bottom of this file. *** ATraceCore
+	 * drives the countdown off a field that is not a kickoff deadline, so it beeped on every level
+	 * load with no kickoff in sight. `Trace.Audio.UnwiredEvents 0` brings it back.
+	 */
 	TRACE_API extern const FName CountdownTick;
 
-	/** The kickoff release. */
+	/**
+	 * The kickoff release.
+	 *
+	 * *** UNWIRED SINCE DEMO 29 (item 11), with CountdownTick and for the same reason. *** It fires
+	 * on every pending-grant resolve, which includes the holderless backstop and a turnover fallback,
+	 * not only on a kickoff. `Trace.Audio.UnwiredEvents 0` brings it back.
+	 */
 	TRACE_API extern const FName CountdownGo;
 
 	// ---------------------------------------------------------------------------------------------
@@ -396,4 +423,39 @@ namespace TraceSoundEvents
 
 	/** "footstep" / "gunshot" / "music" / "-", for logs and for Trace.Audio.Report. */
 	TRACE_API const TCHAR* FamilyName(ETraceSoundFamily Family);
+
+	// ---------------------------------------------------------------------------------------------
+	// DEMO 29 ITEMS 9 AND 11 — THE UNWIRE LIST: declared events that are DELIBERATELY SILENT.
+	//
+	// An event on this list is still a row in the table above, still has its WAV in Art/Sounds/,
+	// still has its USoundWave in the bank (Trace.Audio.Report still answers "71 of 71 resolved")
+	// and its trigger site still runs. What it does not do is reach the audio engine: the three
+	// entry points in TraceAudio.cpp check IsUnwired() and return without playing or multicasting.
+	//
+	// THIS IS AN UNWIRE, NOT A DELETION, and it is one switch away in both directions:
+	//     Trace.Audio.UnwiredEvents 0     every listed event sounds again, at runtime
+	//     delete a row from GUnwired      in TraceSoundEvents.cpp, permanently
+	//
+	// WHY THE LIST LIVES HERE RATHER THAN AT THE TRIGGERS. Both triggers are in
+	// Source/Trace/Gameplay/ — UTraceHealthComponent::BroadcastDeath and ATraceCore's kickoff tick —
+	// which the Demo 29 audio pass does not own. The reasons, per event, are in the long comment
+	// above GUnwired in TraceSoundEvents.cpp; the countdown one names the real repair, which is one
+	// bool on ATraceCore rather than anything in this module.
+	// ---------------------------------------------------------------------------------------------
+
+	/** Every event Demo 29 unwired, whether or not the gate is currently being enforced. */
+	TRACE_API TConstArrayView<FName> Unwired();
+
+	/**
+	 * True when @p Event must not sound: it is on the list above AND Trace.Audio.UnwiredEvents is 1
+	 * (the default). Answers false for everything else, including a name that is not in the table.
+	 */
+	TRACE_API bool IsUnwired(FName Event);
+
+	/**
+	 * One line saying WHY @p Event is unwired, for the log line TraceAudio prints once per event and
+	 * for Scripts/generate_sound_page.py, which badges the row so the owner is not auditioning a
+	 * sound that cannot currently fire. Empty string for an event that is not on the list.
+	 */
+	TRACE_API const TCHAR* UnwiredReason(FName Event);
 }

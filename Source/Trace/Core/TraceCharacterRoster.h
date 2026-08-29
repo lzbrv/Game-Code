@@ -103,12 +103,14 @@ namespace TraceCharacterRoster
 		/**
 		 * THE BODY EVERY OTHER PLAYER SEES — a LoadObject path to a USkeletalMesh, or EMPTY.
 		 *
-		 * EMPTY MEANS "EPIC'S MANNEQUIN", AND IT IS STILL A LEGAL VALUE THOUGH NO ROW USES IT NOW.
-		 * All ten rows name a generated body since PIPELINE_DESIGN.md §9.1; before that, nine of the
-		 * ten were empty. The Mannequin is not a degraded state — a character with no bespoke body is
-		 * drawn exactly as this game has always drawn everybody — and it is what an UNRESOLVABLE path
-		 * falls back to, which is the case that actually happens now: a clone that has not run
-		 * Scripts/import-characters.sh has ten rows pointing at ten assets that are not there.
+		 * EMPTY MEANS "EPIC'S MANNEQUIN", AND SINCE DEMO 29 ITEM 1 ALL TEN ROWS ARE EMPTY AGAIN.
+		 * They named generated bodies between PIPELINE_DESIGN.md §9.1 and Demo 29; the ten strings are
+		 * shelved in comments in TraceCharacterRoster.cpp, which also carries the measurement of why
+		 * (a retarget bake that moved sixteen locomotion sequences' root travel into the pelvis). The
+		 * Mannequin is not a degraded state — a character with no bespoke body is drawn exactly as
+		 * this game has always drawn everybody — and it is also what an UNRESOLVABLE path falls back
+		 * to, which is why this stayed a string: a clone that has not run
+		 * Scripts/import-characters.sh must fall back rather than fail.
 		 *
 		 * SOFT BY CONSTRUCTION — it is a STRING here and a TSoftObjectPtr on the asset. A hard
 		 * reference would make that clone fail to CONSTRUCT rather than fall back, which is the same
@@ -120,10 +122,12 @@ namespace TraceCharacterRoster
 		/**
 		 * Yaw, in degrees, that turns THIS mesh's authored forward onto the actor's +X.
 		 *
-		 * *** MEASURED PER RIG, NOT COPIED — AND THE FACT THAT EVERY ROW NOW READS -90 IS A RESULT,
+		 * *** MEASURED PER RIG, NOT COPIED — AND THE FACT THAT EVERY ROW READS -90 IS A RESULT,
 		 * NOT A DEFAULT. *** Epic's Mannequin is authored facing +Y and therefore needs -90
-		 * (TraceCharacterLayout::MeshYaw, and the default here); the ten generated bodies are authored
-		 * facing +Y too (PIPELINE_DESIGN.md §3.1) and measure the same -90. The rig that proves the
+		 * (TraceCharacterLayout::MeshYaw, and the default here); the ten generated bodies shelved by
+		 * Demo 29 item 1 are authored facing +Y too (PIPELINE_DESIGN.md §3.1) and measured the same
+		 * -90, which is why the rows keep the number while their mesh paths are empty — it is not
+		 * READ while BodyMeshPath is empty, and it is the right answer either way. The rig that proves the
 		 * rule is the one that is gone: the hand-modelled RoccoTest.fbx was authored facing +X and
 		 * needed 0, and copying the Mannequin's -90 onto it turned him sideways — the single most
 		 * likely way this feature looks broken. The number for a new mesh comes from measuring
@@ -144,8 +148,10 @@ namespace TraceCharacterRoster
 		 * the pawn is drawn in its bind pose: an ABP is compiled against one SKELETON ASSET, and
 		 * Epic's ABP_Unarmed is compiled against the Mannequin's, so it has nothing to move on any
 		 * other rig. It is a per-SKELETON field rather than a per-character one, which is why all ten
-		 * rows carry the same string today: the generated bodies share SK_TraceBody_Skeleton, so one
-		 * retarget bake (Scripts/retarget_body.py) produces the one class they all name.
+		 * rows carried the SAME string while the generated bodies were wired: they share
+		 * SK_TraceBody_Skeleton, so one retarget bake (Scripts/retarget_body.py) produced the one
+		 * class they all named. Demo 29 item 1 shelved that string with the mesh paths — the two are
+		 * shelved and restored together, because either one alone is a bug.
 		 *
 		 * SOFT BY CONSTRUCTION, exactly like BodyMeshPath, and unresolvable for the same reason: a
 		 * clone that has not run the import and the retarget does not have it. ApplyBodyAnimInstance

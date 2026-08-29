@@ -447,13 +447,22 @@ namespace TraceCharacterSelectArt
 }
 
 // =============================================================================================
-// THE TEN PORTRAITS — UI plan WP10
+// THE TEN PORTRAITS — UI plan WP10 — *** UNWIRED BY DEMO 29 ITEM 6 ***
 // =============================================================================================
 //
+// THE OWNER ASKED FOR THEM OFF: "Remove the character card portraits." So `For()` returns null for
+// every index and both draw sites take the branch they already had — the monogram watermark, which
+// is exactly what this screen showed before the portraits landed. NOTHING ELSE CHANGED: the ten
+// T_Portrait_* textures stay on disk, this whole namespace stays compiled, the crop knobs still
+// work, and re-wiring is deleting one `return nullptr` (see the gate at the top of For()).
+//
+// The rest of this block is the argument for the machinery, kept because the machinery is kept.
+//
 // W4-PORTRAITS rendered, composed and imported ten 512-square busts and nobody consumed them: this
-// screen was the only place they were ever meant to appear, and until this pass `T_Portrait` did not
+// screen was the only place they were ever meant to appear, and until that pass `T_Portrait` did not
 // occur anywhere in Source/. That is what made character select the emptiest screen in the build —
-// ten cards, each about seventy per cent bare navy behind one faded watermark letter.
+// ten cards, each about seventy per cent bare navy behind one faded watermark letter, which is what
+// it shows again now.
 //
 // ---------------------------------------------------------------------------------------------
 // THE PATH IS DERIVED FROM THE ROSTER, NOT TABULATED
@@ -493,6 +502,13 @@ namespace TraceCharacterSelectPortraits
 {
 	/** `/Game/Trace/UI/Art/Portraits/T_Portrait_<Name>` — W4-PORTRAITS' shipped location. */
 	static const TCHAR* const PathPrefix = TEXT("/Game/Trace/UI/Art/Portraits/T_Portrait_");
+
+	/**
+	 * DEMO 29 ITEM 6's OFF SWITCH. false = every card and the detail panel draw the monogram
+	 * watermark, which is what this screen looked like before the portraits landed and what the owner
+	 * asked to go back to. true restores them with no other edit. See For().
+	 */
+	constexpr bool bPortraitsWired = false;
 
 	/**
 	 * THE DETAIL-PANEL CROP, CORRECTED AGAINST THE SHIPPED FRAMING.
@@ -652,6 +668,22 @@ namespace TraceCharacterSelectPortraits
 	 */
 	UTexture2D* For(int32 Index)
 	{
+		// *** DEMO 29 ITEM 6 — THE PORTRAITS ARE OFF. ***
+		//
+		// ONE GATE rather than ten deletions, and deliberately at the ONE point every draw site
+		// already asks through: the card (DrawCard) and the detail panel (the identity column) both
+		// treat null as "draw the monogram" and have done since the portraits landed, so this puts
+		// the screen back to its pre-portrait look with no layout change and no second code path to
+		// keep alive. The textures are untouched on disk under /Game/Trace/UI/Art/Portraits.
+		//
+		// A CONSTANT rather than a bare `return nullptr`, so everything below it is still compiled,
+		// still type-checked and still warned about — dead code that the compiler stops reading is
+		// dead code that rots. TO PUT THEM BACK: set bPortraitsWired true. Nothing else was removed.
+		if (!bPortraitsWired)
+		{
+			return nullptr;
+		}
+
 		if (Index < 0 || Index >= TraceCharacterRoster::Count || bFailed[Index])
 		{
 			return nullptr;
@@ -702,6 +734,20 @@ namespace TraceCharacterSelectPortraits
 	{
 		if (bLoggedInventory)
 		{
+			return;
+		}
+
+		// SAY SO, ONCE. With the Demo 29 gate off nothing is ever loaded, so the census below would
+		// wait forever for a portrait to be "asked for" and this function would go silent — and a
+		// silent diagnostic is how a capture gets mistaken for a build whose portraits merely failed.
+		if (!bPortraitsWired)
+		{
+			bLoggedInventory = true;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[CharSelect] Portraits: OFF (Demo 29 item 6). Every card and the detail panel "
+				     "draw the monogram watermark. The textures are still on disk at %s*; set "
+				     "TraceCharacterSelectPortraits::bPortraitsWired true to bring them back."),
+				PathPrefix);
 			return;
 		}
 
@@ -2318,11 +2364,12 @@ void FTraceCharacterSelect::DebugPick(int32 CharacterId)
 //   2. A wall of tiny all-caps body     A four-step type ramp (display / name / body / micro-label)
 //                                       set in the menu typeface, and every paragraph sentence-cased.
 //   3. The gameplay HUD shows through   The backdrop is OPAQUE. See TraceSelectStyle::Backdrop.
-//   4. No identity beyond a 3 px stripe Accent-coloured name, a keycap, the artist's plate and — since
-//                                       UI plan WP10 — THE CHARACTER'S OWN PORTRAIT, per tile and again
-//                                       as a 2x crop in the detail panel. The monogram watermark that
-//                                       used to be the whole answer here is now the fallback for a
-//                                       build whose portraits are missing.
+//   4. No identity beyond a 3 px stripe Accent-coloured name, a keycap, the artist's plate and the
+//                                       character's MONOGRAM WATERMARK. UI plan WP10 briefly put the
+//                                       character's own portrait here and in the detail panel; Demo 29
+//                                       item 6 took it back off at the owner's request, so the
+//                                       watermark is the answer again. The portrait code is unwired,
+//                                       not removed - TraceCharacterSelectPortraits::bPortraitsWired.
 //   5. Cramped ability lines            ACTIVATED is a labelled section: the key in a cap, the name at
 //                                       lead size, the cooldown in its own chip. Not one hyphenated run.
 //   6. "0" reads as an ordinal          Every key is drawn inside a KEYCAP, so 0 reads as a key.
@@ -3131,9 +3178,13 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
  *     512's edges, and the framing gate spent real headroom keeping Lily's fins and X's beads inside
  *     the frame).
  *
- * The monogram is still here. It is the fallback now rather than the answer: a clone that has not run
- * the portrait stage, a frame or two before the RHI texture lands, or a load budget already spent all
- * draw the same watermark this tile used to draw, in the square the portrait would have filled.
+ * *** AND DEMO 29 ITEM 6 PUT THE MONOGRAM BACK AS THE ANSWER. *** The owner asked for the portraits
+ * off, so TraceCharacterSelectPortraits::For() returns null for every card and the branch below draws
+ * the watermark, in the square the picture used to fill. NONE OF THE LAYOUT ABOVE CHANGED and that is
+ * on purpose: the two-column tile, the width arithmetic and the 56 px give-up threshold are all still
+ * live, so re-wiring the portraits is one constant and no layout work. What the paragraphs above
+ * describe is therefore still exactly what this function does — it is only the contents of the square
+ * that went back to a letter.
  */
 void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, int32 CardIndex, float X, float Y, float W, float H)
 {
@@ -3234,7 +3285,7 @@ void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, i
 		}
 		else
 		{
-			// ---- The monogram watermark, now the FALLBACK ------------------------------------------
+			// ---- The monogram watermark — THE ANSWER AGAIN SINCE DEMO 29 ITEM 6 --------------------
 			//
 			// Unchanged in what it is and why it works — an alpha low enough that it is texture rather
 			// than text, and the cheapest per-character silhouette available without art: R and S and M
@@ -3242,6 +3293,7 @@ void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, i
 			// off the tile's right padding in the gap between the two text blocks; it now fills the
 			// square the picture would have occupied, so a build with no portraits keeps the same
 			// composition as one with them rather than falling back to a different, emptier layout.
+			// That property is what let item 6 be one constant rather than a layout pass.
 			const FString Monogram = FString(Entry.Name).Left(1);
 			const float MonoSize = PortraitSide * 0.80f;
 			const float MonoW = TraceCharacterSelectType::Width(HUD, Monogram, nullptr, MonoSize, 0.f);

@@ -7,19 +7,27 @@
 // rule verifier and its surface census (Trace.ModeB.Verify, Trace.ModeB.VerifySurfaces), the spec
 // v13 §8 mid-air turnover reproduction, the v31 §4 / v32 §3 art probes and photographers
 // (Trace.Core.FxProbe, Trace.Core.CarryProbe, Trace.Core.ArtShots), the goal-teleport audit and its
-// reproduction, and the spec v25 §2 turnover verifier with its integration stage.
+// reproduction, the spec v25 §2 turnover verifier with its integration stage, and DEMO 29 §3's
+// contested-kickoff probe (Trace.Core.KickoffProbe).
 //
 // That is about six thousand lines of code that never runs in a shipped build, and it was more than
 // a third of TraceCore.cpp. RESTRUCTURE tranche D2 moved it out VERBATIM — guards, banners, essays
 // and red arms unchanged. Tranche A had already fenced every one of these blocks for Shipping, so
 // this file is an extraction, not a new guard: in a Shipping build it compiles to nothing.
 //
-// THE SEAM IS ATraceCore'S PUBLIC SURFACE plus TraceCoreInternal.h. Nothing here is a member of the
-// Core and nothing here can reach a private, which is exactly why these harnesses are worth
-// something: they ask the questions any other caller could ask. The functions they grade against —
-// TraceModeBTuning::SteerTowardCatchPoint, ::PickContestedCatcher, ::SweepLooseCore — are THE
-// FUNCTIONS THE GAME CALLS, reached through the shared header rather than reimplemented here. This
-// project has already had one verification "pass" that never ran the thing it claimed to test.
+// WHAT THESE HARNESSES GRADE AGAINST IS THE SHIPPED CODE, and that is the only rule this file has.
+// TraceModeBTuning::SteerTowardCatchPoint, ::PickContestedCatcher, ::SweepLooseCore,
+// ATraceCore::ServerTryLoosePickup, ATraceGameMode::KickoffCoreForHalf — every one of them is THE
+// FUNCTION THE GAME CALLS, driven here rather than reimplemented. This project has already had one
+// verification "pass" that never ran the thing it claimed to test.
+//
+// SOME OF THEM ARE MEMBERS OF ATraceCore AND REACH ITS PRIVATES. That was not true when tranche D2
+// extracted this file and its banner said so; it stopped being true the moment TickModeBVerification,
+// TickTurnoverVerify and their state came across, and DEMO 29 §3's Trace.Core.KickoffProbe is
+// deliberately one of them — "does the pickup poll refuse this pawn" cannot be asked from outside,
+// and asking a lookalike question instead is exactly the failure the paragraph above is about. The
+// declarations all sit inside `#if !UE_BUILD_SHIPPING` in TraceCore.h, so none of this is in a
+// shipped build's Core either.
 
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceCoreInternal.h"
@@ -6205,5 +6213,711 @@ void ATraceCore::TickTurnoverVerify()
 	}
 	}
 }
+
+
+// =================================================================================================
+// DEMO 29 §3 — Trace.Core.KickoffProbe
+//
+// THE OWNER'S RULE, VERBATIM: "Ensure the core begins each half on top of the octagon, the newly
+// added pillar which lies in the middle of the map. Teams must climb up in order to retrieve it.
+// After a goal, the core spawns in front of the team who was scored on's goal, with the scoring team
+// locked out."
+//
+// WHY IT NEEDS A HARNESS AT ALL, when a screenshot shows the Core on the pillar. Because two thirds
+// of that sentence are about what happens when somebody TOUCHES the ball, and a headless match may
+// never produce that moment where it matters:
+//
+//   * "teams must climb up in order to RETRIEVE it" is a claim that a player who reaches the deck
+//     GETS the Core. A picture of a ball on a pillar is equally consistent with a ball nobody can
+//     ever pick up, which would be a worse bug than the one being fixed.
+//   * "with the scoring team LOCKED OUT" is a claim that a specific thing does NOT happen. Its whole
+//     observable signature is silence, and silence is also what a deleted rule produces. After a
+//     goal every pawn is teleported to their own end, so in an ordinary bot match nobody from the
+//     scoring team goes near the restart spot at all, and the rule is never exercised.
+//
+// So the probe STAGES those two moments and runs the real code on them: it drives the two shipping
+// restarts (ATraceGameMode::KickoffCoreForHalf / KickoffCoreAfterGoal), walks a pawn from each side
+// onto the Core, and calls ATraceCore::ServerTryLoosePickup — the same poll a real match runs every
+// tick. Nothing here re-derives which end the Core should be at or who should be refused; both come
+// out of the shipping functions, because a probe that computes its own expected answer agrees with
+// itself on a build where the rule has been deleted.
+//
+// IT DOES NOT TOUCH THE SCOREBOARD. The restarts are driven directly rather than through
+// NotifyScored, so running the probe cannot change who is winning — and it steps at
+// KickoffProbeBeatSeconds so each placement has replicated before the next assertion reads it.
+//
+// WHAT A GREEN RUN LOOKS LIKE:
+//     [KickoffProbe] ===== DEMO 29 §3 =====
+//     [KickoffProbe]   PASS  half start: the Core is loose and at rest on the centre pillar
+//     [KickoffProbe]   PASS  half start: the deck is 700 uu above the floor - there is a climb
+//     [KickoffProbe]   PASS  half start: neither team is locked out
+//     [KickoffProbe]   PASS  half start: Blue retrieved it by touch
+//     [KickoffProbe]   PASS  half start: Orange retrieved it by touch
+//     [KickoffProbe]   PASS  Blue scored: the Core is in front of Orange's goal
+//     [KickoffProbe]   PASS  Blue scored: Blue is locked out, Orange is not
+//     [KickoffProbe]   PASS  Blue scored: Blue stood on the Core and was REFUSED
+//     [KickoffProbe]   PASS  Blue scored: Orange stood on the Core and TOOK it
+//     ... the same four for Orange scoring ...
+//     [KickoffProbe] ===== DONE: 13 passed, 0 FAILED, 0 skipped =====
+// =================================================================================================
+
+namespace TraceCoreKickoffProbe
+{
+	/** Seconds between steps. One replication cadence and a couple of ticks, not a wall-clock guess. */
+	static constexpr float BeatSeconds = 0.35f;
+
+	/**
+	 * How far above the field floor the pillar's deck must be before the probe will call it a CLIMB.
+	 *
+	 * Two player heights (352 uu at the shipped capsule) is the arena's own language for "you cannot
+	 * walk onto this" — it is the height ATraceArenaBuilder gives its 2x cover blocks, which need a
+	 * jump and a mantle. Anything under it is a step, and the owner asked for a pillar.
+	 */
+	static constexpr double MinClimbUU = 352.0;
+
+	/** A living pawn on @p Team, preferring one that is not already holding the Core. */
+	static ATraceCharacter* FindLivingOn(const TArray<ATraceCharacter*>& Roster, ETraceTeam Team,
+		const ATraceCharacter* Except)
+	{
+		for (ATraceCharacter* Candidate : Roster)
+		{
+			if (IsValid(Candidate) && Candidate != Except && Candidate->IsAlive()
+				&& Candidate->GetTeam() == Team)
+			{
+				return Candidate;
+			}
+		}
+		return nullptr;
+	}
+}
+
+void ATraceCore::StartKickoffProbe()
+{
+	if (!HasAuthority())
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[KickoffProbe] server only — this is a rule about what the SERVER lets a pawn do."));
+		return;
+	}
+
+	if (KickoffProbeStep >= 0)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[KickoffProbe] already running (step %d)."), KickoffProbeStep);
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	ATraceGameMode* GameMode = (World != nullptr) ? World->GetAuthGameMode<ATraceGameMode>() : nullptr;
+	if (GameMode == nullptr)
+	{
+		UE_LOG(LogTraceGame, Error, TEXT("[KickoffProbe] no ATraceGameMode; nothing to drive."));
+		return;
+	}
+
+	if (!IsModeB())
+	{
+		// NOT A FAILURE, AND IT MUST NOT BE REPORTED AS ONE. Mode A has no loose Core, so "retrieve"
+		// and "locked out" have no mechanism to be true or false about. The PLACEMENT half of §3 still
+		// applies there and is covered by the capture, not by this.
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[KickoffProbe] this match is in mode A (endzones), where the Core is a possession ")
+			TEXT("status and there is nothing to walk onto. Run it in goals mode (?mode=b, or the ")
+			TEXT("shipped DefaultGame.ini default)."));
+		return;
+	}
+
+	KickoffProbeStep = 0;
+	KickoffProbePassCount = 0;
+	KickoffProbeFailCount = 0;
+	KickoffProbeSkipCount = 0;
+	KickoffProbeSubject = nullptr;
+
+	UE_LOG(LogTraceGame, Display, TEXT("[KickoffProbe] ===== DEMO 29 §3 ====="));
+
+	World->GetTimerManager().SetTimer(KickoffProbeHandle, this, &ATraceCore::RunKickoffProbeStep,
+		TraceCoreKickoffProbe::BeatSeconds, /*bLoop=*/true, /*FirstDelay=*/TraceCoreKickoffProbe::BeatSeconds);
+}
+
+void ATraceCore::RunKickoffProbeStep()
+{
+	UWorld* World = GetWorld();
+	ATraceGameMode* GameMode = (World != nullptr) ? World->GetAuthGameMode<ATraceGameMode>() : nullptr;
+	ATraceGameState* GameState = (World != nullptr) ? World->GetGameState<ATraceGameState>() : nullptr;
+
+	if (World == nullptr || GameMode == nullptr || GameState == nullptr)
+	{
+		if (World != nullptr)
+		{
+			World->GetTimerManager().ClearTimer(KickoffProbeHandle);
+		}
+		KickoffProbeStep = -1;
+		return;
+	}
+
+	const auto Pass = [this](const TCHAR* What)
+	{
+		++KickoffProbePassCount;
+		UE_LOG(LogTraceGame, Display, TEXT("[KickoffProbe]   PASS  %s"), What);
+	};
+	const auto Fail = [this](const TCHAR* What)
+	{
+		++KickoffProbeFailCount;
+		UE_LOG(LogTraceGame, Error, TEXT("[KickoffProbe]   FAIL  %s"), What);
+	};
+	const auto Skip = [this](const TCHAR* What)
+	{
+		++KickoffProbeSkipCount;
+		UE_LOG(LogTraceGame, Warning, TEXT("[KickoffProbe]   SKIP  %s"), What);
+	};
+
+	/** Puts @p Who exactly where the Core is, remembering where they were so it can be undone. */
+	const auto Stage = [this](ATraceCharacter* Who) -> bool
+	{
+		if (!IsValid(Who))
+		{
+			return false;
+		}
+		KickoffProbeSubject = Who;
+		KickoffProbeSubjectHome = Who->GetActorLocation();
+
+		// ONTO the Core, not beside it: ServerTryLoosePickup measures to the CAPSULE surface, so a
+		// pawn whose capsule contains the ball is at distance zero and is unambiguously "standing on
+		// it". No sweep — the point is to be there, not to walk there.
+		Who->SetActorLocation(FVector(LooseLocation), /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+		return true;
+	};
+
+	/** Puts the staged pawn back. Safe to call when nothing is staged. */
+	const auto Unstage = [this]()
+	{
+		if (ATraceCharacter* Who = KickoffProbeSubject.Get())
+		{
+			Who->SetActorLocation(KickoffProbeSubjectHome, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+		}
+		KickoffProbeSubject = nullptr;
+	};
+
+	TArray<ATraceCharacter*> Roster;
+	GatherCharacters(Roster);
+
+	const int32 Step = KickoffProbeStep++;
+
+	switch (Step)
+	{
+	// --- HALF START ------------------------------------------------------------------------------
+	case 0:
+		GameMode->KickoffCoreForHalf(GameState->GetCurrentHalf());
+		break;
+
+	case 1:
+	{
+		if (!bLoose || IsValid(Carrier))
+		{
+			Fail(TEXT("half start: the Core should be loose and held by nobody"));
+			break;
+		}
+		Pass(TEXT("half start: the Core is loose and held by nobody"));
+
+		if (!bLooseAtRest)
+		{
+			Fail(TEXT("half start: the Core should be AT REST on the deck, not falling"));
+		}
+		else
+		{
+			Pass(TEXT("half start: the Core is at rest on the deck"));
+		}
+
+		// THE CLIMB, measured rather than asserted by eye. The deck height is the whole of "teams must
+		// climb up", and it is a property of the LEVEL — so a level with no pillar is reported as a
+		// skip, not as a failure of this code.
+		AActor* Pillar = nullptr;
+		const FVector Surface = ATraceCore::GetHalfStartCoreSurface(World, &Pillar);
+		const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World);
+		const double FloorZ = (Arena != nullptr) ? Arena->GetFieldBounds().Min.Z : 0.0;
+		const double Climb = Surface.Z - FloorZ;
+
+		if (Pillar == nullptr)
+		{
+			Skip(TEXT("half start: this level has no centre octagon, so there is nothing to climb"));
+		}
+		else if (Climb >= TraceCoreKickoffProbe::MinClimbUU)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[KickoffProbe]   (the deck of '%s' is %.0f uu above the floor; a climb is >= %.0f)"),
+				*GetNameSafe(Pillar), Climb, TraceCoreKickoffProbe::MinClimbUU);
+			Pass(TEXT("half start: the deck is high enough that it has to be climbed"));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[KickoffProbe]   (the deck of '%s' is only %.0f uu above the floor)"),
+				*GetNameSafe(Pillar), Climb);
+			Fail(TEXT("half start: the Core can be walked onto — that is not a pillar"));
+		}
+
+		// The Core's centre must be ON the surface the placement claimed, within a unit or two.
+		const double Above = FVector(LooseLocation).Z - Surface.Z;
+		const double Wanted = static_cast<double>(TraceModeBTuning::CollisionRadius);
+		if (FMath::Abs(Above - Wanted) <= 2.0
+			&& FVector::DistSquaredXY(FVector(LooseLocation), Surface) <= 4.0)
+		{
+			Pass(TEXT("half start: the Core sits exactly one collision radius above the pillar's deck"));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[KickoffProbe]   (Core at %s, deck at %s: %.1f uu above it, wanted %.1f)"),
+				*FVector(LooseLocation).ToCompactString(), *Surface.ToCompactString(), Above, Wanted);
+			Fail(TEXT("half start: the Core is not resting on the deck it was placed on"));
+		}
+
+		if (IsTeamLockedOutOfCore(ETraceTeam::Blue) || IsTeamLockedOutOfCore(ETraceTeam::Orange))
+		{
+			Fail(TEXT("half start: a half start must lock NOBODY out — both teams contest it"));
+		}
+		else
+		{
+			Pass(TEXT("half start: neither team is locked out"));
+		}
+		break;
+	}
+
+	case 2:
+	case 4:
+	{
+		// RETRIEVAL, once per team. Walk a pawn onto the Core and run the real poll.
+		const ETraceTeam Team = (Step == 2) ? ETraceTeam::Blue : ETraceTeam::Orange;
+		ATraceCharacter* Subject = TraceCoreKickoffProbe::FindLivingOn(Roster, Team, nullptr);
+		if (Subject == nullptr || !Stage(Subject))
+		{
+			Skip(TEXT("half start: nobody alive on that team to walk onto the Core"));
+			break;
+		}
+
+		const bool bTook = ServerTryLoosePickup();
+		if (bTook && Carrier == Subject)
+		{
+			Pass((Team == ETraceTeam::Blue)
+				? TEXT("half start: Blue retrieved the Core by standing on it")
+				: TEXT("half start: Orange retrieved the Core by standing on it"));
+		}
+		else if (IsValid(Carrier))
+		{
+			Skip(TEXT("half start: somebody else reached the Core first"));
+		}
+		else
+		{
+			Fail((Team == ETraceTeam::Blue)
+				? TEXT("half start: Blue stood on the Core and did NOT get it")
+				: TEXT("half start: Orange stood on the Core and did NOT get it"));
+		}
+
+		Unstage();
+		break;
+	}
+
+	case 3:
+		// Put it back on the pillar so the other team gets the same test from the same state.
+		GameMode->KickoffCoreForHalf(GameState->GetCurrentHalf());
+		break;
+
+	// --- AFTER A GOAL, both ways round -----------------------------------------------------------
+	case 5:
+	case 9:
+	{
+		const ETraceTeam Scorer = (Step == 5) ? ETraceTeam::Blue : ETraceTeam::Orange;
+		GameMode->KickoffCoreAfterGoal(Scorer);
+		break;
+	}
+
+	case 6:
+	case 10:
+	{
+		const ETraceTeam Scorer = (Step == 6) ? ETraceTeam::Blue : ETraceTeam::Orange;
+		const ETraceTeam ScoredOn = TraceOpposingTeam(Scorer);
+
+		const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World);
+		const float DefendedSign = GameState->GetDefendedEndSign(ScoredOn);
+		const double PlaneX = (Arena != nullptr) ? static_cast<double>(Arena->GetGoalPlaneX()) : 0.0;
+		const double CoreX = FVector(LooseLocation).X;
+
+		// IN FRONT OF THEIR GOAL: the same side of the halfway line as the end they defend, and on the
+		// PITCH side of the goal plane rather than in the pocket behind it.
+		const bool bRightEnd = (DefendedSign < 0.f) ? (CoreX < 0.0) : (CoreX > 0.0);
+		const bool bInFront = FMath::Abs(CoreX) < PlaneX;
+
+		if (bLoose && bLooseAtRest && !IsValid(Carrier) && bRightEnd && bInFront)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[KickoffProbe]   (%s conceded; they defend %cX, goal plane |X| %.0f, Core at X %.0f — ")
+				TEXT("%.0f uu in front of it)"),
+				*TraceTeamName(ScoredOn).ToString(), (DefendedSign < 0.f) ? TEXT('-') : TEXT('+'),
+				PlaneX, CoreX, PlaneX - FMath::Abs(CoreX));
+			Pass((Scorer == ETraceTeam::Blue)
+				? TEXT("Blue scored: the Core is loose in front of Orange's own goal")
+				: TEXT("Orange scored: the Core is loose in front of Blue's own goal"));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[KickoffProbe]   (loose=%d atRest=%d holder=%s rightEnd=%d inFront=%d, X %.0f vs plane %.0f)"),
+				bLoose ? 1 : 0, bLooseAtRest ? 1 : 0, *GetNameSafe(Carrier),
+				bRightEnd ? 1 : 0, bInFront ? 1 : 0, CoreX, PlaneX);
+			Fail((Scorer == ETraceTeam::Blue)
+				? TEXT("Blue scored: the Core is not in front of Orange's goal")
+				: TEXT("Orange scored: the Core is not in front of Blue's goal"));
+		}
+
+		if (IsTeamLockedOutOfCore(Scorer) && !IsTeamLockedOutOfCore(ScoredOn))
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[KickoffProbe]   (window open for %.1fs more; %s locked out, %s may pull)"),
+				GetTurnoverSecondsRemaining(), *TraceTeamName(GetTurnoverLockoutTeam()).ToString(),
+				*TraceTeamName(GetTurnoverPullingTeam()).ToString());
+			Pass((Scorer == ETraceTeam::Blue)
+				? TEXT("Blue scored: Blue is locked out and Orange is not")
+				: TEXT("Orange scored: Orange is locked out and Blue is not"));
+		}
+		else
+		{
+			Fail((Scorer == ETraceTeam::Blue)
+				? TEXT("Blue scored: the lockout does not name Blue and only Blue")
+				: TEXT("Orange scored: the lockout does not name Orange and only Orange"));
+		}
+		break;
+	}
+
+	case 7:
+	case 11:
+	{
+		// THE REFUSAL. A pawn from the SCORING team stands on the Core and must not get it.
+		const ETraceTeam Scorer = (Step == 7) ? ETraceTeam::Blue : ETraceTeam::Orange;
+		ATraceCharacter* Subject = TraceCoreKickoffProbe::FindLivingOn(Roster, Scorer, nullptr);
+		if (Subject == nullptr || !Stage(Subject))
+		{
+			Skip(TEXT("after a goal: nobody alive on the scoring team to try it"));
+			break;
+		}
+
+		const bool bTook = ServerTryLoosePickup();
+		if (!bTook && bLoose && !IsValid(Carrier))
+		{
+			Pass((Scorer == ETraceTeam::Blue)
+				? TEXT("Blue scored: Blue stood on the Core and was REFUSED")
+				: TEXT("Orange scored: Orange stood on the Core and was REFUSED"));
+		}
+		else if (IsValid(Carrier) && Carrier != Subject)
+		{
+			Skip(TEXT("after a goal: the other team collected it before the refusal could be measured"));
+		}
+		else
+		{
+			Fail((Scorer == ETraceTeam::Blue)
+				? TEXT("Blue scored: Blue took the Core they are supposed to be locked out of")
+				: TEXT("Orange scored: Orange took the Core they are supposed to be locked out of"));
+		}
+
+		Unstage();
+		break;
+	}
+
+	case 8:
+	case 12:
+	{
+		// THE PERMISSION, which is the half that stops the refusal above being satisfied by a Core
+		// nobody can pick up at all.
+		const ETraceTeam Scorer = (Step == 8) ? ETraceTeam::Blue : ETraceTeam::Orange;
+		const ETraceTeam ScoredOn = TraceOpposingTeam(Scorer);
+		ATraceCharacter* Subject = TraceCoreKickoffProbe::FindLivingOn(Roster, ScoredOn, nullptr);
+		if (Subject == nullptr || !Stage(Subject))
+		{
+			Skip(TEXT("after a goal: nobody alive on the conceding team to collect it"));
+			break;
+		}
+
+		const bool bTook = ServerTryLoosePickup();
+		if (bTook && Carrier == Subject)
+		{
+			Pass((ScoredOn == ETraceTeam::Blue)
+				? TEXT("Blue conceded: Blue stood on the Core and TOOK it")
+				: TEXT("Orange conceded: Orange stood on the Core and TOOK it"));
+		}
+		else
+		{
+			Fail((ScoredOn == ETraceTeam::Blue)
+				? TEXT("Blue conceded: Blue could not collect their own restart")
+				: TEXT("Orange conceded: Orange could not collect their own restart"));
+		}
+
+		Unstage();
+		break;
+	}
+
+	default:
+	{
+		// PUT THE MATCH BACK. The last thing the probe did was hand the Core to somebody standing in
+		// front of a goal; leaving it there would make the next thirty seconds of the match a
+		// consequence of the diagnostic rather than of the game.
+		Unstage();
+		GameMode->KickoffCoreForHalf(GameState->GetCurrentHalf());
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[KickoffProbe] ===== DONE: %d passed, %d FAILED, %d skipped ====="),
+			KickoffProbePassCount, KickoffProbeFailCount, KickoffProbeSkipCount);
+
+		if (KickoffProbeFailCount > 0)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[KickoffProbe] DEMO 29 §3 is not holding. The two placements are ")
+				TEXT("ATraceGameMode::KickoffCoreForHalf / KickoffCoreAfterGoal; the lockout is spec ")
+				TEXT("v25 §2's window, registered against the scoring team."));
+		}
+
+		World->GetTimerManager().ClearTimer(KickoffProbeHandle);
+		KickoffProbeStep = -1;
+		break;
+	}
+	}
+}
+
+// =================================================================================================
+// DEMO 29 §3 — THE CAMERA, AND THE THREE STAGED RESTARTS IT PHOTOGRAPHS
+//
+// §3 is a rule about WHERE the Core is, so half its evidence is a photograph. Two things make that
+// harder than pointing Trace.V10.Pose at a coordinate:
+//
+//   1. A SHOT FRAMED ON TYPED COORDINATES CANNOT CATCH THIS BUG. The whole claim is that the
+//      placement is DERIVED from the octagon, so a camera aimed at where the octagon happens to be
+//      today would keep photographing the right patch of air after somebody moved the pillar and the
+//      Core stopped following it. Trace.Core.Frame asks the CORE where it is instead.
+//   2. THE MOMENT IS BRIEF. A half-start Core sits on the pillar only until somebody climbs to it,
+//      and a post-goal Core only until the conceding team collects it — and after a goal every pawn
+//      is teleported home, so a headless run may never produce the second framing at all. The three
+//      Stage* commands drive the SHIPPING restart and frame it in the same frame, so the picture is
+//      of a real placement rather than of a lucky moment.
+//
+// Each Stage* command is one argv token with no spaces, so it can be handed straight to -TraceExec /
+// -TraceExec2 (which must not contain a space) rather than needing an argument.
+// =================================================================================================
+
+namespace TraceCoreStageShot
+{
+	/**
+	 * Stands the local pawn @p Standback uu back and @p Rise uu above the Core, on a bearing of
+	 * @p Yaw, looking at it. Held FLYING with the velocity zeroed for the reason Trace.V10.Pose's own
+	 * comment gives: a camera left falling is on the deck by the time -TraceAutoShot fires, and the
+	 * frame then photographs the floor instead of the shot that was composed.
+	 *
+	 * A NEGATIVE Rise IS THE INTERESTING ONE for the pillar: it puts the camera BELOW the ball,
+	 * looking up, which is the view that shows there is something to climb.
+	 */
+	static bool FrameOnCore(UWorld* World, double Standback, double Rise, double Yaw)
+	{
+		ATraceCore* Core = (World != nullptr) ? ATraceCore::Get(World) : nullptr;
+		APlayerController* PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+		ACharacter* LocalPawn = (PC != nullptr) ? Cast<ACharacter>(PC->GetPawn()) : nullptr;
+		if (Core == nullptr || LocalPawn == nullptr)
+		{
+			return false;
+		}
+
+		// The BALL, not the actor root, when the two can differ: a loose Core replicates its position
+		// in LooseLocation and the actor follows it, so either answers on the server — but on a client
+		// mid-reconciliation the replicated field is the one that is right.
+		const FVector Target = Core->IsLoose()
+			? FVector(Core->GetLooseLocation()) : Core->GetActorLocation();
+
+		const FVector Bearing = FRotator(0.0, Yaw, 0.0).Vector();
+		const FVector Where = Target - Bearing * Standback + FVector(0.0, 0.0, Rise);
+		const FRotator Aim = (Target - Where).Rotation();
+
+		LocalPawn->SetActorLocationAndRotation(Where, FRotator(0.f, Aim.Yaw, 0.f), false, nullptr,
+			ETeleportType::TeleportPhysics);
+		PC->SetControlRotation(Aim);
+		if (UCharacterMovementComponent* Movement = LocalPawn->GetCharacterMovement())
+		{
+			Movement->StopMovementImmediately();
+			Movement->SetMovementMode(MOVE_Flying);
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[CoreFrame] Core at %s (loose=%d, atRest=%d, holder %s, lockout %s) — camera at %s ")
+			TEXT("aim %s, standback %.0f, rise %.0f, bearing %.0f."),
+			*Target.ToCompactString(), Core->IsLoose() ? 1 : 0, Core->IsLooseAtRest() ? 1 : 0,
+			*GetNameSafe(Core->GetCarrier()),
+			// "nobody", not TraceTeamName(None) — that spells ETraceTeam::None "Spectator", which on a
+			// line about a LOCKOUT reads as a third team being locked out.
+			(Core->GetTurnoverLockoutTeam() == ETraceTeam::None)
+				? TEXT("nobody") : *TraceTeamName(Core->GetTurnoverLockoutTeam()).ToString(),
+			*Where.ToCompactString(), *Aim.ToCompactString(), Standback, Rise, Yaw);
+
+		return true;
+	}
+
+	/** The first world that has both a Core and a locally controlled pawn. */
+	static UWorld* FindShotWorld()
+	{
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Context.World();
+			if (World != nullptr && ATraceCore::Get(World) != nullptr
+				&& World->GetFirstPlayerController() != nullptr)
+			{
+				return World;
+			}
+		}
+		return nullptr;
+	}
+
+	/**
+	 * Drives one of the two shipping restarts and frames it.
+	 *
+	 * @param ScoringTeam  None stages a HALF START (the octagon); a real team stages the goal THEY
+	 *                     just scored, which puts the Core in front of the other end.
+	 */
+	static void StageAndFrame(ETraceTeam ScoringTeam)
+	{
+		UWorld* World = FindShotWorld();
+		ATraceGameMode* GameMode = (World != nullptr) ? World->GetAuthGameMode<ATraceGameMode>() : nullptr;
+		ATraceGameState* GameState = (World != nullptr) ? World->GetGameState<ATraceGameState>() : nullptr;
+		if (GameMode == nullptr || GameState == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[CoreFrame] no authoritative ATraceGameMode with a local pawn; nothing to stage."));
+			return;
+		}
+
+		if (ScoringTeam == ETraceTeam::None)
+		{
+			GameMode->KickoffCoreForHalf(GameState->GetCurrentHalf());
+
+			// LOW AND FAR, looking UP at the ball: the claim being photographed is "teams must climb up
+			// in order to retrieve it", and a shot from above the deck shows a ball on a floor.
+			//
+			// THE NUMBERS ARE MEASURED OFF THE PILLAR, not composed by eye. Its bounding box is
+			// 1200 x 1200 uu and its deck stands 554 uu over the floor, so 2000 uu back clears the
+			// 600 uu half-extent with room to fit the whole silhouette in frame, and a rise of -400
+			// puts the camera at Z 175 — above the deck of the arena (a deeper drop goes UNDER the
+			// floor slab and photographs its underside, which the first attempt at this did).
+			FrameOnCore(World, 2000.0, -400.0, 0.0);
+			return;
+		}
+
+		GameMode->KickoffCoreAfterGoal(ScoringTeam);
+
+		// LOOKING AT THE GOAL THE CORE IS IN FRONT OF, so the frame contains both. The bearing is read
+		// off where the placement actually put the Core rather than off the team's colour — sides swap
+		// at half time and a colour-derived camera would point at the wrong end for one of the halves.
+		const ATraceCore* Core = ATraceCore::Get(World);
+		//
+		// CLOSE, because the subject is the BALL and where it is relative to the mouth behind it. At
+		// the first attempt's 1800 uu the Core was a 20 uu orb about twenty pixels across and the
+		// frame was a picture of a ramp; 800 uu puts the ball and the hoop in the same shot.
+		const double CoreX = (Core != nullptr) ? FVector(Core->GetLooseLocation()).X : 0.0;
+		FrameOnCore(World, 800.0, 260.0, (CoreX < 0.0) ? 180.0 : 0.0);
+	}
+}
+
+/**
+ * Trace.Core.Frame [Standback] [Rise] [Yaw] — point the local camera AT THE CORE, wherever it is.
+ *
+ * The manual form, for framing a Core that a real match put somewhere interesting. The three
+ * Trace.Core.Stage* commands below are the scripted forms and take no arguments, so they survive
+ * being passed through -TraceExec.
+ */
+static FAutoConsoleCommand GTraceCoreFrameCmd(
+	TEXT("Trace.Core.Frame"),
+	TEXT("Trace.Core.Frame [Standback=900] [Rise=300] [Yaw=0] — put the local camera that far from the ")
+	TEXT("Core, that far above it (negative looks UP at it), on that bearing, looking at it. Derived ")
+	TEXT("from the Core's live position, so it frames wherever the placement rule actually put it."),
+	FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+	{
+		const double Standback = (Args.Num() > 0) ? FCString::Atod(*Args[0]) : 900.0;
+		const double Rise      = (Args.Num() > 1) ? FCString::Atod(*Args[1]) : 300.0;
+		const double Yaw       = (Args.Num() > 2) ? FCString::Atod(*Args[2]) : 0.0;
+
+		if (!TraceCoreStageShot::FrameOnCore(TraceCoreStageShot::FindShotWorld(), Standback, Rise, Yaw))
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[CoreFrame] no Core and local pawn in any world."));
+		}
+	}));
+
+/**
+ * Trace.Core.FrameLow — the pillar framing, with no arguments and NO restaging.
+ *
+ * The half-2 capture has to photograph the Core that the REAL half-time path put there — a capture
+ * that re-ran the placement itself would prove the placement function works and say nothing about
+ * whether BeginHalf(2) calls it. So that shot needs a camera command that only looks, and it needs to
+ * be one argv token because -TraceExec may not contain a space. This is that: Trace.Core.Frame's
+ * low-and-looking-up composition, frozen into a name.
+ */
+static FAutoConsoleCommand GTraceCoreFrameLowCmd(
+	TEXT("Trace.Core.FrameLow"),
+	TEXT("DEMO 29 §3(a). Points the local camera UP at the Core from 2000 uu back and 400 uu below it, ")
+	TEXT("so a Core on the centre pillar is photographed with the pillar under it. Looks only — it ")
+	TEXT("does not move the Core."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		if (!TraceCoreStageShot::FrameOnCore(TraceCoreStageShot::FindShotWorld(), 2000.0, -400.0, 0.0))
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[CoreFrame] no Core and local pawn in any world."));
+		}
+	}));
+
+/** DEMO 29 §3(a). Stage the half start on the octagon and frame it. */
+static FAutoConsoleCommand GTraceCoreStageKickoffCmd(
+	TEXT("Trace.Core.StageKickoff"),
+	TEXT("DEMO 29 §3(a). Runs the real half-start restart (the Core goes on top of the centre octagon, ")
+	TEXT("held by nobody) and points the local camera up at it. Server only."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		TraceCoreStageShot::StageAndFrame(ETraceTeam::None);
+	}));
+
+/** DEMO 29 §3(b). Stage "Blue just scored" — the Core goes in front of Orange's goal. */
+static FAutoConsoleCommand GTraceCoreStageGoalBlueCmd(
+	TEXT("Trace.Core.StageGoalBlue"),
+	TEXT("DEMO 29 §3(b). Runs the real post-goal restart for a BLUE goal: the Core spawns in front of ")
+	TEXT("the goal Orange defends, with Blue locked out, and the camera looks at both. Server only."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		TraceCoreStageShot::StageAndFrame(ETraceTeam::Blue);
+	}));
+
+/** DEMO 29 §3(b). Stage "Orange just scored" — the Core goes in front of Blue's goal. */
+static FAutoConsoleCommand GTraceCoreStageGoalOrangeCmd(
+	TEXT("Trace.Core.StageGoalOrange"),
+	TEXT("DEMO 29 §3(b). Runs the real post-goal restart for an ORANGE goal: the Core spawns in front ")
+	TEXT("of the goal Blue defends, with Orange locked out, and the camera looks at both. Server only."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		TraceCoreStageShot::StageAndFrame(ETraceTeam::Orange);
+	}));
+
+static FAutoConsoleCommand GTraceCoreKickoffProbeCmd(
+	TEXT("Trace.Core.KickoffProbe"),
+	TEXT("DEMO 29 §3. Drives both contested restarts and walks a pawn from each side onto the Core: ")
+	TEXT("proves the half-start Core is on the octagon and can be retrieved by either team, and that ")
+	TEXT("after a goal the scoring team is refused it while the conceding team is not. Server only, ")
+	TEXT("goals mode only. Does not touch the scoreboard."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* World = Context.World();
+			if (World == nullptr || World->GetNetMode() == NM_Client)
+			{
+				continue;
+			}
+
+			if (ATraceCore* Core = ATraceCore::Get(World))
+			{
+				Core->StartKickoffProbe();
+				return;
+			}
+		}
+
+		UE_LOG(LogTraceGame, Warning, TEXT("[KickoffProbe] no Core in any authoritative world."));
+	}));
 
 #endif // !UE_BUILD_SHIPPING

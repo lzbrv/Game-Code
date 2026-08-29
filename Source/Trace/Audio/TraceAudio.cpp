@@ -25,6 +25,36 @@
 // already shipped a Windows-only break that way.
 namespace TraceAudioLocal
 {
+	/**
+	 * DEMO 29 — which unwired events this process has already explained.
+	 *
+	 * ONCE PER EVENT PER PROCESS, not once per call and not a rate limiter, exactly like the
+	 * missing-sound warning: "DeathBurst is switched off" is a fact about the build, so it wants to
+	 * be in the log one time. Without it a bot match would print twenty-nine identical lines for the
+	 * death burst alone. A TSet and not a bool, so each unwired event gets its own sentence.
+	 */
+	static TSet<FName> GUnwiredExplained;
+
+	/**
+	 * Log, once, that @p Event's trigger fired and the sound deliberately did not follow.
+	 *
+	 * Log level and not Verbose: the whole point is that somebody reading an ordinary log after the
+	 * owner says "the death sound is gone" finds the reason and the way back without having to know
+	 * that a list exists.
+	 */
+	static void ExplainUnwiredOnce(FName Event)
+	{
+		if (GUnwiredExplained.Contains(Event))
+		{
+			return;
+		}
+		GUnwiredExplained.Add(Event);
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[Audio] '%s' is UNWIRED: its trigger fired and the sound did not play. %s. ")
+			TEXT("`Trace.Audio.UnwiredEvents 0` brings it (and every other unwired event) back."),
+			*Event.ToString(), TraceSoundEvents::UnwiredReason(Event));
+	}
+
 	/** The world behind any context object, or null. Never asserts, never warns. */
 	static UWorld* WorldOf(const UObject* WorldContext)
 	{
@@ -338,6 +368,17 @@ UAudioComponent* UTraceAudioSubsystem::PlayLocalNow(FName Event)
 		return nullptr;
 	}
 
+	// DEMO 29 items 9 and 11. Ahead of the device test and the resolve so an unwired event costs
+	// nothing and, more importantly, so PlaysByEvent never counts it: Trace.Audio.EventPlays is the
+	// ledger that answers "did this sound?", and a silent event that appears in it with a count
+	// would be a lie in the one instrument built to catch exactly this class of bug.
+	if (TraceSoundEvents::IsUnwired(Event))
+	{
+		++Tally.RefusedUnwired;
+		TraceAudioLocal::ExplainUnwiredOnce(Event);
+		return nullptr;
+	}
+
 	UWorld* World = GetWorld();
 	if (World == nullptr)
 	{
@@ -381,6 +422,17 @@ UAudioComponent* UTraceAudioSubsystem::PlayWorldNow(FName Event, const FVector& 
 {
 	if (!UTraceAudioSettings::Get().bSoundEffectsEnabled)
 	{
+		return nullptr;
+	}
+
+	// DEMO 29 items 9 and 11, and this is the copy that matters most: every game-side route funnels
+	// through here (Play, PlayAt's multicast body, PlayReplicatedLocal, PlayPredictedLocal), so one
+	// test covers all four and a machine RECEIVING a multicast for an unwired event stays silent
+	// even when the sender is an older build that still broadcasts it.
+	if (TraceSoundEvents::IsUnwired(Event))
+	{
+		++Tally.RefusedUnwired;
+		TraceAudioLocal::ExplainUnwiredOnce(Event);
 		return nullptr;
 	}
 
@@ -474,6 +526,16 @@ namespace TraceAudio
 		UTraceAudioSubsystem* Audio = UTraceAudioSubsystem::Get(WorldContext);
 		if (Audio == nullptr)
 		{
+			return;
+		}
+
+		// DEMO 29 items 9 and 11. PlayWorldNow would refuse this on every machine anyway; catching it
+		// HERE, on the authority, is what stops the multicast being SENT — twenty-nine unreliable
+		// RPCs per match for DeathBurst alone, to say something no receiver is allowed to play.
+		if (TraceSoundEvents::IsUnwired(Event))
+		{
+			++Audio->Counters().RefusedUnwired;
+			TraceAudioLocal::ExplainUnwiredOnce(Event);
 			return;
 		}
 
@@ -736,6 +798,18 @@ namespace TraceAudio
 
 		if (!UTraceAudioSettings::Get().bSoundEffectsEnabled)
 		{
+			return nullptr;
+		}
+
+		// DEMO 29 items 9 and 11. None of the three events unwired TODAY is a loop, so this test
+		// costs one compare and changes nothing — it is here so that "an unwired event cannot be
+		// heard" is a property of the module rather than a property of which three names happen to
+		// be on the list. Returning null is the same answer a dedicated server gets, and every
+		// caller already survives it.
+		if (TraceSoundEvents::IsUnwired(Event))
+		{
+			++Audio->Counters().RefusedUnwired;
+			TraceAudioLocal::ExplainUnwiredOnce(Event);
 			return nullptr;
 		}
 

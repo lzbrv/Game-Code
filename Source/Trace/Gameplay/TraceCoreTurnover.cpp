@@ -316,6 +316,11 @@ void ATraceCore::RegisterTurnover(ETraceTeam DroppingTeam, const FVector& Where,
 	TurnoverStartServerTime = GetServerTimeSeconds();
 	bTurnoverRegisteredThisFlight = true;
 
+	// DEMO 29 §3(b). A fresh window counts its own refusals and gets its own log budget, so the count
+	// printed on a refusal line is always about the lockout the reader is looking at.
+	LockoutRefusalCount = 0;
+	LastLockoutRefusalLogServerTime = -1.f;
+
 	// *** SPEC v28 §2. THE CoreTurnover SOUND USED TO BE PLAYED FROM HERE, AND THAT WAS THE BUG. ***
 	//
 	// v26 §9 put it on this line because this function is called "RegisterTurnover". But this function
@@ -439,11 +444,14 @@ void ATraceCore::ClearTurnover(const TCHAR* Why)
 
 	if (TurnoverLockoutTeam != ETraceTeam::None)
 	{
+		// The refusal tally is DEMO 29 §3(b)'s: how many times this window actually turned somebody
+		// away. Zero is the ordinary case (nobody went near it) and is not a failure; a non-zero
+		// number is the rule caught doing its job, on the same line as the window it belongs to.
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[ModeB] spec v25 §2: turnover window CLOSED (%s) after %.2fs - %s is no longer locked ")
-			TEXT("out and nobody may pull."),
+			TEXT("out and nobody may pull. %d pickup(s) refused while it was open."),
 			Why, GetServerTimeSeconds() - TurnoverStartServerTime,
-			*TraceTeamName(TurnoverLockoutTeam).ToString());
+			*TraceTeamName(TurnoverLockoutTeam).ToString(), LockoutRefusalCount);
 	}
 
 	TurnoverLockoutTeam = ETraceTeam::None;
@@ -784,6 +792,23 @@ bool ATraceCore::ServerTryLoosePickup()
 	const bool bLockoutActive = IsTurnoverActive();
 	const ETraceTeam PullingTeam = GetTurnoverPullingTeam();
 
+	// DEMO 29 §3(b). A locked-out player standing ON a Core they may not take is LOGGED, at most once
+	// a second, with the count for the window on the line.
+	//
+	// WHY IT EXISTS AT ALL: "the scoring team is locked out" is a rule whose entire observable effect
+	// is that nothing happens, and a rule that only ever produces silence cannot be told apart from a
+	// rule that is not running. This is the line that says it ran, in a real match, with real
+	// distances in it — the evidence the owner's report can be checked against, and the reason the
+	// lockout does not need a harness of its own to be believed.
+	//
+	// RATE-LIMITED, NOT LATCHED: the poll runs every tick and five bots can be inside the radius at
+	// once, so a per-frame line would be thousands of them across one window. One a second names the
+	// pawn that is currently closest to taking it, which is the interesting one.
+	constexpr float LockoutRefusalLogInterval = 1.0f;
+	const bool bLogRefusals = bLockoutActive
+		&& ((LastLockoutRefusalLogServerTime < 0.f)
+			|| ((Now - LastLockoutRefusalLogServerTime) >= LockoutRefusalLogInterval));
+
 	TArray<ATraceCharacter*> Candidates;
 	GatherCharacters(Candidates);
 
@@ -804,21 +829,6 @@ bool ATraceCore::ServerTryLoosePickup()
 		// player who threw it on the very next tick and the mechanic would not exist. Everybody else -
 		// teammate or enemy - is eligible from frame one, which is what makes interception the point.
 		if (Candidate == Thrower && Now < SelfLockoutEnd)
-		{
-			continue;
-		}
-
-		// *** SPEC v25 §2. THE 5 s LOCKOUT IS ON THE TEAM THAT DROPPED IT. ***
-		//
-		// Row 2 of the table: during the window only the opposing team may pick the Core up, and this
-		// is the whole of that half of it. Row 3 needs no code - IsTurnoverActive() goes false when the
-		// window expires and the loop is back to "first contact, anyone", which is exactly "either team
-		// can pick up the core by running over it".
-		//
-		// Written against the TEAM and not against LooseThrower on purpose: the thrower's own
-		// lockout above is a 0.35 s anti-self-catch on ONE pawn, and this is a 5 s rule about a SIDE.
-		// Conflating them would let a team-mate of the thrower jog over and reclaim the turnover.
-		if (bLockoutActive && Candidate->GetTeam() != PullingTeam)
 		{
 			continue;
 		}
@@ -844,6 +854,42 @@ bool ATraceCore::ServerTryLoosePickup()
 
 		if (DistanceSq > static_cast<double>(Radius) * static_cast<double>(Radius))
 		{
+			continue;
+		}
+
+		// *** SPEC v25 §2. THE 5 s LOCKOUT IS ON THE TEAM THAT DROPPED IT — AND, SINCE DEMO 29 §3(b),
+		// ON THE TEAM THAT JUST SCORED. ***
+		//
+		// Row 2 of the table: during the window only the opposing team may pick the Core up, and this
+		// is the whole of that half of it. Row 3 needs no code - IsTurnoverActive() goes false when the
+		// window expires and the loop is back to "first contact, anyone", which is exactly "either team
+		// can pick up the core by running over it".
+		//
+		// Written against the TEAM and not against LooseThrower on purpose: the thrower's own
+		// lockout above is a 0.35 s anti-self-catch on ONE pawn, and this is a 5 s rule about a SIDE.
+		// Conflating them would let a team-mate of the thrower jog over and reclaim the turnover.
+		//
+		// THROUGH IsTeamLockedOutOfCore() SO THERE IS ONE COPY OF IT. The post-goal lockout and the
+		// probe that proves it both ask that function; a second hand-written comparison here is how
+		// two tests come to disagree. It is the same expression this line always was, ETraceTeam::None
+		// included. Moved BELOW the radius test, which is a pure filter reorder and changes no
+		// verdict — it is what lets the refusal below report a real distance.
+		if (IsTeamLockedOutOfCore(Candidate->GetTeam()))
+		{
+			++LockoutRefusalCount;
+
+			if (bLogRefusals)
+			{
+				LastLockoutRefusalLogServerTime = Now;
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[Core] DEMO 29 §3(b) LOCKOUT REFUSED %s (%s) at %.0f uu from the Core — %s may ")
+					TEXT("not take it for another %.1fs; %s may. %d refusals this window."),
+					*GetNameSafe(Candidate), *TraceTeamName(Candidate->GetTeam()).ToString(),
+					FMath::Sqrt(DistanceSq),
+					*TraceTeamName(TurnoverLockoutTeam).ToString(), GetTurnoverSecondsRemaining(),
+					*TraceTeamName(PullingTeam).ToString(), LockoutRefusalCount);
+			}
+
 			continue;
 		}
 
@@ -924,6 +970,13 @@ void ATraceCore::ClearLooseState()
 	bLoose = false;
 	bLooseAtRest = false;
 	bLooseFromThrow = false;
+
+	// DEMO 29 §3. The placement is over the instant the Core stops being loose — somebody took it,
+	// a goal reset it, the mode changed. Cleared HERE, at the one funnel every one of those paths
+	// runs through, so the flag can never describe a Core that is now in somebody's hands and hold
+	// the reset backstop open against a possession it knows nothing about.
+	bContestedKickoff = false;
+	ContestedFallbackTeam = ETraceTeam::None;
 	CatchZoneTarget = nullptr;
 	bCatchZoneContested = false;   // Spec v13 §5: a new flight starts its own contest.
 	ForgetLastContact();           // Spec v13 §8: and its own contact history, Demo 27's actor with it.

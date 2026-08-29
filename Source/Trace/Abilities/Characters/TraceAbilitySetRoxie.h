@@ -33,6 +33,25 @@
 //        "launches her BACKWARDS"  ApplySelfLaunch(), which writes ROXIE's velocity and nothing else's.
 //        THE 100             ApplyRocketDamageTo(), the ONE damage call site in this feature.
 //
+//   DEMO 29 §7 AMENDS THE 100 AND THE SIZE. Verbatim: "Make Roxie's rocket hit radius match the model,
+//             but it should only do 100 damage for direct impacts. Otherwise, the damage should fall
+//             off."
+//
+//        the size            ONE radius now — RoxieRocketHitRadiusUU at 72 uu is the touch radius, the
+//                            drawn body, the world sweep and the blast. TraceRoxieRocket.h has the
+//                            whole argument; the x1.6 drawn-only multiplier is unwired, not deleted.
+//        "direct impacts"    the projectile ACTUALLY HIT THE PAWN — the flight sweep found their
+//                            capsule within the touch radius of the path. That case, and only that
+//                            case, is the flat 100.
+//        "otherwise"         ATraceRoxieRocket::ApplySplashDamage, a smoothstep falloff from half the
+//                            direct damage at the impact point to zero at the edge of the blast. It
+//                            calls the SAME ApplyRocketDamageTo, so there is still one damage call
+//                            site in this feature and the carrier rule is still enforced once.
+//        SELF-DAMAGE         still exactly 0, at every range, and structurally so: the choke point
+//                            refuses a pawn damaging itself with its own ability
+//                            (ETraceAbilityBlockReason::Self). Her rocket jump costs what it always
+//                            cost, and no retune of the falloff can change that.
+//
 //        *** THE 100 IS THE MOST DANGEROUS NUMBER ADDED TO THIS GAME. *** It is flat, it ignores hit
 //        zones, and the founding invariant says NO ABILITY MAY DAMAGE A CORE CARRIER. It is dealt with
 //        UTraceCharacterAbilitySet::DealDamage, which routes through
@@ -277,22 +296,74 @@ public:
 	/**
 	 * *** SERVER ONLY. THE ONE PLACE THIS FEATURE DEALS DAMAGE. ***
 	 *
-	 * Called by ATraceRoxieRocket on a body hit, and by Trace.Roxie.RocketCarrierTest — deliberately
-	 * the same function, so the harness measures the shipped path rather than a copy of it.
+	 * Called by ATraceRoxieRocket on a direct impact (with GetDamage(), the flat 100), by the same
+	 * actor's splash loop once per pawn the detonation caught (with a falloff amount), and by
+	 * Trace.Roxie.RocketCarrierTest — deliberately the same function for all three, so the harness
+	 * measures the shipped path rather than a copy of it and so DEMO 29's falloff did not add a second
+	 * place in this feature where health can move.
 	 *
 	 * Goes through UTraceCharacterAbilitySet::DealDamage, i.e. through
 	 * UTraceAbilityComponent::CanAffectTarget, which is where spec §4's founding invariant lives. It
-	 * therefore returns 0 for a Core carrier — always, with no knob and no exception — and for a
-	 * team-mate while friendly fire is off, and for the dead.
+	 * therefore returns 0 for a Core carrier — always, with no knob and no exception — for a team-mate
+	 * while friendly fire is off, for the dead, and for ROXIE HERSELF (the choke point's
+	 * ETraceAbilityBlockReason::Self). That last one is why her rocket jump costs nothing and why no
+	 * retune of the falloff can make it lethal.
 	 *
 	 * bHeadshot is FALSE and bMelee is FALSE, always: §2 says the rocket deals its damage "anywhere on
-	 * the body — no headshot/body distinction", so this feature never looks up a hit zone.
+	 * the body — no headshot/body distinction", so this feature never looks up a hit zone. That is
+	 * still true of the falloff, which varies with DISTANCE FROM THE BLAST and never with where on a
+	 * body it lands.
 	 *
-	 * @return the damage actually dealt. 0 means the choke point refused, and the rocket flies ON
-	 *         through that target rather than detonating — see the comment in
+	 * @param DamageAmount the points to ask for. CLAMPED HERE to [0, TraceRoxieRocket::GetDamage()],
+	 *                     which makes "only direct impacts do 100" a property of this function rather
+	 *                     than a promise about its callers: nothing in the game can route more than the
+	 *                     direct-hit knob through the rocket, whatever it computes.
+	 * @return the damage actually dealt. 0 means the choke point refused, and on a direct hit the
+	 *         rocket flies ON through that target rather than detonating — see the comment in
 	 *         ATraceRoxieRocket::TickFlightAuthority for why a carrier must not become a rocket shield.
 	 */
-	float ApplyRocketDamageTo(ATraceCharacter* Victim);
+	float ApplyRocketDamageTo(ATraceCharacter* Victim, float DamageAmount);
+
+	// =============================================================================================
+	// DEMO 29 ITEM 7 — THE DETONATION RECORD
+	//
+	// One rocket's last detonation, as data, so that "the damage falls off" can be a MEASURED TABLE
+	// instead of a reading of the arithmetic. Written by ATraceRoxieRocket::ApplySplashDamage as it
+	// deals each hit, read by Trace.Roxie.RocketFalloffTest, and cleared at the start of every
+	// detonation so a run can never report the previous rocket's numbers.
+	//
+	// It is a plain member and not #if !UE_BUILD_SHIPPING, for the reason every harness seam in this
+	// file is: the shipping path must be the path that was tested. It costs one TArray reset and at
+	// most one small append per pawn caught in a blast, once per rocket, on the server.
+	// =============================================================================================
+
+	/** One pawn's share of one detonation, exactly as the shipped code computed it. */
+	struct FRocketDetonationHit
+	{
+		TWeakObjectPtr<ATraceCharacter> Victim;
+
+		/** uu from the detonation point to the victim's CAPSULE SURFACE. 0 for a direct impact. */
+		float SurfaceGapUU = 0.f;
+
+		/** What the falloff asked for, before the choke point had its say. */
+		float RequestedDamage = 0.f;
+
+		/** What was actually dealt. 0 means refused — carrier, team-mate, dead, or Roxie herself. */
+		float DealtDamage = 0.f;
+
+		/** True only for the pawn the projectile physically hit. Exactly one per detonation, at most. */
+		bool bDirect = false;
+	};
+
+	/** SERVER. Clears the record. Called once per detonation, before any hit is recorded. */
+	void BeginDetonationRecord();
+
+	/** SERVER. Appends one victim's line to the record. */
+	void RecordDetonationHit(ATraceCharacter* Victim, float SurfaceGapUU, float RequestedDamage,
+	                         float DealtDamage, bool bDirect);
+
+	/** The last detonation's lines, newest detonation only. Empty if the last rocket caught nobody. */
+	const TArray<FRocketDetonationHit>& GetLastDetonationRecord() const { return LastDetonationRecord; }
 
 	// =============================================================================================
 	// ACTIVATED — MODDED
@@ -473,6 +544,15 @@ private:
 
 	/** The live rocket, server side. Weak: the actor may expire or be destroyed under us. */
 	TWeakObjectPtr<ATraceRoxieRocket> LiveRocket;
+
+	/**
+	 * DEMO 29 §7. The LAST detonation's per-victim lines. See FRocketDetonationHit above.
+	 *
+	 * A plain TArray whose storage is RESET rather than EMPTIED between detonations, so after the
+	 * first rocket of a match this costs no allocation at all — a 72 uu blast reaches a handful of
+	 * pawns at most and the buffer stops growing immediately.
+	 */
+	TArray<FRocketDetonationHit> LastDetonationRecord;
 
 	/**
 	 * The rocket's cooldown as the PRESSING machine believes it, on the shared match clock.

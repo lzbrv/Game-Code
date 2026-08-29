@@ -226,3 +226,12 @@
 # ------------------------------------------------------------------------------
 # Keep lock files out of code review diffs (still versioned, still merged).
 *.lock     -diff
+
+# ── Generated audition page ────────────────────────────────────────────────
+# Art/Sounds/sound-test.html embeds every sound in the game as a base64 data URI
+# so it plays with no server and no network. That makes it ~7 MB, and it is
+# REGENERATED whenever the bank changes (Scripts/generate_sound_page.py) — so
+# without this rule every regeneration would add another multi-megabyte blob to
+# git history and to every clone, forever. Ordinary .html stays out of LFS; this
+# one generated artefact does not.
+Art/Sounds/sound-test.html filter=lfs diff=lfs merge=lfs -text

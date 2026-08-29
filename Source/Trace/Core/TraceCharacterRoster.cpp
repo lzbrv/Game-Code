@@ -82,6 +82,40 @@ namespace TraceCharacterRosterFile
 	 * Change a word here and regenerate, and the assets follow. Change a word in an asset and this
 	 * does not follow — Trace.VerifyCharacterData is what tells you.
 	 */
+	// =============================================================================================
+	// *** DEMO 29 ITEM 1 — THE TEN GENERATED BODIES ARE UNWIRED, NOT DELETED. ***
+	//
+	// The owner played the overhaul and reported: "The third person view models are extremely messed
+	// up, teleporting around and stretching at extreme angles. It's impossible to shoot at anyone."
+	// He is right, and the cause is NOT the bodies. Every one of the ten rows below therefore has an
+	// EMPTY BodyMeshPath and an EMPTY BodyAnimClassPath, which is a legal value this file has always
+	// supported and which means "Epic's Mannequin" (ATraceCharacter::ApplyCharacterBodyMesh). The ten
+	// SK_* assets, their materials, their physics assets and the shared skeleton all stay on disk,
+	// untouched; the twenty strings that pointed at them are shelved in comments beside the rows they
+	// came from.
+	//
+	// WHAT IS ACTUALLY BROKEN, MEASURED (reports/D29-REVERTS.md §3):
+	//   Scripts/retarget_body.py bakes ABP_Unarmed onto SK_TraceBody_Skeleton with a TWO-op stack,
+	//   PelvisMotion + FKChains. It deliberately drops the engine's RootMotion op on the stated
+	//   grounds that "every sequence deliberately leaves the root in place". That is FALSE of the
+	//   sixteen MF_Unarmed_* locomotion sequences: their travel lives entirely in the ROOT track
+	//   (MF_Unarmed_Jog_Fwd's root runs 0 -> 1060.6 uu over 1.767 s with bEnableRootMotion = true).
+	//   With no RootMotion op the target root is left flat at the origin, and PelvisMotionOp — which
+	//   copies the SOURCE PELVIS'S GLOBAL transform — folds the whole of that root travel into the
+	//   target's PELVIS track. Measured on the baked asset: source root 1060.6 + source pelvis -11.0
+	//   = 1049.6, times the rig's 0.97486 uniform scale = 1023.2, and the baked pelvis reads 1023.4.
+	//   So every walking or running pawn drags its pelvis — and therefore its whole body — up to
+	//   10.3 metres away from its own capsule and snaps back at the loop point, and the blend space
+	//   lerps sixteen such tracks pulling in six different directions. That is the teleporting, the
+	//   stretching, and the reason bullets miss a body that is not where it is drawn.
+	//
+	// RESTORING THEM, once retarget_body.py is fixed and the bake re-run:
+	//   1. put the twenty shelved strings back into the twenty slots marked "SHELVED, Demo 29 item 1"
+	//      (mesh and anim class TOGETHER — a mesh without its anim class is a bind pose);
+	//   2. chmod u+w Content/Trace/Data/Characters/*.uasset and re-run
+	//      Scripts/generate-data-assets.py, or the assets will keep serving the empty paths;
+	//   3. re-run Trace.VerifyCharacterData, and then a THIRD-PERSON MOVING capture, not a census.
+	// =============================================================================================
 	const TArray<TraceCharacterRoster::FTraceCharacterEntry>& GetCppTable()
 	{
 		static const TArray<TraceCharacterRoster::FTraceCharacterEntry> Table =
@@ -98,44 +132,32 @@ namespace TraceCharacterRosterFile
 				     "INCLUDING THE CORE CARRIER, AND YOU CAN SHOOT WHILE RIDING."),
 				20.f,
 				FLinearColor(0.80f, 1.00f, 0.25f, 1.f),   // acid gold #E7FF89, sRGB hue 72.2
-				// *** NO LONGER THE ONLY ROW WITH A BODY OF ITS OWN, AND NO LONGER THE FBX. *** All ten
-				// rows name a generated body now (PIPELINE_DESIGN.md §9.1). Rocco keeps his asset NAME
-				// and nothing else about the old row: SK_Rocco is re-imported by
-				// Scripts/import-characters.sh from Intermediate/Characters/rocco.glb, on the shared
-				// SK_TraceBody_Skeleton, in place of the hand-modelled RoccoTest.fbx that
-				// Scripts/import-rocco.sh used to land here. Absent on a clone that has not run the
-				// import, which is why this is a path and not a hard reference — see
-				// FTraceCharacterEntry::BodyMeshPath.
-				TEXT("/Game/Trace/Characters/Rocco/SK_Rocco.SK_Rocco"),
-				// *** 0 WAS TRUE OF THE FBX AND IS FALSE OF THE GENERATED BODY. *** The old rig was
-				// authored facing +X and needed no correction; every generated body authors facing +Y
-				// and needs the Mannequin's own -90. STILL MEASURED, not copied: import_characters.py's
-				// facing_heading() runs `Z x (LeftHand - RightHand)` on each imported asset and FAILS
-				// the import outside -90 +/- 2, and the same harness reproduces -90 on Manny as its
-				// self-check. See BodyMeshYaw's declaration for why this is measured per rig.
+				// SHELVED, Demo 29 item 1 — put this string back to re-wire Rocco's body:
+				//   TEXT("/Game/Trace/Characters/Rocco/SK_Rocco.SK_Rocco"),
+				TEXT(""),
+				// -90 IS THE MANNEQUIN'S OWN YAW (TraceCharacterLayout::MeshYaw), so this row is
+				// honest whichever body is wired: Epic's Manny is authored facing +Y and needs it,
+				// and so did the shelved generated body, which import_characters.py MEASURED at -90
+				// (facing_heading() runs `Z x (LeftHand - RightHand)` and fails the import outside
+				// -90 +/- 2). It is not read at all while BodyMeshPath is empty — see
+				// ATraceCharacter::ApplyCharacterBodyMesh, which only reads the yaw alongside a mesh.
 				-90.f,
-				// EPIC'S OWN ABP_Unarmed, RETARGETED ONTO THE SHARED BODY SKELETON by
-				// Scripts/retarget_body.py — the same blend space the Mannequin runs, baked once onto
-				// SK_TraceBody_Skeleton rather than once per character, which is the whole reason the
-				// ten bodies share a skeleton (PIPELINE_DESIGN.md §3.3). ABP_Unarmed_Rocco is gone with
-				// the FBX. Absent on a clone that has not run the retarget, which is why this is a
-				// path; see FTraceCharacterEntry::BodyAnimClassPath.
-				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				// SHELVED, Demo 29 item 1 — and this one with it, never on its own. An anim class is
+				// compiled against ONE skeleton, so ABP_Unarmed_Body only means anything on a pawn
+				// that is actually wearing SK_TraceBody_Skeleton:
+				//   TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				TEXT("")
 			},
 			// ---------------------------------------------------------------------------------
-			// AND THE OTHER NINE BODIES (PIPELINE_DESIGN.md §9.1).
+			// AND THE OTHER NINE BODIES — ALL NINE SHELVED TOO (Demo 29 item 1).
 			//
 			// Every row below ends in the same three fields for the same reason Rocco's does, so the
-			// argument is made once, there, and not nine times here. The short version: one generated
-			// GLB per character, all ten bound to the ONE shared SK_TraceBody_Skeleton, so all ten
-			// take the same -90 facing correction (measured per rig by import_characters.py, which
-			// fails the import outside -90 +/- 2) and all ten run the ONE retargeted anim class.
-			//
-			// *** THREE IDENTICAL-LOOKING VALUES ARE NOT A COPY-PASTE SMELL HERE — THEY ARE THE
-			//     DESIGN. *** Ten skeletons would have meant ten retargets and ten yaws to keep in
-			//     step; the pipeline pays for the shared skeleton precisely so these rows can be
-			//     boring. If one row ever needs a different yaw, that is the measurement telling you
-			//     its GLB was authored wrong, not a licence to hand-tune the number.
+			// argument is made once, there, and not nine times here. The short version: there WAS one
+			// generated GLB per character, all ten bound to the ONE shared SK_TraceBody_Skeleton
+			// (PIPELINE_DESIGN.md §9.1), all ten taking the same measured -90 facing correction and
+			// all ten running the ONE retargeted anim class. All ten strings are now shelved in
+			// comments beside the rows that used to carry them, for the reason the block at the top
+			// of GetCppTable() gives; the yaw stays -90 because that is also the Mannequin's.
 			// ---------------------------------------------------------------------------------
 			{
 				2, TEXT("CHUT"),
@@ -147,9 +169,13 @@ namespace TraceCharacterRosterFile
 				     "TIMER. DOES NOT STACK."),
 				20.f,
 				FLinearColor(0.35f, 0.95f, 0.37f, 1.f),   // signal green #A0F9A4, sRGB hue 122.7
-				TEXT("/Game/Trace/Characters/Chut/SK_Chut.SK_Chut"),
+				// SHELVED, Demo 29 item 1 — put this string back to re-wire Chut's body:
+				//   TEXT("/Game/Trace/Characters/Chut/SK_Chut.SK_Chut"),
+				TEXT(""),
 				-90.f,
-				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				// SHELVED, Demo 29 item 1 — and this one with it, never on its own:
+				//   TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				TEXT("")
 			},
 			{
 				3, TEXT("MACE"),
@@ -161,9 +187,13 @@ namespace TraceCharacterRosterFile
 				     "MOMENTUM CEILING. ANY MOVEMENT INPUT CANCELS. YOU CAN SHOOT AND BE SHOT WHILE PULLED."),
 				20.f,
 				FLinearColor(0.74f, 0.55f, 0.99f, 1.f),   // violet #DFC4FE, sRGB hue 267.9
-				TEXT("/Game/Trace/Characters/Mace/SK_Mace.SK_Mace"),
+				// SHELVED, Demo 29 item 1 — put this string back to re-wire Mace's body:
+				//   TEXT("/Game/Trace/Characters/Mace/SK_Mace.SK_Mace"),
+				TEXT(""),
 				-90.f,
-				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				// SHELVED, Demo 29 item 1 — and this one with it, never on its own:
+				//   TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				TEXT("")
 			},
 			{
 				4, TEXT("OYSTER"),
@@ -186,9 +216,13 @@ namespace TraceCharacterRosterFile
 				     "BACK, SO THE 20S IS A CEILING, NOT A WAIT."),
 				20.f,
 				FLinearColor(0.16f, 0.78f, 0.36f, 1.f),   // deep sea green #6FE5A2, sRGB hue 145.9
-				TEXT("/Game/Trace/Characters/Oyster/SK_Oyster.SK_Oyster"),
+				// SHELVED, Demo 29 item 1 — put this string back to re-wire Oyster's body:
+				//   TEXT("/Game/Trace/Characters/Oyster/SK_Oyster.SK_Oyster"),
+				TEXT(""),
 				-90.f,
-				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				// SHELVED, Demo 29 item 1 — and this one with it, never on its own:
+				//   TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				TEXT("")
 			},
 			{
 				5, TEXT("X"),
@@ -211,9 +245,13 @@ namespace TraceCharacterRosterFile
 				     "DAMAGE. THE BEES RESUME ORBITING ONCE ALL FIVE ARE FIRED."),
 				25.f,
 				FLinearColor(1.00f, 0.40f, 0.72f, 1.f),   // rose #FFAADD, sRGB hue 324.0
-				TEXT("/Game/Trace/Characters/X/SK_X.SK_X"),
+				// SHELVED, Demo 29 item 1 — put this string back to re-wire X's body:
+				//   TEXT("/Game/Trace/Characters/X/SK_X.SK_X"),
+				TEXT(""),
 				-90.f,
-				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				// SHELVED, Demo 29 item 1 — and this one with it, never on its own:
+				//   TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				TEXT("")
 			},
 
 			// ---------------------------------------------------------------------------------
@@ -241,9 +279,13 @@ namespace TraceCharacterRosterFile
 				     "CLIP OR 5S, WHICHEVER COMES FIRST."),
 				25.f,
 				FLinearColor(1.00f, 0.12f, 0.20f, 1.f),   // ember #FF617C, sRGB hue 349.7
-				TEXT("/Game/Trace/Characters/Roxie/SK_Roxie.SK_Roxie"),
+				// SHELVED, Demo 29 item 1 — put this string back to re-wire Roxie's body:
+				//   TEXT("/Game/Trace/Characters/Roxie/SK_Roxie.SK_Roxie"),
+				TEXT(""),
 				-90.f,
-				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				// SHELVED, Demo 29 item 1 — and this one with it, never on its own:
+				//   TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				TEXT("")
 			},
 			{
 				7, TEXT("ELLE"),
@@ -265,9 +307,13 @@ namespace TraceCharacterRosterFile
 				     "CAN TELEPORT BETWEEN THEM. BOTH VANISH AFTER 8S."),
 				35.f,
 				FLinearColor(0.96f, 0.42f, 1.00f, 1.f),   // orchid #FAADFF, sRGB hue 296.3
-				TEXT("/Game/Trace/Characters/Elle/SK_Elle.SK_Elle"),
+				// SHELVED, Demo 29 item 1 — put this string back to re-wire Elle's body:
+				//   TEXT("/Game/Trace/Characters/Elle/SK_Elle.SK_Elle"),
+				TEXT(""),
 				-90.f,
-				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				// SHELVED, Demo 29 item 1 — and this one with it, never on its own:
+				//   TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				TEXT("")
 			},
 			{
 				8, TEXT("SLIMEBALL"),
@@ -279,9 +325,13 @@ namespace TraceCharacterRosterFile
 				     "NOBODY CAN SEE THROUGH IT, AND ENEMIES WALKING THROUGH ARE SLOWED 35%."),
 				25.f,
 				FLinearColor(0.33f, 0.92f, 0.16f, 1.f),   // slime #9BF66F, sRGB hue 100.4
-				TEXT("/Game/Trace/Characters/Slimeball/SK_Slimeball.SK_Slimeball"),
+				// SHELVED, Demo 29 item 1 — put this string back to re-wire Slimeball's body:
+				//   TEXT("/Game/Trace/Characters/Slimeball/SK_Slimeball.SK_Slimeball"),
+				TEXT(""),
 				-90.f,
-				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				// SHELVED, Demo 29 item 1 — and this one with it, never on its own:
+				//   TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				TEXT("")
 			},
 
 			// ---------------------------------------------------------------------------------
@@ -336,9 +386,13 @@ namespace TraceCharacterRosterFile
 				     "CARRIER."),
 				20.f,
 				FLinearColor(0.11f, 0.46f, 0.36f, 1.f),   // patinated steel #5DB5A2, sRGB hue 167.0
-				TEXT("/Game/Trace/Characters/Mortimer/SK_Mortimer.SK_Mortimer"),
+				// SHELVED, Demo 29 item 1 — put this string back to re-wire Mortimer's body:
+				//   TEXT("/Game/Trace/Characters/Mortimer/SK_Mortimer.SK_Mortimer"),
+				TEXT(""),
 				-90.f,
-				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				// SHELVED, Demo 29 item 1 — and this one with it, never on its own:
+				//   TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				TEXT("")
 			},
 			{
 				// DEMO 19 ITEMS 8 AND 4 MADE BOTH OF LILY'S FIRST TWO STRINGS UNTRUE, so both moved.
@@ -356,9 +410,13 @@ namespace TraceCharacterRosterFile
 				     "CORE UP MID-FLIGHT HALVES WHATEVER IS LEFT."),
 				30.f,
 				FLinearColor(0.48f, 0.94f, 1.00f, 1.f),   // glacier ice #B8F8FF, sRGB hue 185.9
-				TEXT("/Game/Trace/Characters/Lily/SK_Lily.SK_Lily"),
+				// SHELVED, Demo 29 item 1 — put this string back to re-wire Lily's body:
+				//   TEXT("/Game/Trace/Characters/Lily/SK_Lily.SK_Lily"),
+				TEXT(""),
 				-90.f,
-				TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				// SHELVED, Demo 29 item 1 — and this one with it, never on its own:
+				//   TEXT("/Game/Trace/Characters/Shared/Anims/ABP_Unarmed_Body.ABP_Unarmed_Body_C")
+				TEXT("")
 			}
 		};
 
@@ -494,10 +552,10 @@ namespace TraceCharacterRosterFile
 			const int32 ActivatedNameIndex = Storage.Strings.Add(Definition->ActivatedSlot.DisplayName);
 			const int32 ActivatedIndex = Storage.Strings.Add(Definition->ActivatedSlot.Description);
 
-			// EMPTY WHEN THE ASSET NAMES NO MESH — no longer the normal case (all ten rows name a body
-			// since PIPELINE_DESIGN.md §9.1), but still a legal one, and it is stored anyway rather than
-			// skipped, because the reserve above counts seven strings a row and an Add that only
-			// sometimes happens is an Add nobody can count.
+			// EMPTY WHEN THE ASSET NAMES NO MESH — the normal case again since Demo 29 item 1 shelved
+			// all ten body paths (see the block above GetCppTable()), and always a legal one. It is
+			// stored anyway rather than skipped, because the reserve above counts seven strings a row
+			// and an Add that only sometimes happens is an Add nobody can count.
 			const int32 BodyMeshIndex = Storage.Strings.Add(
 				Definition->BodyMesh.IsNull() ? FString() : Definition->BodyMesh.ToSoftObjectPath().ToString());
 			const int32 BodyAnimIndex = Storage.Strings.Add(

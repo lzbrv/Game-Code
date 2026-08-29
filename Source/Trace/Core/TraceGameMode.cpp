@@ -1761,9 +1761,11 @@ void ATraceGameMode::NotifyScored(ETraceTeam ScoringTeam)
 		switch (KickoffMode)
 		{
 		case ECoreKickoffMode::ScoredOnTeam:
-			// American-football logic, and the spec's stated assumption: the team that conceded
-			// restarts with the Core in their own endzone.
-			GrantCoreToTeam(TraceOpposingTeam(ScoringTeam));
+			// DEMO 29 §3(b), and it is a change of mechanism rather than of who is favoured. The
+			// American-football logic is unchanged — the team that conceded restarts with it — but the
+			// Core is no longer GRANTED to them. It spawns on the floor in front of the goal they just
+			// conceded, and the team that scored is locked out of it while they collect it.
+			KickoffCoreAfterGoal(ScoringTeam);
 			break;
 
 		case ECoreKickoffMode::AlternateTeams:
@@ -3035,16 +3037,26 @@ void ATraceGameMode::BeginHalf(int32 HalfIndex)
 	// a period of play, and it must not depend on who called it to be correct.
 	ApplyTeamSides(GetNegativeSideTeamForHalf(ClampedHalf));
 
-	// Kickoff first, pawns second: ATraceCore::KickoffTo holds the grant back for a moment exactly
-	// so the receiver is already standing on their new pad when it lands.
-	GrantCoreToTeam(GetKickoffTeamForHalf(ClampedHalf));
+	// DEMO 29 §3(a). THE HALF STARTS WITH THE CORE ON THE OCTAGON AND NOBODY HOLDING IT.
+	//
+	// This line used to be GrantCoreToTeam(GetKickoffTeamForHalf(...)) — the Core parked at the centre
+	// and appeared in a player's hands a second later. The owner's rule replaces that: "the core
+	// begins each half on top of the octagon ... Teams must climb up in order to retrieve it."
+	//
+	// Kickoff first, pawns second, exactly as before: the placement wants to be on the wire before ten
+	// pawns teleport, so a client never draws one frame of the Core where the last half left it.
+	KickoffCoreForHalf(ClampedHalf);
 	ResetPlayersToSpawns();
 
 	// The authoritative deadline is the replicated MatchEndServerTime; this timer is merely what
 	// fires on it server-side. Clients count down against the shared clock instead.
 	GetWorldTimerManager().SetTimer(MatchTimerHandle, this, &ATraceGameMode::HandleHalfExpired, Duration, false);
 
-	UE_LOG(LogTraceGame, Log, TEXT("%s started: %.0fs, %s kicks off, %s defends -X. Blue %d - Orange %d"),
+	// "kicks off" IS NO LONGER "is given the Core" — DEMO 29 §3(a). The named team is who the fallback
+	// would favour (mode A, or a deck nobody reaches); in the shipped mode the Core is on the octagon
+	// and unowned, which is what the [Core] line beside this one says.
+	UE_LOG(LogTraceGame, Log, TEXT("%s started: %.0fs, Core contested on the centre pillar (%s favoured ")
+		TEXT("if it is never retrieved), %s defends -X. Blue %d - Orange %d"),
 		*TraceGameState->GetHalfLabel(), Duration,
 		*TraceTeamName(GetKickoffTeamForHalf(ClampedHalf)).ToString(),
 		*TraceTeamName(GetNegativeSideTeamForHalf(ClampedHalf)).ToString(),
@@ -3406,6 +3418,95 @@ void ATraceGameMode::GrantCoreToTeam(ETraceTeam Team)
 	LastKickoffTeam = Team;
 
 	UE_LOG(LogTraceGame, Log, TEXT("Kickoff: the Core goes to %s."), *TraceTeamName(Team).ToString());
+}
+
+// -------------------------------------------------------------------------------------------------
+// DEMO 29 §3 — the two contested restarts
+//
+// Verbatim: "Ensure the core begins each half on top of the octagon, the newly added pillar which
+// lies in the middle of the map. Teams must climb up in order to retrieve it. After a goal, the core
+// spawns in front of the team who was scored on's goal, with the scoring team locked out."
+//
+// TWO SPAWNS, AND THEY ARE DELIBERATELY NOT ONE FUNCTION WITH A FLAG. They differ in where, in who
+// may take it, and in what happens if nobody does; writing them as one call with three arguments is
+// how the half start eventually inherits the goal's lockout by accident. Both end at
+// ATraceCore::KickoffContested, which owns the placement, the lockout and the replication — these
+// two only decide WHERE and WHO, which is the game mode's business and not the Core's.
+// -------------------------------------------------------------------------------------------------
+
+void ATraceGameMode::KickoffCoreForHalf(int32 HalfIndex)
+{
+	UWorld* World = GetWorld();
+	if (!HasAuthority() || World == nullptr)
+	{
+		return;
+	}
+
+	ATraceCore* TheCore = GetCore();
+	if (TheCore == nullptr)
+	{
+		return;
+	}
+
+	// The fallback team, NOT the receiver. Nobody receives it: it sits on the deck until somebody
+	// climbs up to it. See GetKickoffTeamForHalf's own comment for the two things this still decides.
+	const ETraceTeam FavouredTeam = GetKickoffTeamForHalf(HalfIndex);
+
+	AActor* Pillar = nullptr;
+	const FVector Surface = ATraceCore::GetHalfStartCoreSurface(World, &Pillar);
+
+	TheCore->KickoffContested(Surface, /*LockedOutTeam=*/ETraceTeam::None, FavouredTeam,
+		TEXT("half start"));
+
+	// LastKickoffTeam is bookkeeping for ECoreKickoffMode::AlternateTeams, which asks "who went last".
+	// A contested kickoff has no receiver, so the favoured team is the honest answer to that question
+	// and keeps the alternation from stalling if a match is configured that way.
+	LastKickoffTeam = FavouredTeam;
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Kickoff: half %d starts CONTESTED — the Core is on %s at %s and belongs to whoever climbs ")
+		TEXT("to it first (%s favoured only if nobody ever does)."),
+		HalfIndex,
+		(Pillar != nullptr) ? *GetNameSafe(Pillar) : TEXT("the arena's fallback spawn point"),
+		*Surface.ToCompactString(), *TraceTeamName(FavouredTeam).ToString());
+}
+
+void ATraceGameMode::KickoffCoreAfterGoal(ETraceTeam ScoringTeam)
+{
+	UWorld* World = GetWorld();
+	if (!HasAuthority() || World == nullptr || ScoringTeam == ETraceTeam::None)
+	{
+		return;
+	}
+
+	ATraceCore* TheCore = GetCore();
+	ATraceGameState* TraceGameState = GetTraceGameState();
+	if (TheCore == nullptr || TraceGameState == nullptr)
+	{
+		return;
+	}
+
+	const ETraceTeam ScoredOnTeam = TraceOpposingTeam(ScoringTeam);
+
+	// WHICH END, asked of the GameState and never derived from the team's colour. Sides swap at half
+	// time, so "Blue defends -X" is true for one half and false for the next; ATraceGameState's own
+	// header says outright that GetDefendedEndSign() is the only legal way to ask.
+	const float DefendedEndSign = TraceGameState->GetDefendedEndSign(ScoredOnTeam);
+	const FVector Surface = ATraceCore::GetPostGoalCoreSurface(World, DefendedEndSign);
+
+	// The scoring team is locked out; the conceding team is the fallback, because they are the side
+	// the restart is supposed to favour and the one standing nearest to it.
+	TheCore->KickoffContested(Surface, /*LockedOutTeam=*/ScoringTeam, ScoredOnTeam,
+		TEXT("after a goal"));
+
+	LastKickoffTeam = ScoredOnTeam;
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Kickoff: %s conceded, so the Core spawns in front of their own goal at %s (they defend ")
+		TEXT("%cX) and %s is locked out of it."),
+		*TraceTeamName(ScoredOnTeam).ToString(), *Surface.ToCompactString(),
+		(DefendedEndSign < 0.f) ? TEXT('-') : TEXT('+'),
+		*TraceTeamName(ScoringTeam).ToString());
 }
 
 void ATraceGameMode::FinishMatch(ETraceTeam WinningTeam, ETraceMatchEndReason Reason)

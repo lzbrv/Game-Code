@@ -238,6 +238,17 @@ public:
 		 * is a surf plane.
 		 */
 		FVector CrestStand = FVector::ZeroVector;
+
+		/**
+		 * DEMO 29 ITEM 4. Where the arc's TOE meets the arena FLOOR, a third of the way along the run.
+		 *
+		 * This is the point a player running along the outer lane actually arrives at, and it exists
+		 * because the owner's second complaint ("it still doesn't feel like you can surf INTO curves")
+		 * is a claim about the APPROACH, not about a ride already in progress. A rig that can only
+		 * start a ride by teleporting a pawn onto the face cannot measure it. Z is the floor, so a
+		 * capsule is placed by adding its own half height and nothing else.
+		 */
+		FVector ToeOnFloor = FVector::ZeroVector;
 	};
 
 	/**
@@ -1325,6 +1336,22 @@ protected:
 
 	/** |X| of the rail's two ends: [0] nearest the halfway line, [1] nearest the goal. */
 	void SurfRailRunX(float& OutNearX, float& OutFarX) const;
+
+	/**
+	 * DEMO 29 ITEM 4(a). |X| of the nearest solid a surfer leaving a rail can fly into — the first
+	 * approach block or lane pylon whose Y band overlaps the rail's own, or the goal line if there is
+	 * none. Swept off the same specs the build places, so a layout change moves it.
+	 */
+	float SurfRailExitObstacleX() const;
+
+	/**
+	 * DEMO 29 ITEM 4(a). How much clear lane a rail's exit needs, in uu of |X| past the junction.
+	 *
+	 * Maximised along the nose (leaving later means leaving lower AND further out, and the worst case
+	 * is not always at either end) using UTraceCharacterMovementComponent::GetSurfExitReach(), so it
+	 * tracks the movement tuning instead of carrying a copy of it.
+	 */
+	float SurfRailExitClearance() const;
 	void BuildEndzones(bool bBuildVisuals);
 
 	/**

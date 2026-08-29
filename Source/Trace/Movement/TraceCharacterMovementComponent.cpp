@@ -231,6 +231,46 @@ int32 GTraceSurfLegacyAirLimit = 0;
  * needs no saved-move state and cannot rubber-band. It must never be flipped mid-session on one end
  * of a live connection — that is a config change, not a prediction input.
  */
+/**
+ * DEMO 29 ITEM 4 — THE A/B ARM FOR THE EXIT AND ENTRY WORK.
+ *
+ * 1 restores the Patch 28 behaviour of everything Demo 29 item 4 changes about the MOVEMENT code, in
+ * the SAME BINARY:
+ *
+ *   * CanStepUp() refuses a surf plane again (and StepUp() stops refusing it), which is the flypaper
+ *     bug: MoveAlongFloor takes NEITHER of its two branches when CanStepUp() is false and the
+ *     component still reports CanCharacterStepUp(), so a walking pawn that touched a rail got no
+ *     HandleImpact and no SlideAlongSurface, did not move, and had its velocity re-derived from a
+ *     zero displacement. Measured, at every approach angle from 90 degrees down to a 20 degree
+ *     graze: 800 uu/s -> 0.
+ *   * the ground -> surf entry is off, so running at a rail does nothing;
+ *   * the exit rollout is off, so a landing deletes the ride's vertical component;
+ *   * the exit carry window is off, so the overspeed bleed starts the instant the pawn touches down.
+ *
+ * Same shape and same reasoning as GTraceSurfLegacyAirLimit above, including the Shipping guard on
+ * the READER rather than only on the console registration — that distinction is the bug W9-SHIPGUARD
+ * found in this file's last legacy arm and it is not going to be re-introduced here.
+ */
+int32 GTraceSurfLegacyExit = 0;
+
+/**
+ * True while the Patch 28 exit/entry behaviour is in force. See GTraceSurfLegacyExit.
+ *
+ * Read on both machines and on every replayed frame and a pure function of config either way, so it
+ * needs no saved-move state — but like every other legacy arm in this file it must never be flipped
+ * mid-session on one end of a live connection. It changes what CanStepUp(), StepUp(), HandleImpact(),
+ * ProcessLanded() and the ground bleed do, all of which run on the server and on every client.
+ */
+static bool IsSurfLegacyExit()
+{
+#if UE_BUILD_SHIPPING
+	return false;
+#else
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfLegacyExit"));
+	return GTraceSurfLegacyExit != 0 || bFromCommandLine;
+#endif
+}
+
 static bool IsSurfLegacyAirLimit()
 {
 #if UE_BUILD_SHIPPING
@@ -602,6 +642,10 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	SurfElapsedSeconds = 0.f;
 	SurfPeakSpeed = 0.f;
 
+	// DEMO 29 ITEM 4. Same argument: a fresh pawn is not carrying a ride's momentum either.
+	SurfExitCarryRemaining = 0.f;
+	SurfExitSpeed = 0.f;
+
 #if !UE_BUILD_SHIPPING
 	bLedgeTestWasGrounded = 0;
 
@@ -823,6 +867,24 @@ void UTraceCharacterMovementComponent::BeginPlay()
 					GetAirStrafeHardCapSpeed() * GetSurfSpeedCeilingMultiplier(),
 					GetAirStrafeHardCapSpeed(), GetSurfSpeedCeilingMultiplier(),
 					GetWallJumpMaxNormalZ());
+
+			// DEMO 29 ITEM 4, ON ITS OWN LINE for the reason every other MOVECFG line is on one: a
+			// knob that is never printed is a knob nobody can check, and these five decide whether a
+			// rail feels like a ramp or like flypaper.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MOVECFG-D29 SURF EXIT/ENTRY  groundEntry=%d minApproach=%.0f uu/s (of a %.0f uu/s "
+				     "walk limit) | exit carry %.2fs at bleed x%.2f | rollout retention %.2f | "
+				     "ceiling(any profile) %.0f uu/s | legacyArm=%d"),
+				// MaxWalkSpeed, not GetMaxSpeed(): this runs at BeginPlay with MovementMode still
+				// MOVE_None, where GetMaxSpeed() is 0 and the line would report a threshold of zero for
+				// a rule that is evaluated at runtime against 800. The two agree on a walking pawn,
+				// which is the only state the threshold is ever read in.
+				IsSurfGroundEntryEnabled() ? 1 : 0,
+				MaxWalkSpeed * FMath::Clamp(
+					TraceMoveKnob::Float(TEXT("SurfGroundEntryApproachFraction"), 0.2f), 0.02f, 1.f),
+				MaxWalkSpeed,
+				GetSurfExitCarrySeconds(), GetSurfExitCarryBleedScale(), GetSurfExitRolloutRetention(),
+				GetSurfSpeedCeilingMax(), IsSurfLegacyExit() ? 1 : 0);
 			}
 
 			// The knob hygiene check the project's own history demands. A name-bound knob that does
@@ -1785,6 +1847,110 @@ float UTraceCharacterMovementComponent::GetSurfSpeedCeilingMultiplier() const
 	return FMath::Clamp(TraceMoveKnob::Float(TEXT("SurfSpeedCeilingMultiplier"), 1.25f), 1.f, 3.f);
 }
 
+bool UTraceCharacterMovementComponent::IsSurfGroundEntryEnabled() const
+{
+	// DEMO 29 ITEM 4(b). Off restores "a rail is a thing you bump into"; see HandleImpact.
+	return IsSurfEnabled() && !IsSurfLegacyExit()
+		&& TraceMoveKnob::Bool(TEXT("bSurfGroundEntryEnabled"), true);
+}
+
+float UTraceCharacterMovementComponent::GetSurfGroundEntryMinApproachSpeed() const
+{
+	// DERIVED FROM THE PAWN'S OWN GROUND LIMIT, not typed, for the DEMO 21 reason every other ceiling
+	// in this file is: a fixed 160 uu/s would mean something different the day somebody retunes the
+	// walk speed, and the quantity this is really expressing is "a deliberate lean, not a brush".
+	//
+	// At the shipped 800 uu/s walk limit the default 0.2 is 160 uu/s of INTO-THE-FACE speed, which a
+	// pawn at full running speed reaches at 11.5 degrees off parallel. Running along the base of a
+	// rail does not trigger it; leaning into the rail does, which is the input the owner is asking to
+	// be rewarded.
+	const float Fraction = FMath::Clamp(
+		TraceMoveKnob::Float(TEXT("SurfGroundEntryApproachFraction"), 0.2f), 0.02f, 1.f);
+	return FMath::Max(1.f, GetMaxSpeed()) * Fraction;
+}
+
+float UTraceCharacterMovementComponent::GetSurfExitCarrySeconds() const
+{
+	// DEMO 29 ITEM 4(a), THE "CARRY IT ONTO THE FLAT FLOOR" CLOCK. How long the ground overspeed bleed
+	// is held off after a ride ends, and — before the pawn has landed — how long the rollout below
+	// stays available.
+	//
+	// 1.25 s is not a taste call. Measured on the shipped rail, a ride comes off the nose at
+	// 1150-1900 uu/s and the bleed (2 x excess + 400 uu/s^2) takes it back to the 800 uu/s walk limit
+	// in about 0.75 s and 900 uu — barely five capsule lengths, which is why the owner reads it as
+	// losing everything at the end of the curve. 1.25 s of held speed puts the carry at roughly
+	// 1400-2400 uu BEFORE the bleed starts, i.e. most of the way across the outer lane, which is what
+	// "carry momentum from a curve down onto the flat floor" describes.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("SurfExitCarrySeconds"), 1.25f), 0.f, 5.f);
+}
+
+float UTraceCharacterMovementComponent::GetSurfExitCarryBleedScale() const
+{
+	// What fraction of the ordinary overspeed bleed still applies during the carry. 0 holds the speed
+	// outright; 1 is a no-op and is what the legacy arm effectively runs. A scale rather than a flag
+	// so a designer can soften the carry without turning it off, and because "hold it completely for
+	// 1.25 s then drop off a cliff" is a worse feel than it sounds — the bleed resuming at full
+	// strength is a taper, not a cliff, because it is proportional to the EXCESS.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("SurfExitCarryBleedScale"), 0.f), 0.f, 1.f);
+}
+
+float UTraceCharacterMovementComponent::GetSurfExitRolloutRetention() const
+{
+	// DEMO 29 ITEM 4(a), THE MISSING HALF OF THE CURVE. 1 rotates the whole of the ride's speed into
+	// the horizontal on touchdown, which is what a curve whose tangent reached horizontal would do —
+	// the normal force does no work, so |v| is preserved and only its direction changes. 0 is the
+	// engine's own behaviour, which deletes the vertical component outright.
+	//
+	// It is 1 because the geometry CANNOT provide the flattening itself: the surf band's shallow end
+	// IS the walkable limit (44.8 degrees on this build), so the shallowest facet a rail is allowed
+	// to end on is still 47 degrees and the arc meets the floor at a KINK rather than a tangent.
+	// The code is modelling the piece of curve the collision geometry is not allowed to have.
+	return FMath::Clamp(TraceMoveKnob::Float(TEXT("SurfExitRolloutRetention"), 1.f), 0.f, 1.f);
+}
+
+float UTraceCharacterMovementComponent::GetSurfSpeedCeilingMax() const
+{
+	// THE FASTEST A SURF CAN BE ON ANY WEAPON PROFILE, which is a different question from
+	// GetSurfSpeedCeiling() and has a different consumer: the ARENA asks this one, because a rail's
+	// exit lane has to be clear for the fastest pawn that can ever come off it and not merely for the
+	// one holding a gun. GetAirStrafeHardCapSpeed() folds in the knife multiplier only while
+	// bKnifeMovementProfile is set, and it is never set on the CDO the builder reads, so the knife
+	// factor is applied explicitly here — through the same accessor the profile uses, so the two
+	// cannot drift.
+	//
+	// Deliberately NOT floored at SurfEntrySpeed: this is a property of the TUNING, not of a ride in
+	// progress, and geometry cannot be re-cut per pawn.
+	const float KnifeCap = GetAirStrafeHardCapSpeed()
+		* FMath::Max(1.f, bKnifeMovementProfile ? 1.f : GetKnifeAirStrafeHardCapMultiplier());
+	return FMath::Max(GetAirStrafeHardCapSpeed(), KnifeCap) * GetSurfSpeedCeilingMultiplier();
+}
+
+float UTraceCharacterMovementComponent::GetSurfExitReach(const float LaunchHeight,
+	const float WorldGravityZ) const
+{
+	// HOW FAR PAST THE LIP OF A SURF RAMP A SURFER CAN STILL TRAVEL, given the height they leave it
+	// at. Ballistics, with the horizontal speed at this build's absolute surf ceiling:
+	//
+	//     t = sqrt(2h/g),  reach = v_max * t
+	//
+	// This exists because ATraceArenaBuilder has to keep a rail's exit lane clear and the number it
+	// needs is a MOVEMENT number. Demo 29's exit rig found the shipped rails delivering a surfer at
+	// 1469 uu/s into the innermost approach cover 1300 uu past the end of the run — measured
+	// 1469 uu/s on the last frame of the ride and 52 uu/s on the floor. A builder that typed "leave
+	// 1500 uu clear" would be one air-cap retune away from doing it again with nothing to say so.
+	//
+	// THE WORLD'S gravity comes from the caller because a CDO has no physics volume to ask and
+	// UMovementComponent::GetGravityZ() dereferences one unconditionally. GravityScale is applied
+	// HERE rather than by the caller, so the fact that this pawn falls at 1.12g stays a property of
+	// the movement component and does not have to be re-known by the arena.
+	const float Gravity = FMath::Abs(WorldGravityZ) * FMath::Max(0.01f, GravityScale);
+	if (Gravity <= 1.f || LaunchHeight <= 0.f)
+	{
+		return 0.f;
+	}
+	return GetSurfSpeedCeilingMax() * FMath::Sqrt(2.f * LaunchHeight / Gravity);
+}
+
 float UTraceCharacterMovementComponent::GetSurfSpeedCeiling() const
 {
 	// DERIVED, NOT TYPED (the project's DEMO 21 rule). The base is GetAirStrafeHardCapSpeed(), which
@@ -1916,16 +2082,144 @@ FVector UTraceCharacterMovementComponent::LimitAirControl(float DeltaTime, const
 
 bool UTraceCharacterMovementComponent::CanStepUp(const FHitResult& Hit) const
 {
-	// NO STAIR-STEPPING ONTO A SURF FACE. See the header note: StepUp() would reject it anyway, but
-	// only after a multi-sweep round trip taken every frame a runner leans on the toe of a rail, and
-	// on faceted geometry one mis-sized facet is all it takes for one of those probes to find a
-	// walkable ledge and hand a player a staircase up a surf ramp.
-	if (Hit.IsValidBlockingHit() && IsSurfPlane(Hit.ImpactNormal))
+	// =============================================================================================
+	// DEMO 29 ITEM 4(b) — THIS FUNCTION USED TO REFUSE A SURF PLANE, AND THAT WAS THE FLYPAPER BUG.
+	//
+	// Patch 28 refused here, reasoning that StepUp() would reject a surf face anyway and that
+	// refusing at the top was one dot product instead of a multi-sweep round trip. The reasoning was
+	// right about StepUp() and wrong about what refusing HERE does, because of the shape of the
+	// engine's own caller (CharacterMovementComponent.cpp, MoveAlongFloor):
+	//
+	//     if (CanStepUp(Hit) || <hit is our movement base>)   { StepUp(); if (!stepped) { HandleImpact(); SlideAlongSurface(); } }
+	//     else if (Hit.Component.IsValid() && !Hit.Component->CanCharacterStepUp(CharacterOwner))
+	//                                                        { HandleImpact(); SlideAlongSurface(); }
+	//
+	// The rail's collision boxes DO allow CanCharacterStepUp, so a false from here took NEITHER
+	// branch: no HandleImpact, no SlideAlongSurface, no movement at all. PhysWalking then re-derives
+	// Velocity from the displacement actually achieved — which was zero — so a player who touched a
+	// rail while walking was STOPPED DEAD rather than sliding along it. Not slowed: stopped.
+	//
+	// MEASURED, -TraceSurfApproachTest, running at a rail on the flat floor at the 800 uu/s ground
+	// limit: at 90, 60, 45, 30 AND 20 degrees to the rail the planar speed after contact was 0 uu/s,
+	// every time, and the surf state was never entered. A 20 degree graze is a lean, not a collision.
+	// The four largest structures added in Patch 28 were surfaces that deleted a running player's
+	// momentum on touch — which is exactly the owner's "it still doesn't feel like you can surf into
+	// curves", from the other side.
+	//
+	// So the refusal MOVES TO StepUp() below, which MoveAlongFloor calls and whose failure it already
+	// handles by falling through to HandleImpact + SlideAlongSurface. The guarantee is unchanged and
+	// is still one dot product; what changes is that the engine's own recovery path now runs.
+	//
+	// The legacy arm puts the refusal back here for the A/B, which is what makes "800 -> 0" and
+	// "800 -> a ride" two columns of one table on one binary.
+	// =============================================================================================
+	if (IsSurfLegacyExit() && Hit.IsValidBlockingHit() && IsSurfPlane(Hit.ImpactNormal))
 	{
 		return false;
 	}
 
 	return Super::CanStepUp(Hit);
+}
+
+bool UTraceCharacterMovementComponent::StepUp(const FVector& GravDir, const FVector& Delta,
+	const FHitResult& Hit, FStepDownResult* OutStepDownResult)
+{
+	// NO STAIR-STEPPING ONTO A SURF FACE — the Patch 28 guarantee, moved here from CanStepUp() for
+	// the reason written out above. Still one dot product, still taken before any sweep, and now in
+	// the one place where a refusal means "the step-up failed" rather than "there is no impact".
+	//
+	// Super's own down-sweep would reject an unwalkable landing that ends higher than it started
+	// (CharacterMovementComponent.cpp: `if (!IsWalkable(Hit))` -> reject if the normal opposes the
+	// move or if the new location is above the old one), and a surf plane is unwalkable by
+	// construction, so this is belt-and-braces rather than the only guard. It is worth having
+	// anyway: on faceted geometry one mis-sized facet is all it takes for a probe to find a walkable
+	// ledge and hand a player a staircase up a surf ramp.
+	if (!IsSurfLegacyExit() && Hit.IsValidBlockingHit() && IsSurfPlane(Hit.ImpactNormal))
+	{
+		return false;
+	}
+
+	return Super::StepUp(GravDir, Delta, Hit, OutStepDownResult);
+}
+
+bool UTraceCharacterMovementComponent::IsSurfExitCarryActive() const
+{
+	return IsSurfEnabled() && !IsSurfLegacyExit() && SurfExitCarryRemaining > 0.f;
+}
+
+void UTraceCharacterMovementComponent::ProcessLanded(const FHitResult& Hit, float remainingTime, int32 Iterations)
+{
+	// =============================================================================================
+	// DEMO 29 ITEM 4(a) — THE ROLLOUT: THE PIECE OF CURVE THE COLLISION GEOMETRY IS NOT ALLOWED TO
+	// HAVE.
+	//
+	// A real curved ramp whose tangent reaches horizontal converts a descent into floor speed: the
+	// surface's normal force does no work, so |v| is preserved and only its direction changes. OUR
+	// RAMPS CANNOT DO THAT. The surf band's shallow end IS the engine's walkable limit (44.8 degrees
+	// on this build), so the shallowest facet a rail is allowed to end on is 47 degrees and the arc
+	// meets the floor at a KINK. The engine then does what it does at every landing —
+	// MaintainHorizontalGroundVelocity() deletes the vertical component outright — and the ride's
+	// descent is thrown away instead of being turned into speed along the floor.
+	//
+	// This is the owner's "a player should carry momentum from a curve down onto the flat floor",
+	// and it is the half of it that no amount of tuning could fix, because the number being deleted
+	// is not in any knob.
+	//
+	// IT CANNOT MANUFACTURE SPEED, and that is the whole of why it is safe. The target is capped by
+	// SurfExitSpeed — the 3D speed on the last frame the pawn was actually ON the face — so a long
+	// free fall AFTER the ride contributes nothing: fall for a second off the end of a rail and the
+	// extra 1000 uu/s of Vz is still discarded exactly as it is today. It is also capped by
+	// GetSurfSpeedCeiling(), and floored at the planar speed the landing already produced, so it can
+	// only ever ROTATE speed the ride earned into the floor and never add to it.
+	//
+	// READ BEFORE Super, WRITTEN AFTER: Super::ProcessLanded is what sets the movement mode and calls
+	// MaintainHorizontalGroundVelocity(), so the pre-landing vector only exists on this side of it,
+	// and the post-landing DIRECTION (which is the engine's, not ours) only exists on the other.
+	//
+	// PREDICTION: everything read here is either the live velocity or a saved-move field, and
+	// ProcessLanded runs inside the movement step on the client, on the server and on every replayed
+	// frame. See the header block for the two fields and why both are simulation-critical.
+	// =============================================================================================
+	const bool bRollout = !IsSurfLegacyExit()
+		&& IsSurfEnabled()
+		&& SurfExitSpeed > 0.f
+		&& (IsSurfing() || SurfExitCarryRemaining > 0.f);
+
+	const float ArrivingSpeed3D = bRollout ? static_cast<float>(Velocity.Size()) : 0.f;
+	const float RideSpeedCap = SurfExitSpeed;
+
+	Super::ProcessLanded(Hit, remainingTime, Iterations);
+
+	if (!bRollout || !IsMovingOnGround())
+	{
+		// Super can leave the pawn falling again (it re-checks the floor). Nothing is spent in that
+		// case, so the next landing inside the window still gets the rollout.
+		return;
+	}
+
+	FVector Planar(Velocity.X, Velocity.Y, 0.f);
+	const float PlanarSpeed = static_cast<float>(Planar.Size());
+	if (PlanarSpeed > UE_KINDA_SMALL_NUMBER)
+	{
+		const float Target = FMath::Min3(ArrivingSpeed3D, RideSpeedCap, GetSurfSpeedCeiling());
+		const float Rolled = PlanarSpeed
+			+ FMath::Max(0.f, Target - PlanarSpeed) * GetSurfExitRolloutRetention();
+
+		Velocity.X = (Planar.X / PlanarSpeed) * Rolled;
+		Velocity.Y = (Planar.Y / PlanarSpeed) * Rolled;
+		Velocity.Z = 0.f;
+
+#if !UE_BUILD_SHIPPING
+		SurfRolloutCount += (Rolled > PlanarSpeed + 1.f) ? 1 : 0;
+		SurfRolloutGainSum += FMath::Max(0.f, Rolled - PlanarSpeed);
+#endif
+	}
+
+	// SPENT. One rollout per ride, so a pawn that bounces, or hops during the carry, cannot roll the
+	// same descent into the floor twice. The CARRY clock is (re)armed here rather than at the surf's
+	// close so that a long flight off the end of a rail does not eat the floor carry it earned.
+	SurfExitSpeed = 0.f;
+	SurfExitCarryRemaining = GetSurfExitCarrySeconds();
 }
 
 int32 UTraceCharacterMovementComponent::GetMaxDashCharges() const
@@ -2399,8 +2693,22 @@ void UTraceCharacterMovementComponent::ApplyGroundOverspeedBleed(float DeltaTime
 	// Floored at the ground limit, never below: once the excess is gone this branch stops being
 	// taken and Super::CalcVelocity resumes on exactly the speed normal movement would allow, so
 	// there is no discontinuity at the handover.
+	//
+	// DEMO 29 ITEM 4(a) SCALES IT FOR A SHORT WINDOW AFTER A SURF, AND THAT IS THE OWNER'S "carry
+	// momentum from a curve down onto the flat floor". Measured on the shipped rail before the change:
+	// a ride arriving on the floor at 1140 uu/s was back at the 800 uu/s walk limit 0.75 s and 912 uu
+	// later — under six capsule diameters, which reads as losing it all at the bottom of the ramp. The
+	// scale is 0 by default (the speed is HELD, not merely bled more slowly) for
+	// GetSurfExitCarrySeconds(), after which the ordinary bleed resumes — and resumes as a taper, not
+	// a cliff, because it is proportional to the excess.
+	//
+	// It is a scale on the BLEED and not a second speed model: steering, the floor at the ground
+	// limit, and the handover back to Super::CalcVelocity are all unchanged, so nothing about the end
+	// of the carry is new code.
 	const float ExcessSpeed = CurrentSpeed - GroundSpeedLimit;
-	const float Bleed = (GetGroundOverspeedFriction() * ExcessSpeed + GetGroundOverspeedBraking()) * DeltaTime;
+	const float BleedScale = IsSurfExitCarryActive() ? GetSurfExitCarryBleedScale() : 1.f;
+	const float Bleed =
+		(GetGroundOverspeedFriction() * ExcessSpeed + GetGroundOverspeedBraking()) * BleedScale * DeltaTime;
 	const float NewSpeed = FMath::Max(GroundSpeedLimit, CurrentSpeed - Bleed);
 
 	Velocity.X = TravelDirection.X * NewSpeed;
@@ -3155,7 +3463,65 @@ void UTraceCharacterMovementComponent::HandleImpact(const FHitResult& Hit, float
 	// ORDERED BEFORE THE WALL-JUMP BLOCK ON PURPOSE. The two bands do not overlap (GetSurfMinNormalZ()
 	// is above GetWallJumpMaxNormalZ()), so no hit can be both — but the wall-jump block returns early
 	// when the wall jump is switched off, and surf must not be hostage to another mechanic's switch.
+	//
+	// DEMO 29 ITEM 4(b) ADDS THE OTHER HALF OF IT — see the block immediately below. The sensor itself
+	// is unchanged and still tests IsFalling(); what changed is that a WALKING pawn can now become a
+	// falling one on this very frame, a few lines earlier, and fall through into it.
 	// =============================================================================================
+
+	// =============================================================================================
+	// DEMO 29 ITEM 4(b) — SURFING INTO A CURVE FROM THE FLOOR.
+	//
+	// The owner: "It still doesn't feel like you can 'surf' into curves/curved ramps in order to gain
+	// momentum." Patch 28 measured gain on a pawn that was ALREADY on a ramp; nothing in it ever
+	// approached one. Measured with -TraceSurfApproachTest on the shipped build, running at a rail on
+	// the flat floor at the 800 uu/s ground limit, the answer was worse than "no gain": at 90, 60, 45,
+	// 30 and 20 degrees to the rail the planar speed after contact was 0 uu/s and the surf state was
+	// never entered. (CanStepUp() is why, and that is fixed there.)
+	//
+	// Restoring the slide alone would only make a rail a wall you scrape along. What a surf ramp
+	// SHOULD do to a runner is what it does to a faller, and Source has always agreed: a face you
+	// cannot stand on does not stop you, it takes you off the ground and redirects you along itself.
+	// So a walking pawn that leans into a surf plane hard enough LEAVES THE GROUND and has its
+	// velocity clipped against that plane — the identical two operations PhysFalling performs on a
+	// surfer, in Source's own order (accelerate, then clip), and then the sensor below latches the
+	// ride exactly as it would for an airborne contact.
+	//
+	// The clip is not a gift: it removes the into-the-face component like any other surf contact, so a
+	// head-on charge loses about a third of its speed and gets height instead, while a shallow lean
+	// keeps nearly all of it and gets a ride. That gradient IS the mechanic — the reward is for
+	// approaching well, and the ceiling that bounds every other surf bounds this one too.
+	//
+	// WHY IT IS SAFE TO CHANGE THE MOVEMENT MODE HERE. MoveAlongFloor is called from PhysWalking,
+	// which tests `MovementMode != StartingMovementMode` immediately afterwards, refunds the unused
+	// time and re-enters StartNewPhysics in the new mode. This is the engine's own supported flow —
+	// the same one a step-up-and-over uses — not a hole being exploited.
+	//
+	// PREDICTION: no new state. The two writes are Velocity and MovementMode, both of which the
+	// engine already snapshots and replays, and the latch below is the same saved-move state Patch 28
+	// already round-trips.
+	// =============================================================================================
+	if (IsSurfGroundEntryEnabled() && Hit.bBlockingHit && IsMovingOnGround()
+		&& MovementMode != MOVE_None && IsSurfPlane(Hit.ImpactNormal))
+	{
+		FVector EntryNormal = Hit.ImpactNormal;
+		if (EntryNormal.Normalize())
+		{
+			// The component of travel heading INTO the face. Running along the base of a rail is zero
+			// here and stays a scrape; leaning into it is what buys the ride.
+			const float ApproachSpeed = -static_cast<float>(FVector::DotProduct(Velocity, EntryNormal));
+			if (ApproachSpeed >= GetSurfGroundEntryMinApproachSpeed())
+			{
+				SetMovementMode(MOVE_Falling);
+				Velocity = ClipVelocityAgainstPlane(Velocity, EntryNormal, GetSurfOverbounce());
+
+#if !UE_BUILD_SHIPPING
+				++SurfGroundEntries;
+#endif
+			}
+		}
+	}
+
 	if (Hit.bBlockingHit && IsFalling() && MovementMode != MOVE_None && IsSurfPlane(Hit.ImpactNormal))
 	{
 		FVector PlaneNormal = Hit.ImpactNormal;
@@ -4073,6 +4439,35 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 		}
 
 		SurfPeakSpeed = FMath::Max(SurfPeakSpeed, static_cast<float>(Velocity.Size()));
+
+		// DEMO 29 ITEM 4(a). THE RIDE'S OWN SPEED, kept current every frame so that the frame the ride
+		// ENDS this already holds what it was worth. It is the cap on the exit rollout in
+		// ProcessLanded(), and it is deliberately the 3D speed rather than the planar one: on a 47-61
+		// degree face most of a descent is vertical, and the vertical part is precisely what the
+		// landing throws away and what the rollout puts back.
+		//
+		// Latched here rather than at the close because by the time the close is detected the landing
+		// has already happened and MaintainHorizontalGroundVelocity() has already deleted the Z.
+		SurfExitSpeed = static_cast<float>(Velocity.Size());
+	}
+
+	// DEMO 29 ITEM 4(a) — THE EXIT CARRY CLOCK.
+	//
+	// Armed when a ride ends, re-armed by ProcessLanded() on the touchdown that spends the rollout (so
+	// a long flight off the end of a rail cannot eat the floor carry it earned), and read by
+	// ApplyGroundOverspeedBleed(), which holds the bleed off while it runs. Ticked here with every
+	// other clock so a replayed move advances it by exactly the amount the original did.
+	//
+	// SurfExitSpeed dies with it. The two are one fact — "there is a ride's momentum in flight" — and
+	// leaving a stale cap behind after the window closed would let a much later landing roll a descent
+	// that had nothing to do with a ramp into the floor.
+	if (SurfExitCarryRemaining > 0.f)
+	{
+		SurfExitCarryRemaining = FMath::Max(0.f, SurfExitCarryRemaining - DeltaSeconds);
+		if (SurfExitCarryRemaining <= 0.f)
+		{
+			SurfExitSpeed = 0.f;
+		}
 	}
 
 	if (SurfContactRemaining > 0.f)
@@ -4110,8 +4505,20 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 			SurfElapsedSeconds = 0.f;
 			SurfEntrySpeed = 0.f;
 
+			// DEMO 29 ITEM 4(a). ARM THE CARRY. Max, not assignment, because ProcessLanded may already
+			// have armed it a few microseconds earlier on this very frame — a ride that ends BY landing
+			// goes through ProcessLanded first — and re-arming it here would silently extend that
+			// window by a frame's worth of clock every time.
+			//
+			// Not gated on the legacy arm: IsSurfExitCarryActive() and the rollout are, so the clock
+			// running is inert there, and a clock that only exists in one arm is a clock whose saved
+			// move differs between arms.
+			SurfExitCarryRemaining = FMath::Max(SurfExitCarryRemaining, GetSurfExitCarrySeconds());
+
 			// SurfPeakSpeed is deliberately NOT cleared here: it is the ride's own high-water mark and
 			// the report reads it after the ride is over. It is re-seeded by the next entry.
+			// SurfExitSpeed is not cleared either: it IS the exit, and the rollout at the next landing
+			// is what spends it. The clock above clears it if no landing arrives in time.
 		}
 	}
 
@@ -4841,6 +5248,19 @@ static FAutoConsoleVariableRef CVarTraceSurfLegacyAirLimit(
 	TEXT("Patch 28 sec 5 A/B. 1 puts UE's stock LimitAirControl back on surf planes, which deletes the "
 	     "up-slope half of the player's input and is the behaviour the override replaces. Run "
 	     "-TraceSurfTest with it on and off and diff the ideal-strafe column."),
+	ECVF_Cheat);
+
+/**
+ * DEMO 29 ITEM 4. See GTraceSurfLegacyExit's definition for what the arm restores and why.
+ */
+static FAutoConsoleVariableRef CVarTraceSurfLegacyExit(
+	TEXT("Trace.Move.SurfLegacyExit"),
+	GTraceSurfLegacyExit,
+	TEXT("Demo 29 item 4 A/B. 1 restores the Patch 28 exit and entry behaviour: CanStepUp refuses a "
+	     "surf plane (which stops a walking pawn dead instead of sliding), no ground -> surf entry, no "
+	     "exit rollout and no exit carry window. Run -TraceSurfExitTest / -TraceSurfApproachTest with "
+	     "it on and off. Use -TraceSurfLegacyExit on the command line: an ECVF_Cheat variable set from "
+	     "-ExecCmds does not reliably survive into a session."),
 	ECVF_Cheat);
 
 static FAutoConsoleVariableRef CVarTraceV18LegacyAirReverse(
@@ -8049,6 +8469,8 @@ FSavedMove_Trace::FSavedMove_Trace()
 	, SavedSurfEntrySpeed(0.f)
 	, SavedSurfElapsedSeconds(0.f)
 	, SavedSurfPeakSpeed(0.f)
+	, SavedSurfExitCarryRemaining(0.f)
+	, SavedSurfExitSpeed(0.f)
 	, bSavedKnifeMovementProfile(0)
 {
 }
@@ -8114,6 +8536,12 @@ void FSavedMove_Trace::Clear()
 	SavedSurfEntrySpeed = 0.f;
 	SavedSurfElapsedSeconds = 0.f;
 	SavedSurfPeakSpeed = 0.f;
+
+	// DEMO 29 ITEM 4. The same pooling argument, and it bites hard here: a stale carry window in a
+	// recycled move would tell a replayed GROUNDED frame to hold a speed the server was bleeding, and
+	// a stale exit speed would let the next landing anywhere in the level roll a fall into the floor.
+	SavedSurfExitCarryRemaining = 0.f;
+	SavedSurfExitSpeed = 0.f;
 
 	// Spec v10 §1. A stale knife bit would replay a move at 130% speed with the gun in hand.
 	bSavedKnifeMovementProfile = 0;
@@ -8224,6 +8652,18 @@ bool FSavedMove_Trace::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 	// bSavedMomentumActive below, so the only moves this newly refuses are the handful of grounded
 	// ones between a landing and the next slide — which is exactly the window the threshold lives in.
 	//
+	// DEMO 29 ITEM 4 ADDS ONE MORE, AND IT IS THE FIRST ITEM ON THIS LIST THAT IS LIVE WHILE THE PAWN
+	// IS ON ITS FEET. SurfExitCarryRemaining scales the ground overspeed bleed, which is a PER SUB-STEP
+	// clamp (max(limit, speed - bleed x dt)), so a merged move straddling the window's expiry bleeds a
+	// different amount than the two moves it replaced — and it decides whether a frame bleeds AT ALL,
+	// which is a bigger difference than any other entry here.
+	//
+	// Like the surf clock below it, it costs nothing in practice: the carry only matters while the
+	// pawn is over the ground limit, and IsCarryingExcessSpeed() already sets bSavedMomentumActive on
+	// exactly those moves. It is written out because the two facts are independent — somebody could
+	// lower the bleed, or raise the limit, and the coincidence would stop holding without any line
+	// changing here.
+	//
 	// PATCH 28 §5 ADDS ONE MORE, AND IT COSTS EXACTLY ZERO EXTRA REFUSALS. The surf ceiling is a
 	// per-sub-step clamp (min against max(entry, cap)), so f(2dt) != f(dt) twice the moment it binds,
 	// which is this list's founding reason. It is free because OnMovementUpdated clears the surf on
@@ -8237,7 +8677,8 @@ bool FSavedMove_Trace::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 		|| SavedSlideJumpChainBoosts > 0 || Other->SavedSlideJumpChainBoosts > 0
 		|| SavedWallJumpControlLockoutRemaining > 0.f || Other->SavedWallJumpControlLockoutRemaining > 0.f
 		|| SavedWallJumpInputBufferRemaining > 0.f || Other->SavedWallJumpInputBufferRemaining > 0.f
-		|| SavedSurfContactRemaining > 0.f || Other->SavedSurfContactRemaining > 0.f)
+		|| SavedSurfContactRemaining > 0.f || Other->SavedSurfContactRemaining > 0.f
+		|| SavedSurfExitCarryRemaining > 0.f || Other->SavedSurfExitCarryRemaining > 0.f)
 	{
 		return false;
 	}
@@ -8443,6 +8884,19 @@ void FSavedMove_Trace::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 			SavedSurfElapsedSeconds   = Movement->SurfElapsedSeconds;
 			SavedSurfPeakSpeed        = Movement->SurfPeakSpeed;
 
+			// DEMO 29 ITEM 4. NEITHER OF THESE IS SELF-HEALING, and both change what a replayed frame
+			// computes rather than merely describing it:
+			//   * SurfExitCarryRemaining decides whether the ground bleed runs on this frame at all. A
+			//     replay that lost it bleeds a frame the server held, and the two ends disagree about
+			//     several hundred uu/s within a handful of frames — on the ground, where it is most
+			//     visible.
+			//   * SurfExitSpeed is the CAP on the exit rollout. It is set from a frame that is already
+			//     in the past by the time the landing happens, so nothing in a replay can re-derive it;
+			//     a replay that lost it would land with the engine's flattened velocity while the server
+			//     rolled the ride's descent into the floor.
+			SavedSurfExitCarryRemaining = Movement->SurfExitCarryRemaining;
+			SavedSurfExitSpeed          = Movement->SurfExitSpeed;
+
 			// SPEC v10 §1. The weapon in hand at the START of this move, which is the profile the
 			// move was actually simulated under.
 			bSavedKnifeMovementProfile = Movement->bKnifeMovementProfile;
@@ -8581,6 +9035,12 @@ void FSavedMove_Trace::PrepMoveFor(ACharacter* C)
 			Movement->SurfEntrySpeed       = SavedSurfEntrySpeed;
 			Movement->SurfElapsedSeconds   = SavedSurfElapsedSeconds;
 			Movement->SurfPeakSpeed        = SavedSurfPeakSpeed;
+
+			// DEMO 29 ITEM 4. Rewind the exit too. See SetMoveFor for what each of the two decides;
+			// the short version is that one of them turns the ground bleed off and the other caps the
+			// rollout at the landing, so a replay missing either simulates a different floor.
+			Movement->SurfExitCarryRemaining = SavedSurfExitCarryRemaining;
+			Movement->SurfExitSpeed          = SavedSurfExitSpeed;
 
 			// SPEC v10 §1. Put the right weapon back in the pawn's hand before the move is replayed:
 			// GetMaxSpeed() and all three air ceilings read this bit, so a replay under the wrong one

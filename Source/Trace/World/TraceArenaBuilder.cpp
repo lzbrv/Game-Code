@@ -995,7 +995,19 @@ namespace TraceArenaConstants
 	// the field's own dimensions. See ATraceArenaBuilder::BuildSurfRails() for the level-design
 	// argument and for the clearance arithmetic these were chosen against.
 
-	/** |X| of the rail's ends, as fractions of the half length. 5600 and 11700 on the shipped field. */
+	/**
+	 * |X| of the rail's ends, as fractions of the half length. 5601 and 11700 on the shipped field.
+	 *
+	 * THE FAR ONE IS NOW A CEILING, NOT THE ANSWER. DEMO 29 item 4: a surfer leaves the exit nose as a
+	 * projectile, and at the 11700 this asks for the flight landed inside the innermost approach cover
+	 * — measured at 1469 uu/s on the last frame of the ride and 52 uu/s on the floor. SurfRailRunX()
+	 * therefore clamps it against SurfRailExitObstacleX() minus SurfRailExitClearance(), which on the
+	 * shipped field brings the far end to |X| 10610 and costs 1090 uu of main run (4868 -> 3778).
+	 *
+	 * The near one is untouched: the inner lane pylon stands at |X| 4690..4910 in this rail's Y band,
+	 * so there is only ~600 uu to be had inboard and taking it would move the access ramp's foot into
+	 * ground this pass did not measure.
+	 */
 	static constexpr float SurfRailNearXFrac = 0.2917f;
 	static constexpr float SurfRailFarXFrac  = 0.6094f;
 
@@ -1087,6 +1099,13 @@ namespace TraceArenaConstants
 	 * strafe rode the full 5,880 uu face in 3.9 s and met the end rib at 1,300 uu/s; measured exit
 	 * speeds collapsed from ~1,300 to ~150 uu/s. A fast lane that terminates in a flat face is a
 	 * mechanic that punishes the players who are best at it.
+	 *
+	 * IT FIXED THE RAIL'S OWN END AND NOT THE LANE BEYOND IT, and DEMO 29 item 4 is that second half.
+	 * Removing the wall at the end of the structure turned the exit into a LAUNCH, and the launch was
+	 * landing inside the innermost approach cover 1300 uu further out — the identical failure one
+	 * structure downrange, with identical numbers (1469 uu/s on the ride's last frame, 52 on the
+	 * floor). The nose is unchanged; what changed is that SurfRailRunX() now places the far end from
+	 * the ballistic envelope of the exit rather than from a fraction of the field.
 	 *
 	 * The nose is the SAME cross-section swept along a descending line, not a stepped-down second
 	 * ridge: the surface is continuous through the junction (only its slope kinks, which is one more
@@ -1562,6 +1581,60 @@ namespace
 		     "pre-patch arena, kept as the BEFORE arm. Read once when the arena is built - use "
 		     "-TraceNoSurfRails to get it in place before the game mode builds the arena."),
 		ECVF_Default);
+
+	/**
+	 * DEMO 29 ITEM 4(a). 1 restores the Patch 28 rail EXTENTS — the far end at 0.6094 of the half
+	 * length, with no exit-lane clearance derived at all.
+	 *
+	 * That is the arm in which a surfer leaving the nose at 1469 uu/s flies 1300 uu and hits the
+	 * innermost approach bar at 52 uu/s, which is the largest single cause of the owner's "a player
+	 * loses all momentum at the end of the curve". It exists so the fix can be shown rather than
+	 * asserted: one binary, one map, two runs of -TraceSurfExitTest.
+	 *
+	 * Like Trace.Arena.SurfRails above it, the arena is built once at BeginPlay, so use
+	 * -TraceSurfRailLegacyRun to get it in place before the game mode builds the arena.
+	 */
+	int32 GArenaSurfRailLegacyRun = 0;
+
+	// THE REGISTRATION IS DEV-ONLY AND THE READER BELOW CARRIES ITS OWN GUARD, which is the pair
+	// W9-SHIPGUARD's finding demands: guarding only one of the two is how the last legacy arm in this
+	// project shipped a live command-line switch. With both in place a UTF-16LE search of the linked
+	// Trace-Mac-Shipping finds neither "Trace.Arena.SurfRailLegacyRun" nor "TraceSurfRailLegacyRun".
+	// The int32 itself is defined unconditionally and costs four bytes: a global that only exists in
+	// one configuration is the "Shipping compiles a reader and finds no definition" link failure this
+	// project has already had once.
+#if !UE_BUILD_SHIPPING
+	FAutoConsoleVariableRef CVarArenaSurfRailLegacyRun(
+		TEXT("Trace.Arena.SurfRailLegacyRun"),
+		GArenaSurfRailLegacyRun,
+		TEXT("Demo 29 item 4 A/B. 1 restores the Patch 28 surf rail extents, whose exit lane ends in "
+		     "the innermost approach bar. Set with -TraceSurfRailLegacyRun; the arena is built once."),
+		ECVF_Cheat);
+#endif
+
+	/**
+	 * True while the Patch 28 rail extents are in force.
+	 *
+	 * THE SHIPPING GUARD IS ON THE READER AND NOT ONLY ON THE REGISTRATION, and that distinction is
+	 * not decoration — it is the exact bug W9-SHIPGUARD found in the movement slice's last legacy arm,
+	 * where a bare FParse::Param on the read line put the switch literal into the linked Shipping
+	 * artefact and left the whole arm reachable from a command line. Verified the same way: a UTF-16LE
+	 * search of Binaries/Mac/Trace-Mac-Shipping finds no "TraceSurfRailLegacyRun".
+	 *
+	 * It matters more here than for a movement knob. This one changes the LEVEL: a shipped server
+	 * launched with the switch would build rails whose exit lane ends in a wall while every client
+	 * that joined it saw the same geometry and wondered why the fast route was a trap.
+	 */
+	bool IsSurfRailLegacyRun()
+	{
+#if UE_BUILD_SHIPPING
+		return false;
+#else
+		static const bool bFromCommandLine =
+			FParse::Param(FCommandLine::Get(), TEXT("TraceSurfRailLegacyRun"));
+		return GArenaSurfRailLegacyRun != 0 || bFromCommandLine;
+#endif
+	}
 
 	int32 GArenaWallCove = 1;
 	FAutoConsoleVariableRef CVarArenaWallCove(
@@ -3917,6 +3990,17 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 //   same read the LaneStripes and the FlankRail already give the flank. Both wear the half's team
 //   colour and both are registered for the half-time repaint, like the cover and the floor grid.
 //
+// THE EXIT LANE (DEMO 29 ITEM 4). A rail's clearances are not only the ones beside it. A surfer
+// leaves the nose as a PROJECTILE and lands somewhere out in the lane, so the clearance that decides
+// whether the fast route is fun or a punishment is "what is in the LANDING zone" — and Patch 28's
+// table, which recorded 100 uu of X clear between the run's end and the innermost approach bar, was
+// answering a different question. Measured with -TraceSurfExitTest: rides left the nose at 1164, 1469
+// and 1894 uu/s and arrived on the floor at 183, 52 and 62, having flown ~1300 uu into that bar.
+// SurfRailRunX() now derives the far end from SurfRailExitObstacleX() and SurfRailExitClearance(), the
+// latter asking UTraceCharacterMovementComponent::GetSurfExitReach() how far the fastest possible
+// surfer can fly. It costs 1090 uu of main run on the shipped field and is printed at build time with
+// both numbers and a CLEAR / ENDS IN A WALL verdict, so it can never quietly stop being true.
+//
 // THE BAKE. This runs on the PROCEDURAL map only. Arena_Baked was baked before these existed and is
 // deliberately NOT re-baked here (W5-MAPFINISH records what a forced re-bake costs), so a baked level
 // has no rails until somebody bakes again — at which point these pieces come along for free, because
@@ -4021,10 +4105,168 @@ float ATraceArenaBuilder::SurfRailBackY() const
 	return FMath::Clamp(Wanted, CrestY + 160.f, HalfWidth() - 200.f);
 }
 
+float ATraceArenaBuilder::SurfRailExitObstacleX() const
+{
+	// =============================================================================================
+	// DEMO 29 ITEM 4(a) — THE FIRST SOLID A SURFER LEAVING THIS RAIL CAN FLY INTO.
+	//
+	// A surfer does not stop at the end of the rail; they leave the nose as a projectile and land
+	// somewhere out in the lane. So the quantity that matters is not "how much X is clear beside the
+	// structure" (Patch 28 checked that, and got 100 uu) but "what is in the LANDING lane".
+	//
+	// Only blocks whose Y band actually overlaps the rail's own are candidates: the goal-approach
+	// diamonds sit in the spine and a surfer passes well outboard of them. The pieces returned by
+	// this sweep on the shipped field are the innermost approach bar (|X| 11800..12200, |Y| 1850..
+	// 3150) and the outer lane pylon (|X| 12690..12910, |Y| 2790..3010) — the bar is nearer, so it is
+	// the answer, and it is the thing the exit rig measured rides hitting at 1469 uu/s.
+	//
+	// Everything is measured with the SAME accessors the build uses, so a layout change moves this
+	// with it rather than leaving a stale literal behind.
+	// =============================================================================================
+	const float HalfX = HalfLength();
+	const float HalfY = HalfWidth();
+	const float RailNearY = SurfRailToeY();
+	const float RailFarY = SurfRailBackY();
+
+	// OUTBOARD OF THE RAIL'S OWN START, AND THIS TEST IS LOAD-BEARING. Without it the sweep returns
+	// the INNER lane pylon at |X| 4690, which is behind the rail's near end and in nobody's exit lane
+	// — and the clamp derived from it cut the main run from 4868 uu to 900. A surfer travels away from
+	// the halfway line, so only what is in FRONT of the run can ever be flown into.
+	//
+	// The cut-off is the near end rather than the junction because the junction is what this
+	// computation is on its way to deciding, and a rail's own body is never a candidate anyway: the
+	// sweep only looks at cover and pylons.
+	const float RunStartX = HalfX * TraceArenaConstants::SurfRailNearXFrac;
+
+	// Nothing beyond the goal line is in a surfer's way: the endzone is 2400 uu of empty approach and
+	// a rail that reached it would have other problems. It is the backstop, not a real candidate.
+	float Nearest = GoalLineX();
+
+	auto Consider = [&Nearest, RailNearY, RailFarY, RunStartX](float CentreX, float ExtentX, float CentreY, float ExtentY)
+	{
+		// Y bands are compared as |Y| bands: everything in this file is mirrored, so a block at +Y and
+		// the rail at +Y are the pair that can collide.
+		const float BlockLoY = FMath::Abs(CentreY) - ExtentY;
+		const float BlockHiY = FMath::Abs(CentreY) + ExtentY;
+		if (BlockHiY < RailNearY || BlockLoY > RailFarY)
+		{
+			return;
+		}
+
+		const float NearFaceX = FMath::Abs(CentreX) - ExtentX;
+		if (NearFaceX <= RunStartX)
+		{
+			return;
+		}
+		Nearest = FMath::Min(Nearest, NearFaceX);
+	};
+
+	const float GoalX = GoalLineX();
+	for (const TraceArenaConstants::FCoverSpec& Spec : TraceArenaConstants::ApproachCover)
+	{
+		// A 45-degree footprint reaches further in both axes than its side length; using the
+		// half-diagonal is the conservative reading and it is the only one that is right for a
+		// clearance.
+		const bool bDiamond = !FMath::IsNearlyZero(Spec.Yaw);
+		const float ExtentX = (bDiamond ? UE_SQRT_2 : 1.f) * Spec.SizeX * 0.5f;
+		const float ExtentY = (bDiamond ? UE_SQRT_2 : 1.f) * Spec.SizeY * 0.5f;
+		Consider(FMath::Max(0.f, GoalX - Spec.XAnchor), ExtentX, HalfY * Spec.YFrac, ExtentY);
+	}
+
+	for (const float XFrac : TraceArenaConstants::LanePylonXFracs)
+	{
+		Consider(HalfX * XFrac, TraceArenaConstants::LanePylonSide * 0.5f,
+			HalfY * TraceArenaConstants::LanePylonYFrac, TraceArenaConstants::LanePylonSide * 0.5f);
+	}
+
+	return Nearest;
+}
+
+float ATraceArenaBuilder::SurfRailExitClearance() const
+{
+	// =============================================================================================
+	// DEMO 29 ITEM 4(a) — HOW MUCH LANE THE RAIL'S EXIT NEEDS, ASKED OF THE MOVEMENT COMPONENT.
+	//
+	// The measurement that produced this function: -TraceSurfExitTest, five rides on the shipped
+	// rail. The three fastest left the nose at 1164, 1469 and 1894 uu/s planar and arrived on the
+	// floor at 183, 52 and 62. They did not lose it to friction or to the landing — they flew about
+	// 1300 uu and hit the innermost approach bar. "A player loses all momentum at the end of the
+	// curve" was, first and largest, a fast lane that ends in a wall. AGAIN: Patch 28 already fixed
+	// one of those (the rail's own end rib, which is why the stepped nose exists) and its rig could
+	// not see this one, because it closed its sample the frame the SURF STATE closed — in mid-air,
+	// several hundred uu before the impact.
+	//
+	// The envelope is maximised ALONG THE NOSE rather than taken at the junction, and that is not
+	// pedantry: leaving later means leaving lower, which shortens the flight, but it also starts the
+	// flight further down the lane. The two trade off and the worst case is in the middle. On the
+	// shipped numbers the junction gives 2287 uu and the midpoint of the nose gives 2234, so the
+	// junction wins here — but a shallower nose would move the maximum and nothing would say so.
+	//
+	// Speed comes from UTraceCharacterMovementComponent::GetSurfExitReach(), which uses the ceiling
+	// for the FASTEST weapon profile. Retune the air cap and the rail re-cuts itself; that is the
+	// DEMO 21 rule, and it is the same rule that already derives the face angles.
+	// =============================================================================================
+	const UWorld* World = GetWorld();
+	const UTraceCharacterMovementComponent* CDO =
+		UTraceCharacterMovementComponent::StaticClass()->GetDefaultObject<UTraceCharacterMovementComponent>();
+	if (World == nullptr || CDO == nullptr)
+	{
+		return 0.f;
+	}
+
+	const float Height = SurfRailHeight();
+	const float NoseRun = Height * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	if (Height <= 1.f || NoseRun <= 1.f)
+	{
+		return 0.f;
+	}
+
+	const float Gravity = World->GetGravityZ();
+
+	// Sixteen stations along the nose. The profile is smooth and single-peaked, so this is far finer
+	// than it needs to be and costs nothing — it runs once per rail at build time.
+	float Worst = 0.f;
+	for (int32 Station = 0; Station <= 16; ++Station)
+	{
+		const float Along = NoseRun * (static_cast<float>(Station) / 16.f);
+		const float LaunchHeight = Height * (1.f - static_cast<float>(Station) / 16.f);
+		Worst = FMath::Max(Worst, Along + CDO->GetSurfExitReach(LaunchHeight, Gravity));
+	}
+
+	return Worst;
+}
+
 void ATraceArenaBuilder::SurfRailRunX(float& OutNearX, float& OutFarX) const
 {
 	OutNearX = HalfLength() * TraceArenaConstants::SurfRailNearXFrac;
 	OutFarX  = HalfLength() * TraceArenaConstants::SurfRailFarXFrac;
+
+	// DEMO 29 ITEM 4(a). The A/B arm restores the Patch 28 extents so "the exit lane is clear" and
+	// "the exit lane ends in a wall" are two columns of one table on one binary. Asked through
+	// IsSurfRailLegacyRun(), never read here: that function carries the Shipping guard, and a bare
+	// FParse on this line is precisely how the last legacy arm in this project shipped.
+	if (IsSurfRailLegacyRun())
+	{
+		return;
+	}
+
+	const float Height = SurfRailHeight();
+	const float NoseRun = Height * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	const float Clearance = SurfRailExitClearance();
+	if (Height <= 1.f || Clearance <= 0.f)
+	{
+		return;
+	}
+
+	// The JUNCTION is where a surfer can first leave the surface, so the clearance is measured from
+	// there — and the far end of the structure is the junction plus its own nose.
+	const float MaxJunctionX = SurfRailExitObstacleX() - Clearance;
+	const float ClampedFarX = MaxJunctionX + NoseRun;
+
+	// Never shorten the rail into something that is not a ramp. If the field genuinely cannot fit a
+	// rail with a safe exit, BuildSurfRails' own guard skips it and says so — a rail that fits by
+	// being cut to nothing would be worse than none.
+	OutFarX = FMath::Max(OutNearX + NoseRun + 900.f, FMath::Min(OutFarX, ClampedFarX));
 }
 
 ATraceArenaBuilder::FTraceSurfRailProbe ATraceArenaBuilder::GetSurfRailProbe(float XSign, float YSign) const
@@ -4087,6 +4329,12 @@ ATraceArenaBuilder::FTraceSurfRailProbe ATraceArenaBuilder::GetSurfRailProbe(flo
 	Probe.MaxFaceAngleDegrees = MaxDeg;
 	Probe.CrestStand = FVector(SignX * (NearX + MainRun * 0.5f),
 		SignY * (CrestY + (SurfRailBackY() - CrestY) * 0.5f), Height);
+
+	// DEMO 29 ITEM 4. The toe, ON THE FLOOR, a third of the way along the level main run — the place a
+	// player running the outer lane meets the rail. The arc's first station is Z = 0 at Y = ToeY by
+	// construction (StationY/StationZ are both zero at MinDeg), so this is the arc's own start point
+	// and not a second guess at it.
+	Probe.ToeOnFloor = FVector(SignX * (NearX + MainRun * 0.333f), SignY * ToeY, 0.f);
 
 	return Probe;
 }
@@ -4411,6 +4659,23 @@ void ATraceArenaBuilder::BuildSurfRails(bool bBuildVisuals)
 	// surf ramp are how steep it is, how long the ridable band is, whether the shallowest part of it is
 	// genuinely un-walkable, and what happens at the end of it. All of them are derived here rather
 	// than read off a screenshot.
+	// DEMO 29 ITEM 4(a), SAID OUT LOUD. "The exit lane is clear" is the claim this patch makes about
+	// the rails, and it is a comparison between two numbers, so both of them are printed next to the
+	// verdict rather than left for a reader to reconstruct from the geometry.
+	{
+		const float ObstacleX = SurfRailExitObstacleX();
+		const float Clearance = SurfRailExitClearance();
+		const float Reach = JunctionX + Clearance;
+		UE_LOG(LogTraceGame, Log,
+			TEXT("Surf rail EXIT LANE: a surfer can leave the nose and travel up to %.0f uu past the "
+			     "junction at |X| %.0f, i.e. as far as |X| %.0f; the first solid in the lane is at |X| "
+			     "%.0f -> %s. (Demo 29 item 4: before this clamp the far end stood at |X| %.0f and rides "
+			     "measured at 1469 uu/s arrived on the floor at 52.)"),
+			Clearance, JunctionX, Reach, ObstacleX,
+			(Reach <= ObstacleX) ? TEXT("CLEAR") : TEXT("*** THE EXIT ENDS IN A WALL ***"),
+			HalfLength() * TraceArenaConstants::SurfRailFarXFrac);
+	}
+
 	const float ArcLength = Radius * FMath::DegreesToRadians(MaxDeg - MinDeg);
 	UE_LOG(LogTraceGame, Log,
 		TEXT("Surf rails: 4 x (%d facets %.2f..%.2f deg [DERIVED from the movement surf band, margin "

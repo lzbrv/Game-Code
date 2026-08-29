@@ -34,6 +34,18 @@
 //                           NEGATIVE CONTROLS that drop the pawn on walkable ground and assert it
 //                           never enters the surf state.
 //
+//   -TraceSurfExitTest      DEMO 29 ITEM 4(a). What happens at the END of a ride. The rig above
+//                           closes its sample the frame the SURF STATE closes, which on every strafed
+//                           rung was still airborne with the ride in progress — so the owner's "a
+//                           player loses all momentum at the end of the curve" happened entirely
+//                           after it had stopped looking. This one follows the ride through the
+//                           landing and across two seconds of floor, and reports the DISTANCE carried.
+//
+//   -TraceSurfApproachTest  DEMO 29 ITEM 4(b). Whether you can surf INTO a curve. Every arm above
+//                           starts a ride by teleporting a pawn onto the face or walking it off the
+//                           crest; the owner is describing running at a rail from the floor and
+//                           getting nothing. This one never puts a pawn on the face at all.
+//
 // WHY THE RIG ASKS THE ARENA WHERE THE RAMP IS. ATraceArenaBuilder::GetSurfRailProbe() is the single
 // definition of a rail's geometry. A rig holding its own copy of the coordinates would keep passing
 // after the level moved, which is this project's standing lesson about two copies of one rule — and
@@ -510,6 +522,312 @@ namespace TraceMovementSurf
 		static bool bValid = false;
 		return bValid;
 	}
+
+	// =============================================================================================
+	// THE IDEAL SURF INPUT — ONE DEFINITION, USED BY EVERY ARM OF EVERY RIG IN THIS FILE.
+	//
+	// It used to be written out inline in the ladder arm and again in the net arm, and the second
+	// copy was already a slightly different vector (it re-aimed off the live velocity rather than off
+	// the rail). Two copies of one rule is this project's standing lesson, and a HARNESS with two
+	// copies of its own input model is the worst place to have it: the two arms stop being
+	// comparable and nothing says so. The derivation is written out once, here.
+	//
+	// The air model's gain along the wish direction is
+	//
+	//     AddSpeed = AirMaxWishSpeed - dot(v, wish)
+	//
+	// and what a surfer wants to grow is |v|, which grows at AddSpeed x cos(phi), phi being the angle
+	// between the wish and the velocity. With c = cos(phi):
+	//
+	//     growth(c) = (W - v c) c ,  maximised at  c = W / (2 v) ,  giving  W^2 / (4 v)
+	//
+	// So the best sustainable surf input is neither along travel nor perpendicular to it: it is
+	// exactly acos(W / 2v) off the rail, opening toward 90 degrees as the pawn gets faster. It is
+	// ANCHORED TO THE RAIL, not to the velocity — aiming phi off the current velocity is a positive
+	// feedback loop that flies the pawn up the face, stalls it, and brings it over the crest slower
+	// than it arrived (measured, in Patch 28: entry 400 -> peak 886 -> exit 282).
+	//
+	// W is read LIVE by the caller off GetAirMaxWishSpeed(), so retuning the air model re-derives the
+	// rig's input instead of measuring the old one.
+	// =============================================================================================
+	static FVector IdealSurfWish(const FVector& RunDirection, const FVector& PlaneNormal,
+		const float PlanarSpeed, const float WishCap)
+	{
+		// The horizontal part of the surface normal points DOWN the slope, so its negation is up-slope
+		// — and up-slope is the axis UE's stock LimitAirControl deletes, which is the whole reason the
+		// surf overrides exist. Read off the LIVE plane, never off the rig's idea of the geometry.
+		const FVector UpSlope = -FVector(PlaneNormal.X, PlaneNormal.Y, 0.f).GetSafeNormal();
+		const float Speed = FMath::Max(1.f, PlanarSpeed);
+		const float CosPhi = FMath::Clamp(FMath::Max(1.f, WishCap) / (2.f * Speed), 0.f, 0.999f);
+		const float SinPhi = FMath::Sqrt(FMath::Max(0.f, 1.f - CosPhi * CosPhi));
+		return (RunDirection * CosPhi + UpSlope * SinPhi).GetSafeNormal();
+	}
+
+	/**
+	 * Drive one frame of the ideal strafe through the SAME AddMovementInput path a key press takes,
+	 * with the mouse-rate limit on the wish direction, so every frame the rig produces is a frame the
+	 * prediction pipeline would have produced for a player.
+	 */
+	static void DriveIdealSurfStrafe(ACharacter* Pawn, APlayerController* PC, const FVector& RunDirection,
+		const FVector& PlaneNormal, const FVector& Velocity, const float WishCap, const float DeltaSeconds)
+	{
+		if (Pawn == nullptr)
+		{
+			return;
+		}
+
+		FVector Planar(Velocity.X, Velocity.Y, 0.f);
+		if (!Planar.Normalize())
+		{
+			return;
+		}
+
+		const FVector Ideal = IdealSurfWish(RunDirection, PlaneNormal,
+			static_cast<float>(FVector(Velocity.X, Velocity.Y, 0.f).Size()), WishCap);
+
+		float& WishYaw = SurfTestWishYaw();
+		if (!SurfTestWishYawValid())
+		{
+			SurfTestWishYawValid() = true;
+			WishYaw = static_cast<float>(Ideal.Rotation().Yaw);
+		}
+
+		// A mouse cannot snap: the wish chases its target at SurfTestTurnRateDegPerSec and no faster,
+		// so the numbers this reports are reachable rather than theoretical.
+		const float IdealYaw = static_cast<float>(Ideal.Rotation().Yaw);
+		const float MaxStep = SurfTestTurnRateDegPerSec * DeltaSeconds;
+		const float Delta = FMath::FindDeltaAngleDegrees(WishYaw, IdealYaw);
+		WishYaw = FRotator::NormalizeAxis(WishYaw + FMath::Clamp(Delta, -MaxStep, MaxStep));
+
+		Pawn->AddMovementInput(FRotator(0.f, WishYaw, 0.f).Vector(), 1.f);
+		if (PC != nullptr)
+		{
+			PC->SetControlRotation(Planar.Rotation());
+		}
+	}
+
+	// =============================================================================================
+	// DEMO 29 ITEM 4 — THE TWO TRANSITION RIGS.
+	//
+	// The owner reports two things, and Patch 28's rig can measure NEITHER of them:
+	//
+	//   (a) "when sliding down the curved surfaces, a player loses all momentum at the end of the
+	//       curve."  The Patch 28 ladder closes its sample the frame the SURF STATE closes and reports
+	//       the planar speed there. Every strafed rung in that table ran out its four-second run clock
+	//       while still AIRBORNE (mode=3, grounded=0 in FINAL2.log), so the number in the "exit"
+	//       column is a mid-air speed and the transition the owner is complaining about happened after
+	//       the rig had stopped looking. -TraceSurfExitTest follows the ride THROUGH the landing and
+	//       across two seconds of floor.
+	//
+	//   (b) "it still doesn't feel like you can surf INTO curves/curved ramps in order to gain
+	//       momentum."  Every arm of the Patch 28 rig starts by TELEPORTING a pawn onto the face (or,
+	//       in the net arm, by walking it off the crest). Nothing in it ever approached a rail at
+	//       floor level, which is what a player does. -TraceSurfApproachTest does only that.
+	// =============================================================================================
+
+	/** One ride, followed from the face to the floor. Every field is uu/s unless it says otherwise. */
+	struct FSurfExitSample
+	{
+		float RequestedEntry = 0.f;
+		float Entry = 0.f;
+		float PeakPlanar = 0.f;
+		float RideSeconds = 0.f;
+
+		/** The last frame IsSurfing() was true. */
+		float LastSurfPlanar = 0.f;
+		float LastSurfSpeed3D = 0.f;
+		float LastSurfVz = 0.f;
+
+		/** The last AIRBORNE frame, i.e. the frame before the landing zeroed Z. */
+		float LastAirPlanar = 0.f;
+		float LastAirSpeed3D = 0.f;
+		float LastAirVz = 0.f;
+
+		/** Seconds between the surf state closing and the pawn being grounded. */
+		float AirGapSeconds = 0.f;
+
+		/** The first grounded frame, then the floor phase. */
+		float GroundPlanar = 0.f;
+		float At025 = 0.f;
+		float At050 = 0.f;
+		float At100 = 0.f;
+		float At200 = 0.f;
+
+		/** How far the pawn travelled on the floor before it was back at the walking limit, uu. */
+		float CarryDistance = 0.f;
+		float GroundLimit = 0.f;
+
+		/**
+		 * Where a single frame took more than 150 uu/s off the planar speed, if one did.
+		 *
+		 * IT IS THE DIFFERENCE BETWEEN TWO ANSWERS THAT LOOK IDENTICAL IN A SPEED COLUMN. A carry that
+		 * ends because the floor bled it out and a carry that ends because the pawn ran into a piece of
+		 * cover are not the same result, and the rig drives the pawn STRAIGHT — it cannot steer round
+		 * anything, which a player can and does. Without this the table would silently under-report the
+		 * carry every time the lane happens to have furniture in it.
+		 */
+		bool bAirObstructed = false;
+		bool bGroundObstructed = false;
+		float ObstructedAt = 0.f;
+		float ObstructedLoss = 0.f;
+		FVector ObstructedWhere = FVector::ZeroVector;
+
+		bool bSurfed = false;
+		bool bLanded = false;
+		FVector SurfCloseAt = FVector::ZeroVector;
+		FVector LandedAt = FVector::ZeroVector;
+	};
+
+	static TArray<FSurfExitSample>& SurfExitRows()
+	{
+		static TArray<FSurfExitSample> Rows;
+		return Rows;
+	}
+
+	/** One approach, from the flat floor into the rail. */
+	struct FSurfApproachSample
+	{
+		float AngleDegrees = 0.f;
+		float StartSpeed = 0.f;
+		float SpeedAtContact = 0.f;
+		float MinAfterContact = 0.f;
+		float PeakAfterContact = 0.f;
+		float FinalSpeed = 0.f;
+		float SurfSeconds = 0.f;
+		bool bReachedFace = false;
+		bool bSurfed = false;
+		FVector ContactAt = FVector::ZeroVector;
+	};
+
+	static TArray<FSurfApproachSample>& SurfApproachRows()
+	{
+		static TArray<FSurfApproachSample> Rows;
+		return Rows;
+	}
+
+	/** Phases of one transition run. Both rigs share the shape; only Ride/Approach differ. */
+	enum class ESurfRigPhase : uint8
+	{
+		Place,
+		Settle,
+		Ride,
+		AirGap,
+		Ground,
+	};
+
+	static ESurfRigPhase& RigPhase()   { static ESurfRigPhase P = ESurfRigPhase::Place; return P; }
+	static float& RigClock()           { static float T = 0.f; return T; }
+	static float& RigPhaseClock()      { static float T = 0.f; return T; }
+	static int32& RigRun()             { static int32 R = -1; return R; }
+	static bool& RigReported()         { static bool B = false; return B; }
+	static FSurfExitSample& RigExit()  { static FSurfExitSample S; return S; }
+	static FSurfApproachSample& RigApproach() { static FSurfApproachSample S; return S; }
+	static FVector& RigGroundStart()   { static FVector V = FVector::ZeroVector; return V; }
+
+	/** The exit rig's entry ladder. The same five rungs as Patch 28, so the two tables line up. */
+	static constexpr float SurfExitLadder[] = { 400.f, 800.f, 1200.f, 1600.f, 2000.f };
+	static constexpr int32 SurfExitLadderCount = UE_ARRAY_COUNT(SurfExitLadder);
+
+	/** How long a ride may run before the rig gives up on it ever reaching the floor. */
+	static constexpr float SurfExitRideCeilingSeconds = 12.f;
+
+	/** How long the floor phase is followed. Two seconds is well past the whole overspeed bleed. */
+	static constexpr float SurfExitGroundSeconds = 2.0f;
+
+	/**
+	 * The approach ladder: degrees between the RAIL and the direction the pawn runs at it.
+	 *
+	 * 90 is straight into the face and is the case the owner is most likely to have tried by accident;
+	 * 20 is the shallow lean a surfer would actually use. Both ends matter, because the complaint is
+	 * that NONE of them does anything.
+	 */
+	static constexpr float SurfApproachAngles[] = { 0.f, 90.f, 60.f, 45.f, 30.f, 20.f };
+	static constexpr int32 SurfApproachCount = UE_ARRAY_COUNT(SurfApproachAngles);
+
+	/**
+	 * How far inboard of the toe an approach starts, uu.
+	 *
+	 * Short enough that even the shallowest rung closes it inside a second (at 20 degrees the closing
+	 * rate is only sin(20) of the run speed) and short enough to stay well clear of the midfield cover
+	 * whose diamond reaches |Y| 2548 against a toe at 2700.
+	 */
+	static constexpr float SurfApproachStandoff = 300.f;
+
+	/**
+	 * Seconds one approach is followed for, after the settle.
+	 *
+	 * FIVE, not three, and the first measured table is why: at three seconds every rung that gained
+	 * was still gaining when the clock stopped (peak == final on 45, 30 and 20 degrees), so the table
+	 * was reporting where the ride had got to rather than what it was worth. Five seconds is longer
+	 * than the shortened rail can hold a pawn at these speeds, so every rung now ends because the ride
+	 * did.
+	 */
+	static constexpr float SurfApproachSeconds = 5.0f;
+
+	/** How long an approach stands still first, so it starts from the floor and not from a fall. */
+	static constexpr float SurfApproachSettleSeconds = 0.35f;
+
+	/** Settle after an exit-rig placement, before the ride is measured. Longer than the surf grace. */
+	static constexpr float SurfExitSettleSeconds = 0.15f;
+
+	/** Which pose the net arm's server hands out next. Alternates crest / floor lane. */
+	static bool& SurfNetPoseOnFloor()
+	{
+		static bool bOnFloor = false;
+		return bOnFloor;
+	}
+
+	/**
+	 * Where the net arm stands a pawn on the FLOOR so it can run at the rail: inboard of the toe by
+	 * the approach rig's own standoff, and back down the rail by the distance a 20-degree lean takes
+	 * to close it, so the pawn meets the face at a shallow angle rather than head-on.
+	 *
+	 * The 20 degrees is not a second copy of the approach rig's ladder — it is the SHALLOW END of it,
+	 * chosen here because a glancing lean is the case a player actually uses and the case that most
+	 * needs to survive prediction: it is the one where the pawn keeps most of its speed through the
+	 * clip and rides for seconds afterwards.
+	 */
+	static FVector SurfNetLaneStand(const ATraceArenaBuilder::FTraceSurfRailProbe& Probe)
+	{
+		const FVector Inboard = Probe.FaceNormal.GetSafeNormal2D();
+		const float BackOff = SurfApproachStandoff / FMath::Tan(FMath::DegreesToRadians(20.f));
+		return Probe.ToeOnFloor + Inboard * SurfApproachStandoff - Probe.RunDirection * BackOff;
+	}
+
+	/** The 20-degree approach direction the net arm's client runs at the rail with. */
+	static FVector SurfNetApproachDirection(const ATraceArenaBuilder::FTraceSurfRailProbe& Probe)
+	{
+		const FVector TowardFace = -Probe.FaceNormal.GetSafeNormal2D();
+		const float Rad = FMath::DegreesToRadians(20.f);
+		return (Probe.RunDirection * FMath::Cos(Rad) + TowardFace * FMath::Sin(Rad)).GetSafeNormal();
+	}
+
+	/**
+	 * The rail in this pawn's own quadrant. ONE lookup, so no two arms of this file can end up
+	 * measuring different rails — and it goes through GetSurfRailProbe() rather than through any
+	 * coordinate of its own, for the reason at the top of the file.
+	 */
+	static ATraceArenaBuilder::FTraceSurfRailProbe ProbeForPawn(const UTraceCharacterMovementComponent& Movement)
+	{
+		ATraceArenaBuilder::FTraceSurfRailProbe Probe;
+
+		const UWorld* World = Movement.GetWorld();
+		const USceneComponent* Updated = Movement.UpdatedComponent;
+		if (World == nullptr || Updated == nullptr)
+		{
+			return Probe;
+		}
+
+		TActorIterator<ATraceArenaBuilder> It(const_cast<UWorld*>(World));
+		const ATraceArenaBuilder* Arena = It ? *It : nullptr;
+		if (Arena == nullptr)
+		{
+			return Probe;
+		}
+
+		const FVector Here = Updated->GetComponentLocation();
+		return Arena->GetSurfRailProbe((Here.X >= 0.0) ? 1.f : -1.f, (Here.Y >= 0.0) ? 1.f : -1.f);
+	}
 }
 
 void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
@@ -528,9 +846,17 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 	// and then RUNS IT OFF THE EDGE under ordinary predicted input. Every frame of every ride it
 	// measures is a frame the client predicted and the server re-simulated, which is the only
 	// arrangement in which "zero corrections while surfing" means anything.
+	//
+	// DEMO 29 ITEM 4 adds two more, and both exist because neither of the two above can see the thing
+	// the owner is complaining about: -TraceSurfExitTest follows a ride THROUGH the landing and across
+	// two seconds of floor, and -TraceSurfApproachTest never puts a pawn on the face at all — it runs
+	// one at the rail from the floor, which is what a player does. See their block in the namespace
+	// above.
 	static const bool bLadderMode = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfTest"));
 	static const bool bNetMode = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfNetTest"));
-	const bool bEnabled = bLadderMode || bNetMode;
+	static const bool bExitMode = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfExitTest"));
+	static const bool bApproachMode = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfApproachTest"));
+	const bool bEnabled = bLadderMode || bNetMode || bExitMode || bApproachMode;
 	if (!bEnabled || CharacterOwner == nullptr || UpdatedComponent == nullptr)
 	{
 		return;
@@ -604,15 +930,31 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 		{
 			SurfTestPhaseTime = Now + TraceMovementSurf::SurfNetCycleSeconds;
 
-			const FVector Where = Probe.CrestStand + FVector(0.f, 0.f, 120.f);
+			// DEMO 29 ITEM 4(b). ALTERNATE THE POSE, because there are now TWO ways a ride can start
+			// and only one of them was ever predicted under lag. The crest walk-off tests the airborne
+			// entry Patch 28 added; the FLOOR LANE tests the ground entry this patch added, which is
+			// the one that writes Velocity AND the movement mode from inside HandleImpact. "It needs no
+			// new saved state" is a claim about exactly that path, so the claim has to be run on a
+			// client that can be corrected.
+			//
+			// Both poses are AUTHORITATIVE and neither is anywhere near a measured ride: the client
+			// waits, moves under its own predicted input, and only then starts surfing.
+			bool& bPoseOnFloor = TraceMovementSurf::SurfNetPoseOnFloor();
+			bPoseOnFloor = !bPoseOnFloor;
+
+			const FVector Where = bPoseOnFloor
+				? (TraceMovementSurf::SurfNetLaneStand(Probe) + FVector(0.f, 0.f, 120.f))
+				: (Probe.CrestStand + FVector(0.f, 0.f, 120.f));
+
 			CharacterOwner->TeleportTo(Where, CharacterOwner->GetActorRotation(), false, true);
 			Velocity = FVector::ZeroVector;
 
 			UE_LOG(LogTraceGame, Display,
-				TEXT("SURFNET [server] re-posed %s onto the crest at %s (next in %.1f s). The client is "
-				     "not told and does not teleport: it waits, runs off the edge, and measures."),
-				*GetNameSafe(CharacterOwner), *Where.ToCompactString(),
-				TraceMovementSurf::SurfNetCycleSeconds);
+				TEXT("SURFNET [server] re-posed %s onto the %s at %s (next in %.1f s). The client is "
+				     "not told and does not teleport: it waits, %s, and measures."),
+				*GetNameSafe(CharacterOwner), bPoseOnFloor ? TEXT("FLOOR LANE") : TEXT("crest"),
+				*Where.ToCompactString(), TraceMovementSurf::SurfNetCycleSeconds,
+				bPoseOnFloor ? TEXT("runs at the rail from the floor") : TEXT("runs off the edge"));
 		}
 		return;
 	}
@@ -620,6 +962,70 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 	APlayerController* TestController = Cast<APlayerController>(CharacterOwner->GetController());
 	if (TestController == nullptr || !CharacterOwner->IsLocallyControlled())
 	{
+		return;
+	}
+
+	// =============================================================================================
+	// DEMO 29 ITEM 4 — THE TRANSITION RIGS. Everything below this block belongs to Patch 28's ladder
+	// and net arms and is untouched; these two modes return before reaching it.
+	// =============================================================================================
+	if (bExitMode || bApproachMode)
+	{
+		using namespace TraceMovementSurf;
+
+		if (RigReported())
+		{
+			return;
+		}
+
+		const int32 TotalRigRuns = bExitMode ? SurfExitLadderCount : SurfApproachCount;
+
+		if (RigRun() < 0)
+		{
+			// Six seconds is the same wait the Patch 28 ladder takes: the arena is built, the bots have
+			// spawned and the pawn has settled onto the floor before anything is measured.
+			if (TestWorld->GetTimeSeconds() < 6.f)
+			{
+				return;
+			}
+			RigRun() = 0;
+			RigPhase() = ESurfRigPhase::Place;
+			SurfExitRows().Reset();
+			SurfApproachRows().Reset();
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SURF%s ---- begin. rail %d..%d deg, crest %.0f uu, run %.0f uu | toe on the floor at "
+				     "%s | ground limit %.0f uu/s | air hard cap %.0f | surf ceiling %.0f | %d runs"),
+				bExitMode ? TEXT("EXIT") : TEXT("APPROACH"),
+				FMath::RoundToInt(Probe.MinFaceAngleDegrees), FMath::RoundToInt(Probe.MaxFaceAngleDegrees),
+				Probe.Height, Probe.RunLength, *Probe.ToeOnFloor.ToCompactString(),
+				GetMaxSpeed(), GetAirStrafeHardCapSpeed(),
+				GetAirStrafeHardCapSpeed() * GetSurfSpeedCeilingMultiplier(), TotalRigRuns);
+		}
+
+		if (RigRun() >= TotalRigRuns)
+		{
+			RigReported() = true;
+			if (bExitMode)
+			{
+				LogSurfExitTable();
+			}
+			else
+			{
+				LogSurfApproachTable();
+			}
+			LogSurfReport();
+			return;
+		}
+
+		if (bExitMode)
+		{
+			TickSurfExitRun(DeltaSeconds);
+		}
+		else
+		{
+			TickSurfApproachRun(DeltaSeconds);
+		}
 		return;
 	}
 
@@ -790,6 +1196,25 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 					*NetHere.ToCompactString(), *Crest.ToCompactString(), bOnCrest ? 1 : 0,
 					IsSurfing() ? 1 : 0, static_cast<int32>(MovementMode.GetValue()), GetPlanarSpeed(),
 					SurfTestRun, SurfCorrectionsInWindow, CorrectionCount);
+			}
+		}
+
+		// DEMO 29 ITEM 4(b). Posed in the FLOOR LANE instead: run at the rail. Ordinary predicted input
+		// through AddMovementInput, no teleport and no velocity write — the entry itself happens inside
+		// HandleImpact on the frame the capsule touches the face, on this machine and on the server,
+		// from the same ServerMove.
+		{
+			const FVector LaneStand = TraceMovementSurf::SurfNetLaneStand(Probe);
+			const bool bInLane = IsMovingOnGround()
+				&& FVector::Dist2D(NetHere, LaneStand) < 1400.f
+				&& FMath::Abs(NetHere.Z - LaneStand.Z) < 240.f;
+
+			if (bInLane && !bOnCrest)
+			{
+				const FVector Approach = TraceMovementSurf::SurfNetApproachDirection(Probe);
+				CharacterOwner->AddMovementInput(Approach, 1.f);
+				TestController->SetControlRotation(Approach.Rotation());
+				return;
 			}
 		}
 
@@ -1042,9 +1467,561 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 	}
 }
 
+// =================================================================================================
+// DEMO 29 ITEM 4 (a) — WHAT HAPPENS AT THE END OF THE CURVE, MEASURED ACROSS THE TRANSITION.
+// =================================================================================================
+//
+// The owner: "when sliding down the curved surfaces, a player loses all momentum at the end of the
+// curve ... a player should carry momentum from a curve down onto the flat floor."
+//
+// Patch 28's ladder cannot answer that, and the reason is worth stating because it is the same
+// shape as the bug: it closes its sample on the frame the SURF STATE closes, and on every strafed
+// rung the surf state was still open when the four-second run clock expired (FINAL2.log: mode=3,
+// grounded=0, "run clock expired"). The number in its "exit" column is therefore a MID-AIR speed
+// taken while the ride was still going. Everything the owner is describing happens afterwards.
+//
+// This rig follows one ride through all four of the places speed can go:
+//
+//   1. the last frame ON the face          (planar, 3D and Vz — the ride's own speed)
+//   2. the last AIRBORNE frame             (the frame before the landing, i.e. what arrives)
+//   3. the first GROUNDED frame            (what survives the landing itself)
+//   4. +0.25 / +0.5 / +1.0 / +2.0 s        (what survives the floor)
+//
+// and it reports the distance the pawn actually carried before it was back at walking pace, which
+// is the quantity the complaint is really about: "carry momentum onto the flat floor" is a claim
+// about DISTANCE, not about one frame's number.
+//
+// No input is driven after the ride ends except forward along the direction of travel, which is what
+// a player holds. Steering is the only thing input can do to carried momentum in this model, so
+// holding forward changes nothing about the bleed and stops the run ending in a dead stop that would
+// make the floor phase unreadable.
+// =================================================================================================
+void UTraceCharacterMovementComponent::TickSurfExitRun(float DeltaSeconds)
+{
+	using namespace TraceMovementSurf;
+
+	if (CharacterOwner == nullptr || UpdatedComponent == nullptr)
+	{
+		return;
+	}
+
+	const ATraceArenaBuilder::FTraceSurfRailProbe Probe = ProbeForPawn(*this);
+	if (!Probe.bValid)
+	{
+		return;
+	}
+
+	APlayerController* PC = Cast<APlayerController>(CharacterOwner->GetController());
+	FSurfExitSample& Row = RigExit();
+	const FVector Here = UpdatedComponent->GetComponentLocation();
+
+	// Kept in one place so the "last airborne frame" is the same fact in every phase: the frame
+	// before the landing, whether the surf closed by landing or by falling off the end of the rail.
+	if (!IsMovingOnGround())
+	{
+		Row.LastAirPlanar = GetPlanarSpeed();
+		Row.LastAirSpeed3D = static_cast<float>(Velocity.Size());
+		Row.LastAirVz = static_cast<float>(Velocity.Z);
+	}
+
+	// A SHARP LOSS IS AN EVENT. Nothing in this movement model can take 150 uu/s off a planar speed in
+	// one frame — the bleed's whole authority is (2 x excess + 400) uu/s^2, which is 30 uu/s at 60 fps
+	// even at 1900 uu/s — so a step this big is a collision, and it is the one thing that would make a
+	// carry number mean the opposite of what it says.
+	{
+		static float LastGroundPlanar = 0.f;
+		const float NowPlanar = GetPlanarSpeed();
+		const bool bMeasuring = (RigPhase() == ESurfRigPhase::AirGap || RigPhase() == ESurfRigPhase::Ground);
+		if (bMeasuring && LastGroundPlanar - NowPlanar > 150.f)
+		{
+			if (RigPhase() == ESurfRigPhase::Ground)
+			{
+				Row.bGroundObstructed = true;
+			}
+			else
+			{
+				Row.bAirObstructed = true;
+			}
+			Row.ObstructedLoss = LastGroundPlanar - NowPlanar;
+			Row.ObstructedWhere = Here;
+			Row.ObstructedAt = RigPhaseClock();
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SURFEXIT   run %d hit something %s: %.0f uu/s gone in one frame at %s (%.2f s into "
+				     "the phase). The rig drives straight and cannot steer; a player can."),
+				RigRun() + 1, (RigPhase() == ESurfRigPhase::Ground) ? TEXT("ON THE FLOOR") : TEXT("IN THE AIR"),
+				Row.ObstructedLoss, *Here.ToCompactString(), Row.ObstructedAt);
+		}
+		LastGroundPlanar = NowPlanar;
+	}
+
+	switch (RigPhase())
+	{
+	case ESurfRigPhase::Place:
+	{
+		const float Requested = SurfExitLadder[FMath::Clamp(RigRun(), 0, SurfExitLadderCount - 1)];
+
+		Row = FSurfExitSample();
+		Row.RequestedEntry = Requested;
+		Row.GroundLimit = FMath::Max(1.f, GetMaxSpeed());
+
+		CharacterOwner->TeleportTo(Probe.FaceEntry, CharacterOwner->GetActorRotation(), false, true);
+		Velocity = Probe.RunDirection * Requested;
+		SetMovementMode(MOVE_Falling);
+
+		// The previous run's ride is WIPED rather than left to expire. A grace still ticking would make
+		// this run's first frame look like a continuation of the last one, and the entry speed in the
+		// table would belong to a different ride.
+		SurfContactRemaining = 0.f;
+		SurfPlaneNormal = FVector::ZeroVector;
+		SurfEntrySpeed = 0.f;
+		SurfElapsedSeconds = 0.f;
+
+		SurfTestWishYawValid() = false;
+		RigPhaseClock() = 0.f;
+		RigPhase() = ESurfRigPhase::Settle;
+
+		if (PC != nullptr)
+		{
+			PC->SetControlRotation(Probe.RunDirection.Rotation());
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SURFEXIT   placing run %d/%d at %s (asked %s), entry %.0f uu/s along %s"),
+			RigRun() + 1, SurfExitLadderCount, *UpdatedComponent->GetComponentLocation().ToCompactString(),
+			*Probe.FaceEntry.ToCompactString(), Requested, *Probe.RunDirection.ToCompactString());
+		break;
+	}
+
+	case ESurfRigPhase::Settle:
+	{
+		RigPhaseClock() += DeltaSeconds;
+		if (RigPhaseClock() >= SurfExitSettleSeconds)
+		{
+			RigPhaseClock() = 0.f;
+			RigPhase() = ESurfRigPhase::Ride;
+		}
+		break;
+	}
+
+	case ESurfRigPhase::Ride:
+	{
+		RigPhaseClock() += DeltaSeconds;
+		Row.PeakPlanar = FMath::Max(Row.PeakPlanar, GetPlanarSpeed());
+
+		if (IsSurfing())
+		{
+			if (!Row.bSurfed)
+			{
+				Row.bSurfed = true;
+				Row.Entry = GetSurfEntrySpeed();
+			}
+			Row.RideSeconds += DeltaSeconds;
+			Row.LastSurfPlanar = GetPlanarSpeed();
+			Row.LastSurfSpeed3D = static_cast<float>(Velocity.Size());
+			Row.LastSurfVz = static_cast<float>(Velocity.Z);
+			Row.SurfCloseAt = Here;
+
+			DriveIdealSurfStrafe(CharacterOwner, PC, Probe.RunDirection, GetSurfPlaneNormal(),
+				Velocity, GetAirMaxWishSpeed(), DeltaSeconds);
+			break;
+		}
+
+		if (Row.bSurfed)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SURFEXIT   run %d ride closed after %.2f s at %s | last surf frame: planar %.0f, "
+				     "3D %.0f, Vz %+.0f | grounded=%d mode=%d"),
+				RigRun() + 1, Row.RideSeconds, *Row.SurfCloseAt.ToCompactString(),
+				Row.LastSurfPlanar, Row.LastSurfSpeed3D, Row.LastSurfVz,
+				IsMovingOnGround() ? 1 : 0, static_cast<int32>(MovementMode.GetValue()));
+
+			RigPhaseClock() = 0.f;
+			RigPhase() = ESurfRigPhase::AirGap;
+			break;
+		}
+
+		// Never got onto the face at all. A run that reports nothing is worse than a run that fails.
+		if (RigPhaseClock() >= 2.0f)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("SURFEXIT   run %d never entered the surf state (at %s, mode=%d). The placement is "
+				     "wrong or the rail moved."),
+				RigRun() + 1, *Here.ToCompactString(), static_cast<int32>(MovementMode.GetValue()));
+			SurfExitRows().Add(Row);
+			++RigRun();
+			RigPhase() = ESurfRigPhase::Place;
+		}
+		break;
+	}
+
+	case ESurfRigPhase::AirGap:
+	{
+		RigPhaseClock() += DeltaSeconds;
+		Row.AirGapSeconds = RigPhaseClock();
+		Row.PeakPlanar = FMath::Max(Row.PeakPlanar, GetPlanarSpeed());
+
+		if (IsMovingOnGround())
+		{
+			Row.bLanded = true;
+			Row.GroundPlanar = GetPlanarSpeed();
+			Row.LandedAt = Here;
+			RigGroundStart() = Here;
+			RigPhaseClock() = 0.f;
+			RigPhase() = ESurfRigPhase::Ground;
+
+			// THE ONE LINE THE WHOLE OF COMPLAINT (a) LIVES ON. Both sides of the landing, on the same
+			// frame, so no reader has to line up two log lines to see what the transition cost.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SURFEXIT   run %d LANDED at %s after %.2f s of air | last airborne frame planar %.0f "
+				     "3D %.0f Vz %+.0f  ->  first grounded frame planar %.0f  (the landing cost %.0f uu/s "
+				     "of 3D speed, %.0f uu/s of it vertical)"),
+				RigRun() + 1, *Here.ToCompactString(), Row.AirGapSeconds,
+				Row.LastAirPlanar, Row.LastAirSpeed3D, Row.LastAirVz, Row.GroundPlanar,
+				Row.LastAirSpeed3D - Row.GroundPlanar, FMath::Abs(Row.LastAirVz));
+			break;
+		}
+
+		if (RigPhaseClock() >= 5.0f)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("SURFEXIT   run %d never landed within 5 s of the ride ending (at %s)."),
+				RigRun() + 1, *Here.ToCompactString());
+			SurfExitRows().Add(Row);
+			++RigRun();
+			RigPhase() = ESurfRigPhase::Place;
+		}
+		break;
+	}
+
+	case ESurfRigPhase::Ground:
+	{
+		const float Before = RigPhaseClock();
+		RigPhaseClock() += DeltaSeconds;
+		const float After = RigPhaseClock();
+		const float Planar = GetPlanarSpeed();
+
+		auto Sample = [Before, After](float Mark, float& Slot, float Value)
+		{
+			if (Before < Mark && After >= Mark)
+			{
+				Slot = Value;
+			}
+		};
+		Sample(0.25f, Row.At025, Planar);
+		Sample(0.50f, Row.At050, Planar);
+		Sample(1.00f, Row.At100, Planar);
+		Sample(2.00f, Row.At200, Planar);
+
+		// The carry, as a DISTANCE: how far the pawn got before the floor had taken it back to walking
+		// pace. "Carry momentum onto the flat floor" is a claim about distance, not about one frame.
+		// One uu/s of slack, for the same reason the component's own overspeed test carries an epsilon:
+		// float noise around the limit would otherwise stop the carry a frame early or a frame late.
+		if (Planar > Row.GroundLimit + 1.f)
+		{
+			Row.CarryDistance = static_cast<float>(FVector::Dist2D(Here, RigGroundStart()));
+		}
+
+		// Forward along travel, which is what a player holds. It cannot change the bleed (the bleed is
+		// input-independent; input only steers), and it stops the run ending in a dead stop.
+		FVector Travel(Velocity.X, Velocity.Y, 0.f);
+		if (Travel.Normalize() && PC != nullptr)
+		{
+			CharacterOwner->AddMovementInput(Travel, 1.f);
+			PC->SetControlRotation(Travel.Rotation());
+		}
+
+		if (RigPhaseClock() >= SurfExitGroundSeconds)
+		{
+			SurfExitRows().Add(Row);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SURFEXIT run %d/%d  entry %6.0f | last surf %6.0f planar / %6.0f 3D | landed %6.0f | "
+				     "+0.25 %6.0f  +0.5 %6.0f  +1.0 %6.0f  +2.0 %6.0f | carried %.0f uu"),
+				RigRun() + 1, SurfExitLadderCount, Row.Entry, Row.LastSurfPlanar, Row.LastSurfSpeed3D,
+				Row.GroundPlanar, Row.At025, Row.At050, Row.At100, Row.At200, Row.CarryDistance);
+
+			++RigRun();
+			RigPhase() = ESurfRigPhase::Place;
+		}
+		break;
+	}
+	}
+}
+
+// =================================================================================================
+// DEMO 29 ITEM 4 (b) — CAN A PLAYER SURF INTO A CURVE FROM THE FLOOR?
+// =================================================================================================
+//
+// The owner: "It still doesn't feel like you can 'surf' into curves/curved ramps in order to gain
+// momentum."
+//
+// Patch 28 measured gain while ALREADY on a ramp — every arm of its rig either teleports the pawn
+// onto the face or walks it off the crest. The owner is describing the APPROACH: running at a rail
+// at floor speed and getting nothing for it. So this rig never puts a pawn on the face. It stands
+// one on the flat floor a few hundred uu inboard of the toe, runs it at the rail at the ground
+// limit, and records what the rail gives back.
+//
+// THE FIRST RUNG IS THE CONTROL AND IT IS 0 DEGREES: the same pawn at the same speed running
+// PARALLEL to the rail, which never touches it. Its final speed is what "floor speed" means on this
+// build, and every other rung is only interesting relative to it.
+// =================================================================================================
+void UTraceCharacterMovementComponent::TickSurfApproachRun(float DeltaSeconds)
+{
+	using namespace TraceMovementSurf;
+
+	if (CharacterOwner == nullptr || UpdatedComponent == nullptr)
+	{
+		return;
+	}
+
+	const ATraceArenaBuilder::FTraceSurfRailProbe Probe = ProbeForPawn(*this);
+	if (!Probe.bValid)
+	{
+		return;
+	}
+
+	APlayerController* PC = Cast<APlayerController>(CharacterOwner->GetController());
+	FSurfApproachSample& Row = RigApproach();
+	const FVector Here = UpdatedComponent->GetComponentLocation();
+
+	// INBOARD is the face's own outward direction, flattened — the way the ramp looks, and therefore
+	// the way a player comes at it. Taken off the probe's normal so it mirrors with the quadrant for
+	// free rather than from a sign this file would have to get right four times.
+	const FVector Inboard = Probe.FaceNormal.GetSafeNormal2D();
+	const FVector TowardFace = -Inboard;
+	const float AngleDeg = SurfApproachAngles[FMath::Clamp(RigRun(), 0, SurfApproachCount - 1)];
+	const float AngleRad = FMath::DegreesToRadians(AngleDeg);
+	const FVector Approach =
+		(Probe.RunDirection * FMath::Cos(AngleRad) + TowardFace * FMath::Sin(AngleRad)).GetSafeNormal();
+
+	switch (RigPhase())
+	{
+	case ESurfRigPhase::Place:
+	{
+		Row = FSurfApproachSample();
+		Row.AngleDegrees = AngleDeg;
+
+		// Back along the rail by however far the approach travels while it closes the standoff, so
+		// every rung meets the face at roughly the same station and not at four different ones.
+		const float BackOff = (AngleDeg <= 1.f)
+			? 0.f
+			: FMath::Min(1200.f, SurfApproachStandoff / FMath::Max(0.05f, FMath::Tan(AngleRad)));
+
+		const FVector Start = Probe.ToeOnFloor
+			+ Inboard * SurfApproachStandoff
+			- Probe.RunDirection * BackOff
+			+ FVector(0.f, 0.f, 120.f);
+
+		CharacterOwner->TeleportTo(Start, Approach.Rotation(), false, true);
+		Velocity = FVector::ZeroVector;
+		SetMovementMode(MOVE_Walking);
+
+		SurfContactRemaining = 0.f;
+		SurfPlaneNormal = FVector::ZeroVector;
+		SurfEntrySpeed = 0.f;
+		SurfElapsedSeconds = 0.f;
+
+		RigPhaseClock() = 0.f;
+		RigPhase() = ESurfRigPhase::Settle;
+
+		if (PC != nullptr)
+		{
+			PC->SetControlRotation(Approach.Rotation());
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SURFAPPROACH   placing run %d/%d: %2.0f deg to the rail, from %s (asked %s), toe on the "
+			     "floor at %s, standoff %.0f uu"),
+			RigRun() + 1, SurfApproachCount, AngleDeg,
+			*UpdatedComponent->GetComponentLocation().ToCompactString(), *Start.ToCompactString(),
+			*Probe.ToeOnFloor.ToCompactString(), SurfApproachStandoff);
+		break;
+	}
+
+	case ESurfRigPhase::Settle:
+	{
+		RigPhaseClock() += DeltaSeconds;
+		if (RigPhaseClock() >= SurfApproachSettleSeconds)
+		{
+			// AT THE GROUND LIMIT, not above it: the complaint is about a player at ordinary floor
+			// speed, so the run starts at exactly what GetMaxSpeed() allows and nothing is carried in.
+			Velocity = Approach * FMath::Max(1.f, GetMaxSpeed());
+			Row.StartSpeed = GetPlanarSpeed();
+			Row.MinAfterContact = Row.StartSpeed;
+			RigPhaseClock() = 0.f;
+			RigPhase() = ESurfRigPhase::Ride;
+		}
+		break;
+	}
+
+	case ESurfRigPhase::Ride:
+	{
+		RigPhaseClock() += DeltaSeconds;
+		const float Planar = GetPlanarSpeed();
+
+		// Signed distance INBOARD of the toe line. Negative means the pawn is over the face.
+		const float Inset = static_cast<float>(FVector::DotProduct(Here - Probe.ToeOnFloor, Inboard));
+		if (!Row.bReachedFace && Inset < 80.f)
+		{
+			Row.bReachedFace = true;
+			Row.SpeedAtContact = Planar;
+			Row.MinAfterContact = Planar;
+			Row.ContactAt = Here;
+		}
+
+		if (Row.bReachedFace)
+		{
+			Row.MinAfterContact = FMath::Min(Row.MinAfterContact, Planar);
+			Row.PeakAfterContact = FMath::Max(Row.PeakAfterContact, Planar);
+		}
+
+		if (IsSurfing())
+		{
+			Row.bSurfed = true;
+			Row.SurfSeconds += DeltaSeconds;
+
+			// Once a ride HAS started the rig strafes it, because "can you gain speed by surfing into a
+			// ramp" is a question about the ride the approach buys, not only about the first frame.
+			DriveIdealSurfStrafe(CharacterOwner, PC, Probe.RunDirection, GetSurfPlaneNormal(),
+				Velocity, GetAirMaxWishSpeed(), DeltaSeconds);
+		}
+		else
+		{
+			SurfTestWishYawValid() = false;
+			CharacterOwner->AddMovementInput(Approach, 1.f);
+			if (PC != nullptr)
+			{
+				PC->SetControlRotation(Approach.Rotation());
+			}
+		}
+
+		if (RigPhaseClock() >= SurfApproachSeconds)
+		{
+			Row.FinalSpeed = Planar;
+			SurfApproachRows().Add(Row);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SURFAPPROACH run %d/%d  %2.0f deg  start %5.0f -> contact %5.0f (at %s) | min after "
+				     "contact %5.0f | peak %5.0f | final %5.0f | surfed=%d for %.2f s | reachedFace=%d"),
+				RigRun() + 1, SurfApproachCount, Row.AngleDegrees, Row.StartSpeed, Row.SpeedAtContact,
+				*Row.ContactAt.ToCompactString(), Row.MinAfterContact, Row.PeakAfterContact,
+				Row.FinalSpeed, Row.bSurfed ? 1 : 0, Row.SurfSeconds, Row.bReachedFace ? 1 : 0);
+
+			++RigRun();
+			RigPhase() = ESurfRigPhase::Place;
+		}
+		break;
+	}
+
+	default:
+		RigPhase() = ESurfRigPhase::Place;
+		break;
+	}
+}
+
+void UTraceCharacterMovementComponent::LogSurfExitTable() const
+{
+	using namespace TraceMovementSurf;
+
+	UE_LOG(LogTraceGame, Display, TEXT("================ SURFEXIT: SPEED ACROSS THE CURVE'S EXIT ================"));
+	UE_LOG(LogTraceGame, Display,
+		TEXT("  ground limit %.0f uu/s | air hard cap %.0f | surf ceiling %.0f | overspeed bleed "
+		     "friction %.2f + %.0f uu/s^2"),
+		GetMaxSpeed(), GetAirStrafeHardCapSpeed(),
+		GetAirStrafeHardCapSpeed() * GetSurfSpeedCeilingMultiplier(),
+		GetGroundOverspeedFriction(), GetGroundOverspeedBraking());
+	UE_LOG(LogTraceGame, Display,
+		TEXT("  %-6s %-7s %-9s %-8s %-8s %-8s %-7s %-7s %-7s %-7s %-8s"),
+		TEXT("entry"), TEXT("ride s"), TEXT("lastSurf"), TEXT("lastAir"), TEXT("lastAirZ"),
+		TEXT("landed"), TEXT("+0.25"), TEXT("+0.5"), TEXT("+1.0"), TEXT("+2.0"), TEXT("carry uu"));
+
+	int32 AirHits = 0;
+	int32 GroundHits = 0;
+	for (const FSurfExitSample& Row : SurfExitRows())
+	{
+		AirHits += Row.bAirObstructed ? 1 : 0;
+		GroundHits += Row.bGroundObstructed ? 1 : 0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("  %6.0f %7.2f %9.0f %8.0f %8.0f %8.0f %7.0f %7.0f %7.0f %7.0f %8.0f  %s"),
+			Row.Entry, Row.RideSeconds, Row.LastSurfPlanar, Row.LastAirSpeed3D, Row.LastAirVz,
+			Row.GroundPlanar, Row.At025, Row.At050, Row.At100, Row.At200, Row.CarryDistance,
+			!Row.bLanded ? TEXT("never landed")
+				: (Row.bAirObstructed
+					? TEXT("*** FLEW INTO SOMETHING — the exit lane is not clear ***")
+					: (Row.bGroundObstructed
+						? TEXT("carried, then met cover on the floor (the rig cannot steer)")
+						: TEXT("clean: flew clear, landed, bled out on open floor"))));
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("  EXIT LANE: %d of %d rides hit something WHILE STILL AIRBORNE (must be 0 — that is the "
+		     "'fast lane ends in a wall' failure) -> %s.  %d met cover after carrying along the floor, "
+		     "which is level furniture a player steers round and the rig cannot."),
+		AirHits, SurfExitRows().Num(), (AirHits == 0) ? TEXT("PASS") : TEXT("*** FAIL ***"), GroundHits);
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("  lastSurf = planar speed on the last frame ON the face. lastAir = 3D speed on the last "
+		     "AIRBORNE frame and its vertical part. landed = planar speed on the FIRST grounded frame. "
+		     "carry = uu travelled on the floor before the pawn was back at the walking limit."));
+	UE_LOG(LogTraceGame, Display, TEXT("=========================================================================="));
+}
+
+void UTraceCharacterMovementComponent::LogSurfApproachTable() const
+{
+	using namespace TraceMovementSurf;
+
+	UE_LOG(LogTraceGame, Display, TEXT("========== SURFAPPROACH: RUNNING AT A RAIL FROM THE FLOOR =========="));
+	UE_LOG(LogTraceGame, Display,
+		TEXT("  ground limit %.0f uu/s | surf band %.2f..%.2f deg | the 0 deg rung is the CONTROL: it "
+		     "runs parallel to the rail and never touches it."),
+		GetMaxSpeed(),
+		FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(GetWalkableFloorZ(), -1.f, 1.f))),
+		FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(GetSurfMinNormalZ(), -1.f, 1.f))));
+	UE_LOG(LogTraceGame, Display,
+		TEXT("  %-6s %-7s %-9s %-9s %-8s %-8s %-8s %s"),
+		TEXT("angle"), TEXT("start"), TEXT("contact"), TEXT("min"), TEXT("peak"), TEXT("final"),
+		TEXT("surf s"), TEXT("verdict"));
+
+	int32 Gained = 0;
+	for (const FSurfApproachSample& Row : SurfApproachRows())
+	{
+		const bool bControl = (Row.AngleDegrees <= 1.f);
+		const bool bGain = !bControl && Row.PeakAfterContact > Row.StartSpeed + 25.f;
+		Gained += bGain ? 1 : 0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("  %5.0f %7.0f %9.0f %9.0f %8.0f %8.0f %8.2f  %s"),
+			Row.AngleDegrees, Row.StartSpeed, Row.SpeedAtContact, Row.MinAfterContact,
+			Row.PeakAfterContact, Row.FinalSpeed, Row.SurfSeconds,
+			bControl
+				? TEXT("CONTROL - runs parallel, never touches the rail")
+				: (!Row.bReachedFace
+					? TEXT("*** never reached the face - placement is wrong ***")
+					: (bGain
+						? (Row.bSurfed ? TEXT("gained speed, and surfed for it") : TEXT("gained speed WITHOUT surfing"))
+						: (Row.bSurfed ? TEXT("surfed but gained nothing") : TEXT("*** no surf, no gain ***")))));
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("  VERDICT: %d of %d approach angles gained speed off the rail (the owner's complaint is "
+		     "that this number is 0)."),
+		Gained, FMath::Max(0, SurfApproachRows().Num() - 1));
+	UE_LOG(LogTraceGame, Display, TEXT("===================================================================="));
+}
+
 void UTraceCharacterMovementComponent::LogSurfReport() const
 {
 	const bool bAuthoritative = (CharacterOwner != nullptr) && CharacterOwner->HasAuthority();
+
+	// DEMO 29 ITEM 4 adds its own line rather than lengthening this one: the three new numbers are
+	// claims about the ENTRY and the EXIT, and reading them next to a ride's entry/exit means is how a
+	// reader tells "the rail gave nothing back" from "nobody rode it".
+	UE_LOG(LogTraceGame, Display,
+		TEXT("SURFREPORT %-16s DEMO29 | rides STARTED from the ground by running at a rail: %d | "
+		     "landings that rolled a ride's descent into the floor: %d (mean +%.0f uu/s each)"),
+		*GetNameSafe(CharacterOwner), SurfGroundEntries, SurfRolloutCount,
+		SurfRolloutGainSum / static_cast<float>(FMath::Max(1, SurfRolloutCount)));
 
 	UE_LOG(LogTraceGame, Display,
 		TEXT("SURFREPORT %-16s rides=%d closed=%d | entry mean %6.0f -> exit mean %6.0f uu/s "

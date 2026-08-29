@@ -117,6 +117,13 @@ struct FTraceAudioCounters
 	int32 MissingSound = 0;
 	/** Plays the engine declined (no audio device — a dedicated server, or -nosound). */
 	int32 NoAudioDevice = 0;
+	/**
+	 * Plays refused because the event is on Demo 29's unwire list (TraceSoundEvents::IsUnwired) —
+	 * the trigger fired, the sound deliberately did not. A non-zero count here is the difference
+	 * between "that trigger is broken" and "that sound is switched off", which is exactly the
+	 * question somebody will ask about DeathBurst and the kickoff countdown.
+	 */
+	int32 RefusedUnwired = 0;
 };
 
 /**
