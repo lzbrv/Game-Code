@@ -246,6 +246,26 @@ namespace TracePracticeRangeLocal
 		     "every press starts a real cooldown and the ability is refused until the next poll. "
 		     "0 (default) also refreshes it every frame, after input, so it is never refused."),
 		ECVF_Cheat);
+
+	/**
+	 * *** DEMO 29 ITEM 2's A/B KNOB. *** See ShouldUseOwnerArmsViewModel() in the header for the
+	 * whole argument; the short version is that this can only ever turn the fixture OFF, and only
+	 * inside the range. It defaults to 1 because the owner asked for the rig to be there when they
+	 * open the range — "I need to test this" — not for a switch they then have to find.
+	 *
+	 * NOT A RED ARM, unlike the two above, and the difference is worth stating: LeakArm and
+	 * PollOnlyInfinite exist to make a green harness go red. This one changes which of two meshes is
+	 * drawn in one game mode and asserts nothing.
+	 */
+	TAutoConsoleVariable<int32> CVarPracticeArmsRig(
+		TEXT("Trace.Practice.ArmsRig"),
+		1,
+		TEXT("DEV ONLY. Demo 29 item 2. 1 (default) draws the owner's imported first-person arms rig "
+		     "(SK_TraceArms) in the PRACTICE RANGE in place of the shipped pack hands "
+		     "(SK_TraceHands); 0 puts the pack hands back, so the two can be A/B'd live in one "
+		     "session. Has no effect in any other game mode: the range gate is "
+		     "TracePracticeRange::IsActive(), which no cvar can open in a real match."),
+		ECVF_Cheat);
 #endif
 }
 
@@ -280,6 +300,15 @@ namespace TracePracticeRange
 	bool IsInfinitePollOnlyArmed()
 	{
 		return TracePracticeRangeLocal::CVarPracticePollOnlyInfinite.GetValueOnAnyThread() != 0;
+	}
+
+	bool ShouldUseOwnerArmsViewModel(const UWorld* WorldPtr)
+	{
+		// THE RANGE TERM FIRST, AND NOT ONLY FOR SPEED. Written this way round the cvar is never
+		// consulted at all in a real match, so there is no reading of this line on which a value
+		// typed into a match's console reaches the viewmodel.
+		return IsActive(WorldPtr)
+			&& TracePracticeRangeLocal::CVarPracticeArmsRig.GetValueOnAnyThread() != 0;
 	}
 #endif
 }

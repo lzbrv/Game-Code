@@ -486,6 +486,43 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 		}
 	}
 
+#if !UE_BUILD_SHIPPING
+	// [DEMO 29 §2] The owner's own arms rig and its four solved hold poses, on the SAME optional
+	// contract as everything above: CDO references so a Development cook packages them, and a miss is
+	// a fixture that does not appear (or one loadout that falls back to the bind pose) rather than an
+	// error. NONE of the pack's twenty clips can serve here — they are on SK_TraceHands_Skeleton and
+	// do not interchange — so this rig has its own four, authored by Scripts/pose_hands.py against
+	// the very weapon geometry the shipped viewmodel puts in front of it.
+	//
+	// INSIDE THE GUARD, WHICH IS THE POINT. A Shipping binary does not reference these assets at all,
+	// so the cooker does not carry a test fixture into a shipped build. See
+	// TracePracticeRange::ShouldUseOwnerArmsViewModel().
+	{
+		static ConstructorHelpers::FObjectFinder<USkeletalMesh> ArmsFinder(TraceCharacterAssets::ArmsMeshPath);
+		if (ArmsFinder.Succeeded())
+		{
+			ArmsMesh = ArmsFinder.Object;
+		}
+
+		// A STATIC ARRAY OF FINDERS, for the same two reasons the twenty above are one: a finder must
+		// be static and constructed inside a constructor, and one ordered table beside the enum that
+		// indexes it cannot get out of step the way four named variables can.
+		static ConstructorHelpers::FObjectFinder<UAnimSequence> ArmsPoseFinders[] =
+		{
+			TraceCharacterAssets::ArmsPosePaths[0], TraceCharacterAssets::ArmsPosePaths[1],
+			TraceCharacterAssets::ArmsPosePaths[2], TraceCharacterAssets::ArmsPosePaths[3]
+		};
+		static_assert(UE_ARRAY_COUNT(ArmsPoseFinders) == TraceCharacterAssets::ArmsPose_Count,
+			"The constructor's arms pose finders and the arms pose index enum have drifted apart.");
+
+		ArmsPoses.SetNum(TraceCharacterAssets::ArmsPose_Count);
+		for (int32 Index = 0; Index < TraceCharacterAssets::ArmsPose_Count; ++Index)
+		{
+			ArmsPoses[Index] = ArmsPoseFinders[Index].Succeeded() ? ArmsPoseFinders[Index].Object : nullptr;
+		}
+	}
+#endif
+
 	// Body: a cylinder standing on the bottom of the capsule, as wide as the capsule is.
 	{
 		const float BodyScaleXY = (TraceCharacterLayout::CapsuleRadius * 2.f) / TraceCharacterLayout::BasicShapeSize;

@@ -1577,6 +1577,156 @@ namespace TraceCharacterAssets
 	const FName PackShellSlot(TEXT("shell"));
 	const FName PackCarbonSlot(TEXT("carbon"));
 
+#if !UE_BUILD_SHIPPING
+	// --- THE OWNER'S OWN FIRST-PERSON ARMS RIG  (demo 29 item 2) ---------------------------------
+	//
+	// A TEST FIXTURE, PRACTICE RANGE ONLY, AND THAT IS THE WHOLE SCOPE. Demo 29 asked to *test* this
+	// rig, not to replace SK_TraceHands, which is shipped, photographed and correct. Everything below
+	// is behind TracePracticeRange::ShouldUseOwnerArmsViewModel() and compiles out of Shipping.
+	//
+	// WHAT THE ASSET IS. `Art/Characters/Hands/HandModel2.fbx` (Blender Rigify, 1,251 model nodes,
+	// 336 verts, 47 weighted clusters) rebuilt by Scripts/import_hands.py into a clean 51-bone
+	// SkeletalMesh; the full derivation is in Art/Characters/Hands/SOURCE_NOTES.md. It is a BODY rig,
+	// not a view model, and three measured facts follow from that and drive the placement code:
+	//
+	//   * it is TWICE the size the first-person camera is tuned for — hand_right -> index_right_2 is
+	//     17.83 uu against the pack hands' 9.14 (1.95x), and the knuckle spread is only 1.30x, so it
+	//     is a differently proportioned hand rather than a scaled copy of the pack's;
+	//   * it is T-POSED, hands 142.83 uu apart against the pack's 18.46;
+	//   * it sits at Z 136.7..161.1 uu — a standing character's shoulder height — not at the
+	//     component origin where SK_TraceHands sits (Z -17.07..8.15).
+	//
+	// So the fixture owns a component transform as well as a mesh, and `arms_root` at the origin
+	// exists to give that a handle. There are TWO such transforms and which one is used depends on
+	// whether a POSE is on the rig, because a solved pose carries its own placement (below):
+	//
+	//   * NO POSE — BuildOwnerArmsViewModel() DERIVES a placement from the two skeletons rather than
+	//     typing it, landing this rig's `hand_right` on the pack rig's wrist, so a re-export retunes
+	//     itself. It is what the bind pose is drawn at, and it is the degrade path;
+	//   * A POSE — ArmsPoseScale / ArmsPoseYawDegrees / ArmsPoseTranslationRig, which is the
+	//     placement the poses were SOLVED against and is part of the pose deliverable.
+	//
+	// The constants below are the bone names the derivation reads, one fallback for the case where a
+	// bone has been renamed, the four poses, and that second placement.
+	//
+	// NAMES, NOT Rigify's. UE 5.8 headless CANNOT rename a bone after import (measured, wave 3), so
+	// the rebuild emits the names the shipped hands already use — `hand_right`, `index_right_2` — and
+	// that is why the two rigs can be measured against each other by one pair of FNames below.
+	const TCHAR* const ArmsMeshPath = TEXT("/Game/Trace/Characters/Hands/SK_TraceArms.SK_TraceArms");
+
+	/**
+	 * The right hand's root, on BOTH rigs, and the point the fixture is anchored by.
+	 *
+	 * NOT `wrist_right`: the owner's rig has no such bone. That asymmetry is the reason the arms are
+	 * an ADDITIONAL component rather than a mesh swapped into HandsPart — every weapon in this
+	 * viewmodel is composed off `wrist_right`, and a rig that does not carry it cannot be asked to
+	 * hold them. See BuildOwnerArmsViewModel for the full argument.
+	 */
+	const FName ArmsHandBone(TEXT("hand_right"));
+
+	/**
+	 * The right forearm. On the OWNER's rig this is the real forearm and `hand_right`'s PARENT; on
+	 * the pack rig the same name is a decoration leaf parented UNDER the hand. Same anatomy, opposite
+	 * parentage — so this name may only ever be read on the arms skeleton, and it is read for exactly
+	 * one thing: the hand -> elbow axis the whole rig is rotated by.
+	 */
+	const FName ArmsForearmBone(TEXT("forearm_right"));
+
+	/**
+	 * The right index fingertip, present on BOTH rigs (TraceKnifeView.cpp builds the knife's hold
+	 * basis out of it, so the pack rig's copy is load-bearing elsewhere). `hand -> fingertip` is the
+	 * one length that means the same thing on two differently proportioned hands, which is what makes
+	 * it the scale yardstick.
+	 */
+	const FName ArmsFingerTipBone(TEXT("index_right_2"));
+
+	/**
+	 * The scale to fall back to when either skeleton stops carrying the two bones above.
+	 *
+	 * MEASURED, not chosen: 9.14 / 17.83 = 0.5126 is the pack hand's length over the owner's, i.e.
+	 * the number the runtime derivation produces today. It exists so that a renamed bone degrades to
+	 * a rig at roughly the right size with a warning, rather than to a pair of arms at twice scale
+	 * filling the frame — which is the failure this codebase keeps meeting as "the fix silently
+	 * stopped applying".
+	 */
+	constexpr float ArmsFallbackScale = 0.5126f;
+
+	// --- THE FOUR SOLVED HOLD POSES, AND THE PLACEMENT THEY WERE SOLVED AGAINST -------------------
+	//
+	// Scripts/pose_hands.py's deliverable. Each is a ONE-FRAME AnimSequence on SK_TraceArms_Skeleton
+	// (0.033 s, two identical keys) holding all 51 bones: a two-bone IK put each hand on the weapon's
+	// grip and every finger was closed by binary search until its own measured flesh sat on the
+	// weapon's triangles. They are POSES, not clips — nothing in them moves, and UpdateOwnerArmsPose
+	// pins the playhead at 0 rather than letting a 33 ms clip free-run.
+	//
+	// *** INDEXED BY ATraceCharacter::EHandsLoadout, WHICH IS CHECKED BY static_assert AT THE ONE
+	// PLACE THAT INDEXES THEM *** (UpdateOwnerArmsPose, which is the only file where both this table
+	// and that enum are visible). So the hand shape the pack rig is already playing picks the arms'
+	// pose by construction, and the two rigs cannot end up holding different weapons.
+	//
+	// THE CORE'S ROW IS THE FIST, and it is a deliberate substitute rather than a missing entry: the
+	// Core is the two-hand cradle, it is carried in THIRD person, and the viewmodel is hidden for the
+	// whole of it (see UpdateHandsAnimation). No cradle pose was solved because there is no weapon
+	// geometry to solve one against; a closed fist is the honest neutral if the rig is ever seen in
+	// that loadout, and it is what the ring-finger fix was photographed on.
+	const TCHAR* const ArmsPosePaths[] =
+	{
+		TEXT("/Game/Trace/Characters/Hands/Poses/A_TraceArms_Knife.A_TraceArms_Knife"),
+		TEXT("/Game/Trace/Characters/Hands/Poses/A_TraceArms_Pistol.A_TraceArms_Pistol"),
+		TEXT("/Game/Trace/Characters/Hands/Poses/A_TraceArms_Smg.A_TraceArms_Smg"),
+		TEXT("/Game/Trace/Characters/Hands/Poses/A_TraceArms_Fist.A_TraceArms_Fist")
+	};
+
+	/** Index into ArmsPosePaths. Must stay in step with ATraceCharacter::EHandsLoadout. */
+	enum EArmsPoseIndex : int32
+	{
+		ArmsPose_Knife = 0,
+		ArmsPose_Pistol = 1,
+		ArmsPose_Smg = 2,
+		ArmsPose_Fist = 3,
+		ArmsPose_Count
+	};
+	static_assert(UE_ARRAY_COUNT(ArmsPosePaths) == ArmsPose_Count,
+		"The arms pose paths and the arms pose index enum have drifted apart.");
+
+	/** For the log line and Trace.Hands.Probe, in the same order. */
+	const TCHAR* const ArmsPoseNames[] =
+	{
+		TEXT("A_TraceArms_Knife"),
+		TEXT("A_TraceArms_Pistol"),
+		TEXT("A_TraceArms_Smg"),
+		TEXT("A_TraceArms_Fist")
+	};
+	static_assert(UE_ARRAY_COUNT(ArmsPoseNames) == ArmsPose_Count,
+		"The arms pose names and the arms pose index enum have drifted apart.");
+
+	/**
+	 * *** THE POSE AND THIS TRANSFORM ARE ONE DELIVERABLE. YOU MAY NOT MIX POSE A WITH PLACEMENT B. ***
+	 *
+	 * Every pose above was solved with the component sitting HERE, in rig space: the shoulders were
+	 * pinned at rig (-11.0, +/-8.86, -16.0) by this transform and the arms were then IK'd from there
+	 * onto the weapons. Draw the same pose under a different component transform and the solved hands
+	 * land wherever that transform happens to put them — which is exactly what a first attempt at
+	 * this did, and it is why the numbers are HERE, beside the assets they belong to, instead of
+	 * being re-derived by geometry that knows nothing about how the poses were solved.
+	 *
+	 * NOT TYPED, AND NOT INDEPENDENT OF THE ASSETS: pose_hands.py writes these three numbers into
+	 * `placement` in Intermediate/Hands/TraceArmsPoses_manifest.json on every run, and they are
+	 * copied from it. Re-solve the poses and copy them again if that block has changed.
+	 *
+	 *   scale 0.5126192 — the SAME ratio BuildOwnerArmsViewModel measures at runtime (pack
+	 *     `hand_right -> index_right_2` over this rig's), quoted here to the solver's precision;
+	 *   yaw -90 deg — the rig lays its arms along component +/-X and rig space wants them along +/-Y;
+	 *   translation rig (-9.7007, 0, -94.6355) — drops a standing body rig's shoulder height onto the
+	 *     viewmodel's, with the shoulders CHEATED FORWARD on purpose (an anatomically placed shoulder
+	 *     is ~66 uu from the grip and this arm is 57.9 x 0.5126 = 29.7 uu long, so it cannot reach;
+	 *     every first-person view model resolves that the same way).
+	 */
+	constexpr float ArmsPoseScale = 0.5126192f;
+	constexpr float ArmsPoseYawDegrees = -90.f;
+	const FVector ArmsPoseTranslationRig(-9.7007f, 0.f, -94.6355f);
+#endif // !UE_BUILD_SHIPPING
+
 	/** Printed at most once per process, so a missing import is loud but not spam. */
 	const TCHAR* const MissingImportHint =
 		TEXT("Character art is not imported. Run Scripts/import-mannequin.sh to copy Epic's Mannequin ")

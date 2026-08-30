@@ -25,6 +25,7 @@
 #include "Core/TraceCharacterInternal.h"      // the measured layout/asset tables and this file's CVars
 
 #include "Animation/AnimInstance.h"
+#include "Animation/AnimSingleNodeInstance.h"   // the arms fixture's pose is READ BACK off the rig
 #include "Camera/CameraActor.h"                // Trace.Characters.Watch films from a free camera
 #include "Camera/CameraComponent.h"            // Trace.DebugViewProbe compares the CAMERA to the aim
 #include "Components/CapsuleComponent.h"       // ... and the capsule half-height to the eye height
@@ -49,6 +50,8 @@
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceWeaponComponent.h"
 #include "GameFramework/SpringArmComponent.h"   // the third-person arm length, printed by the probe
+#include "Modes/TracePracticeRange.h"           // [DEMO 29 §2] Trace.Hands.Probe tells "not the range"
+                                                // apart from "the range, but the fixture is missing"
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Settings/TraceUserSettings.h"        // spec v32 §7d: Trace.ViewModel.Equip reads the live binds
 #include "Trace.h"
@@ -2160,6 +2163,66 @@ namespace
 						ViewModelShownGunName(Character->GetShownGun()),
 						TraceMelee::GetSwingCooldownRemaining(Character),
 						TraceMelee::GetShootLockoutRemaining(Character));
+
+					// *** [DEMO 29 §2] WHICH HAND RIG IS ON SCREEN, AND WHETHER THE ONE ABOVE IS
+					//     STILL LIVE. ***
+					//
+					// The practice range draws the owner's imported arms (SK_TraceArms) in place of
+					// the pack gloves, and the pack rig stays built and ticked underneath so the guns
+					// keep riding a pose that is THIS frame's. Those two claims are exactly what a
+					// screenshot cannot tell apart — a hidden rig that stopped evaluating and a
+					// hidden rig that did not look identical — so they are printed side by side with
+					// the wristRig/wristDelta line above, which is read off the LIVE component and is
+					// the measurement that settles it.
+					//
+					// IT MUST READ `armsRig=off (not the practice range)` IN EVERY MATCH. That line
+					// is the isolation proof this whole seam exists for, and it is cheap enough to
+					// print unconditionally so it cannot quietly stop being checked.
+					{
+						const USkeletalMeshComponent* const Arms = Character->GetViewModelArmsMesh();
+						const USkeletalMeshComponent* const PackRig = Character->GetViewModelHandsMesh();
+
+						// TWO CAUSES OF `null`, AND THEY ARE COMPLETELY DIFFERENT NEWS — so the gate
+						// is asked here as well, and this is the one other place in the codebase that
+						// asks it. "This is not the range" is the isolation holding; "this IS the
+						// range and the fixture is not there" is a degrade with a [Practice] warning
+						// naming the missing asset a few lines above. Printing one string for both
+						// would make a broken fixture read as a working boundary.
+						FString ArmsState = TEXT("off (not the practice range)");
+						if (Arms != nullptr)
+						{
+							// *** THE POSE IS READ OFF THE LIVE COMPONENT, NOT OFF THE CODE THAT
+							// WROTE IT. *** This line exists because the fixture shipped once with
+							// SetAnimationMode called and SetAnimation never called: every log line
+							// in the build said "the arms rig is drawn" and it was, flat and open,
+							// across all three weapons. `<none: BIND POSE>` here is that bug, named,
+							// on a line nobody has to interpret — and it comes from the single-node
+							// instance's own asset pointer, so no amount of intending to pose the
+							// rig can make it print a pose that is not on it.
+							const UAnimSingleNodeInstance* const Node = Arms->GetSingleNodeInstance();
+							const UAnimationAsset* const Held = (Node != nullptr) ? Node->GetAnimationAsset() : nullptr;
+							const FString Pose = (Held != nullptr)
+								? FString::Printf(TEXT("%s t=%.3fs"), *Held->GetName(),
+									(Node != nullptr) ? Node->GetCurrentTime() : -1.f)
+								: FString(TEXT("<none: BIND POSE — the hold is not playing>"));
+
+							ArmsState = Arms->bHiddenInGame
+								? FString::Printf(TEXT("BUILT but not drawn (Trace.Practice.ArmsRig 0), pose %s"), *Pose)
+								: FString::Printf(TEXT("DRAWN (SK_TraceArms, pose %s)"), *Pose);
+						}
+						else if (TracePracticeRange::IsActive(Character->GetWorld()))
+						{
+							ArmsState = TEXT("NOT BUILT, and this IS the practice range — see the "
+							                 "[Practice] warning above for which asset was missing");
+						}
+
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[Hands] armsRig=%s  (demo 29 §2 fixture; the pack rig above is %s)"),
+							*ArmsState,
+							(PackRig == nullptr) ? TEXT("absent — this pawn is on the procedural cubes")
+								: (PackRig->bHiddenInGame ? TEXT("built, ticked and NOT drawn")
+								                          : TEXT("built, ticked and drawn")));
+					}
 
 					// [SPEC v32 §5] THE GLOW, ON ITS OWN LINE, AND IT NAMES THE DRIVER.
 					//

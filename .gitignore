@@ -247,3 +247,7 @@ Art/Fonts/*.pdf
 .githooks/post-commit
 .githooks/post-merge
 .githooks/pre-push
+
+# Throwaway capture scaffolding written by Scripts/pose-hands.sh (documented as
+# throwaway in that script). Regenerated on demand; never part of a build.
+/Content/Trace/Temp/

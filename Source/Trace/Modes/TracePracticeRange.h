@@ -30,6 +30,9 @@
 //     character switching ....  UTracePracticeRangeSubsystem::PollRange, behind IsActive()
 //     the no-turnover spot ...  the CoreRack pad, only ever spawned behind IsActive()
 //     the dummies ............  only ever spawned behind IsActive()
+//     the owner's arms rig ...  ATraceCharacter::BuildOwnerArmsViewModel, behind
+//                               ShouldUseOwnerArmsViewModel() — which is IsActive() and a cvar
+//                               (demo 29 item 2; dev builds only, absent from Shipping entirely)
 //
 // IsActive() answers "is the authoritative game mode an ATracePracticeGameMode?". In a real match it
 // is not, and it cannot be made so by a setting, a cvar or an .ini: the mode arrives on the travel
@@ -103,6 +106,39 @@ namespace TracePracticeRange
 	 * Absent from shipping builds. Never set by any code path — only by the console.
 	 */
 	TRACE_API bool IsInfinitePollOnlyArmed();
+
+	/**
+	 * *** DEMO 29 ITEM 2 — THE OWNER'S FIRST-PERSON ARMS RIG, AND THE ONE QUESTION THAT DECIDES IT. ***
+	 *
+	 * Verbatim: "I need to test this first person arms rig i created. ... Implement this only in the
+	 * practice range, for testing purposes." So the rig is a TEST FIXTURE, and this is the predicate
+	 * that keeps it one. `SK_TraceArms` replaces the drawn pack hands (`SK_TraceHands`) in the
+	 * first-person view when — and only when — this answers true.
+	 *
+	 * TWO TERMS, AND THEY DO DIFFERENT JOBS:
+	 *
+	 *   IsActive()  is the RANGE gate, unchanged and unfakeable in a shipped build: the practice game
+	 *               mode can only arrive on the travel URL. This is the term that makes a normal match
+	 *               structurally incapable of drawing the rig.
+	 *   the cvar    is the A/B knob (`Trace.Practice.ArmsRig`, default 1 = the new rig). It exists so
+	 *               the owner can put the shipped pack hands back with one console command and compare
+	 *               them live, in one session, without a rebuild. It can only ever turn the fixture
+	 *               OFF inside the range; on its own it turns nothing on anywhere.
+	 *
+	 * THE SEAM ASKS TWO QUESTIONS, IN TWO PLACES, AND THEY ARE NOT THE SAME QUESTION:
+	 *   * WHETHER THE FIXTURE EXISTS — asked once, at rig build time, of IsActive() ALONE. The arms
+	 *     component is constructed in the range whatever the knob says, so the knob can be flipped
+	 *     BOTH ways in one session; a switch that can only be turned off is not an A/B. In every
+	 *     world that is not the range there is no component, so the pawn's per-frame path degenerates
+	 *     to one null pointer compare and a match cannot be reached from here at all.
+	 *   * WHICH RIG IS DRAWN — asked per frame, of THIS function, but only on a pawn that already has
+	 *     an arms component (i.e. only inside the range). That is what makes the knob live.
+	 *
+	 * ABSENT FROM SHIPPING ENTIRELY, along with the cvar and every line of the viewmodel seam that
+	 * calls it: a test fixture for an unfinished art asset has no business in a shipped binary, and
+	 * "compiled in but never true" is a weaker claim than "not compiled in".
+	 */
+	TRACE_API bool ShouldUseOwnerArmsViewModel(const UWorld* WorldPtr);
 #endif
 }
 

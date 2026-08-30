@@ -63,6 +63,7 @@
 #include "Gameplay/TraceMelee.h"                // spec v28 §10: TraceMelee::IsDualWieldEnabled()
 #include "Gameplay/TraceRailgunFireCurve.h"     // the measured fire curve the rig plays
 #include "Gameplay/TraceWeaponComponent.h"      // the equipped weapon, the ammo, the fire latch
+#include "Modes/TracePracticeRange.h"           // [DEMO 29 §2] the ONE gate the arms fixture is behind
 #include "Settings/TraceUserSettings.h"
 #include "Trace.h"
 #include "TraceSettings.h"
@@ -209,6 +210,23 @@ void ATraceCharacter::EnsureViewModelBuilt()
 	// the fallback promise in the file header — a clone with no `git lfs pull`, and
 	// -TraceNoCharacterArt asked for on purpose — go through this one return value.
 	const bool bPackHands = BuildPackHandsViewModel();
+
+	// =============================================================================================
+	// *** DEMO 29 ITEM 2 — THE OWNER'S ARMS RIG. THIS IS THE ONLY SEAM IT CUTS INTO THIS FILE. ***
+	// =============================================================================================
+	//
+	// "Implement this only in the practice range, for testing purposes." One call, immediately after
+	// the pack rig it sits on top of and before anything is placed against that rig, and every line
+	// of it is behind TracePracticeRange::IsActive() — so in a match this is one game-mode cast that
+	// answers no and returns. See BuildOwnerArmsViewModel and this file's header block.
+	//
+	// AFTER BuildPackHandsViewModel AND NOT INSIDE IT, deliberately: the fixture is DERIVED from what
+	// that function measured (HandsWristRestRig, re-based onto Idle_Pistol t=0 at the bottom of it),
+	// so it cannot be computed until that function has finished, and putting it inside would bury a
+	// range-only branch in the middle of the shipped rig's build.
+#if !UE_BUILD_SHIPPING
+	BuildOwnerArmsViewModel(bPackHands);
+#endif
 
 	// The railgun replaces the twelve gun parts if its art resolved. The hands and arms below are
 	// built either way — they are what holds whichever weapon won.
@@ -623,6 +641,22 @@ void ATraceCharacter::EnsureViewModelBuilt()
 	// before the first frame, so a pawn that spawns holding the SMG never shows a pistol — not even
 	// for the one tick it would take Tick() to get around to it.
 	UpdateWeaponSelection();
+
+#if !UE_BUILD_SHIPPING
+	// [DEMO 29 §2] And the same courtesy for the hand rig, for the same "not even for one tick"
+	// reason — but it has to be HERE rather than at the bottom of BuildOwnerArmsViewModel, and that
+	// is a fixed bug and not a preference. The fixture also puts away the pack's two procedural
+	// SLEEVE tubes (the owner's rig has real forearms), and those are built by the parts loop ABOVE,
+	// which runs after the hand rigs. Settled from inside the build they were still an empty array
+	// and stayed on screen — photographed, once.
+	UpdateOwnerArmsRig();
+
+	// AND THE HOLD POSE WITH IT, on the same "not even for one tick" argument. BuildPackHandsViewModel
+	// has already run UpdateHandsAnimation(0.f), so HandsLoadout is settled and this picks the right
+	// hold; HandsWristDelta is still identity until the first UpdateWeaponsFollowHands, which is what
+	// the weapons are placed at right now too, so the two agree on this frame as on every other.
+	UpdateOwnerArmsPose();
+#endif
 
 	ApplyTeamColors();
 
@@ -1295,6 +1329,503 @@ bool ATraceCharacter::BuildPackHandsViewModel()
 		TraceCharacterAssets::HandsClip_Count);
 	return true;
 }
+
+#if !UE_BUILD_SHIPPING
+
+// =================================================================================================
+// DEMO 29 ITEM 2 — the owner's own first-person arms rig, PRACTICE RANGE ONLY
+//
+// Verbatim: "I need to test this first person arms rig i created. See if you can animate it to hold
+// the knife and guns correctly. The ring fingers bend opposite the rest, so you'll have to invert
+// that. Implement this only in the practice range, for testing purposes."
+//
+// THIS FILE PUTS THE RIG ON SCREEN AND PLAYS THE HOLD ON IT. The rig is drawn at the right size, in
+// the right place, in one game mode, WITH the pose for whatever weapon is in the hand. The poses
+// themselves are Scripts/pose_hands.py's deliverable — one solved AnimSequence per loadout on
+// SK_TraceArms_Skeleton, listed in TraceCharacterAssets::ArmsPosePaths — and the ring-finger
+// inversion is fixed in that rig's BIND pose by Scripts/import_hands.py, so there is no per-finger
+// special case anywhere in this file.
+//
+// AND THE POSE BRINGS ITS OWN PLACEMENT WITH IT, WHICH IS THE ONE TRAP IN THIS SECTION. Each pose
+// was solved by IK from shoulders pinned at a specific rig-space transform; drawn under any OTHER
+// component transform the solved hands land wherever that transform puts them, not on the gun. So
+// UpdateOwnerArmsPose writes BOTH — the sequence and the transform it was solved against — and
+// BuildOwnerArmsViewModel's derived placement below is what the BIND pose (a T-pose) is drawn at,
+// which is now only the degrade path for a missing pose asset.
+//
+// WHY THE PACK RIG IS STILL BUILT AND STILL TICKED, and this is the decision the whole tranche turns
+// on: every weapon in this viewmodel is composed off `wrist_right`, a bone SK_TraceArms does not
+// carry, and the two AddTickPrerequisiteComponent(HandsPart) calls above order the actor and the
+// weapon component against THAT pose. Swapping the mesh under HandsPart would have moved the guns,
+// the muzzle markers, the tracer origin and the balisong's hold basis onto an unposed T-pose and
+// broken both prerequisites' meaning in the same edit. So the pack rig keeps running and stops being
+// DRAWN, the guns do not move by a micrometre, and the fixture is a second cosmetic component with
+// no prerequisite of its own — because nothing reads a bone off it.
+//
+// (That is also what the fixture needs: the weapons are the TARGET the new rig has to be posed onto.
+// A target that moved with the rig would make the posing unfalsifiable.)
+// =================================================================================================
+
+void ATraceCharacter::BuildOwnerArmsViewModel(bool bPackHandsBuilt)
+{
+	// *** THE GATE, AND IT IS ASKED ONCE. *** IsActive() rather than ShouldUseOwnerArmsViewModel():
+	// the component is CONSTRUCTED on the range question alone so that Trace.Practice.ArmsRig can be
+	// flipped BOTH WAYS inside one session — the owner asked to A/B this against the shipped hands,
+	// and a knob that can only be turned off is not an A/B. Which of the two is DRAWN is the knob's
+	// business, per frame, in UpdateOwnerArmsRig.
+	if (ViewModelRoot == nullptr || !TracePracticeRange::IsActive(GetWorld()))
+	{
+		return;
+	}
+
+	// REFUSED, NOT WORKED AROUND. Everything below is derived from the pack rig's live measurements —
+	// the scale yardstick is SK_TraceHands' own hand, the anchor is where its wrist ended up in rig
+	// space after the Idle_Pistol re-base. On the procedural cube fallback none of that exists, and a
+	// fixture that quietly placed itself somewhere else would be a worse answer than one that says
+	// why it is not on screen.
+	if (!bPackHandsBuilt || HandsPart == nullptr || HandsMesh == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Practice] The owner's arms rig needs the pack hands to measure and anchor against, ")
+			TEXT("and this pawn is on the procedural cube fallback. Showing the cubes; run ")
+			TEXT("./Scripts/import-pack.sh (or drop -TraceNoPackHands) to see the fixture."));
+		return;
+	}
+
+	if (ArmsMesh == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Practice] The owner's arms rig did not resolve (%s); the practice range is showing ")
+			TEXT("the shipped pack hands. Run ./Scripts/import-hands.sh."),
+			TraceCharacterAssets::ArmsMeshPath);
+		return;
+	}
+
+	const FReferenceSkeleton& ArmsRef = ArmsMesh->GetRefSkeleton();
+	const int32 ArmsHandIndex = ArmsRef.FindBoneIndex(TraceCharacterAssets::ArmsHandBone);
+	const int32 ArmsElbowIndex = ArmsRef.FindBoneIndex(TraceCharacterAssets::ArmsForearmBone);
+	if (ArmsHandIndex == INDEX_NONE || ArmsElbowIndex == INDEX_NONE)
+	{
+		// LOUD, and it names both bones: the placement is DERIVED from them, so without them there is
+		// no honest position to put the rig in. A re-export that renamed them would otherwise show up
+		// as a pair of arms at the rig origin, which reads as a placement bug in this file rather
+		// than as an art change.
+		UE_LOG(LogTraceGame, Error,
+			TEXT("[Practice] The owner's arms rig has no '%s' (%d) / '%s' (%d) — the two bones its ")
+			TEXT("placement is derived from. Not building it; the range keeps the pack hands. Bone ")
+			TEXT("count on the imported skeleton: %d."),
+			*TraceCharacterAssets::ArmsHandBone.ToString(), ArmsHandIndex,
+			*TraceCharacterAssets::ArmsForearmBone.ToString(), ArmsElbowIndex, ArmsRef.GetNum());
+		return;
+	}
+
+	const FVector ArmsHandLocal = RefPoseComponentSpace(ArmsRef, ArmsHandIndex).GetLocation();
+	const FVector ArmsElbowLocal = RefPoseComponentSpace(ArmsRef, ArmsElbowIndex).GetLocation();
+
+	// --- 1. SCALE: measured off both skeletons, not typed --------------------------------------
+	//
+	// `hand_right -> index_right_2` is the one length that means the same thing on two differently
+	// proportioned hands, and both rigs carry both bones (the pack's copy is load-bearing in
+	// TraceKnifeView.cpp's hold basis). Today this comes out at 9.14 / 17.83 = 0.513, which is the
+	// measured 1.95x the import report records — but it is DERIVED every run, so a re-export at a
+	// different size retunes the fixture instead of quietly doubling it.
+	//
+	// The fallback is the same number frozen (ArmsFallbackScale), used only if a bone has been
+	// renamed, and it is warned about: a fixture at roughly the right size with a line in the log
+	// beats a fixture at twice scale filling the frame.
+	const FReferenceSkeleton& PackRef = HandsMesh->GetRefSkeleton();
+	const int32 PackHandIndex = PackRef.FindBoneIndex(TraceCharacterAssets::ArmsHandBone);
+	const int32 PackTipIndex = PackRef.FindBoneIndex(TraceCharacterAssets::ArmsFingerTipBone);
+	const int32 ArmsTipIndex = ArmsRef.FindBoneIndex(TraceCharacterAssets::ArmsFingerTipBone);
+
+	double PackSpan = -1.0;
+	double ArmsSpan = -1.0;
+	if (PackHandIndex != INDEX_NONE && PackTipIndex != INDEX_NONE && ArmsTipIndex != INDEX_NONE)
+	{
+		PackSpan = FVector::Dist(RefPoseComponentSpace(PackRef, PackHandIndex).GetLocation(),
+			RefPoseComponentSpace(PackRef, PackTipIndex).GetLocation());
+		ArmsSpan = FVector::Dist(ArmsHandLocal, RefPoseComponentSpace(ArmsRef, ArmsTipIndex).GetLocation());
+	}
+
+	float ArmsScale = TraceCharacterAssets::ArmsFallbackScale;
+	bool bScaleDerived = false;
+	if (PackSpan > 1.0 && ArmsSpan > 1.0)
+	{
+		// The pack's span is in MESH units; what has to match is what is DRAWN, so it carries the
+		// pack rig's own component scale through. HandsScale is 1.0 today and this is therefore a
+		// no-op today — which is exactly why it is written down rather than left implicit.
+		ArmsScale = static_cast<float>((PackSpan * TraceCharacterLayout::HandsScale) / ArmsSpan);
+		bScaleDerived = true;
+	}
+	else
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Practice] The owner's arms rig could not be measured against the pack hands ")
+			TEXT("('%s' -> '%s' missing on one of them); falling back to the frozen scale %.4f. The ")
+			TEXT("fixture will be roughly, not exactly, hand sized."),
+			*TraceCharacterAssets::ArmsHandBone.ToString(),
+			*TraceCharacterAssets::ArmsFingerTipBone.ToString(), ArmsScale);
+	}
+
+	// *** SECTIONS 2 AND 3 BUILD THE *BIND POSE'S* PLACEMENT, AND THAT IS NOW THE DEGRADE PATH. ***
+	// A solved hold pose carries the placement it was solved against (TraceCharacterAssets::
+	// ArmsPoseTranslationRig), and UpdateOwnerArmsPose writes that one whenever a pose resolves. What
+	// follows is what the T-posed asset is drawn at when a pose asset is MISSING: it is still
+	// derived rather than typed, so a re-export lands somewhere honest instead of at the rig origin,
+	// and it is stored in ArmsBindPlacement at the bottom of section 4.
+
+	// --- 2. ROTATION: aim the arm the way a viewmodel arm has to run ----------------------------
+	//
+	// The rig is T-POSED, so its right arm runs straight out along its own -X. A viewmodel arm has to
+	// leave the fist DOWNWARD AND BACKWARD, off the bottom of the frame within a few centimetres —
+	// that is the whole argument on HandsArmLengthRightUU, and its conclusion is already a named
+	// constant: HandsArmDirectionRight, the direction the procedural sleeve leaves the fist in. So
+	// the rig's own hand -> elbow axis is rotated onto that, with FindBetweenNormals' minimal arc.
+	//
+	// MINIMAL ARC, WHICH LEAVES THE TWIST ABOUT THE ARM UNDECIDED, and on a bind pose that is all it
+	// can honestly be: which way the palm faces is a POSE decision, and a pose that has one states it
+	// in its own placement. This rotation is a placement for a T-pose and not a claim about the wrist.
+	const FVector ArmsAxisLocal = (ArmsElbowLocal - ArmsHandLocal).GetSafeNormal();
+	const FVector WantAxisRig = TraceCharacterLayout::HandsArmDirectionRight.GetSafeNormal();
+	const FQuat ArmsRotation = (ArmsAxisLocal.IsNearlyZero() || WantAxisRig.IsNearlyZero())
+		? FQuat::Identity
+		: FQuat::FindBetweenNormals(ArmsAxisLocal, WantAxisRig);
+
+	// --- 3. POSITION: put the owner's hand where the pack's hand already is ----------------------
+	//
+	// HandsWristRestRig is `wrist_right` in RIG space in the base pose — the point every weapon
+	// offset in this file is stored relative to, and (after the Idle_Pistol re-base at the bottom of
+	// BuildPackHandsViewModel) the point the fist is actually closed at. Landing `hand_right` on it
+	// is the whole placement: no new constant, and the fixture follows automatically if the pack rig
+	// is ever re-tuned.
+	const FVector ArmsAnchorRig = HandsWristRestRig.GetLocation();
+	const FVector ArmsLocation = ArmsAnchorRig - ArmsRotation.RotateVector(ArmsHandLocal * ArmsScale);
+
+	// --- 4. The component ------------------------------------------------------------------------
+
+	ArmsPart = NewObject<USkeletalMeshComponent>(this,
+		MakeUniqueObjectName(this, USkeletalMeshComponent::StaticClass(), TEXT("ViewModelOwnerArms")));
+	if (ArmsPart == nullptr)
+	{
+		return;
+	}
+
+	ArmsPart->SetMobility(EComponentMobility::Movable);
+	ArmsPart->SetupAttachment(ViewModelRoot);
+	ArmsPart->SetSkeletalMeshAsset(ArmsMesh);
+	ArmsPart->SetRelativeLocationAndRotation(ArmsLocation, ArmsRotation);
+	ArmsPart->SetRelativeScale3D(FVector(ArmsScale));
+
+	// KEPT, because UpdateOwnerArmsPose has to be able to come BACK to it: a loadout whose pose asset
+	// did not resolve is drawn in the bind pose, and the bind pose only means anything under the
+	// placement derived for it. Everything else is drawn at the pose's own placement.
+	ArmsBindPlacement = FTransform(ArmsRotation, ArmsLocation, FVector(ArmsScale));
+
+	// Contract §7, the same rule every other viewmodel part keeps: the capsule is the ONLY collider.
+	ArmsPart->SetCollisionProfileName(TEXT("NoCollision"));
+	ArmsPart->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+	ArmsPart->SetGenerateOverlapEvents(false);
+	ArmsPart->SetCanEverAffectNavigation(false);
+	ArmsPart->bReceivesDecals = false;
+
+	// NOBODY ELSE MAY EVER SEE THIS, and no shadow of any kind — a test fixture must not be able to
+	// put a pair of floating arms in another player's frame even by accident. (It cannot reach
+	// another machine anyway: the range is single-player. Belt and braces, because these two flags
+	// are the ones every other part in this file carries and a fixture is not a reason to be the
+	// exception.)
+	ArmsPart->SetOnlyOwnerSee(true);
+	ArmsPart->SetCastShadow(false);
+	ArmsPart->bCastHiddenShadow = false;
+
+	// Set BEFORE RegisterComponent so the scene proxy is created with it. Same depth compression the
+	// rest of the rig is drawn under; see TraceCharacter.h's viewmodel block.
+	ArmsPart->FirstPersonPrimitiveType = EFirstPersonPrimitiveType::FirstPerson;
+
+	// SINGLE-NODE MODE, WHICH IS THE HANDLE UpdateOwnerArmsPose HANGS THE HOLD POSE ON. No anim
+	// blueprint: there is one static pose per loadout and a graph to choose between four sequences by
+	// a value this class already owns would be four assets and a compile step to say what one switch
+	// statement says. Set BEFORE RegisterComponent so InitAnim creates the single-node instance —
+	// SetAnimation() is a silent no-op without one, which is exactly how this rig spent its first
+	// three days on screen T-posed.
+	//
+	// NOTHING IS ASSIGNED HERE. The pose depends on the weapon in the hand, and that is settled per
+	// frame; EnsureViewModelBuilt calls UpdateOwnerArmsPose at the bottom of its own body so the
+	// first DRAWN frame is already holding something.
+	ArmsPart->SetAnimationMode(EAnimationMode::AnimationSingleNode);
+	ArmsPart->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
+	ArmsPart->bEnableUpdateRateOptimizations = false;
+
+	// bVisible follows the VIEW BLEND, exactly like every other part (SetViewModelVisible drives it).
+	// Read off the pawn rather than written false so the fixture cannot be born hidden on a pawn whose
+	// rig is already up — SetViewModelVisible early-outs when the flag has not changed, and a fixture
+	// that missed that edge would simply never appear.
+	ArmsPart->SetVisibility(bViewModelVisible);
+
+	// *** AND bHiddenInGame IS THE A/B FLAG, WRITTEN ONLY BY UpdateOwnerArmsRig. *** Born hidden and
+	// bOwnerArmsShown born false, so the two agree from frame zero and the first update writes both
+	// rigs whichever way the knob is set. Nothing else in this codebase writes bHiddenInGame on the
+	// hands: UpdateWeaponSelection touches only the two gun lists, and
+	// UTraceWeaponComponent::IsViewModelHandPart exists precisely to keep the knife rule off them.
+	ArmsPart->SetHiddenInGame(true);
+	bOwnerArmsShown = false;
+
+	ArmsPart->RegisterComponent();
+
+	// *** NOT ONE BONE IS HIDDEN, AND THAT IS A RULE RATHER THAN AN OMISSION. *** The pack rig hides
+	// `forearm_right` / `forearm_left` because they are childless decoration leaves that fly at the
+	// lens. On THIS rig those same two names are the real forearms and the hands' PARENTS — same
+	// anatomy, opposite parentage — so HideBoneByName here would collapse each hand to a point. See
+	// TraceCharacterAssets::ArmsForearmBone.
+
+	// --- 5. Lighting, borrowed rather than invented ----------------------------------------------
+	//
+	// The rig wears `shell` (MI_Pack_shell, bound at import), whose base colour is 0.041 with
+	// EmissiveColor (0,0,0) — and this arena puts under 6 lux on the inside of a player's face, so
+	// with no floor the arms would render as a silhouette and the fixture would prove nothing. The
+	// floor is the GLOVE's, to the number: the MIDs are appended to HandsUnlitMIDs, so
+	// ApplyHandsGloveFloor and the shipped Trace.Hands.GloveFloor knob drive the arms and the gloves
+	// with one write and there is no second brightness to keep in step.
+	{
+		int32 LitSlots = 0;
+		const TArray<FName> SlotNames = ArmsPart->GetMaterialSlotNames();
+		for (int32 Index = 0; Index < SlotNames.Num(); ++Index)
+		{
+			if (SlotNames[Index] != TraceCharacterAssets::PackShellSlot
+				&& SlotNames[Index] != TraceCharacterAssets::PackCarbonSlot)
+			{
+				continue;
+			}
+			UMaterialInstanceDynamic* const Floor = ArmsPart->CreateDynamicMaterialInstance(Index);
+			if (Floor == nullptr)
+			{
+				continue;
+			}
+
+			// Written here as well as registered above, because ApplyHandsGloveFloor only runs again
+			// when the knob CHANGES — a slot that was only registered would stay black until somebody
+			// typed at the console. HandsGloveFloorApplied is the product BuildHandsEmissive just
+			// wrote (knob included); the constant is the floor for the impossible case where the pack
+			// rig's own emissive never got built.
+			const float Strength = (HandsGloveFloorApplied >= 0.f)
+				? HandsGloveFloorApplied
+				: TraceCharacterLayout::HandsGloveEmissiveStrength;
+			const FLinearColor& Tint = TraceCharacterLayout::ViewModelBodyEmissiveColor;
+			Floor->SetVectorParameterValue(TEXT("EmissiveColor"),
+				FLinearColor(Tint.R * Strength, Tint.G * Strength, Tint.B * Strength, 1.f));
+			Floor->SetScalarParameterValue(TEXT("EmissiveIntensity"), 1.f);
+
+			HandsUnlitMIDs.Add(Floor);
+			++LitSlots;
+		}
+
+		if (LitSlots == 0)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Practice] The owner's arms rig has no '%s'/'%s' slot to light (%d slots on the ")
+				TEXT("mesh), so it will render as a silhouette against this arena. Re-run ")
+				TEXT("./Scripts/import-hands.sh, which binds slot `shell` to MI_Pack_shell."),
+				*TraceCharacterAssets::PackShellSlot.ToString(),
+				*TraceCharacterAssets::PackCarbonSlot.ToString(), SlotNames.Num());
+		}
+	}
+
+	// EVERY DERIVED NUMBER, ON ONE LINE, because the pose stage's first question is "where did you
+	// put it and how big is it" and the second is "did you measure that or type it".
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Practice] Built the owner's arms rig SK_TraceArms (%d bones) as the practice range's ")
+		TEXT("first-person hands. BIND placement (the fallback): scale %.4f (%s: pack hand %.2f uu / ")
+		TEXT("arms hand %.2f uu), rig loc (%.2f, %.2f, %.2f), '%s' anchored on the pack's '%s' rest ")
+		TEXT("at rig (%.2f, %.2f, %.2f), arm axis (%.3f, %.3f, %.3f) -> (%.3f, %.3f, %.3f). The rig ")
+		TEXT("is normally drawn in a SOLVED HOLD POSE at that pose's own placement instead — see the ")
+		TEXT("[Practice] arms pose line below. The pack rig is still built, still ticked and still ")
+		TEXT("holds every weapon, it is only not drawn. Trace.Practice.ArmsRig 0 puts the pack hands ")
+		TEXT("back."),
+		ArmsRef.GetNum(), ArmsScale, bScaleDerived ? TEXT("measured") : TEXT("FROZEN FALLBACK"),
+		PackSpan, ArmsSpan,
+		ArmsLocation.X, ArmsLocation.Y, ArmsLocation.Z,
+		*TraceCharacterAssets::ArmsHandBone.ToString(),
+		*TraceCharacterAssets::HandsWeaponBone.ToString(),
+		ArmsAnchorRig.X, ArmsAnchorRig.Y, ArmsAnchorRig.Z,
+		ArmsAxisLocal.X, ArmsAxisLocal.Y, ArmsAxisLocal.Z,
+		WantAxisRig.X, WantAxisRig.Y, WantAxisRig.Z);
+
+	// *** WHICH RIG IS DRAWN IS NOT SETTLED HERE, AND THAT IS DELIBERATE. *** EnsureViewModelBuilt
+	// calls UpdateOwnerArmsRig at the BOTTOM of its own body, once the parts loop has built the
+	// pack's two sleeve tubes — which the fixture also has to put away, and which do not exist yet at
+	// this point in the sequence. Settled from here they stayed on screen; that was photographed.
+}
+
+void ATraceCharacter::UpdateOwnerArmsRig()
+{
+	// *** THIS NULL CHECK IS THE ISOLATION, AND IT IS THE WHOLE PER-FRAME COST IN A MATCH. ***
+	// ArmsPart is only ever constructed under TracePracticeRange::IsActive(), so in every world whose
+	// game mode is not ATracePracticeGameMode this returns here and no cvar is read at all.
+	if (ArmsPart == nullptr)
+	{
+		return;
+	}
+
+	const bool bWantArms = TracePracticeRange::ShouldUseOwnerArmsViewModel(GetWorld());
+	if (bWantArms == bOwnerArmsShown)
+	{
+		return;
+	}
+	bOwnerArmsShown = bWantArms;
+
+	// bHiddenInGame, NOT bVisible. bVisible belongs to SetViewModelVisible and follows the view
+	// blend; a component draws only when both agree. Split this way the fixture cannot make the
+	// viewmodel appear in third person, and the view blend cannot bring the hidden rig back.
+	ArmsPart->SetHiddenInGame(!bWantArms);
+	if (HandsPart != nullptr)
+	{
+		HandsPart->SetHiddenInGame(bWantArms);
+	}
+
+	// AND THE PACK'S SLEEVES WITH IT. The two tubes and their lit cuff bands exist for exactly one
+	// reason — the pack rig's own forearms are hidden, and two gloves with no arms float
+	// (HandsArmDirectionRight). The owner's rig HAS forearms, so leaving them on would draw a
+	// procedural sleeve through a real arm. They are the pack presentation, and they go with it.
+	for (const TObjectPtr<UStaticMeshComponent>& Part : HandsForearmParts)
+	{
+		if (Part != nullptr)
+		{
+			Part->SetHiddenInGame(bWantArms);
+		}
+	}
+
+	// Display, not Verbose: this is a fixture swapping the thing the player is looking at, in a mode
+	// whose whole purpose is looking at it, and "which rig is on screen" is the first question any
+	// frame taken here raises. One line per flip, and flips only happen when a human types.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Practice] First-person rig -> %s (Trace.Practice.ArmsRig %d). The pack rig is still "
+		     "built and still ticked either way; only what is DRAWN changes."),
+		bWantArms ? TEXT("THE OWNER'S ARMS (SK_TraceArms, in its solved hold pose)")
+		          : TEXT("the shipped pack hands (SK_TraceHands)"),
+		bWantArms ? 1 : 0);
+}
+
+// =================================================================================================
+// THE HOLD POSE — the half of demo 29 item 2 that makes the fixture worth photographing
+// =================================================================================================
+//
+// WHAT WAS WRONG, AND IT WAS INVISIBLE IN EVERY LOG LINE. The component was put in single-node mode
+// and nothing was ever assigned to it, so the rig rendered its BIND POSE: a flat, splayed, open palm
+// laid across three different weapons, for pistol, SMG and knife alike. Two stages had each verified
+// their own half — the poses were photographed on offline preview meshes whose REFERENCE pose was
+// the pose, and the wiring was photographed with the poses admittedly absent — and neither had ever
+// asked the only question that matters, which is whether the poses play on the wired rig. They did
+// not. The fix is this function; the guard against it happening again is that the pose is now read
+// back off the LIVE component by Trace.Hands.Probe rather than asserted from the code that wrote it.
+//
+// AND THE SECOND HALF OF THE FIX IS THE PLACEMENT, which is the part that is easy to get wrong
+// twice. These poses are not additive fingers-only clips: each is a full 51-bone solve with a
+// two-bone IK that ran from shoulders pinned by ONE specific component transform. Play such a pose
+// under BuildOwnerArmsViewModel's bind placement — which was derived to land the T-POSE's hand on
+// the pack wrist — and the solved hand goes wherever that lands it. The pose and its transform are
+// one deliverable, and this function writes them together.
+
+void ATraceCharacter::UpdateOwnerArmsPose()
+{
+	// The same null check, for the same reason and at the same price as UpdateOwnerArmsRig's: in
+	// every world that is not the practice range this feature costs one pointer compare per frame.
+	if (ArmsPart == nullptr)
+	{
+		return;
+	}
+
+	// *** ONE FACT, TWO RIGS. *** The pose is chosen by HandsLoadout — the value UpdateHandsAnimation
+	// settled from the replicated weapon selector EARLIER IN THIS SAME TICK for the pack rig's own
+	// clip — and not by a second read of the selector. So the hidden rig that is carrying the gun and
+	// the visible rig that is gripping it cannot disagree about which weapon that is, and
+	// Trace.Hands.Hold (which forces the loadout) moves both.
+	//
+	// INDEXED, NOT SWITCHED, and these four asserts are what makes that safe: the pose table is
+	// written in EHandsLoadout's own order, and this is the one translation unit where the enum and
+	// the table are both visible to say so at compile time.
+	static_assert(static_cast<int32>(EHandsLoadout::Knife) == TraceCharacterAssets::ArmsPose_Knife,
+		"ArmsPosePaths is indexed by EHandsLoadout and the two have drifted apart (knife).");
+	static_assert(static_cast<int32>(EHandsLoadout::Pistol) == TraceCharacterAssets::ArmsPose_Pistol,
+		"ArmsPosePaths is indexed by EHandsLoadout and the two have drifted apart (pistol).");
+	static_assert(static_cast<int32>(EHandsLoadout::Smg) == TraceCharacterAssets::ArmsPose_Smg,
+		"ArmsPosePaths is indexed by EHandsLoadout and the two have drifted apart (smg).");
+	static_assert(static_cast<int32>(EHandsLoadout::Core) == TraceCharacterAssets::ArmsPose_Fist,
+		"The Core loadout must map to the fist pose; see TraceCharacterAssets::ArmsPosePaths.");
+
+	const int32 DesiredPose = static_cast<int32>(HandsLoadout);
+	UAnimSequence* const Pose = ArmsPoses.IsValidIndex(DesiredPose) ? ArmsPoses[DesiredPose].Get() : nullptr;
+
+	if (DesiredPose != ArmsPoseApplied)
+	{
+		ArmsPoseApplied = DesiredPose;
+
+		// SetAnimation, NOT PlayAnimation, and that is the whole handling of "these are poses, not
+		// clips". USkeletalMeshComponent::SetAnimation assigns the asset with looping OFF and playing
+		// OFF; the single-node instance then evaluates its one frame every tick and never advances.
+		// PlayAnimation would start a 0.033 s sequence free-running at 30 loops a second — harmless
+		// on two identical keys, and exactly the kind of thing that stops being harmless the first
+		// time somebody solves a two-frame pose. Stop() and the explicit seek say the intent out loud
+		// rather than resting on that default.
+		ArmsPart->SetAnimation(Pose);
+		ArmsPart->Stop();
+		ArmsPart->SetPosition(0.f, /*bFireNotifies=*/false);
+
+		if (Pose != nullptr)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Practice] Arms pose -> %s (%.3f s, held at frame 0) at the placement it was ")
+				TEXT("solved against: scale %.4f, yaw %.1f, rig (%.2f, %.2f, %.2f). It rides the same ")
+				TEXT("HandsWristDelta the weapons do, so the grip cannot drift off the gun."),
+				TraceCharacterAssets::ArmsPoseNames[DesiredPose], Pose->GetPlayLength(),
+				TraceCharacterAssets::ArmsPoseScale, TraceCharacterAssets::ArmsPoseYawDegrees,
+				TraceCharacterAssets::ArmsPoseTranslationRig.X,
+				TraceCharacterAssets::ArmsPoseTranslationRig.Y,
+				TraceCharacterAssets::ArmsPoseTranslationRig.Z);
+		}
+		else
+		{
+			// LOUD AND SPECIFIC, because the symptom — a flat open hand laid across a gun — is the
+			// exact symptom this whole function exists to have fixed, and a reader who meets it again
+			// must be told which asset is missing rather than left to re-diagnose it.
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Practice] The owner's arms have no hold pose for this loadout (%s did not ")
+				TEXT("resolve), so they are drawn FLAT AND OPEN in their bind pose at the derived ")
+				TEXT("bind placement. Run ./Scripts/pose-hands.sh."),
+				TraceCharacterAssets::ArmsPoseNames[DesiredPose]);
+		}
+	}
+
+	// --- THE PLACEMENT, EVERY FRAME ---------------------------------------------------------------
+	//
+	// TWO REASONS IT IS NOT WRITTEN ONCE BESIDE THE SetAnimation ABOVE.
+	//
+	//   THE POSE OWNS THE TRANSFORM. Which of the two placements is correct is a property of what is
+	//   ON the rig, so it is settled from the same `Pose` pointer the sequence came from — there is
+	//   no way to leave a solved pose sitting at the bind placement, or the reverse.
+	//
+	//   AND THE GUN MOVES. Every weapon part in this viewmodel is drawn at `rest x HandsWristDelta`
+	//   (UpdateWeaponsFollowHands) — the pack rig's live wrist, which keeps walking with Idle_Pistol
+	//   even while that rig is hidden. Measured in the range: 0.22 uu on the pistol, 2.10 uu on the
+	//   SMG, 0.97 uu / 6.5 deg on the knife. The poses were solved against the weapons at REST, so
+	//   the arms are carried by the SAME delta and the two stay exactly as solved. Left static, the
+	//   SMG's hand would slide 2.1 uu off a grip that a finger sits 0.9 uu thick on.
+	//
+	// The delta rotates about the WRIST rather than the rig origin (see ComputeHandsWristDelta), so
+	// this swings the shoulders a few uu and leaves the fist welded where it was posed — which is the
+	// right way round for a picture of a hand on a gun.
+	static const FTransform PosePlacement(
+		FRotator(0.f, TraceCharacterAssets::ArmsPoseYawDegrees, 0.f),
+		TraceCharacterAssets::ArmsPoseTranslationRig,
+		FVector(TraceCharacterAssets::ArmsPoseScale));
+
+	ArmsPart->SetRelativeTransform((Pose != nullptr ? PosePlacement : ArmsBindPlacement) * HandsWristDelta);
+}
+
+USkeletalMeshComponent* ATraceCharacter::GetViewModelArmsMesh() const
+{
+	return ArmsPart;
+}
+
+#endif // !UE_BUILD_SHIPPING
 
 int32 ATraceCharacter::ResolveHandsClip(EHandsLoadout Loadout, EHandsAction Action) const
 {
@@ -3296,6 +3827,17 @@ void ATraceCharacter::SetViewModelVisible(bool bVisible)
 	{
 		HandsPart->SetVisibility(bVisible);
 	}
+
+#if !UE_BUILD_SHIPPING
+	// [DEMO 29 §2] And the practice range's fixture, on the identical terms and for the identical
+	// reason: it is a hand rig, so it follows the RIG's visibility and nothing else. Null everywhere
+	// but the range. Which of the two hand rigs is DRAWN is bHiddenInGame's job, not this one's —
+	// see UpdateOwnerArmsRig for why the two flags are kept apart.
+	if (ArmsPart != nullptr)
+	{
+		ArmsPart->SetVisibility(bVisible);
+	}
+#endif
 }
 
 void ATraceCharacter::UpdateViewModel(float DeltaSeconds)
@@ -3311,6 +3853,16 @@ void ATraceCharacter::UpdateViewModel(float DeltaSeconds)
 	// SetViewModelVisible brings it back, rather than a frame of the wrong one. It is also cheap:
 	// SetHiddenInGame is a no-op when the flag already matches.
 	UpdateWeaponSelection();
+
+#if !UE_BUILD_SHIPPING
+	// [DEMO 29 §2] WHICH HAND RIG, on exactly the same terms as WHICH GUN above and immediately after
+	// it: outside the bAnimate gate, because a hidden rig can still have its selector changed and the
+	// right one must already be up when SetViewModelVisible brings the viewmodel back.
+	//
+	// In a match this is one null pointer compare — ArmsPart is only ever constructed inside the
+	// practice range. See UpdateOwnerArmsRig.
+	UpdateOwnerArmsRig();
+#endif
 
 	// A hidden rig still gets its state DECAYED rather than frozen, so a player who takes the Core
 	// mid-burst and hands it back does not come out of third person with a stale recoil kick and a
@@ -3373,6 +3925,17 @@ void ATraceCharacter::UpdateViewModel(float DeltaSeconds)
 	// spurious wall jump on the frame the hands came back.
 	UpdateHandsAnimation(DeltaSeconds);
 	UpdateWeaponsFollowHands();
+
+#if !UE_BUILD_SHIPPING
+	// [DEMO 29 §2] HERE AND NOWHERE EARLIER, because it reads what both lines above just wrote:
+	// HandsLoadout (which hold to play) from UpdateHandsAnimation, and HandsWristDelta (where the gun
+	// has got to this frame) from UpdateWeaponsFollowHands. Called one line after the guns are placed
+	// and against the same delta, so the fist and the grip are settled from one measurement.
+	//
+	// ABOVE THE bAnimate GATE, with UpdateHandsAnimation, and for the same reason: a rig that is
+	// hidden must not come back holding the previous weapon. One pointer compare in a match.
+	UpdateOwnerArmsPose();
+#endif
 
 	if (!bAnimate)
 	{
