@@ -170,7 +170,10 @@ Scripts/
   run-listen-server.sh      Host a listen server on :7777. The default way to play right now.
   run-client.sh             Connect a client to <ip>:7777.
   run-dedicated-server.sh   Headless server. Needs --editor on a launcher engine — see NETWORKING.
-  run-practice-range.sh     Boot straight into the practice range.
+  run-practice-range.sh     Boot straight into the practice range. (Windows: the .bat twin.)
+                            The owner's first-person arms rig is drawn HERE AND NOWHERE ELSE;
+                            `Trace.Practice.ArmsRig 0` in the console swaps back to the pack
+                            hands for an A/B without relaunching.
   verify-practice-range.sh  Three headless runs that prove the practice range's cheats cannot leak
                             into a real match — red arm first, then green, then the range itself.
   setup-lfs.sh              One-time Git LFS bootstrap after cloning.
