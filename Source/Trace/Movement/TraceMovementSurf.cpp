@@ -770,6 +770,54 @@ namespace TraceMovementSurf
 	/** Settle after an exit-rig placement, before the ride is measured. Longer than the surf grace. */
 	static constexpr float SurfExitSettleSeconds = 0.15f;
 
+	// =============================================================================================
+	// -TraceSurfFrameTrace — ONE LINE PER FRAME, AND WHY A SUMMARY TABLE COULD NOT REPLACE IT.
+	//
+	// Every rig above this line reports a ride as a handful of scalars: entry, peak, last surf frame,
+	// landed, carried. That is the right shape for "is surfing worth anything", and it is the wrong
+	// shape for "is the ride SMOOTH" — a ride that loses 40 uu/s four times at four facet joints and
+	// a ride that loses 160 uu/s once at the junction have the same entry, the same peak and very
+	// nearly the same exit. The owner's complaint is about the second kind of thing, so the
+	// instrument has to be able to see WHERE on the structure a frame went wrong.
+	//
+	// So this arm prints the per-frame state with the two derived columns that make a geometry defect
+	// legible: the CHANGE in planar speed since the previous frame, and the face angle acos(Nz) of
+	// the plane the pawn is on. A facet joint is a step in the angle column; what it costs is the
+	// number next to it in the delta column. Both are read LIVE off the movement state, so the trace
+	// is of the ride the shipped code actually simulated.
+	//
+	// It is a modifier, not a mode: pass it alongside -TraceSurfExitTest. On its own it does nothing,
+	// because there is no ride to trace.
+	// =============================================================================================
+	static bool SurfFrameTraceEnabled()
+	{
+		static const bool bEnabled = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfFrameTrace"));
+		return bEnabled;
+	}
+
+	/** Previous frame's planar speed, for the delta column. Reset at every placement. */
+	static float& SurfFrameTracePrevPlanar()
+	{
+		static float Planar = 0.f;
+		return Planar;
+	}
+
+	/** The worst single-frame planar loss of the current ride, and where it happened. */
+	struct FSurfFrameWorst
+	{
+		float Loss = 0.f;
+		float AtX = 0.f;
+		float AtAngle = 0.f;
+		float FromPlanar = 0.f;
+		bool bSurfing = false;
+	};
+
+	static FSurfFrameWorst& SurfFrameTraceWorst()
+	{
+		static FSurfFrameWorst Worst;
+		return Worst;
+	}
+
 	/** Which pose the net arm's server hands out next. Alternates crest / floor lane. */
 	static bool& SurfNetPoseOnFloor()
 	{
@@ -1555,11 +1603,50 @@ void UTraceCharacterMovementComponent::TickSurfExitRun(float DeltaSeconds)
 		LastGroundPlanar = NowPlanar;
 	}
 
+	// --- -TraceSurfFrameTrace: the ride, frame by frame. See the block in the namespace above. -----
+	if (SurfFrameTraceEnabled()
+		&& (RigPhase() == ESurfRigPhase::Ride || RigPhase() == ESurfRigPhase::AirGap
+			|| RigPhase() == ESurfRigPhase::Ground))
+	{
+		const float Planar = GetPlanarSpeed();
+		const float Delta = Planar - SurfFrameTracePrevPlanar();
+		SurfFrameTracePrevPlanar() = Planar;
+
+		// The plane the pawn is ON. While surfing that is the live surf plane; on the ground it is the
+		// floor the engine found. Reported as the FACE ANGLE, because degrees off horizontal is the
+		// number the geometry is cut in and the number a facet joint moves.
+		const FVector Plane = IsSurfing() ? GetSurfPlaneNormal() : CurrentFloor.HitResult.ImpactNormal;
+		const float Nz = FMath::Clamp(static_cast<float>(Plane.Z), -1.f, 1.f);
+		const float FaceDegrees = Plane.IsNearlyZero()
+			? -1.f : FMath::RadiansToDegrees(FMath::Acos(Nz));
+
+		// A LOSS IS ONLY INTERESTING WHILE THE PAWN IS ON SOMETHING. Air drag and the wish cap take
+		// their own few uu/s off a free-flying pawn every frame and none of that is geometry.
+		if (-Delta > SurfFrameTraceWorst().Loss && (IsSurfing() || IsMovingOnGround()))
+		{
+			FSurfFrameWorst& Worst = SurfFrameTraceWorst();
+			Worst.Loss = -Delta;
+			Worst.AtX = static_cast<float>(Here.X);
+			Worst.AtAngle = FaceDegrees;
+			Worst.FromPlanar = Planar - Delta;
+			Worst.bSurfing = IsSurfing();
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SURFFRAME run=%d ph=%d t=%6.3f X=%8.1f Y=%7.1f Z=%7.1f planar=%7.1f d=%+7.1f "
+			     "v3=%7.1f Vz=%+8.1f face=%6.2f surf=%d gnd=%d"),
+			RigRun() + 1, static_cast<int32>(RigPhase()), RigPhaseClock(),
+			Here.X, Here.Y, Here.Z, Planar, Delta, Velocity.Size(), Velocity.Z,
+			FaceDegrees, IsSurfing() ? 1 : 0, IsMovingOnGround() ? 1 : 0);
+	}
+
 	switch (RigPhase())
 	{
 	case ESurfRigPhase::Place:
 	{
 		const float Requested = SurfExitLadder[FMath::Clamp(RigRun(), 0, SurfExitLadderCount - 1)];
+		SurfFrameTracePrevPlanar() = Requested;
+		SurfFrameTraceWorst() = FSurfFrameWorst();
 
 		Row = FSurfExitSample();
 		Row.RequestedEntry = Requested;
@@ -1739,6 +1826,17 @@ void UTraceCharacterMovementComponent::TickSurfExitRun(float DeltaSeconds)
 				     "+0.25 %6.0f  +0.5 %6.0f  +1.0 %6.0f  +2.0 %6.0f | carried %.0f uu"),
 				RigRun() + 1, SurfExitLadderCount, Row.Entry, Row.LastSurfPlanar, Row.LastSurfSpeed3D,
 				Row.GroundPlanar, Row.At025, Row.At050, Row.At100, Row.At200, Row.CarryDistance);
+
+			if (SurfFrameTraceEnabled())
+			{
+				const FSurfFrameWorst& Worst = SurfFrameTraceWorst();
+				UE_LOG(LogTraceGame, Display,
+					TEXT("SURFFRAME run %d WORST SINGLE FRAME: -%.1f uu/s (from %.0f) at X %.0f on a %.2f "
+					     "deg face, %s. Anything over ~30 uu/s is larger than one frame of gravity along "
+					     "the steepest facet and is therefore geometry, not the model."),
+					RigRun() + 1, Worst.Loss, Worst.FromPlanar, Worst.AtX, Worst.AtAngle,
+					Worst.bSurfing ? TEXT("while SURFING") : TEXT("on the GROUND"));
+			}
 
 			++RigRun();
 			RigPhase() = ESurfRigPhase::Place;

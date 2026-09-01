@@ -1328,6 +1328,55 @@ protected:
 	/** How far the face reaches outboard from its toe, uu. */
 	float SurfRailFaceSpan() const;
 
+	/**
+	 * How many planar facets the face's arc is cut into, for COLLISION and for the DRAWN shell.
+	 *
+	 * Both are DERIVED from a maximum allowed crease (SurfRailCollisionCreaseDegrees /
+	 * SurfRailVisualCreaseDegrees) rather than typed, so retuning the surf band re-samples the arc
+	 * instead of silently changing how coarse it is. The visual count is a MULTIPLE of the collision
+	 * count, which makes every collision joint a drawn joint too — the property that keeps the
+	 * collision chords from ever crossing the drawn ones.
+	 */
+	int32 SurfRailCollisionFacets() const;
+	int32 SurfRailVisualFacets() const;
+
+	/**
+	 * How many equal-height bands the solid fill under the face is built from; the fill uses one box
+	 * per band above the first. Derived from SurfRailFillBandRiseFactor, so it is independent of the
+	 * facet count — see that constant for the seal argument.
+	 */
+	int32 SurfRailFillBands() const;
+
+	/**
+	 * THE JUNCTION BETWEEN THE LEVEL MAIN RUN AND THE SWEPT NOSE: TWO PLACEMENTS FROM ONE REACH.
+	 *
+	 * A swept facet's box is cut square to its own sweep, so its near face leans BACK past the
+	 * section's start below the strip's mid-chord and FORWARD by the same amount above it.
+	 * SurfRailNoseJointReach() is that amount, in |X|; the build laps the whole nose that far back
+	 * along the sweep (which closes the forward half — twenty see-through wedge notches, one per drawn
+	 * plate, before this) and sinks it by SurfRailNoseZOffset() = -Sink * 2 * reach (which keeps the
+	 * backward half under the level run instead of proud of it).
+	 *
+	 * They are HERE rather than inside BuildSurfRails because Trace.Arena.SurfProfile needs them: an
+	 * instrument that samples coarser than the feature it is asked about can only ever report that the
+	 * feature is not there. The full geometric argument is in BuildSurfRails, above the call.
+	 *
+	 * -TraceSurfRailNoJunctionLap (Trace.Arena.SurfRailJunctionLap 0) restores the first swept nose's
+	 * single-sign cancellation, notches and all, so the fix has a BEFORE arm inside the same binary
+	 * and the drawn-shell probe's verdict can be falsified rather than only agreed with.
+	 *
+	 * THE OFFSET MOVES TWO EDGES, NOT ONE, and the second one cost two passes to notice. It lowers the
+	 * whole cross-section of the FACE, so it lowers the top of the face relative to the CREST WEDGE
+	 * over the nose — a ledge |ZOffset| uu tall running the nose's whole length, invisible to every
+	 * probe in this file until Trace.Arena.SurfProfile §3c, because everything the rig fired ran ALONG
+	 * travel and this feature runs ACROSS it. BuildSurfRails §4 sinks the crest wedge by the same
+	 * offset so the two stay flush, and -TraceSurfRailNoCrestSink (Trace.Arena.SurfRailCrestSink 0)
+	 * puts the ledge back so §3c has something to find.
+	 */
+	float SurfRailNoseJointReach() const;
+	float SurfRailNoseStartLap() const;
+	float SurfRailNoseZOffset() const;
+
 	/** |Y| of the rail's inboard toe, uu. */
 	float SurfRailToeY() const;
 
@@ -1338,9 +1387,16 @@ protected:
 	void SurfRailRunX(float& OutNearX, float& OutFarX) const;
 
 	/**
-	 * DEMO 29 ITEM 4(a). |X| of the nearest solid a surfer leaving a rail can fly into — the first
-	 * approach block or lane pylon whose Y band overlaps the rail's own, or the goal line if there is
-	 * none. Swept off the same specs the build places, so a layout change moves it.
+	 * DEMO 29 ITEM 4(a). |X| of the furthest a surfer's CAPSULE CENTRE can travel down the exit lane
+	 * before something stops it — the first approach block or lane pylon whose Y band overlaps the
+	 * rail's own, or the goal line if there is none. Swept off the same specs the build places, so a
+	 * layout change moves it.
+	 *
+	 * IT IS NOT THE BlockAll FACE, and it returned that for three passes. Cover carries a pawn-only
+	 * standoff shell NeonStandoff uu proud of its collision box and the pawn is PawnCapsuleRadius
+	 * wide, so a centre stops 60 uu short of the box: 11740, not 11800, on the shipped field — which
+	 * is where fifteen of fifteen instrumented rides actually stopped. BuildSurfRails re-measures it
+	 * with a capsule swept down the real lane and errors if the two disagree.
 	 */
 	float SurfRailExitObstacleX() const;
 
@@ -1922,6 +1978,38 @@ public:
 	 *         pulse chain: the assignments in MakeNeonMID are landing on nothing).
 	 */
 	int32 ForcePulseOnAllMIDs(float PulseRate, float PulseAmp);
+
+	/**
+	 * MEASURES the surf rail in quadrant (@p XSign, @p YSign) by firing traces at it — see the
+	 * implementation's block comment. Drives Trace.Arena.SurfProfile.
+	 *
+	 * It exists because every safety property BuildSurfRails() claims about the solid it makes ("the
+	 * overlap can only add material BELOW the ridable surface", "a staircase that only steps down
+	 * presents no face to a rider") is a property of the SHAPE, and this project has already shipped
+	 * one surf nose whose correctness was argued rather than measured and which left ~10 uu lips.
+	 *
+	 * IT HAS BEEN WRONG THREE TIMES ITSELF, AND THE THREE WAYS IT WAS ARE WHY IT NOW LOOKS WHERE IT
+	 * DOES.
+	 *   1. It sampled along travel at 10 uu across three of the band's 447 uu, so it reported "worst
+	 *      RISE +0.0 uu" about a junction feature 13.3 uu long that its samples straddled. Both
+	 *      resolutions are now derived from SurfRailNoseJointReach() and from the drawn facet cut.
+	 *   2. It traced only COLLISION, so a shell with twenty see-through holes in it read clean. §5
+	 *      builds a height field for the DRAWN shell from the instance transforms.
+	 *   3. EVERYTHING IT FIRED RAN ALONG TRAVEL. The lateral stations existed only to place an
+	 *      along-travel finding, never to compare two of them with each other, so a discontinuity
+	 *      that is constant along travel was invisible — and one pass created a 13.3 uu one along the
+	 *      whole nose without being able to see it. §3c walks ACROSS travel, in the RESIDUAL against
+	 *      the designed cross-section (raw Z is useless on a 61-degree face), and separates a step on
+	 *      the ride surface from a step on the walkable crest.
+	 * The pawn's own capsule is swept through the junction rather than argued about, and §6 sweeps it
+	 * down the flight off the junction AT THE LATERAL DRIFT A RIDE CARRIES — the variable an earlier
+	 * version pinned at zero, which is the one that decides the answer.
+	 *
+	 * Anything added here should be asked the same question first: could this probe tell the
+	 * difference between "clean" and "too coarse to see"? And the follow-up this file learned the
+	 * hard way: is there an AXIS it does not look along?
+	 */
+	void LogSurfRailProfile(float XSign, float YSign) const;
 #endif
 
 private:

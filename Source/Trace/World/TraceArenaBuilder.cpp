@@ -1001,8 +1001,11 @@ namespace TraceArenaConstants
 	 * THE FAR ONE IS NOW A CEILING, NOT THE ANSWER. DEMO 29 item 4: a surfer leaves the exit nose as a
 	 * projectile, and at the 11700 this asks for the flight landed inside the innermost approach cover
 	 * — measured at 1469 uu/s on the last frame of the ride and 52 uu/s on the floor. SurfRailRunX()
-	 * therefore clamps it against SurfRailExitObstacleX() minus SurfRailExitClearance(), which on the
-	 * shipped field brings the far end to |X| 10610 and costs 1090 uu of main run (4868 -> 3778).
+	 * therefore clamps it against SurfRailExitObstacleX() minus SurfRailExitClearance(). The clamp
+	 * BINDS EXACTLY on the shipped field — the junction lands on the last |X| the flight can leave from
+	 * and still land clear — so both of those functions are load-bearing to the uu, which is how
+	 * SurfRailExitObstacleX() being 60 uu wrong went unnoticed for three passes. It brings the junction
+	 * to |X| 9318 and the far end to 10304, and costs 1150 uu of main run (4868 -> 3718).
 	 *
 	 * The near one is untouched: the inner lane pylon stands at |X| 4690..4910 in this rail's Y band,
 	 * so there is only ~600 uu to be had inboard and taking it would move the access ramp's foot into
@@ -1031,90 +1034,311 @@ namespace TraceArenaConstants
 	static constexpr float SurfRailBandMarginDegrees = 2.f;
 
 	/**
-	 * Facets the arc is cut into. FIVE, and the number is a legibility/cost trade, not a guess.
+	 * HOW FINE THE ARC IS CUT — as a MAXIMUM CREASE rather than as a facet count.
 	 *
-	 * The band is ~14.5 degrees wide on the shipped tuning, so five facets put a 2.9-degree crease
-	 * between neighbours — under the angular resolution of anything a player can see at the speeds
-	 * this is ridden at, and small enough that crossing one costs nothing (the velocity is re-clipped
-	 * against the new plane, which is the whole "transitions between ramp faces" case). Ten facets
-	 * would halve that and double the collision-box count of the largest new structure in the arena;
-	 * three would put a 5-degree kink in a surface players ride at 1500 uu/s.
+	 * v1 typed `SurfRailFacets = 5` and argued that the 2.9-degree crease it left was "under the
+	 * angular resolution of anything a player can see". THE OWNER LOOKED AT THE RAMP AND CALLED IT
+	 * STEPPED, so that claim is refuted by observation and is not repeated here. What the measurement
+	 * added is that the two halves of "stepped" have completely different costs:
+	 *
+	 *   THE EYE. Trace.Arena.SurfProfile measured the built face standing 1.9 uu proud of the ideal
+	 *   arc with a 2.76-degree crease at each of four joints. 1.9 uu is nothing; the CREASE is the
+	 *   whole defect, because two flat plates meeting at 2.9 degrees are shaded as two flat plates and
+	 *   the eye reads the line between them.
+	 *
+	 *   THE PHYSICS. -TraceSurfExitTest -TraceSurfFrameTrace measured every joint crossing of five
+	 *   rides: a 2.90-degree seam cost 0.4 to 0.9 uu/s out of 1100-1900, on frames where the ordinary
+	 *   frame-to-frame change was already 1 to 2. The file's original claim that crossing a seam
+	 *   "costs nothing" is therefore CONFIRMED, not refuted — the arc's creases were never the physics
+	 *   problem. The exit nose was (see SurfRailNoseRunPerRise).
+	 *
+	 *   AND THE WORST SINGLE FRAME ANYWHERE ON THE FACE, since three reports have now quoted three
+	 *   different numbers for it. Over 1,116 surfing frames — fifteen rides, three sessions, shipped
+	 *   geometry, `surf=1` only and under the 1719 uu/s surf ceiling:
+	 *
+	 *       worst at any speed        -10.0 uu/s, 194 uu into the SLOWEST ride, at 450 uu/s
+	 *       worst above 1000 uu/s      -4.3 uu/s
+	 *       worst above 1400 uu/s      -3.9 uu/s
+	 *
+	 *   EVERY ONE OF THEM IS MID-FACET on the same facet (53.29 deg) and NOT AT A JOINT, which is the
+	 *   finding: it is the movement model's own per-frame noise, not geometry. Earlier passes quoted
+	 *   -2.5 and -3.5 over ten rides each; this pass would have quoted -3.9 from its first session and
+	 *   -10.0 from its third. The quantity is not stable to two significant figures on a rig with a
+	 *   variable frame time and should stop being quoted as though it were. What IS stable is the
+	 *   shape: nothing on this face costs a frame more than a few uu/s out of 1100-1900, against
+	 *   ~18 uu/s that one frame of gravity along the same facet puts back. The one larger figure in
+	 *   any of these traces (-24.8 uu/s) is the OVERSPEED BLEED on the 2000 uu/s placement, above the
+	 *   surf ceiling, and is the movement model doing its job rather than a seam.
+	 *
+	 * So the two resolutions are split, exactly as SPEC v10 SECTION 9 split the wall coves, and each
+	 * is expressed as the SLOPE CHANGE it is allowed to leave so that both describe the same envelope
+	 * however finely either is sampled:
+	 *
+	 *   COLLISION is a UBoxComponent per facet and every one is a registered primitive. 1.5 degrees
+	 *   is not taste: the velocity re-clip at a joint costs v * (1 - cos crease), which at 1.5 degrees
+	 *   and the FASTEST speed this game can produce (the knife air cap, 2011 uu/s) is 0.69 uu/s —
+	 *   about a quarter of what gravity puts back along the steepest facet in ONE frame at 60 fps. A
+	 *   seam is then provably smaller than the model's own per-frame noise, which is the strongest
+	 *   form the claim can take.
+	 *
+	 *   VISUAL is an INSTANCE in a pooled ISM and costs no registered primitive at all (see
+	 *   AddInstancedBlock), so it is sampled four times as finely — 0.75 degrees, a fifth of the crease
+	 *   the owner objected to and well under what a shading step needs to read as a line on a screen.
+	 *   The count is rounded UP to a MULTIPLE of the collision count, which is what makes the two
+	 *   surfaces nest: every collision joint is also a drawn joint, so the collision chords touch the
+	 *   arc where the drawn chords do and can never cross them. It is not sampled finer still because
+	 *   an instance is free of the PRIMITIVE budget and not of the frame — see
+	 *   SurfRailVisualPlateThickness, which records what that cost and what could not be measured.
+	 *
+	 * WHAT THE SPLIT COSTS, stated up front. Chords of this profile stand ABOVE their arc (the slope
+	 * increases up the face, so the profile is convex in cross-section and a secant lies outside it),
+	 * and a coarser chord stands higher: measured, the built face is 1.9 uu proud of the arc at 5
+	 * facets and 0.5 uu at 10. The pawn therefore rides about 0.4 uu ABOVE the drawn surface — a fifth
+	 * of a percent of a player's height, and a HOVER rather than a sink, which is the direction the
+	 * cove note already argued is the harmless one.
 	 */
-	static constexpr int32 SurfRailFacets = 5;
+	static constexpr float SurfRailCollisionCreaseDegrees = 1.5f;
+	static constexpr float SurfRailVisualCreaseDegrees = 0.75f;
 
 	/**
-	 * Thickness of a main-run facet slab, measured along its own normal.
+	 * Thickness of a DRAWN face plate, measured along its own normal. Half a collision slab's.
 	 *
-	 * 200 rather than something thinner because it is half of the SEAL. Under each facet sits an
-	 * axis-aligned filler box whose top is level with that facet's LOW end (which can never poke
-	 * through the arc, since the arc only rises from there); the slab above has to reach down far
-	 * enough to overlap that filler across the whole facet, and 200 uu along the normal covers the
-	 * ~123 uu a facet rises with ~120 uu of vertical reach to spare. Together they make the rail SOLID
-	 * in cross-section, which is what stops the space behind the plates being a 6,100 uu long tunnel a
-	 * player could walk into and hide in.
+	 * A DRAWN PLATE HAS TWO JOBS AND NEITHER OF THEM NEEDS 200 uu: be the surface, and leave nothing
+	 * to see between itself and the fill below it. The second is a reach test — a plate t thick spans
+	 * t / cos(theta) vertically, so 110 uu spans 160 uu at the shallowest facet against a fill band
+	 * that rises 123 — and the 200 uu the COLLISION slabs keep is a different number for a different
+	 * job (the seal, which has to hold against a retune of the arc) and is unchanged.
+	 *
+	 * WHY IT IS WORTH BEING THIN, honestly stated including what could NOT be measured. An instance
+	 * costs no registered primitive but it is not free of GPU: Lumen pays per instance for cards,
+	 * distance fields and the ray-tracing scene. A first cut of this change (0.4 deg of crease, 40
+	 * plates a section, each a full 200 uu solid) took the arena from 1484 to 1740 instances.
+	 *
+	 * WHAT THE FRAME TIME SAYS — AND WHAT THREE PASSES OF IT SAY ABOUT THE MEASUREMENT ITSELF. This
+	 * paragraph has been wrong twice and is now written method-first, because the numbers are the least
+	 * reliable part of it.
+	 *
+	 *   v1 quoted four Trace.Arena.Perf samples its own harness had marked "*** THIS MEASUREMENT IS
+	 *   INVALID ... do NOT quote the numbers above ***" — every arm within 2 % of 16.67 ms because the
+	 *   frame was PACED TO THE DISPLAY, so the rig could not have detected a regression of any size.
+	 *
+	 *   v2 fixed the pacing (`r.ScreenPercentage 300` first, so the GPU is the bottleneck) and then
+	 *   quoted "4.4 ms, against a 0.44 ms spread" from TWO consecutive samples of one arm and ONE of
+	 *   the control. That error bar measures short-term stability, not run-to-run variance.
+	 *
+	 * BOTH ARE STRUCK. What three independent interleaved measurements of the same thing have produced
+	 * on this machine, each GPU-bound, each with no INVALID flag and each arm's own validity line
+	 * reading "the frame was NOT paced and this comparison could have detected a difference":
+	 *
+	 *     verifier, 3 + 3 interleaved   with rails 96.16 ms   without 88.23 ms   difference +7.9 ms
+	 *     this pass, 3 + 3 interleaved  with rails 85.28 ms   without 85.50 ms   difference -0.2 ms
+	 *
+	 * This pass's six samples are 80.92 / 87.58 / 87.35 with the rails and 85.53 / 83.42 / 87.54
+	 * without: the arms INTERLEAVE COMPLETELY, the within-arm spreads are 6.7 and 4.1 ms, and the
+	 * difference of means is smaller than either. Three passes have now produced +4.4, +7.9 and -0.2 ms
+	 * for one comparison. THE HONEST STATEMENT IS THAT THIS BOX CANNOT RESOLVE IT: the between-run
+	 * variance is several ms and the effect, whatever it is, is under it. Anyone quoting a number here
+	 * needs interleaved arms, at least three samples each, and to look at whether the arms overlap
+	 * before quoting a difference of means.
+	 *
+	 * NONE OF WHICH IS A REASON TO RE-CUT THIS CONSTANT, and that is the part that matters. What this
+	 * constant controls is the INSTANCE COUNT, and the census is the direct measurement of it: 523
+	 * primitives and 1580 instances, unchanged across the last three passes. A frame time that cannot
+	 * resolve four whole rails certainly cannot resolve a change of zero instances. This constant and
+	 * the 0.75 deg crease together hold the added instances to +96 rather than +256, at a drawn crease
+	 * still half of what the eye could pick out. Buying margin that cannot be measured is cheap;
+	 * spending budget on it is not.
+	 */
+	static constexpr float SurfRailVisualPlateThickness = 110.f;
+
+	/**
+	 * Thickness of a face slab, measured along its own normal.
+	 *
+	 * 200 rather than something thinner because it is half of the SEAL. Under the face sit filler
+	 * boxes standing on the floor (see SurfRailFillBandRiseFactor); a slab t thick along its normal
+	 * spans t / cos(theta) VERTICALLY, which is 292 uu at the shallowest facet and 416 at the
+	 * steepest, so 200 uu of slab overlaps every filler band across its whole width with margin to
+	 * spare. Together they make the rail SOLID in cross-section, which is what stops the space behind
+	 * the plates being a 5,000 uu long tunnel a player could walk into and hide in.
 	 */
 	static constexpr float SurfRailFacetThickness = 200.f;
 
 	/**
-	 * How far each facet slab is extended PAST its chord at both ends, uu.
+	 * How tall a FILL band may be, as a fraction of the vertical reach of the slab above it.
 	 *
-	 * WHY IT IS SAFE IN BOTH DIRECTIONS, which is the only thing that matters here: the profile is
-	 * concave, so the slope strictly increases up the arc. Extending a facet UP past a joint continues
-	 * it at a SHALLOWER angle than the true surface, which puts the extension underneath. Extending it
-	 * DOWN past a joint continues it at a STEEPER angle, which also puts it underneath (tan is
-	 * increasing). So the overlap can only ever add material below the ridable surface, never a lip on
-	 * it — and a lip on a surf face is a pawn catching at 1500 uu/s.
+	 * THE FILL IS NO LONGER TIED TO THE FACET COUNT, and that is what makes a ten-facet face affordable.
+	 * v1 put one filler under every facet, so raising the face's resolution doubled the collision cost
+	 * twice over. The filler's only two jobs are to stand under the face without poking through it (the
+	 * arc is monotone, so a band whose top is the arc height at its LOW edge can never do that, at any
+	 * resolution) and to be OVERLAPPED by the slab above it. The second is a slope rule, not a count:
+	 * a band that rises less than the slab's vertical reach is covered across its whole width. Half of
+	 * that reach is used, so the seal keeps a factor of two against any retune of the arc, the crest
+	 * height or the thickness — and it is 5 bands on the shipped field, i.e. the same four filler boxes
+	 * per section this rail has always had, now under twice as many facets.
+	 */
+	static constexpr float SurfRailFillBandRiseFactor = 0.5f;
+
+	/**
+	 * How far each COLLISION facet slab is extended past its chord at both ends, uu. Drawn plates get
+	 * NONE — see the build.
 	 *
-	 * The TOP facet gets no upward extension: above it the surface is the FLAT crest, which is
-	 * shallower than the facet, so an extension there WOULD stand proud. That exception is the one
-	 * case the rule above does not cover and it is handled explicitly in the build.
+	 * WHY IT IS SAFE IN BOTH DIRECTIONS, which is the only thing that matters here: consecutive
+	 * chords MEET on the arc at their shared joint, and the slope strictly increases up the face.
+	 * Extending a facet UP past a joint continues it at a SHALLOWER angle than its neighbour, which
+	 * puts the extension underneath that neighbour's surface. Extending it DOWN past a joint continues
+	 * it at a STEEPER angle, which also puts it underneath (tan is increasing). So the overlap can
+	 * only ever add material below the ridable surface, never a lip on it — and a lip on a surf face
+	 * is a pawn catching at 1500 uu/s.
+	 *
+	 * TRACE.ARENA.SURFPROFILE ASSERTS THE CONCLUSION RATHER THAN TRUSTING THE ARGUMENT, and the FORM
+	 * of that assertion is load-bearing. It used to be one number — "worst RISE along travel 0.0 uu" —
+	 * from a probe that stepped 10 uu at three of the band's 447, i.e. from a probe that could not have
+	 * seen a rise if there had been one (SURF-SMOOTH-VERIFY §3 found a 13.3 uu feature straddled by two
+	 * of its samples). It is now three: a line probe stepping an EIGHTH of the junction's own joint
+	 * reach at a station on and beside every drawn joint; the LENGTH of whatever notch each rise sits
+	 * in, against a pawn capsule's 68 uu span; and the pawn's own capsule swept through the junction,
+	 * which is what a player actually meets. All three read zero, and the third is the one that means
+	 * "no player can catch here" rather than "this probe found nothing".
+	 *
+	 * THE OVERLAP IS SYMMETRIC, AND ON THE TOP FACET IT IS ZERO AT BOTH ENDS. Above the top facet the
+	 * surface is the FLAT crest, which is shallower, so an upward extension there WOULD stand proud.
+	 * v1 handled that by zeroing only the upward half — which shifts the slab's centre by half the
+	 * overlap, and on the SWEPT nose this file now builds, "up the slope" has a component ALONG the
+	 * rail, so that shift would have pushed the nose's top slab back over the level main run and stood
+	 * it 3.6 uu proud at the junction. Zeroing both ends keeps every centre exactly on its strip. The
+	 * joint below the top facet is still sealed, by the upward extension of the facet under it.
 	 */
 	static constexpr float SurfRailFacetOverlap = 45.f;
 
 	/**
-	 * How many LEVEL steps the exit nose is built from.
+	 * THE EXIT NOSE IS A SWEPT SECTION AGAIN, AND THIS TIME THE CONSTRUCTION IS RIGHT.
 	 *
-	 * The nose could have been one swept section descending smoothly, and the first version was. It
-	 * did not survive measurement: a swept section's slabs are boxes whose local axes no longer line
-	 * up with the vertical cross-section, so consecutive facets stop sharing an edge and leave ~10 uu
-	 * lips, and the rig caught rides losing 400-850 uu/s in a single frame at the junction, in both
-	 * halves of the field, every run.
+	 * HISTORY, KEPT BECAUSE IT IS THE REASON THIS CONSTANT IS NOT A STEP COUNT. v1 swept the
+	 * cross-section down a descending line and lost: "consecutive facets stop sharing an edge and
+	 * leave ~10 uu lips", rides losing 400-850 uu/s in a single frame at the junction. v2 replaced the
+	 * sweep with SurfRailNoseSteps = 3 LEVEL steps of Height/4, and proved that a staircase which only
+	 * ever steps DOWN can present no face to a rider. Both halves of that are true. What v2 could not
+	 * see is that a staircase presents no SURFACE either:
 	 *
-	 * A staircase that only ever steps DOWN cannot do that, and the reason is a proof rather than a
-	 * tuning: every step's far end face has its outward normal pointing along the direction of travel,
-	 * so a surfer LEAVES that solid through it instead of arriving at it, and the next step is strictly
-	 * lower. Nothing is in front of the player to hit, at any height, on any facet, at any speed.
+	 *   MEASURED, -TraceSurfExitTest -TraceSurfFrameTrace on the 3-step build, five rides: the surf
+	 *   state closed 83, 176 and 157 uu past the junction on the three fastest rides. The rider left
+	 *   the level main run at the first 154 uu drop and never touched the nose again — the whole
+	 *   1,232 uu of it was decoration. Trace.Arena.SurfProfile on the same build: worst RISE along
+	 *   travel 0.0 uu (v2's proof, confirmed) and worst DROP 154.0 uu at the junction (v2's cost,
+	 *   measured for the first time). "The ride is inconsistent" was that: the last quarter of the
+	 *   structure could not be ridden at all.
 	 *
-	 * Three steps of Height/4 leave a terminal face one quarter of the crest — 154 uu on the shipped
-	 * field, under one player height, and standing over the outermost ~90 uu of the face band only,
-	 * because by that offset the rest of the arc is under the floor.
-	 */
-	static constexpr int32 SurfRailNoseSteps = 3;
-
-	/**
-	 * Run per unit rise of the EXIT NOSE at the outboard end — the whole cross-section sinking into the
-	 * floor rather than the crest stepping down.
+	 * WHY THE SWEEP FAILED THE FIRST TIME, which is a geometry bug and not a law of nature. Sweeping
+	 * the cross-section along a descending direction d gives, per facet, a PLANE: the strip is spanned
+	 * by the chord and by d, and its two boundaries are the JOINT LINES, which run along d. In the
+	 * plane's own frame those boundaries are parallel to one axis, so the strip is a RECTANGLE and a
+	 * box fits it exactly — but its width is the PERPENDICULAR distance between the joint lines, which
+	 * is the chord length times sqrt(1 - (chord . d)^2), NOT the chord length. On this nose that
+	 * factor is 0.93, so a box sized by the chord overhangs its strip by ~7% of a chord: about ten uu.
+	 * That is the ~10 uu lip, exactly, and it is arithmetic rather than an argument.
 	 *
-	 * THIS EXISTS BECAUSE THE FIRST BUILD ENDED IN A WALL AND THE RIG HIT IT. A surfer holding a good
-	 * strafe rode the full 5,880 uu face in 3.9 s and met the end rib at 1,300 uu/s; measured exit
-	 * speeds collapsed from ~1,300 to ~150 uu/s. A fast lane that terminates in a flat face is a
-	 * mechanic that punishes the players who are best at it.
+	 * The build now measures that width instead of assuming it, and the safety property is stronger
+	 * than v2's, not weaker: at ANY |X| in the nose the cross-section is the SAME set of chords as the
+	 * main run, lowered by Sink * (|X| - junction). Every statement the main run's overlap comment
+	 * makes therefore holds verbatim at every station of the nose.
+	 *
+	 * WHAT THE SWEEP COSTS AT THE JUNCTION, AND THE SECOND TIME IT WAS GOT WRONG. Sizing the width was
+	 * only half the fix. A box cut square to its own sweep also MISSES the junction plane at the top of
+	 * every strip by exactly as much as it overshoots it at the bottom, and the first build of this
+	 * nose cancelled only the overshoot — which shipped twenty see-through wedge notches down the seam,
+	 * one per drawn plate, photographed from two player-eye cameras before anything in this file could
+	 * see them. Both signs are cancelled now (SurfRailNoseJointReach), and the price is a junction that
+	 * steps DOWN by Sink * 2 * reach — 18.7 uu at this slope — before the kink begins. That step falls
+	 * AWAY from a rider, so it can release a ride and cannot catch one; Trace.Arena.SurfProfile measures
+	 * worst RISE 0.00 uu along travel and 0.00 uu under a swept pawn capsule, against the 154 uu the
+	 * staircase this replaced stepped down. The crest wedge is SUNK WITH IT (see BuildSurfRails §4), so
+	 * the whole cross-section takes that step together and nothing steps ACROSS travel anywhere.
+	 *
+	 * WHY 1.6 AND NOT 2.0, WHICH IS THE WHOLE OF "THE EXIT IS NOT CONSISTENT". A rider leaves the level
+	 * face at the junction on a parabola, and a straight ramp cannot be in contact with a parabola over
+	 * a range of speeds: a rider leaving at v rejoins a ramp of slope s after 2 s v^2 / g, which is a
+	 * DIFFERENT PLACE for every v. So there is always a boundary speed — fast enough and the nose is
+	 * flown over, slow enough and it is landed on — and the only thing that can be designed is WHERE
+	 * that boundary sits relative to the speeds rides actually leave at. At 2.0 it sat INSIDE them.
+	 *
+	 *   MEASURED, Trace.Arena.SurfProfile §6 on the 2.0 build, sweeping the pawn's own capsule down the
+	 *   parabola at eleven band stations and several lateral drifts: the highest launch speed that still
+	 *   reached the ride surface was 1000 uu/s at no drift, 1100 at 65 uu/s of drift, and 1200 at twice
+	 *   that. (65 was one ride's drift and was wrongly written here as "the drift a real ride carries";
+	 *   25 rides later measured 80.4 uu/s, range 78.1..82.2 — see the ladder in §6.) The slowest
+	 *   measured junction crossing was 1084.5 uu/s and the
+	 *   run-to-run scatter on one rung is 7 to 9. The boundary was ON TOP of the population: the same
+	 *   entry crossed at 1084.5 and grazed the nose in one session and at 1093.2 and missed it in the
+	 *   next, and the graze is worth +68 uu/s of surf clip and another +261 when the descent is rolled
+	 *   into the floor. Two landings 335 uu/s apart from one input, decided by float scatter.
+	 *
+	 *   1.6 MOVES THE BOUNDARY OUT FROM UNDER THE POPULATION. It shortens the nose from 1232 to 986 uu
+	 *   and steepens it from 26.6 to 32.0 degrees, which does two things at once: the ride surface sinks
+	 *   under the deck sooner (its live length falls from 1205 to 956 uu of |X|) and it falls away from
+	 *   the parabola faster. It costs the ridden part of the rail NOTHING: the far end is clamped by the
+	 *   exit lane, so the JUNCTION does not move when the nose shortens — only the far end does.
+	 *
+	 *   THE CLOSED FORM THIS IS SET FROM, which BuildSurfRails asserts at every build so a retune
+	 *   cannot walk back into the defect. The ride surface at the CREST — the last station to sink
+	 *   under the deck, and the one an outboard drift carries a rider toward — dies at
+	 *   (Height - ZOffset) / Sink past the junction. A capsule launched level from Height reaches that
+	 *   |X| having fallen g x^2 / 2 v^2, and it touches the steepest swept facet while its centre is
+	 *   still PawnRadius / Nz + (PawnHalf - PawnRadius) = 128 uu clear of it. Equating the two gives
+	 *   the boundary v* = x_die * sqrt(g / (2 (Height - that reach))): 1206 uu/s at 2.0 rise/run, 958
+	 *   at 1.6, against a slowest measured crossing of 1075.8 on this geometry. It is the
+	 *   DRIFT-SATURATED case (a rider carried all the way to the crest) and it takes launch Vz as zero
+	 *   where the rig measures +24..+64, so it is the pessimistic end at both ends; §6's capsule sweep
+	 *   measures the realistic one.
+	 *
+	 *   WHAT IT COSTS, STATED. The nose's steepest facet reads 62.6 degrees swept instead of 62.1
+	 *   against a wall limit of 63.3, so the margin at the steep end falls from 1.1 to 0.7 degrees. The
+	 *   arc's own cut is UNCHANGED — the level main run, which is the part anybody rides, is the same
+	 *   shape and the same length it was. The crest's walk down steepens from 26.6 to 32.0 degrees,
+	 *   still well inside the 44.8-degree walkable limit, and the structure ends 246 uu sooner.
+	 *
+	 *   AND THE FLOOR OF THIS CONSTRUCTION, HONESTLY. The boundary cannot be removed, only moved, and
+	 *   the two levers fight: every step that moves it further below the ride population also pushes
+	 *   the swept steep end nearer the wall limit. The whole trade, from the closed form above:
+	 *
+	 *       rise/run   nose |X|   boundary v*   margin under 1075.8   swept steep end (wall 63.3)
+	 *          2.0        1232       1206 uu/s        -130 uu/s              62.12 deg
+	 *          1.8        1109       1082                 -6                 62.32
+	 *          1.7        1047       1020                +56                 62.44
+	 *          1.6         986        958               +118                 62.58
+	 *          1.5         924        895               +181                 62.75
+	 *          1.4         862        833               +243                 62.95
+	 *
+	 *   1.6 is the shallowest row with a margin over ten times the 7-9 uu/s scatter. Going further buys
+	 *   determinism margin nobody needs out of band margin somebody might. The only thing that breaks
+	 *   through the trade entirely is giving the nose a curvature that matches g/v^2 — a parabola cut
+	 *   for ONE speed — and this game produces exit speeds from 1084 to 1920, so no single cut is in
+	 *   contact across them. Making the nose ridable is not on the table; making it reliably NOT
+	 *   ridden is, and that is what this constant is set to.
+	 *
+	 * WHY 2.0 RUN PER RISE. THIS EXISTS BECAUSE THE FIRST BUILD ENDED IN A WALL AND THE RIG HIT IT. A
+	 * surfer holding a good strafe rode the full 5,880 uu face in 3.9 s and met the end rib at
+	 * 1,300 uu/s; measured exit speeds collapsed from ~1,300 to ~150 uu/s. A fast lane that terminates
+	 * in a flat face is a mechanic that punishes the players who are best at it.
 	 *
 	 * IT FIXED THE RAIL'S OWN END AND NOT THE LANE BEYOND IT, and DEMO 29 item 4 is that second half.
 	 * Removing the wall at the end of the structure turned the exit into a LAUNCH, and the launch was
 	 * landing inside the innermost approach cover 1300 uu further out — the identical failure one
 	 * structure downrange, with identical numbers (1469 uu/s on the ride's last frame, 52 on the
-	 * floor). The nose is unchanged; what changed is that SurfRailRunX() now places the far end from
-	 * the ballistic envelope of the exit rather than from a fraction of the field.
+	 * floor). What changed then is that SurfRailRunX() places the far end from the ballistic envelope
+	 * of the exit rather than from a fraction of the field; that is untouched here.
 	 *
-	 * The nose is the SAME cross-section swept along a descending line, not a stepped-down second
-	 * ridge: the surface is continuous through the junction (only its slope kinks, which is one more
-	 * facet transition and is exactly the case the movement code handles), and by the far end the whole
-	 * profile has sunk to the floor, so there is nothing left to hit. 2.0 gives 27 degrees of descent
-	 * over 1,232 uu, which is walkable if you are on the crest and a free 616 uu of drop if you are on
-	 * the face.
+	 * 1.6 gives 32 degrees of descent over 986 uu, which is walkable if you are on the crest. It
+	 * also TILTS every face facet: a facet cut at theta on the level run reads as
+	 * atan(sqrt(tan^2 theta + Sink^2)) once swept, i.e. 46.8..61.3 becomes 50.9..62.6 degrees. Both
+	 * ends are still inside the movement component's live surf band (44.8..63.3) — the shallow end by
+	 * a wider margin than the level run's, the steep end by 0.7 degrees — so the nose is surfable and
+	 * un-walkable by the same derivation as the rest of the face. BuildSurfRails() computes that pair
+	 * and logs it with a verdict rather than leaving it to this comment, because it is the one number
+	 * a retune of this constant could quietly push out of the band — and it now asserts the FLIGHT
+	 * clearance beside it, which is the other thing this constant decides and the one that made the
+	 * exit non-deterministic when nobody was checking it.
 	 */
-	static constexpr float SurfRailNoseRunPerRise = 2.0f;
+	static constexpr float SurfRailNoseRunPerRise = 1.6f;
 
 	/**
 	 * Run per unit rise of the walkable access ramp at the rail's inboard end. 2.6 -> 21 degrees, well
@@ -1578,9 +1802,38 @@ namespace
 		TEXT("Trace.Arena.SurfRails"),
 		GArenaSurfRails,
 		TEXT("1 (default) = build the four curved surf rails in the outer lanes (Patch 28 sec 5). 0 = the "
-		     "pre-patch arena, kept as the BEFORE arm. Read once when the arena is built - use "
-		     "-TraceNoSurfRails to get it in place before the game mode builds the arena."),
-		ECVF_Default);
+		     "pre-patch arena, kept as the BEFORE arm. Read once when the arena is built, so the "
+		     "matching launch switch (dev builds only) is what works for a measured run."),
+		ECVF_Cheat);
+
+	/**
+	 * THE MASTER SWITCH, ASKED THE WAY ITS SIBLINGS ARE ASKED — and it was NOT, until Demo 29.
+	 *
+	 * IsSurfRailLegacyRun() and the junction arm below both open with `#if UE_BUILD_SHIPPING return
+	 * false`, so neither the CVar name nor the command-line switch survives the link. This one was a
+	 * bare FParse::Param at the call site with no guard at all, which put "-TraceNoSurfRails" in the
+	 * shipped artefact: a launch argument that deletes four structures from the level, on a server
+	 * whose clients would all see the geometry it built and wonder why the fast route was missing.
+	 * That is the same class of leak the movement component's legacy arms were guarded for, and it
+	 * is strictly worse than a movement knob for the reason IsSurfRailLegacyRun() already states —
+	 * this one changes the LEVEL.
+	 *
+	 * It survived three verification passes because the byte scan those passes used to prove the
+	 * Shipping artefact was clean silently did nothing: Apple's strings(1) rejects `-el`, so the
+	 * UTF-16LE half of every scan exited without searching and the passes read that as "no hits".
+	 * A check that cannot fail proves nothing, and this project has now been bitten by that exact
+	 * shape often enough to name it. Scan with `strings - -a` (or grep -a on the raw bytes) instead.
+	 */
+	bool IsSurfRailsDisabledByLaunchArg()
+	{
+#if UE_BUILD_SHIPPING
+		return false;
+#else
+		static const bool bFromCommandLine =
+			FParse::Param(FCommandLine::Get(), TEXT("TraceNoSurfRails"));
+		return bFromCommandLine;
+#endif
+	}
 
 	/**
 	 * DEMO 29 ITEM 4(a). 1 restores the Patch 28 rail EXTENTS — the far end at 0.6094 of the half
@@ -1633,6 +1886,84 @@ namespace
 		static const bool bFromCommandLine =
 			FParse::Param(FCommandLine::Get(), TEXT("TraceSurfRailLegacyRun"));
 		return GArenaSurfRailLegacyRun != 0 || bFromCommandLine;
+#endif
+	}
+
+	/**
+	 * THE JUNCTION A/B. 0 restores the single-sign cancellation the swept nose first shipped with —
+	 * the one that produced twenty see-through wedge notches down the seam where the main run meets
+	 * the nose (see SurfRailNoseJointReach and SURF-SMOOTH-VERIFY §1.2).
+	 *
+	 * IT EXISTS BECAUSE A FIX WITH NO BEFORE ARM IN THE SAME BINARY IS NOT A FIX ANYBODY CAN CHECK,
+	 * and because the defect was found by a person looking at two screenshots after two instruments
+	 * had passed it. With this switch, `Trace.Arena.SurfProfile`'s drawn-shell probe can be pointed at
+	 * the broken geometry and the fixed geometry on one build, which is the only way to show that the
+	 * probe detects the thing it was written for rather than merely agreeing with the current shape.
+	 *
+	 * Same shape and same Shipping guard as the extents arm above, for the same reason: this one
+	 * changes the LEVEL, and a shipped server launched with it would draw holes in a rail every client
+	 * could see through.
+	 */
+	int32 GArenaSurfRailJunctionLap = 1;
+#if !UE_BUILD_SHIPPING
+	FAutoConsoleVariableRef CVarArenaSurfRailJunctionLap(
+		TEXT("Trace.Arena.SurfRailJunctionLap"),
+		GArenaSurfRailJunctionLap,
+		TEXT("1 (default) = the swept nose starts lapped back along its own sweep so the shell has no "
+		     "wedge in it. 0 = the first swept nose's single-sign cancellation, which leaves one "
+		     "see-through notch per drawn plate at the junction. Set with -TraceSurfRailNoJunctionLap; "
+		     "the arena is built once."),
+		ECVF_Cheat);
+#endif
+
+	bool IsSurfRailJunctionLapOff()
+	{
+#if UE_BUILD_SHIPPING
+		return false;
+#else
+		static const bool bFromCommandLine =
+			FParse::Param(FCommandLine::Get(), TEXT("TraceSurfRailNoJunctionLap"));
+		return GArenaSurfRailJunctionLap == 0 || bFromCommandLine;
+#endif
+	}
+
+	/**
+	 * THE CREST A/B. 0 leaves the nose's crest wedge at the level run's height while the face under it
+	 * is sunk by SurfRailNoseZOffset — which is what every build of the swept nose did until now, and
+	 * which stands the crest |ZOffset| uu proud of the top of the face for the WHOLE length of the
+	 * nose. 6.6 uu on the first swept nose, 13.3 after the notch fix doubled the offset, 18.7 at the
+	 * slope the nose is cut to now.
+	 *
+	 * IT EXISTS FOR THE SAME REASON THE JUNCTION ARM DOES, and for one more. The ledge was invisible
+	 * to every probe in this file for two passes because everything the rig fired ran ALONG travel and
+	 * this feature runs ACROSS it. Trace.Arena.SurfProfile §3c is the probe that can see it now, and a
+	 * probe that has only ever been run on geometry with no ledge in it has not been shown to detect
+	 * anything. With this switch the same command on one binary puts the ledge back and §3c has to
+	 * find it.
+	 *
+	 * Same Shipping guard as the two arms above, for the same reason: it changes the LEVEL.
+	 */
+	int32 GArenaSurfRailCrestSink = 1;
+#if !UE_BUILD_SHIPPING
+	FAutoConsoleVariableRef CVarArenaSurfRailCrestSink(
+		TEXT("Trace.Arena.SurfRailCrestSink"),
+		GArenaSurfRailCrestSink,
+		TEXT("1 (default) = the nose's crest wedge is sunk with the cross-section under it, so the whole "
+		     "structure steps down together at the junction and nothing steps ACROSS travel anywhere. "
+		     "0 = the crest left at the level run's height, which is a ledge along the top of the nose "
+		     "the height of SurfRailNoseZOffset. Set with -TraceSurfRailNoCrestSink; the arena is built "
+		     "once."),
+		ECVF_Cheat);
+#endif
+
+	bool IsSurfRailCrestSinkOff()
+	{
+#if UE_BUILD_SHIPPING
+		return false;
+#else
+		static const bool bFromCommandLine =
+			FParse::Param(FCommandLine::Get(), TEXT("TraceSurfRailNoCrestSink"));
+		return GArenaSurfRailCrestSink == 0 || bFromCommandLine;
 #endif
 	}
 
@@ -2478,8 +2809,7 @@ void ATraceArenaBuilder::BuildArena()
 	// line reads better next to theirs; before the scoring shapes because it is ordinary interior
 	// geometry and must be swept into neither GoalModePieces nor EndzoneModePieces. Its own switch,
 	// like the banks' and the flanks'.
-	if (bBuildSurfRails && GArenaSurfRails != 0
-		&& !FParse::Param(FCommandLine::Get(), TEXT("TraceNoSurfRails")))
+	if (bBuildSurfRails && GArenaSurfRails != 0 && !IsSurfRailsDisabledByLaunchArg())
 	{
 		BuildSurfRails(bBuildVisuals);
 	}
@@ -3923,14 +4253,41 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 // quadrant.
 //
 // WHAT A RAIL IS. A long solid ridge lying along the field in the outer lane, with:
-//   * a CURVED, UNWALKABLE INBOARD FACE — a circular arc cut into SurfRailFacets planar facets, the
-//     shallowest at the toe and the steepest at the crest. This is the ridable surface.
+//   * a CURVED, UNWALKABLE INBOARD FACE — a circular arc cut into planar facets, the shallowest at
+//     the toe and the steepest at the crest. This is the ridable surface, and it is cut TWICE from
+//     one envelope: coarse invisible collision slabs and a much finer drawn shell (see
+//     SurfRailCollisionCreaseDegrees, and SPEC v10 SECTION 9 for the precedent).
 //   * a WALKABLE CREST at 3.5 player heights, the arena's landmark tier — the same height as the
 //     top-centre tower and the goal-approach tower, so the rail reads as a member of the existing
 //     height language rather than as a prop.
 //   * a WALKABLE ACCESS RAMP at the inboard end, 21 degrees, so the crest is a route you can take on
 //     foot and not just a shape.
-//   * an END RIB at each end of the face, which caps the run and closes the void behind the facets.
+//   * a SWEPT EXIT NOSE at the outboard end: the same cross-section, sinking to the floor.
+//
+//     WHAT IT IS FOR, SAID PLAINLY BECAUSE THREE PASSES HAVE NOW GOT IT WRONG IN THREE DIFFERENT
+//     WAYS. THE RIDE ENDS AT THE MAIN RUN'S END. A rider leaves the level face at the junction on a
+//     parabola, and a straight ramp cannot follow a parabola over a range of speeds — a rider leaving
+//     at v rejoins a ramp of slope s after 2 s v^2 / g, a different place for every v — so the nose is
+//     not a continuation of the ride and no re-angling makes it one.
+//
+//     WHAT THAT DOES NOT MEAN is "the nose is never touched", and the previous version of this
+//     paragraph said so and was false when it was typed. There is always a BOUNDARY speed: below it
+//     the parabola comes back down onto the ramp, above it the ramp is gone before the rider gets
+//     there. The pass that wrote "at every speed a ride can leave at ... the first thing the flight
+//     touches is the FLOOR" measured it with a POINT, at three band stations, with the lateral
+//     velocity pinned to zero — and real launches drift ~64 uu outboard, toward the crest, where the
+//     nose survives above the deck longest. Trace.Arena.SurfProfile §6 now sweeps the pawn's own
+//     CAPSULE down the parabola at eleven stations and three drifts and reports the boundary as a
+//     number; on the 2.0-rise/run nose it was 1100 uu/s against a slowest measured crossing of 1084.5,
+//     i.e. underneath the rides, which is exactly what "the exit is inconsistent" was.
+//
+//     SO THE BOUNDARY IS PLACED, NOT DENIED. SurfRailNoseRunPerRise is set so that it sits well below
+//     the slowest speed any ride crosses the junction at, and BuildSurfRails asserts that every build.
+//     What the nose IS, then: the thing that stops the structure ending in a wall or a cliff (Patch
+//     28's end rib cost rides 1150 uu/s), the ground the high route walks down, the prow the whole
+//     shape reads as, and a surface that is still safe for anything slow enough to meet it. It is
+//     measured against that job. See SurfRailNoseRunPerRise and SURF-FINAL-FIX §2.
+//   * SOLID FILL under the face, banded by height, so the rail has no room inside it.
 //
 // WHY THE FACE IS CURVED AND NOT FLAT, which is the actual request. On a flat ramp there is one
 // slope, so there is one correct strafe angle and holding it is the whole skill. On an arc the slope
@@ -4091,6 +4448,160 @@ float ATraceArenaBuilder::SurfRailFaceSpan() const
 		* (FMath::Sin(FMath::DegreesToRadians(MaxDeg)) - FMath::Sin(FMath::DegreesToRadians(MinDeg)));
 }
 
+int32 ATraceArenaBuilder::SurfRailCollisionFacets() const
+{
+	// DERIVED FROM THE CREASE, NOT TYPED. See SurfRailCollisionCreaseDegrees for why 1.5 degrees is
+	// the number and what it buys. At least three facets, or "curved" is a figure of speech.
+	const float MinDeg = SurfRailMinFaceAngleDegrees();
+	const float BandDegrees = FMath::Max(0.f, TraceSurfRailMaxFaceAngleDegrees(MinDeg) - MinDeg);
+	const float MaxCrease = FMath::Max(0.05f, TraceArenaConstants::SurfRailCollisionCreaseDegrees);
+	return FMath::Clamp(FMath::CeilToInt(BandDegrees / MaxCrease), 3, 64);
+}
+
+int32 ATraceArenaBuilder::SurfRailVisualFacets() const
+{
+	// A MULTIPLE of the collision count, and that is the load-bearing half of this function: it makes
+	// every collision joint a drawn joint as well, so the two chord sets touch the arc at the same
+	// stations and the coarse surface can only ever sit ABOVE the fine one by the difference of their
+	// sagittas. Round the ratio up, never down — rounding down would ship a drawn shell coarser than
+	// the collision under it and put the pawn's feet through the picture.
+	const int32 Collision = SurfRailCollisionFacets();
+	const float MinDeg = SurfRailMinFaceAngleDegrees();
+	const float BandDegrees = FMath::Max(0.f, TraceSurfRailMaxFaceAngleDegrees(MinDeg) - MinDeg);
+	const float MaxCrease = FMath::Max(0.02f, TraceArenaConstants::SurfRailVisualCreaseDegrees);
+	const int32 Wanted = FMath::Clamp(FMath::CeilToInt(BandDegrees / MaxCrease), Collision, 512);
+	const int32 Multiple = FMath::DivideAndRoundUp(Wanted, Collision);
+	return Collision * FMath::Max(1, Multiple);
+}
+
+int32 ATraceArenaBuilder::SurfRailFillBands() const
+{
+	// A SLOPE RULE, NOT A COUNT — see SurfRailFillBandRiseFactor. A slab t thick along its normal
+	// spans t / cos(theta) vertically and cos is largest (so the span is smallest) at the SHALLOWEST
+	// facet, which is therefore the binding case and the one asked here.
+	const float Height = SurfRailHeight();
+	const float MinRad = FMath::DegreesToRadians(SurfRailMinFaceAngleDegrees());
+	const float Reach = TraceArenaConstants::SurfRailFacetThickness / FMath::Max(0.05f, FMath::Cos(MinRad));
+	const float MaxRise = FMath::Max(20.f, TraceArenaConstants::SurfRailFillBandRiseFactor * Reach);
+	return FMath::Clamp(FMath::CeilToInt(Height / MaxRise), 2, 32);
+}
+
+float ATraceArenaBuilder::SurfRailNoseJointReach() const
+{
+	// THE SIGNED MISMATCH AT THE JUNCTION, IN |X|, AND THE ONLY DEFINITION OF IT.
+	//
+	// A swept facet's box is cut square to its own sweep, so its near face is the plane
+	// |X| = start + Sink * (Z - Z of the strip's mid-chord). Below the mid-chord that plane leans BACK
+	// past the section's start by this much; above it, it leans FORWARD by the same. The full argument
+	// — including why one box cannot do better, and why cancelling only the backward half is what left
+	// twenty see-through notches down the seam — is in BuildSurfRails, above the call.
+	//
+	// Both the build and Trace.Arena.SurfProfile read THIS function: the instrument has to sample
+	// finer than the feature to be able to say anything about it, and it cannot know how fine that is
+	// from a second copy of the arithmetic.
+	const float Height = SurfRailHeight();
+	const float Radius = SurfRailFaceRadius();
+	const float NoseRun = Height * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	if (Height <= 1.f || Radius <= 1.f || NoseRun <= 1.f)
+	{
+		return 0.f;
+	}
+
+	const float Sink = Height / NoseRun;
+	const float MinDeg = SurfRailMinFaceAngleDegrees();
+	const float MaxDeg = TraceSurfRailMaxFaceAngleDegrees(MinDeg);
+	const float MinRad = FMath::DegreesToRadians(MinDeg);
+	const FVector Dir = FVector(1.f, 0.f, -Sink).GetSafeNormal();
+
+	// The worse of the two passes. The reach is half a facet's own rise times Sink / (1 + Sink^2), so
+	// the COARSER pass always wins — but that is a property of this arc's cut, not a law, and asking
+	// both costs nothing at build time.
+	float Worst = 0.f;
+	for (const int32 FacetCount : { SurfRailCollisionFacets(), SurfRailVisualFacets() })
+	{
+		for (int32 Facet = 0; Facet < FacetCount; ++Facet)
+		{
+			auto StationAt = [Radius, MinRad, MinDeg, MaxDeg, FacetCount](int32 Index)
+			{
+				const float Deg = FMath::Lerp(MinDeg, MaxDeg,
+					static_cast<float>(Index) / static_cast<float>(FMath::Max(1, FacetCount)));
+				const float Rad = FMath::DegreesToRadians(Deg);
+				return FVector2D(Radius * (FMath::Sin(Rad) - FMath::Sin(MinRad)),
+					Radius * (FMath::Cos(MinRad) - FMath::Cos(Rad)));
+			};
+
+			const FVector2D S0 = StationAt(Facet);
+			const FVector2D S1 = StationAt(Facet + 1);
+			const FVector Chord(0.f, S1.X - S0.X, S1.Y - S0.Y);
+			const FVector Across = Chord - Dir * FVector::DotProduct(Chord, Dir);
+			const float Width = static_cast<float>(Across.Size());
+			if (Width <= 1.f)
+			{
+				continue;
+			}
+
+			// Half the strip's width times the sweep's own X component: the X displacement of the box
+			// corner that sits furthest from the plane |X| = the section's start. The nose takes no
+			// facet overlap in either pass, so there is no overlap term to add.
+			Worst = FMath::Max(Worst, FMath::Abs(static_cast<float>(Across.X)) * 0.5f);
+		}
+	}
+
+	return Worst;
+}
+
+float ATraceArenaBuilder::SurfRailNoseStartLap() const
+{
+	// How far the nose's boxes start BACK along their own sweep, in sweep length rather than in |X|:
+	// the reach is quoted in |X| and applied along a direction that covers sqrt(1 + Sink^2) of length
+	// per unit of X. Getting that conversion wrong would under-lap by 11 % and leave a thinner version
+	// of the same notch.
+	//
+	// ZERO IN THE BEFORE ARM. -TraceSurfRailNoJunctionLap builds the junction the way the first swept
+	// nose did, which is what makes the drawn-shell probe's verdict falsifiable.
+	if (IsSurfRailJunctionLapOff())
+	{
+		return 0.f;
+	}
+
+	const float Height = SurfRailHeight();
+	const float NoseRun = Height * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	if (Height <= 1.f || NoseRun <= 1.f)
+	{
+		return 0.f;
+	}
+
+	const float Sink = Height / NoseRun;
+	return SurfRailNoseJointReach() * FMath::Sqrt(1.f + Sink * Sink);
+}
+
+float ATraceArenaBuilder::SurfRailNoseZOffset() const
+{
+	// SINK TIMES THE TOTAL TRAVEL, which is the reach the section overshoots the junction plane by
+	// PLUS whatever it has been lapped back on top of that. Both are material on a plane that rises
+	// going backwards, so both have to be sunk under the level run or they stand proud of it — and
+	// a lip on a surf face is a pawn catching at 1500 uu/s.
+	//
+	// Deriving it from SurfRailNoseStartLap() rather than from a second constant is what keeps the two
+	// arms honest: with the lap on it is Sink * 2 * reach (an 18.7 uu step at the shipped 1.6 rise per
+	// rise), with the lap off it falls back to Sink * reach (9.3 uu) — the same pair the first swept
+	// nose shipped, notches and all, at whatever slope the nose is currently cut to.
+	//
+	// IT MOVES TWO EDGES. The other one is the crest: sinking the face's cross-section without sinking
+	// the crest wedge over it leaves a ledge this tall along the top of the nose for its whole length.
+	// BuildSurfRails §4 sinks the wedge with it. See the crest A/B arm.
+	const float Height = SurfRailHeight();
+	const float NoseRun = Height * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	if (Height <= 1.f || NoseRun <= 1.f)
+	{
+		return 0.f;
+	}
+
+	const float Sink = Height / NoseRun;
+	const float LapInX = SurfRailNoseStartLap() / FMath::Sqrt(1.f + Sink * Sink);
+	return -Sink * (SurfRailNoseJointReach() + LapInX);
+}
+
 float ATraceArenaBuilder::SurfRailToeY() const
 {
 	return HalfWidth() * TraceArenaConstants::SurfRailToeYFrac;
@@ -4120,6 +4631,22 @@ float ATraceArenaBuilder::SurfRailExitObstacleX() const
 	// 3150) and the outer lane pylon (|X| 12690..12910, |Y| 2790..3010) — the bar is nearer, so it is
 	// the answer, and it is the thing the exit rig measured rides hitting at 1469 uu/s.
 	//
+	// IT IS NOT THE BlockAll BOX, AND FOR THREE PASSES IT WAS. THIS FUNCTION RETURNED |X| 11800 — the
+	// near face of that bar's collision box — while every instrumented ride stopped dead at |X| 11739,
+	// and the build printed "the first solid in the lane is at |X| 11800 -> CLEAR" over the top of it.
+	// A pawn cannot reach the BlockAll box: AddNeonBlock gives every cover block that carries
+	// eye-height trim a PAWN-ONLY standoff shell inflated by NeonStandoff (26 uu), and the pawn's own
+	// capsule is PawnCapsuleRadius (34 uu) wide, so the furthest |X| a pawn's CENTRE can occupy is
+	// 11800 - 26 - 34 = 11740. The rides measured 11739; the uu is the sweep's own epsilon.
+	//
+	// THE COMPARISON THIS FEEDS IS ABOUT A CENTRE, which is what makes that the right number rather
+	// than a conservatism: SurfRailExitClearance() is a ballistic RANGE from GetSurfExitReach(), i.e.
+	// how far the pawn's centre travels, and it is added to JunctionX, which is a plane. Comparing a
+	// centre's reach against a surface the centre can never occupy overstates the clearance by
+	// exactly the 61 uu above — small here, and the sort of small that decides a marginal case
+	// silently. Both the shell and the capsule are read from the constants that build them, so a
+	// retune of either moves this with it.
+	//
 	// Everything is measured with the SAME accessors the build uses, so a layout change moves this
 	// with it rather than leaving a stale literal behind.
 	// =============================================================================================
@@ -4127,6 +4654,11 @@ float ATraceArenaBuilder::SurfRailExitObstacleX() const
 	const float HalfY = HalfWidth();
 	const float RailNearY = SurfRailToeY();
 	const float RailFarY = SurfRailBackY();
+
+	// How much nearer than its own collision box a piece's PAWN-BLOCKING surface is, and then how far
+	// short of that a pawn's centre stops. Applied to both lists below because both build one: cover
+	// through AddNeonBlock's bHasFaceTrim branch, pylons unconditionally in AddPylon.
+	const float PawnInflation = TraceArenaConstants::NeonStandoff + TraceArenaConstants::PawnCapsuleRadius;
 
 	// OUTBOARD OF THE RAIL'S OWN START, AND THIS TEST IS LOAD-BEARING. Without it the sweep returns
 	// the INNER lane pylon at |X| 4690, which is behind the rail's near end and in nobody's exit lane
@@ -4166,17 +4698,20 @@ float ATraceArenaBuilder::SurfRailExitObstacleX() const
 	{
 		// A 45-degree footprint reaches further in both axes than its side length; using the
 		// half-diagonal is the conservative reading and it is the only one that is right for a
-		// clearance.
+		// clearance. The standoff is applied INSIDE the rotation for the same reason: the shell is
+		// yawed with the block, so on a diamond its 26 uu reaches 26 * sqrt(2) in world X.
 		const bool bDiamond = !FMath::IsNearlyZero(Spec.Yaw);
-		const float ExtentX = (bDiamond ? UE_SQRT_2 : 1.f) * Spec.SizeX * 0.5f;
-		const float ExtentY = (bDiamond ? UE_SQRT_2 : 1.f) * Spec.SizeY * 0.5f;
+		const float Scale = bDiamond ? UE_SQRT_2 : 1.f;
+		const float ExtentX = Scale * (Spec.SizeX * 0.5f + PawnInflation);
+		const float ExtentY = Scale * (Spec.SizeY * 0.5f + PawnInflation);
 		Consider(FMath::Max(0.f, GoalX - Spec.XAnchor), ExtentX, HalfY * Spec.YFrac, ExtentY);
 	}
 
 	for (const float XFrac : TraceArenaConstants::LanePylonXFracs)
 	{
-		Consider(HalfX * XFrac, TraceArenaConstants::LanePylonSide * 0.5f,
-			HalfY * TraceArenaConstants::LanePylonYFrac, TraceArenaConstants::LanePylonSide * 0.5f);
+		Consider(HalfX * XFrac, TraceArenaConstants::LanePylonSide * 0.5f + PawnInflation,
+			HalfY * TraceArenaConstants::LanePylonYFrac,
+			TraceArenaConstants::LanePylonSide * 0.5f + PawnInflation);
 	}
 
 	return Nearest;
@@ -4192,7 +4727,7 @@ float ATraceArenaBuilder::SurfRailExitClearance() const
 	// floor at 183, 52 and 62. They did not lose it to friction or to the landing — they flew about
 	// 1300 uu and hit the innermost approach bar. "A player loses all momentum at the end of the
 	// curve" was, first and largest, a fast lane that ends in a wall. AGAIN: Patch 28 already fixed
-	// one of those (the rail's own end rib, which is why the stepped nose exists) and its rig could
+	// one of those (the rail's own end rib, which is why the nose exists at all) and its rig could
 	// not see this one, because it closed its sample the frame the SURF STATE closed — in mid-air,
 	// several hundred uu before the impact.
 	//
@@ -4366,24 +4901,39 @@ void ATraceArenaBuilder::BuildSurfRails(bool bBuildVisuals)
 	const float CrestY = ToeY + Span;
 	const float BackY = SurfRailBackY();
 
-	// The ridable main run, then the stepped nose that lets a surfer off the end of it.
-	const int32 NoseSteps = FMath::Clamp(TraceArenaConstants::SurfRailNoseSteps, 1, 8);
+	// HOW FINELY THE ARC IS SAMPLED, TWICE. Both counts are derived from a maximum crease and the
+	// visual one is a multiple of the collision one; see the constants and the accessors.
+	const int32 CollisionFacets = SurfRailCollisionFacets();
+	const int32 VisualFacets = SurfRailVisualFacets();
+	const int32 FillBands = SurfRailFillBands();
+
+	// The ridable main run, then the SWEPT nose that carries a surfer off the end of it.
 	const float MainRun = (FarX - NearX) - NoseRun;
 	const float JunctionX = NearX + MainRun;
-	const float StepRun = NoseRun / static_cast<float>(NoseSteps);
-	const float StepDrop = Height / static_cast<float>(NoseSteps + 1);
+
+	// The nose sinks the WHOLE cross-section at this rise over run. It is the one number that turns
+	// the level section builder below into the nose, and it is why there is only one builder.
+	const float NoseSink = Height / NoseRun;
+	const float NoseSlopeScale = FMath::Sqrt(1.f + NoseSink * NoseSink);
+	const float NoseCrestRad = FMath::Atan(NoseSink);
+	const float NoseCrestDeg = FMath::RadiansToDegrees(NoseCrestRad);
+	const float NoseCrestLength = NoseRun * NoseSlopeScale;
+
+	// Set below, once the section helpers exist. The swept nose's boxes MISS the junction plane by the
+	// same distance at the top of every strip that they OVERSHOOT it by at the bottom, so closing the
+	// shell takes two numbers, not one: how far the section starts BACK along its own sweep, and how
+	// far it starts DOWN. See SurfRailNoseJointReach().
+	float NoseJointReach = 0.f;   // the half-width of the mismatch, in |X|
+	float NoseStartLap = 0.f;     // the same distance, measured ALONG the sweep
+	float NoseZOffset = 0.f;
 
 	const float AccessRun = Height * FMath::Max(1.f, TraceArenaConstants::SurfRailAccessRunPerRise);
 	const float AccessSlopeRad = FMath::Atan2(Height, AccessRun);
 	const float AccessSlopeDeg = FMath::RadiansToDegrees(AccessSlopeRad);
 	const float AccessSlopeLength = FMath::Sqrt(AccessRun * AccessRun + Height * Height);
 
-	const float NoseCrestRad = FMath::Atan2(Height, NoseRun);
-	const float NoseCrestDeg = FMath::RadiansToDegrees(NoseCrestRad);
-	const float NoseCrestLength = FMath::Sqrt(NoseRun * NoseRun + Height * Height);
-
 	// Arc stations, in the cross-section's own (outboard from the toe, up from the floor) frame. ONE
-	// definition, used by the face, by the fillers and by GetSurfRailProbe().
+	// definition, used by the face, by the fill, by Trace.Arena.SurfProfile and by GetSurfRailProbe().
 	auto StationY = [Radius, MinRad](float Degrees)
 	{
 		return Radius * (FMath::Sin(FMath::DegreesToRadians(Degrees)) - FMath::Sin(MinRad));
@@ -4392,11 +4942,97 @@ void ATraceArenaBuilder::BuildSurfRails(bool bBuildVisuals)
 	{
 		return Radius * (FMath::Cos(MinRad) - FMath::Cos(FMath::DegreesToRadians(Degrees)));
 	};
-	auto FacetAngle = [MinDeg, MaxDeg](int32 Index)
+	auto FacetAngle = [MinDeg, MaxDeg](int32 Index, int32 Count)
 	{
-		return FMath::Lerp(MinDeg, MaxDeg,
-			static_cast<float>(Index) / static_cast<float>(TraceArenaConstants::SurfRailFacets));
+		return FMath::Lerp(MinDeg, MaxDeg, static_cast<float>(Index) / static_cast<float>(FMath::Max(1, Count)));
 	};
+
+	// The inverse of StationZ: how far outboard the ARC has reached by the time it is this high. The
+	// fill is banded by HEIGHT rather than by facet, so this is what places its edges.
+	auto ArcOffsetAtHeight = [Radius, MinRad, MinDeg, MaxDeg, &StationY](float Z)
+	{
+		const float CosAlpha = FMath::Clamp(FMath::Cos(MinRad) - Z / FMath::Max(1.f, Radius), -1.f, 1.f);
+		const float Degrees = FMath::Clamp(FMath::RadiansToDegrees(FMath::Acos(CosAlpha)), MinDeg, MaxDeg);
+		return StationY(Degrees);
+	};
+
+	// WHAT A SWEPT FACET READS AS. Sinking the cross-section at Sink tilts every facet: a plane cut at
+	// theta on the level run has normal-Z cos(theta)/sqrt(1 + Sink^2 cos^2 theta), i.e. it reads as
+	// atan(sqrt(tan^2 theta + Sink^2)) degrees from horizontal. Both ends of the nose's band have to
+	// stay inside the movement component's live surf band or the nose is either walkable or a wall,
+	// and that is exactly the kind of thing a retune of SurfRailNoseRunPerRise could break in silence.
+	auto SweptFaceDegrees = [](float Degrees, float Sink)
+	{
+		const float T = FMath::Tan(FMath::DegreesToRadians(Degrees));
+		return FMath::RadiansToDegrees(FMath::Atan(FMath::Sqrt(T * T + Sink * Sink)));
+	};
+
+	// =============================================================================================
+	// WHERE A SWEPT SECTION ACTUALLY STARTS — AND THE ONE THING A BOX CANNOT DO.
+	//
+	// A facet's strip has three bounds that matter: its two JOINT LINES, which run along the sweep,
+	// and its near end, which is the CHORD in the plane |X| = the section's start. A box's faces are
+	// perpendicular to its own axes, so it can match the joint lines (put local Y across them) or the
+	// chord (put local Y along it) — NOT BOTH, because the chord is not perpendicular to the sweep on
+	// a descending section. That is a fact about boxes, not a choice.
+	//
+	// Getting the JOINT LINES right is not optional: that is the bound whose violation puts one
+	// facet's material through its neighbour's surface, and it is exactly the ~10 uu lip the first
+	// swept nose shipped. So the joint lines win, and the near end is left square to the sweep.
+	//
+	// THE MISMATCH THAT LEAVES IS SIGNED, AND THE FIRST BUILD OF THIS NOSE ONLY CANCELLED HALF OF IT.
+	// A box cut square to the sweep has its near face on the plane |X| = start + Sink * (Z - Z of the
+	// strip's mid-chord). Below the mid-chord that plane leans BACK past the section's start; above it,
+	// it leans FORWARD. So one box both
+	//
+	//   OVERSHOOTS by this much at the bottom of its strip — material on a plane that RISES going
+	//   backwards, i.e. a ledge standing proud of the level run at the junction (MEASURED at +7.5 uu
+	//   by Trace.Arena.SurfProfile on the first build of this nose), and
+	//
+	//   FALLS SHORT by the same amount at the TOP of its strip — a wedge of surface that no box owns,
+	//   because the main run's plates stop dead on the vertical junction plane and this one has not
+	//   started yet. The plate above does not cover it: drawn plates take no overlap, so their
+	//   material stops at the joint line, and below that line the only candidate was this plate.
+	//
+	// The first build cancelled the overshoot with the Z offset alone and left the shortfall open. It
+	// is TWENTY SEE-THROUGH WEDGE NOTCHES down the seam — one per drawn plate, up to 6.7 uu long and
+	// 18 uu tall, photographed from two player-eye cameras (SURF-SMOOTH-VERIFY §1.2) — and the same
+	// wedge in the collision, where it is a reach-long slot with a back-facing wall in it.
+	//
+	// SO BOTH HALVES ARE CANCELLED HERE, and it takes both of the two numbers a box gives you:
+	//
+	//   START THE SECTION BACK along its own sweep by the worst shortfall, which drags every near face
+	//   past the junction plane and closes the wedge at the top of every strip; then
+	//
+	//   START IT DOWN by Sink times the TOTAL reach (the original overshoot plus the new lap), which
+	//   is what keeps the now-longer tail of material under the level run instead of proud of it.
+	//
+	// THE PRICE, STATED: the junction steps DOWN by Sink * 2 * reach rather than Sink * reach — 18.7 uu
+	// here instead of 9.3, against the 154 uu the staircase this nose replaced stepped down. That
+	// factor of two is not a choice either: whatever is not spent on the lap has to be spent on the
+	// offset, so the two together are always Sink * 2 * reach, and a DROP is free where a RISE is
+	// fatal. The only lever that shortens it is the reach itself, which is half a facet's rise times
+	// Sink / (1 + Sink^2) and therefore scales as 1 / FacetCount: cutting the nose at the DRAWN
+	// resolution would halve it, at +40 collision boxes across the four rails.
+	//
+	// STILL NOT TAKEN, AND NOW FOR A BETTER REASON THAN LAST TIME. The pass that doubled this step
+	// declined the +40 boxes on the grounds that "nothing is in contact there", which was true of the
+	// step along travel and false of the thing the same offset moved sideways — the crest-to-face
+	// ledge, which the +40 boxes would have HALVED and which §4 below now removes outright for no
+	// primitives at all. What is left is a drop in the direction of travel that the flight table and
+	// the swept capsule both say nobody is standing on. If a future retune ever puts a rider back in
+	// contact here, the price list above is what it costs and the constant is one line.
+	// =============================================================================================
+	// ONE definition, and the instrument reads the same one: Trace.Arena.SurfProfile has to know where
+	// the junction's step comes from to sample finely enough to see it, and a second copy of this
+	// arithmetic there is precisely how a "worst RISE +0.0 uu" gets asserted about a feature the probe
+	// never looks at. SurfRailNoseJointReach() takes the WORSE of the two passes so the collision
+	// surface and the drawn shell stay COINCIDENT — giving each its own lap and offset would sink the
+	// pawn several uu into the drawn nose for its whole length, which is worse than one shared step at
+	// the junction. It also means the collision pass, the coarser of the two, is what sets the step.
+	NoseJointReach = SurfRailNoseJointReach();
+	NoseStartLap = SurfRailNoseStartLap();
+	NoseZOffset = SurfRailNoseZOffset();
 
 	// THE FACE gets the DAIS/BANK emissive, not the cover blocks'. It is by area the largest new
 	// surface in the arena and it is INCLINED toward the key light, which is the same term the palette
@@ -4413,6 +5049,7 @@ void ATraceArenaBuilder::BuildSurfRails(bool bBuildVisuals)
 		: nullptr;
 
 	int32 CollisionBoxes = 0;
+	int32 DrawnPlates = 0;
 
 	for (const float XSign : { -1.f, 1.f })
 	{
@@ -4431,138 +5068,214 @@ void ATraceArenaBuilder::BuildSurfRails(bool bBuildVisuals)
 		for (const float YSign : { -1.f, 1.f })
 		{
 			// =====================================================================================
-			// ONE LEVEL SECTION OF RAIL: the curved face, and the fillers that make it SOLID.
+			// ONE SECTION OF FACE — LEVEL OR SWEPT, FROM ONE CONSTRUCTION.
 			//
-			// Called once for the main run at Z offset 0, and once per nose step at a NEGATIVE offset
-			// — the identical cross-section, sunk further into the floor each time. Reusing the level
-			// builder rather than sweeping the section along a descending line is a deliberate
-			// retreat from a version that DID sweep it, and the reason is worth recording: a swept
-			// section's slabs are boxes whose local axes no longer line up with the vertical
-			// cross-section, so consecutive facets stop sharing an edge and leave ~10 uu lips. The rig
-			// found it — rides that were holding 1,500 uu/s lost 400-850 of it in a single frame at
-			// the junction, every time, in both halves of the field.
+			// Sweeping the cross-section along Dir = (XSign, 0, -Sink) makes every facet a PLANE: the
+			// strip is spanned by the chord and by Dir, and its two edges are the JOINT LINES, which
+			// run along Dir. In the plane's own frame those edges are parallel, so the strip is a
+			// rectangle and a box fits it EXACTLY — provided its cross-axis extent is the
+			// PERPENDICULAR distance between the joint lines and not the chord length. That
+			// distinction is the whole of the ~10 uu lip the first swept nose shipped (chord x 0.93 on
+			// this nose), so the width is MEASURED here, from the chord's component across Dir, and
+			// the level run falls out of the same expression with Sink = 0 (Dir is then the rail axis,
+			// the chord is already perpendicular to it, and the width is the chord length).
 			//
-			// A STAIRCASE THAT ONLY EVER STEPS DOWN CANNOT DO THAT, and it is a proof rather than a
-			// tuning: each step's far end face has its outward normal pointing ALONG the direction of
-			// travel, so a surfer leaves that solid through it rather than arriving at it, and the
-			// next step is strictly lower. There is nothing in front of the player to hit at any
-			// height, on any facet, at any speed.
+			// WHY NOTHING CAN STAND PROUD ACROSS THE FACE, at any Sink. At a fixed |X| the plane's
+			// cross-section is the facet's own chord lowered by Sink * (|X| - section start) — the same
+			// chord, at every station. So the level run's argument holds verbatim along the whole nose:
+			// consecutive chords meet ON the arc, the slope increases up the face, and extending a facet
+			// either way past a joint continues it at an angle that puts it UNDER its neighbour.
+			//
+			// THAT SAYS NOTHING ABOUT THE SECTION'S OWN TWO ENDS, and believing it did is what shipped
+			// the notches. Where a swept section MEETS a level one, the mismatch is along travel, not
+			// across the face, and it is answered by StartLap and ZOffset together — see
+			// SurfRailNoseJointReach.
 			//
 			// @param SectionNearX |X| where the section starts
 			// @param SectionRun   |X| length of the section
-			// @param ZOffset      how far the whole cross-section is sunk. 0 for the main run.
+			// @param Sink         rise/run at which the whole cross-section sinks. 0 for the main run.
+			// @param StartLap     how far every box starts BACK along the sweep, past SectionNearX.
+			//                     Zero on a level section, whose near face is already square to it;
+			//                     on a swept one this is what closes the wedge notches (see
+			//                     SurfRailNoseJointReach) and it comes with a matching ZOffset.
+			// @param FacetCount   how finely to cut the arc
+			// @param Overlap      how far each facet is extended past its strip at BOTH ends
 			// =====================================================================================
-			auto BuildLevelSection = [&](float SectionNearX, float SectionRun, float ZOffset)
+			auto BuildFaceSection = [&](float SectionNearX, float SectionRun, float Sink, float ZOffset,
+				float StartLap, int32 FacetCount, float Overlap, float Thickness, bool bCollision, bool bDraw)
 			{
-				const float CentreX = XSign * (SectionNearX + SectionRun * 0.5f);
+				const FVector Dir = FVector(XSign, 0.f, -Sink).GetSafeNormal();
+				const float SweepLength = SectionRun * FMath::Sqrt(1.f + Sink * Sink);
 
-				for (int32 Facet = 0; Facet < TraceArenaConstants::SurfRailFacets; ++Facet)
+				for (int32 Facet = 0; Facet < FacetCount; ++Facet)
 				{
-					const float Alpha0 = FacetAngle(Facet);
-					const float Alpha1 = FacetAngle(Facet + 1);
+					const float Alpha0 = FacetAngle(Facet, FacetCount);
+					const float Alpha1 = FacetAngle(Facet + 1, FacetCount);
 
-					const float LowY = StationY(Alpha0);
-					const float LowZ = StationZ(Alpha0) + ZOffset;
-					const float HighY = StationY(Alpha1);
-					const float HighZ = StationZ(Alpha1) + ZOffset;
+					// The two joint points, on the arc, in the section's FIRST cross-section.
+					const FVector Joint0(XSign * SectionNearX,
+						YSign * (ToeY + StationY(Alpha0)), StationZ(Alpha0) + ZOffset);
+					const FVector Joint1(XSign * SectionNearX,
+						YSign * (ToeY + StationY(Alpha1)), StationZ(Alpha1) + ZOffset);
 
-					// Entirely under the floor: this facet is not part of the arena at this offset.
-					if (HighZ <= 1.f)
+					// The chord, and the part of it that is ACROSS the sweep. |Across| is the strip's
+					// true width; see the block above for why using |Chord| here is a ~10 uu lip.
+					const FVector Chord = Joint1 - Joint0;
+					const FVector Across = Chord - Dir * FVector::DotProduct(Chord, Dir);
+					const float Width = static_cast<float>(Across.Size());
+					if (Width <= 1.f)
 					{
 						continue;
 					}
+					const FVector UpSlope = Across / Width;
 
-					// A chord of a circle has the arc's MID angle as its slope, exactly, so the whole
-					// facet is one plane and there is no fitting to do.
-					const float MidRad = FMath::DegreesToRadians((Alpha0 + Alpha1) * 0.5f);
-					const float ChordLength = FMath::Sqrt(FMath::Square(HighY - LowY) + FMath::Square(HighZ - LowZ));
+					// The ride surface faces up, always: of the two unit vectors perpendicular to the
+					// strip, take the one with a positive Z.
+					FVector Normal = FVector::CrossProduct(UpSlope, Dir).GetSafeNormal();
+					if (Normal.Z < 0.f)
+					{
+						Normal = -Normal;
+					}
 
-					// The top facet gets no upward extension: above it the surface is the FLAT crest,
-					// which is SHALLOWER, so an extension there would stand proud of walkable ground.
-					// Everywhere else the concave profile puts both extensions underneath — see the
-					// constant.
-					const float LowerOverlap = TraceArenaConstants::SurfRailFacetOverlap;
-					const float UpperOverlap = (Facet == TraceArenaConstants::SurfRailFacets - 1)
-						? 0.f : TraceArenaConstants::SurfRailFacetOverlap;
+					// SYMMETRIC, and zero on the top facet at BOTH ends — see SurfRailFacetOverlap.
+					// An asymmetric overlap shifts the box along UpSlope, and on a swept section
+					// UpSlope has a component along the rail, which would push the top slab back over
+					// the level run and stand it proud at the junction.
+					const float FacetOverlap = (Facet == FacetCount - 1) ? 0.f : Overlap;
 
-					// Up-slope unit vector along the chord, and the face normal, both mirrored in Y.
-					const FVector UpSlope(0.f, YSign * FMath::Cos(MidRad), FMath::Sin(MidRad));
-					const FVector Normal(0.f, -YSign * FMath::Sin(MidRad), FMath::Cos(MidRad));
+					// The midpoint of the two joint points is exactly half the strip's width from each
+					// joint LINE, so the strip's centre is that point carried half way along the sweep;
+					// then drop half a thickness along the normal so the box's TOP FACE is the strip.
+					// The box runs from -StartLap to +SweepLength along the sweep, so its centre sits
+					// at (SweepLength - StartLap) / 2 and its length is the sum of the two.
+					const FVector Centre = (Joint0 + Joint1) * 0.5f
+						+ Dir * ((SweepLength - StartLap) * 0.5f)
+						- Normal * (Thickness * 0.5f);
 
-					// Centre of the chord, then shifted for the asymmetric overlap and dropped half a
-					// thickness along the normal so the TOP FACE is the chord rather than the middle of
-					// the slab. Same construction the goal ramps use, one dimension further.
-					const FVector ChordMid(CentreX, YSign * (ToeY + (LowY + HighY) * 0.5f),
-						(LowZ + HighZ) * 0.5f);
+					const FVector Size(SweepLength + StartLap, Width + FacetOverlap * 2.f, Thickness);
 
-					const FVector Centre = ChordMid
-						+ UpSlope * ((UpperOverlap - LowerOverlap) * 0.5f)
-						- Normal * (TraceArenaConstants::SurfRailFacetThickness * 0.5f);
-
-					const FVector Size(SectionRun, ChordLength + LowerOverlap + UpperOverlap,
-						TraceArenaConstants::SurfRailFacetThickness);
-
-					// MakeFromZX puts the slab's own +Z on the face normal and its +X along the rail,
+					// MakeFromZX puts the slab's own +Z on the face normal and its +X along the sweep,
 					// which is the only orientation that makes the box's TOP the surface a player rides.
-					const FRotator FacetRotation =
-						FRotationMatrix::MakeFromZX(Normal, FVector(XSign, 0.f, 0.f)).Rotator();
+					const FRotator FacetRotation = FRotationMatrix::MakeFromZX(Normal, Dir).Rotator();
 
-					AddCollisionBlockRotated(Centre, Size, TEXT("SurfRailFace"), FacetRotation);
-					++CollisionBoxes;
-
-					if (bBuildVisuals)
+					if (bCollision)
+					{
+						AddCollisionBlockRotated(Centre, Size, TEXT("SurfRailFace"), FacetRotation);
+						++CollisionBoxes;
+					}
+					if (bDraw)
 					{
 						AddMeshBlockRotated(CubeMesh, Centre, Size, FaceMID, /*bCastShadow=*/true,
 							TEXT("SurfRailFace"), FacetRotation);
-					}
-				}
-
-				// THE FILLERS, AND WHY EACH ONE CAN NEVER POKE THROUGH THE FACE. Filler k spans the Y
-				// band of facet k and stands from the floor to that facet's LOW end. The arc is
-				// monotone, so everywhere inside that band the real surface is at or above the filler's
-				// top BY CONSTRUCTION — no fitting, no tolerance, and no way for a geometry retune to
-				// break it. The slab above reaches 200 uu down its own normal, which overlaps the
-				// filler across the whole band, so between them the cross-section is SOLID: there is no
-				// 6,100 uu tunnel behind the plates for a player to walk into and hide in.
-				for (int32 Facet = 1; Facet < TraceArenaConstants::SurfRailFacets; ++Facet)
-				{
-					const float LowY = StationY(FacetAngle(Facet));
-					const float HighY = StationY(FacetAngle(Facet + 1));
-					const float FillTop = StationZ(FacetAngle(Facet)) + ZOffset;
-					if (FillTop <= 1.f || HighY - LowY <= 1.f)
-					{
-						continue;
-					}
-
-					const FVector FillCentre(CentreX, YSign * (ToeY + (LowY + HighY) * 0.5f), FillTop * 0.5f);
-					const FVector FillSize(SectionRun, HighY - LowY, FillTop);
-
-					AddCollisionBlock(FillCentre, FillSize, TEXT("SurfRailFill"));
-					++CollisionBoxes;
-
-					if (bBuildVisuals)
-					{
-						AddMeshBlock(CubeMesh, FillCentre, FillSize, FaceMID, /*bCastShadow=*/false,
-							TEXT("SurfRailFill"));
+						++DrawnPlates;
 					}
 				}
 			};
 
-			// --- 1. The level main run ---------------------------------------------------------------
-			BuildLevelSection(NearX, MainRun, /*ZOffset=*/0.f);
-
-			// --- 2. The stepped exit nose --------------------------------------------------------------
+			// =====================================================================================
+			// THE FILL, AND WHY IT IS BANDED BY HEIGHT RATHER THAN BY FACET.
 			//
-			// THIS EXISTS BECAUSE THE FIRST BUILD ENDED IN A WALL AND THE RIG HIT IT. A surfer holding a
-			// good strafe rode the full face in 3.9 s and met the end at 1,300 uu/s. A fast lane that
-			// terminates in a flat face is a mechanic that punishes the players who are best at it.
-			for (int32 Step = 0; Step < NoseSteps; ++Step)
+			// Band j stands on the floor and its top is the ARC's height at the band's LOW edge. The
+			// arc is monotone, so everywhere inside the band the real surface is at or above that top
+			// BY CONSTRUCTION — and the built surface is the chords, which stand ABOVE the arc, so the
+			// margin only ever grows. No fitting, no tolerance, and no way for a geometry retune to
+			// break it. The slab above reaches SurfRailFacetThickness / cos(theta) DOWN vertically,
+			// which is 292 uu at the shallowest facet against a band that rises at most half of that,
+			// so the two overlap across the whole band and the cross-section is SOLID: there is no
+			// 5,000 uu tunnel behind the plates for a player to walk into and hide in.
+			//
+			// Being banded by height is what makes a ten-facet face affordable — the fill is four
+			// boxes per section whether the face is cut into five facets or fifty.
+			// =====================================================================================
+			auto BuildFillSection = [&](float SectionNearX, float SectionRun, float Sink, float ZOffset,
+				float StartLap)
 			{
-				BuildLevelSection(JunctionX + StepRun * static_cast<float>(Step), StepRun,
-					-StepDrop * static_cast<float>(Step + 1));
-			}
+				const FVector Dir = FVector(XSign, 0.f, -Sink).GetSafeNormal();
+				const float SweepLength = SectionRun * FMath::Sqrt(1.f + Sink * Sink);
 
-			// --- 3. The body behind the crest, over the main run ---------------------------------------
+				// A filler's top is horizontal ACROSS the rail and descends with the sweep along it.
+				const FVector FillNormal = FVector(XSign * Sink, 0.f, 1.f).GetSafeNormal();
+				const FRotator FillRotation = FRotationMatrix::MakeFromZX(FillNormal, Dir).Rotator();
+
+				for (int32 Band = 1; Band < FillBands; ++Band)
+				{
+					const float LowZ = Height * (static_cast<float>(Band) / static_cast<float>(FillBands));
+					const float HighZ = Height * (static_cast<float>(Band + 1) / static_cast<float>(FillBands));
+					const float LowY = ArcOffsetAtHeight(LowZ);
+					const float HighY = ArcOffsetAtHeight(HighZ);
+					const float TopZ = LowZ + ZOffset;
+					if (HighY - LowY <= 1.f || TopZ <= 1.f)
+					{
+						continue;
+					}
+
+					// Thick enough that the BOTTOM is under the deck at the section's high end, so the
+					// fill is a solid standing on the floor rather than a floating plate. The extra
+					// 60 uu is only ever below the floor, where nothing can see it.
+					const float FillThickness = TopZ * FMath::Sqrt(1.f + Sink * Sink) + 60.f;
+
+					// Lapped back exactly as the face above it is, so the two sections' fill OVERLAPS at
+					// the junction instead of abutting there: an abutment between a level box and a
+					// swept one is the same construction that put the notches in the face.
+					const FVector TopCentre(XSign * SectionNearX,
+						YSign * (ToeY + (LowY + HighY) * 0.5f), TopZ);
+					const FVector FillCentre = TopCentre
+						+ Dir * ((SweepLength - StartLap) * 0.5f)
+						- FillNormal * (FillThickness * 0.5f);
+					const FVector FillSize(SweepLength + StartLap, HighY - LowY, FillThickness);
+
+					AddCollisionBlockRotated(FillCentre, FillSize, TEXT("SurfRailFill"), FillRotation);
+					++CollisionBoxes;
+
+					if (bBuildVisuals)
+					{
+						AddMeshBlockRotated(CubeMesh, FillCentre, FillSize, FaceMID, /*bCastShadow=*/false,
+							TEXT("SurfRailFill"), FillRotation);
+					}
+				}
+			};
+
+			// --- 1. The level main run -----------------------------------------------------------
+			//
+			// TWO RESOLUTIONS, ONE ENVELOPE. The coarse pass is COLLISION ONLY and keeps the proven
+			// 45 uu overlap, which is invisible and therefore free to overlap as much as it likes. The
+			// fine pass is DRAWN ONLY and takes NO overlap at all. That is not symmetry, it is the same
+			// arithmetic pointing the other way: an overlap buries a plate under its neighbour by the
+			// overlap times the SINE OF THE CREASE, and the whole point of the drawn shell is that its
+			// crease is a fraction of a degree — 45 uu of lap would sit a third of a uu under the plate
+			// it laps and z-fight with it across the entire face. With no overlap consecutive plates
+			// share their joint edge exactly, which is what a smooth-shaded fan of quads is.
+			BuildFaceSection(NearX, MainRun, /*Sink=*/0.f, /*ZOffset=*/0.f, /*StartLap=*/0.f,
+				CollisionFacets, TraceArenaConstants::SurfRailFacetOverlap,
+				TraceArenaConstants::SurfRailFacetThickness, /*bCollision=*/true, /*bDraw=*/false);
+			if (bBuildVisuals)
+			{
+				BuildFaceSection(NearX, MainRun, /*Sink=*/0.f, /*ZOffset=*/0.f, /*StartLap=*/0.f,
+					VisualFacets, /*Overlap=*/0.f, TraceArenaConstants::SurfRailVisualPlateThickness,
+					/*bCollision=*/false, /*bDraw=*/true);
+			}
+			BuildFillSection(NearX, MainRun, /*Sink=*/0.f, /*ZOffset=*/0.f, /*StartLap=*/0.f);
+
+			// --- 2. The SWEPT exit nose ----------------------------------------------------------
+			//
+			// The identical cross-section and the identical two-resolution split, sinking at NoseSink
+			// so that by the far end the whole profile has reached the floor. Every box of it starts
+			// NoseStartLap back along the sweep and NoseZOffset down, which is the pair that closes the
+			// junction (see SurfRailNoseJointReach): the shell has no wedge in it, and no material stands
+			// proud of the level run. What is left along travel is the junction's own step DOWN and
+			// then the 32-degree kink, and both fall AWAY from a rider.
+			BuildFaceSection(JunctionX, NoseRun, NoseSink, NoseZOffset, NoseStartLap, CollisionFacets,
+				/*Overlap=*/0.f, TraceArenaConstants::SurfRailFacetThickness,
+				/*bCollision=*/true, /*bDraw=*/false);
+			if (bBuildVisuals)
+			{
+				BuildFaceSection(JunctionX, NoseRun, NoseSink, NoseZOffset, NoseStartLap, VisualFacets,
+					/*Overlap=*/0.f, TraceArenaConstants::SurfRailVisualPlateThickness,
+					/*bCollision=*/false, /*bDraw=*/true);
+			}
+			BuildFillSection(JunctionX, NoseRun, NoseSink, NoseZOffset, NoseStartLap);
+
+			// --- 3. The body behind the crest, over the main run ---------------------------------
 			const FVector BodyCentre(XSign * (NearX + MainRun * 0.5f), YSign * (CrestY + BackY) * 0.5f,
 				Height * 0.5f);
 			AddCollisionBlock(BodyCentre, FVector(MainRun, BackY - CrestY, Height), TEXT("SurfRailBody"));
@@ -4573,21 +5286,48 @@ void ATraceArenaBuilder::BuildSurfRails(bool bBuildVisuals)
 					BodyMID, /*bCastShadow=*/true, TEXT("SurfRailBody"));
 			}
 
-			// --- 4. The crest's own way down, over the nose --------------------------------------------
+			// --- 4. The crest's own way down, over the nose --------------------------------------
 			//
 			// One pitched slab across the crest band, from the crest to the floor over the nose run.
 			// 27 degrees is walkable, so the high route has an exit at BOTH ends rather than a drop at
-			// one — and it is the piece that makes the stepped face underneath read as a prow rather
-			// than as a mistake.
+			// one — and it is the piece that makes the swept face underneath read as a prow.
+			//
+			// IT IS A SOLID WEDGE, NOT A 200 uu PLATE, and that is a fix rather than a flourish: a
+			// plate leaves the space under it (353 uu wide, up to 437 uu tall and the nose long, open
+			// on the outboard side where the corner bank's first terraces are only ~20 uu high) as a
+			// room a pawn fits inside. Thickening it until its underside is below the deck at the
+			// junction costs no primitive at all, and every uu of the extra bulk is either under the
+			// floor or inside the body block.
+			//
+			// IT SINKS WITH THE SECTION UNDER IT, AND THAT IS THE FIX FOR A LEDGE NOBODY HAD NAMED.
+			// SurfRailNoseZOffset lowers the whole cross-section of the FACE, so it moves two edges,
+			// not one: the step along travel at the junction (priced, measured, free — it falls away
+			// from a rider) and the CREST LINE, where the top of the face meets this wedge. Leaving
+			// the wedge at the level run's height therefore stood it |ZOffset| uu proud of the face
+			// for the entire length of the nose — 6.6 uu on the first swept nose, 13.3 after the notch
+			// fix doubled the offset, 18.7 at the slope this one is cut to — a wall facing a rider
+			// drifting up the face, on
+			// a file whose own crest-line note says a 12 uu lip catches a capsule at 1500 uu/s. It
+			// survived two passes because every probe in this file ran ALONG travel and this ledge
+			// runs ACROSS it (Trace.Arena.SurfProfile §3c is the probe that can now see it).
+			//
+			// Sinking the wedge by the same offset costs NO primitive and no constant: the face's top
+			// edge and the crest are then flush at every station of the nose, and what is left is ONE
+			// discontinuity in the whole structure — the junction's step DOWN, taken by the full
+			// cross-section at once, in the direction of travel. On the crest that step is a walk,
+			// not a ride: 18.7 uu is well under the engine's 45 uu MaxStepHeight in both directions.
+			// The alternative on the table was +40 collision boxes to HALVE the ledge (cutting the
+			// nose's collision at the drawn resolution); this removes it, for nothing. See the crest
+			// A/B arm above for how that claim is falsified rather than asserted.
 			{
 				const FRotator NoseRotation(-XSign * NoseCrestDeg, 0.f, 0.f);
 				const FVector NoseNormal(XSign * FMath::Sin(NoseCrestRad), 0.f, FMath::Cos(NoseCrestRad));
+				const float NoseCrestThickness = Height * NoseSlopeScale + 200.f;
+				const float CrestSink = IsSurfRailCrestSinkOff() ? 0.f : NoseZOffset;
 				const FVector NoseTopCentre(XSign * (JunctionX + NoseRun * 0.5f),
-					YSign * (CrestY + BackY) * 0.5f, Height * 0.5f);
-				const FVector NoseCentre = NoseTopCentre
-					- NoseNormal * (TraceArenaConstants::SurfRailFacetThickness * 0.5f);
-				const FVector NoseSize(NoseCrestLength, BackY - CrestY,
-					TraceArenaConstants::SurfRailFacetThickness);
+					YSign * (CrestY + BackY) * 0.5f, Height * 0.5f + CrestSink);
+				const FVector NoseCentre = NoseTopCentre - NoseNormal * (NoseCrestThickness * 0.5f);
+				const FVector NoseSize(NoseCrestLength, BackY - CrestY, NoseCrestThickness);
 
 				AddCollisionBlockRotated(NoseCentre, NoseSize, TEXT("SurfRailNose"), NoseRotation);
 				++CollisionBoxes;
@@ -4598,7 +5338,7 @@ void ATraceArenaBuilder::BuildSurfRails(bool bBuildVisuals)
 				}
 			}
 
-			// --- 5. The walkable access ramp at the inboard end -----------------------------------------
+			// --- 5. The walkable access ramp at the inboard end ----------------------------------
 			//
 			// WITHOUT THIS THE CREST IS NOT A ROUTE. 616 uu is over three times the jump apex, so a
 			// player on foot could not reach the top of their own team's rail and the whole structure
@@ -4632,7 +5372,7 @@ void ATraceArenaBuilder::BuildSurfRails(bool bBuildVisuals)
 				continue;   // Dedicated server: collision only, byte-identical to a client's.
 			}
 
-			// --- 6. The two lines. Neither can be ridden, which is why they are where they are ----------
+			// --- 6. The two lines. Neither can be ridden, which is why they are where they are ----
 			//
 			// FLUSH, not proud. Every other neon element in this file stands off the surface it
 			// decorates by LipOut (12 uu); on a rail that would be a 12 uu lip, and a lip on a surf face
@@ -4662,34 +5402,1485 @@ void ATraceArenaBuilder::BuildSurfRails(bool bBuildVisuals)
 	// DEMO 29 ITEM 4(a), SAID OUT LOUD. "The exit lane is clear" is the claim this patch makes about
 	// the rails, and it is a comparison between two numbers, so both of them are printed next to the
 	// verdict rather than left for a reader to reconstruct from the geometry.
+	//
+	// AND IT SAYS WHAT IT CHECKS. The previous wording was "the exit lane is clear", and that claim is
+	// false: fifteen of fifteen instrumented rides across three sessions ended by hitting cover at
+	// |X| 11739. They hit it ON THE GROUND, several hundred uu after landing, holding a straight input
+	// the rig cannot steer out of — and the guard has never been about that. What it is about, and all
+	// it can be about, is the part of the ride the player has no control over: the FLIGHT. So the line
+	// below says "the flight lands clear", names the ground slide as the thing it does not cover, and
+	// compares against the surface a pawn can actually reach (see SurfRailExitObstacleX, which was
+	// returning the BlockAll face 61 uu beyond it until this pass).
 	{
 		const float ObstacleX = SurfRailExitObstacleX();
 		const float Clearance = SurfRailExitClearance();
 		const float Reach = JunctionX + Clearance;
 		UE_LOG(LogTraceGame, Log,
-			TEXT("Surf rail EXIT LANE: a surfer can leave the nose and travel up to %.0f uu past the "
-			     "junction at |X| %.0f, i.e. as far as |X| %.0f; the first solid in the lane is at |X| "
-			     "%.0f -> %s. (Demo 29 item 4: before this clamp the far end stood at |X| %.0f and rides "
-			     "measured at 1469 uu/s arrived on the floor at 52.)"),
+			TEXT("Surf rail EXIT FLIGHT: a surfer can leave the nose and FLY up to %.0f uu past the "
+			     "junction at |X| %.0f, i.e. land as far out as |X| %.0f; the first surface in that lane "
+			     "a PAWN'S CENTRE can reach is |X| %.0f (a cover shell, %.0f uu inboard of its own "
+			     "collision box) -> %s. This is a claim about the FLIGHT ONLY: a ride then slides 600 to "
+			     "1300 uu on the floor, which is steerable and is not what this clamps. (Demo 29 item 4: "
+			     "before this clamp the far end stood at |X| %.0f and rides measured at 1469 uu/s arrived "
+			     "on the floor at 52.)"),
 			Clearance, JunctionX, Reach, ObstacleX,
-			(Reach <= ObstacleX) ? TEXT("CLEAR") : TEXT("*** THE EXIT ENDS IN A WALL ***"),
+			TraceArenaConstants::NeonStandoff + TraceArenaConstants::PawnCapsuleRadius,
+			(Reach <= ObstacleX) ? TEXT("NOTHING IS HIT AIRBORNE")
+				: TEXT("*** THE FLIGHT ENDS IN A WALL ***"),
 			HalfLength() * TraceArenaConstants::SurfRailFarXFrac);
+
+		// AND THE NUMBER IS MEASURED, NOT ONLY DERIVED. Everything above comes from the cover tables,
+		// which is how it came to be 61 uu wrong for three passes with nothing to catch it. The cover
+		// field is built before the rails (see BuildArena), so by the time this runs the lane really
+		// exists and can be swept: a pawn-sized capsule pushed down the lane on ECC_Pawn at floor
+		// height, at nine stations across the rail's own Y band. If the two disagree the derivation is
+		// wrong, and the build says so instead of printing a verdict computed from a table.
+		if (const UWorld* LaneWorld = GetWorld())
+		{
+			const float PawnHalf = PlayerHeightUU() * 0.5f;
+			const FCollisionShape LanePawn =
+				FCollisionShape::MakeCapsule(TraceArenaConstants::PawnCapsuleRadius, PawnHalf);
+			FCollisionQueryParams LaneParams(SCENE_QUERY_STAT(TraceSurfExitLane), /*bTraceComplex=*/false);
+
+			float MeasuredX = 1.0e9f;
+			FString MeasuredWhat;
+			int32 LaneHits = 0;
+			for (const float XSignLane : { -1.f, 1.f })
+			{
+				for (const float YSignLane : { -1.f, 1.f })
+				{
+					// TOE TO CREST, not toe to back. The rail's back overlaps the corner bank by
+					// SurfRailBackOverlap, so a sweep that ran to BackY would stop on the bank's first
+					// terrace 1,376 uu short of the lane and report it as the obstacle. Rides land at
+					// |Y| 3015..3079, inside this band.
+					for (int32 Station = 0; Station <= 8; ++Station)
+					{
+						const float AbsY = ToeY + (CrestY - ToeY) * (static_cast<float>(Station) / 8.f);
+						const FVector From(XSignLane * (FarX + 60.f), YSignLane * AbsY, PawnHalf + 2.f);
+						const FVector To(XSignLane * GoalLineX(), YSignLane * AbsY, PawnHalf + 2.f);
+						FHitResult LaneHit;
+						if (LaneWorld->SweepSingleByChannel(LaneHit, From, To, FQuat::Identity, ECC_Pawn,
+							LanePawn, LaneParams))
+						{
+							++LaneHits;
+							const float HitX = static_cast<float>(FMath::Abs(LaneHit.Location.X));
+							if (HitX < MeasuredX)
+							{
+								MeasuredX = HitX;
+								MeasuredWhat = GetNameSafe(LaneHit.GetComponent());
+							}
+						}
+					}
+				}
+			}
+
+			if (LaneHits == 0)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("Surf rail EXIT FLIGHT: the lane sweep found NOTHING between |X| %.0f and the "
+					     "goal line at |X| %.0f on any of 36 stations. Either the lane really is empty or "
+					     "the physics scene was not ready at build time — this check did not take a "
+					     "measurement and must not be read as a pass."),
+					FarX + 60.f, GoalLineX());
+			}
+			else if (FMath::Abs(MeasuredX - ObstacleX) <= 4.f)
+			{
+				UE_LOG(LogTraceGame, Log,
+					TEXT("Surf rail EXIT FLIGHT, MEASURED: a pawn capsule pushed down the lane first "
+					     "blocks at |X| %.0f on '%s', against the %.0f this derives from the cover "
+					     "tables -> the derivation matches the built world."),
+					MeasuredX, *MeasuredWhat, ObstacleX);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("Surf rail EXIT FLIGHT, MEASURED: a pawn capsule pushed down the lane first "
+					     "blocks at |X| %.0f on '%s', but SurfRailExitObstacleX() derives %.0f — a %.0f uu "
+					     "disagreement. *** THE CLEARANCE IS BEING COMPUTED AGAINST THE WRONG SURFACE. "
+					     "The rail is clamped from a number the world does not agree with. ***"),
+					MeasuredX, *MeasuredWhat, ObstacleX, MeasuredX - ObstacleX);
+			}
+		}
+	}
+
+	// THE NOSE'S OWN BAND, ASSERTED. Sinking the cross-section tilts every facet, so the nose surfs a
+	// DIFFERENT slope range from the level run and it is the one this rail could lose to a retune of
+	// SurfRailNoseRunPerRise. Compared against the live band rather than against a comment.
+	{
+		float BandLo = 0.f;
+		float BandHi = 0.f;
+		if (const UTraceCharacterMovementComponent* CDO =
+			UTraceCharacterMovementComponent::StaticClass()->GetDefaultObject<UTraceCharacterMovementComponent>())
+		{
+			CDO->GetSurfSlopeBandDegrees(BandLo, BandHi);
+		}
+		const float NoseLo = SweptFaceDegrees(MinDeg, NoseSink);
+		const float NoseHi = SweptFaceDegrees(MaxDeg, NoseSink);
+		const bool bInBand = (NoseLo > BandLo) && (NoseHi < BandHi);
+		if (bInBand)
+		{
+			UE_LOG(LogTraceGame, Log,
+				TEXT("Surf rail NOSE BAND: sinking the cross-section at %.2f rise/run reads the %.2f..%.2f "
+				     "deg face as %.2f..%.2f deg. The movement component surfs %.2f..%.2f -> INSIDE the "
+				     "band at both ends."),
+				NoseSink, MinDeg, MaxDeg, NoseLo, NoseHi, BandLo, BandHi);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("Surf rail NOSE BAND: sinking the cross-section at %.2f rise/run reads the %.2f..%.2f "
+				     "deg face as %.2f..%.2f deg, and the movement component surfs %.2f..%.2f. *** THE NOSE "
+				     "IS OUTSIDE THE BAND: it is walkable at one end or a wall at the other. Lower "
+				     "SurfRailNoseRunPerRise, or re-cut the face. ***"),
+				NoseSink, MinDeg, MaxDeg, NoseLo, NoseHi, BandLo, BandHi);
+		}
+	}
+
+	// THE NOSE'S FLIGHT BOUNDARY, ASSERTED — the other thing SurfRailNoseRunPerRise decides, and the
+	// one that shipped wrong because nothing checked it. See that constant's note for the derivation;
+	// in one line: the ride surface at the CREST dies (Height + ZOffset) / Sink past the junction, a
+	// capsule launched level from Height has fallen g x^2 / 2 v^2 by then, and it touches the steepest
+	// swept facet while its centre is still PawnRadius / Nz + (PawnHalf - PawnRadius) clear of it. The
+	// speed at which those balance is the boundary: slower rides land on the nose, faster ones fly
+	// over it, and the exit is only deterministic if the whole population of real crossings is on one
+	// side of it with room to spare.
+	//
+	// This is the DRIFT-SATURATED, zero-Vz case, so it is a bound and not an estimate: it assumes a
+	// rider carried all the way outboard to the crest, where the nose survives longest, and it gives
+	// the launch none of the +24..+64 uu/s of Vz fifteen measured crossings carry. Trace.Arena.
+	// SurfProfile §6 measures the realistic one by sweeping the pawn's capsule against the built solid.
+	{
+		const float LiveLength = (NoseSink > 0.01f)
+			? ((Height + NoseZOffset) / NoseSink) : 0.f;
+		const float CosMax = FMath::Cos(FMath::DegreesToRadians(MaxDeg));
+		const float FacetNz = CosMax / FMath::Sqrt(1.f + NoseSink * NoseSink * CosMax * CosMax);
+		const float PawnHalf = PlayerHeightUU() * 0.5f;
+		const float CapsuleReach = (FacetNz > 0.01f)
+			? (TraceArenaConstants::PawnCapsuleRadius / FacetNz
+				+ (PawnHalf - TraceArenaConstants::PawnCapsuleRadius))
+			: Height;
+		const UWorld* FlightWorld = GetWorld();
+		const float Gravity = (FlightWorld != nullptr) ? FMath::Abs(FlightWorld->GetGravityZ()) : 980.f;
+		const float Headroom = Height - CapsuleReach;
+
+		// 1075.8 uu/s: the slowest of fifteen junction crossings measured with -TraceSurfExitTest
+		// -TraceSurfFrameTrace across three independent sessions ON THIS GEOMETRY, taken at the last
+		// frame with |X| inside the junction rather than at the last surf frame (which the rig logs
+		// 78..130 uu downrange, and which is worth 8..17 uu/s of the difference — the error that made
+		// the previous pass's safety margin look positive when it was not). The fifteen read
+		// 1075.8 1077.4 1082.8 | 1126.4 1131.9 1133.6 | 1178.4 1178.8 1180.3 | 1527.0 1527.8 1530.5 |
+		// 1922.1 1922.8 1923.8, i.e. about 7 uu/s of run-to-run scatter on a rung.
+		constexpr float SlowestMeasuredCrossing = 1075.8f;
+		constexpr float RequiredMargin = 100.f;
+
+		const float Boundary = (Headroom > 1.f && LiveLength > 1.f)
+			? (LiveLength * FMath::Sqrt(Gravity / (2.f * Headroom))) : 0.f;
+		const float Margin = SlowestMeasuredCrossing - Boundary;
+
+		if (Margin >= RequiredMargin)
+		{
+			UE_LOG(LogTraceGame, Log,
+				TEXT("Surf rail NOSE FLIGHT: the ride surface at the crest dies %.0f uu past the junction "
+				     "and a capsule needs %.0f uu of clearance to miss the steepest swept facet, so the "
+				     "highest speed that can still reach it is %.0f uu/s. The slowest measured junction "
+				     "crossing is %.0f -> CLEAR BY %.0f uu/s (%.0fx the 9 uu/s run-to-run scatter): every "
+				     "ride flies over the nose, and the same entry gives the same exit."),
+				LiveLength, CapsuleReach, Boundary, SlowestMeasuredCrossing, Margin, Margin / 9.f);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("Surf rail NOSE FLIGHT: the ride surface at the crest dies %.0f uu past the junction "
+				     "and a capsule needs %.0f uu of clearance to miss the steepest swept facet, so the "
+				     "highest speed that can still reach it is %.0f uu/s against a slowest measured "
+				     "junction crossing of %.0f — a margin of %.0f uu/s, under the %.0f this needs. *** THE "
+				     "EXIT IS NOT DETERMINISTIC: rides near the boundary graze the nose on some runs and "
+				     "miss it on others, and a graze is worth several hundred uu/s. Lower "
+				     "SurfRailNoseRunPerRise. ***"),
+				LiveLength, CapsuleReach, Boundary, SlowestMeasuredCrossing, Margin, RequiredMargin);
+		}
 	}
 
 	const float ArcLength = Radius * FMath::DegreesToRadians(MaxDeg - MinDeg);
 	UE_LOG(LogTraceGame, Log,
-		TEXT("Surf rails: 4 x (%d facets %.2f..%.2f deg [DERIVED from the movement surf band, margin "
-		     "%.0f deg], arc R=%.0f uu, %.0f uu of ridable band across the face, %.0f uu face span, crest "
-		     "%.0f uu | main run %.0f uu level + a %d-step nose over %.0f uu dropping %.0f uu a step to a "
-		     "%.0f uu terminal face | %.0f uu walkable crest, access ramp %.1f deg over %.0f uu, crest "
-		     "descent %.1f deg). |X| %.0f..%.0f (junction %.0f), |Y| toe %.0f crest %.0f back %.0f. "
-		     "%d collision boxes in total."),
-		TraceArenaConstants::SurfRailFacets, MinDeg, MaxDeg,
-		TraceArenaConstants::SurfRailBandMarginDegrees, Radius, ArcLength, Span, Height,
-		MainRun, NoseSteps, NoseRun, StepDrop, Height - StepDrop * static_cast<float>(NoseSteps),
+		TEXT("Surf rails: 4 x (arc %.2f..%.2f deg [DERIVED from the movement surf band, margin %.0f deg], "
+		     "R=%.0f uu, %.0f uu of ridable band across the face, %.0f uu face span, crest %.0f uu | cut "
+		     "into %d COLLISION facets [%.2f deg of crease, cap %.2f] and %d DRAWN plates [%.2f deg, cap "
+		     "%.2f], fill in %d height bands | main run %.0f uu level + a SWEPT nose over %.0f uu sinking "
+		     "%.2f rise/run to the floor, no terminal face and a %.1f uu step DOWN at the junction (the "
+		     "swept section's %.1f uu joint reach cancelled at BOTH signs: lapped that far back along "
+		     "the sweep so the shell has no wedge in it, and sunk twice that times the sink so none of "
+		     "the lap stands proud) | %.0f uu walkable crest, access ramp %.1f deg over "
+		     "%.0f uu, crest descent %.1f deg). |X| %.0f..%.0f (junction %.0f), |Y| toe %.0f crest %.0f "
+		     "back %.0f. %d collision boxes and %d drawn plates in total."),
+		MinDeg, MaxDeg, TraceArenaConstants::SurfRailBandMarginDegrees, Radius, ArcLength, Span, Height,
+		CollisionFacets, (MaxDeg - MinDeg) / static_cast<float>(CollisionFacets),
+		TraceArenaConstants::SurfRailCollisionCreaseDegrees,
+		VisualFacets, (MaxDeg - MinDeg) / static_cast<float>(VisualFacets),
+		TraceArenaConstants::SurfRailVisualCreaseDegrees, FillBands,
+		MainRun, NoseRun, NoseSink, -NoseZOffset, NoseJointReach,
 		BackY - CrestY, AccessSlopeDeg, AccessRun, NoseCrestDeg,
-		NearX, FarX, JunctionX, ToeY, CrestY, BackY, CollisionBoxes);
+		NearX, FarX, JunctionX, ToeY, CrestY, BackY, CollisionBoxes, DrawnPlates);
 }
+
+#if !UE_BUILD_SHIPPING
+// =================================================================================================
+// THE RIDE SURFACE, MEASURED — Trace.Arena.SurfProfile
+// =================================================================================================
+//
+// WHY A TRACE RIG AND NOT A READING OF THIS FILE. Every claim BuildSurfRails() makes about the shape
+// it builds ("the overlap can only ever add material below the ridable surface", "a staircase that
+// only ever steps down cannot present a face to a rider") is a claim about the SOLID that came out
+// of the constructor, not about the arithmetic that went into it. The one previous swept nose was
+// argued correct and shipped ~10 uu lips, and the argument is still in this file next to the
+// staircase it lost to. So the shape is measured the way a player meets it: by firing traces at it.
+//
+// It samples the built collision with vertical line traces — the arena's collision is UBoxComponents
+// on BlockAll and the drawn geometry is instanced with NoCollision, so a downward trace lands on
+// exactly the surface a movement sweep would find, and on nothing else.
+//
+// IT NOW LOOKS AT THE PICTURE TOO, AND AT THE FLIGHT, because tracing collision was a blind spot with
+// a defect in it. §5 reads the instance transforms back off the registered ISM components and builds a
+// height field for the DRAWN shell the same way the trace builds one for collision — which is what
+// catches a plate that does not meet its neighbour, the thing two screenshots caught and this rig did
+// not. §6 walks the parabola a rider leaves the junction on and measures the built nose's clearance
+// under it, which is the measurement the nose's whole justification turns on and which nobody had
+// taken.
+//
+// AND EVERY RESOLUTION IS DERIVED FROM THE CONSTRUCTION, not typed. See §3's note: the previous
+// version stepped 10 uu at three of the band's 447 and reported "worst RISE +0.0 uu" about a 13.3 uu
+// feature its samples straddled. A probe coarser than what it is asked about cannot report anything
+// but silence, and silence reads exactly like a pass.
+//
+// SIX SECTIONS COME OUT. The first three are the three ways this surface can be wrong:
+//
+//   1. PROUD / RECESSED, per cross-section, against the IDEAL circular arc. The build approximates
+//      the arc with chords, and a chord of a circle lies BELOW its arc, so a correct build is
+//      recessed by at most the sagitta of one facet and proud by nothing. Any positive number here
+//      is material standing above the surface the design promises — the failure mode the
+//      SurfRailFacetOverlap comment argues cannot happen, asserted instead of argued.
+//
+//   2. THE CREASE, per cross-section: the largest change of slope between two neighbouring samples
+//      across the face. This is the quantity the owner is looking at when a ramp reads as "stepped",
+//      and it is also the quantity a rider's velocity is re-clipped by at a facet joint.
+//
+//   3. THE STEP ALONG TRAVEL, per longitudinal profile: the largest rise and the largest drop in the
+//      surface height between neighbouring samples in the direction a surfer is moving. A RISE is a
+//      face pointing back at the rider — the thing that ends a ride at 1500 uu/s. A DROP is the thing
+//      the exit nose's staircase was made of. Each rise is reported with the LENGTH of the notch it
+//      closes, and §3b then sweeps the pawn's own capsule through the junction, because "no rise" and
+//      "no rise a player can hit" are different claims and only the second one is a safety property.
+//
+// Then, because the first three were not enough to keep a defect out:
+//
+//   5. THE DRAWN SHELL against the collision surface, from the instance transforms.
+//   6. THE FLIGHT off the junction against the built nose's clearance under it.
+//
+// The longitudinal profile is printed as well as summarised, because a staircase and a ramp have
+// identical summaries if you only ever look at the maximum.
+// =================================================================================================
+void ATraceArenaBuilder::LogSurfRailProfile(float XSign, float YSign) const
+{
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	const float Height = SurfRailHeight();
+	const float Radius = SurfRailFaceRadius();
+	const float Span = SurfRailFaceSpan();
+	if (!bBuildSurfRails || Height <= 1.f || Radius <= 1.f || Span <= 1.f)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[SURFPROFILE] this level has no surf rails to measure (height %.0f, radius %.0f, span "
+			     "%.0f). Run on /Game/Maps/Arena."), Height, Radius, Span);
+		return;
+	}
+
+	float NearX = 0.f;
+	float FarX = 0.f;
+	SurfRailRunX(NearX, FarX);
+
+	const float NoseRun = Height * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	const float MainRun = (FarX - NearX) - NoseRun;
+	const float JunctionX = NearX + MainRun;
+	const float MinDeg = SurfRailMinFaceAngleDegrees();
+	const float MaxDeg = TraceSurfRailMaxFaceAngleDegrees(MinDeg);
+	const float MinRad = FMath::DegreesToRadians(MinDeg);
+	const float ToeY = SurfRailToeY();
+	const float CrestY = ToeY + Span;
+
+	const float SgnX = (XSign < 0.f) ? -1.f : 1.f;
+	const float SgnY = (YSign < 0.f) ? -1.f : 1.f;
+
+	// The SAME two station functions BuildSurfRails() cuts the facets with. Copied nowhere: if the
+	// profile ever changes shape, this rig changes with it and keeps measuring the real thing.
+	auto StationY = [Radius, MinRad](float Degrees)
+	{
+		return Radius * (FMath::Sin(FMath::DegreesToRadians(Degrees)) - FMath::Sin(MinRad));
+	};
+	auto StationZ = [Radius, MinRad](float Degrees)
+	{
+		return Radius * (FMath::Cos(MinRad) - FMath::Cos(FMath::DegreesToRadians(Degrees)));
+	};
+
+	// THE IDEAL RIDE SURFACE, AS DESIGNED rather than as built: the arc, sunk past the junction by the
+	// nose's own constant descent. Stated once, here, so the BEFORE build (which approximates that
+	// descent with level steps) and the AFTER build are measured against the SAME intention and the
+	// two tables can be read side by side.
+	const float NoseSlope = (NoseRun > 1.f) ? (Height / NoseRun) : 0.f;
+	auto IdealZ = [JunctionX, NoseSlope, &StationZ](float AbsX, float Degrees)
+	{
+		const float Sink = (AbsX <= JunctionX) ? 0.f : NoseSlope * (AbsX - JunctionX);
+		return StationZ(Degrees) - Sink;
+	};
+
+	// The angle whose arc station sits at this Y offset, i.e. the inverse of StationY.
+	auto AngleAtOffset = [Radius, MinRad, MinDeg, MaxDeg](float OffsetY)
+	{
+		const float SinValue = FMath::Clamp(OffsetY / Radius + FMath::Sin(MinRad), -1.f, 1.f);
+		return FMath::Clamp(FMath::RadiansToDegrees(FMath::Asin(SinValue)), MinDeg, MaxDeg);
+	};
+
+	// One vertical probe. Returns the height of the first solid under the sky at (AbsX, AbsY), or a
+	// large negative if the trace found nothing at all (which would mean a HOLE, and is reported).
+	auto ProbeTop = [World, SgnX, SgnY, Height](float AbsX, float AbsY) -> float
+	{
+		FHitResult Hit;
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceSurfProfile), /*bTraceComplex=*/true);
+		const FVector Start(SgnX * AbsX, SgnY * AbsY, Height + 500.f);
+		const FVector End(SgnX * AbsX, SgnY * AbsY, -200.f);
+		if (World->LineTraceSingleByChannel(Hit, Start, End, ECC_Visibility, Params))
+		{
+			return static_cast<float>(Hit.ImpactPoint.Z);
+		}
+		return -1.0e9f;
+	};
+
+	UE_LOG(LogTraceGame, Display, TEXT("================================================================================"));
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[SURFPROFILE] rail (%+.0f, %+.0f): arc %.2f..%.2f deg, R %.0f, span %.0f, crest %.0f | "
+		     "|X| %.0f..%.0f, junction %.0f, nose %.0f uu at %.1f deg | toe |Y| %.0f, crest |Y| %.0f | the "
+		     "nose's joint reach is %.2f uu; it is lapped %.2f uu back along its sweep and started %.2f uu "
+		     "DOWN by construction, so the IDEAL below (the bare swept arc) sits that far ABOVE the built "
+		     "nose and its rows read as a recess of about that much - that is the junction's step, not "
+		     "faceting."),
+		SgnX, SgnY, MinDeg, MaxDeg, Radius, Span, Height, NearX, FarX, JunctionX, NoseRun,
+		FMath::RadiansToDegrees(FMath::Atan(NoseSlope)), ToeY, CrestY,
+		SurfRailNoseJointReach(), SurfRailNoseStartLap(), -SurfRailNoseZOffset());
+
+	// ---------------------------------------------------------------------------------------------
+	// 1 + 2. CROSS-SECTIONS: proud/recessed against the ideal arc, and the crease.
+	// ---------------------------------------------------------------------------------------------
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[SURFPROFILE] cross-sections (%s):"),
+		TEXT("proud>0 means solid stands ABOVE the designed arc - the lip a surfer catches on"));
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[SURFPROFILE]   |X|      where          proud    recess   worst crease   samples  holes"));
+
+	constexpr float CrossStepY = 6.f;
+	float WorstProudAll = -1.0e9f;
+	float WorstCreaseAll = 0.f;
+	float WorstProudAtX = 0.f;
+	float WorstCreaseAtX = 0.f;
+
+	const float Stations[] = {
+		NearX + MainRun * 0.10f, NearX + MainRun * 0.50f, NearX + MainRun * 0.90f,
+		JunctionX + NoseRun * 0.15f, JunctionX + NoseRun * 0.50f, JunctionX + NoseRun * 0.85f };
+	const TCHAR* StationNames[] = {
+		TEXT("main 10%"), TEXT("main 50%"), TEXT("main 90%"),
+		TEXT("nose 15%"), TEXT("nose 50%"), TEXT("nose 85%") };
+
+	for (int32 Station = 0; Station < UE_ARRAY_COUNT(Stations); ++Station)
+	{
+		const float AbsX = Stations[Station];
+		float Proud = -1.0e9f;
+		float Recess = 1.0e9f;
+		float Crease = 0.f;
+		int32 Samples = 0;
+		int32 Holes = 0;
+
+		float PrevZ = 0.f;
+		float PrevSlope = 0.f;
+		bool bHavePrev = false;
+		bool bHaveSlope = false;
+		bool bPrevOnFace = false;
+
+		for (float OffsetY = 0.f; OffsetY <= Span; OffsetY += CrossStepY)
+		{
+			const float AbsY = ToeY + OffsetY;
+			const float Measured = ProbeTop(AbsX, AbsY);
+			if (Measured < -1.0e8f)
+			{
+				++Holes;
+				bHavePrev = false;
+				bHaveSlope = false;
+				continue;
+			}
+
+			++Samples;
+
+			// Only compare against the arc where the arc is above the floor: past the junction the
+			// bottom of the profile has sunk under the deck and the trace correctly finds the FLOOR
+			// there, which is not a defect and must not be read as one.
+			const float Ideal = IdealZ(AbsX, AngleAtOffset(OffsetY));
+			if (Ideal > 2.f)
+			{
+				Proud = FMath::Max(Proud, Measured - Ideal);
+				Recess = FMath::Min(Recess, Measured - Ideal);
+			}
+
+			// THE CREASE IS ONLY A CREASE WHERE THERE IS A FACE. Past the junction the bottom of the
+			// profile has sunk under the deck and a downward trace correctly finds the FLOOR, so the
+			// floor-to-face corner would otherwise be reported as a 30-degree crease in the ramp. Both
+			// samples have to be clear of that corner, in the design AND in what was built — one uu of
+			// slack either side of the deck is not enough, because the two disagree by however far the
+			// build deliberately sinks a section (see the nose's overhang cancellation).
+			const bool bOnFace = (Ideal > 30.f) && (Measured > 12.f);
+			if (bHavePrev && bOnFace && bPrevOnFace)
+			{
+				const float Slope = FMath::RadiansToDegrees(FMath::Atan2(Measured - PrevZ, CrossStepY));
+				if (bHaveSlope)
+				{
+					Crease = FMath::Max(Crease, FMath::Abs(Slope - PrevSlope));
+				}
+				PrevSlope = Slope;
+				bHaveSlope = true;
+			}
+			else
+			{
+				bHaveSlope = false;
+			}
+			PrevZ = Measured;
+			bHavePrev = true;
+			bPrevOnFace = bOnFace;
+		}
+
+		if (Proud > WorstProudAll)
+		{
+			WorstProudAll = Proud;
+			WorstProudAtX = AbsX;
+		}
+		if (Crease > WorstCreaseAll)
+		{
+			WorstCreaseAll = Crease;
+			WorstCreaseAtX = AbsX;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFPROFILE]  %6.0f  %-10s  %+8.1f  %+8.1f      %6.2f deg    %4d   %4d"),
+			AbsX, StationNames[Station], Proud, Recess, Crease, Samples, Holes);
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// 3. LONGITUDINAL: what the surface does ALONG the direction a surfer travels.
+	//
+	// HOW FINELY, AND WHY NEITHER RESOLUTION IS A TYPED NUMBER ANY MORE.
+	//
+	// The first version of this section stepped 10 uu along travel at three lateral stations, and
+	// SURF-SMOOTH-VERIFY §3 showed exactly what that buys: the built junction contains a feature
+	// SurfRailNoseJointReach() uu long, the samples straddled it — one uu before it started and three
+	// after it ended — and the rig reported "worst RISE +0.0 uu" about geometry it had never touched.
+	// A probe that steps further than the shortest thing the construction can make cannot say anything
+	// about that thing; it can only fail to find it, which reads identically to finding nothing.
+	//
+	// So both resolutions are DERIVED from the construction instead:
+	//
+	//   ACROSS the face, every candidate defect this build can produce sits ON a joint line — an
+	//   overlap that stands proud of its neighbour, a plate that falls short of it. The stations are
+	//   therefore the DRAWN pass's own joints (which include every collision joint, because the visual
+	//   count is a multiple of the collision one), each facet's midpoint, and a station two uu BELOW
+	//   each joint, which is where a shortfall opens first. Three lateral samples out of 447 uu of
+	//   band are replaced by fifty-odd placed where the geometry has edges.
+	//
+	//   ALONG travel, the shortest feature is the junction's own joint reach, read from the same
+	//   function the build laps and sinks the nose by. The scan runs at an EIGHTH of it through the
+	//   junction and at half of it everywhere else, so nothing this construction can make is narrower
+	//   than four samples.
+	//
+	// AND THE ANSWER IS REPORTED AS A SHAPE, NOT AS A MAXIMUM. A rise is only something a player can
+	// hit if the ground in front of them climbs back toward the ground behind them over a distance
+	// their capsule cannot span, so each rise is reported with the LENGTH of the notch it closes and
+	// with what a 34 uu capsule does over that length. §3b then stops arguing and sweeps the capsule.
+	// ---------------------------------------------------------------------------------------------
+	const float JointReach = FMath::Max(0.5f, SurfRailNoseJointReach());
+	const float FineStepX = FMath::Max(0.1f, JointReach / 8.f);
+	const float CoarseStepX = FMath::Max(0.5f, JointReach * 0.5f);
+	const float FineLoX = JunctionX - 4.f * JointReach - 10.f;
+	const float FineHiX = JunctionX + 4.f * JointReach + 10.f;
+
+	// The lateral stations, as |Y| offsets from the toe, with a name so a finding can be placed.
+	TArray<float> BandOffsets;
+	TArray<FString> BandNames;
+	{
+		const int32 VisualFacets = SurfRailVisualFacets();
+		for (int32 Joint = 1; Joint < VisualFacets; ++Joint)
+		{
+			const float Deg = FMath::Lerp(MinDeg, MaxDeg,
+				static_cast<float>(Joint) / static_cast<float>(VisualFacets));
+			BandOffsets.Add(StationY(Deg));
+			BandNames.Add(FString::Printf(TEXT("drawn joint %d"), Joint));
+			BandOffsets.Add(FMath::Max(0.5f, StationY(Deg) - 2.f));
+			BandNames.Add(FString::Printf(TEXT("2 uu under joint %d"), Joint));
+		}
+		for (int32 Facet = 0; Facet < VisualFacets; ++Facet)
+		{
+			const float Deg = FMath::Lerp(MinDeg, MaxDeg,
+				(static_cast<float>(Facet) + 0.5f) / static_cast<float>(VisualFacets));
+			BandOffsets.Add(StationY(Deg));
+			BandNames.Add(FString::Printf(TEXT("facet %d middle"), Facet));
+		}
+	}
+
+	// The |X| stations. Fine through the junction, coarse elsewhere, and the fine window is laid out
+	// on its own grid rather than walked into, so its first sample lands where it is meant to.
+	TArray<float> ScanX;
+	{
+		// 25 uu INSIDE the structure's own near end. A trace fired exactly at |X| = NearX lands on the
+		// knife edge of the first slab's end cap and resolves to the slab on one half of the field and
+		// to the fill 20 uu under it on the other — a float coin flip at the edge of the solid, not a
+		// property of the ride surface, and it would otherwise be reported as an 80 uu ledge.
+		for (float AbsX = NearX + 25.f; AbsX <= FarX + 200.f; AbsX += CoarseStepX)
+		{
+			if (AbsX < FineLoX || AbsX > FineHiX)
+			{
+				ScanX.Add(AbsX);
+			}
+		}
+		for (float AbsX = FineLoX; AbsX <= FineHiX; AbsX += FineStepX)
+		{
+			ScanX.Add(AbsX);
+		}
+		ScanX.Sort();
+	}
+
+	float WorstRise = 0.f;
+	float WorstRiseAt = 0.f;
+	float WorstRiseSpan = 0.f;
+	FString WorstRiseWhere = TEXT("nowhere");
+	float WorstDrop = 0.f;
+	float WorstDropAt = 0.f;
+	int32 LineProbes = 0;
+	int32 StationsWithRise = 0;
+
+	{
+		TArray<float> Profile;
+		Profile.Reserve(ScanX.Num());
+
+		for (int32 Station = 0; Station < BandOffsets.Num(); ++Station)
+		{
+			const float OffsetY = BandOffsets[Station];
+			const float AbsY = ToeY + OffsetY;
+			const float Degrees = AngleAtOffset(OffsetY);
+
+			Profile.Reset();
+			float Rise = 0.f;
+			float RiseAt = 0.f;
+			float RiseSpan = 0.f;
+			float Drop = 0.f;
+			float DropAt = 0.f;
+
+			for (const float AbsX : ScanX)
+			{
+				const float Measured = ProbeTop(AbsX, AbsY);
+				++LineProbes;
+
+				// Same exclusion as the cross-sections': where the DESIGN has taken the profile under the
+				// deck, the trace finds the FLOOR and the ramp-meets-floor corner is not a defect in the
+				// ramp. An excluded sample is stored as a sentinel rather than dropped, so the notch-length
+				// walk below cannot step across a gap in the profile and call it a shelf.
+				const float IdealHere = IdealZ(AbsX, Degrees);
+				const bool bOnFace = (Measured > -1.0e8f) && (IdealHere > 30.f) && (Measured > 12.f);
+				Profile.Add(bOnFace ? Measured : -1.0e9f);
+			}
+
+			for (int32 Index = 1; Index < Profile.Num(); ++Index)
+			{
+				if (Profile[Index] < -1.0e8f || Profile[Index - 1] < -1.0e8f)
+				{
+					continue;
+				}
+
+				// RAW, not against the design, and deliberately so: the question a rider's capsule asks is
+				// whether the surface in front of it is HIGHER than the surface under it, and that is a raw
+				// comparison. A positive number is a face pointing back at the player and is the fatal one.
+				// A negative number is a step down, which is free — and on a descending nose it includes the
+				// ramp's own fall (Sink x the sampling step), so read the drop column against that floor.
+				const float Delta = Profile[Index] - Profile[Index - 1];
+				if (Delta > Rise)
+				{
+					Rise = Delta;
+					RiseAt = ScanX[Index];
+
+					// HOW LONG THE NOTCH IS: walk back to the last station that stood at least as high as
+					// the one this rise arrives at. That distance is what a capsule has to span, and it is
+					// the number the previous version of this rig never had.
+					RiseSpan = ScanX[Index] - ScanX[0];
+					for (int32 Back = Index - 1; Back >= 0; --Back)
+					{
+						if (Profile[Back] >= Profile[Index])
+						{
+							RiseSpan = ScanX[Index] - ScanX[Back];
+							break;
+						}
+					}
+				}
+				if (-Delta > Drop)
+				{
+					Drop = -Delta;
+					DropAt = ScanX[Index];
+				}
+			}
+
+			if (Rise > WorstRise)
+			{
+				WorstRise = Rise;
+				WorstRiseAt = RiseAt;
+				WorstRiseSpan = RiseSpan;
+				WorstRiseWhere = BandNames[Station];
+			}
+			if (Drop > WorstDrop)
+			{
+				WorstDrop = Drop;
+				WorstDropAt = DropAt;
+			}
+
+			// Only stations with something to say are printed: fifty-eight identical lines would hide the
+			// one that matters, which is the failure mode this whole section exists to avoid.
+			if (Rise > 0.05f)
+			{
+				++StationsWithRise;
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[SURFPROFILE]   RISE at %-22s (|Y| %.0f, %.2f deg): %+.2f uu at |X| %.2f, over a "
+					     "%.2f uu notch"),
+					*BandNames[Station], AbsY, Degrees, Rise, RiseAt, RiseSpan);
+			}
+		}
+	}
+
+	// The printable sketch, at ONE station, because a staircase and a ramp have identical maxima and
+	// completely different shapes and only one of the two survives a summary line.
+	{
+		const float SketchDegrees = FMath::Lerp(MinDeg, MaxDeg, 0.55f);
+		const float SketchY = ToeY + StationY(SketchDegrees);
+		FString Sketch;
+		for (float AbsX = NearX + 25.f; AbsX <= FarX + 200.f; AbsX += 200.f)
+		{
+			Sketch += FString::Printf(TEXT("%.0f "), ProbeTop(AbsX, SketchY));
+		}
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFPROFILE] along travel: %d stations across the band x %d |X| samples (%.2f uu step "
+			     "through the junction, %.2f uu elsewhere, from a %.2f uu joint reach) = %d probes. %d "
+			     "station(s) found any rise at all."),
+			BandOffsets.Num(), ScanX.Num(), FineStepX, CoarseStepX, JointReach, LineProbes,
+			StationsWithRise);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFPROFILE]   Z every 200 uu from |X| %.0f at 55%% up the band: %s"), NearX, *Sketch);
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// 3b. THE SAME WINDOW, WITH THE PAWN'S OWN CAPSULE INSTEAD OF A LINE.
+	//
+	// A line trace answers "what shape is this"; it does not answer "what does a player ride", and the
+	// two differ by exactly the width of the pawn. The previous version of this rig rested its safety
+	// claim on a line probe that stepped over the junction plus the observation that nobody had caught
+	// in 28 rides — an argument and an absence, not a measurement. This is the measurement: the
+	// character's own capsule, swept DOWN onto the surface at every fine station through the junction,
+	// at every lateral station. A rise in where the CAPSULE comes to rest is a step a player meets. A
+	// rise in the line profile that does NOT appear here is a notch the capsule bridges, and the rig
+	// says which of the two it found rather than leaving a reader to assume.
+	// ---------------------------------------------------------------------------------------------
+	float CapsuleRise = 0.f;
+	float CapsuleRiseAt = 0.f;
+	FString CapsuleRiseWhere = TEXT("nowhere");
+	{
+		const float PawnHalf = PlayerHeightUU() * 0.5f;
+		constexpr float PawnRadius = 34.f;   // ATraceCharacter's capsule; see PlayerHeightUU().
+		const FCollisionShape Pawn = FCollisionShape::MakeCapsule(PawnRadius, PawnHalf);
+		FCollisionQueryParams SweepParams(SCENE_QUERY_STAT(TraceSurfCapsuleProfile), /*bTraceComplex=*/false);
+
+		int32 Sweeps = 0;
+		int32 Missed = 0;
+
+		for (int32 Station = 0; Station < BandOffsets.Num(); ++Station)
+		{
+			const float AbsY = ToeY + BandOffsets[Station];
+			float PrevRest = 0.f;
+			bool bHavePrev = false;
+
+			for (float AbsX = FineLoX; AbsX <= FineHiX; AbsX += FineStepX)
+			{
+				const FVector Start(SgnX * AbsX, SgnY * AbsY, Height + 400.f);
+				const FVector End(SgnX * AbsX, SgnY * AbsY, PawnHalf + 4.f);
+				FHitResult Hit;
+				++Sweeps;
+				if (!World->SweepSingleByChannel(Hit, Start, End, FQuat::Identity, ECC_Pawn, Pawn, SweepParams))
+				{
+					++Missed;
+					bHavePrev = false;
+					continue;
+				}
+
+				const float Rest = static_cast<float>(Hit.Location.Z);
+				if (bHavePrev && (Rest - PrevRest) > CapsuleRise)
+				{
+					CapsuleRise = Rest - PrevRest;
+					CapsuleRiseAt = AbsX;
+					CapsuleRiseWhere = BandNames[Station];
+				}
+				PrevRest = Rest;
+				bHavePrev = true;
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFPROFILE] pawn capsule swept down through the junction (|X| %.0f..%.0f, %.2f uu step, "
+			     "%d stations, %d sweeps, %d found no ground): worst RISE in where the capsule RESTS %+.2f uu "
+			     "at |X| %.2f (%s). %s"),
+			FineLoX, FineHiX, FineStepX, BandOffsets.Num(), Sweeps, Missed, CapsuleRise, CapsuleRiseAt,
+			*CapsuleRiseWhere,
+			(CapsuleRise <= 0.25f)
+				? TEXT("A pawn crossing the junction never climbs: every step is level or down.")
+				: TEXT("*** A PAWN CLIMBS AT THE JUNCTION. That is a face pointing back at a rider. ***"));
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// 3c. ACROSS TRAVEL: THE LEDGE PROBE, AND THE BLIND SPOT IT CLOSES.
+	//
+	// EVERY PROBE ABOVE THIS LINE WALKS IN |X|. §1/§2 compare one cross-section with the arc it was
+	// cut from; §3 and §3b walk ALONG travel and their fifty-odd lateral stations exist only to PLACE
+	// an along-travel finding — nothing in the rig ever compared two lateral samples with each other.
+	// So a discontinuity that is CONSTANT along travel was invisible to all of it, and that is not a
+	// hypothetical: the pass that sharpened §3 created one and doubled it in the same edit
+	// (SURF-NOTCH-VERIFY §2.2 — the crest-to-face ledge, 6.6 -> 13.3 uu, for the whole length of the
+	// nose, printed by §1's cross-section table as a RECESS and never identified as a ledge).
+	//
+	// THE MEASUREMENT. At every |X| station, |Y| from the toe to the back at 1 uu, comparing each
+	// sample with the one beside it — but in the RESIDUAL against the designed cross-section, not in
+	// raw Z. Raw Z is useless here: the face is a 47..61 degree ramp ACROSS the rail, so adjacent
+	// samples differ by up to 1.8 uu from the design itself and a ledge of that size would be
+	// indistinguishable from the surface doing its job. The residual is flat wherever the build agrees
+	// with its own drawing, so any STEP in it is material that is not where the section says it is.
+	//
+	// The sign is the whole point. A step that rises going OUTBOARD is a wall facing a rider drifting
+	// up the face — the thing SurfRailCrestLineWidth's note calls "a lip on a surf face catches a
+	// capsule at 1500 uu/s". A step that rises going INBOARD faces a player walking off the crest, and
+	// is answered by MaxStepHeight rather than by a surf clip. Both are reported, with the |X| range
+	// each persists over, because a one-station artefact and a ledge that runs a whole section are
+	// different findings and a maximum cannot tell them apart.
+	//
+	// AND IT SEPARATES THE RIDE SURFACE FROM THE CREST, because they are answered by different systems
+	// and a maximum over both is a number nobody can act on. Inboard of the crest line a step is met by
+	// a surf clip at 1100..1900 uu/s; outboard of it a step is met by a walker and by MaxStepHeight.
+	// ---------------------------------------------------------------------------------------------
+	float LedgeOut = 0.f;         // residual rises going OUTBOARD: a wall facing a rider on the face
+	float LedgeOutAtX = 0.f;
+	float LedgeOutAtY = 0.f;
+	float LedgeIn = 0.f;          // residual rises going INBOARD: a wall facing a walker on the crest
+	float LedgeInAtX = 0.f;
+	float LedgeInAtY = 0.f;
+	float LedgeRide = 0.f;        // the worst of either sign INBOARD of the crest line, i.e. on the ride
+	float LedgeRideAtX = 0.f;
+	float LedgeRideAtY = 0.f;
+	float LedgeFirstX = 0.f;
+	float LedgeLastX = 0.f;
+	int32 LedgeStationsFlagged = 0;
+	int32 LedgeRideStations = 0;
+	{
+		constexpr float LedgeStepY = 1.f;
+		constexpr float LedgeStepX = 25.f;
+
+		// What counts as a step rather than as sampling noise. The two surfaces this rig compares are
+		// 0.49 uu apart by construction (the two-resolution hover, §5) and a chord's sagitta is 0.5 uu,
+		// so anything at or under a uu is the build agreeing with itself.
+		constexpr float LedgeReport = 1.f;
+
+		const float BackYAbs = SurfRailBackY();
+		int32 LedgeStationCount = 0;
+		int32 Probes = 0;
+
+		for (float AbsX = NearX + 25.f; AbsX <= FarX - 25.f; AbsX += LedgeStepX)
+		{
+			++LedgeStationCount;
+			const float SinkHere = (AbsX <= JunctionX) ? 0.f : NoseSlope * (AbsX - JunctionX);
+			float PrevResidual = 0.f;
+			bool bHavePrev = false;
+			bool bFlagged = false;
+			bool bRideFlagged = false;
+
+			for (float AbsY = ToeY + 2.f; AbsY <= BackYAbs - 2.f; AbsY += LedgeStepY)
+			{
+				// The DESIGNED surface here: the arc while the section is still under the face, the
+				// flat crest behind it, sunk by however far the nose has descended. The same
+				// expression §4 uses for its roof, for the same reason — one definition of the shape.
+				const float OffsetY = AbsY - ToeY;
+				const float DesignZ =
+					((OffsetY >= Span) ? Height : StationZ(AngleAtOffset(OffsetY))) - SinkHere;
+
+				// Only where the design is genuinely above the deck. Past that the cross-section has
+				// sunk under the floor and the trace is measuring the arena's floor, whose residual
+				// against a design that has gone negative is not a property of this rail.
+				if (DesignZ <= 20.f)
+				{
+					bHavePrev = false;
+					continue;
+				}
+
+				const float Z = ProbeTop(AbsX, AbsY);
+				++Probes;
+				if (Z < -1.0e8f)
+				{
+					bHavePrev = false;
+					continue;
+				}
+
+				const float Residual = Z - DesignZ;
+				if (bHavePrev)
+				{
+					const float Step = Residual - PrevResidual;
+					if (Step > LedgeOut)
+					{
+						LedgeOut = Step;
+						LedgeOutAtX = AbsX;
+						LedgeOutAtY = AbsY;
+					}
+					if (-Step > LedgeIn)
+					{
+						LedgeIn = -Step;
+						LedgeInAtX = AbsX;
+						LedgeInAtY = AbsY;
+					}
+					// The crest line is the boundary between the two systems: at or inboard of it the
+					// surface is ridden, outboard of it it is walked. A step is attributed to the RIDE
+					// when EITHER of its two samples is at or inboard of that line — the wall between
+					// the top of the face and the crest is measured at the outboard sample and is a
+					// wall a rider on the face meets, so testing only the outboard one files the
+					// headline defect of this pass under "walkable".
+					const float InboardY = AbsY - LedgeStepY;
+					if (InboardY <= ToeY + Span && FMath::Abs(Step) > LedgeRide)
+					{
+						LedgeRide = FMath::Abs(Step);
+						LedgeRideAtX = AbsX;
+						LedgeRideAtY = InboardY;
+					}
+					if (FMath::Abs(Step) >= LedgeReport)
+					{
+						bFlagged = true;
+						if (InboardY <= ToeY + Span)
+						{
+							bRideFlagged = true;
+						}
+					}
+				}
+				PrevResidual = Residual;
+				bHavePrev = true;
+			}
+
+			if (bFlagged)
+			{
+				++LedgeStationsFlagged;
+				if (LedgeStationsFlagged == 1)
+				{
+					LedgeFirstX = AbsX;
+				}
+				LedgeLastX = AbsX;
+			}
+			if (bRideFlagged)
+			{
+				++LedgeRideStations;
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFPROFILE] ACROSS travel (%d |X| stations x %.0f uu, |Y| %.0f..%.0f at %.0f uu, %d "
+			     "probes): worst step in the residual OUTBOARD (a wall facing a rider) %+.2f uu at |X| "
+			     "%.0f |Y| %.0f; INBOARD (a wall facing a walker) %+.2f uu at |X| %.0f |Y| %.0f. ON THE "
+			     "RIDE SURFACE (|Y| at or inboard of the crest line at %.0f): %.2f uu at |X| %.0f |Y| "
+			     "%.0f, over %d of %d stations. Anywhere: %d station(s) over %.0f uu, |X| %.0f..%.0f. %s"),
+			LedgeStationCount, LedgeStepX, ToeY + 2.f, BackYAbs - 2.f, LedgeStepY, Probes,
+			LedgeOut, LedgeOutAtX, LedgeOutAtY, LedgeIn, LedgeInAtX, LedgeInAtY,
+			ToeY + Span, LedgeRide, LedgeRideAtX, LedgeRideAtY, LedgeRideStations, LedgeStationCount,
+			LedgeStationsFlagged, LedgeReport, LedgeFirstX, LedgeLastX,
+			(LedgeRide < LedgeReport)
+				? TEXT("The RIDE SURFACE is flush across travel: nothing on it steps sideways anywhere.")
+				: (LedgeRideStations > 4)
+					? TEXT("*** A LEDGE RUNS ALONG THE RIDE SURFACE. It is constant along travel, so "
+					       "nothing in §3, §3b or §6 can see it. ***")
+					: TEXT("*** A STEP ACROSS TRAVEL ON THE RIDE SURFACE. ***"));
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// 4. SOLIDITY: CAN A PAWN GET INSIDE THE RAIL?
+	//
+	// "The rail is solid in cross-section" is the claim the fill exists to make, and until now it was
+	// an argument about overlaps. This asserts it the way it matters: by trying to FIT A PAWN in the
+	// space behind the plates. The pawn's own capsule is read off the character CDO, and the test is
+	// an overlap against the Pawn channel — the same channel a movement sweep uses — so anywhere this
+	// reports a room is somewhere a player could stand inside the structure and shoot out of it.
+	//
+	// Only points the DESIGN puts under the ride surface (and under the crest, over the nose, where a
+	// 200 uu plate used to leave a 437 uu attic) are candidates: a capsule floating in the lane
+	// outside the rail is not a hole in the rail.
+	// ---------------------------------------------------------------------------------------------
+	{
+		const float PawnHalf = PlayerHeightUU() * 0.5f;
+		constexpr float PawnRadius = 34.f;   // ATraceCharacter's capsule; see PlayerHeightUU().
+		const FCollisionShape Pawn = FCollisionShape::MakeCapsule(PawnRadius, PawnHalf);
+		FCollisionQueryParams RoomParams(SCENE_QUERY_STAT(TraceSurfSolidity), /*bTraceComplex=*/false);
+
+		int32 Rooms = 0;
+		int32 Tested = 0;
+		FVector WorstRoom = FVector::ZeroVector;
+
+		for (float AbsX = NearX + 120.f; AbsX <= FarX - 120.f; AbsX += 240.f)
+		{
+			// How far the whole cross-section has sunk by this station, so the roof over each column
+			// is the DESIGNED surface here and not the arc at the junction.
+			const float Sink = (AbsX <= JunctionX) ? 0.f : NoseSlope * (AbsX - JunctionX);
+
+			for (float AbsY = ToeY + 30.f; AbsY <= SurfRailBackY() - 30.f; AbsY += 40.f)
+			{
+				// The roof: the arc while the section is still under the face, the flat crest behind it.
+				const float OffsetY = AbsY - ToeY;
+				const float Roof = ((OffsetY >= Span) ? Height : StationZ(AngleAtOffset(OffsetY))) - Sink;
+
+				for (float Z = PawnHalf + 4.f; Z + PawnHalf <= Roof; Z += 40.f)
+				{
+					++Tested;
+					const FVector Where(SgnX * AbsX, SgnY * AbsY, Z);
+					if (!World->OverlapBlockingTestByChannel(Where, FQuat::Identity, ECC_Pawn, Pawn, RoomParams))
+					{
+						++Rooms;
+						WorstRoom = Where;
+					}
+				}
+			}
+		}
+
+		if (Rooms == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SURFPROFILE] SOLID: a %.0f x %.0f uu pawn capsule fits nowhere inside this rail "
+				     "(%d interior stations tried, 0 free)."),
+				PawnRadius * 2.f, PawnHalf * 2.f, Tested);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[SURFPROFILE] *** HOLLOW: a pawn capsule fits at %d of %d interior stations, e.g. %s. "
+				     "There is a room inside this rail. ***"),
+				Rooms, Tested, *WorstRoom.ToCompactString());
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// 5. THE DRAWN SHELL: DOES THE PICTURE AGREE WITH THE SURFACE?
+	//
+	// WHY THIS EXISTS. Everything above traces COLLISION, because collision is what a player rides —
+	// and the arena's drawn geometry is instanced with NoCollision, so a trace cannot reach it at all.
+	// That blind spot shipped a defect. The first swept nose left, at the top of every drawn plate, a
+	// wedge of surface no plate owned; twenty see-through notches down the seam; and this rig reported
+	// the rail clean because it had never looked at the picture (SURF-SMOOTH-VERIFY §1.2). "I looked at
+	// two screenshots" is how that was eventually caught, and it is not a property anybody can re-check
+	// cheaply.
+	//
+	// So the drawn shell gets its own height field, built the same way the collision one is: instance
+	// transforms are read back off the registered UInstancedStaticMeshComponents — what is actually
+	// being DRAWN, not what the builder believes it added — every instance whose box overlaps this rail
+	// is collected, and a downward ray is intersected against them at the same stations §3 traces.
+	//
+	// TWO NUMBERS COME OUT, and between them they are the defect:
+	//
+	//   THE DISAGREEMENT. |drawn top - collision top| at each station. A few tenths of a uu is the
+	//   two-resolution split working as designed (the coarser collision chord stands slightly above the
+	//   finer drawn one, so the pawn HOVERS). Tens of uu is a hole: the collision says there is a ride
+	//   surface here and the picture has nothing nearer than the fill.
+	//
+	//   THE DRAWN PROFILE'S OWN RISE, exactly as §3 measures the collision's. A shell whose plates do
+	//   not meet reads as a cliff and a climb in its own height field, wherever the eye happens to be.
+	// ---------------------------------------------------------------------------------------------
+	{
+		struct FDrawnBox
+		{
+			FTransform ToWorld;
+			FVector LocalMin = FVector::ZeroVector;
+			FVector LocalMax = FVector::ZeroVector;
+		};
+
+		// The rail's own volume, generously: the face, the fill, the body and the crest wedge, plus the
+		// nose's lap back past the junction and the access ramp's foot.
+		const float LoX = FMath::Min(SgnX * (NearX - 900.f), SgnX * (FarX + 300.f));
+		const float HiX = FMath::Max(SgnX * (NearX - 900.f), SgnX * (FarX + 300.f));
+		const float LoY = FMath::Min(SgnY * (ToeY - 160.f), SgnY * (SurfRailBackY() + 160.f));
+		const float HiY = FMath::Max(SgnY * (ToeY - 160.f), SgnY * (SurfRailBackY() + 160.f));
+		const FBox RailBounds(FVector(LoX, LoY, -260.f), FVector(HiX, HiY, Height + 260.f));
+
+		TArray<FDrawnBox> Drawn;
+		{
+			TInlineComponentArray<UInstancedStaticMeshComponent*> Pools(this);
+			for (const UInstancedStaticMeshComponent* Pool : Pools)
+			{
+				if (!IsValid(Pool) || Pool->GetStaticMesh() == nullptr)
+				{
+					continue;
+				}
+
+				const FBox MeshBox = Pool->GetStaticMesh()->GetBoundingBox();
+				for (int32 Index = 0; Index < Pool->GetInstanceCount(); ++Index)
+				{
+					FTransform ToWorld;
+					if (!Pool->GetInstanceTransform(Index, ToWorld, /*bWorldSpace=*/true))
+					{
+						continue;
+					}
+					if (!RailBounds.Intersect(MeshBox.TransformBy(ToWorld)))
+					{
+						continue;
+					}
+
+					FDrawnBox& Box = Drawn.AddDefaulted_GetRef();
+					Box.ToWorld = ToWorld;
+					Box.LocalMin = MeshBox.Min;
+					Box.LocalMax = MeshBox.Max;
+				}
+			}
+		}
+
+		if (Drawn.Num() == 0)
+		{
+			// A dedicated server builds collision only, and reporting "the picture has a hole in it"
+			// about a build that has no picture would be a false alarm rather than a finding.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SURFPROFILE] drawn shell: no instanced geometry overlaps this rail (collision-only "
+				     "build). Nothing to compare."));
+		}
+		else
+		{
+			// The highest drawn surface under the sky at (AbsX, AbsY): the same question ProbeTop asks of
+			// collision, answered against the instance boxes, since a trace cannot reach NoCollision
+			// geometry. Slab test in each box's own frame, where it is axis aligned; scale lives in the
+			// transform, so the inverse carries it and the local box stays the mesh's own bounds.
+			auto ProbeDrawnTop = [&Drawn, SgnX, SgnY, Height](float AbsX, float AbsY) -> float
+			{
+				const FVector From(SgnX * AbsX, SgnY * AbsY, Height + 500.f);
+				const FVector To(SgnX * AbsX, SgnY * AbsY, -200.f);
+				const FVector Ray = To - From;
+
+				float Best = 2.f;   // Nothing hit: any t past the segment's end.
+				for (const FDrawnBox& Box : Drawn)
+				{
+					const FVector A = Box.ToWorld.InverseTransformPosition(From);
+					const FVector B = Box.ToWorld.InverseTransformPosition(To);
+					const FVector D = B - A;
+
+					float Enter = 0.f;
+					float Exit = 1.f;
+					bool bHit = true;
+					for (int32 Axis = 0; Axis < 3 && bHit; ++Axis)
+					{
+						const double Delta = D[Axis];
+						if (FMath::Abs(Delta) < 1.0e-8)
+						{
+							bHit = (A[Axis] >= Box.LocalMin[Axis]) && (A[Axis] <= Box.LocalMax[Axis]);
+							continue;
+						}
+						float T0 = static_cast<float>((Box.LocalMin[Axis] - A[Axis]) / Delta);
+						float T1 = static_cast<float>((Box.LocalMax[Axis] - A[Axis]) / Delta);
+						if (T0 > T1)
+						{
+							Swap(T0, T1);
+						}
+						Enter = FMath::Max(Enter, T0);
+						Exit = FMath::Min(Exit, T1);
+						bHit = (Enter <= Exit);
+					}
+
+					if (bHit && Enter < Best)
+					{
+						Best = Enter;
+					}
+				}
+
+				return (Best > 1.f) ? -1.0e9f : static_cast<float>(From.Z + Ray.Z * Best);
+			};
+
+			// The stations §3 uses, plus a DENSE lateral pass through the junction: a notch that opens
+			// below a joint line is 18 uu tall at most, so a band sampled every 1.5 uu cannot step over
+			// one, and this is the window where the two sections meet and the only place the
+			// construction changes along travel.
+			float WorstGap = 0.f;
+			FVector WorstGapAt = FVector::ZeroVector;
+			float WorstDrawnRise = 0.f;
+			float WorstDrawnRiseAt = 0.f;
+			float WorstHover = 0.f;      // drawn BELOW collision, the harmless direction, in uu
+			float WorstPokeThrough = 0.f;   // drawn ABOVE collision: the picture standing proud of the ride
+			int32 DrawnProbes = 0;
+			int32 BigGaps = 0;
+
+			auto Compare = [&](float AbsX, float AbsY)
+			{
+				const float Collision = ProbeTop(AbsX, AbsY);
+				const float Picture = ProbeDrawnTop(AbsX, AbsY);
+				++DrawnProbes;
+				if (Collision < -1.0e8f || Picture < -1.0e8f || Collision <= 12.f)
+				{
+					return;
+				}
+
+				const float Gap = Picture - Collision;
+				if (Gap > WorstPokeThrough) { WorstPokeThrough = Gap; }
+				if (-Gap > WorstHover) { WorstHover = -Gap; }
+				if (FMath::Abs(Gap) > WorstGap)
+				{
+					WorstGap = FMath::Abs(Gap);
+					WorstGapAt = FVector(SgnX * AbsX, SgnY * AbsY, Picture);
+				}
+				// FOUR uu, and the number is chosen against the two things it has to tell apart rather
+				// than picked. The legitimate disagreement is the two-resolution split's hover — the
+				// coarser collision chord standing above the finer drawn one — and that is MEASURED at
+				// 0.49 uu on this arc. A notch is the picture stepping away from the ride surface by the
+				// junction's own reach or the plate's own thickness, tens of uu: the BEFORE arm
+				// (-TraceSurfRailNoJunctionLap) reads 28.19. Four uu is eight times the one and a
+				// seventh of the other, so nothing has to be close to the line to be classified.
+				if (FMath::Abs(Gap) > 4.f)
+				{
+					++BigGaps;
+				}
+			};
+
+			for (int32 Station = 0; Station < BandOffsets.Num(); ++Station)
+			{
+				const float AbsY = ToeY + BandOffsets[Station];
+				float PrevPicture = 0.f;
+				bool bHavePrev = false;
+				for (const float AbsX : ScanX)
+				{
+					Compare(AbsX, AbsY);
+
+					const float Picture = ProbeDrawnTop(AbsX, AbsY);
+					const bool bOnFace = (Picture > 12.f) && (IdealZ(AbsX, AngleAtOffset(BandOffsets[Station])) > 30.f);
+					if (bHavePrev && bOnFace && (Picture - PrevPicture) > WorstDrawnRise)
+					{
+						WorstDrawnRise = Picture - PrevPicture;
+						WorstDrawnRiseAt = AbsX;
+					}
+					PrevPicture = Picture;
+					bHavePrev = bOnFace;
+				}
+			}
+
+			for (float AbsX = FineLoX; AbsX <= FineHiX; AbsX += FineStepX)
+			{
+				for (float OffsetY = 2.f; OffsetY <= Span - 2.f; OffsetY += 1.5f)
+				{
+					Compare(AbsX, ToeY + OffsetY);
+				}
+			}
+
+			const bool bAgrees = (BigGaps == 0) && (WorstDrawnRise <= 0.5f);
+			const FString Shell = FString::Printf(
+				TEXT("[SURFPROFILE] DRAWN SHELL vs COLLISION: %d instances overlap this rail, %d probes. The "
+				     "picture sits at most %.2f uu BELOW the ride surface (a hover, harmless) and %.2f uu "
+				     "ABOVE it; worst disagreement %.2f uu at %s; %d probe(s) disagree by more than 4 uu. "
+				     "Worst RISE in the DRAWN profile along travel %+.2f uu at |X| %.0f."),
+				Drawn.Num(), DrawnProbes, WorstHover, WorstPokeThrough, WorstGap, *WorstGapAt.ToCompactString(),
+				BigGaps, WorstDrawnRise, WorstDrawnRiseAt);
+
+			if (bAgrees)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("%s The shell is closed: nowhere does the picture leave the surface a player rides."),
+					*Shell);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("%s *** THE PICTURE AND THE RIDE SURFACE DISAGREE. There is a hole in the shell. ***"),
+					*Shell);
+			}
+		}
+	}
+
+	// ---------------------------------------------------------------------------------------------
+	// 6. THE FLIGHT, SWEPT WITH THE PAWN'S OWN CAPSULE AND WITH THE DRIFT A RIDE ACTUALLY CARRIES.
+	//
+	// WHY THIS EXISTS, AND WHY IT WAS REBUILT. The nose was rebuilt on the argument that a staircase
+	// "presents no surface", and the rig that replaced the argument with a measurement then walked a
+	// POINT down a parabola at three band fractions with the LATERAL VELOCITY HELD AT ZERO. It
+	// concluded "seventeen of eighteen flights land on the FLOOR", that sentence went into this file
+	// twice, and SURF-NOTCH-VERIFY §3 falsified it from the shipped rig on the shipped binary: real
+	// launches drift about 64 uu OUTBOARD during the flight, which carries them toward the crest,
+	// where the nose survives above the deck longest — and a probe that pins Y cannot produce that
+	// contact at any speed. It also compared against the LAST SURF FRAME (logged 78..130 uu downrange)
+	// rather than the junction crossing, and the difference is worth 8..17 uu/s against a margin of 7.
+	//
+	// So this version fixes all three of those and one more:
+	//
+	//   IT SWEEPS THE PAWN'S OWN CAPSULE, not a point with a downward trace under it. The point rejoin
+	//   and the capsule contact are 200+ uu apart in |X| on this geometry, because a 34 x 176 uu
+	//   capsule meets a 60-degree face while its centre is still ~120 uu clear of it.
+	//
+	//   IT CARRIES A LATERAL VELOCITY, at zero AND at the measured drift AND at twice it, so the
+	//   answer is a function of the variable that decides it rather than a statement about a rider who
+	//   does not exist.
+	//
+	//   IT SWEEPS THE SPEED, and reports the BOUNDARY: the highest launch speed at which any band
+	//   station still reaches the ride surface. That is the number the exit's determinism turns on. A
+	//   straight ramp cannot be "always ridden" (a parabola off a level surface rejoins a ramp of
+	//   slope s after 2 s v^2 / g, which is a different place for every v, so no straight ramp is in
+	//   contact across a speed range) and it cannot be "never touched" either (slow enough and the
+	//   parabola always comes back down onto it). What it CAN be is clear across the whole band of
+	//   speeds rides actually leave at, with the boundary far enough below the slowest of them that
+	//   run-to-run scatter cannot cross it. This prints the boundary; SurfRailNoseRunPerRise's note
+	//   records what it is set against.
+	//
+	//   IT NAMES WHAT IT HIT, off the component rather than off a height threshold, and it separates
+	//   the RIDE surface (SurfRailFace / SurfRailFill — a contact there is a surf clip and pays out
+	//   speed) from the WALKABLE crest (SurfRailNose / SurfRailBody — a contact there is a landing).
+	//
+	// LAUNCH Vz IS ZERO HERE AND THAT IS THE CONSERVATIVE END, not an assumption: the ride rig
+	// measures +23.9..+64.3 at fifteen junction crossings, and positive Vz raises the parabola, which
+	// can only make the nose easier to clear. Zero is the worst case this build has to survive.
+	// ---------------------------------------------------------------------------------------------
+	float GrazeBoundary = 0.f;          // highest speed at which any station still reaches the RIDE surface
+	float GrazeBoundaryDrift = 0.f;
+	float GrazeDeepestPast = 0.f;
+	{
+		const float Gravity = World->GetGravityZ();
+		const float PawnHalf = PlayerHeightUU() * 0.5f;
+		constexpr float PawnRadius = 34.f;   // ATraceCharacter's capsule; see PlayerHeightUU().
+		const FCollisionShape Pawn = FCollisionShape::MakeCapsule(PawnRadius, PawnHalf);
+		FCollisionQueryParams FlightParams(SCENE_QUERY_STAT(TraceSurfFlight), /*bTraceComplex=*/false);
+
+		// 1/240 s. Half the resolution of the old point walk and eight times what the game ticks at,
+		// against a capsule that is 68 uu across: at 1900 uu/s one step is 7.9 uu, an eighth of the
+		// capsule's own width, so nothing this geometry can present is stepped over.
+		constexpr float Dt = 1.f / 240.f;
+		constexpr int32 FlightStations = 11;
+
+		static const float FlightSpeeds[] = {
+			700.f, 800.f, 900.f, 950.f, 1000.f, 1050.f, 1100.f, 1150.f, 1200.f, 1300.f, 1500.f, 1700.f, 1900.f };
+
+		// Zero, THE MEASURED DRIFT, and multiples of it. The multiples are not padding: drift is a
+		// function of the INPUT, so for a fixed input it is fixed, and the question the extra rows
+		// answer is "how much harder than a real ride would somebody have to steer outboard before
+		// the nose came back into their flight path". A rider who steers differently and gets a
+		// different exit is not the defect; the same rider getting two exits is.
+		//
+		// 80 uu/s, NOT the 65 THIS LADDER SHIPPED WITH. 65 came from a single ride in
+		// SURF-NOTCH-VERIFY §3.3; SURF-FINAL-VERIFY then measured 25 rides across five sessions and
+		// got mean 80.4, median 80.4, range 78.1..82.2 — so every ride this arena actually produces
+		// drifts MORE than the row the verdict was read off, and the old ladder had no sample at all
+		// between 65 and 130, which is precisely the interval the boundary moves through (800 ->
+		// 1000 uu/s). The margin printed against the 65 row was therefore not the margin: the honest
+		// figure was a bound of 76..276 uu/s, quoted as 276. Sampling the population you actually
+		// have is the whole point of the row, so it is sampled here, and 100/130 keep the shape of
+		// the ladder above it.
+		static const float FlightDrifts[] = { 0.f, 80.f, 100.f, 130.f, 200.f, 300.f };
+		constexpr int32 MeasuredDriftIndex = 1;
+
+		// 0 = met nothing but the floor, 1 = met the RIDE surface, 2 = met the walkable crest.
+		auto Fly = [&](float Speed, float Drift, int32 Station, float& OutPast) -> int32
+		{
+			OutPast = -1.f;
+			const float Deg = FMath::Lerp(MinDeg, MaxDeg,
+				(static_cast<float>(Station) + 0.5f) / static_cast<float>(FlightStations));
+			const float AbsY = ToeY + StationY(Deg);
+
+			// Rest the capsule on the LEVEL run eight uu short of the junction, which is where the
+			// rider is on the frame before the flight starts.
+			FHitResult Rest;
+			const FVector RestStart(SgnX * (JunctionX - 8.f), SgnY * AbsY, Height + 400.f);
+			const FVector RestEnd(SgnX * (JunctionX - 8.f), SgnY * AbsY, PawnHalf + 4.f);
+			if (!World->SweepSingleByChannel(Rest, RestStart, RestEnd, FQuat::Identity, ECC_Pawn, Pawn,
+				FlightParams))
+			{
+				return 0;
+			}
+
+			FVector P = Rest.Location + FVector(0.f, 0.f, 4.f);
+			float Vz = 0.f;
+			for (int32 Step = 0; Step < 1200; ++Step)
+			{
+				Vz += Gravity * Dt;
+				const FVector Next = P + FVector(SgnX * Speed * Dt, SgnY * Drift * Dt, Vz * Dt);
+
+				FHitResult Hit;
+				if (World->SweepSingleByChannel(Hit, P, Next, FQuat::Identity, ECC_Pawn, Pawn, FlightParams))
+				{
+					// The first forty uu belong to the frames on which the rider is still leaving the
+					// surface they launched from; a contact there is the launch, not a re-contact.
+					const float Past = static_cast<float>(FMath::Abs(Hit.Location.X)) - JunctionX;
+					if (Past > 40.f)
+					{
+						OutPast = Past;
+						const UPrimitiveComponent* Component = Hit.GetComponent();
+						const FString Name = (Component != nullptr) ? Component->GetName() : FString();
+						if (Name.StartsWith(TEXT("SurfRailFace")) || Name.StartsWith(TEXT("SurfRailFill")))
+						{
+							return 1;
+						}
+						if (Name.StartsWith(TEXT("SurfRail")))
+						{
+							return 2;
+						}
+						return 0;
+					}
+				}
+
+				P = Next;
+				if (static_cast<float>(FMath::Abs(P.X)) - JunctionX > NoseRun + 1500.f)
+				{
+					break;
+				}
+				if (P.Z < -200.f)
+				{
+					break;
+				}
+			}
+			return 0;
+		};
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFPROFILE] the flight off the junction, PAWN CAPSULE swept against the built solid "
+			     "(gravity %.0f, launch Vz 0 — the conservative end; the ride rig measures +24..+64 at the "
+			     "crossing, and positive Vz only lifts the parabola). %d band stations x %d speeds x %d "
+			     "drifts, %.4f s steps. The nose is %.0f uu long at %.2f rise/run, junction |X| %.0f, far "
+			     "end |X| %.0f."),
+			Gravity, FlightStations, static_cast<int32>(UE_ARRAY_COUNT(FlightSpeeds)),
+			static_cast<int32>(UE_ARRAY_COUNT(FlightDrifts)), Dt, NoseRun, NoseSlope, JunctionX, FarX);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFPROFILE]   drift   speed   stations that met the RIDE surface / the CREST / the "
+			     "floor   deepest contact past the junction"));
+
+		float BoundaryAt[UE_ARRAY_COUNT(FlightDrifts)] = {};
+		for (int32 DriftIndex = 0; DriftIndex < UE_ARRAY_COUNT(FlightDrifts); ++DriftIndex)
+		{
+			const float Drift = FlightDrifts[DriftIndex];
+			for (const float Speed : FlightSpeeds)
+			{
+				int32 Ride = 0;
+				int32 Crest = 0;
+				float Deepest = -1.f;
+				for (int32 Station = 0; Station < FlightStations; ++Station)
+				{
+					float Past = -1.f;
+					const int32 What = Fly(Speed, Drift, Station, Past);
+					if (What == 1)
+					{
+						++Ride;
+						Deepest = FMath::Max(Deepest, Past);
+					}
+					else if (What == 2)
+					{
+						++Crest;
+					}
+				}
+
+				if (Ride > 0)
+				{
+					BoundaryAt[DriftIndex] = FMath::Max(BoundaryAt[DriftIndex], Speed);
+					if (Speed > GrazeBoundary)
+					{
+						GrazeBoundary = Speed;
+						GrazeBoundaryDrift = Drift;
+						GrazeDeepestPast = Deepest;
+					}
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[SURFPROFILE]   %5.0f   %5.0f   %2d ride / %2d crest / %2d floor   %s"),
+					Drift, Speed, Ride, Crest, FlightStations - Ride - Crest,
+					(Deepest < 0.f) ? TEXT("-") : *FString::Printf(TEXT("%.0f uu"), Deepest));
+			}
+		}
+
+		// THE REFERENCE THIS IS JUDGED AGAINST, AND WHERE IT COMES FROM. 1075.8 uu/s is the slowest of
+		// fifteen junction crossings measured with -TraceSurfExitTest -TraceSurfFrameTrace over three
+		// independent sessions on this geometry, taken at the last frame with |X| INSIDE the junction
+		// rather than at the last surf frame — which the rig logs 78..130 uu downrange, and comparing
+		// against which is how the previous pass's margin came out positive when it was not. The
+		// run-to-run scatter on one rung of that table is about 7 uu/s; 9 is used below as the round
+		// number the earlier passes measured.
+		constexpr float SlowestMeasuredCrossing = 1075.8f;
+
+		// How hard a rider would have to steer outboard before the boundary reached the slowest speed
+		// anybody crosses at. Reported as a drift rather than as a pass/fail because that is the shape
+		// of the answer: the nose is clear for the way rides are actually flown, and this says by how
+		// much of a change in flying they would have to stop being.
+		float DriftThatReaches = -1.f;
+		for (int32 DriftIndex = 0; DriftIndex < UE_ARRAY_COUNT(FlightDrifts); ++DriftIndex)
+		{
+			if (BoundaryAt[DriftIndex] >= SlowestMeasuredCrossing && DriftThatReaches < 0.f)
+			{
+				DriftThatReaches = FlightDrifts[DriftIndex];
+			}
+		}
+
+		const float MeasuredBoundary = BoundaryAt[MeasuredDriftIndex];
+		const float Margin = SlowestMeasuredCrossing - MeasuredBoundary;
+		const FString DriftLine = (DriftThatReaches < 0.f)
+			? FString::Printf(TEXT("not even at %.0f uu/s of drift, %.0fx a real ride's"),
+				FlightDrifts[UE_ARRAY_COUNT(FlightDrifts) - 1],
+				FlightDrifts[UE_ARRAY_COUNT(FlightDrifts) - 1] / FlightDrifts[MeasuredDriftIndex])
+			: FString::Printf(TEXT("at %.0f uu/s of drift, %.1fx a real ride's"),
+				DriftThatReaches, DriftThatReaches / FlightDrifts[MeasuredDriftIndex]);
+
+		if (Margin >= 100.f)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SURFPROFILE] EXIT DETERMINISM: at the MEASURED drift (%.0f uu/s, mean of 25 rides) the "
+				     "highest launch speed that still reaches the RIDE surface is %.0f uu/s, which is "
+				     "%.0f uu/s BELOW the slowest measured junction crossing of %.0f — about %.0fx the "
+				     "9 uu/s run-to-run scatter, so no scatter can flip a ride across it. The boundary "
+				     "only climbs back to the crossings %s. Worst over every drift tried: %.0f uu/s."),
+				FlightDrifts[MeasuredDriftIndex], MeasuredBoundary, Margin, SlowestMeasuredCrossing,
+				Margin / 9.f, *DriftLine, GrazeBoundary);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[SURFPROFILE] *** EXIT DETERMINISM: at the MEASURED drift (%.0f uu/s, mean of 25 rides) the "
+				     "highest launch speed that still reaches the RIDE surface is %.0f uu/s against a "
+				     "slowest measured junction crossing of %.0f — a margin of %.0f uu/s. The boundary is "
+				     "inside the band of speeds rides leave at, so the SAME ENTRY LANDS AT TWO DIFFERENT "
+				     "SPEEDS depending on whether the parabola happens to clip the nose. Lower "
+				     "SurfRailNoseRunPerRise. *** (Worst over every drift tried: %.0f uu/s at %.0f uu/s of "
+				     "drift, %.0f uu past the junction.)"),
+				FlightDrifts[MeasuredDriftIndex], MeasuredBoundary, SlowestMeasuredCrossing, Margin,
+				GrazeBoundary, GrazeBoundaryDrift, GrazeDeepestPast);
+		}
+	}
+
+	// A RISE is the only one of the two that can end a ride: it is a face pointing back at the player.
+	// A drop is free height, and the nose is made of them by construction — which is exactly why the
+	// number is printed rather than asserted away.
+	//
+	// THE RISE IS NOW QUOTED THREE WAYS, and the previous version of this line is the reason. It said
+	// "worst RISE along travel +0.0 uu" and that was read as a safety proof, when it was a probe that
+	// stepped 10 uu across a 13 uu feature at three of the band's 447 uu. So: the LINE probe says what
+	// the geometry does, over how long a notch; the CAPSULE says what a player meets; and if the two
+	// disagree the notch is one the pawn bridges, which is a margin and has to be quoted as one.
+	const float CapsuleSpan = 2.f * 34.f;
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[SURFPROFILE] VERDICT rail (%+.0f,%+.0f): worst material PROUD of the designed arc %+.1f uu "
+		     "(at |X| %.0f), worst CREASE %.2f deg (at |X| %.0f), worst DROP along travel %.1f uu (at |X| "
+		     "%.0f). RISE, line probe: %+.2f uu at |X| %.2f (%s), over a %.2f uu notch -> %s. RISE, pawn "
+		     "capsule swept through the junction: %+.2f uu at |X| %.2f. LEDGE across travel, on the RIDE "
+		     "SURFACE: %.2f uu over %d station(s) (anywhere on the structure: %+.2f uu outboard / %+.2f uu "
+		     "inboard). EXIT: the flight reaches the ride surface up to %.0f uu/s."),
+		SgnX, SgnY, WorstProudAll, WorstProudAtX, WorstCreaseAll, WorstCreaseAtX,
+		WorstDrop, WorstDropAt,
+		WorstRise, WorstRiseAt, *WorstRiseWhere, WorstRiseSpan,
+		(WorstRise <= 0.05f) ? TEXT("no rise anywhere")
+			: (WorstRiseSpan < CapsuleSpan)
+				? TEXT("SHORTER than a pawn capsule's 68 uu span, so the capsule bridges it")
+				: TEXT("*** LONGER than a pawn capsule's 68 uu span: a pawn can drop into this ***"),
+		CapsuleRise, CapsuleRiseAt, LedgeRide, LedgeRideStations, LedgeOut, LedgeIn, GrazeBoundary);
+	UE_LOG(LogTraceGame, Display, TEXT("================================================================================"));
+}
+#endif // !UE_BUILD_SHIPPING
 
 void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 {
@@ -9138,6 +11329,51 @@ namespace
 				{
 					return TickArenaCoveWalk(State, DeltaTime);
 				}), 0.f);
+		}));
+
+	/**
+	 * THE RIDE SURFACE, MEASURED. See ATraceArenaBuilder::LogSurfRailProfile().
+	 *
+	 * With no argument it measures all four rails, because "the rails are smooth" is a claim about
+	 * the arena and not about one quadrant — and because the two halves are built by the same loop
+	 * with opposite signs, which is exactly the kind of symmetry that hides a sign error until
+	 * somebody rides the other end.
+	 */
+	FAutoConsoleCommand CmdArenaSurfProfile(
+		TEXT("Trace.Arena.SurfProfile"),
+		TEXT("Trace.Arena.SurfProfile [XSign YSign] - fire traces at the built surf rail(s) and report "
+		     "how far any solid stands PROUD of the designed arc, the worst CREASE across the face, and "
+		     "the worst rise/drop along the direction of travel. No argument measures all four."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			UWorld* World = FindArenaPerfWorld();
+			if (World == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[SURFPROFILE] no world."));
+				return;
+			}
+
+			TActorIterator<ATraceArenaBuilder> It(World);
+			ATraceArenaBuilder* Arena = It ? *It : nullptr;
+			if (Arena == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[SURFPROFILE] no arena builder in this world."));
+				return;
+			}
+
+			if (Args.Num() >= 2)
+			{
+				Arena->LogSurfRailProfile(FCString::Atof(*Args[0]), FCString::Atof(*Args[1]));
+				return;
+			}
+
+			for (const float XSign : { -1.f, 1.f })
+			{
+				for (const float YSign : { -1.f, 1.f })
+				{
+					Arena->LogSurfRailProfile(XSign, YSign);
+				}
+			}
 		}));
 
 	/**
