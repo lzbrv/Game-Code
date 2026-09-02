@@ -259,6 +259,21 @@ public:
 	FTraceSurfRailProbe GetSurfRailProbe(float XSign, float YSign) const;
 
 	/**
+	 * The SIDE-WALL RIDE described in the same terms, so the surf harness can ride it without a second
+	 * copy of anything. -TraceSurfBankTest swaps this in for GetSurfRailProbe() and every arm of
+	 * TraceMovementSurf.cpp — the twelve-run ladder, the exit test, the approach test and the two
+	 * negative controls — then measures the band instead of a rail. A rig with its own idea of where
+	 * the ramp is keeps passing after the level moves; this is the same lesson GetSurfRailProbe's own
+	 * header states, applied to the structure that replaced it.
+	 *
+	 * CrestStand is the BENCH (level ground behind the crest) and ToeOnFloor is the foot of the exit
+	 * chain, which is the only place on this ride a player can reach from the floor — those two are
+	 * where the negative control and the approach test respectively belong on this geometry, and they
+	 * are not the same places they are on a rail.
+	 */
+	FTraceSurfRailProbe GetSurfBankProbe(float XSign, float YSign) const;
+
+	/**
 	 * The placed Core spawn marker, or null when the level has none (which is the normal state of
 	 * /Game/Maps/Arena). Warns, once per resolve, if there is more than one.
 	 */
@@ -266,6 +281,103 @@ public:
 
 	/** World-space playable volume: floor to wall top, inside faces of the four walls. */
 	FBox GetFieldBounds() const;
+
+	/**
+	 * ONE STRAIGHT SWEEP of the ride's cross-section: where it starts, which way it goes, how fast the
+	 * whole section sinks, and how far its boxes lap past each end. The ride is a chain of these and
+	 * NOTHING ELSE, which is what makes it measurable: Trace.Arena.SurfBankProfile walks the same list
+	 * the build did, so the instrument cannot be pointed at a surface the build never made.
+	 */
+	struct FTraceSurfBankSection
+	{
+		FVector2D StartTop = FVector2D::ZeroVector;   // plan point of the TOP EDGE at the start
+		FVector2D Dir = FVector2D(1.f, 0.f);          // unit plan direction of travel
+		FVector2D Out = FVector2D(0.f, -1.f);         // unit plan direction from crest toward toe
+		float Length = 0.f;                           // plan length
+		float Sink = 0.f;                             // rise/run the whole cross-section sinks at
+		float StartZ = 0.f;                           // Z of the top edge at the start
+		float StartLap = 0.f;
+		float EndLap = 0.f;
+	};
+
+	/**
+	 * The whole ride along one side wall, in build order: the level run, then an exit chain off each
+	 * end. @p PlanSegments is how finely the exits' turn is cut — the build asks for the collision
+	 * count on one pass and SurfBankVisualTurnMultiple times it on the other, and the probe asks for
+	 * the collision count because that is the surface a player is actually standing on.
+	 */
+	void GetSurfBankSections(float YSign, int32 PlanSegments, TArray<FTraceSurfBankSection>& OutSections) const;
+
+	/**
+	 * The cross-section, in its own frame: how far OUT from the crest and how far DOWN from it the
+	 * face is at this face angle. Zero at the crest; the full run and rise at the toe. One definition,
+	 * used by the build, by the probe and by SurfBankJointReach.
+	 */
+	void SurfBankStation(float Degrees, float& OutOutward, float& OutDrop) const;
+
+	// --- THE SIDE-WALL RIDE'S ORACLE, and it is PUBLIC for the reason PlayerHeightUU() is -----------
+	//
+	// Trace.Arena.SurfBankProfile has to sample finer than the smallest feature of this structure, and
+	// it cannot know how fine that is from a second copy of the arithmetic. Every number the rig needs
+	// comes from the functions the BUILD used, so an instrument that agrees with a stale constant is
+	// not possible here. See BuildSurfBanks.
+	/**
+	 * Depth of the band's CREST off the side wall face, uu. ButtressDepth + SurfBankTopClearance; the
+	 * buttress row is the thing that decides it. Zero when the band is not being built, which is what
+	 * the cove reads to know whether to truncate itself early.
+	 */
+	float SurfBankTopDepth() const;
+
+	/**
+	 * Depth of the band's TOE off the side wall face, uu — where the surf face hands over to the
+	 * walkable cove underneath it. DERIVED, by bisection, from one requirement:
+	 *
+	 *     the band's crest lands exactly on SurfBankCrestZ(), which is the arena's 3.5x structure
+	 *     height — the same height as the surf rails this replaces.
+	 *
+	 * The toe is wherever the cove envelope has to stop for the surf arc above it to gain the remaining
+	 * height at the band's own slopes, so it moves coherently with BankHeight, BankDepth, the player's
+	 * own capsule and the movement component's live surf band. Nothing here is typed.
+	 */
+	float SurfBankToeDepth() const;
+
+	/** Radius of the circular arc the band's face is cut from, uu. Follows from the toe and the band. */
+	float SurfBankFaceRadius() const;
+
+	/**
+	 * Thickness of one face slab along its own normal, uu. DERIVED from the crest and the shallow end
+	 * of the cut so that a slab always reaches from the ride surface to under the floor — which is why
+	 * this structure carries no fill boxes at all. See SurfBankFacetThicknessMargin.
+	 */
+	float SurfBankFacetThickness() const;
+
+	/** Crest height of the band above the floor, uu — BankHeight, by construction of the toe. */
+	float SurfBankCrestZ() const;
+
+	/**
+	 * The band's face angles, and they are THE RAILS' READING of the movement component rather than a
+	 * second one: the surf band is read off the movement CDO exactly once per process, and two
+	 * structures asking separately is how one of them ends up cut to a stale band.
+	 */
+	float SurfBankMinFaceAngleDegrees() const;
+	float SurfBankMaxFaceAngleDegrees() const;
+
+
+	/**
+	 * The worst signed mismatch, in plan length, between a swept section's box (cut square to its own
+	 * sweep) and the plane where it meets the level run. The build laps and sinks the exit chain by
+	 * this at BOTH signs; the probe uses it as the FEATURE SIZE it must out-sample. One definition.
+	 */
+	float SurfBankJointReach() const;
+
+	/**
+	 * |X| where the level run ends and the exit chain begins, and |X| where the exit chain's far end
+	 * lands. The probe needs both to know where to sample finely.
+	 */
+	void SurfBankRunX(float& OutRunEndX, float& OutExitEndX) const;
+
+	/** Half the field width, uu. The ride is measured in depth off the side wall face. */
+	float SurfBankHalfWidth() const;
 
 	/**
 	 * ONE PLAYER HEIGHT, in uu, and the single source of every structure height in the arena.
@@ -1121,6 +1233,87 @@ public:
 	UPROPERTY(EditAnywhere, Category = "Trace|Layout")
 	bool bBuildSurfRails = true;
 
+	// --- THE SIDE-WALL SURF BANDS ------------------------------------------------------------------
+	//
+	// THE OWNER'S INSTRUCTION: "do NOT add new ramps in the outer lanes. Turn THE BANKS ALONG THE SIDE
+	// WALLS into the curved surf ramps." This is that. See BuildSurfBanks() for the construction and
+	// SurfBankToeDepth() for where the shape comes from.
+	//
+	// WHY THE BANK AND NOT A FIFTH RAIL. The collaborator rode the rails and said "the ramps don't work
+	// on the end, plus they're not curved they're just angled", and the second half of that is
+	// arithmetic rather than taste. A surface is surfable only between the walkable limit (44.77 deg on
+	// the shipped movement knobs) and acos(SurfMinNormalZ) (63.26): THE WHOLE BAND IS 18.5 DEGREES WIDE,
+	// and with the 2-degree margins the rails already take at both ends a face can bend at most 14.5
+	// degrees from toe to crest. No cross-section can read as "curved" inside that, whatever its radius
+	// - the sagitta of a 14.5-degree arc is 0.8% of its own chord at ANY radius, so the rails' 763 uu
+	// face and this 286 uu one are equally flat-looking as a FRACTION of themselves. Three previous
+	// passes reduced the crease BETWEEN facets from 2.76 to 1.38 degrees and never moved total
+	// curvature, because total curvature is capped by the band and they were optimising the wrong
+	// quantity.
+	//
+	// WHAT IS NOT CAPPED is curvature about a VERTICAL axis. Rotating a plane about a vertical axis
+	// leaves its normal's Z untouched, so a face may turn as far as you like IN PLAN and stay exactly
+	// as surfable as it started - a right circular cone has constant slope over its whole surface.
+	// That is where the curve in this structure comes from: the run is straight, and each end PEELS OFF
+	// THE WALL through a mitred fan of plan segments before its nose delivers the rider to the floor.
+	// The fan costs nothing in band margin (checked at build time, not asserted here) and it is the
+	// only kind of curvature this geometry can actually show.
+	//
+	// WHAT IT COSTS, STATED HERE BECAUSE IT IS A GAMEPLAY CHANGE AND NOT AN IMPLEMENTATION DETAIL:
+	//   * The bank's WALKABLE cove is truncated earlier - at SurfBankToeDepth() instead of at the 40 uu
+	//     pawn standoff - so the walkable crest drops from ~271 uu to ~70. The cove's envelope, its
+	//     three stop rules and its generator are all UNCHANGED; it simply stops sooner and the band
+	//     continues from there. Below the toe not one box moves. The perimeter is still walkable, still
+	//     tangent to the floor and still keeps bots off the wall, but the bank is no longer high ground
+	//     you can hide a standing body behind - see SurfBankCrestZ for why that price was paid and what
+	//     was measured before paying it.
+	//   * The bank's INBOARD X taper goes, so the ride runs the full length of the wall instead of
+	//     existing only near the corners. The bowl's goal-line SETBACK is untouched: the bank still
+	//     steps back from the endzone and the endzones are still flat and full width.
+	//   * The structure's total height becomes the arena's 3.5x class (616 uu), the same as the surf
+	//     rails it replaces, and it tops out on a level bench at the buttress line rather than at an
+	//     edge.
+	//
+	// Its own switch for the reason the rails' switch exists: an A/B of a movement mechanic against the
+	// geometry it runs on is worth one bool, and this one also has to be comparable against the rails.
+	//
+	// *** DEFAULTED OFF, AND IT SHIPPED THAT WAY DELIBERATELY. THIS BAND DOES NOT RIDE. ***
+	//
+	// The idea was sound and the measurements below it are real, but the thing does not work and the
+	// honest place to record that is here, next to the switch, rather than in a report nobody reads:
+	//   * IT HAS NO ENTRANCE. -TraceSurfApproachTest runs a pawn at it from the floor and scores 0 of
+	//     6 rides, four of them stopping dead, against 5 of 6 at 1272-1286 uu/s on the surf rails in
+	//     the same binary and session. The band's walkable bench sits at Z 616 and its toe 600 uu up
+	//     a terraced bank, so there is nowhere a body can get onto it.
+	//   * IT IS NOT CURVED, which was the entire point of building it. GetSurfBankSections emits one
+	//     plan-straight 31,700 uu prism plus 2 x 986 uu of turn per wall: 94.1% of the ride is a flat
+	//     plane. Player-eye frames show two dead-straight neon lines converging on a vanishing point.
+	//   * The premise it was dispatched on does not survive its own arithmetic. The strip between
+	//     where the cove stops (44.77 deg) and where the wall goes vertical (63.26 deg) really is the
+	//     surf band in ANGLE, but it is 29.9 uu of run and 49.7 uu of slope-length - a fifteenth of
+	//     the rail it was meant to replace - and all of it inside the 40 uu pawn standoff shell. The
+	//     angular coincidence is real; the space is not.
+	// Turning it on costs +124 registered primitives (523 -> 647) for geometry nobody can ride, so it
+	// stays off until somebody solves the entrance. The code and its instrument (Trace.Arena.
+	// SurfBankProfile, whose control arm caught two defects in itself) are kept because the shape work
+	// and the measurements are reusable; the DEFAULT is the claim, and the claim is "not yet".
+	UPROPERTY(EditAnywhere, Category = "Trace|Layout")
+	bool bBuildSurfBanks = false;
+
+	/**
+	 * How far the surf band's crest stands off the side wall, BEYOND the buttress row.
+	 *
+	 * NOT A TASTE NUMBER. Thirty wall buttresses stand flush against the perimeter walls and are
+	 * ButtressDepth (200 uu) deep, from Z = 0 up. A ride surface whose crest reached the wall face
+	 * would pass THROUGH every one of them - a 420 uu wide block across the ride every 2520 uu - and
+	 * moving the crest to exactly ButtressDepth would leave the buttress face and the bench face
+	 * coplanar and z-fighting over 420 x 352 uu apiece. So the crest stops this far short of the
+	 * buttress line: the buttresses stand ON the bench the band tops out on, they overhang nothing,
+	 * and no two drawn faces are coincident.
+	 */
+	UPROPERTY(EditAnywhere, Category = "Trace|Layout", meta = (ClampMin = "0.0"))
+	float SurfBankTopClearance = 4.f;
+
 	UPROPERTY(EditAnywhere, Category = "Trace|Spawns")
 	int32 StartsPerTeam = 5;
 
@@ -1315,6 +1508,14 @@ protected:
 	 * are DERIVED from the movement component's walkable limit, not typed beside it.
 	 */
 	void BuildSurfRails(bool bBuildVisuals);
+
+	/**
+	 * THE SIDE-WALL SURF BANDS. One continuous ride surface along each side wall, sitting on top of the
+	 * corner bank's own cove and topping out on a bench at the buttress line, with a mitred plan fan
+	 * and a sinking nose at each end. See the block comment on the definition; read bBuildSurfBanks
+	 * before changing any of the numbers below, because all three of them are derived rather than set.
+	 */
+	void BuildSurfBanks(bool bBuildVisuals);
 
 	/** Shallowest facet slope on a surf rail, degrees. Derived from the pawn's walkable limit. */
 	float SurfRailMinFaceAngleDegrees() const;

@@ -851,8 +851,30 @@ namespace TraceMovementSurf
 	}
 
 	/**
-	 * The rail in this pawn's own quadrant. ONE lookup, so no two arms of this file can end up
-	 * measuring different rails — and it goes through GetSurfRailProbe() rather than through any
+	 * -TraceSurfBankTest: point every arm of this file at the SIDE-WALL RIDE instead of at a rail.
+	 *
+	 * The side-wall band (ATraceArenaBuilder::BuildSurfBanks) is the structure the owner asked for in
+	 * place of the rails, and "the ramps don't work on the end, plus they're not curved they're just
+	 * angled" is a claim about a RIDE. Every arm here already knows how to measure a ride; what it
+	 * needed was to be told where the ramp is, and that is one accessor. So the rig is not duplicated:
+	 * the twelve-run ladder, the exit test, the approach test and both negative controls all run
+	 * against the band unchanged, which is the only way the two structures' numbers are comparable.
+	 *
+	 * Guarded like every other arm in this file: the switch does not survive a Shipping link.
+	 */
+	static bool SurfBankTestArm()
+	{
+#if UE_BUILD_SHIPPING
+		return false;
+#else
+		static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfBankTest"));
+		return bFromCommandLine;
+#endif
+	}
+
+	/**
+	 * The ramp in this pawn's own quadrant. ONE lookup, so no two arms of this file can end up
+	 * measuring different ramps — and it goes through the arena's own accessor rather than through any
 	 * coordinate of its own, for the reason at the top of the file.
 	 */
 	static ATraceArenaBuilder::FTraceSurfRailProbe ProbeForPawn(const UTraceCharacterMovementComponent& Movement)
@@ -874,7 +896,10 @@ namespace TraceMovementSurf
 		}
 
 		const FVector Here = Updated->GetComponentLocation();
-		return Arena->GetSurfRailProbe((Here.X >= 0.0) ? 1.f : -1.f, (Here.Y >= 0.0) ? 1.f : -1.f);
+		const float SignX = (Here.X >= 0.0) ? 1.f : -1.f;
+		const float SignY = (Here.Y >= 0.0) ? 1.f : -1.f;
+		return SurfBankTestArm() ? Arena->GetSurfBankProbe(SignX, SignY)
+			: Arena->GetSurfRailProbe(SignX, SignY);
 	}
 }
 
@@ -934,8 +959,9 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 
 	// The rail in the pawn's own quadrant, so the rig works from wherever the match spawned it.
 	const FVector Here = UpdatedComponent->GetComponentLocation();
-	const ATraceArenaBuilder::FTraceSurfRailProbe Probe =
-		Arena->GetSurfRailProbe((Here.X >= 0.0) ? 1.f : -1.f, (Here.Y >= 0.0) ? 1.f : -1.f);
+	const ATraceArenaBuilder::FTraceSurfRailProbe Probe = TraceMovementSurf::SurfBankTestArm()
+		? Arena->GetSurfBankProbe((Here.X >= 0.0) ? 1.f : -1.f, (Here.Y >= 0.0) ? 1.f : -1.f)
+		: Arena->GetSurfRailProbe((Here.X >= 0.0) ? 1.f : -1.f, (Here.Y >= 0.0) ? 1.f : -1.f);
 
 	if (!Probe.bValid)
 	{

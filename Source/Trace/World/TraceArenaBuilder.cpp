@@ -1210,6 +1210,101 @@ namespace TraceArenaConstants
 	 */
 	static constexpr float SurfRailFacetOverlap = 45.f;
 
+	// ============================================================================================
+	// THE SIDE-WALL SURF BANDS. See ATraceArenaBuilder::BuildSurfBanks and the bBuildSurfBanks block
+	// in the header. Everything with a length in it below is DERIVED at build time from the bank, the
+	// buttress row and the movement component's live surf band; what is left here is the three shape
+	// decisions that are not derivable from anything, each with the measurement that set it.
+	// ============================================================================================
+
+	/**
+	 * How much thicker than it strictly needs to be each facet slab is cut, and the reason THE BAND
+	 * NEEDS NO FILL BOXES AT ALL.
+	 *
+	 * A slab t thick along its own normal spans t / cos(theta) VERTICALLY, and cos is largest — so the
+	 * span is smallest — at the SHALLOWEST facet. So a slab whose thickness is (crest + margin) times
+	 * cos(the shallow end) reaches from ANY point of the face to under Z = 0: a vertical line dropped
+	 * anywhere on the ride stays inside that point's own slab until it is below the floor. The
+	 * cross-section is therefore SOLID out of the face slabs alone — no capsule-sized room behind the
+	 * plates, and none of the five height-banded fill boxes per section the rails need
+	 * (SurfRailFillBands), which is what makes a structure 30,000 uu long affordable at all.
+	 *
+	 * DERIVED FROM THE CREST rather than typed, and that is the whole point of this constant being a
+	 * margin instead of a thickness: the first build of this ride typed 200 uu, which was solid at a
+	 * 352 uu crest and would have opened a 324 uu room the moment the crest was raised to 616. The
+	 * build re-derives and ASSERTS the property every time (WorstSolidResidual) rather than trusting
+	 * this paragraph, because it is exactly the kind of thing a height change breaks in silence.
+	 */
+	static constexpr float SurfBankFacetThicknessMargin = 60.f;
+
+	/** Drawn plate thickness. The rails' number, for the rails' reason: it is never stood on. */
+	static constexpr float SurfBankVisualPlateThickness = 110.f;
+
+	/**
+	 * How far every section's boxes are extended past their strip at BOTH ends, along the sweep.
+	 *
+	 * This is the seam between two sections, not the seam between two facets (that is the cross-slope
+	 * overlap, which is SurfRailFacetOverlap's job and is applied here too). A box cut square to its
+	 * own sweep cannot land on the plane where two sections meet — the mismatch is the same signed
+	 * pair the nose junction has (SurfRailNoseJointReach): it OVERSHOOTS at the bottom of a strip and
+	 * FALLS SHORT at the top by the same amount. On the rails that shortfall shipped as twenty
+	 * see-through wedge notches.
+	 *
+	 * Between two LEVEL sections turning only in plan, extending BOTH boxes past the joint is safe in
+	 * both directions and it closes the notch outright, because the union of two planes that cross at
+	 * the joint is a RIDGE: past the joint each plane is UNDER the other, so neither extension can
+	 * stand proud. That property is what makes the plan fan buildable out of boxes; it is NOT true of
+	 * a section that also sinks, which is why the nose still takes the rails' lap-and-offset pair.
+	 * 90 uu is over five times the worst mismatch on the shipped geometry (16.5 uu) and it is free:
+	 * every uu of it is buried.
+	 */
+	static constexpr float SurfBankSectionLap = 90.f;
+
+	/**
+	 * THE PLAN FAN — the only curvature in this structure a player can actually see, and the answer to
+	 * "they're not curved they're just angled".
+	 *
+	 * TURN DEGREES. 45 is a quarter turn less a bit: enough that the ride visibly leaves the wall and
+	 * points across the field before the nose takes it down, and little enough that the whole end
+	 * assembly (fan + nose) still lands inside the corner bank's own 1500 uu footprint rather than out
+	 * in the playfield where the cover scatter lives.
+	 *
+	 * SEGMENTS. Three, and the number is a TRADE between two costs that pull opposite ways, both of
+	 * them measured rather than argued:
+	 *
+	 *   SPEED. Crossing a plan joint costs the component of velocity into the next plane. Two faces at
+	 *   the same slope theta whose plans differ by d have normals d * (sin^2 theta + ...) apart — 0.81 d
+	 *   at this band's mid slope — so the loss is 1 - cos(0.81 d) per joint, i.e. 2.2% at 15 degrees and
+	 *   5.0% at 22.5. Three segments cost 6.8% of speed across the whole turn; two cost 10%. Note the
+	 *   direction of the trade: MORE segments is LESS loss, because the loss goes as d^2 per joint and
+	 *   there are only 1/d of them.
+	 *
+	 *   PRIMITIVES. Every segment is a registered UBoxComponent per facet, and the arena's whole
+	 *   budget is 523 (see the census line at the end of BuildArena). Three segments an end is 12
+	 *   sections of face across the two walls; four would be 16.
+	 *
+	 * THERE IS NO RADIUS CONSTANT, and that is deliberate. The exit's plan LENGTH is already fixed by
+	 * the sink — it is exactly as long as it takes the crest to reach the floor at
+	 * SurfRailNoseRunPerRise — so a radius typed here would be a third number over-determining two.
+	 * The turn radius falls out as (chord length) / (2 sin(half a step)) and BuildSurfBanks logs it
+	 * through the one thing it decides: how far the COLLIDED turn stands above the DRAWN one.
+	 */
+	static constexpr float SurfBankTurnDegrees = 45.f;
+	static constexpr int32 SurfBankTurnSegments = 3;
+
+	/**
+	 * Drawn plan chords per collision plan chord. A MULTIPLE, so the two cut the same arc and the sign
+	 * of their disagreement is fixed: chords of a coarse cut lie closer to the turn's centre than
+	 * chords of a fine one, the centre is on the DOWNHILL side of the face, and a face anchored nearer
+	 * its own downhill side sits HIGHER. So the collided surface is above the drawn one — a player
+	 * stands slightly above the picture, never inside it — by R * (cos(fine/2) - cos(coarse/2)), which
+	 * BuildSurfBanks measures and logs rather than leaving to this paragraph.
+	 */
+	static constexpr int32 SurfBankVisualTurnMultiple = 3;
+
+	/** Emissive tint on the band's face and its bench. The rails' face number. */
+	static constexpr float SurfBankBodyEmissive = 0.014f;
+
 	/**
 	 * THE EXIT NOSE IS A SWEPT SECTION AGAIN, AND THIS TIME THE CONSTRUCTION IS RIGHT.
 	 *
@@ -1797,6 +1892,27 @@ namespace
 	 * half an arena. The command-line switch is the one that actually works for a measured run: the
 	 * arena is built from ATraceGameMode::PreInitializeComponents, earlier than any console command.
 	 */
+	/**
+	 * THE SIDE-WALL RIDE'S OWN A/B ARM, and it exists for the reason its sibling below does: "the
+	 * arena with the ride" and "the arena without it" both have to be lookable-at and rideable-in
+	 * while the movement feature is tuned against the geometry it runs on. Read ONCE when the arena is
+	 * built, so a mid-match flip cannot produce half a wall.
+	 *
+	 * Turning it off restores the corner bank EXACTLY as it was: BuildCornerBanks reads
+	 * SurfBankTopDepth(), which returns zero here, and falls back to the 40 uu standoff truncation and
+	 * its X taper. That is what makes the before arm a real before arm rather than a differently
+	 * broken one.
+	 */
+	int32 GArenaSurfBanks = 1;
+	FAutoConsoleVariableRef CVarArenaSurfBanks(
+		TEXT("Trace.Arena.SurfBanks"),
+		GArenaSurfBanks,
+		TEXT("1 (default) = turn the banks along the side walls into surf ramps (see BuildSurfBanks). "
+		     "0 = the pre-tranche bank, kept as the BEFORE arm: the cove truncates at the 40 uu pawn "
+		     "standoff again and the bowl gets its inboard taper back. Read once when the arena is "
+		     "built."),
+		ECVF_Cheat);
+
 	int32 GArenaSurfRails = 1;
 	FAutoConsoleVariableRef CVarArenaSurfRails(
 		TEXT("Trace.Arena.SurfRails"),
@@ -2794,6 +2910,19 @@ void ATraceArenaBuilder::BuildArena()
 		BuildWallFillets(bBuildVisuals);
 	}
 
+	// THE SIDE-WALL RIDE, immediately after the ground it stands on, and before anything that stands on
+	// IT — the buttress row is built from Z = 0 in BuildFlanks below and comes up through the bench this
+	// lays down. Order does not decide the geometry (every piece here is a union), but it decides the
+	// order of the log lines, and the cross-section reads cove, then band, then what sits on top.
+	//
+	// bBuildCornerBanks is a HARD prerequisite rather than a nicety: the band's toe is bisected from
+	// the corner bank's own cove envelope and it truncates that cove to meet it. With no bank there is
+	// no envelope to continue and the band would be a shelf floating over the wall fillet.
+	if (bBuildCornerBanks && bBuildSurfBanks && GArenaSurfBanks != 0 && !bBuildingSquareCorners)
+	{
+		BuildSurfBanks(bBuildVisuals);
+	}
+
 	if (bBuildInteriorLayout)
 	{
 		BuildCentreDais(bBuildVisuals);
@@ -3454,10 +3583,27 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 	}
 	else
 	{
+		// WHERE THE COVE HANDS OVER, AND WHY IT IS THE SAME GENERATOR EITHER WAY.
+		//
+		// With the side-wall ride on (BuildSurfBanks), the cove stops at the ride's TOE instead of at
+		// the 40 uu pawn standoff. That is a change of ONE ARGUMENT — MinInner — and not a change of
+		// shape: the envelope, the riser ceiling, the slope cap and the circumscribing rule are all
+		// untouched, so every box below the toe is the box that was there before, to the millimetre.
+		// The steps this drops are the ones between the toe and the wall, which are exactly the ones
+		// the ride replaces.
+		//
+		// ONE SOURCE FOR THAT NUMBER. SurfBankTopDepth() returns 0 when the band is not being built (a
+		// square-corners A/B run, the cvar arm, banks off), which falls this straight back to
+		// FilletMinInner and restores the pre-tranche bank exactly. A second copy of "where does the
+		// cove stop" is precisely how a 10 uu lip gets built between two structures that each believe
+		// they are right.
+		const float BandToe = SurfBankToeDepth();
+		const float CoveMinInner = (BandToe > 0.f) ? BandToe : TraceArenaConstants::FilletMinInner;
+
 		TraceBuildCoveProfile(Depth, Height, TraceArenaConstants::CoveCollisionRiser,
-			TraceArenaConstants::FilletMinInner, TraceArenaConstants::FilletMaxSlope, Terraces);
+			CoveMinInner, TraceArenaConstants::FilletMaxSlope, Terraces);
 		TraceBuildCoveProfile(Depth, Height, TraceArenaConstants::CoveVisualRiser,
-			TraceArenaConstants::FilletMinInner, TraceArenaConstants::FilletMaxSlope, Skin);
+			CoveMinInner, TraceArenaConstants::FilletMaxSlope, Skin);
 	}
 
 	if (Terraces.Num() == 0 || Skin.Num() == 0)
@@ -3486,6 +3632,10 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 	{
 		return FMath::Clamp((Z - TraceArenaConstants::CoveVisualRiser) / SafeHeight, 0.f, 1.f);
 	};
+
+	// Asked ONCE, from the same accessor the cove truncation above reads, so the two halves of this
+	// function cannot end up disagreeing about whether the ride exists.
+	const bool bSurfBankRide = SurfBankTopDepth() > 0.f;
 
 	// Emissive 0.012, the DAIS number, not the 0.026-0.030 the cover blocks carry - and for exactly
 	// the reason recorded on the dais: a terrace is a large UP-FACING surface, up-facing surfaces
@@ -3535,9 +3685,30 @@ void ATraceArenaBuilder::BuildCornerBanks(bool bBuildVisuals)
 			// sideline into a bank that is highest at the CORNER.
 			auto BankPiece = [&](float TopZ, float OuterDepth, FVector& OutCentre, FVector& OutSize) -> bool
 			{
+				// THE INBOARD TAPER GOES WHEN THE RIDE IS ON, and this is the one place it is decided.
+				//
+				// The taper is what made the bowl "highest at the corner, flat in the centre": terrace
+				// k starts BankInboardTaperFrac * GoalX * Alpha out from the halfway line, so the upper
+				// terraces exist only near the corners. That is incompatible with a ride surface that
+				// runs the length of the wall — the band's toe sits ON these terraces, and with the
+				// taper in place the band would be standing on air for the inboard 5,000 uu of every
+				// quadrant, or would have to present a 121 uu vertical face along the sideline at
+				// midfield to hold itself up. A wall along the sideline is the one thing the bank was
+				// built not to be (see the navmesh-less bot note at the top of this function).
+				//
+				// ONLY THE INBOARD TAPER. The GOAL-LINE SETBACK STAYS, and the first build of this
+				// dropped both — which put a 97.6 uu vertical face across the sideline at the goal
+				// line, because every terrace then ended at the same X instead of stepping back one
+				// after another. Trace.Arena.SurfBankProfile's across-travel scan measured it (it is
+				// the reason that scan exists) and SurfBankRunX now ends the ride inside the terrace
+				// that carries its toe, so the setback and the ride do not fight.
+				//
+				// What is lost is the inboard half of the bowl's silhouette — the bank no longer rises
+				// toward the corners, it is a constant berm between the goal lines. That is a real
+				// cost and it is stated in the header rather than buried here.
 				const float Alpha = BankAlpha(TopZ);
 				const float InnerY = HalfY - OuterDepth;
-				const float NearX = Inboard * Alpha;
+				const float NearX = bSurfBankRide ? 0.f : (Inboard * Alpha);
 				const float FarX = GoalX - TraceArenaConstants::BankGoalClearance - Setback * Alpha;
 
 				const float SpanX = FarX - NearX;
@@ -4804,6 +4975,96 @@ void ATraceArenaBuilder::SurfRailRunX(float& OutNearX, float& OutFarX) const
 	OutFarX = FMath::Max(OutNearX + NoseRun + 900.f, FMath::Min(OutFarX, ClampedFarX));
 }
 
+ATraceArenaBuilder::FTraceSurfRailProbe ATraceArenaBuilder::GetSurfBankProbe(float XSign, float YSign) const
+{
+	FTraceSurfRailProbe Probe;
+
+	const float TopDepth = SurfBankTopDepth();
+	const float ToeDepth = SurfBankToeDepth();
+	const float CrestZ = SurfBankCrestZ();
+	if (TopDepth <= 0.f || ToeDepth <= TopDepth + 1.f || CrestZ <= 1.f)
+	{
+		return Probe;
+	}
+
+	float RunEndX = 0.f;
+	float ExitEndX = 0.f;
+	SurfBankRunX(RunEndX, ExitEndX);
+	if (RunEndX <= 600.f)
+	{
+		return Probe;
+	}
+
+	const float SignX = (XSign < 0.f) ? -1.f : 1.f;
+	const float SignY = (YSign < 0.f) ? -1.f : 1.f;
+	const float HalfY = HalfWidth();
+	const float MinDeg = SurfBankMinFaceAngleDegrees();
+	const float MaxDeg = SurfBankMaxFaceAngleDegrees();
+
+	// TWO THIRDS UP THE ARC, the rail probe's station and for its reason: it is where a player who has
+	// just dropped off the bench lands, and it is clear of both the bench above and the cove below, so
+	// the rig is never measuring the shallowest facet in the arena and calling it surf.
+	const float EntryDeg = FMath::Lerp(MinDeg, MaxDeg, 0.667f);
+	float EntryOut = 0.f;
+	float EntryDrop = 0.f;
+	SurfBankStation(EntryDeg, EntryOut, EntryDrop);
+	const float EntryRad = FMath::DegreesToRadians(EntryDeg);
+
+	// The face descends AWAY from the wall, so the facet's outward normal leans toward the field.
+	const FVector Normal = FVector(0.f, -SignY * FMath::Sin(EntryRad), FMath::Cos(EntryRad)).GetSafeNormal();
+
+	// A SIXTH of the way along the level run from the far end, so the ride has five sixths of the run
+	// AND the whole exit chain ahead of it — this ride is 32,000 uu long and the interesting parts are
+	// the far junction and the turn, not the first second.
+	const float EntryX = -SignX * RunEndX * 0.70f;
+
+	Probe.bValid = true;
+	Probe.FaceNormal = Normal;
+	// 120 uu OFF the face along its normal, the rail probe's clearance and its reason: a capsule is 34
+	// in radius and 88 in half height, so anything closer starts the run with the pawn inside the ramp
+	// and the first thing measured is a depenetration instead of a ride.
+	Probe.FaceEntry = FVector(EntryX, SignY * (HalfY - TopDepth - EntryOut), CrestZ - EntryDrop)
+		+ Normal * 120.f;
+	Probe.RunDirection = FVector(SignX, 0.f, 0.f);
+	Probe.RunLength = RunEndX * 1.70f;
+	Probe.Height = CrestZ;
+	Probe.MinFaceAngleDegrees = MinDeg;
+	Probe.MaxFaceAngleDegrees = MaxDeg;
+
+	// THE NEGATIVE CONTROL STANDS ON THE BENCH, not on a crest: this structure tops out on level ground
+	// between the ride and the wall, and that strip is the "ordinary geometry at speed" a surf state
+	// must never be entered from. Half a buttress depth in from the crest keeps the capsule clear of
+	// the crest edge.
+	Probe.CrestStand = FVector(SignX * RunEndX * 0.5f,
+		SignY * (HalfY - TopDepth * 0.5f), CrestZ);
+
+	// THE APPROACH STARTS AT THE FOOT OF AN EXIT, because that is the only part of this ride a player
+	// on the floor can reach. The exit sinks its whole cross-section to the floor over its own length,
+	// so its far end IS a ramp coming out of the ground; standing a capsule outboard of that with room
+	// to run at it is the approach this geometry actually offers. On a rail the equivalent point was
+	// the toe of the level face, which on this structure is 120 uu up in the air.
+	{
+		TArray<FTraceSurfBankSection> Sections;
+		GetSurfBankSections(SignY, TraceArenaConstants::SurfBankTurnSegments, Sections);
+		FVector2D Foot(SignX * ExitEndX, SignY * (HalfY - ToeDepth));
+		for (const FTraceSurfBankSection& Section : Sections)
+		{
+			if (Section.Sink <= 0.f)
+			{
+				continue;
+			}
+			const FVector2D End = Section.StartTop + Section.Dir * Section.Length;
+			if (FMath::Sign(static_cast<float>(End.X)) == SignX && FMath::Abs(static_cast<float>(End.X)) > FMath::Abs(Foot.X) - 1.f)
+			{
+				Foot = End + Section.Out * ((ToeDepth - TopDepth) + 260.f);
+			}
+		}
+		Probe.ToeOnFloor = FVector(Foot.X, Foot.Y, 0.f);
+	}
+
+	return Probe;
+}
+
 ATraceArenaBuilder::FTraceSurfRailProbe ATraceArenaBuilder::GetSurfRailProbe(float XSign, float YSign) const
 {
 	FTraceSurfRailProbe Probe;
@@ -5623,7 +5884,1590 @@ void ATraceArenaBuilder::BuildSurfRails(bool bBuildVisuals)
 		NearX, FarX, JunctionX, ToeY, CrestY, BackY, CollisionBoxes, DrawnPlates);
 }
 
+
+// =================================================================================================
+// THE SIDE-WALL SURF BANDS — the owner's instruction, tranche SIDEWALL-BUILD.
+//
+// "Do NOT add new ramps in the outer lanes. Turn THE BANKS ALONG THE SIDE WALLS into the curved surf
+// ramps." One continuous ride surface along each side wall, 31,000 uu of it, sitting on the corner
+// bank's own cove and topping out on a bench at the buttress line, with a turning, sinking exit at
+// each end. The header's bBuildSurfBanks block says WHY the side walls; this says HOW.
+//
+// -------------------------------------------------------------------------------------------------
+// 1. THE SHAPE, AND THE PREMISE THAT DID NOT SURVIVE MEASUREMENT.
+//
+// The tranche was dispatched with a shape already sketched: "the strip between where the cove stops
+// and where the wall turns vertical IS, almost exactly, the surf band; continuing the cove's own curve
+// up through it turns it into the ramp, and costs nothing that is in use today." The ANGLES in that
+// are exactly right and the SIZE is not, and the difference is the whole design.
+//
+//   MEASURED, from the cove's own envelope (TraceCoveEnvelopeZ below is its closed form). On the
+//   shipped 1500 x 352 bank the envelope passes 44.77 degrees at 40.3 uu off the wall and 63.26
+//   degrees at 10.4 uu. The strip between them is 29.9 uu of run, 39.7 uu of rise, 49.7 uu of slope.
+//   On the 600 x 296 wall fillet it is 75.4 uu. The shipped surf rail's ridable face is 763 uu.
+//
+// So the literal continuation is a ribbon a fifteenth the size of the thing it is meant to replace,
+// entirely inside the 40 uu pawn standoff shell that runs the full height of every wall — i.e. inside
+// the one volume in the arena a body provably cannot enter. It is not a small ramp; it is not a ramp.
+//
+// WHY IT IS THAT SMALL, in one line: the cove is a quarter-ellipse 4.3 times wider than it is tall, so
+// all of its bend is packed into the last few tens of uu against the wall. Its slope reaches 44
+// degrees only where it has nearly run out of floor. Nothing about the surf band is wrong — the strip
+// really is the surf band — there is just barely any of it.
+//
+// WHAT REPLACES IT. The cove is kept, exactly, and TRUNCATED EARLIER: TraceBuildCoveProfile is handed
+// SurfBankToeDepth() as its MinInner instead of the 40 uu standoff, so it stops at the toe of the ride
+// surface rather than at the wall. Same generator, same envelope, same three stop rules, same boxes
+// below the toe to the millimetre. From the toe up, a CIRCULAR arc — constant curvature, so the band
+// gets room in proportion rather than the ellipse's crumb — carries the surface through the surf band
+// to a crest at the buttress line.
+//
+// AND THE TOE IS NOT TYPED. It is bisected, at every build, from one requirement: the band's crest
+// lands exactly on SurfBankCrestZ() — the arena's 3.5x structure height, the same class the surf rails
+// this replaces belong to. The toe therefore moves coherently with the player's capsule, with
+// BankDepth, with BankHeight and with the movement component's live surf band. See SurfBankToeDepth()
+// and SurfBankCrestZ(), the latter for the twelve measured rides that set that height.
+//
+// -------------------------------------------------------------------------------------------------
+// 2. WHY THE CREST STOPS AT THE BUTTRESS LINE, WHICH IS NOT A STYLE CHOICE.
+//
+// Thirty wall buttresses stand flush against the perimeter walls, ButtressDepth (200 uu) deep and
+// 420 wide, built from Z = 0. A ride surface whose crest reached the wall face would have one of them
+// standing IN it every 2520 uu — a 420 uu wide block across a 1500 uu/s ride — and a crest that
+// stopped exactly at ButtressDepth would leave the buttress face and this structure's face coplanar
+// and z-fighting. So the crest stops SurfBankTopClearance past the buttress line, the strip between it
+// and the wall is filled solid, and the buttress row stands ON that bench: nothing overhangs the ride,
+// nothing is coincident, and the flank dressing's rhythm is untouched above the bench.
+//
+// THE BENCH IS ALSO WHAT THE TOP OF THE RIDE MEETS, and that is better than what a surf face usually
+// meets. The rails end their face at a flat crest; a face that ran into a vertical wall would hold a
+// rider who drifted up it against a surface they cannot ride and cannot walk. Here the last thing
+// above the ride is level ground.
+//
+// -------------------------------------------------------------------------------------------------
+// 3. THE CURVE THE COLLABORATOR ASKED FOR, AND WHERE IT CAN COME FROM AT ALL.
+//
+// "They're not curved they're just angled." Arithmetic, not taste: the surfable band is
+// 44.77..63.26 degrees, the rails and this band both take 2 degrees of margin at each end, so a
+// cross-section can bend at most 14.5 degrees end to end. The sagitta of a 14.5-degree arc is 0.8% of
+// its own chord AT ANY RADIUS, so making the face shorter and tighter changes nothing about how curved
+// it LOOKS — this band's 286 uu face and the rails' 763 uu face are equally flat as a fraction of
+// themselves. Three passes tightened the crease BETWEEN facets and never touched this, because this
+// cannot be touched.
+//
+// WHAT IS FREE IS ROTATION ABOUT A VERTICAL AXIS. Yaw a plane and its normal's Z does not move at all,
+// so a face may turn as far in PLAN as you like and stay exactly as surfable as it started. That is
+// why a right circular cone has one slope over its whole surface. So the curve lives in the exit: each
+// end of the run PEELS OFF THE WALL through a chain of yawed sections while it sinks, and the rider
+// leaves the wall pointing across the field instead of arriving at a step.
+//
+// A STRAIGHT NOSE WOULD HAVE BEEN CHEAPER AND IT IS NOT WHAT WAS ASKED FOR. The plan turn costs
+// SurfBankTurnSegments extra sections per end and about 4.5% of speed across the whole exit (see
+// SurfBankTurnDegrees for that arithmetic); it buys the only curvature in this structure a player can
+// see, at the one place the collaborator said the rails failed.
+//
+// WHY THE LONG RUN IS STILL STRAIGHT, said plainly rather than left to be discovered: plan curvature
+// costs one section per plan facet and every section is ten registered UBoxComponents. A serpentine
+// with a visible amplitude down 31,000 uu of wall is ~180 sections a wall against an arena budget of
+// 523 primitives in total. It is not affordable in this construction and no amount of care makes it
+// so; the ends are where the budget buys the most visible turn.
+//
+// -------------------------------------------------------------------------------------------------
+// 4. THE CONSTRUCTION, WHICH IS WHERE THE RAILS' LAST THREE PASSES DIED.
+//
+// Every section is a STRAIGHT SWEEP of the cross-section along one direction, exactly as
+// BuildSurfRails' BuildFaceSection is, and for exactly its reason: sweeping a cross-section along a
+// fixed direction makes every facet's strip a PLANE bounded by two parallel joint lines, so a box fits
+// it EXACTLY provided its cross-axis extent is the PERPENDICULAR distance between those lines rather
+// than the chord length. That distinction was a ~10 uu lip on the rails' first swept nose, and the
+// width is measured here for the same reason.
+//
+// WHAT THAT BUYS, restated because it is the property the tranche demands: consecutive chords meet ON
+// the arc, the slope increases up the face, so extending any facet past a joint continues it at an
+// angle that puts it UNDER its neighbour. Facets share edges BY CONSTRUCTION, not by fitting.
+//
+// THE JOINT BETWEEN TWO SECTIONS IS THE OTHER HALF, and it is what the rails got wrong twice. A box
+// cut square to its own sweep cannot land on the plane where two sections meet: it OVERSHOOTS at the
+// bottom of a strip by as much as it FALLS SHORT at the top. Cancelling only the overshoot is what
+// shipped twenty see-through wedge notches down the rails' seam. Here:
+//
+//   BETWEEN TWO SWEPT SECTIONS (the exit chain), both are extended past the joint by
+//   SurfBankSectionLap and NEITHER extension can stand proud, because the exposed surface at such a
+//   joint is the MAXIMUM of two planes and the maximum of two linear functions is CONVEX: past the
+//   crossing each plane is strictly under the other. That is a proof, not a tolerance, and it is what
+//   makes a yawed fan buildable out of boxes at all.
+//
+//   BETWEEN THE LEVEL RUN AND THE FIRST SWEPT SECTION, the max-of-planes argument does not apply
+//   (the level run's plane is above the chain's everywhere behind the junction), so this junction
+//   takes the rails' proven pair: the chain starts BACK along its own sweep by the worst joint reach
+//   and DOWN by the sink times the total travel. The price is the rails' price — the junction steps
+//   DOWN, never up, and a drop falls away from a rider.
+//
+// SOLID, WITHOUT A SINGLE FILL BOX. The rails need five height-banded fill boxes per section to keep
+// a pawn out of the space behind the plates. This band needs none, and that is arithmetic rather than
+// luck: SurfBankFacetThickness() is DERIVED as (crest + margin) * cos(the shallow end of the cut), and
+// a slab t thick spans t / cos(theta) vertically, so a vertical line dropped from any point of the
+// face stays inside that point's own slab until it is below Z = 0 — at any crest height. The first
+// build of this typed 200 uu, which was solid at a 352 crest and would have opened a 324 uu room the
+// moment the crest was raised. BuildSurfBanks ASSERTS the property at every build instead of trusting
+// this paragraph, which is how that would have been caught even if the constant had stayed typed.
+// =================================================================================================
+namespace
+{
+	/**
+	 * Height of the cove's quarter-ellipse envelope at a given horizontal distance from the wall face.
+	 *
+	 * The CLOSED FORM of the same curve TraceBuildCoveProfile samples, inverted: that function walks
+	 * up in Z and asks how far out the envelope is; the band has to walk in from the field and ask how
+	 * HIGH it is. Written from the same two lines of that generator rather than fitted to its output,
+	 * so a change to the envelope moves both or neither:
+	 *
+	 *     StepDepth = Depth * (1 - sqrt(1 - u^2)),  u = (Height - Z) / Height
+	 *  => sqrt(1 - u^2) = 1 - d / Depth
+	 *  => Z = Height * (1 - sqrt(1 - (1 - d/Depth)^2))
+	 *
+	 * Checked at both ends: d = 0 gives Z = Height (the envelope is vertical at the wall), d = Depth
+	 * gives Z = 0 (tangent to the floor).
+	 */
+	float TraceCoveEnvelopeZ(float Depth, float Height, float DepthFromWall)
+	{
+		if (Depth <= 1.f || Height <= 1.f)
+		{
+			return 0.f;
+		}
+
+		const float Sec = FMath::Clamp(1.f - DepthFromWall / Depth, -1.f, 1.f);
+		return Height * (1.f - FMath::Sqrt(FMath::Max(0.f, 1.f - Sec * Sec)));
+	}
+}
+
+float ATraceArenaBuilder::SurfBankTopDepth() const
+{
+	// ZERO IS THE "NOT BUILT" ANSWER, and BuildCornerBanks reads exactly this to decide whether to
+	// truncate its cove early. One function, so the cove and the band can never disagree about where
+	// they hand over — two copies of that number is precisely how a 10 uu lip gets built.
+	if (!bBuildSurfBanks || !bBuildCornerBanks || bBuildingSquareCorners || GArenaSurfBanks == 0)
+	{
+		return 0.f;
+	}
+
+	return TraceArenaConstants::ButtressDepth + FMath::Max(0.f, SurfBankTopClearance);
+}
+
+float ATraceArenaBuilder::SurfBankCrestZ() const
+{
+	// THE RIDE IS A 3.5x STRUCTURE, exactly like the surf rails it replaces — SurfRailHeight() is
+	// PlayerHeightUU() * StructureHeight35x, the arena's "red outline" class, and this calls it rather
+	// than repeating the product.
+	//
+	// IT USED TO BE BankHeight (352), and that was a prettier derivation than it was a ramp. MEASURED,
+	// -TraceSurfTest -TraceSurfBankTest on the 352 build, twelve runs: the ridable face was 288 uu of
+	// arc — four capsule widths — and the strafed ladder surfed for 0.38, 0.60, 0.86 and 2.35 seconds
+	// before the rider drifted off the top onto the bench or off the bottom onto the cove, and the
+	// 2000 uu/s rung never entered the surf state at all (it fell off the face inboard and lost
+	// everything: exit 0 from a peak of 2000). A face that a rider crosses in half a second is not a
+	// ride, whatever its normals say, and every normal on it was inside the band.
+	//
+	// At 616 the same construction gives 676 uu of arc — 89% of the rails' 763, ten capsule widths —
+	// for the same reason the rails have theirs: the arc's length scales with the height it climbs.
+	//
+	// WHAT IT COSTS, and it is the largest single cost in this tranche: the cove below the toe now tops
+	// out at ~70 uu instead of ~271, so the corner bank stops being high ground you can stand behind.
+	// The bank is still walkable, still tangent to the floor, still 1500 uu deep and still keeps bots
+	// off the wall — the properties the tranche named — but "a body behind it is hidden", which
+	// BankHeight's own comment claims, is no longer true of the walkable part. Stated here rather than
+	// discovered later.
+	return SurfRailHeight();
+}
+
+float ATraceArenaBuilder::SurfBankToeDepth() const
+{
+	const float TopDepth = SurfBankTopDepth();
+
+	// TWO DIFFERENT HEIGHTS, AND CONFLATING THEM WAS A REAL DEFECT ON THIS TRANCHE.
+	//
+	//   CoveHeight is the vertical semi-axis of the quarter-ellipse the corner bank is built from —
+	//   BankHeight. It is what TraceBuildCoveProfile is handed, so it is what the terraces under the
+	//   ride actually follow.
+	//
+	//   CrestZ is how high the RIDE tops out, which since SurfBankCrestZ() became the arena's 3.5x
+	//   structure height is a completely different number.
+	//
+	// The first build after that change asked the envelope for its height at a depth using CrestZ,
+	// which is a 616-tall ellipse the arena does not contain. It solved the toe 50 uu too far in and
+	// left the ride's toe hanging 41 uu ABOVE the cove that is supposed to catch it — a drop at the
+	// bottom of the ramp, measured by the handover line of Trace.Arena.SurfBankProfile before anything
+	// else noticed. They were the same number while the crest was BankHeight, which is exactly the kind
+	// of coincidence that hides a bug until a knob moves.
+	const float Depth = HalfWidth() - BankInnerHalfWidth();
+	const float CoveHeight = FMath::Max(0.f, BankHeight);
+	const float Height = SurfBankCrestZ();
+	if (TopDepth <= 0.f || Depth <= TopDepth + 2.f || Height <= 1.f || CoveHeight <= 1.f)
+	{
+		return 0.f;
+	}
+
+	const float MinRad = FMath::DegreesToRadians(SurfBankMinFaceAngleDegrees());
+	const float MaxRad = FMath::DegreesToRadians(SurfBankMaxFaceAngleDegrees());
+	const float SinSpan = FMath::Sin(MaxRad) - FMath::Sin(MinRad);
+	const float CosSpan = FMath::Cos(MinRad) - FMath::Cos(MaxRad);
+	if (SinSpan <= UE_KINDA_SMALL_NUMBER || CosSpan <= UE_KINDA_SMALL_NUMBER)
+	{
+		return 0.f;
+	}
+
+	// An arc that rises from MinDeg to MaxDeg gains CosSpan / SinSpan of height per unit of horizontal
+	// run, whatever its radius. So the crest height of a band whose toe sits at depth d on the cove is
+	//     E(d) + (d - TopDepth) * CosSpan / SinSpan,
+	// and the toe is the d that makes that BankHeight. Monotone in d over the whole bank (the first
+	// term falls at the cove's own slope, which is under 30 degrees anywhere outboard of 110 uu, and
+	// the second rises at 1.38), so bisection is exact rather than a search.
+	const float RisePerRun = CosSpan / SinSpan;
+	auto Excess = [Depth, CoveHeight, Height, TopDepth, RisePerRun](float DepthFromWall)
+	{
+		return TraceCoveEnvelopeZ(Depth, CoveHeight, DepthFromWall) + (DepthFromWall - TopDepth) * RisePerRun
+			- Height;
+	};
+
+	float Lo = TopDepth + 1.f;
+	float Hi = Depth - 1.f;
+	if (Excess(Lo) > 0.f || Excess(Hi) < 0.f)
+	{
+		// No toe inside the bank. REFUSE rather than clamp: a clamped toe would build a band whose
+		// crest is not BankHeight, which is the one thing every number in this file is derived from.
+		return 0.f;
+	}
+
+	for (int32 Step = 0; Step < 64; ++Step)
+	{
+		const float Mid = (Lo + Hi) * 0.5f;
+		if (Excess(Mid) < 0.f)
+		{
+			Lo = Mid;
+		}
+		else
+		{
+			Hi = Mid;
+		}
+	}
+
+	return (Lo + Hi) * 0.5f;
+}
+
+float ATraceArenaBuilder::SurfBankFacetThickness() const
+{
+	// See SurfBankFacetThicknessMargin: thickness * (1 / cos theta) is the slab's VERTICAL span and the
+	// shallow end of the cut is the binding case, so this is exactly "reach from the crest to under the
+	// floor at the shallowest facet", plus a margin.
+	return (SurfBankCrestZ() + TraceArenaConstants::SurfBankFacetThicknessMargin)
+		* FMath::Cos(FMath::DegreesToRadians(SurfBankMinFaceAngleDegrees()));
+}
+
+float ATraceArenaBuilder::SurfBankFaceRadius() const
+{
+	const float TopDepth = SurfBankTopDepth();
+	const float ToeDepth = SurfBankToeDepth();
+	if (TopDepth <= 0.f || ToeDepth <= TopDepth + 1.f)
+	{
+		return 0.f;
+	}
+
+	const float MinRad = FMath::DegreesToRadians(SurfBankMinFaceAngleDegrees());
+	const float MaxRad = FMath::DegreesToRadians(SurfBankMaxFaceAngleDegrees());
+	const float SinSpan = FMath::Sin(MaxRad) - FMath::Sin(MinRad);
+	if (SinSpan <= UE_KINDA_SMALL_NUMBER)
+	{
+		return 0.f;
+	}
+
+	return (ToeDepth - TopDepth) / SinSpan;
+}
+
+float ATraceArenaBuilder::SurfBankMinFaceAngleDegrees() const
+{
+	// THE SAME READING OF THE MOVEMENT COMPONENT THE RAILS TAKE, not a second one. The band edges are
+	// read off the movement CDO exactly once per process (SurfRailMinFaceAngleDegrees caches it and
+	// logs it), and a structure that asked a second time could drift from the first the day somebody
+	// gives one of them its own margin. If this band ever needs a different margin from the rails,
+	// that is a change to SurfRailBandMarginDegrees' siblings, not to this line.
+	return SurfRailMinFaceAngleDegrees();
+}
+
+float ATraceArenaBuilder::SurfBankMaxFaceAngleDegrees() const
+{
+	return TraceSurfRailMaxFaceAngleDegrees(SurfRailMinFaceAngleDegrees());
+}
+
+float ATraceArenaBuilder::SurfBankHalfWidth() const
+{
+	return HalfWidth();
+}
+
+float ATraceArenaBuilder::SurfBankJointReach() const
+{
+	// THE SIGNED MISMATCH AT THE LEVEL/SWEPT JUNCTION, AND THE ONLY DEFINITION OF IT.
+	//
+	// A swept facet's box is cut square to its own sweep, so its near face is the plane
+	// (start + Sink * (Z - the strip's mid-chord Z)). Below the mid-chord that plane leans BACK past
+	// the section's start by this much; above it, FORWARD by the same. Cancelling only one sign is
+	// what shipped twenty see-through wedge notches on the rails; the build cancels both.
+	//
+	// The BUILD and Trace.Arena.SurfBankProfile read THIS function, and that is the load-bearing part:
+	// the instrument has to sample finer than the feature to be able to say anything about it, and a
+	// second copy of this arithmetic in the probe is exactly how "worst rise 0.0 uu" gets asserted
+	// about a feature the probe never straddles.
+	const float TopDepth = SurfBankTopDepth();
+	const float ToeDepth = SurfBankToeDepth();
+	const float Radius = SurfBankFaceRadius();
+	const float CrestZ = SurfBankCrestZ();
+	if (TopDepth <= 0.f || ToeDepth <= TopDepth + 1.f || Radius <= 1.f || CrestZ <= 1.f)
+	{
+		return 0.f;
+	}
+
+	const float MinDeg = SurfBankMinFaceAngleDegrees();
+	const float MaxDeg = SurfBankMaxFaceAngleDegrees();
+	const float MaxRad = FMath::DegreesToRadians(MaxDeg);
+	const float ExitRun = CrestZ * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	const float Sink = CrestZ / FMath::Max(1.f, ExitRun);
+	const FVector Dir = FVector(1.f, 0.f, -Sink).GetSafeNormal();
+
+	// The WORSE of the two passes. The reach scales as 1 / facet count, so the coarser pass always
+	// wins on this cut — but that is a property of this arc, not a law, and asking both is free.
+	float Worst = 0.f;
+	for (const int32 FacetCount : { SurfRailCollisionFacets(), SurfRailVisualFacets() })
+	{
+		for (int32 Facet = 0; Facet < FacetCount; ++Facet)
+		{
+			auto StationAt = [Radius, MaxRad, MinDeg, MaxDeg, FacetCount](int32 Index)
+			{
+				const float Rad = FMath::DegreesToRadians(FMath::Lerp(MinDeg, MaxDeg,
+					static_cast<float>(Index) / static_cast<float>(FMath::Max(1, FacetCount))));
+				return FVector2D(Radius * (FMath::Sin(MaxRad) - FMath::Sin(Rad)),
+					Radius * (FMath::Cos(Rad) - FMath::Cos(MaxRad)));
+			};
+
+			const FVector2D S0 = StationAt(Facet);
+			const FVector2D S1 = StationAt(Facet + 1);
+			const FVector Chord(0.f, S1.X - S0.X, S0.Y - S1.Y);
+			const FVector Across = Chord - Dir * FVector::DotProduct(Chord, Dir);
+			Worst = FMath::Max(Worst, FMath::Abs(static_cast<float>(Across.X)) * 0.5f);
+		}
+	}
+
+	return Worst;
+}
+
+void ATraceArenaBuilder::SurfBankRunX(float& OutRunEndX, float& OutExitEndX) const
+{
+	OutRunEndX = 0.f;
+	OutExitEndX = 0.f;
+
+	const float CrestZ = SurfBankCrestZ();
+	const float EndX = GoalLineX() - TraceArenaConstants::BankGoalClearance;
+	if (SurfBankTopDepth() <= 0.f || CrestZ <= 1.f || EndX <= 1.f)
+	{
+		return;
+	}
+
+	// WHERE THE RIDE HAS TO STOP, AND IT IS THE BANK THAT DECIDES IT.
+	//
+	// The corner bank steps BACK from the goal line: terrace k ends at GoalX - clearance -
+	// BankGoalSetback * Alpha(k), so the higher the terrace the sooner it stops, and the endzone stays
+	// flat and full width. The ride's TOE stands on the terrace one collision riser above the toe's own
+	// height, so the run has to end inside THAT terrace, not inside the lowest one. Getting this wrong
+	// is not subtle: the first build of this ride ended the run at the lowest terrace's X and left its
+	// last stretch of toe hanging over ground that had already stepped away.
+	float ToeOut = 0.f;
+	float ToeDrop = 0.f;
+	SurfBankStation(SurfBankMinFaceAngleDegrees(), ToeOut, ToeDrop);
+	const float ToeZ = CrestZ - ToeDrop;
+	const float SupportZ = ToeZ + TraceArenaConstants::CoveCollisionRiser;
+	const float Alpha = FMath::Clamp((SupportZ - TraceArenaConstants::CoveVisualRiser)
+		/ FMath::Max(1.f, BankHeight), 0.f, 1.f);
+	const float Setback = FMath::Min(TraceArenaConstants::BankGoalSetback,
+		FMath::Max(0.f, GoalLineX() * 0.5f));
+
+	const float ExitRun = CrestZ * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	const int32 Segments = FMath::Clamp(TraceArenaConstants::SurfBankTurnSegments, 1, 16);
+	const float StepDeg = TraceArenaConstants::SurfBankTurnDegrees / static_cast<float>(Segments);
+	const float Chord = ExitRun / static_cast<float>(Segments);
+
+	float AdvanceX = 0.f;
+	for (int32 Segment = 0; Segment < Segments; ++Segment)
+	{
+		AdvanceX += Chord * FMath::Cos(FMath::DegreesToRadians(StepDeg * (static_cast<float>(Segment) + 0.5f)));
+	}
+
+	// The EXIT may run on past the supporting terrace: it sinks its whole cross-section to the floor,
+	// its slabs reach below Z = 0 and its bench reaches the wall, so it carries itself. It still has to
+	// stay inside the bank's own outermost footprint, or it would stand in the endzone.
+	OutRunEndX = FMath::Min(EndX - Setback * Alpha, EndX - AdvanceX);
+	OutExitEndX = FMath::Min(OutRunEndX + AdvanceX, EndX);
+}
+
+void ATraceArenaBuilder::SurfBankStation(float Degrees, float& OutOutward, float& OutDrop) const
+{
+	// The face is an arc whose slope IS the parameter: d(drop)/d(outward) = tan(Degrees) at every
+	// station, which is what makes an assert on "Degrees" an assert on the surface's actual angle
+	// rather than on a number that merely correlates with it. Zero at the crest by construction.
+	const float Radius = SurfBankFaceRadius();
+	const float MaxRad = FMath::DegreesToRadians(SurfBankMaxFaceAngleDegrees());
+	const float Rad = FMath::DegreesToRadians(Degrees);
+	OutOutward = Radius * (FMath::Sin(MaxRad) - FMath::Sin(Rad));
+	OutDrop = Radius * (FMath::Cos(Rad) - FMath::Cos(MaxRad));
+}
+
+void ATraceArenaBuilder::GetSurfBankSections(float YSign, int32 PlanSegments,
+	TArray<ATraceArenaBuilder::FTraceSurfBankSection>& OutSections) const
+{
+	OutSections.Reset();
+
+	const float TopDepth = SurfBankTopDepth();
+	const float CrestZ = SurfBankCrestZ();
+	if (TopDepth <= 0.f || CrestZ <= 1.f)
+	{
+		return;
+	}
+
+	float RunEndX = 0.f;
+	float ExitEndX = 0.f;
+	SurfBankRunX(RunEndX, ExitEndX);
+	if (RunEndX <= 600.f)
+	{
+		return;
+	}
+
+	const float HalfY = HalfWidth();
+	const float TopEdgeY = YSign * (HalfY - TopDepth);
+
+	// --- 1. The level run, goal line to goal line, straight through the halfway line ---------------
+	{
+		FTraceSurfBankSection& Run = OutSections.AddDefaulted_GetRef();
+		Run.StartTop = FVector2D(-RunEndX, TopEdgeY);
+		Run.Dir = FVector2D(1.f, 0.f);
+		Run.Out = FVector2D(0.f, -YSign);
+		Run.Length = RunEndX * 2.f;
+		Run.Sink = 0.f;
+		Run.StartZ = CrestZ;
+	}
+
+	// --- 2. An exit chain off each end -------------------------------------------------------------
+	const float ExitRun = CrestZ * FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	const float ExitSink = CrestZ / FMath::Max(1.f, ExitRun);
+	const int32 Segments = FMath::Clamp(PlanSegments, 1, 256);
+	const float StepDeg = TraceArenaConstants::SurfBankTurnDegrees / static_cast<float>(Segments);
+	const float Chord = ExitRun / static_cast<float>(Segments);
+	const float StartLap = SurfBankJointReach() * FMath::Sqrt(1.f + ExitSink * ExitSink);
+	const float ZOffset = -ExitSink * 2.f * SurfBankJointReach();
+
+	for (const float XSign : { -1.f, 1.f })
+	{
+		FVector2D Position(XSign * RunEndX, TopEdgeY);
+		float TopZ = CrestZ + ZOffset;
+
+		for (int32 Segment = 0; Segment < Segments; ++Segment)
+		{
+			// The chord's bearing is the MID-angle of the arc step it spans, which is what makes
+			// consecutive chords exact rotations of one another about the turn's centre and each chord
+			// symmetric about its own bisector. That symmetry is why two neighbouring faces cross ON
+			// their shared bisector instead of somewhere that depends on how finely the turn was cut.
+			const float Bearing = FMath::DegreesToRadians(StepDeg * (static_cast<float>(Segment) + 0.5f));
+			const float CosB = FMath::Cos(Bearing);
+			const float SinB = FMath::Sin(Bearing);
+
+			FTraceSurfBankSection& Exit = OutSections.AddDefaulted_GetRef();
+			Exit.StartTop = Position;
+			Exit.Dir = FVector2D(XSign * CosB, -YSign * SinB);
+			Exit.Out = FVector2D(-XSign * SinB, -YSign * CosB);
+			Exit.Length = Chord;
+			Exit.Sink = ExitSink;
+			Exit.StartZ = TopZ;
+			// The FIRST segment meets the level run, so it takes the rails' lap-and-offset pair. Every
+			// later joint is swept-to-swept, where the exposed surface is the maximum of two planes and
+			// therefore convex, so a symmetric lap at both ends is provably buried.
+			Exit.StartLap = (Segment == 0) ? StartLap : TraceArenaConstants::SurfBankSectionLap;
+			Exit.EndLap = TraceArenaConstants::SurfBankSectionLap;
+
+			Position += Exit.Dir * Chord;
+			TopZ -= ExitSink * Chord;
+		}
+	}
+}
+
+void ATraceArenaBuilder::BuildSurfBanks(bool bBuildVisuals)
+{
+	const float TopDepth = SurfBankTopDepth();
+	const float ToeDepth = SurfBankToeDepth();
+	const float CrestZ = SurfBankCrestZ();
+	const float Radius = SurfBankFaceRadius();
+
+	const float HalfY = HalfWidth();
+	const float GoalX = GoalLineX();
+	const float EndX = GoalX - TraceArenaConstants::BankGoalClearance;
+
+	if (TopDepth <= 0.f || ToeDepth <= TopDepth + 1.f || Radius <= 1.f || CrestZ <= 1.f || EndX <= 1.f)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Arena] Surf banks skipped: the bank cannot carry one (crest depth %.1f, toe depth %.1f, "
+			     "arc radius %.1f, crest %.0f uu, bank reaches |X| %.0f)."),
+			TopDepth, ToeDepth, Radius, CrestZ, EndX);
+		return;
+	}
+
+	const float MinDeg = SurfBankMinFaceAngleDegrees();
+	const float MaxDeg = SurfBankMaxFaceAngleDegrees();
+	const float MinRad = FMath::DegreesToRadians(MinDeg);
+	const float MaxRad = FMath::DegreesToRadians(MaxDeg);
+
+	const int32 CollisionFacets = SurfRailCollisionFacets();
+	const int32 VisualFacets = SurfRailVisualFacets();
+
+	// --- THE CROSS-SECTION, in its own (out from the crest, down from the crest) frame -------------
+	//
+	// ONE definition, used by the face, by the bench, by the solidity assert and by the band-margin
+	// assert. StationOut is 0 at the crest and the face's whole run at the toe; StationDrop is 0 at the
+	// crest and the face's whole rise at the toe. d(drop)/d(out) is tan(alpha) at every station, which
+	// is what makes ALPHA the face angle rather than a parameter that merely correlates with it.
+	auto StationOut = [Radius, MaxRad](float Degrees)
+	{
+		return Radius * (FMath::Sin(MaxRad) - FMath::Sin(FMath::DegreesToRadians(Degrees)));
+	};
+	auto StationDrop = [Radius, MaxRad](float Degrees)
+	{
+		return Radius * (FMath::Cos(FMath::DegreesToRadians(Degrees)) - FMath::Cos(MaxRad));
+	};
+	auto FacetAngle = [MinDeg, MaxDeg](int32 Index, int32 Count)
+	{
+		return FMath::Lerp(MinDeg, MaxDeg, static_cast<float>(Index) / static_cast<float>(FMath::Max(1, Count)));
+	};
+
+	const float FaceRun = StationOut(MinDeg);            // horizontal, crest to toe
+	const float FaceRise = StationDrop(MinDeg);          // vertical, crest to toe
+	const float ArcLength = Radius * FMath::DegreesToRadians(MaxDeg - MinDeg);
+	const float ToeZ = CrestZ - FaceRise;
+
+	// --- WHAT A SWEPT FACET READS AS, and the assert that keeps it inside the live band ------------
+	//
+	// Sinking a cross-section at Sink tilts every facet: a plane cut at theta on a level section reads
+	// as atan(sqrt(tan^2 theta + Sink^2)) degrees from horizontal once swept. YAW DOES NOT APPEAR IN
+	// THAT EXPRESSION, and that is the whole reason the plan fan is free: rotating a plane about a
+	// vertical axis leaves its normal's Z exactly where it was. So the only thing that can push a facet
+	// out of the band is the sink, and it is checked below at both ends against the numbers the
+	// MOVEMENT COMPONENT reports, not against the numbers this file was written with.
+	auto SweptFaceDegrees = [](float Degrees, float Sink)
+	{
+		const float T = FMath::Tan(FMath::DegreesToRadians(Degrees));
+		return FMath::RadiansToDegrees(FMath::Atan(FMath::Sqrt(T * T + Sink * Sink)));
+	};
+
+	float BandLoDeg = 44.765f;
+	float BandHiDeg = 63.256f;
+	if (const UTraceCharacterMovementComponent* MoveCDO =
+		UTraceCharacterMovementComponent::StaticClass()->GetDefaultObject<UTraceCharacterMovementComponent>())
+	{
+		MoveCDO->GetSurfSlopeBandDegrees(BandLoDeg, BandHiDeg);
+	}
+
+	// --- THE EXIT: a chain of yawed sections that sinks the whole cross-section to the floor --------
+	//
+	// The sink is the RAILS' sink (SurfRailNoseRunPerRise), and taking it rather than inventing one is
+	// deliberate: that constant carries a measured derivation of where the ballistic boundary sits
+	// relative to the speeds rides actually leave at, and a second number here would need the same
+	// eleven-station capsule sweep behind it. The plan length is whatever it takes for the crest to
+	// reach the floor at that sink; the chain is cut into SurfBankTurnSegments chords of the arc that
+	// turns SurfBankTurnDegrees, so the ride leaves the wall pointing across the field.
+	const float NoseRunPerRise = FMath::Max(0.5f, TraceArenaConstants::SurfRailNoseRunPerRise);
+	const float ExitRun = CrestZ * NoseRunPerRise;
+	const float ExitSink = CrestZ / FMath::Max(1.f, ExitRun);
+	const int32 TurnSegments = FMath::Clamp(TraceArenaConstants::SurfBankTurnSegments, 1, 16);
+	const float TurnStepDeg = TraceArenaConstants::SurfBankTurnDegrees / static_cast<float>(TurnSegments);
+	const float ChordLength = ExitRun / static_cast<float>(TurnSegments);
+
+	// INSCRIBED CHORDS, NOT A TANGENT POLYGON, AND THE SIGN IS THE REASON. The drawn exit is cut at
+	// SurfBankVisualTurnMultiple times this segment count on the same arc. Chords of a coarse cut lie
+	// closer to the turn's centre than chords of a fine one, the centre is on the DOWNHILL side of the
+	// face, and a face anchored closer to its own downhill side sits HIGHER at any given plan point.
+	// So the collided surface is above the drawn one by Radius * (cos(fine/2) - cos(coarse/2)) — 5.5 uu
+	// on the shipped cut, the same SIGN and a third the size of the 15 uu foot/skin gap the cove
+	// already ships. A tangent polygon would have put that error the other way up: feet through the
+	// picture.
+	const int32 VisualTurnSegments = TurnSegments * FMath::Max(1, TraceArenaConstants::SurfBankVisualTurnMultiple);
+	const float VisualTurnStepDeg = TraceArenaConstants::SurfBankTurnDegrees / static_cast<float>(VisualTurnSegments);
+	const float TurnRadius = ChordLength
+		/ (2.f * FMath::Max(1e-4f, FMath::Sin(FMath::DegreesToRadians(TurnStepDeg * 0.5f))));
+	const float DrawnPlanGap = TurnRadius
+		* (FMath::Cos(FMath::DegreesToRadians(VisualTurnStepDeg * 0.5f))
+			- FMath::Cos(FMath::DegreesToRadians(TurnStepDeg * 0.5f)));
+
+	// --- THE LEVEL-TO-SWEPT JUNCTION: the rails' lap-and-offset pair, re-derived for this cut --------
+	//
+	// A box cut square to its own sweep has its near face on the plane (start + Sink * (Z - the strip's
+	// mid-chord Z)). Below the mid-chord that leans BACK past the start; above it, FORWARD. The rails
+	// shipped twenty see-through wedge notches by cancelling only one sign. Both are cancelled here:
+	// the chain starts back along its own sweep by the worst reach and DOWN by the sink times the total
+	// travel, so nothing of the lap stands proud of the level run. The price is a junction that steps
+	// DOWN, and a drop falls away from a rider.
+	const float JointReach = SurfBankJointReach();
+	const float ExitStartLap = JointReach * FMath::Sqrt(1.f + ExitSink * ExitSink);
+	const float ExitZOffset = -ExitSink * (JointReach + JointReach);
+
+	// Where the level run has to stop so the exit chain still lands inside the bank's own footprint.
+	// ONE definition, shared with the probe — see SurfBankRunX.
+	float RunEndX = 0.f;
+	float ExitEndX = 0.f;
+	SurfBankRunX(RunEndX, ExitEndX);
+	if (RunEndX <= 600.f)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Arena] Surf banks skipped: the exit chain does not fit inside the bank's %.0f uu half "
+			     "length (the level run would end at |X| %.0f)."), EndX, RunEndX);
+		return;
+	}
+
+	// --- Materials ---------------------------------------------------------------------------------
+	//
+	// The FACE takes the rails' face treatment for the rails' reason: it is a large INCLINED surface
+	// pointed at the key light, which is the term the palette note records as blowing platform tops out
+	// to a flat pale sheet. The bench is a level up-facing strip and takes the bank terraces' number.
+	UMaterialInstanceDynamic* FaceMID = bBuildVisuals
+		? MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.50f, 0.f,
+			TraceArenaConstants::NeonNeutral, TraceArenaConstants::SurfBankBodyEmissive)
+		: nullptr;
+	UMaterialInstanceDynamic* BenchMID = bBuildVisuals
+		? MakeSurfaceMID(TraceArenaConstants::StructureColor, 0.52f, 0.05f,
+			TraceArenaConstants::NeonNeutral, 0.012f)
+		: nullptr;
+
+	const float RunLength = RunEndX * 2.f;
+
+	int32 CollisionBoxes = 0;
+	int32 DrawnPlates = 0;
+	float WorstSweptDeg = 0.f;
+	float BestSweptDeg = 180.f;
+	float WorstSolidResidual = -1e9f;   // how far a facet slab's underside falls SHORT of the floor
+
+	// =============================================================================================
+	// ONE SECTION OF FACE — LEVEL OR SWEPT, YAWED OR NOT, FROM ONE CONSTRUCTION.
+	//
+	// Sweeping the cross-section along Dir makes every facet a PLANE: the strip is spanned by the
+	// chord and by Dir, and its two edges are the JOINT LINES, which run along Dir. In the plane's own
+	// frame those edges are parallel, so the strip is a rectangle and a box fits it EXACTLY — provided
+	// its cross-axis extent is the PERPENDICULAR distance between the joint lines and NOT the chord
+	// length. That distinction is a ~10 uu lip on this arc, so the width is MEASURED here, from the
+	// chord's component across Dir. A level section falls out of the same expression with Sink = 0.
+	//
+	// NOTHING CAN STAND PROUD ACROSS THE FACE, at any Sink and any yaw: at a fixed distance along the
+	// sweep the cross-section is the same set of chords lowered by Sink times the distance, consecutive
+	// chords meet ON the arc, and the slope increases up the face, so extending a facet either way past
+	// a joint continues it at an angle that puts it UNDER its neighbour.
+	//
+	// @param StartTop  plan point of the TOP EDGE at the section's start
+	// @param Dir2D     unit plan direction of travel
+	// @param Out2D     unit plan direction from the crest toward the toe (perpendicular to Dir2D)
+	// @param Length    plan length of the section
+	// @param Sink      rise/run at which the WHOLE cross-section sinks along Dir2D. 0 for the run.
+	// @param StartZ    Z of the top edge at the section's start
+	// @param StartLap  how far every box starts BACK along the sweep, past the section's start
+	// @param EndLap    how far every box runs ON past the section's end
+	// =============================================================================================
+	auto BuildFaceSection = [&](const FVector2D& StartTop, const FVector2D& Dir2D, const FVector2D& Out2D,
+		float Length, float Sink, float StartZ, float StartLap, float EndLap, int32 FacetCount,
+		float Overlap, float Thickness, bool bCollision, bool bDraw)
+	{
+		const FVector Dir = FVector(Dir2D.X, Dir2D.Y, -Sink).GetSafeNormal();
+		const FVector Out(Out2D.X, Out2D.Y, 0.f);
+		const FVector Origin(StartTop.X, StartTop.Y, StartZ);
+		const float SweepLength = Length * FMath::Sqrt(1.f + Sink * Sink);
+
+		for (int32 Facet = 0; Facet < FacetCount; ++Facet)
+		{
+			const float Alpha0 = FacetAngle(Facet, FacetCount);
+			const float Alpha1 = FacetAngle(Facet + 1, FacetCount);
+
+			// The two joint points, on the arc, in the section's FIRST cross-section. Index 0 is the
+			// TOE (the shallowest station) and the last index is the crest, exactly as the rails cut
+			// theirs, so "up the slope" points the same way in both structures.
+			const FVector Joint0 = Origin + Out * StationOut(Alpha0) - FVector(0.f, 0.f, StationDrop(Alpha0));
+			const FVector Joint1 = Origin + Out * StationOut(Alpha1) - FVector(0.f, 0.f, StationDrop(Alpha1));
+
+			const FVector Chord = Joint1 - Joint0;
+			const FVector Across = Chord - Dir * FVector::DotProduct(Chord, Dir);
+			const float Width = static_cast<float>(Across.Size());
+			if (Width <= 1.f)
+			{
+				continue;
+			}
+			const FVector UpSlope = Across / Width;
+
+			FVector Normal = FVector::CrossProduct(UpSlope, Dir).GetSafeNormal();
+			if (Normal.Z < 0.f)
+			{
+				Normal = -Normal;
+			}
+
+			// SYMMETRIC, and zero on the top facet at BOTH ends — the rails' rule and their reason:
+			// above the top facet is the level bench, which is shallower, so an upward extension there
+			// would stand proud; and an asymmetric overlap shifts the box along UpSlope, which on a
+			// swept section has a component along the sweep and would push the top slab back over the
+			// section behind it.
+			const float FacetOverlap = (Facet == FacetCount - 1) ? 0.f : Overlap;
+
+			const FVector Centre = (Joint0 + Joint1) * 0.5f
+				+ Dir * ((SweepLength + EndLap - StartLap) * 0.5f)
+				- Normal * (Thickness * 0.5f);
+			const FVector Size(SweepLength + StartLap + EndLap, Width + FacetOverlap * 2.f, Thickness);
+			const FRotator FacetRotation = FRotationMatrix::MakeFromZX(Normal, Dir).Rotator();
+
+			// MEASURED, not asserted in a comment: the angle this facet actually reads as, and how far
+			// its slab reaches DOWN from the highest point of the face it belongs to.
+			const float FaceDeg = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Normal.Z, -1.f, 1.f)));
+			WorstSweptDeg = FMath::Max(WorstSweptDeg, FaceDeg);
+			BestSweptDeg = FMath::Min(BestSweptDeg, FaceDeg);
+			if (bCollision)
+			{
+				// The slab's underside is Thickness / Normal.Z BELOW the strip, vertically. The strip's
+				// own highest point is Joint1.Z. Positive residual = the slab stops above the floor and
+				// the cross-section is NOT solid to the ground out of the face alone.
+				WorstSolidResidual = FMath::Max(WorstSolidResidual,
+					static_cast<float>(Joint1.Z) - Thickness / FMath::Max(0.05f, static_cast<float>(Normal.Z)));
+			}
+
+			if (bCollision)
+			{
+				AddCollisionBlockRotated(Centre, Size, TEXT("SurfBankFace"), FacetRotation);
+				++CollisionBoxes;
+			}
+			if (bDraw)
+			{
+				AddMeshBlockRotated(CubeMesh, Centre, Size, FaceMID, /*bCastShadow=*/true,
+					TEXT("SurfBankFace"), FacetRotation);
+				++DrawnPlates;
+			}
+		}
+	};
+
+	// =============================================================================================
+	// THE BENCH — one box per section, and it is three things at once.
+	//
+	//   1. It is the SOLID between the ride surface's crest and the wall. Without it the strip behind
+	//      the crest is an open slot the length of the arena.
+	//   2. It is what the top of the ride MEETS: level ground rather than a wall a drifting rider
+	//      cannot ride or walk.
+	//   3. It is what the buttress row stands on, which is why the crest stops at ButtressDepth +
+	//      SurfBankTopClearance in the first place.
+	//
+	// It is a box whose TOP FACE contains the section's top edge and is level ACROSS the section (it
+	// descends WITH the section along the sweep, so the crest and the face's top edge stay flush for
+	// the whole of a sinking section — leaving the bench level while the face sinks under it is exactly
+	// the ledge the rails' crest wedge shipped, a wall facing a rider drifting up the face).
+	//
+	// It reaches back past the wall face on purpose: overlapping solids are free, an abutment is not.
+	// =============================================================================================
+	auto BuildBenchSection = [&](const FVector2D& StartTop, const FVector2D& Dir2D, const FVector2D& Out2D,
+		float Length, float Sink, float StartZ, float StartLap, float EndLap, float YSign, bool bDraw)
+	{
+		const FVector Dir = FVector(Dir2D.X, Dir2D.Y, -Sink).GetSafeNormal();
+		const FVector Origin(StartTop.X, StartTop.Y, StartZ);
+		const float SweepLength = Length * FMath::Sqrt(1.f + Sink * Sink);
+
+		// How far back along -Out the wall face is. -Out is only square to the wall while the section
+		// still runs along it; once an exit has yawed away, the same wall is further off along that
+		// direction by 1 / cos(yaw), so the reach is DERIVED from the direction rather than assumed.
+		// Both ends of the section are asked and the deeper one wins, because a bench that stops short
+		// of the wall leaves a slot the length of a section behind the ride surface.
+		const FVector2D EndTop = StartTop + Dir2D * Length;
+		const float StartDepth = HalfY - YSign * StartTop.Y;
+		const float EndDepth = HalfY - YSign * EndTop.Y;
+		const float TowardWall = FMath::Max(0.2f, -Out2D.Y * YSign);
+		const float Reach = (FMath::Max(StartDepth, EndDepth) + WallThickness) / TowardWall;
+
+		// Thick enough that the underside is below the floor at the section's LOW end. Over-thick is
+		// free: every uu of the excess is under the floor, where nothing can see it or stand on it.
+		const float Thickness = (FMath::Max(1.f, StartZ) + 200.f) * FMath::Sqrt(1.f + Sink * Sink);
+
+		const FVector BenchNormal = FVector(Dir2D.X * Sink, Dir2D.Y * Sink, 1.f).GetSafeNormal();
+		const FRotator BenchRotation = FRotationMatrix::MakeFromZX(BenchNormal, Dir).Rotator();
+		const FVector Centre = Origin
+			+ Dir * ((SweepLength + EndLap - StartLap) * 0.5f)
+			- FVector(Out2D.X, Out2D.Y, 0.f) * (Reach * 0.5f)
+			- BenchNormal * (Thickness * 0.5f);
+		const FVector Size(SweepLength + StartLap + EndLap, Reach, Thickness);
+
+		AddCollisionBlockRotated(Centre, Size, TEXT("SurfBankBench"), BenchRotation);
+		++CollisionBoxes;
+		if (bDraw)
+		{
+			AddMeshBlockRotated(CubeMesh, Centre, Size, BenchMID, /*bCastShadow=*/true,
+				TEXT("SurfBankBench"), BenchRotation);
+			++DrawnPlates;
+		}
+	};
+
+	for (const float YSign : { -1.f, 1.f })
+	{
+		// THE SECTION LIST IS NOT BUILT HERE, and that is the point: GetSurfBankSections() is the only
+		// description of where this ride goes, and Trace.Arena.SurfBankProfile walks the same list. An
+		// instrument with its own copy of the layout is how a probe ends up certifying a surface that
+		// was never built — this file has shipped that three times.
+		TArray<FTraceSurfBankSection> Sections;
+		GetSurfBankSections(YSign, TurnSegments, Sections);
+
+		for (const FTraceSurfBankSection& Section : Sections)
+		{
+			BuildFaceSection(Section.StartTop, Section.Dir, Section.Out, Section.Length, Section.Sink,
+				Section.StartZ, Section.StartLap, Section.EndLap, CollisionFacets,
+				// NO facet overlap on a SWEPT section, in either pass — the rails' nose rule, and the
+				// reason is the joint reach: that reach is derived from the strips' own widths, and an
+				// overlap would widen every strip without the reach knowing about it. The level run,
+				// which has no joint reach at all, keeps the proven 45 uu.
+				(Section.Sink > 0.f) ? 0.f : TraceArenaConstants::SurfRailFacetOverlap,
+				SurfBankFacetThickness(), /*bCollision=*/true, /*bDraw=*/false);
+
+			BuildBenchSection(Section.StartTop, Section.Dir, Section.Out, Section.Length, Section.Sink,
+				Section.StartZ, Section.StartLap, Section.EndLap, YSign, bBuildVisuals);
+		}
+
+		if (bBuildVisuals)
+		{
+			// THE DRAWN PASS TAKES A FINER TURN, on the same arc. Chords of a coarse cut lie closer to
+			// the turn's centre than chords of a fine one and the centre is on the DOWNHILL side of the
+			// face, so the COLLIDED surface sits above the drawn one — a player stands slightly above
+			// the picture, never inside it. NO facet overlap either: at the drawn crease an overlap
+			// buries a plate under its neighbour by a fraction of a uu and z-fights across the face.
+			TArray<FTraceSurfBankSection> DrawnSections;
+			GetSurfBankSections(YSign, VisualTurnSegments, DrawnSections);
+			for (const FTraceSurfBankSection& Section : DrawnSections)
+			{
+				BuildFaceSection(Section.StartTop, Section.Dir, Section.Out, Section.Length, Section.Sink,
+					Section.StartZ, Section.StartLap, Section.EndLap, VisualFacets, /*Overlap=*/0.f,
+					TraceArenaConstants::SurfBankVisualPlateThickness, /*bCollision=*/false, /*bDraw=*/true);
+			}
+		}
+
+		if (!bBuildVisuals)
+		{
+			continue;   // Dedicated server: collision only, byte-identical to a client's.
+		}
+
+		// --- The crest line, and it is REGISTERED for the half-time repaint -----------------------
+		//
+		// The band wears the colour of the half it lies in, exactly like the bank contours under it and
+		// the flank dressing above it: a player who has lost their bearings while riding a wall can
+		// still read which way they are attacking. A line still saying "blue half" after the sides swap
+		// misinforms the player it exists to orient, so both halves' MIDs go through RegisterSideMID.
+		//
+		// ON THE BENCH, NOT ON THE FACE, and flush rather than proud. Every other neon element in this
+		// file stands off its surface by LipOut (12 uu); 12 uu on a ride surface catches a capsule at
+		// 1500 uu/s. This one sits entirely on the level ground behind the crest.
+		for (const float XSign : { -1.f, 1.f })
+		{
+			const ETraceTeam HalfTeam = (XSign < 0.f) ? ETraceTeam::Blue : ETraceTeam::Orange;
+			UMaterialInstanceDynamic* CrestLineMID = MakeNeonMID(TraceTeamColor(HalfTeam),
+				TraceArenaConstants::GlowLip);
+			RegisterSideMID(XSign, CrestLineMID, /*bNeon=*/true, TraceArenaConstants::GlowLip);
+
+			const float LineWidth = TraceArenaConstants::SurfRailCrestLineWidth;
+			AddMeshBlock(CubeMesh,
+				FVector(XSign * RunEndX * 0.5f,
+					YSign * (HalfY - TopDepth + LineWidth * 0.5f),
+					CrestZ - TraceArenaConstants::SurfRailCrestLineHeight * 0.5f),
+				FVector(RunEndX, LineWidth, TraceArenaConstants::SurfRailCrestLineHeight),
+				CrestLineMID, /*bCastShadow=*/false, TEXT("SurfBankCrestLine"));
+			++DrawnPlates;
+		}
+	}
+
+	// --- THE ASSERTS, and they are measurements rather than arguments -------------------------------
+	//
+	// Both of these are things a knob change elsewhere could break in silence, which is exactly the
+	// class of defect this structure's three predecessors shipped:
+	//
+	//   THE BAND. Every facet's angle is compared against the band the MOVEMENT COMPONENT reports at
+	//   this build, not against the numbers this file was written with. Out the shallow end the face
+	//   becomes WALKABLE (the ride stops being a ride); out the steep end it becomes a WALL (the ride
+	//   becomes a collision). The yaw contributes nothing to this and the sink contributes all of it.
+	//
+	//   THE SOLID. The face is built with no fill boxes at all, on the arithmetic that a slab
+	//   SurfBankFacetThickness thick spans thickness / Normal.Z vertically and that this face's crest
+	//   is low enough for that to reach under the floor from any station. WorstSolidResidual is the
+	//   highest any slab's underside actually lands; it must be below Z = 0 or there is a room behind
+	//   the plates, which is what "a pawn capsule must not fit inside" means.
+	const bool bInsideBand = (BestSweptDeg > BandLoDeg) && (WorstSweptDeg < BandHiDeg);
+	const bool bSolid = (WorstSolidResidual < 0.f);
+	if (!bInsideBand || !bSolid)
+	{
+		UE_LOG(LogTraceGame, Error,
+			TEXT("[Arena] SURF BANK BUILD IS UNSOUND and has been built anyway so it can be looked at: "
+			     "faces read %.2f..%.2f deg against a live surf band of %.2f..%.2f (%s), worst slab "
+			     "underside %.1f uu (%s). A face outside the band is either walkable or a wall; a slab "
+			     "that stops above the floor is a room behind the ride surface."),
+			BestSweptDeg, WorstSweptDeg, BandLoDeg, BandHiDeg,
+			bInsideBand ? TEXT("inside") : TEXT("OUTSIDE"),
+			WorstSolidResidual, bSolid ? TEXT("under the floor") : TEXT("ABOVE THE FLOOR"));
+	}
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Surf banks (the side-wall ride): 2 x (arc %.2f..%.2f deg [DERIVED from the movement surf "
+		     "band, margin %.0f deg], R=%.0f uu, %.0f uu of ridable band across the face, %.0f uu run, "
+		     "%.0f uu rise | toe %.0f uu off the wall at Z %.0f, crest %.0f uu off the wall at Z %.0f "
+		     "against BankHeight %.0f | %d COLLISION facets at %.2f deg of crease, %d DRAWN plates at "
+		     "%.2f deg, NO fill boxes: worst slab underside %.1f uu, must be under 0)."),
+		MinDeg, MaxDeg, TraceArenaConstants::SurfRailBandMarginDegrees, Radius, ArcLength, FaceRun,
+		FaceRise, ToeDepth, ToeZ, TopDepth, CrestZ, BankHeight,
+		CollisionFacets, (MaxDeg - MinDeg) / static_cast<float>(CollisionFacets),
+		VisualFacets, (MaxDeg - MinDeg) / static_cast<float>(VisualFacets),
+		WorstSolidResidual);
+
+	UE_LOG(LogTraceGame, Log,
+		TEXT("Surf banks, the ride: level run %.0f uu over |X| 0..%.0f, then TWO EXITS per wall yawing "
+		     "%.0f deg off the wall in %d chords while sinking %.2f rise/run over %.0f uu to the floor. "
+		     "%.1f uu step DOWN at the level/swept junction (joint reach %.1f uu cancelled at BOTH "
+		     "signs). Drawn at %d chords, so the collided turn stands %.1f uu ABOVE the drawn one. "
+		     "Swept faces read %.2f..%.2f deg against a LIVE band of %.2f..%.2f — margins %.2f deg "
+		     "shallow, %.2f deg steep (%s). %d collision boxes and %d drawn plates in total."),
+		RunLength, RunEndX,
+		TraceArenaConstants::SurfBankTurnDegrees, TurnSegments, ExitSink, ExitRun,
+		-ExitZOffset, JointReach, VisualTurnSegments, DrawnPlanGap,
+		BestSweptDeg, WorstSweptDeg, BandLoDeg, BandHiDeg,
+		BestSweptDeg - BandLoDeg, BandHiDeg - WorstSweptDeg,
+		(bInsideBand && bSolid) ? TEXT("SOUND") : TEXT("UNSOUND"),
+		CollisionBoxes, DrawnPlates);
+}
+
 #if !UE_BUILD_SHIPPING
+// =================================================================================================
+// THE SIDE-WALL RIDE, MEASURED — Trace.Arena.SurfBankProfile
+// =================================================================================================
+//
+// WHY A TRACE RIG AND NOT A READING OF BuildSurfBanks. Every claim that function makes is about the
+// SOLID the physics scene ends up holding, and that solid is a union of rotated boxes. The build can
+// only assert things about the boxes it asked for; a lip is what two boxes do to each other.
+//
+// AND WHY THIS RIG IS SHAPED THE WAY IT IS. Three probes have already passed on this feature family
+// while the thing they certified was broken, and each failure is answered here by construction:
+//
+//   ONE SAMPLED EVERY 10 uu ACROSS A 13.3 uu FEATURE. Nyquist. Every step below is derived from the
+//   SMALLEST feature this structure has (the level/swept junction's joint reach, 5.6 uu on the shipped
+//   cut) and takes a fraction of it, and the rig PRINTS the feature and the step side by side so a
+//   reader can check the ratio rather than trust it.
+//
+//   ONE ARGUED A SAFETY PROPERTY INSTEAD OF MEASURING IT. "The cross-section is solid" is not an
+//   argument here: §4 puts the pawn's OWN CAPSULE inside the structure at a lattice of stations and
+//   asks the physics scene whether it fits. A capsule that fits is a room.
+//
+//   ONE ONLY EVER FIRED ALONG TRAVEL and was therefore blind to a ledge that ran across it. §2 and §3
+//   are the same test on the two axes, and both are reported, always, even when one is zero.
+//
+// AND THE RIG ITSELF HAS TO BE ABLE TO FAIL. `Trace.Arena.SurfBankProfile control` runs all three
+// tests against targets whose answers are known and WRONG — the corner bank's own 19.6 uu staircase
+// for the lip tests, open air for the capsule test — and prints them. If the control arm reports
+// "clean" the rig is broken and nothing it says about the ride surface means anything.
+// =================================================================================================
+namespace
+{
+	/** One vertical probe, and it reports WHAT it hit — a step with no name is not a diagnosis. */
+	struct FTraceBankHit
+	{
+		float Z = 0.f;
+		float NormalZ = 0.f;
+		bool bHit = false;
+		FString What;
+	};
+
+	FTraceBankHit TraceBankProbeAt(UWorld* World, const FVector& Plan, float CeilingZ)
+	{
+		FTraceBankHit Out;
+		FHitResult Hit;
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceSurfBankProfile), /*bTraceComplex=*/true);
+		if (World->LineTraceSingleByChannel(Hit, FVector(Plan.X, Plan.Y, CeilingZ),
+			FVector(Plan.X, Plan.Y, -400.f), ECC_Visibility, Params))
+		{
+			Out.bHit = true;
+			Out.Z = static_cast<float>(Hit.ImpactPoint.Z);
+			Out.NormalZ = static_cast<float>(Hit.ImpactNormal.Z);
+			Out.What = Hit.Component.IsValid() ? Hit.Component->GetName() : TEXT("<none>");
+		}
+		return Out;
+	}
+
+	void TraceArenaSurfBankProfile(UWorld* World, bool bControlArm)
+	{
+		ATraceArenaBuilder* Arena = nullptr;
+		{
+			TActorIterator<ATraceArenaBuilder> It(World);
+			if (It)
+			{
+				Arena = *It;
+			}
+		}
+		if (Arena == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[SURFBANK] no arena builder in this level."));
+			return;
+		}
+
+		const float TopDepth = Arena->SurfBankTopDepth();
+		const float ToeDepth = Arena->SurfBankToeDepth();
+		const float CrestZ = Arena->SurfBankCrestZ();
+		if (TopDepth <= 0.f || ToeDepth <= TopDepth + 1.f)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[SURFBANK] this level has no side-wall ride to measure (crest depth %.1f, toe depth "
+				     "%.1f). Trace.Arena.SurfBanks must have been 1 when the arena was built."),
+				TopDepth, ToeDepth);
+			return;
+		}
+
+		const float MinDeg = Arena->SurfBankMinFaceAngleDegrees();
+		const float MaxDeg = Arena->SurfBankMaxFaceAngleDegrees();
+
+		float BandLo = 44.765f;
+		float BandHi = 63.256f;
+		if (const UTraceCharacterMovementComponent* MoveCDO =
+			UTraceCharacterMovementComponent::StaticClass()->GetDefaultObject<UTraceCharacterMovementComponent>())
+		{
+			MoveCDO->GetSurfSlopeBandDegrees(BandLo, BandHi);
+		}
+		const float WalkableNz = FMath::Cos(FMath::DegreesToRadians(BandLo));   // at or above = WALKABLE
+		const float WallNz = FMath::Cos(FMath::DegreesToRadians(BandHi));       // at or below = WALL
+
+		// THE STEPS, DERIVED FROM THE SMALLEST FEATURE THIS STRUCTURE HAS rather than typed. The
+		// junction's joint reach is the finest thing in it; a probe that cannot straddle it several
+		// times cannot say anything about it, and that is exactly how a 13.3 uu feature survived a
+		// probe sampling every 10 uu. Printed beside the feature so the ratio is checkable.
+		const float Feature = FMath::Max(1.f, Arena->SurfBankJointReach());
+		const float AcrossStep = FMath::Max(0.5f, Feature / 6.f);
+		const float AlongStepEnd = FMath::Max(0.5f, Feature / 6.f);
+		const float AlongStepRun = 40.f;
+
+		// The face angles this rig samples the surface at, and they stop MarginDeg short of the built
+		// arc at both ends on purpose: the very edges of the face are where it hands over to the bench
+		// above and the walkable cove below, and a sample that lands on the neighbour is not a
+		// statement about the ride. The handover itself is measured separately, in §3.
+		constexpr float EdgeMarginDeg = 0.6f;
+
+		// HOW CLOSE A SAMPLE HAS TO BE TO THE IDEAL FACE TO COUNT AS BEING ON IT. The built face is a
+		// fan of chords on the arc and stands at most R * (1 - cos(half a crease)) = 0.09 uu above it,
+		// so 3 uu is thirty times the real error and still tight enough to REJECT the corner bank's
+		// top tread, which buries the bottom of the face by 8.3 uu. The first version of this rig used
+		// 12 uu, swallowed that tread, and duly reported the ride as "walkable" — a tolerance loose
+		// enough to include the neighbouring surface is a tolerance that measures the wrong thing.
+		constexpr float OnFaceTolerance = 3.f;
+		const float SampleLoDeg = MinDeg + EdgeMarginDeg;
+		const float SampleHiDeg = MaxDeg - EdgeMarginDeg;
+
+		UE_LOG(LogTraceGame, Display, TEXT("================================================================================"));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFBANK] %s arm. Face arc %.2f..%.2f deg (sampled %.2f..%.2f), crest depth %.1f at "
+			     "Z %.0f, toe depth %.1f. Live surf band %.2f..%.2f deg (normal Z %.4f..%.4f). Smallest "
+			     "feature %.2f uu; stepping %.2f uu across travel and %.2f uu along it through the ends "
+			     "(%.0f uu down the prism) = %.1f samples per feature."),
+			bControlArm ? TEXT("CONTROL (known-bad targets)") : TEXT("RIDE"),
+			MinDeg, MaxDeg, SampleLoDeg, SampleHiDeg, TopDepth, CrestZ, ToeDepth,
+			BandLo, BandHi, WallNz, WalkableNz, Feature, AcrossStep, AlongStepEnd, AlongStepRun,
+			Feature / AcrossStep);
+
+		double NzSum = 0.0;
+		int32 NzCount = 0;
+		float NzMin = 2.f;
+		float NzMax = -2.f;
+		FVector WorstSteepAt = FVector::ZeroVector;
+		FVector WorstShallowAt = FVector::ZeroVector;
+		FString WorstSteepWhat;
+		FString WorstShallowWhat;
+		int32 WalkableSamples = 0;
+		int32 WallSamples = 0;
+		int32 Misses = 0;
+		int32 BuriedByDesign = 0;   // the ideal face is under the floor: the exit chain, doing its job
+		int32 Covered = 0;          // the ideal face is above ground but something else is exposed
+		int32 Adrift = 0;           // the ride's own primitive is there, in the wrong place
+		float WorstAdrift = 0.f;
+		FVector WorstAdriftAt = FVector::ZeroVector;
+		FString WorstAdriftWhat;
+		FString WorstCoveredBy;
+		FVector WorstCoveredAt = FVector::ZeroVector;
+
+		float WorstRiseAlong = 0.f;
+		FVector WorstRiseAlongAt = FVector::ZeroVector;
+		FString WorstRiseAlongWhat;
+		float WorstRiseAcross = 0.f;
+		FVector WorstRiseAcrossAt = FVector::ZeroVector;
+		FString WorstRiseAcrossWhat;
+		float HandoverZ = 1.0e9f;
+		bool HandoverSeen = false;
+		float WorstRiseAtJunction = 0.f;
+		FVector WorstRiseAtJunctionAt = FVector::ZeroVector;
+
+		// The CONTROL arm scans the same code the other way up the corner bank's own staircase, whose
+		// risers are CoveCollisionRiser (19.6 uu) by design. If it comes back clean, §3 is blind and
+		// the RIDE arm's "no lip" means nothing. The first control run this rig ever did DID come back
+		// clean, because a staircase descends outboard and §3 was only looking outboard — the control
+		// caught the probe, which is the entire reason it exists.
+		const float AcrossSign = bControlArm ? -1.f : 1.f;
+
+		for (const float YSign : { -1.f, 1.f })
+		{
+			TArray<ATraceArenaBuilder::FTraceSurfBankSection> Sections;
+			Arena->GetSurfBankSections(YSign, TraceArenaConstants::SurfBankTurnSegments, Sections);
+			if (Sections.Num() == 0)
+			{
+				continue;
+			}
+
+			for (const ATraceArenaBuilder::FTraceSurfBankSection& Section : Sections)
+			{
+				const bool bPrism = (Section.Sink <= 0.f);
+				const float AlongStep = bPrism ? AlongStepRun : AlongStepEnd;
+
+				// §1 and §2: walk ALONG the section at a set of fixed face angles.
+				for (float Deg = SampleLoDeg; Deg <= SampleHiDeg; Deg += 1.0f)
+				{
+					float Outward = 0.f;
+					float Drop = 0.f;
+					Arena->SurfBankStation(Deg, Outward, Drop);
+
+					float PrevZ = 0.f;
+					bool bHavePrev = false;
+					// The prism is 32,000 uu long and cannot vary along itself; its ENDS are where every
+					// junction is, so they are walked at the fine step whatever section they belong to.
+					for (float Along = 0.f; Along <= Section.Length; Along += AlongStep)
+					{
+						const float Fine = FMath::Min(Along, Section.Length - Along);
+						if (bPrism && Fine > 300.f && FMath::Fmod(Along, AlongStepRun) > 0.5f)
+						{
+							continue;
+						}
+						const FVector2D Plan = Section.StartTop + Section.Dir * Along + Section.Out * Outward;
+						const float IdealZ = Section.StartZ - Section.Sink * Along - Drop;
+						const FTraceBankHit Hit = TraceBankProbeAt(World, FVector(Plan.X, Plan.Y, 0.f),
+							CrestZ + 900.f);
+						if (!Hit.bHit)
+						{
+							++Misses;
+							bHavePrev = false;
+							continue;
+						}
+
+						// IS THIS THE RIDE SURFACE AT ALL? Asked in two independent ways, and NEVER by
+						// "is the normal in the band" — that would be circular and would exclude exactly
+						// the defect it is looking for. The sample has to be where the ideal face is AND
+						// on one of the ride's own primitives. The three ways it can fail are counted
+						// separately, because they mean completely different things:
+						//
+						//   BURIED BY DESIGN - the ideal face is below the floor. That is the exit chain
+						//   sinking, and it is what the exit is for.
+						//
+						//   COVERED - the ideal face is above ground but something else is the exposed
+						//   surface there. At the bottom of the run that is the corner bank's top tread
+						//   taking over, which is the handover §1b measures. Anywhere else it would be a
+						//   structure standing IN the ride, which is what the buttress row would have
+						//   been if the crest had reached the wall.
+						//
+						//   ADRIFT - the ride's own primitive is there but not where it should be. That
+						//   is the only one of the three that is a construction defect, and it is the
+						//   one a looser tolerance would have hidden.
+						// IS THIS A PIECE OF THE RIDE'S FACE? Asked of the PRIMITIVE, because that is the
+						// only question with a definite answer: this box was built by BuildFaceSection
+						// or it was not. NEVER asked as "is the normal in the band" — that is circular
+						// and would drop exactly the samples this test exists to find.
+						//
+						// The geometric comparison against the ideal face is kept, but as a SEPARATE
+						// statistic (ADRIFT), because near a section joint the exposed surface is the
+						// higher of two planes and "the ideal for the section I indexed" is not the
+						// surface a player stands on. An earlier version of this rig used that
+						// comparison as the filter, and it silently dropped 1,364 samples of real ride
+						// surface — a filter that removes the surface it is meant to measure.
+						const bool bOwnFace = Hit.What.StartsWith(TEXT("SurfBankFace"));
+						if (!bOwnFace)
+						{
+							if (IdealZ < 2.f || Hit.Z >= IdealZ - OnFaceTolerance)
+							{
+								// The ride's face is under the floor or under the cove here: the exits,
+								// sinking, which is what they are for.
+								++BuriedByDesign;
+							}
+							else
+							{
+								// Something LOWER than the ride's own face is exposed where the face
+								// should be. The face is MISSING: a hole.
+								++Covered;
+								WorstCoveredBy = Hit.What;
+								WorstCoveredAt = FVector(Plan.X, Plan.Y, Hit.Z);
+							}
+							bHavePrev = false;
+							continue;
+						}
+						if (FMath::Abs(Hit.Z - IdealZ) > WorstAdrift)
+						{
+							WorstAdrift = FMath::Abs(Hit.Z - IdealZ);
+							WorstAdriftAt = FVector(Plan.X, Plan.Y, Hit.Z);
+							WorstAdriftWhat = Hit.What;
+						}
+						if (FMath::Abs(Hit.Z - IdealZ) > OnFaceTolerance)
+						{
+							++Adrift;
+						}
+
+						NzSum += Hit.NormalZ;
+						++NzCount;
+						if (Hit.NormalZ < NzMin)
+						{
+							NzMin = Hit.NormalZ;
+							WorstSteepAt = FVector(Plan.X, Plan.Y, Hit.Z);
+							WorstSteepWhat = Hit.What;
+						}
+						if (Hit.NormalZ > NzMax)
+						{
+							NzMax = Hit.NormalZ;
+							WorstShallowAt = FVector(Plan.X, Plan.Y, Hit.Z);
+							WorstShallowWhat = Hit.What;
+						}
+						if (Hit.NormalZ >= WalkableNz) { ++WalkableSamples; }
+						if (Hit.NormalZ <= WallNz) { ++WallSamples; }
+
+						if (bHavePrev)
+						{
+							// ALONG TRAVEL. The ride is level on the prism and descends on the exits, so
+							// the honest defect is a RISE relative to what the section is doing: a step
+							// UP in the direction of travel is a wall facing a rider.
+							const float Expected = -Section.Sink * AlongStep;
+							const float Rise = (Hit.Z - PrevZ) - Expected;
+							if (Rise > WorstRiseAlong)
+							{
+								WorstRiseAlong = Rise;
+								WorstRiseAlongAt = FVector(Plan.X, Plan.Y, Hit.Z);
+								WorstRiseAlongWhat = Hit.What;
+							}
+						}
+						PrevZ = Hit.Z;
+						bHavePrev = true;
+					}
+				}
+
+				// §3: walk ACROSS travel, down the face, at a set of stations along the section. This
+				// is the axis every previous probe on this feature family was blind to.
+				const int32 Lanes = bPrism ? 9 : 6;
+				for (int32 Lane = 0; Lane <= Lanes; ++Lane)
+				{
+					const float Along = Section.Length * static_cast<float>(Lane) / static_cast<float>(Lanes);
+					const bool bJunctionLane = (Lane == 0) || (Lane == Lanes);
+					float PrevZ = 0.f;
+					bool bHavePrev = false;
+					// Sampled past BOTH edges of the face on purpose: the handover to the bench above and
+					// to the walkable cove below are exactly where a lip would be, and a scan that stops
+					// at the face's own edges cannot see either of them.
+					bool bLeftTheRide = false;
+					for (float Outward = -40.f; Outward <= (ToeDepth - TopDepth) + 120.f; Outward += AcrossStep)
+					{
+						const FVector2D Plan = Section.StartTop + Section.Dir * Along
+							+ Section.Out * (AcrossSign * Outward);
+						const FTraceBankHit Hit = TraceBankProbeAt(World, FVector(Plan.X, Plan.Y, 0.f),
+							CrestZ + 900.f);
+						if (!Hit.bHit)
+						{
+							bHavePrev = false;
+							continue;
+						}
+						if (bHavePrev)
+						{
+							const float Rise = Hit.Z - PrevZ;   // positive = the ground rose going out
+							// A lane at Along = 0 or Along = Length sits ON a junction plane, and because
+							// Out is yawed the scan drifts ACROSS that plane as it goes. What it then
+							// measures is the junction's own step (7 uu here, priced and logged by the
+							// build) seen sideways, not a defect of the face. Both are reported, apart,
+							// because merging them is how a real face defect would get explained away as
+							// "that's just the junction".
+							if (bJunctionLane)
+							{
+								if (Rise > WorstRiseAtJunction)
+								{
+									WorstRiseAtJunction = Rise;
+									WorstRiseAtJunctionAt = FVector(Plan.X, Plan.Y, Hit.Z);
+								}
+							}
+							else if (Rise > WorstRiseAcross)
+							{
+								WorstRiseAcross = Rise;
+								WorstRiseAcrossAt = FVector(Plan.X, Plan.Y, Hit.Z);
+								WorstRiseAcrossWhat = Hit.What;
+							}
+						}
+						PrevZ = Hit.Z;
+						bHavePrev = true;
+
+						// WHERE THE RIDE HANDS OVER, MEASURED. Below the toe the exposed surface stops
+						// being the face and becomes the corner bank's top tread; that handover is
+						// exactly where a lip would live, so the scan takes the rise ACROSS it (above)
+						// and then stops. Carrying on would walk off the bank's own goal-line step and
+						// report ITS height as a lip on the ride, which is what the first run of this
+						// rig did — a 97.6 uu "lip" that was really the bank ending at the goal line.
+						if (bLeftTheRide)
+						{
+							break;
+						}
+						if (Outward > 0.f && Hit.NormalZ >= WalkableNz)
+						{
+							// Only meaningful on the LEVEL RUN: on the exits the whole cross-section has
+							// sunk, so "the first walkable thing below the face" is the floor, not a
+							// handover, and averaging the two would report a handover 100 uu below the
+							// toe — which is what the first run of this rig did.
+							if (bPrism)
+							{
+								HandoverZ = FMath::Min(HandoverZ, Hit.Z);
+								HandoverSeen = true;
+							}
+							bLeftTheRide = true;
+						}
+					}
+				}
+			}
+		}
+
+		// ------------------------------------------------------------------------------------------
+		// §2b  THE TWO JUNCTIONS, CROSSED IN BOTH DIRECTIONS.
+		// ------------------------------------------------------------------------------------------
+		// §1's along-travel scan walks WITHIN a section and therefore cannot see the one discontinuity
+		// this structure has by construction: the step where the level run hands over to the sinking
+		// exit. This walks straight through it, at every face angle, at a step finer than the joint
+		// reach, and reports the signed height change in both directions of travel.
+		//
+		// AND IT IS THE RIG'S OWN FALSIFICATION FOR THE ALONG-TRAVEL AXIS. The step is a known size —
+		// the build derives and logs it — so a scan that reports zero here is a scan that cannot see a
+		// step at all, whatever it says about the rest of the ride.
+		float WorstJunctionDrop = 0.f;     // outbound: run -> exit. Falls away from a rider.
+		float WorstJunctionRise = 0.f;     // inbound: exit -> run. Faces a rider.
+		FVector WorstJunctionRiseAt = FVector::ZeroVector;
+		for (const float YSign : { -1.f, 1.f })
+		{
+			TArray<ATraceArenaBuilder::FTraceSurfBankSection> Sections;
+			Arena->GetSurfBankSections(YSign, TraceArenaConstants::SurfBankTurnSegments, Sections);
+			if (Sections.Num() < 2)
+			{
+				continue;
+			}
+			const ATraceArenaBuilder::FTraceSurfBankSection& Run = Sections[0];
+
+			for (int32 Index = 1; Index < Sections.Num(); ++Index)
+			{
+				const ATraceArenaBuilder::FTraceSurfBankSection& Exit = Sections[Index];
+				// The first chord of each chain is the only one that meets the level run.
+				const bool bMeetsRun = FMath::IsNearlyEqual(Exit.StartLap, Arena->SurfBankJointReach()
+					* FMath::Sqrt(1.f + Exit.Sink * Exit.Sink), 0.01f);
+				if (!bMeetsRun)
+				{
+					continue;
+				}
+
+				for (float Deg = SampleLoDeg; Deg <= SampleHiDeg; Deg += 1.0f)
+				{
+					float Outward = 0.f;
+					float Drop = 0.f;
+					Arena->SurfBankStation(Deg, Outward, Drop);
+
+					// Which way along the RUN does this junction lie? The exit's start is at one end of
+					// the run, so compare the two.
+					const float ToJunctionAlong = FVector2D::DotProduct(Exit.StartTop - Run.StartTop, Run.Dir);
+
+					float PrevZ = 0.f;
+					bool bHavePrev = false;
+					for (float Offset = -80.f; Offset <= 80.f; Offset += 0.4f)
+					{
+						// ONE STRAIGHT LINE, IN THE RUN'S FRAME, ON BOTH SIDES. The first version of this
+						// switched to the exit's frame past the junction, and because the exit is yawed
+						// 7.5 degrees the sample point jumped sideways by up to 22 uu at the toe — on a
+						// 55-degree face that is 30 uu of height, and the rig duly reported an 18 uu
+						// "step" that no rider could meet. A rider goes STRAIGHT through a junction; so
+						// does this scan, and the yaw then shows up as the face falling away, which is
+						// what it actually does.
+						const FVector2D Plan = Run.StartTop + Run.Dir * (ToJunctionAlong + Offset)
+							+ Run.Out * Outward;
+						const FTraceBankHit Hit = TraceBankProbeAt(World, FVector(Plan.X, Plan.Y, 0.f),
+							CrestZ + 900.f);
+						if (!Hit.bHit || !Hit.What.StartsWith(TEXT("SurfBank")))
+						{
+							bHavePrev = false;
+							continue;
+						}
+						if (bHavePrev)
+						{
+							const float Delta = Hit.Z - PrevZ;
+							if (Delta < 0.f)
+							{
+								WorstJunctionDrop = FMath::Max(WorstJunctionDrop, -Delta);
+							}
+							else if (Delta > WorstJunctionRise)
+							{
+								// A rise crossing the junction OUTBOUND would be a wall facing a rider
+								// leaving the run. Crossed INBOUND the same feature is the drop below,
+								// with its sign flipped — both are printed so neither can be quoted
+								// without the other.
+								WorstJunctionRise = Delta;
+								WorstJunctionRiseAt = FVector(Plan.X, Plan.Y, Hit.Z);
+							}
+						}
+						PrevZ = Hit.Z;
+						bHavePrev = true;
+					}
+				}
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFBANK] S2b JUNCTIONS, walked through at 0.40 uu (the joint reach is %.2f uu): "
+			     "crossing OUTBOUND, run to exit, the surface DROPS at most %.2f uu — that falls away "
+			     "from a rider and can only release a ride. Crossing INBOUND it RISES the same %.2f uu at "
+			     "%s, which is what a rider entering the ride up an exit meets. Both are the sunk "
+			     "cross-section the build logs; a zero here would mean this scan cannot see a step."),
+			Arena->SurfBankJointReach(), WorstJunctionDrop, WorstJunctionRise,
+			*WorstJunctionRiseAt.ToCompactString());
+
+		// ------------------------------------------------------------------------------------------
+		// §4  SOLID, ASKED OF THE PHYSICS SCENE WITH THE PAWN'S OWN CAPSULE.
+		// ------------------------------------------------------------------------------------------
+		// A lattice of capsule centres strictly INSIDE the structure: under the face by more than a
+		// capsule, above the floor by more than a capsule, between the crest and the toe in depth.
+		// Every one must overlap something. One that does not is a room a player fits in, which is what
+		// the rails' hollow interior was.
+		//
+		// The control arm puts the identical capsule in OPEN AIR over the middle of the field, where
+		// the honest answer is "it fits". If that comes back solid the test is measuring nothing.
+		const float PawnRadius = TraceArenaConstants::PawnCapsuleRadius;
+		const float PawnHalf = FMath::Max(PawnRadius + 1.f, Arena->PlayerHeightUU() * 0.5f);
+		const FCollisionShape Pawn = FCollisionShape::MakeCapsule(PawnRadius, PawnHalf);
+		FCollisionQueryParams SolidParams(SCENE_QUERY_STAT(TraceSurfBankSolid), /*bTraceComplex=*/true);
+
+		int32 CapsuleStations = 0;
+		int32 CapsuleFits = 0;
+		FVector FirstFitAt = FVector::ZeroVector;
+		for (const float YSign : { -1.f, 1.f })
+		{
+			TArray<ATraceArenaBuilder::FTraceSurfBankSection> Sections;
+			Arena->GetSurfBankSections(YSign, TraceArenaConstants::SurfBankTurnSegments, Sections);
+			for (const ATraceArenaBuilder::FTraceSurfBankSection& Section : Sections)
+			{
+				for (float Along = 40.f; Along <= Section.Length - 40.f; Along += 313.f)
+				{
+					for (float Deg = MinDeg; Deg <= MaxDeg; Deg += 1.5f)
+					{
+						float Outward = 0.f;
+						float Drop = 0.f;
+						Arena->SurfBankStation(Deg, Outward, Drop);
+						const FVector2D Plan = Section.StartTop + Section.Dir * Along + Section.Out * Outward;
+						const float FaceZ = Section.StartZ - Section.Sink * Along - Drop;
+
+						// Strictly inside: the top of the capsule must clear the face, its bottom the
+						// floor. Anything else is testing open air or the ground and would pass for free.
+						for (float Z = PawnHalf + 2.f; Z <= FaceZ - PawnHalf - 2.f; Z += 14.f)
+						{
+							++CapsuleStations;
+							const FVector Centre = bControlArm
+								? FVector(Plan.X, YSign * 1200.f, Z + 500.f)
+								: FVector(Plan.X, Plan.Y, Z);
+							if (!World->OverlapBlockingTestByChannel(Centre, FQuat::Identity, ECC_Pawn,
+								Pawn, SolidParams))
+							{
+								if (CapsuleFits == 0) { FirstFitAt = Centre; }
+								++CapsuleFits;
+							}
+						}
+					}
+				}
+			}
+		}
+
+		const float MeanNz = (NzCount > 0) ? static_cast<float>(NzSum / NzCount) : 0.f;
+		const float SteepDeg = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(NzMin, -1.f, 1.f)));
+		const float ShallowDeg = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(NzMax, -1.f, 1.f)));
+		const float MeanDeg = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(MeanNz, -1.f, 1.f)));
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFBANK] S1 normal Z over %d samples ON THE FACE: min %.4f (%.2f deg, steepest, at %s "
+			     "on '%s'), max %.4f (%.2f deg, shallowest, at %s on '%s'), mean %.4f (%.2f deg). MARGIN "
+			     "to the walkable edge %.2f deg, to the wall edge %.2f deg. %d samples walkable, %d wall. "
+			     "%d stations had NO ride face where one was expected, worst ADRIFT from the ideal arc "
+			     "%.2f uu, %d traces hit nothing."),
+			NzCount, NzMin, SteepDeg, *WorstSteepAt.ToCompactString(), *WorstSteepWhat,
+			NzMax, ShallowDeg, *WorstShallowAt.ToCompactString(), *WorstShallowWhat,
+			MeanNz, MeanDeg, ShallowDeg - BandLo, BandHi - SteepDeg,
+			WalkableSamples, WallSamples, Covered, WorstAdrift, Misses);
+
+		float ToeOutward = 0.f;
+		float ToeDrop = 0.f;
+		Arena->SurfBankStation(MinDeg, ToeOutward, ToeDrop);
+		const float BuiltToeZ = CrestZ - ToeDrop;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFBANK] S1b HANDOVER: scanning down the face, the first WALKABLE surface appears at "
+			     "Z %.1f (%s). The built arc's own toe is at Z %.1f, so the bottom %.1f uu of it is BURIED "
+			     "under the corner bank's top tread. That is the ride ending ON walkable ground instead of "
+			     "at an edge; it costs that much ride surface and it makes the effective shallow end "
+			     "steeper — i.e. further inside the band — than the cut."),
+			HandoverSeen ? HandoverZ : -1.f, HandoverSeen ? TEXT("found") : TEXT("NOT FOUND - suspicious"),
+			BuiltToeZ, HandoverSeen ? (HandoverZ - BuiltToeZ) : 0.f);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFBANK] S1c BOOKKEEPING: %d stations BURIED (the exits sinking under the cove and "
+			     "under the floor, which is what they are for), %d stations where the ride's face is "
+			     "MISSING and something LOWER is exposed - '%s' at %s, a hole if it is not zero - and %d "
+			     "of the ride's own samples ADRIFT, worst %.2f uu at %s on '%s'."),
+			BuriedByDesign, Covered, WorstCoveredBy.IsEmpty() ? TEXT("-") : *WorstCoveredBy,
+			*WorstCoveredAt.ToCompactString(), Adrift, WorstAdrift,
+			*WorstAdriftAt.ToCompactString(), WorstAdriftWhat.IsEmpty() ? TEXT("-") : *WorstAdriftWhat);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFBANK] S2 ALONG travel: worst RISE against the section's own descent %.2f uu at %s "
+			     "on '%s'. S3 ACROSS travel (%s): worst RISE on the FACE %.2f uu at %s on '%s'; worst rise "
+			     "at a SECTION JUNCTION %.2f uu at %s (that is the level/swept step, seen sideways)."),
+			WorstRiseAlong, *WorstRiseAlongAt.ToCompactString(), *WorstRiseAlongWhat,
+			bControlArm ? TEXT("scanned INBOARD, up the corner bank's staircase") : TEXT("scanned outboard, down the face"),
+			WorstRiseAcross, *WorstRiseAcrossAt.ToCompactString(), *WorstRiseAcrossWhat,
+			WorstRiseAtJunction, *WorstRiseAtJunctionAt.ToCompactString());
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SURFBANK] S4 SOLID: the pawn's own capsule (r %.0f, half %.0f) at %d stations strictly "
+			     "inside the structure; %d of them FIT (first at %s). Anything but zero is a room."),
+			PawnRadius, PawnHalf, CapsuleStations, CapsuleFits, *FirstFitAt.ToCompactString());
+
+		if (bControlArm)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SURFBANK] CONTROL VERDICT: S3 was pointed INBOARD, up the corner bank's own %.0f uu "
+				     "staircase, and S4 at open air 500 uu above the floor. It MUST report an across-travel "
+				     "rise near one riser and a capsule that fits at nearly every station. A clean control "
+				     "means the rig is blind and the RIDE arm's verdict is worth nothing."),
+				TraceArenaConstants::CoveCollisionRiser);
+		}
+		else
+		{
+			const bool bBandOk = (NzCount > 0) && (WalkableSamples == 0) && (WallSamples == 0);
+			const bool bLipOk = (WorstRiseAcross <= 1.0f) && (WorstRiseAlong <= 1.0f);
+			const bool bSolidOk = (CapsuleFits == 0);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SURFBANK] VERDICT: band %s, lips %s (along %.2f / across %.2f uu), solid %s."),
+				bBandOk ? TEXT("PASS") : TEXT("FAIL"), bLipOk ? TEXT("PASS") : TEXT("FAIL"),
+				WorstRiseAlong, WorstRiseAcross, bSolidOk ? TEXT("PASS") : TEXT("FAIL"));
+		}
+		UE_LOG(LogTraceGame, Display, TEXT("================================================================================"));
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs CmdArenaSurfBankProfile(
+		TEXT("Trace.Arena.SurfBankProfile"),
+		TEXT("Trace.Arena.SurfBankProfile [control] - fire traces at the side-wall surf band and report "
+		     "normal Z across the whole surface, lips ALONG and ACROSS travel, and whether a pawn capsule "
+		     "fits inside the solid. 'control' points the same three tests at known-bad targets so the "
+		     "rig can be seen to fail."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+			[](const TArray<FString>& Args, UWorld* World)
+			{
+				if (World == nullptr)
+				{
+					return;
+				}
+				const bool bControl = Args.Num() > 0 && Args[0].StartsWith(TEXT("c"));
+				TraceArenaSurfBankProfile(World, bControl);
+			}));
+}
+
 // =================================================================================================
 // THE RIDE SURFACE, MEASURED — Trace.Arena.SurfProfile
 // =================================================================================================

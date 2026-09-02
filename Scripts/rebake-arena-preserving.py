@@ -92,6 +92,11 @@
 #   TRACE_REBAKE_RECREATE_Z  donor (default) | census — which Z a re-created
 #                         duplicate comes back at. The argument is written out
 #                         above plan_recreate.
+#   TRACE_REBAKE_HAND_DUPLICATES  comma-separated labels DECLARED to be hand
+#                         duplicates, for the case where the non-unit-scale
+#                         proof no longer applies to them. Empty by default. A
+#                         declared label still has to pass the mirror-donor test.
+#                         See HAND_DUPLICATE_LABELS for why it exists.
 #
 # MAP §10.4's kit asset renames are carried by MESH_RENAMES: the census records
 # the mesh a hand actor wore by path, those four assets are renamed between the
@@ -231,6 +236,42 @@ RECREATE_DUPLICATES = os.environ.get("TRACE_REBAKE_RECREATE", "1") == "1"
 # map is that same Z multiplied by a hand squash the restore deliberately does
 # not replay. The whole argument is written out above plan_recreate.
 RECREATE_Z_SOURCE = os.environ.get("TRACE_REBAKE_RECREATE_Z", "donor").strip().lower()
+
+# Labels DECLARED to be hand duplicates, comma-separated. Empty by default, so
+# nothing about a default run changes.
+#
+# WHY THIS HAD TO EXIST (measured 2026-09-01, second re-bake). plan_recreate's
+# proof that a census piece with no fresh counterpart is a hand COPY rather than
+# a label the builder retired was "its actor scale is not 1". That proof was
+# sound when it was written and IT IS NOW VACUOUS, because the previous restore
+# consumed it: W5-MAPFINISH deliberately brought the nine top-centre-tower
+# copies back at the DONOR's unit scale rather than the census's 0.75 (see the
+# argument above plan_recreate), so the map those pieces now live in has
+#
+#     census pieces with a non-unit actor scale: 0     (was 22)
+#
+# and `hand_scaled` is False for every one of the nine. Simulated against a real
+# fresh bake before this run: the unmodified script planned 0 re-creations and
+# 9 "vanished" - it would have dropped the whole mirrored half of the tower and
+# still printed BALANCED: YES with restore_failures [], because `vanished` is a
+# legitimate accounting bucket and `recreated == len(plan_recreate)` is 0 == 0.
+# That is precisely the failure W5-MAPFINISH §2.5 warned a balanced
+# reconciliation cannot catch.
+#
+# WHY A DECLARED LIST AND NOT A CLEVERER GEOMETRIC RULE. The obvious repair is
+# to promote the mirror-donor test (`usable`) to a proof of its own. It is not
+# one: this arena is symmetric in both axes, so for a family that genuinely LOST
+# members - the goal ring went 32 spokes -> 26 - a retired member reflects onto
+# a surviving sibling at ~0 uu and would be "re-created" as a duplicate of a
+# piece the builder deliberately stopped emitting. A rule that fires on the real
+# case and on that one too is not a rule. So the list is explicit and auditable,
+# the same way DELETION_ALLOWLIST and MESH_RENAMES carry map-specific facts, and
+# a declared label STILL has to pass the mirror-donor test before it is acted on
+# - declaration alone re-creates nothing, so a stale or mistyped label degrades
+# to the documented-loss path with a log line rather than resurrecting junk.
+HAND_DUPLICATE_LABELS = tuple(
+    part.strip() for part in os.environ.get("TRACE_REBAKE_HAND_DUPLICATES", "").split(",")
+    if part.strip())
 
 # Which piece TRACE_REBAKE_PHASE=probe clones as its throwaway. Default is the
 # top-centre tower's BODY, because it is the piece the nine re-creations most
@@ -1150,7 +1191,29 @@ if IN_EDITOR:
                             pass
                 colour = spec.get("light_color")
                 if colour:
-                    comp.set_editor_property("light_color", unreal.Color(colour[0], colour[1], colour[2], 255))
+                    # RED AND BLUE SWAPPED HERE ON EVERY RESTORE UNTIL 2026-09-01.
+                    #
+                    # unreal.Color's POSITIONAL constructor is FColor(B, G, R, A) — blue first —
+                    # while the census at the top of this file stores [r, g, b] in that order. So
+                    # `unreal.Color(colour[0], colour[1], colour[2], 255)` assigned r->B and b->R and
+                    # inverted the five hand-placed centre floor lamps on every single bake. Verified
+                    # in the editor rather than inferred: unreal.Color(10, 20, 30, 40) reads back
+                    # r=30 g=20 b=10.
+                    #
+                    # It went unnoticed because it is self-cancelling across an EVEN number of bakes,
+                    # so the lamps flip-flopped between correct and inverted and any given inspection
+                    # had even odds of looking right. The bake that found it happened to land on the
+                    # correct parity, which is exactly why it had to be fixed rather than left alone —
+                    # the next bake would have inverted them again.
+                    #
+                    # Setting the channels by NAME instead of by position so the order cannot be
+                    # misread again, and so this line says what it means.
+                    fixed = unreal.Color()
+                    fixed.set_editor_property("r", int(colour[0]))
+                    fixed.set_editor_property("g", int(colour[1]))
+                    fixed.set_editor_property("b", int(colour[2]))
+                    fixed.set_editor_property("a", 255)
+                    comp.set_editor_property("light_color", fixed)
 
         for tag in record.get("tags", []):
             tags = actor.get_editor_property("tags")
@@ -1277,12 +1340,19 @@ if IN_EDITOR:
         plan_recreate = []
         for piece in unmatched_old:
             hand_scaled = max(abs(value - 1.0) for value in piece["scale"]) > SCALE_TOLERANCE
+            declared = piece["label"] in HAND_DUPLICATE_LABELS
+            claimed = hand_scaled or declared
             donor, mirror, distance = donor_for_duplicate(piece, b_by_stem_lookup)
             usable = (donor is not None and distance is not None
                       and distance <= DUPLICATE_MIRROR_RADIUS_UU)
-            if RECREATE_DUPLICATES and hand_scaled and usable:
+            if declared and not hand_scaled:
+                log("DECLARED hand duplicate {0} (TRACE_REBAKE_HAND_DUPLICATES); its actor scale "
+                    "is {1}, so the non-unit-scale proof does not apply - see "
+                    "HAND_DUPLICATE_LABELS".format(
+                        piece["label"], [round(v, 3) for v in piece["scale"]]))
+            if RECREATE_DUPLICATES and claimed and usable:
                 plan_recreate.append((piece, donor, mirror, distance))
-            elif hand_scaled:
+            elif claimed:
                 vanished.append(piece["label"])
                 why = ("re-creation is off; see TRACE_REBAKE_RECREATE" if not RECREATE_DUPLICATES
                        else "no sibling within {0:.0f} uu of any mirror of it (best {1} at {2}) - "
