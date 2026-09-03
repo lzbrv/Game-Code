@@ -63,6 +63,13 @@ DEFAULT_FORBIDDEN = [
     "Trace.Fx.BurstTest",
     "Trace.Fx.LegacyAccents",
     "Trace.Arena.SurfProfile",
+    # The side-ramp instruments. Both are guarded — the command lives inside this file's
+    # #if !UE_BUILD_SHIPPING block and the harness arm returns false outright in Shipping — and both
+    # are listed here so the gate would SEE it if either guard were ever removed. A previous pass
+    # added Trace.Arena.SurfBankProfile beside SurfProfile and did not list it, which left exactly
+    # this hole for that command; the same mistake is not worth making twice.
+    "Trace.Arena.SideRamp",
+    "TraceSurfSideRampTest",
 ]
 
 # A string we KNOW ships, used as a positive control. Without one of these, "zero

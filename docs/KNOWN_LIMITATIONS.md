@@ -542,8 +542,16 @@ re-bake rewrites all 647 external actor packages.
 * **`Content/Trace/Characters/Shared/SK_TraceBodyHitDonor`** is a deliberate editor-only asset — ten
   physics assets point their `PreviewSkeletalMesh` at it, and it never cooks. Do not "clean it up".
 * **The corner banks were deliberately not restored.** The census proved a collaborator replaced them
-  with two 41,522 uu sideline ramps, and a restored bank's collision would sit 171 uu above the ramp
-  surface. This is a resolved question, not a pending one.
+  with two 41,522 uu sideline ramps (`Kit_Ramp_03/04` on `/Game/Maps/Arena_Baked`). This is a resolved
+  question, not a pending one. **The 171 uu figure that used to be quoted here is stale:** those two
+  ramps were re-scaled and sunk on 2026-09-02 so their exposed face is a single 54.0 deg surf plane
+  (`SIDERAMP-RIDE.md`), and the clearance a restored bank would have over them is a different number
+  now. Re-derive it before acting on it.
+* **`SM_KitRamp` is unwalkable by asset-level override, and that is not a bug to fix.** Its BodySetup
+  carries `WalkableSlopeOverride = DECREASE / 0 deg` and `PhysMat_Ice`, so *no* face of it — 7 deg or
+  58 — can be stood on or climbed, on any actor that uses it (`Kit_Ramp_01..06`). That is why no pawn
+  has ever walked up the sideline ramps, and the sideline ramps are now shaped to be surfed rather
+  than climbed. Changing the override would make every centre-kit ramp climbable at once.
 
 ---
 

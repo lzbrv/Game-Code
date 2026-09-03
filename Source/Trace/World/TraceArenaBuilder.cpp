@@ -5065,6 +5065,354 @@ ATraceArenaBuilder::FTraceSurfRailProbe ATraceArenaBuilder::GetSurfBankProbe(flo
 	return Probe;
 }
 
+// =================================================================================================
+// THE SIDE RAMPS, MEASURED. See the header block on GetSideRampProbe for WHY this one traces.
+//
+// One sweep is a column of downward line traces marching in from a side wall face at one X station.
+// Every sample carries the LIVE ImpactNormal, so "is this surfable" is answered by the same number
+// the movement component answers it with, on the surface a pawn would actually stand on.
+// =================================================================================================
+namespace TraceSideRampProbe
+{
+	/**
+	 * How far in from the wall face a sweep looks.
+	 *
+	 * 1300, AND IT IS AN UPPER BOUND RATHER THAN A CONVENIENCE. The first version of this reached
+	 * 1900 and the probe came back describing a face at |Y| 2960 at 53..61 degrees — the SURF RAIL,
+	 * whose toe is 2180 uu in from the side wall. It is a longer ridable run than any side ramp, so
+	 * "the longest band run in the sweep" picked it every time and the harness would have ridden a
+	 * rail while the log said side ramp. The reach now stops 880 uu short of the rail's toe, and the
+	 * run chosen below is the one NEAREST THE WALL rather than the longest, so a second structure
+	 * inside the reach still cannot capture this instrument.
+	 */
+	static constexpr float SweepReach = 1300.f;
+
+	/** Sample spacing across the sweep, uu. 6 uu resolves this mesh's 16 uu joint bevels. */
+	static constexpr float SweepStep = 6.f;
+
+	/** How high above the floor a column starts. Above any side ramp, below the light bridges (1240). */
+	static constexpr float SweepTopAboveFloor = 1150.f;
+
+	/** One sample of one sweep. */
+	struct FSample
+	{
+		float Out = 0.f;        // distance in from the wall face, uu
+		float Z = 0.f;          // world Z of the surface
+		float NormalZ = 0.f;    // the traced normal's Z
+		FVector Point = FVector::ZeroVector;
+		FVector Normal = FVector::ZeroVector;
+		bool bHit = false;
+	};
+
+	/** March a column of traces in from the wall at one X station. Returns samples outward-to-inward. */
+	static void Sweep(const UWorld& World, const float X, const float SignY, const float WallY,
+		const float FloorZ, TArray<FSample>& Out)
+	{
+		Out.Reset();
+
+		// ECC_Visibility, WITH EVERY PAWN IGNORED, and both halves of that are load-bearing.
+		//
+		// Visibility because the walls carry PAWN-ONLY standoff shells — vertical planes 40 uu off
+		// each wall running the full height — and an object-type query tests the object TYPE, not the
+		// channel response, so it walks straight into one and reports its own start point as the
+		// ground. That is not a hypothesis: the first run of this probe reported Z = 1150 with a flat
+		// normal for every sample within 40 uu of the wall, which is the ray's own start.
+		// Trace.Arena.CrossSection documents the same trap and takes the same way out.
+		//
+		// Ignoring pawns because a character blocks Visibility, so a bot standing on the apron would
+		// otherwise be measured AS the apron.
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceSideRampProbe), /*bTraceComplex=*/false);
+		Params.bFindInitialOverlaps = false;
+		for (TActorIterator<APawn> PawnIt(const_cast<UWorld*>(&World)); PawnIt; ++PawnIt)
+		{
+			Params.AddIgnoredActor(*PawnIt);
+		}
+
+		const int32 Count = FMath::CeilToInt(SweepReach / SweepStep);
+		Out.Reserve(Count);
+
+		for (int32 Index = 0; Index < Count; ++Index)
+		{
+			// From 5 uu off the face inward. Never 0: a probe started exactly on a wall face is a coin
+			// toss between the wall and the air beside it (Trace.Arena.CrossSection's own reason).
+			const float D = 5.f + SweepStep * static_cast<float>(Index);
+			const float Y = WallY - SignY * D;
+
+			FHitResult Hit;
+			const bool bHit = World.LineTraceSingleByChannel(Hit,
+				FVector(X, Y, FloorZ + SweepTopAboveFloor), FVector(X, Y, FloorZ - 200.f),
+				ECC_Visibility, Params) && !Hit.bStartPenetrating;
+
+			FSample S;
+			S.Out = D;
+			S.bHit = bHit;
+			if (bHit)
+			{
+				S.Point = Hit.ImpactPoint;
+				S.Normal = Hit.ImpactNormal;
+				S.Z = static_cast<float>(Hit.ImpactPoint.Z - FloorZ);
+				S.NormalZ = static_cast<float>(Hit.ImpactNormal.Z);
+			}
+			Out.Add(S);
+		}
+	}
+
+	/**
+	 * The contiguous run of in-band samples NEAREST THE WALL, at least @p MinSamples long, as
+	 * [First, Last] indices into @p Samples. THIS IS THE FUNCTION THAT CAN SAY NO.
+	 *
+	 * Nearest, not longest, and the difference is the whole reason the reach above is capped: a side
+	 * ramp is the thing bolted to the side wall, and any other ridable surface inside the sweep — a
+	 * surf rail, a bank, a piece of cover with a chamfer — is by definition further in. Longest picks
+	 * whichever structure happens to be biggest; nearest picks the one being asked about.
+	 *
+	 * @param MinSamples reject a run shorter than this. Three at 6 uu spacing is 12 uu of face, which
+	 *                   is the smallest thing that can be a facet rather than a sampling artefact at
+	 *                   the seam between two.
+	 */
+	static bool NearestBandRun(const TArray<FSample>& Samples, const float MinNormalZ, const float MaxNormalZ,
+		const int32 MinSamples, int32& OutFirst, int32& OutLast)
+	{
+		OutFirst = OutLast = INDEX_NONE;
+		int32 RunFirst = INDEX_NONE;
+
+		for (int32 Index = 0; Index <= Samples.Num(); ++Index)
+		{
+			const bool bInBand = Samples.IsValidIndex(Index) && Samples[Index].bHit
+				&& Samples[Index].NormalZ > MinNormalZ && Samples[Index].NormalZ < MaxNormalZ;
+
+			if (bInBand)
+			{
+				if (RunFirst == INDEX_NONE)
+				{
+					RunFirst = Index;
+				}
+				continue;
+			}
+
+			if (RunFirst != INDEX_NONE)
+			{
+				if ((Index - RunFirst) >= MinSamples)
+				{
+					OutFirst = RunFirst;
+					OutLast = Index - 1;
+					return true;
+				}
+				RunFirst = INDEX_NONE;
+			}
+		}
+
+		return false;
+	}
+}
+
+ATraceArenaBuilder::FTraceSurfRailProbe ATraceArenaBuilder::GetSideRampProbe(
+	float XSign, float YSign, float MinNormalZ, float MaxNormalZ) const
+{
+	using namespace TraceSideRampProbe;
+
+	const float SignX = (XSign < 0.f) ? -1.f : 1.f;
+	const float SignY = (YSign < 0.f) ? -1.f : 1.f;
+	const int32 CacheSlot = ((SignX > 0.f) ? 2 : 0) + ((SignY > 0.f) ? 1 : 0);
+
+	// MEASURED ONCE PER QUADRANT, THEN CACHED — BUT ONLY A SUCCESS IS CACHED. The sweep is ~317 traces
+	// and the run scan walks it forty times; the surf harness asks for this probe EVERY FRAME, and a
+	// rig that re-measured the level sixty times a second would be measuring its own hitch.
+	//
+	// A FAILURE IS NOT CACHED, and that is not an oversight. On /Game/Maps/Arena the arena does not
+	// exist until BeginPlay has run and the harness asks for the probe before that; a cache that
+	// remembered the first answer would answer "this level has no ridable side ramp" for the rest of
+	// the process, on a level that grows one a moment later. So a miss is retried, twice a second.
+	const UWorld* World = GetWorld();
+	const double Now = (World != nullptr) ? World->GetTimeSeconds() : 0.0;
+	if (SideRampProbeCache[CacheSlot].bValid)
+	{
+		return SideRampProbeCache[CacheSlot];
+	}
+	if (World != nullptr && Now < SideRampProbeRetryAfter[CacheSlot])
+	{
+		return FTraceSurfRailProbe();
+	}
+	SideRampProbeRetryAfter[CacheSlot] = Now + 0.5;
+
+	FTraceSurfRailProbe Probe;
+	if (World == nullptr || MaxNormalZ <= MinNormalZ || MinNormalZ <= 0.f)
+	{
+		return Probe;
+	}
+
+	const FBox Field = GetFieldBounds();
+	const float FloorZ = static_cast<float>(Field.Min.Z);
+	const float HalfX = static_cast<float>(Field.GetExtent().X);
+	const FVector Mid = Field.GetCenter();
+	const float WallY = static_cast<float>(Mid.Y) + SignY * static_cast<float>(Field.GetExtent().Y);
+
+	// FIND A STATION THAT HAS A BAND, rather than trusting one. The side wall carries 13 buttresses a
+	// side and a sweep that landed on one would describe a buttress; so the search walks outward from
+	// 30 % of the half length in 400 uu steps and takes the first station whose band run is at least
+	// three samples deep. If none of the twenty is ridable, this returns bValid = false — which is the
+	// answer on a map whose side wall is bare floor, and is the answer this instrument exists to give.
+	TArray<FSample> Samples;
+	int32 First = INDEX_NONE;
+	int32 Last = INDEX_NONE;
+	float StationX = 0.f;
+	bool bFound = false;
+
+	for (int32 Attempt = 0; Attempt < 20 && !bFound; ++Attempt)
+	{
+		StationX = static_cast<float>(Mid.X) + SignX * (HalfX * 0.30f + 400.f * static_cast<float>(Attempt));
+		if (FMath::Abs(StationX - static_cast<float>(Mid.X)) > HalfX - 400.f)
+		{
+			break;
+		}
+
+		Sweep(*World, StationX, SignY, WallY, FloorZ, Samples);
+		bFound = NearestBandRun(Samples, MinNormalZ, MaxNormalZ, 3, First, Last);
+	}
+
+	if (!bFound)
+	{
+		return Probe;
+	}
+
+	// TWO THIRDS UP THE RIDABLE RUN — the rail and bank probes' station, for their reason: a rig that
+	// entered on the run's very first facet would be measuring the shallowest surface on the structure
+	// and calling it surf. Samples march INWARD from the wall and the ramp rises toward the wall, so
+	// the run's top is at the LOW index.
+	const int32 EntryIndex = FMath::Clamp(
+		FMath::RoundToInt(FMath::Lerp(static_cast<float>(Last), static_cast<float>(First), 0.667f)),
+		First, Last);
+	const FSample& Entry = Samples[EntryIndex];
+
+	Probe.bValid = true;
+	Probe.FaceNormal = Entry.Normal.GetSafeNormal();
+	// 120 uu OFF the face along its normal, the other two probes' clearance and their reason: the
+	// capsule is 34 uu in radius and 88 in half height, so anything closer starts a placed run with the
+	// pawn inside the ramp and the first thing measured is a depenetration rather than a ride.
+	Probe.FaceEntry = Entry.Point + Probe.FaceNormal * 120.f;
+	Probe.RunDirection = FVector(SignX, 0.f, 0.f);
+	Probe.Height = Samples[First].Z;
+
+	{
+		float MinDeg = 180.f;
+		float MaxDeg = 0.f;
+		for (int32 Index = First; Index <= Last; ++Index)
+		{
+			const float Deg = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Samples[Index].NormalZ, -1.f, 1.f)));
+			MinDeg = FMath::Min(MinDeg, Deg);
+			MaxDeg = FMath::Max(MaxDeg, Deg);
+		}
+		Probe.MinFaceAngleDegrees = MinDeg;
+		Probe.MaxFaceAngleDegrees = MaxDeg;
+	}
+
+	// THE TOE IS WHERE THE SURFACE LEAVES THE FLOOR, measured: the outermost sample still standing
+	// within 4 uu of floor level with the ramp continuously above it inboard. Anything else — the mesh
+	// bounds, the actor's Y, a constant — would be a second copy of the level's layout.
+	{
+		// Walk from the FIELD side inward and stop at the first place the surface has been off the
+		// floor for three samples running. Three, not one: a single sample is a cover block, a bolt
+		// head or a decal edge, and a toe line that jumped 700 uu inboard because the sweep clipped a
+		// crate would put the whole approach rig in the wrong place with nothing in the log to say so.
+		float ToeOut = Samples.IsValidIndex(Last) ? Samples[Last].Out : SweepReach;
+		for (int32 Index = Samples.Num() - 1; Index >= 2; --Index)
+		{
+			const bool bUp = Samples[Index].bHit && Samples[Index].Z > 4.f
+				&& Samples[Index - 1].bHit && Samples[Index - 1].Z > 4.f
+				&& Samples[Index - 2].bHit && Samples[Index - 2].Z > 4.f;
+			if (bUp)
+			{
+				ToeOut = Samples[Index].Out;
+				break;
+			}
+		}
+		Probe.ToeOnFloor = FVector(static_cast<float>(Mid.X) + SignX * (HalfX * 0.333f),
+			WallY - SignY * ToeOut, FloorZ);
+	}
+
+	// THE NEGATIVE CONTROL STANDS ON THE WALK-UP, not on flat floor. These ramps are climbable for
+	// their bottom two thirds, and "a face you can stand on is never surfable" is exactly the claim
+	// that needs a control on THIS structure: the middle of the longest walkable run OUTBOARD of the
+	// band (i.e. below it), at least 25 uu clear of the floor so it is on the ramp and not beside it.
+	{
+		int32 BestFirst = INDEX_NONE;
+		int32 BestLast = INDEX_NONE;
+		int32 RunFirst = INDEX_NONE;
+		for (int32 Index = Last + 1; Index <= Samples.Num(); ++Index)
+		{
+			const bool bWalkableRamp = Samples.IsValidIndex(Index) && Samples[Index].bHit
+				&& Samples[Index].NormalZ >= MaxNormalZ && Samples[Index].Z > 25.f;
+			if (bWalkableRamp)
+			{
+				if (RunFirst == INDEX_NONE)
+				{
+					RunFirst = Index;
+				}
+				continue;
+			}
+			if (RunFirst != INDEX_NONE)
+			{
+				if (BestFirst == INDEX_NONE || (Index - RunFirst) > (BestLast - BestFirst + 1))
+				{
+					BestFirst = RunFirst;
+					BestLast = Index - 1;
+				}
+				RunFirst = INDEX_NONE;
+			}
+		}
+
+		if (BestFirst != INDEX_NONE)
+		{
+			const FSample& Stand = Samples[(BestFirst + BestLast) / 2];
+			Probe.CrestStand = FVector(StationX, Stand.Point.Y, Stand.Point.Z);
+		}
+		else
+		{
+			// No walk-up: the control goes on the floor just outboard of the toe, which is still a
+			// surface a pawn must never surf. It is a weaker control and it says so here.
+			Probe.CrestStand = Probe.ToeOnFloor + FVector(0.f, -SignY * 200.f, 0.f);
+		}
+	}
+
+	// HOW LONG THE RIDE ACTUALLY IS: step along the run and re-sweep until the band is lost. Measured,
+	// because a curved ramp does not stay at one distance from the wall and a ramp that stops short of
+	// the corner does not run to the corner.
+	{
+		// THREE MISSES IN A ROW, not one. The side wall carries buttresses and cover, and a single
+		// station whose sweep lands on one is a station with no ridable run at that X — not the end of
+		// the ramp. The first version stopped at the first miss and reported a 41,000 uu ramp as 2,000
+		// uu long. Three consecutive 500 uu stations with nothing ridable IS the end of a ramp.
+		float Reached = 0.f;
+		int32 Misses = 0;
+		for (int32 Step = 1; Step <= 40 && Misses < 3; ++Step)
+		{
+			const float X = StationX + SignX * 500.f * static_cast<float>(Step);
+			if (FMath::Abs(X - static_cast<float>(Mid.X)) > HalfX)
+			{
+				break;
+			}
+
+			TArray<FSample> Along;
+			Sweep(*World, X, SignY, WallY, FloorZ, Along);
+			int32 AlongFirst = INDEX_NONE;
+			int32 AlongLast = INDEX_NONE;
+			if (NearestBandRun(Along, MinNormalZ, MaxNormalZ, 3, AlongFirst, AlongLast))
+			{
+				Reached = 500.f * static_cast<float>(Step);
+				Misses = 0;
+			}
+			else
+			{
+				++Misses;
+			}
+		}
+		Probe.RunLength = Reached;
+	}
+
+	SideRampProbeCache[CacheSlot] = Probe;
+	return Probe;
+}
+
 ATraceArenaBuilder::FTraceSurfRailProbe ATraceArenaBuilder::GetSurfRailProbe(float XSign, float YSign) const
 {
 	FTraceSurfRailProbe Probe;
@@ -12833,6 +13181,314 @@ namespace
 			const float Reach = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 100.f, 4000.f) : 1700.f;
 			const float Step = (Args.Num() > 1) ? FMath::Clamp(FCString::Atof(*Args[1]), 5.f, 200.f) : 25.f;
 			ReportArenaCrossSection(Reach, Step);
+		}));
+
+	// ---------------------------------------------------------------------------------------------
+	// Trace.Arena.SideRamp — WHAT IS ON THE SIDE WALL, FACET BY FACET, AGAINST THE LIVE BAND.
+	//
+	// Trace.Arena.CrossSection above answers "what shape is the perimeter" and answers it in HEIGHTS.
+	// That is the wrong unit for this question. Whether a face can be surfed is a claim about its
+	// NORMAL, and a height profile only lets you infer one — which is how a hand-placed ramp came to be
+	// described in two reports as a "28.5 degree prism" when 28.5 is its bounding box's diagonal and
+	// nothing on it is at that angle: the mesh is five facets from 7 to 58 degrees with four shallow
+	// bevels between them, and the argument about whether it is "too shallow to surf" was being had
+	// about a number no surface on it has.
+	//
+	// So this reads the TRACED ImpactNormal at every sample and classifies it against the band the
+	// movement component reports THIS RUN, printing the facets it finds, which of them are ridable, how
+	// tall each ridable run is, and — the number that decides whether a ride survives — the tallest
+	// UNINTERRUPTED ridable run, because a 3 uu walkable bevel in the middle of a face is a landing.
+	// ---------------------------------------------------------------------------------------------
+	void ReportArenaSideRamp(float Reach, float SampleStep)
+	{
+		UWorld* World = FindArenaPerfWorld();
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[SIDERAMP] no game world."));
+			return;
+		}
+
+		ATraceArenaBuilder* Builder = ATraceArenaBuilder::Get(World);
+		if (Builder == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[SIDERAMP] no ATraceArenaBuilder in this world."));
+			return;
+		}
+
+		// THE BAND, LIVE. Off the CDO, which is where every other arena consumer of it reads it, so a
+		// knob change moves this instrument and the movement code together or moves neither.
+		float BandLoDeg = 0.f;
+		float BandHiDeg = 0.f;
+		float WalkZ = 0.f;
+		float SurfZ = 0.f;
+		if (const UTraceCharacterMovementComponent* CDO =
+			UTraceCharacterMovementComponent::StaticClass()->GetDefaultObject<UTraceCharacterMovementComponent>())
+		{
+			// GetSurfSlopeBandDegrees IS the band, and it is the public face of both edges: it returns
+			// acos of the walkable limit and acos of the surf floor. Converting back here rather than
+			// reading the two normal-Z accessors keeps this to ONE public entry point and keeps the
+			// instrument honest if either edge is ever clamped inside the component.
+			CDO->GetSurfSlopeBandDegrees(BandLoDeg, BandHiDeg);
+			WalkZ = FMath::Cos(FMath::DegreesToRadians(BandLoDeg));
+			SurfZ = FMath::Cos(FMath::DegreesToRadians(BandHiDeg));
+		}
+		if (BandHiDeg <= BandLoDeg)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[SIDERAMP] could not read the surf band off the movement CDO."));
+			return;
+		}
+
+		const FBox Field = Builder->GetFieldBounds();
+		const float HalfX = static_cast<float>(Field.GetExtent().X);
+		const float HalfY = static_cast<float>(Field.GetExtent().Y);
+		const FVector Mid = Field.GetCenter();
+		const float FloorZ = static_cast<float>(Field.Min.Z);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SIDERAMP] ===== side-wall faces vs the LIVE surf band: %.2f..%.2f deg "
+			     "(walkable floor Nz %.4f, surf floor Nz %.4f). Reach %.0f uu in %.1f uu steps, "
+			     "WorldStatic traces. ====="),
+			BandLoDeg, BandHiDeg, WalkZ, SurfZ, Reach, SampleStep);
+
+		// ECC_Visibility with every pawn ignored — GetSideRampProbe's Sweep() carries the full reason:
+		// the walls' pawn-only standoff shells swallow an object-type query, and a bot standing on the
+		// ramp would otherwise be measured as the ramp.
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceArenaSideRamp), /*bTraceComplex=*/false);
+		Params.bFindInitialOverlaps = false;
+		for (TActorIterator<APawn> PawnIt(World); PawnIt; ++PawnIt)
+		{
+			Params.AddIgnoredActor(*PawnIt);
+		}
+
+		const int32 Count = FMath::Clamp(FMath::CeilToInt(Reach / FMath::Max(1.f, SampleStep)), 4, 900);
+
+		struct FStation { FString Name; float X; float SignY; };
+		TArray<FStation> Stations;
+		Stations.Add({ TEXT("+Y wall, midfield"),      static_cast<float>(Mid.X) + HalfX * 0.075f,  1.f });
+		Stations.Add({ TEXT("+Y wall, quarter"),       static_cast<float>(Mid.X) + HalfX * 0.400f,  1.f });
+		Stations.Add({ TEXT("+Y wall, endzone"),       static_cast<float>(Mid.X) + HalfX - 1800.f,  1.f });
+		Stations.Add({ TEXT("-Y wall, midfield"),      static_cast<float>(Mid.X) + HalfX * 0.075f, -1.f });
+		Stations.Add({ TEXT("-Y wall, quarter"),       static_cast<float>(Mid.X) - HalfX * 0.400f, -1.f });
+		Stations.Add({ TEXT("-Y wall, endzone"),       static_cast<float>(Mid.X) - HalfX + 1800.f, -1.f });
+
+		for (const FStation& Station : Stations)
+		{
+			const float WallY = static_cast<float>(Mid.Y) + Station.SignY * HalfY;
+
+			TArray<float> Out;
+			TArray<float> Z;
+			TArray<float> Nz;
+			TArray<bool> Hit;
+			Out.Reserve(Count); Z.Reserve(Count); Nz.Reserve(Count); Hit.Reserve(Count);
+
+			for (int32 Index = 0; Index < Count; ++Index)
+			{
+				const float D = 5.f + SampleStep * static_cast<float>(Index);
+				const float Y = WallY - Station.SignY * D;
+
+				FHitResult Result;
+				const bool bHit = World->LineTraceSingleByChannel(Result,
+					FVector(Station.X, Y, FloorZ + 1150.f), FVector(Station.X, Y, FloorZ - 200.f),
+					ECC_Visibility, Params) && !Result.bStartPenetrating;
+
+				Out.Add(D);
+				Hit.Add(bHit);
+				Z.Add(bHit ? static_cast<float>(Result.ImpactPoint.Z - FloorZ) : -999.f);
+				Nz.Add(bHit ? static_cast<float>(Result.ImpactNormal.Z) : 1.f);
+			}
+
+			// Group consecutive samples whose face angle agrees within a degree: that is a facet.
+			// Reported outward-to-inward is the wrong way round for a reader — a player climbs from the
+			// field toward the wall — so the walk is from the LAST sample back to the first.
+			FString Facets;
+			int32 RunStart = INDEX_NONE;
+			float RunAngle = 0.f;
+
+			float BandHeight = 0.f;         // total vertical inside the band
+			float TallestRun = 0.f;         // tallest UNINTERRUPTED in-band run
+			float ThisRun = 0.f;
+			float WalkTop = 0.f;            // highest point reachable without leaving walkable ground
+			bool bWalkBroken = false;
+			float RampTop = 0.f;
+
+			for (int32 Index = Count - 1; Index >= 0; --Index)
+			{
+				if (!Hit[Index])
+				{
+					continue;
+				}
+				RampTop = FMath::Max(RampTop, Z[Index]);
+
+				const float Angle = FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(Nz[Index], -1.f, 1.f)));
+				const bool bBand = Nz[Index] > SurfZ && Nz[Index] < WalkZ;
+				const float Rise = (Index < Count - 1 && Hit[Index + 1]) ? (Z[Index] - Z[Index + 1]) : 0.f;
+
+				if (bBand)
+				{
+					BandHeight += FMath::Max(0.f, Rise);
+					ThisRun += FMath::Max(0.f, Rise);
+					TallestRun = FMath::Max(TallestRun, ThisRun);
+					bWalkBroken = true;
+				}
+				else
+				{
+					ThisRun = 0.f;
+					if (!bWalkBroken)
+					{
+						WalkTop = FMath::Max(WalkTop, Z[Index]);
+					}
+				}
+
+				if (RunStart == INDEX_NONE || FMath::Abs(Angle - RunAngle) > 1.0f)
+				{
+					if (RunStart != INDEX_NONE)
+					{
+						// The rise across the facet, which is the number that decides how long a ride on
+						// it lasts. An angle on its own says whether a face is ridable and says nothing
+						// about whether the ride is worth having.
+						const float FacetRise = Z[Index + 1] - Z[RunStart];
+						Facets += FString::Printf(TEXT("%.0f-%.0f:%.1fdeg/%.0fuu%s "),
+							Out[RunStart], Out[Index + 1], RunAngle, FacetRise,
+							(FMath::Cos(FMath::DegreesToRadians(RunAngle)) > SurfZ
+								&& FMath::Cos(FMath::DegreesToRadians(RunAngle)) < WalkZ) ? TEXT("*BAND") : TEXT(""));
+					}
+					RunStart = Index;
+					RunAngle = Angle;
+				}
+			}
+
+			// FLUSH THE LAST FACET. Without this the run nearest the wall — which on a side ramp is the
+			// RIDE FACE — is never printed, because the loop only emits a facet when the angle changes
+			// and there is no sample after the last one to change it. The first run of this command
+			// printed two stations with no *BAND facet listed and a non-zero band vertical on the same
+			// line, which is the shape of that bug.
+			if (RunStart != INDEX_NONE)
+			{
+				int32 LastHit = 0;
+				while (LastHit < Count && !Hit[LastHit])
+				{
+					++LastHit;
+				}
+				const float FacetRise = (LastHit < Count) ? (Z[LastHit] - Z[RunStart]) : 0.f;
+				Facets += FString::Printf(TEXT("%.0f-%.0f:%.1fdeg/%.0fuu%s "),
+					Out[RunStart], Out[FMath::Min(LastHit, Count - 1)], RunAngle, FacetRise,
+					(FMath::Cos(FMath::DegreesToRadians(RunAngle)) > SurfZ
+						&& FMath::Cos(FMath::DegreesToRadians(RunAngle)) < WalkZ) ? TEXT("*BAND") : TEXT(""));
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SIDERAMP] %-20s top %6.1f uu | band vertical %6.1f uu | tallest UNBROKEN band run "
+				     "%6.1f uu | highest walk-up %6.1f uu"),
+				*Station.Name, RampTop, BandHeight, TallestRun, WalkTop);
+			UE_LOG(LogTraceGame, Display, TEXT("[SIDERAMP]   facets (field -> wall): %s"), *Facets);
+
+			FString Profile;
+			for (int32 Index = 0; Index < Count; ++Index)
+			{
+				if (!Hit[Index])
+				{
+					continue;
+				}
+				Profile += FString::Printf(TEXT("%.0f:%.0f/%.2f "), Out[Index], Z[Index], Nz[Index]);
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("[SIDERAMP]   out:Z/Nz %s"), *Profile);
+		}
+
+		// -----------------------------------------------------------------------------------------
+		// WHAT STOPS A BODY, on the channel a body is stopped on, WITH THE BLOCKER NAMED.
+		//
+		// Everything above this reads ECC_Visibility, which is right for "what shape is the ramp" and
+		// is NOT what a pawn collides with: this arena's walls carry pawn-only standoff shells and its
+		// wall fillets carry a Custom collision profile, so the surface a rig can see and the surface a
+		// body can touch are two different surfaces. A ride measured against the first one is a ride
+		// nobody can take, and the approach rig had already reported six identical failures with the
+		// visibility profile saying the ramp was walkable.
+		//
+		// So this sweeps the PAWN's own capsule horizontally in from the field at a ladder of heights
+		// and prints the first thing that blocks it BY NAME. A "no blocker" row is the pass, and it is
+		// a row that can fail: run it on the open floor and it reports the far wall.
+		// -----------------------------------------------------------------------------------------
+		{
+			float CapsuleRadius = 34.f;
+			float CapsuleHalfHeight = 88.f;
+			if (const ACharacter* CharacterCDO = ATraceCharacter::StaticClass()->GetDefaultObject<ATraceCharacter>())
+			{
+				if (const UCapsuleComponent* Capsule = CharacterCDO->GetCapsuleComponent())
+				{
+					CapsuleRadius = Capsule->GetUnscaledCapsuleRadius();
+					CapsuleHalfHeight = Capsule->GetUnscaledCapsuleHalfHeight();
+				}
+			}
+
+			const FCollisionShape Body = FCollisionShape::MakeCapsule(CapsuleRadius, CapsuleHalfHeight);
+			const float FeetLadder[] = { 5.f, 25.f, 45.f, 80.f, 140.f, 220.f, 320.f, 420.f };
+
+			for (const FStation& Station : Stations)
+			{
+				const float WallY = static_cast<float>(Mid.Y) + Station.SignY * HalfY;
+				FString Row;
+				for (const float Feet : FeetLadder)
+				{
+					const float CentreZ = FloorZ + Feet + CapsuleHalfHeight;
+					const FVector From(Station.X, WallY - Station.SignY * 1300.f, CentreZ);
+					const FVector To(Station.X, WallY - Station.SignY * (CapsuleRadius + 2.f), CentreZ);
+
+					FHitResult Body_Hit;
+					const bool bBlocked = World->SweepSingleByChannel(Body_Hit, From, To, FQuat::Identity,
+						ECC_Pawn, Body, Params);
+
+					if (bBlocked)
+					{
+						const float StoppedOut = static_cast<float>(
+							FMath::Abs(WallY - Body_Hit.Location.Y));
+						Row += FString::Printf(TEXT("feet %.0f: stops %.0f uu out on '%s'  "),
+							Feet, StoppedOut, *GetNameSafe(Body_Hit.GetComponent()));
+					}
+					else
+					{
+						Row += FString::Printf(TEXT("feet %.0f: reaches the wall  "), Feet);
+					}
+				}
+				UE_LOG(LogTraceGame, Display, TEXT("[SIDERAMP] body sweep %-20s %s"), *Station.Name, *Row);
+			}
+		}
+
+		// AND THE PROBE THE HARNESS ACTUALLY RIDES, printed from the same run, so a report can never
+		// quote a cross-section from one place and a ride from another.
+		for (int32 Quadrant = 0; Quadrant < 4; ++Quadrant)
+		{
+			const float SignX = (Quadrant & 2) ? 1.f : -1.f;
+			const float SignY = (Quadrant & 1) ? 1.f : -1.f;
+			const ATraceArenaBuilder::FTraceSurfRailProbe Probe =
+				Builder->GetSideRampProbe(SignX, SignY, SurfZ, WalkZ);
+			if (!Probe.bValid)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[SIDERAMP] probe (%+.0f,%+.0f): INVALID - no ridable run found on this wall."),
+					SignX, SignY);
+				continue;
+			}
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SIDERAMP] probe (%+.0f,%+.0f): face %.2f..%.2f deg | entry %s n=%s | toe %s | "
+				     "control stands at %s | run %.0f uu | top %.0f uu"),
+				SignX, SignY, Probe.MinFaceAngleDegrees, Probe.MaxFaceAngleDegrees,
+				*Probe.FaceEntry.ToCompactString(), *Probe.FaceNormal.ToCompactString(),
+				*Probe.ToeOnFloor.ToCompactString(), *Probe.CrestStand.ToCompactString(),
+				Probe.RunLength, Probe.Height);
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[SIDERAMP] ===== END. ====="));
+	}
+
+	FAutoConsoleCommand CmdArenaSideRamp(
+		TEXT("Trace.Arena.SideRamp"),
+		TEXT("Trace.Arena.SideRamp [Reach] [SampleStep] - trace the side walls' cross-section and classify "
+		     "every facet against the LIVE surf band, then print the probe the surf harness rides."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			const float Reach = (Args.Num() > 0) ? FMath::Clamp(FCString::Atof(*Args[0]), 100.f, 4000.f) : 1400.f;
+			const float Step = (Args.Num() > 1) ? FMath::Clamp(FCString::Atof(*Args[1]), 2.f, 200.f) : 5.f;
+			ReportArenaSideRamp(Reach, Step);
 		}));
 
 	// ---------------------------------------------------------------------------------------------

@@ -274,6 +274,41 @@ public:
 	FTraceSurfRailProbe GetSurfBankProbe(float XSign, float YSign) const;
 
 	/**
+	 * THE HAND-PLACED SIDE RAMPS, FOUND BY TRACING THEM RATHER THAN BY KNOWING WHERE THEY ARE.
+	 *
+	 * The two structures above are described from the build's own accessors, which is right for
+	 * geometry this class builds. The side ramps are NOT built here: they are `Kit_Ramp_03/04`, two
+	 * StaticMeshActors a human placed on /Game/Maps/Arena_Baked, and this class has never heard of
+	 * them. An accessor that carried their coordinates would be a second copy of a level's layout
+	 * living in C++ — exactly the failure GetSurfRailProbe's own header warns about, and worse,
+	 * because the level can be edited without recompiling.
+	 *
+	 * So this one MEASURES. It marches downward line traces in from the side wall face at one X
+	 * station, reads the LIVE ImpactNormal at each sample, and reports the longest contiguous run of
+	 * samples whose normal Z is strictly inside (@p MinNormalZ, @p MaxNormalZ) — the band handed in by
+	 * the caller, which is the movement component's own live band and not a copy of it. Everything
+	 * else follows from that run:
+	 *
+	 *   FaceEntry     two thirds up the ridable run, 120 uu off along its measured normal
+	 *   FaceNormal    the traced normal at that sample, not a derived one
+	 *   ToeOnFloor    where the ramp surface last stands within 4 uu of the floor, i.e. its real foot
+	 *   CrestStand    the middle of the WALKABLE apron BELOW the band — the negative control belongs
+	 *                 on the same structure, because "you cannot surf a walk-up" is the claim
+	 *   RunLength     stepped along the run until the band is lost, so it measures the ramp and not
+	 *                 the field
+	 *
+	 * IT CAN FAIL, AND THAT IS THE POINT. bValid is false when no sample in the sweep is inside the
+	 * band: on a map whose side wall is bare floor, or on a ramp too shallow to surf, this returns
+	 * nothing and the harness reports "this level has no ridable side ramp" instead of teleporting a
+	 * pawn into empty air and blaming the movement code.
+	 *
+	 * @param MinNormalZ the surf band's FLOOR (steep end), from the live movement component.
+	 * @param MaxNormalZ the walkable limit, from the live movement component. Samples at or above it
+	 *                   are the walk-up, and are where CrestStand goes.
+	 */
+	FTraceSurfRailProbe GetSideRampProbe(float XSign, float YSign, float MinNormalZ, float MaxNormalZ) const;
+
+	/**
 	 * The placed Core spawn marker, or null when the level has none (which is the normal state of
 	 * /Game/Maps/Arena). Warns, once per resolve, if there is more than one.
 	 */
@@ -2214,6 +2249,18 @@ public:
 #endif
 
 private:
+	/**
+	 * GetSideRampProbe's memo, one slot per (XSign, YSign) quadrant, indexed 0..3.
+	 *
+	 * mutable because the probe is const — it MEASURES the level rather than changing it, and a
+	 * caller asking "where is the ridable side ramp" should not have to hold a non-const arena. Only
+	 * a VALID probe is kept: see the function, which explains why a miss has to be retried.
+	 */
+	mutable FTraceSurfRailProbe SideRampProbeCache[4];
+
+	/** World time before which a failed side-ramp measurement is not attempted again. */
+	mutable double SideRampProbeRetryAfter[4] = { 0.0, 0.0, 0.0, 0.0 };
+
 	/**
 	 * One recolourable arena surface, remembered so half time can repaint it.
 	 *

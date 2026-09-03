@@ -67,6 +67,7 @@
 #include "Misc/CommandLine.h"
 #include "Misc/Parse.h"
 
+#include "Components/CapsuleComponent.h"
 #include "Core/TraceCharacter.h"
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "World/TraceArenaBuilder.h"
@@ -697,6 +698,19 @@ namespace TraceMovementSurf
 		bool bReachedFace = false;
 		bool bSurfed = false;
 		FVector ContactAt = FVector::ZeroVector;
+
+		/**
+		 * HOW FAR UP THE RAMP THE PAWN ACTUALLY GOT, and where it stopped.
+		 *
+		 * Without these a failed run is unfalsifiable. "surfed=0" is equally true of a pawn stopped
+		 * dead at a kerb 250 uu short of the toe, a pawn that climbed the whole walk-up and was
+		 * refused at the band, and a pawn that rode for one frame and landed — and the fix for those
+		 * three is a different fix each time. The first measured pass on the steepened ramp reported
+		 * six identical "no surf, no gain" rows and nothing that could tell them apart.
+		 */
+		float HighestZ = 0.f;
+		float DeepestInset = 0.f;      // most negative = furthest INBOARD of the toe line
+		FVector EndedAt = FVector::ZeroVector;
 	};
 
 	static TArray<FSurfApproachSample>& SurfApproachRows()
@@ -873,6 +887,31 @@ namespace TraceMovementSurf
 	}
 
 	/**
+	 * -TraceSurfSideRampTest: point every arm of this file at the HAND-PLACED SIDE RAMPS.
+	 *
+	 * `Kit_Ramp_03/04` on /Game/Maps/Arena_Baked are the structures the owner means by "the ones which
+	 * exist all the way on the side", and on the shipping map they are the ONLY thing on those walls —
+	 * the procedural banks are absent there because these replaced them. Two reports have argued about
+	 * whether they can be surfed from a bounding box; nobody had ridden one, because the harness only
+	 * knew about the two structures this codebase builds itself.
+	 *
+	 * It is the same swap -TraceSurfBankTest makes, to a third probe, and for the same reason: the
+	 * twelve-run ladder, the exit test, the approach test and both negative controls are the
+	 * instrument, and pointing them somewhere new must not mean writing a second one.
+	 *
+	 * Guarded like every other arm in this file: the switch does not survive a Shipping link.
+	 */
+	static bool SurfSideRampTestArm()
+	{
+#if UE_BUILD_SHIPPING
+		return false;
+#else
+		static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfSideRampTest"));
+		return bFromCommandLine;
+#endif
+	}
+
+	/**
 	 * The ramp in this pawn's own quadrant. ONE lookup, so no two arms of this file can end up
 	 * measuring different ramps — and it goes through the arena's own accessor rather than through any
 	 * coordinate of its own, for the reason at the top of the file.
@@ -898,6 +937,18 @@ namespace TraceMovementSurf
 		const FVector Here = Updated->GetComponentLocation();
 		const float SignX = (Here.X >= 0.0) ? 1.f : -1.f;
 		const float SignY = (Here.Y >= 0.0) ? 1.f : -1.f;
+		if (SurfSideRampTestArm())
+		{
+			// THE BAND IS HANDED IN LIVE, not typed into the probe. The side-ramp probe decides which
+			// samples are ridable, and if it carried its own idea of the band a knob change would move
+			// the movement code and leave the instrument measuring the old rule.
+			float BandLoDeg = 0.f;
+			float BandHiDeg = 0.f;
+			Movement.GetSurfSlopeBandDegrees(BandLoDeg, BandHiDeg);
+			return Arena->GetSideRampProbe(SignX, SignY,
+				FMath::Cos(FMath::DegreesToRadians(BandHiDeg)),
+				FMath::Cos(FMath::DegreesToRadians(BandLoDeg)));
+		}
 		return SurfBankTestArm() ? Arena->GetSurfBankProbe(SignX, SignY)
 			: Arena->GetSurfRailProbe(SignX, SignY);
 	}
@@ -959,18 +1010,39 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 
 	// The rail in the pawn's own quadrant, so the rig works from wherever the match spawned it.
 	const FVector Here = UpdatedComponent->GetComponentLocation();
-	const ATraceArenaBuilder::FTraceSurfRailProbe Probe = TraceMovementSurf::SurfBankTestArm()
-		? Arena->GetSurfBankProbe((Here.X >= 0.0) ? 1.f : -1.f, (Here.Y >= 0.0) ? 1.f : -1.f)
-		: Arena->GetSurfRailProbe((Here.X >= 0.0) ? 1.f : -1.f, (Here.Y >= 0.0) ? 1.f : -1.f);
+	const float ProbeSignX = (Here.X >= 0.0) ? 1.f : -1.f;
+	const float ProbeSignY = (Here.Y >= 0.0) ? 1.f : -1.f;
+	const ATraceArenaBuilder::FTraceSurfRailProbe Probe = TraceMovementSurf::SurfSideRampTestArm()
+		? Arena->GetSideRampProbe(ProbeSignX, ProbeSignY, GetSurfMinNormalZ(), GetWalkableFloorZ())
+		: (TraceMovementSurf::SurfBankTestArm()
+			? Arena->GetSurfBankProbe(ProbeSignX, ProbeSignY)
+			: Arena->GetSurfRailProbe(ProbeSignX, ProbeSignY));
 
 	if (!Probe.bValid)
 	{
 		if (TestWorld->GetTimeSeconds() > 8.f)
 		{
 			bSurfTestReported = 1;
-			UE_LOG(LogTraceGame, Error,
-				TEXT("SURFTEST: this level has no surf rails (bBuildSurfRails off, or a baked map that was "
-				     "baked before they existed). Run on /Game/Maps/Arena."));
+			if (TraceMovementSurf::SurfSideRampTestArm())
+			{
+				// A DIFFERENT SENTENCE, because it is a different failure and it is a RESULT. The side
+				// ramps are placed by hand in a level, so "no ridable side ramp here" means the sweep
+				// found nothing between the live surf floor and the live walkable limit anywhere it
+				// looked — i.e. the wall is bare, or the ramp on it is a walk-up.
+				UE_LOG(LogTraceGame, Error,
+					TEXT("SURFTEST: no ridable side ramp on this level. The sweep in from the side wall found "
+					     "no run of samples inside the live band %.4f < Nz < %.4f (%.2f..%.2f deg). Either the "
+					     "wall is bare or what is on it is walkable."),
+					GetSurfMinNormalZ(), GetWalkableFloorZ(),
+					FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(GetWalkableFloorZ(), -1.f, 1.f))),
+					FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(GetSurfMinNormalZ(), -1.f, 1.f))));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("SURFTEST: this level has no surf rails (bBuildSurfRails off, or a baked map that was "
+					     "baked before they existed). Run on /Game/Maps/Arena."));
+			}
 		}
 		return;
 	}
@@ -1999,6 +2071,51 @@ void UTraceCharacterMovementComponent::TickSurfApproachRun(float DeltaSeconds)
 			Row.PeakAfterContact = FMath::Max(Row.PeakAfterContact, Planar);
 		}
 
+		Row.HighestZ = FMath::Max(Row.HighestZ, static_cast<float>(Here.Z));
+		Row.DeepestInset = FMath::Min(Row.DeepestInset, Inset);
+		Row.EndedAt = Here;
+
+		// -TraceSurfFrameTrace, ON THE APPROACH TOO. It used to be wired only into the exit rig, and
+		// that is the arm that needed it least: an exit run starts ON the face and the summary already
+		// says where it landed. An APPROACH run that reports "no surf" has failed somewhere between the
+		// floor and the band and the summary cannot say where — the same six-identical-rows problem the
+		// climb columns above were added for, one level deeper. The face angle column is the one that
+		// matters here: it says which facet the pawn was standing on when it stopped climbing.
+		if (SurfFrameTraceEnabled())
+		{
+			const FVector Plane = IsSurfing() ? GetSurfPlaneNormal() : CurrentFloor.HitResult.ImpactNormal;
+			const float FaceDegrees = Plane.IsNearlyZero()
+				? -1.f
+				: FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(static_cast<float>(Plane.Z), -1.f, 1.f)));
+
+			// WHAT IS IN FRONT OF THE PAWN, named, with its normal. The columns above can say a run
+			// stopped and cannot say what stopped it: the first steepened ramp read "face=0.00" and
+			// "planar 976 -> 0" in consecutive frames, which is a pawn on flat ground hitting something
+			// vertical, and nothing in the arena's visibility profile at that spot is vertical. A
+			// forward sweep of the pawn's OWN capsule answers it directly, on the pawn's own channel.
+			FString Ahead = TEXT("clear");
+			if (const UCapsuleComponent* Capsule = CharacterOwner->GetCapsuleComponent())
+			{
+				FCollisionQueryParams AheadParams(SCENE_QUERY_STAT(TraceSurfApproachAhead), false, CharacterOwner);
+				FHitResult AheadHit;
+				const FVector Step = Approach.GetSafeNormal() * 60.f;
+				if (GetWorld()->SweepSingleByChannel(AheadHit, Here, Here + Step, FQuat::Identity,
+					ECC_Pawn, FCollisionShape::MakeCapsule(Capsule->GetScaledCapsuleRadius(),
+						Capsule->GetScaledCapsuleHalfHeight()), AheadParams))
+				{
+					Ahead = FString::Printf(TEXT("'%s' n=%s (Nz %.3f) at %s t=%.2f"),
+						*GetNameSafe(AheadHit.GetComponent()), *AheadHit.ImpactNormal.ToCompactString(),
+						AheadHit.ImpactNormal.Z, *AheadHit.ImpactPoint.ToCompactString(), AheadHit.Time);
+				}
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SURFFRAME run=%d approach t=%6.3f X=%8.1f Y=%8.1f Z=%7.1f planar=%7.1f Vz=%+8.1f "
+				     "face=%6.2f surf=%d gnd=%d inset=%7.1f ahead=%s"),
+				RigRun() + 1, RigPhaseClock(), Here.X, Here.Y, Here.Z, Planar, Velocity.Z,
+				FaceDegrees, IsSurfing() ? 1 : 0, IsMovingOnGround() ? 1 : 0, Inset, *Ahead);
+		}
+
 		if (IsSurfing())
 		{
 			Row.bSurfed = true;
@@ -2026,10 +2143,12 @@ void UTraceCharacterMovementComponent::TickSurfApproachRun(float DeltaSeconds)
 
 			UE_LOG(LogTraceGame, Display,
 				TEXT("SURFAPPROACH run %d/%d  %2.0f deg  start %5.0f -> contact %5.0f (at %s) | min after "
-				     "contact %5.0f | peak %5.0f | final %5.0f | surfed=%d for %.2f s | reachedFace=%d"),
+				     "contact %5.0f | peak %5.0f | final %5.0f | surfed=%d for %.2f s | reachedFace=%d | "
+				     "climbed to Z %.0f, %.0f uu inboard of the toe, ended at %s"),
 				RigRun() + 1, SurfApproachCount, Row.AngleDegrees, Row.StartSpeed, Row.SpeedAtContact,
 				*Row.ContactAt.ToCompactString(), Row.MinAfterContact, Row.PeakAfterContact,
-				Row.FinalSpeed, Row.bSurfed ? 1 : 0, Row.SurfSeconds, Row.bReachedFace ? 1 : 0);
+				Row.FinalSpeed, Row.bSurfed ? 1 : 0, Row.SurfSeconds, Row.bReachedFace ? 1 : 0,
+				Row.HighestZ, -Row.DeepestInset, *Row.EndedAt.ToCompactString());
 
 			++RigRun();
 			RigPhase() = ESurfRigPhase::Place;

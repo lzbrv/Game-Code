@@ -106,6 +106,7 @@
 
 import json
 import os
+import time
 import re
 import sys
 
@@ -129,6 +130,12 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 CENSUS_PATH = os.environ.get(
     "TRACE_REBAKE_CENSUS", os.path.join(PROJECT_ROOT, "Saved", "rebake_census.json"))
+
+# How old a census may be before the restore phase refuses it. Six hours is chosen to be
+# comfortably longer than any full census->bake->restore run (the longest measured is well
+# under an hour) and far shorter than "yesterday's file is still lying around".
+CENSUS_MAX_AGE_HOURS = float(os.environ.get("TRACE_REBAKE_CENSUS_MAX_AGE_HOURS", "6"))
+ALLOW_STALE_CENSUS = os.environ.get("TRACE_REBAKE_ALLOW_STALE_CENSUS", "") not in ("", "0")
 
 # The bake's own vocabulary. Changing any of these in TraceArenaBake.cpp without
 # changing them here would make the census mis-sort the hand layer, so they are
@@ -958,6 +965,14 @@ if IN_EDITOR:
         out = {
             "map": MAP_PATH,
             "engine": str(unreal.SystemLibrary.get_engine_version()),
+            # Stamped so phase_restore can refuse a STALE census. A census records the
+            # hand layer's transforms as they were when it ran; restoring from an old one
+            # silently reverts every hand edit made since. That is not hypothetical — the
+            # side ramps were re-scaled and re-sunk to make them surfable, and the census
+            # sitting on disk still held their old shallow transforms, so a bare restore
+            # would have quietly undone the whole change and still reconciled clean.
+            "captured_unix": time.time(),
+            "captured_utc": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
             "census_a": data,
             "stems_a": stems,
         }
@@ -1236,6 +1251,30 @@ if IN_EDITOR:
             raise RuntimeError("{0} not found - run the census phase first".format(CENSUS_PATH))
         with open(CENSUS_PATH, "r") as handle:
             census = json.load(handle)
+
+        # STALE-CENSUS GUARD. The full run does census -> bake -> restore in one go, so the
+        # file is fresh by construction. But TRACE_REBAKE_PHASE lets restore run on its own,
+        # and then whatever census happens to be on disk is treated as the truth about the
+        # hand layer. An old one reverts every hand edit made since it was taken, reconciles
+        # BALANCED, and reports success — the same shape as the unit-scale trap this script
+        # already carries a guard for.
+        captured = census.get("captured_unix")
+        age_hours = (time.time() - captured) / 3600.0 if captured else None
+        if captured is None:
+            log("*** CENSUS HAS NO TIMESTAMP (written by an older version). Cannot tell whether "
+                "it describes the CURRENT hand layer. Re-run the census phase unless you are "
+                "certain nothing has moved since it was written. ***")
+        else:
+            log("Census was captured {0} ({1:.2f} hours ago).".format(
+                census.get("captured_utc", "?"), age_hours))
+            if age_hours > CENSUS_MAX_AGE_HOURS and not ALLOW_STALE_CENSUS:
+                raise RuntimeError(
+                    "census at {0} is {1:.1f} hours old (limit {2}). Restoring from it would "
+                    "revert any hand edit made since it was taken. Re-run the census phase, or "
+                    "set TRACE_REBAKE_ALLOW_STALE_CENSUS=1 if you have checked that nothing "
+                    "in the hand layer has moved.".format(
+                        CENSUS_PATH, age_hours, CENSUS_MAX_AGE_HOURS))
+
         census_a = census["census_a"]
 
         open_map()
