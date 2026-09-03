@@ -10,6 +10,7 @@
 #include "Gameplay/TraceCore.h"        // Trace.Arena.GoalSides grants the Core and reads the tally
 #include "Gameplay/TraceEndzone.h"
 #include "World/TraceCoreSpawn.h"       // spec v17 §2 - the placed Core spawn marker
+#include "World/TraceSideRampProfile.h" // the concave side ramps' design, and its live-band check
 #include "World/TraceTeamPlayerStart.h"
 
 #include "Components/BoxComponent.h"
@@ -2727,6 +2728,7 @@ void ATraceArenaBuilder::EnsureBuilt()
 	{
 		AdoptBakedArena();
 		WarnIfHitscanRangeIsShort();
+		WarnIfSideRampProfileIsOutOfBand();
 		return;
 	}
 
@@ -2777,6 +2779,57 @@ void ATraceArenaBuilder::WarnIfHitscanRangeIsShort() const
 		     "Trace.Arena.VerifyHitscanReach measures it properly, against the real geometry."),
 		RangeUU, FieldLength, FieldWidth, DiagonalUU, DiagonalUU - RangeUU,
 		FMath::CeilToFloat(DiagonalUU / 100.f) * 100.f);
+}
+
+// =================================================================================================
+// THE SIDE RAMPS' WALK-UP / SURF SPLIT, RE-CHECKED AGAINST THE LIVE BAND.
+//
+// See TraceSideRampProfile.h for the design and for the build-time half of this check. The split is
+// the whole design: the owner's parabola is shipped at an aspect ratio chosen so that its lower half
+// is under the walkable limit (you run up it) and its upper half is inside the surf band (you ride
+// it), continuously, with no seam. Move either edge of the band and the mesh does not change — the
+// walk-up silently becomes unwalkable, or the face silently becomes a wall, and the only symptom is
+// that players stop getting a ride they used to get.
+//
+// Reads the band off the movement CDO, which is where Trace.Arena.SideRamp reads it and where the
+// surf harness reads it, so all three move together or none of them do.
+// =================================================================================================
+void ATraceArenaBuilder::WarnIfSideRampProfileIsOutOfBand() const
+{
+	const UTraceCharacterMovementComponent* CDO =
+		UTraceCharacterMovementComponent::StaticClass()->GetDefaultObject<UTraceCharacterMovementComponent>();
+	if (CDO == nullptr)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Arena] side-ramp profile check skipped: no UTraceCharacterMovementComponent CDO."));
+		return;
+	}
+
+	// THROUGH GetSurfSlopeBandDegrees, not through the two normal-Z accessors: it is the ONE public
+	// face of both edges of the band, it is where Trace.Arena.SideRamp reads them, and converting back
+	// here keeps this instrument honest if either edge is ever clamped inside the component.
+	float BandLoDeg = 0.f;
+	float BandHiDeg = 0.f;
+	CDO->GetSurfSlopeBandDegrees(BandLoDeg, BandHiDeg);
+
+	FString Reason;
+	const bool bInBand = TraceSideRampProfile::ValidateAgainstLiveBand(
+		FMath::Cos(FMath::DegreesToRadians(BandLoDeg)),
+		FMath::Cos(FMath::DegreesToRadians(BandHiDeg)), Reason);
+
+	if (bInBand)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[Arena][SIDERAMP-PROFILE] IN BAND: %s"), *Reason);
+		return;
+	}
+
+	UE_LOG(LogTraceGame, Error,
+		TEXT("[Arena][SIDERAMP-PROFILE] *** THE SIDE RAMPS NO LONGER SPAN THE SURF BAND. *** %s  The mesh "
+		     "SM_SideRampConcave was generated from the constants in Source/Trace/World/TraceSideRampProfile.h "
+		     "against the band literals asserted there; a knob has moved out from under it. Either put the "
+		     "band back, or change kDepthUU/kHeightUU (the build asserts will tell you which way) and "
+		     "re-run Scripts/generate_side_ramp.py + Scripts/import_side_ramp.py."),
+		*Reason);
 }
 
 void ATraceArenaBuilder::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -13249,6 +13302,23 @@ namespace
 			     "(walkable floor Nz %.4f, surf floor Nz %.4f). Reach %.0f uu in %.1f uu steps, "
 			     "WorldStatic traces. ====="),
 			BandLoDeg, BandHiDeg, WalkZ, SurfZ, Reach, SampleStep);
+
+		// THE DESIGN, AND WHETHER IT IS STILL INSIDE THAT BAND. Printed here as well as at startup so a
+		// cross-section and the design it was cut to can never be quoted from two different runs.
+		{
+			FString ProfileReason;
+			const bool bProfileInBand = TraceSideRampProfile::ValidateAgainstLiveBand(WalkZ, SurfZ, ProfileReason);
+			UE_LOG(LogTraceGame, Display, TEXT("[SIDERAMP] design: %s"), *TraceSideRampProfile::Describe());
+			if (bProfileInBand)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[SIDERAMP] design vs live band: IN BAND -- %s"), *ProfileReason);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[SIDERAMP] design vs live band: *** OUT OF BAND *** -- %s"), *ProfileReason);
+			}
+		}
 
 		// ECC_Visibility with every pawn ignored — GetSideRampProbe's Sweep() carries the full reason:
 		// the walls' pawn-only standoff shells swallow an object-type query, and a bot standing on the

@@ -104,6 +104,35 @@ MIC_TABLE = (
      {"Color": (0.18, 0.78, 1.00, 1.0)},               # NeonNeutral
      {"Glow": 3.2},                                    # GlowLip
      {}),
+    # ---- the concave side ramps' neon (Scripts/import_side_ramp.py binds these)
+    #
+    # The owner's tron-concave-ramp.obj carries TWO tiers of light: cyan
+    # edge_light_l/r + lane_light_1..4 climbing the face, and AMBER
+    # takeoff_lip_light + entry_threshold across its two ends. The hierarchy is
+    # the point - the ends dominate, the lines up the face are secondary.
+    #
+    # THE COLOUR IS NOT AMBER HERE, DELIBERATELY. This arena has exactly two neon
+    # colours (TraceArenaBuilder.cpp: NeonNeutral 0.18/0.78/1.00 and
+    # NeonNeutralPale 0.55/0.92/1.00) plus the two team colours, and no amber
+    # anywhere; a 384 m amber line down both sidelines would introduce a third
+    # neutral colour to the whole game rather than port the owner's ramp. So the
+    # HIERARCHY is carried in the arena's own language: pale at GlowLip 3.2 for
+    # the lip and threshold, neutral at GlowFace 1.7 for the lines up the face -
+    # which is exactly how this arena already separates a dominant top lip from
+    # secondary face trim (see GlowFace's comment in TraceArenaBuilder.cpp).
+    # Making them amber is one Color value in each of the two rows below.
+    #
+    # Neutral, never team-tinted: these run the FULL length of the field and
+    # cross both halves, so they need no FTraceBakedSideTint entry and are
+    # invisible to the half-time repaint - the same call the centre kit made.
+    ("MI_Neon_SideRamp_Lane", "M_TraceNeon",
+     {"Color": (0.18, 0.78, 1.00, 1.0)},               # NeonNeutral
+     {"Glow": 1.7},                                    # GlowFace - secondary
+     {}),
+    ("MI_Neon_SideRamp_Lip", "M_TraceNeon",
+     {"Color": (0.55, 0.92, 1.00, 1.0)},               # NeonNeutralPale
+     {"Glow": 3.2},                                    # GlowLip - dominant
+     {}),
     ("MI_Surface_Floor_Grid", "M_TraceSurface",
      {"BaseColor": (0.0110, 0.0135, 0.0190, 1.0),      # FloorColor
       "GridColor": (0.18, 0.78, 1.00, 1.0)},           # NeonNeutral

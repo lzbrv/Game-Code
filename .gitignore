@@ -251,3 +251,14 @@ Art/Fonts/*.pdf
 # Throwaway capture scaffolding written by Scripts/pose-hands.sh (documented as
 # throwaway in that script). Regenerated on demand; never part of a build.
 /Content/Trace/Temp/
+
+# ── The owner's hand-authored concave ramp ────────────────────────────────────
+# *.obj is ignored above because every other .obj in this repo is GENERATED —
+# railgun_glb_to_obj.py and generate_side_ramp.py both emit them, and the side
+# ramp's trim alone is 8.7 MB per regeneration. This one is the exception: it is
+# hand-modelled source art, it cannot be regenerated from anything in the repo,
+# and it is the reference that generate_side_ramp.py --verify measures the
+# shipped profile against (max normalised deviation 2.3e-05, with a circular arc
+# through the same endpoints rejected at 2.5e-01). Losing it would cost the
+# provenance check and the only copy of the original.
+!Art/SideRamp/tron-concave-ramp.obj

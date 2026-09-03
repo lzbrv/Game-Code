@@ -1,0 +1,12 @@
+# Trace - generated. Slot NAMES are the contract; the arena's own authored
+# MICs are bound over these by Scripts/import_side_ramp.py.
+newmtl sideramp_neon_lane
+Kd 0.180 0.780 1.000
+d 1.0
+illum 2
+
+newmtl sideramp_neon_lip
+Kd 0.550 0.920 1.000
+d 1.0
+illum 2
+

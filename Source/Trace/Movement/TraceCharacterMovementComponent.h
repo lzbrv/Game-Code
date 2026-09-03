@@ -1085,11 +1085,35 @@ public:
 	 */
 	void TickSurfApproachRun(float DeltaSeconds);
 
+	/**
+	 * THE WALK-UP RIG. Enabled with -TraceSurfWalkUpTest (with -TraceSurfSideRampTest to aim it).
+	 *
+	 * The concave side ramps are designed so their lower half is a WALKABLE run-up and their upper
+	 * half is a surfable face, continuously. Every other rig in this file measures the second half.
+	 * Nothing measured the first, and the first is the half that can be silently destroyed by a
+	 * BodySetup: SM_KitRamp — the mesh these ramps replace — carries WalkableSlopeOverride
+	 * DECREASE/0 deg plus PhysMat_Ice, which makes EVERY face of it unwalkable at ANY angle, and two
+	 * reports argued about a "28.5 degree walk-up" that no body could ever have climbed.
+	 *
+	 * A cross-section cannot see that: Trace.Arena.SideRamp's "highest walk-up" column is computed
+	 * from a VISIBILITY trace and reported 316.5 uu on a surface a pawn was physically stopped dead
+	 * by. The only instrument that can tell the truth here is a pawn, walking, so this walks one:
+	 * placed on the floor outboard of the toe, driven at the wall at a ladder of ANALOG INPUT SCALES
+	 * (0.25 is a walk, 1.00 is a sprint), reporting the highest Z it reached WHILE STILL ON THE
+	 * GROUND, the steepest facet it stood on, and the frame the ground handed it over to the ride.
+	 *
+	 * The first rung is the control and it runs PARALLEL to the wall on flat floor: it must climb 0.
+	 */
+	void TickSurfWalkUpRun(float DeltaSeconds);
+
 	/** The exit rig's table. Public for the same reason LogSurfReport() is — see that method. */
 	void LogSurfExitTable() const;
 
 	/** The approach rig's table. */
 	void LogSurfApproachTable() const;
+
+	/** The walk-up rig's table. */
+	void LogSurfWalkUpTable() const;
 
 	/**
 	 * SPEC v8 §5 — "the two dash charges aren't working anymore, for the carrier", answered ON A CLIENT

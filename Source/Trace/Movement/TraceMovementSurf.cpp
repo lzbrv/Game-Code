@@ -781,6 +781,134 @@ namespace TraceMovementSurf
 	/** How long an approach stands still first, so it starts from the floor and not from a fall. */
 	static constexpr float SurfApproachSettleSeconds = 0.35f;
 
+	/**
+	 * -TraceSurfApproachSpeed=<0..1>: run the approach ladder at a FRACTION of the ground limit.
+	 *
+	 * The rig was written to answer "does running at a ramp at ordinary floor speed give anything
+	 * back", so it starts every rung at exactly GetMaxSpeed(). That is the right default and it is
+	 * only one speed. A ramp whose entrance is a WALK-UP has to work for somebody arriving slowly as
+	 * well — a player who jogs at it, or who is already on the ramp when they turn into the face —
+	 * and a rig that can only test the top speed cannot say whether it does.
+	 *
+	 * Defaults to 1.0, so an unflagged run is byte-for-byte the run every previous report quotes.
+	 * Clamped to [0.05, 1.0]: above the ground limit is not a thing a player can do on the floor, and
+	 * a rig that started above it would be measuring a teleport.
+	 */
+	static float SurfApproachSpeedScale()
+	{
+#if UE_BUILD_SHIPPING
+		return 1.f;
+#else
+		static const float Scale = []()
+		{
+			float Parsed = 1.f;
+			if (!FParse::Value(FCommandLine::Get(), TEXT("TraceSurfApproachSpeed="), Parsed))
+			{
+				return 1.f;
+			}
+			return FMath::Clamp(Parsed, 0.05f, 1.f);
+		}();
+		return Scale;
+#endif
+	}
+
+	// =============================================================================================
+	// THE WALK-UP RIG — -TraceSurfWalkUpTest
+	//
+	// See UTraceCharacterMovementComponent::TickSurfWalkUpRun's header for WHY this exists at all.
+	// The short version: the concave ramp's whole design is that its bottom half is walkable, and the
+	// only thing that can prove a surface is walkable is a pawn that walks it. A cross-section
+	// cannot — SM_KitRamp's asset-level WalkableSlopeOverride made every face of the OLD side ramps
+	// unwalkable at any angle while the visibility trace happily reported a 316.5 uu walk-up.
+	// =============================================================================================
+
+	struct FSurfWalkUpSample
+	{
+		float InputScale = 0.f;        // AnalogInputModifier: 0.25 is a walk, 1.00 is the ground limit
+		float BearingDegrees = 0.f;    // 0 = parallel to the wall (the control), 90 = straight at it
+
+		// HEIGHT OF THE PAWN'S FEET ABOVE THE FLOOR, not of its capsule's centre. The first measured
+		// table read 90.2 uu for a pawn standing on flat ground and declared the parallel CONTROL a
+		// climb, which is the shape of that bug: the capsule is 88 uu in half-height and its origin is
+		// its middle.
+		float HighestWalkedZ = 0.f;    // highest FEET Z reached WHILE IsMovingOnGround() — the point
+		float HighestWalkedFacetDeg = 0.f;   // the facet under the pawn at that highest point
+		float SteepestWalkedDeg = 0.f;       // the steepest facet it stood on ANYWHERE in the run
+		float DeepestWalkedInset = 0.f;      // how far inboard of the toe it walked, uu
+
+		float HandoffZ = -1.f;         // Z of the first frame that left the ground for a surf
+		float HandoffFacetDeg = -1.f;  // the face angle on that frame
+		float HandoffSeconds = -1.f;
+
+		float SurfSeconds = 0.f;
+		float PeakSpeed = 0.f;
+		float FinalZ = 0.f;
+		float StallSeconds = 0.f;      // longest run of frames ASKING to move and not moving
+		bool bSurfed = false;
+		bool bReachedRamp = false;
+		FVector EndedAt = FVector::ZeroVector;
+		FString StoppedBy;             // what the forward capsule probe named when the pawn stalled
+	};
+
+	static TArray<FSurfWalkUpSample>& SurfWalkUpRows()
+	{
+		static TArray<FSurfWalkUpSample> Rows;
+		return Rows;
+	}
+
+	static FSurfWalkUpSample& RigWalkUp() { static FSurfWalkUpSample S; return S; }
+
+	/** Longest stall seen so far in the current run, and the clock that measures it. */
+	static float& RigStallClock() { static float T = 0.f; return T; }
+
+	/**
+	 * The walk-up ladder: analog input scale, and the bearing to the wall.
+	 *
+	 * RUNG 0 IS THE CONTROL and it can fail: input 1.0 at 0 degrees runs PARALLEL to the wall across
+	 * flat floor and must climb nothing. If the control ever reports a climb, the placement is wrong
+	 * and every other row on the table is worthless.
+	 *
+	 * 0.25 is the rung that matters. UCharacterMovementComponent scales its speed cap by
+	 * AnalogInputModifier, so AddMovementInput(Dir, 0.25) really is a quarter-speed walk and not a
+	 * sprint with a smaller push: a pawn that climbs at 0.25 climbs because the surface is walkable,
+	 * not because it arrived with enough momentum to be carried up something it could not stand on.
+	 */
+	struct FSurfWalkUpRung { float InputScale; float BearingDegrees; };
+	static constexpr FSurfWalkUpRung SurfWalkUpLadder[] = {
+		{ 1.00f,  0.f },    // CONTROL: parallel to the wall, on the floor. Must climb 0.
+		{ 0.25f, 90.f },    // a walk, straight at the face
+		{ 0.40f, 90.f },
+		{ 0.70f, 90.f },
+		{ 1.00f, 90.f },
+		{ 0.25f, 45.f },    // a walk, angled — the way a player actually arrives
+		{ 1.00f, 45.f },
+	};
+	static constexpr int32 SurfWalkUpCount = UE_ARRAY_COUNT(SurfWalkUpLadder);
+
+	/** Seconds one walk-up run is followed for. Long enough for a 0.25-scale walk to cross 1000 uu. */
+	static constexpr float SurfWalkUpSeconds = 8.0f;
+
+	/** How far outboard of the toe a walk-up starts, uu. Clear of the ramp, on flat floor. */
+	static constexpr float SurfWalkUpStandoff = 420.f;
+
+	/** Settle before walking, so the run starts from the floor and not from a drop. */
+	static constexpr float SurfWalkUpSettleSeconds = 0.5f;
+
+	/**
+	 * -TraceSurfWalkUpTest: prove the run-up is a run-up.
+	 *
+	 * Guarded like every other arm in this file: the switch does not survive a Shipping link.
+	 */
+	static bool SurfWalkUpTestArm()
+	{
+#if UE_BUILD_SHIPPING
+		return false;
+#else
+		static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfWalkUpTest"));
+		return bFromCommandLine;
+#endif
+	}
+
 	/** Settle after an exit-rig placement, before the ride is measured. Longer than the surf grace. */
 	static constexpr float SurfExitSettleSeconds = 0.15f;
 
@@ -980,7 +1108,8 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 	static const bool bNetMode = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfNetTest"));
 	static const bool bExitMode = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfExitTest"));
 	static const bool bApproachMode = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfApproachTest"));
-	const bool bEnabled = bLadderMode || bNetMode || bExitMode || bApproachMode;
+	const bool bWalkUpMode = TraceMovementSurf::SurfWalkUpTestArm();
+	const bool bEnabled = bLadderMode || bNetMode || bExitMode || bApproachMode || bWalkUpMode;
 	if (!bEnabled || CharacterOwner == nullptr || UpdatedComponent == nullptr)
 	{
 		return;
@@ -1115,7 +1244,7 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 	// DEMO 29 ITEM 4 — THE TRANSITION RIGS. Everything below this block belongs to Patch 28's ladder
 	// and net arms and is untouched; these two modes return before reaching it.
 	// =============================================================================================
-	if (bExitMode || bApproachMode)
+	if (bExitMode || bApproachMode || bWalkUpMode)
 	{
 		using namespace TraceMovementSurf;
 
@@ -1124,7 +1253,8 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 			return;
 		}
 
-		const int32 TotalRigRuns = bExitMode ? SurfExitLadderCount : SurfApproachCount;
+		const int32 TotalRigRuns = bExitMode ? SurfExitLadderCount
+			: (bWalkUpMode ? SurfWalkUpCount : SurfApproachCount);
 
 		if (RigRun() < 0)
 		{
@@ -1138,11 +1268,12 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 			RigPhase() = ESurfRigPhase::Place;
 			SurfExitRows().Reset();
 			SurfApproachRows().Reset();
+			SurfWalkUpRows().Reset();
 
 			UE_LOG(LogTraceGame, Display,
 				TEXT("SURF%s ---- begin. rail %d..%d deg, crest %.0f uu, run %.0f uu | toe on the floor at "
 				     "%s | ground limit %.0f uu/s | air hard cap %.0f | surf ceiling %.0f | %d runs"),
-				bExitMode ? TEXT("EXIT") : TEXT("APPROACH"),
+				bExitMode ? TEXT("EXIT") : (bWalkUpMode ? TEXT("WALKUP") : TEXT("APPROACH")),
 				FMath::RoundToInt(Probe.MinFaceAngleDegrees), FMath::RoundToInt(Probe.MaxFaceAngleDegrees),
 				Probe.Height, Probe.RunLength, *Probe.ToeOnFloor.ToCompactString(),
 				GetMaxSpeed(), GetAirStrafeHardCapSpeed(),
@@ -1156,6 +1287,10 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 			{
 				LogSurfExitTable();
 			}
+			else if (bWalkUpMode)
+			{
+				LogSurfWalkUpTable();
+			}
 			else
 			{
 				LogSurfApproachTable();
@@ -1167,6 +1302,10 @@ void UTraceCharacterMovementComponent::TickSurfTest(float DeltaSeconds)
 		if (bExitMode)
 		{
 			TickSurfExitRun(DeltaSeconds);
+		}
+		else if (bWalkUpMode)
+		{
+			TickSurfWalkUpRun(DeltaSeconds);
 		}
 		else
 		{
@@ -2041,7 +2180,9 @@ void UTraceCharacterMovementComponent::TickSurfApproachRun(float DeltaSeconds)
 		{
 			// AT THE GROUND LIMIT, not above it: the complaint is about a player at ordinary floor
 			// speed, so the run starts at exactly what GetMaxSpeed() allows and nothing is carried in.
-			Velocity = Approach * FMath::Max(1.f, GetMaxSpeed());
+			// -TraceSurfApproachSpeed=<0..1> scales it DOWN and only down (see the knob), so the whole
+			// ladder can be re-run at a jog against a ramp whose entrance is a walk-up.
+			Velocity = Approach * FMath::Max(1.f, GetMaxSpeed() * SurfApproachSpeedScale());
 			Row.StartSpeed = GetPlanarSpeed();
 			Row.MinAfterContact = Row.StartSpeed;
 			RigPhaseClock() = 0.f;
@@ -2129,7 +2270,12 @@ void UTraceCharacterMovementComponent::TickSurfApproachRun(float DeltaSeconds)
 		else
 		{
 			SurfTestWishYawValid() = false;
-			CharacterOwner->AddMovementInput(Approach, 1.f);
+			// THE SAME SCALE AS THE ENTRY VELOCITY, not 1.0. UCharacterMovementComponent caps ground
+			// speed at GetMaxSpeed() * AnalogInputModifier, and AnalogInputModifier comes from the size
+			// of this vector — so pushing at 1.0 after entering at 0.35 would accelerate the pawn back
+			// to the ground limit within a few frames and the whole "slow approach" arm would silently
+			// be the full-speed arm again, with a lower number in the start column to say otherwise.
+			CharacterOwner->AddMovementInput(Approach, SurfApproachSpeedScale());
 			if (PC != nullptr)
 			{
 				PC->SetControlRotation(Approach.Rotation());
@@ -2160,6 +2306,327 @@ void UTraceCharacterMovementComponent::TickSurfApproachRun(float DeltaSeconds)
 		RigPhase() = ESurfRigPhase::Place;
 		break;
 	}
+}
+
+// =================================================================================================
+// THE WALK-UP RIG — CAN A PAWN CLIMB THE BOTTOM OF THE CONCAVE RAMP, AT WALKING PACE?
+// =================================================================================================
+//
+// The owner supplied a concave ramp and the reason it is the right answer is that its shallow lower
+// half is the WAY ON. That claim is worth nothing unless a body can actually walk it, and the way it
+// dies is silent: an asset-level BodySetup override (WalkableSlopeOverride, or a PhysMat) makes a
+// surface unwalkable at ANY angle without changing one degree of its geometry. SM_KitRamp — the mesh
+// this ramp replaces — carries exactly that, and it stopped a pawn dead at the toe of a face whose
+// traced normal read 0.879 (a 28.5 degree slope every ordinary rule calls walkable).
+//
+// So this rig does not read a normal. It walks a pawn at the ramp and reports HOW HIGH IT GOT WHILE
+// STILL ON THE GROUND, which is a number no override can lie about.
+// =================================================================================================
+void UTraceCharacterMovementComponent::TickSurfWalkUpRun(float DeltaSeconds)
+{
+	using namespace TraceMovementSurf;
+
+	if (CharacterOwner == nullptr || UpdatedComponent == nullptr)
+	{
+		return;
+	}
+
+	const ATraceArenaBuilder::FTraceSurfRailProbe Probe = ProbeForPawn(*this);
+	if (!Probe.bValid)
+	{
+		return;
+	}
+
+	APlayerController* PC = Cast<APlayerController>(CharacterOwner->GetController());
+	FSurfWalkUpSample& Row = RigWalkUp();
+	const FVector Here = UpdatedComponent->GetComponentLocation();
+
+	const FSurfWalkUpRung& Rung = SurfWalkUpLadder[FMath::Clamp(RigRun(), 0, SurfWalkUpCount - 1)];
+	const FVector Inboard = Probe.FaceNormal.GetSafeNormal2D();   // ramp -> field
+	const FVector TowardFace = -Inboard;
+	const float BearingRad = FMath::DegreesToRadians(Rung.BearingDegrees);
+	const FVector Walk =
+		(Probe.RunDirection * FMath::Cos(BearingRad) + TowardFace * FMath::Sin(BearingRad)).GetSafeNormal();
+
+	// The FLOOR under the toe, so a run's Z is measured from the floor and not from wherever the level
+	// happens to put its origin.
+	const float FloorZ = static_cast<float>(Probe.ToeOnFloor.Z);
+
+	switch (RigPhase())
+	{
+	case ESurfRigPhase::Place:
+	{
+		Row = FSurfWalkUpSample();
+		Row.InputScale = Rung.InputScale;
+		Row.BearingDegrees = Rung.BearingDegrees;
+		RigStallClock() = 0.f;
+
+		// OUTBOARD OF THE TOE, ON THE FLOOR, and backed along the wall so the angled rungs still have
+		// room to close. The control rung (0 degrees) starts in the same place and simply never turns
+		// toward the ramp.
+		const float BackOff = (Rung.BearingDegrees <= 1.f)
+			? 0.f
+			: FMath::Min(1400.f, SurfWalkUpStandoff / FMath::Max(0.05f, FMath::Tan(BearingRad)));
+
+		const FVector Start = Probe.ToeOnFloor
+			+ Inboard * SurfWalkUpStandoff
+			- Probe.RunDirection * BackOff
+			+ FVector(0.f, 0.f, 120.f);
+
+		CharacterOwner->TeleportTo(Start, Walk.Rotation(), false, true);
+		Velocity = FVector::ZeroVector;
+		SetMovementMode(MOVE_Walking);
+
+		SurfContactRemaining = 0.f;
+		SurfPlaneNormal = FVector::ZeroVector;
+		SurfEntrySpeed = 0.f;
+		SurfElapsedSeconds = 0.f;
+
+		RigPhaseClock() = 0.f;
+		RigPhase() = ESurfRigPhase::Settle;
+
+		if (PC != nullptr)
+		{
+			PC->SetControlRotation(Walk.Rotation());
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("SURFWALKUP   placing run %d/%d: input scale %.2f, %2.0f deg to the wall, from %s "
+			     "(asked %s), toe on the floor at %s, standoff %.0f uu"),
+			RigRun() + 1, SurfWalkUpCount, Rung.InputScale, Rung.BearingDegrees,
+			*UpdatedComponent->GetComponentLocation().ToCompactString(), *Start.ToCompactString(),
+			*Probe.ToeOnFloor.ToCompactString(), SurfWalkUpStandoff);
+		break;
+	}
+
+	case ESurfRigPhase::Settle:
+	{
+		RigPhaseClock() += DeltaSeconds;
+		if (RigPhaseClock() >= SurfWalkUpSettleSeconds)
+		{
+			// NOTHING IS CARRIED IN. A walk-up starts from a standstill, because the question is
+			// whether the SURFACE can be climbed and not whether momentum can throw a pawn up it.
+			Velocity = FVector::ZeroVector;
+			RigPhaseClock() = 0.f;
+			RigPhase() = ESurfRigPhase::Ride;
+		}
+		break;
+	}
+
+	case ESurfRigPhase::Ride:
+	{
+		RigPhaseClock() += DeltaSeconds;
+
+		const float Planar = GetPlanarSpeed();
+		// FEET, not the capsule's centre — see FSurfWalkUpSample::HighestWalkedZ.
+		const float HalfHeight = (CharacterOwner->GetCapsuleComponent() != nullptr)
+			? CharacterOwner->GetCapsuleComponent()->GetScaledCapsuleHalfHeight()
+			: 88.f;
+		const float RelZ = static_cast<float>(Here.Z) - FloorZ - HalfHeight;
+		const float Inset = static_cast<float>(FVector::DotProduct(Here - Probe.ToeOnFloor, Inboard));
+		const bool bGrounded = IsMovingOnGround();
+		const FVector Plane = IsSurfing() ? GetSurfPlaneNormal() : CurrentFloor.HitResult.ImpactNormal;
+		const float FaceDegrees = Plane.IsNearlyZero()
+			? -1.f
+			: FMath::RadiansToDegrees(FMath::Acos(FMath::Clamp(static_cast<float>(Plane.Z), -1.f, 1.f)));
+
+		Row.PeakSpeed = FMath::Max(Row.PeakSpeed, Planar);
+		Row.FinalZ = RelZ;
+		Row.EndedAt = Here;
+		if (Inset < 20.f)
+		{
+			Row.bReachedRamp = true;
+		}
+
+		// THE ONE NUMBER THIS RIG EXISTS FOR. Height climbed WHILE THE PAWN IS STILL ON THE GROUND —
+		// not "height reached", which a pawn sliding up a face on momentum would also produce.
+		if (bGrounded && RelZ > Row.HighestWalkedZ)
+		{
+			Row.HighestWalkedZ = RelZ;
+			Row.HighestWalkedFacetDeg = FaceDegrees;
+			Row.DeepestWalkedInset = FMath::Min(Row.DeepestWalkedInset, Inset);
+		}
+		// SEPARATELY, the steepest thing it ever STOOD on. On a concave ramp the highest point and the
+		// steepest facet are the same place; on a TERRACED bank they are not, and the difference is
+		// exactly how you tell "climbed a ramp" from "climbed two flat steps and stopped".
+		if (bGrounded && FaceDegrees > Row.SteepestWalkedDeg && RelZ > 5.f)
+		{
+			Row.SteepestWalkedDeg = FaceDegrees;
+		}
+
+		// THE HANDOFF FRAME: the first frame the pawn is surfing, having previously been walking. On a
+		// correctly scaled concave ramp this is the frame the walk-up ends and the ride begins, and
+		// its face angle should be within a facet of the live walkable limit.
+		if (IsSurfing())
+		{
+			if (!Row.bSurfed)
+			{
+				Row.bSurfed = true;
+				Row.HandoffZ = RelZ;
+				Row.HandoffFacetDeg = FaceDegrees;
+				Row.HandoffSeconds = RigPhaseClock();
+				UE_LOG(LogTraceGame, Display,
+					TEXT("SURFWALKUP   run %d HANDOFF at t=%.3f: walked to Z %.1f on a %.2f deg facet, then "
+					     "the ground let go and the ride started. planar %.0f, %.0f uu inboard of the toe."),
+					RigRun() + 1, RigPhaseClock(), Row.HighestWalkedZ, Row.HighestWalkedFacetDeg,
+					Planar, -Inset);
+			}
+			Row.SurfSeconds += DeltaSeconds;
+		}
+
+		// A STALL IS "ASKING TO MOVE AND NOT MOVING", which is the shape of the ice-override failure:
+		// the pawn stands at the toe with full input and zero velocity, forever, and every other
+		// column looks like a pawn that simply chose to stop.
+		if (bGrounded && Planar < 15.f && RigPhaseClock() > 0.4f)
+		{
+			RigStallClock() += DeltaSeconds;
+			Row.StallSeconds = FMath::Max(Row.StallSeconds, RigStallClock());
+			if (Row.StoppedBy.IsEmpty() && RigStallClock() > 0.3f)
+			{
+				if (const UCapsuleComponent* Capsule = CharacterOwner->GetCapsuleComponent())
+				{
+					FCollisionQueryParams AheadParams(SCENE_QUERY_STAT(TraceSurfWalkUpAhead), false, CharacterOwner);
+					FHitResult AheadHit;
+					if (GetWorld()->SweepSingleByChannel(AheadHit, Here, Here + Walk * 60.f, FQuat::Identity,
+						ECC_Pawn, FCollisionShape::MakeCapsule(Capsule->GetScaledCapsuleRadius(),
+							Capsule->GetScaledCapsuleHalfHeight()), AheadParams))
+					{
+						Row.StoppedBy = FString::Printf(TEXT("'%s' n=%s Nz %.3f at %s"),
+							*GetNameSafe(AheadHit.GetComponent()), *AheadHit.ImpactNormal.ToCompactString(),
+							AheadHit.ImpactNormal.Z, *AheadHit.ImpactPoint.ToCompactString());
+					}
+					else
+					{
+						Row.StoppedBy = TEXT("nothing ahead - the floor itself refused to be climbed");
+					}
+				}
+			}
+		}
+		else
+		{
+			RigStallClock() = 0.f;
+		}
+
+		if (SurfFrameTraceEnabled())
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SURFWALK run=%d t=%6.3f Y=%8.1f Zrel=%7.1f planar=%7.1f Vz=%+8.1f face=%6.2f "
+				     "gnd=%d surf=%d inset=%7.1f"),
+				RigRun() + 1, RigPhaseClock(), Here.Y, RelZ, Planar, Velocity.Z, FaceDegrees,
+				bGrounded ? 1 : 0, IsSurfing() ? 1 : 0, Inset);
+		}
+
+		if (IsSurfing())
+		{
+			// Left alone once the ride starts. This rig is not measuring the ride — the approach and
+			// ladder rigs do that — it is measuring whether the ramp handed one over, and steering it
+			// after the handoff would mix the two.
+			SurfTestWishYawValid() = false;
+		}
+		else
+		{
+			SurfTestWishYawValid() = false;
+			CharacterOwner->AddMovementInput(Walk, Rung.InputScale);
+			if (PC != nullptr)
+			{
+				PC->SetControlRotation(Walk.Rotation());
+			}
+		}
+
+		if (RigPhaseClock() >= SurfWalkUpSeconds)
+		{
+			SurfWalkUpRows().Add(Row);
+
+			const FString StoppedByText = Row.StoppedBy.IsEmpty()
+				? FString()
+				: FString::Printf(TEXT(" stopped by %s"), *Row.StoppedBy);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("SURFWALKUP run %d/%d  input %.2f  %2.0f deg | WALKED (feet) to Z %6.1f on a %5.2f deg "
+				     "facet, steepest stood on %5.2f deg, %.0f uu inboard of the toe | peak %.0f uu/s | "
+				     "handoff Z %.1f at %.2f deg after %.2f s | surfed=%d for %.2f s | longest stall "
+				     "%.2f s%s | ended at %s"),
+				RigRun() + 1, SurfWalkUpCount, Row.InputScale, Row.BearingDegrees,
+				Row.HighestWalkedZ, Row.HighestWalkedFacetDeg, Row.SteepestWalkedDeg,
+				-Row.DeepestWalkedInset, Row.PeakSpeed,
+				Row.HandoffZ, Row.HandoffFacetDeg, Row.HandoffSeconds, Row.bSurfed ? 1 : 0,
+				Row.SurfSeconds, Row.StallSeconds, *StoppedByText,
+				*Row.EndedAt.ToCompactString());
+
+			++RigRun();
+			RigPhase() = ESurfRigPhase::Place;
+		}
+		break;
+	}
+
+	default:
+		RigPhase() = ESurfRigPhase::Place;
+		break;
+	}
+}
+
+void UTraceCharacterMovementComponent::LogSurfWalkUpTable() const
+{
+	using namespace TraceMovementSurf;
+
+	float BandLoDeg = 0.f;
+	float BandHiDeg = 0.f;
+	GetSurfSlopeBandDegrees(BandLoDeg, BandHiDeg);
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("========== SURFWALKUP: IS THE RUN-UP ACTUALLY WALKABLE? =========="));
+	UE_LOG(LogTraceGame, Display,
+		TEXT("  ground limit %.0f uu/s | live band %.2f..%.2f deg | 'walked to' is the highest Z reached "
+		     "WHILE STILL ON THE GROUND, which no BodySetup override can fake."),
+		GetMaxSpeed(), BandLoDeg, BandHiDeg);
+	UE_LOG(LogTraceGame, Display,
+		TEXT("  %-6s %-8s %-9s %-9s %-9s %-9s %-8s %-8s %s"),
+		TEXT("input"), TEXT("bearing"), TEXT("feetZ"), TEXT("at deg"), TEXT("steepest"),
+		TEXT("handoffZ"), TEXT("surf s"), TEXT("stall s"), TEXT("verdict"));
+
+	int32 Climbed = 0;
+	int32 HandedOff = 0;
+	int32 Attempts = 0;
+	bool bControlFailed = false;
+
+	for (const FSurfWalkUpSample& Row : SurfWalkUpRows())
+	{
+		const bool bControl = (Row.BearingDegrees <= 1.f);
+		// 60 uu is well past anything a capsule can be pushed up by a floor irregularity and well
+		// short of the 220.6 uu the design says the walk-up climbs to.
+		const bool bDidClimb = Row.HighestWalkedZ > 60.f;
+		if (bControl)
+		{
+			bControlFailed = bDidClimb;
+		}
+		else
+		{
+			++Attempts;
+			Climbed += bDidClimb ? 1 : 0;
+			HandedOff += Row.bSurfed ? 1 : 0;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("  %6.2f %8.0f %9.1f %9.2f %9.2f %9.1f %8.2f %8.2f  %s"),
+			Row.InputScale, Row.BearingDegrees, Row.HighestWalkedZ, Row.HighestWalkedFacetDeg,
+			Row.SteepestWalkedDeg, Row.HandoffZ, Row.SurfSeconds, Row.StallSeconds,
+			bControl
+				? (bDidClimb
+					? TEXT("*** CONTROL CLIMBED - the placement is wrong, discard this table ***")
+					: TEXT("CONTROL - runs parallel on the floor, climbs nothing"))
+				: (!Row.bReachedRamp
+					? TEXT("*** never reached the ramp ***")
+					: (!bDidClimb
+						? TEXT("*** COULD NOT CLIMB IT - the run-up is not a run-up ***")
+						: (Row.bSurfed
+							? TEXT("walked up it, then the face took over: WALK -> SURF")
+							: TEXT("walked up it, but never reached the surfable face")))));
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("  VERDICT: %d of %d walked up the run-up; %d of those went on to a ride. Control climbed: %s."),
+		Climbed, Attempts, HandedOff, bControlFailed ? TEXT("YES - TABLE INVALID") : TEXT("no"));
+	UE_LOG(LogTraceGame, Display, TEXT("=================================================================="));
 }
 
 void UTraceCharacterMovementComponent::LogSurfExitTable() const

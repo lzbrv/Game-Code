@@ -500,6 +500,23 @@ public:
 	void WarnIfHitscanRangeIsShort() const;
 
 	/**
+	 * THE SIDE RAMPS' DESIGN, RE-CHECKED AGAINST THE LIVE SURF BAND ON EVERY BAKED STARTUP.
+	 *
+	 * The concave side ramps (SM_SideRampConcave, the owner's parabola swept along both sidelines)
+	 * are the ONLY structure in this project whose whole point is that one continuous surface is
+	 * walkable at its bottom and surfable at its top. That claim is a claim about two numbers a
+	 * designer can move from an .ini — WalkableFloorZ and SurfMinNormalZ — and a mesh cannot notice
+	 * when they move. TraceSideRampProfile.h asserts the shipped profile against the band AT BUILD
+	 * TIME; this is the other half, and it is here for exactly the reason WarnIfHitscanRangeIsShort()
+	 * above it is here: a pairing rule that only lives in a comment gets broken.
+	 *
+	 * Baked path only. The ramps are hand-placed actors on /Game/Maps/Arena_Baked; the procedural map
+	 * has nothing on its side walls, so running this there would be a warning about geometry that is
+	 * not present.
+	 */
+	void WarnIfSideRampProfileIsOutOfBand() const;
+
+	/**
 	 * World-space box of the playable pocket behind the goal at @p EndSign: goal plane to end wall,
 	 * sideline to sideline, floor to wall top.
 	 *

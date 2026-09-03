@@ -70,6 +70,12 @@ DEFAULT_FORBIDDEN = [
     # this hole for that command; the same mistake is not worth making twice.
     "Trace.Arena.SideRamp",
     "TraceSurfSideRampTest",
+    # The concave side ramp's walk-up rig and the approach rig's speed knob. Same guards, same
+    # reason: TraceSurfWalkUpTest's arm returns false outright under UE_BUILD_SHIPPING and
+    # TraceSurfApproachSpeed= is parsed inside the same block, so neither can be reached in a
+    # shipped build - and both are listed so the gate would SEE it if a guard were ever removed.
+    "TraceSurfWalkUpTest",
+    "TraceSurfApproachSpeed",
 ]
 
 # A string we KNOW ships, used as a positive control. Without one of these, "zero
