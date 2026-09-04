@@ -62,6 +62,26 @@ print("branch      {0}".format(branch))
 print("local HEAD  {0}  {1}".format(local[:9], subject))
 print("origin      {0}\n".format(remote[:9] if remote else "(no upstream)"))
 
+# The trap this check exists for: comparing against origin/<your branch> says
+# "level with origin" and looks perfectly healthy while you sit on a branch that
+# stopped receiving work. That is exactly what happened here — a collaborator was
+# told to check out release/overhaul-2026-08, it was merged into main, work
+# continued on main, and their faithful pulls brought nothing for days while every
+# check they had reported success. So compare against the DEFAULT branch too.
+default_branch = "main"
+main_sha = sh("git", "rev-parse", "origin/{0}".format(default_branch))
+if main_sha and branch != default_branch:
+    gap = sh("git", "rev-list", "--count", "{0}..{1}".format(local, main_sha))
+    if gap and gap != "0":
+        say(BAD, "You are on '{0}', which is {1} commit(s) behind origin/{2}. A pull on this "
+                 "branch succeeds and brings NOTHING, because the work is on {2}."
+                 .format(branch, gap, default_branch),
+            "git checkout {0}   then   Scripts/pull.sh  (Windows: Scripts\\pull.bat)"
+            .format(default_branch))
+    else:
+        say(WARN, "You are on '{0}', not {1}. It is level with {1} today, but new work lands "
+                  "on {1}.".format(branch, default_branch))
+
 if remote and local != remote:
     behind = sh("git", "rev-list", "--count", "{0}..{1}".format(local, remote))
     ahead = sh("git", "rev-list", "--count", "{0}..{1}".format(remote, local))
