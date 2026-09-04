@@ -262,6 +262,43 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Music Volume (x Master)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float MusicVolumeScale = 0.7f;
 
+	// =============================================================================================
+	// *** THE TWO MUSIC BEDS ARE OFF. "UNTIL FURTHER NOTICE" — SO THIS IS A SWITCH, NOT A DELETION.
+	// =============================================================================================
+	//
+	// The owner asked for MusicTitle (the title/results loop) and AmbienceMatch (the in-match loop)
+	// to stop playing, and for everything else to be untouched. TO PUT THEM BACK: set this to True
+	// here, or in Config/DefaultGame.ini under [/Script/Trace.TraceAudioSettings], or at runtime
+	// with `Trace.Music.Beds 1`. Nothing else has to change and no code was removed.
+	//
+	// WHAT THIS DOES AND DOES NOT SILENCE. It gates UTraceMusicSubsystem::Play, which is the ONLY
+	// thing that plays a bed — a persistent looping 2D component, started from three call sites
+	// (menu HUD BeginPlay, match HUD BeginPlay, and the results screen). It touches NOTHING ELSE:
+	// the victory/defeat stingers go through TraceAudio::PlayLocal2D, and every weapon, ability, UI
+	// and footstep sound goes through UTraceAudioSubsystem. Those are different code paths and this
+	// flag is not on any of them. Trace.Audio.Verify still passes with the beds off.
+	//
+	// WHY THE GATE IS IN THE SUBSYSTEM AND NOT AT THE CALL SITES. Three reasons, and the third is
+	// the one that would have bitten:
+	//   1. One place to flip, so the two beds cannot end up half-disabled.
+	//   2. The call sites keep their comments and their ordering, so turning the beds back on is a
+	//      config edit rather than a code revert.
+	//   3. *** IT KEEPS THE SUBSYSTEM'S BOOKKEEPING HONEST. *** Play() sets CurrentTrack, which is
+	//      what makes "asking for the track that is already playing" a no-op and what Stop() clears.
+	//      A gate at the call sites would leave CurrentTrack correct-by-accident; a gate that
+	//      returned from the middle of Play() could leave the subsystem believing a bed was playing
+	//      when none was. The gate below returns BEFORE any state is touched and, if it is flipped
+	//      off while a bed is already up, stops that bed and clears CurrentTrack — so
+	//      GetCurrentTrack() is NAME_None whenever nothing is audible, in every order of events.
+	//
+	// THERE IS NO CROSS-FADE LEFT DANGLING. The one place a bed cross-fades into a stinger is the
+	// results screen (ATraceHUD::DrawMatchResult): Stop(0.5f), stinger, then Play(MusicTitle) timed
+	// to rise under the stinger's decay. With the beds off, Stop() is a no-op because nothing is
+	// playing, the stinger is unaffected, and the timed Play() is refused — so the sequence
+	// degrades to "the stinger plays", not to "half a fade against silence".
+	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Music Beds Enabled (title + match loops)"))
+	bool bMusicBedsEnabled = false;
+
 	/**
 	 * SPEC v29 §1c — how long without firing resets the pistol ladder to PistolShoot1.
 	 *

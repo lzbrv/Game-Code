@@ -9,11 +9,14 @@
 #include "GameFramework/GameStateBase.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
+#include "HAL/IConsoleManager.h"     // FAutoConsoleCommand — Trace.NetVersion
 #include "HAL/PlatformTime.h"
 #include "IPAddress.h"
 #include "Misc/CommandLine.h"
 #include "Misc/ConfigCacheIni.h"
 #include "Misc/CoreMisc.h"
+#include "Misc/Crc.h"                    // FCrc::StrCrc32 — the compatibility checksum
+#include "Misc/NetworkVersion.h"         // FNetworkVersion::GetLocalNetworkVersionOverride
 #include "Misc/Parse.h"
 #include "SocketSubsystem.h"
 #include "Sockets.h"
@@ -419,15 +422,21 @@ FString DescribeNetworkFailure(ENetworkFailure::Type FailureType)
 		return TEXT("CONNECTION TIMED OUT. CHECK THE ADDRESS, THE VPN, AND UDP 7777 ON THE HOST.");
 	case ENetworkFailure::FailureReceived:
 		return TEXT("THE SERVER REFUSED THE CONNECTION.");
+	// THE FOUR VERSION-MISMATCH CODES NAME THE CHECK, because "different builds" is true and useless:
+	// it does not say what to compare or where to look. The NET code is on the title screen of every
+	// build, bottom-right, so the instruction is one a player can actually carry out.
 	case ENetworkFailure::OutdatedClient:
-		return TEXT("YOUR BUILD IS OLDER THAN THE SERVER'S. REBUILD AND TRY AGAIN.");
+		return FString::Printf(TEXT("BUILD MISMATCH. YOURS IS %s — COMPARE IT WITH THE HOST'S (TITLE SCREEN, BOTTOM RIGHT)."),
+			*GetNetVersionLabel());
 	case ENetworkFailure::OutdatedServer:
-		return TEXT("THE SERVER'S BUILD IS OLDER THAN YOURS. THE HOST MUST REBUILD.");
+		return FString::Printf(TEXT("BUILD MISMATCH. YOURS IS %s — THE HOST'S TITLE SCREEN MUST SHOW THE SAME CODE."),
+			*GetNetVersionLabel());
 	case ENetworkFailure::PendingConnectionFailure:
 		return TEXT("COULD NOT REACH THAT ADDRESS.");
 	case ENetworkFailure::NetGuidMismatch:
 	case ENetworkFailure::NetChecksumMismatch:
-		return TEXT("CLIENT AND SERVER ARE RUNNING DIFFERENT BUILDS.");
+		return FString::Printf(TEXT("CLIENT AND SERVER ARE RUNNING DIFFERENT BUILDS. YOURS IS %s."),
+			*GetNetVersionLabel());
 	default:
 		return TEXT("THE CONNECTION FAILED.");
 	}
@@ -530,7 +539,123 @@ void LogNetworkDiagnostics(const UWorld* World, const TCHAR* Context)
 	// to connect, and it has to survive the default verbosity of a normal run.
 	UE_LOG(LogTraceGame, Display, TEXT("[Net] %s: %s  endpoint=%s  %s  localAddrs=[%s]"),
 		Context, RoleName, *Endpoint, *Detail, *FString::Join(Addresses, TEXT(", ")));
+
+	// The compatibility value, on the SAME line anyone is already asked for. A mismatch between two
+	// machines is the failure this line exists to make a five-second check rather than an evening.
+	UE_LOG(LogTraceGame, Display, TEXT("[Net] compatibility: %s  (\"%s\")  — this must match on every machine in the session."),
+		*GetNetVersionLabel(), *GetNetVersionString());
 }
+
+// =================================================================================================
+// THE NETWORK COMPATIBILITY VALUE
+//
+// See the long block on NetProtocolVersion in TraceNetworking.h for why this exists and what it
+// trades away. This file is only the mechanism.
+// =================================================================================================
+
+FString GetNetVersionString()
+{
+	// Computed ONCE. Not for speed — this is called a handful of times per process — but because the
+	// value must not be able to change under a live connection. GConfig is fully loaded by the time
+	// anything asks (the earliest caller is the game module's StartupModule, which runs at
+	// LoadingPhase Default, after config init), and a static local makes "read it once" the only
+	// possible behaviour rather than a convention someone has to keep.
+	static const FString Value = []() -> FString
+	{
+		FString ProjectVersion;
+		if (GConfig != nullptr)
+		{
+			GConfig->GetString(TEXT("/Script/EngineSettings.GeneralProjectSettings"),
+				TEXT("ProjectVersion"), ProjectVersion, GGameIni);
+		}
+		ProjectVersion.TrimStartAndEndInline();
+
+		// AN EMPTY ProjectVersion MUST NOT SILENTLY BECOME A DIFFERENT VALUE ON ONE MACHINE. If the
+		// ini read fails on one side only — a corrupt config, a staged build missing DefaultGame.ini
+		// — the two machines would compute different checksums and the mismatch would be blamed on
+		// the platform. A fixed sentinel makes that case AGREE (and shows up in the printed string,
+		// so it is visible rather than invisible).
+		if (ProjectVersion.IsEmpty())
+		{
+			ProjectVersion = TEXT("unset");
+		}
+
+		// Lower case, matching the engine's own GetLocalNetworkVersion, which does .ToLower() before
+		// hashing. Keeping the same convention means the two strings are comparable by eye.
+		return FString::Printf(TEXT("trace netproto %d, project %s"),
+			NetProtocolVersion, *ProjectVersion.ToLower());
+	}();
+
+	return Value;
+}
+
+uint32 GetNetVersionChecksum()
+{
+	static const uint32 Checksum = FCrc::StrCrc32(*GetNetVersionString());
+	return Checksum;
+}
+
+FString GetNetVersionLabel()
+{
+	return FString::Printf(TEXT("NET %08X"), GetNetVersionChecksum());
+}
+
+void InstallNetVersionOverride()
+{
+	// IDEMPOTENT. BindStatic on an already-bound delegate would just replace the same binding, but
+	// saying so here is cheaper than making a reader work it out, and the early return also means a
+	// second caller cannot invalidate a checksum that is already in use by a live connection.
+	if (FNetworkVersion::GetLocalNetworkVersionOverride.IsBound())
+	{
+		return;
+	}
+
+	FNetworkVersion::GetLocalNetworkVersionOverride.BindStatic(&GetNetVersionChecksum);
+
+	// *** THIS LINE IS LOAD-BEARING AND ITS ABSENCE WOULD BE INVISIBLE. ***
+	// FNetworkVersion::GetLocalNetworkVersion caches its answer in a static the first time anything
+	// asks (NetworkVersion.cpp:223 — "if (bHasCachedNetworkChecksum) return CachedNetworkChecksum;")
+	// and only consults the delegate on a cache MISS. Anything that asked before this bind — and the
+	// engine does ask, e.g. when building the user agent string — would have burned the DEFAULT
+	// value in, and this override would then do nothing at all while appearing to be installed.
+	FNetworkVersion::InvalidateNetworkChecksum();
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Net] compatibility value pinned by the project: %s  (\"%s\"). "
+		     "Every machine in a session must print this same value; the engine's own default "
+		     "would have mixed in the engine install's changelist and could differ between "
+		     "a Mac and a Windows build of this same commit."),
+		*GetNetVersionLabel(), *GetNetVersionString());
+}
+
+// -------------------------------------------------------------------------------------------------
+// Trace.NetVersion — the console-side check.
+//
+// Registered unconditionally, including Shipping: IConsoleManager is compiled in there and this
+// command reads state and prints, so there is no cheat surface to gate. The console itself is
+// unavailable in a Shipping game, which is exactly why the value ALSO goes on the title screen
+// (ATraceMenuHUD's version label) — that is the check a player can actually run.
+// -------------------------------------------------------------------------------------------------
+static FAutoConsoleCommand GTraceNetVersionCmd(
+	TEXT("Trace.NetVersion"),
+	TEXT("Print this build's network compatibility value. Two machines can only connect if they print the same one."),
+	FConsoleCommandDelegate::CreateStatic([]()
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[Net] %s  (\"%s\")  protocol=%d  override=%s"),
+			*TraceNet::GetNetVersionLabel(), *TraceNet::GetNetVersionString(),
+			TraceNet::NetProtocolVersion,
+			FNetworkVersion::GetLocalNetworkVersionOverride.IsBound() ? TEXT("installed") : TEXT("NOT INSTALLED"));
+
+		// The engine's own answer as well, so the command proves the override is actually the thing
+		// the handshake uses instead of merely asserting it. These two MUST agree; if they do not,
+		// something asked for the network version before InstallNetVersionOverride() ran.
+		const uint32 EngineSays = FNetworkVersion::GetLocalNetworkVersion();
+		UE_LOG(LogTraceGame, Display, TEXT("[Net] engine handshake will send: NET %08X  %s"),
+			EngineSays,
+			(EngineSays == TraceNet::GetNetVersionChecksum())
+				? TEXT("(matches — the override is in force)")
+				: TEXT("*** DOES NOT MATCH THE OVERRIDE — the engine cached a value before startup ***"));
+	}));
 
 } // namespace TraceNet
 

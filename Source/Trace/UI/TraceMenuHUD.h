@@ -231,7 +231,7 @@ protected:
 	void DrawMenuRows();
 	void DrawFooter();
 
-	/** WP8.2 — "V 0.1.0" bottom-right, read once from ProjectVersion. The widget mirrors it. */
+	/** WP8.2 — "V 0.1.0   NET xxxxxxxx" bottom-right, read once. The widget mirrors it. */
 	void DrawVersionString();
 
 	void DrawCursor();

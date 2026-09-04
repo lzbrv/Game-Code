@@ -169,6 +169,98 @@ namespace TraceNet
 
 	/** One Display line naming the net mode, the endpoint and every local address. */
 	TRACE_API void LogNetworkDiagnostics(const UWorld* World, const TCHAR* Context);
+
+	// =============================================================================================
+	// THE NETWORK COMPATIBILITY VALUE — MADE EXPLICIT, BECAUSE THE DEFAULT IS NOT PORTABLE
+	// =============================================================================================
+	//
+	// A client whose network version disagrees with the server's is refused during the handshake,
+	// and the message the player gets ("CLIENT AND SERVER ARE RUNNING DIFFERENT BUILDS") does not
+	// say WHICH of the several inputs disagreed. This project plays Mac-against-Windows, so it is
+	// worth knowing exactly what that value is made of.
+	//
+	// WHAT THE ENGINE WOULD DO ON ITS OWN. FNetworkVersion::GetLocalNetworkVersion (UE 5.8,
+	// Engine/Source/Runtime/Core/Private/Misc/NetworkVersion.cpp:221) CRCs this string:
+	//
+	//     "<ProjectName> <ProjectVersion>, NetCL: <n>, EngineNetworkVersion: <e>, GameNetworkVersion: <g>"
+	//
+	// Of those five terms, THREE COME FROM THE ENGINE INSTALL AND NOT FROM THIS REPOSITORY:
+	//
+	//   NetCL                 ENGINE_NET_VERSION is 0 in 5.8 (NetworkVersion.h:12), so this falls
+	//                         through to BuildSettings::GetCompatibleChangelist() — the
+	//                         "CompatibleChangelist" field of <engine>/Engine/Build/Build.version.
+	//                         It is 55116800 on this machine's UE 5.8.1. It is a property of the
+	//                         INSTALLED ENGINE, not of the game: a friend on 5.8.0, on a source
+	//                         build, or on a launcher hotfix Epic shipped a different number in,
+	//                         computes a different value from the same commit of this repository.
+	//   EngineNetworkVersion  FEngineNetworkCustomVersion::LatestVersion — an engine header constant.
+	//   GameNetworkVersion    FGameNetworkCustomVersion::LatestVersion — likewise.
+	//
+	// So the engine default is "these two machines will agree if their engine installs are
+	// byte-identical", which is a hope, not a guarantee, and it is the specific hope that produces
+	// an evening of "connection failed" with no diagnosis. THIS PROJECT DOES NOT RELY ON IT.
+	//
+	// WHAT WE DO INSTEAD. GetNetVersionString() below is built from exactly two things, BOTH OF
+	// WHICH LIVE IN THIS REPOSITORY and are therefore identical on every machine that checked out
+	// the same commit:
+	//
+	//     NetProtocolVersion                 the constant immediately below
+	//     ProjectVersion                     Config/DefaultGame.ini, [GeneralProjectSettings]
+	//
+	// InstallNetVersionOverride() binds that to FNetworkVersion::GetLocalNetworkVersionOverride, the
+	// engine's own supported hook (NetworkVersion.h:54-56), so every handshake uses it.
+	//
+	// *** WHAT THIS TRADES AWAY, SAID PLAINLY. *** The engine's default refuses a connection between
+	// two DIFFERENT ENGINE VERSIONS, because the engine terms differ. Ours does not: two builds of
+	// the same commit on 5.8 and on some future 5.9 would now agree on the version number and then
+	// disagree about the wire format, which fails later and less clearly. That is an acceptable
+	// trade for a project pinned to one engine version by Trace.uproject's EngineAssociation and
+	// played by five people this weekend — and it is why NetProtocolVersion exists: BUMP IT when
+	// the engine version moves or when anything about the replicated surface changes, and old
+	// clients are refused again, by us, on purpose.
+	//
+	// FCrc::StrCrc32 IS SAFE TO USE ACROSS PLATFORMS AND THAT IS NOT AN ASSUMPTION. TCHAR is 2 bytes
+	// on Windows and 4 on macOS, so a naive string hash would differ by platform. Crc.h:StrCrc32
+	// widens every character to 32 bits before folding it in and says why in its own comment: "we
+	// always want to treat every CRC as if it was based on 4 byte chars, even if it's less, because
+	// we want consistency between equivalent strings with different character types." That is also
+	// why the engine's own default network version works cross-platform at all.
+
+	/**
+	 * BUMP THIS to refuse older clients. It is the only thing in the compatibility value that a
+	 * human sets.
+	 *
+	 * Bump it when: the engine version changes, a replicated property is added/removed/reordered in
+	 * a way old clients cannot read, an RPC signature changes, or a cooked-content change would make
+	 * two builds disagree about the world. Do NOT bump it for a fix that both sides can carry.
+	 */
+	inline constexpr int32 NetProtocolVersion = 1;
+
+	/**
+	 * The exact string GetNetVersionChecksum() CRCs, e.g. "trace netproto 1, project 0.1.0".
+	 *
+	 * Printed as well as the checksum everywhere the checksum is printed, so a mismatch tells you
+	 * WHICH term differs instead of only that something did. Lower-case already: the engine's own
+	 * path lower-cases before hashing and this matches it, so the two are comparable by eye.
+	 */
+	TRACE_API FString GetNetVersionString();
+
+	/** CRC32 of GetNetVersionString(). This is the number the handshake compares. */
+	TRACE_API uint32 GetNetVersionChecksum();
+
+	/** "NET 3F9A1C2E" — the eight hex digits a player can read off a title screen and compare. */
+	TRACE_API FString GetNetVersionLabel();
+
+	/**
+	 * Binds GetNetVersionChecksum() to FNetworkVersion::GetLocalNetworkVersionOverride.
+	 *
+	 * Idempotent, and called once from the game module's StartupModule so that it is in place before
+	 * any net driver exists in every configuration and every target (client, listen host, dedicated
+	 * server, editor PIE). Invalidates the engine's cached checksum on the way out, because
+	 * GetLocalNetworkVersion caches its answer on first use and binding after that first use would
+	 * otherwise be silently ignored.
+	 */
+	TRACE_API void InstallNetVersionOverride();
 }
 
 /**

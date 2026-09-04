@@ -7,6 +7,7 @@
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "Kismet/GameplayStatics.h"
+#include "HAL/IConsoleManager.h"   // Trace.Music.Beds — the runtime half of the switch
 #include "Sound/SoundBase.h"
 
 #include "Audio/TraceSoundBank.h"
@@ -44,6 +45,55 @@ UTraceMusicSubsystem* UTraceMusicSubsystem::Get(const UObject* WorldContext)
 	const UWorld* World = GEngine->GetWorldFromContextObject(WorldContext, EGetWorldErrorMode::ReturnNull);
 	const UGameInstance* GameInstance = (World != nullptr) ? World->GetGameInstance() : nullptr;
 	return (GameInstance != nullptr) ? GameInstance->GetSubsystem<UTraceMusicSubsystem>() : nullptr;
+}
+
+namespace TraceMusicFile
+{
+	// =============================================================================================
+	// *** THE BEDS ARE OFF UNTIL FURTHER NOTICE, AND THIS IS THE SWITCH. ***
+	// =============================================================================================
+	//
+	// Two ways to turn them back on, both live at once and either is enough:
+	//
+	//     Config/DefaultGame.ini   [/Script/Trace.TraceAudioSettings]  bMusicBedsEnabled=True
+	//     console                  Trace.Music.Beds 1
+	//
+	// THE CVAR IS A THREE-STATE OVERRIDE, NOT A SECOND COPY OF THE SETTING, and that distinction is
+	// the whole reason it is an int and not a bool:
+	//
+	//     -1  follow UTraceAudioSettings::bMusicBedsEnabled   (the default — no opinion)
+	//      0  force the beds off
+	//      1  force the beds on
+	//
+	// A plain bool cvar defaulting to false would have SHADOWED the config setting: the owner would
+	// flip bMusicBedsEnabled=True, hear nothing, and have no way to tell which of the two switches
+	// was winning. With -1 as the default the cvar is silent until somebody sets it.
+	int32 GBedsOverride = -1;
+	FAutoConsoleVariableRef CVarMusicBeds(
+		TEXT("Trace.Music.Beds"),
+		GBedsOverride,
+		TEXT("The two music beds (MusicTitle, AmbienceMatch). -1 = follow bMusicBedsEnabled in ")
+		TEXT("Config/DefaultGame.ini (the default), 0 = force off, 1 = force on. Stingers, UI, ")
+		TEXT("weapons and every other sound are unaffected either way."),
+		ECVF_Default);
+
+	/** True when a bed is allowed to play right now. The ONE place that question is answered. */
+	bool BedsEnabled()
+	{
+		if (GBedsOverride >= 0)
+		{
+			return GBedsOverride != 0;
+		}
+		return UTraceAudioSettings::Get().bMusicBedsEnabled;
+	}
+}
+
+bool UTraceMusicSubsystem::AreBedsEnabled()
+{
+	// The public face of TraceMusicFile::BedsEnabled(). One implementation, two names, because the
+	// gate has to be file-local (it is the thing Play() consults) and the ANSWER has to be readable
+	// from outside (the results-screen log has to be able to say "the beds are off" truthfully).
+	return TraceMusicFile::BedsEnabled();
 }
 
 float UTraceMusicSubsystem::DesiredGain()
@@ -117,6 +167,23 @@ void UTraceMusicSubsystem::Play(FName Track, float FadeSeconds)
 {
 	if (Track.IsNone())
 	{
+		return;
+	}
+
+	// ---- THE BEDS ARE OFF (TraceMusicFile::BedsEnabled, above) ----------------------------------
+	//
+	// FIRST, BEFORE ANY STATE IS TOUCHED, so a refused Play cannot leave this subsystem believing a
+	// bed is playing: CurrentTrack, Active and Fading are all still whatever they were, and the
+	// Stop() below makes that "nothing" in every order of events.
+	//
+	// The Stop() is NOT redundant with the early return. It is what makes the RUNTIME toggle honest:
+	// `Trace.Music.Beds 0` typed while a bed is up leaves that component playing until something
+	// asks for a track, and the next ask is the next HUD's BeginPlay — a whole match away. Stopping
+	// here means the first Play() after the switch is thrown ends the bed instead of ignoring it,
+	// and it costs nothing on the ordinary path because Stop() early-returns when nothing plays.
+	if (!TraceMusicFile::BedsEnabled())
+	{
+		Stop(FadeSeconds);
 		return;
 	}
 

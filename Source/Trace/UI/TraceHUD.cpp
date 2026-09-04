@@ -834,6 +834,13 @@ void ATraceHUD::BeginPlay()
 	//
 	// Menu -> match is therefore a CROSS-FADE, not a cut: MusicTitle is still playing when this
 	// runs, and Play() fades one into the other over its default 0.8 s.
+	//
+	// *** ALL OF THAT IS THE BEHAVIOUR WITH THE BEDS ON, AND THEY ARE CURRENTLY OFF. *** The owner
+	// asked for both beds to stop "until further notice", so UTraceAudioSettings::bMusicBedsEnabled
+	// is False and this Play() starts nothing (Audio/TraceMusicPlayer.h). The line is deliberately
+	// LEFT HERE AND LEFT UNCONDITIONAL: flipping that one config line — or typing
+	// `Trace.Music.Beds 1` — restores everything the paragraphs above describe, with no code change
+	// and nothing to remember to put back.
 	if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(this))
 	{
 		Music->Play(TraceSoundEvents::AmbienceMatch);
@@ -5779,10 +5786,30 @@ void ATraceHUD::DrawMatchResult()
 	{
 		bMatchEndStingerPlayed = true;
 
+		// WAS a bed actually playing? Asked BEFORE the Stop, because the three log lines below used
+		// to state "ambience stopped (0.5s)" unconditionally and that sentence became FALSE the day
+		// the beds could be switched off (UTraceAudioSettings::bMusicBedsEnabled). A log that
+		// describes a fade nobody heard is exactly the kind of thing that sends the next reader
+		// hunting for a mixing bug. Null subsystem and no-track both answer "no", correctly.
+		bool bBedWasPlaying = false;
 		if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(this))
 		{
+			bBedWasPlaying = !Music->GetCurrentTrack().IsNone();
 			Music->Stop(0.5f);
 		}
+
+		// *** "NOTHING WAS PLAYING" AND "THE BEDS ARE OFF" ARE TWO DIFFERENT FACTS AND THIS LINE USED
+		// *** TO CONFUSE THEM. *** The first version of this repair reported the switch's state from
+		// bBedWasPlaying alone. That is a runtime observation, and it is false whenever the beds are
+		// ON but no bed happened to be up — which is not hypothetical: a run that typed
+		// `Trace.Music.Beds 1` mid-match (after the match HUD's BeginPlay had already been refused)
+		// printed "music beds are off" here and then started MusicTitle 1.9 s later, contradicting
+		// itself inside one log. So the switch is read from the switch.
+		const bool bBedsEnabled = UTraceMusicSubsystem::AreBedsEnabled();
+		const TCHAR* const BedState =
+			bBedWasPlaying  ? TEXT("ambience stopped (0.5s)")
+			: bBedsEnabled  ? TEXT("no ambience was playing, though the beds are ENABLED — nothing had started one")
+			                : TEXT("no ambience was playing (the music beds are disabled)");
 
 		bool bStingerPlayed = false;
 		FName StingerEvent = NAME_None;
@@ -5794,17 +5821,18 @@ void ATraceHUD::DrawMatchResult()
 			bStingerPlayed = true;
 			TraceAudio::PlayLocal2D(this, StingerEvent);
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[Music] full time: ambience stopped (0.5s) and the %s stinger played "
-				     "(winner=%s, local team=%s)."),
-				bWon ? TEXT("VICTORY") : TEXT("DEFEAT"),
+				TEXT("[Music] full time: %s, and the %s stinger played "
+				     "(winner=%s, local team=%s). The stinger does NOT go through the music "
+				     "subsystem, so it plays either way."),
+				BedState, bWon ? TEXT("VICTORY") : TEXT("DEFEAT"),
 				*TraceTeamName(Winner).ToString(), *TraceTeamName(LocalTeam).ToString());
 		}
 		else
 		{
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[Music] full time: ambience stopped (0.5s), no stinger (winner=%s, local team=%s "
+				TEXT("[Music] full time: %s, no stinger (winner=%s, local team=%s "
 				     "— a draw, or a viewer with no team, gets neither)."),
-				*TraceTeamName(Winner).ToString(), *TraceTeamName(LocalTeam).ToString());
+				BedState, *TraceTeamName(Winner).ToString(), *TraceTeamName(LocalTeam).ToString());
 		}
 
 		// ---- AND THEN THE BED COMES BACK, HERE, UNDER THE RESULTS SCREEN ------------------------
@@ -5865,15 +5893,28 @@ void ATraceHUD::DrawMatchResult()
 			             StingerSeconds - TraceHUDMatchEndMusic::BedRisesUnderTailSeconds);
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[Music] results screen: the menu bed will rise in %.2fs (stinger %.2fs, fade %.2fs), "
-			     "so the %.0fs post-match window is not bed-less."),
+			TEXT("[Music] results screen: the menu bed is scheduled to rise in %.2fs (stinger %.2fs, "
+			     "fade %.2fs), which is what keeps the %.0fs post-match window from being bed-less. "
+			     "%s"),
 			MatchEndBedResumeRealTime - World->GetRealTimeSeconds(), StingerSeconds,
-			TraceHUDMatchEndMusic::BedFadeSeconds, TraceMatchFlow::PostMatchDuration);
+			TraceHUDMatchEndMusic::BedFadeSeconds, TraceMatchFlow::PostMatchDuration,
+			// The SWITCH, not "was something playing" — see the block above. This sentence predicts
+			// what the scheduled Play() will do, and Play() decides on the switch alone.
+			bBedsEnabled
+				? TEXT("")
+				: TEXT("(The music beds are disabled, so nothing will actually start — the schedule "
+				       "is kept so turning them back on needs no code change.)"));
 	}
 
 	// The bed itself, on a later frame. Play() is a no-op when MusicTitle is already the playing
 	// track, so the bool is belt-and-braces rather than the only guard — but it also keeps this out
 	// of the subsystem entirely on the other ~800 frames of the results screen.
+	//
+	// WITH THE BEDS DISABLED (the current state — see the block at the AmbienceMatch call site) this
+	// whole sequence degrades cleanly rather than half-running: the Stop(0.5f) above finds nothing
+	// playing and returns, the stinger is untouched because it does not go through this subsystem,
+	// and this Play() starts nothing. There is no fade left hanging against silence, because there
+	// was never an outgoing bed to fade.
 	if (bMatchEndStingerPlayed && !bMatchEndBedResumed
 		&& MatchEndBedResumeRealTime >= 0.f
 		&& World->GetRealTimeSeconds() >= MatchEndBedResumeRealTime)
@@ -5883,9 +5924,11 @@ void ATraceHUD::DrawMatchResult()
 		{
 			Music->Play(TraceSoundEvents::MusicTitle, TraceHUDMatchEndMusic::BedFadeSeconds);
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[Music] results screen: menu bed rising (fade %.2fs). It carries through the "
-				     "travel — the title screen's Play() will be a no-op."),
-				TraceHUDMatchEndMusic::BedFadeSeconds);
+				TEXT("[Music] results screen: menu bed requested (fade %.2fs); the subsystem now "
+				     "reports track '%s'. With beds ON that is MusicTitle and it carries through "
+				     "the travel, so the title screen's Play() is a no-op. With beds OFF it is None "
+				     "and nothing started."),
+				TraceHUDMatchEndMusic::BedFadeSeconds, *Music->GetCurrentTrack().ToString());
 		}
 	}
 

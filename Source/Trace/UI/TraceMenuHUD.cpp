@@ -271,12 +271,23 @@ namespace TraceMenuHUDFile
 	}
 
 	/**
-	 * Release UI plan WP8.2 — "V 0.1.0", bottom-right of the title screen.
+	 * Release UI plan WP8.2 — "V 0.1.0   NET 3F9A1C2E", bottom-right of the title screen.
 	 *
 	 * Read once from the one place a version already exists — ProjectVersion in
 	 * Config/DefaultGame.ini ([/Script/EngineSettings.GeneralProjectSettings]) — rather than a
-	 * second constant that would drift from it. Empty when the ini has no version, in which case
-	 * nothing is drawn: an empty corner beats "V ".
+	 * second constant that would drift from it.
+	 *
+	 * *** THE SECOND HALF IS THE CROSS-PLAY CHECK, AND IT IS HERE BECAUSE THIS IS THE ONLY PLACE A
+	 * *** SHIPPING BUILD CAN SHOW IT. *** Two machines can only connect if their network
+	 * compatibility values match (TraceNet::NetProtocolVersion documents what the value is made of).
+	 * There is a console command that prints it — Trace.NetVersion — and a Display log line, and a
+	 * SHIPPING GAME HAS NEITHER: logging is compiled out and the console is unavailable. The friends
+	 * this project is played with run Shipping builds. So the value goes on the title screen, where
+	 * comparing two machines is "read the bottom-right corner of both screens" and takes five
+	 * seconds instead of an evening of "connection failed".
+	 *
+	 * The version half is dropped when the ini has no version (an empty corner beats "V "), but the
+	 * NET half is ALWAYS drawn: it is the half that has a job.
 	 *
 	 * Both renderers show it from this one string: the Canvas path draws it in DrawHUD, and
 	 * BuildMenuView hands it to the widget in the view (a Canvas draw alone cannot serve the UMG
@@ -294,7 +305,11 @@ namespace TraceMenuHUDFile
 					TEXT("ProjectVersion"), Version, GGameIni);
 			}
 			Version.TrimStartAndEndInline();
-			return Version.IsEmpty() ? FString() : FString::Printf(TEXT("V %s"), *Version);
+
+			const FString NetLabel = TraceNet::GetNetVersionLabel();
+			return Version.IsEmpty()
+				? NetLabel
+				: FString::Printf(TEXT("V %s   %s"), *Version, *NetLabel);
 		}();
 		return Label;
 	}
@@ -589,8 +604,9 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 	// number four; the chip it pointed at is right there.
 	OutView.FooterHint = TEXT("PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE");
 
-	// WP8.2 — the version, bottom-right. The widget draws it because this Canvas cannot reach a UMG
-	// frame (AHUD's canvas composites under Slate); the Canvas path draws the same string in DrawHUD.
+	// WP8.2 — the version AND the network compatibility code, bottom-right. The widget draws it
+	// because this Canvas cannot reach a UMG frame (AHUD's canvas composites under Slate); the Canvas
+	// path draws the same string in DrawHUD.
 	OutView.Version = TraceMenuHUDFile::ProjectVersionLabel();
 
 	// ---- Failure banner ---------------------------------------------------------------------------
@@ -757,6 +773,12 @@ void ATraceMenuHUD::BeginPlay()
 	//
 	// Null-tested rather than assumed: Get() refuses on a dedicated server, and it returns null
 	// before a game instance exists at all.
+	//
+	// *** THE BED IS CURRENTLY DISABLED AND THIS CALL IS STILL HERE ON PURPOSE. *** The owner asked
+	// for both music beds off "until further notice", so UTraceAudioSettings::bMusicBedsEnabled is
+	// False in Config/DefaultGame.ini and Play() starts nothing (Audio/TraceMusicPlayer.h). Leaving
+	// the unconditional call in place is what makes turning it back on a one-line config edit — and
+	// the "no-op when already playing" contract above is what makes that safe in both states.
 	if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(this))
 	{
 		Music->Play(TraceSoundEvents::MusicTitle);
@@ -3008,9 +3030,10 @@ void ATraceMenuHUD::DrawFooter()
 
 void ATraceMenuHUD::DrawVersionString()
 {
-	// WP8.2. Bottom-right, small and dim — a build identifier for screenshots and bug reports, not a
-	// design element. Drawn after the footer strip so it sits ON it, and before the modals'
-	// scrims/panels in this frame's order, so a modal dims it proportionally rather than losing it.
+	// WP8.2. Bottom-right, small and dim — a build identifier for screenshots and bug reports, and
+	// (the NET half) the one thing two players must compare before they try to connect. Drawn after
+	// the footer strip so it sits ON it, and before the modals' scrims/panels in this frame's order,
+	// so a modal dims it proportionally rather than losing it.
 	const FString& Label = TraceMenuHUDFile::ProjectVersionLabel();
 	if (Label.IsEmpty())
 	{

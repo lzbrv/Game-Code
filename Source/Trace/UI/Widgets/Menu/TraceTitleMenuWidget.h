@@ -120,7 +120,7 @@ struct FTraceTitleMenuView
 	FString FooterKeys;
 	FString FooterHint;
 
-	/** WP8.2 — "V 0.1.0", from ProjectVersion. Empty draws nothing. The HUD owns the read. */
+	/** WP8.2 — "V 0.1.0   NET xxxxxxxx". The NET half is the cross-play check. The HUD owns the read. */
 	FString Version;
 
 	bool bFailureVisible = false;

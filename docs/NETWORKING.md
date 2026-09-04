@@ -456,6 +456,105 @@ until the game is worth joining.
 
 ---
 
+## 4.5 Cross-platform: the network compatibility value
+
+**Mac and Windows players can only connect if their builds compute the same network version.** This
+section is about making that a fact rather than a hope, because the failure mode is expensive: the
+engine refuses the connection during the handshake and the player is told the *connection* failed.
+
+### What Unreal does by default, and why it is not enough here
+
+`FNetworkVersion::GetLocalNetworkVersion` (UE 5.8,
+`Engine/Source/Runtime/Core/Private/Misc/NetworkVersion.cpp:221`) CRC32s this string:
+
+```
+"<ProjectName> <ProjectVersion>, NetCL: <n>, EngineNetworkVersion: <e>, GameNetworkVersion: <g>"
+```
+
+Three of those five terms **come from the engine install rather than from this repository**:
+
+* `NetCL` — `ENGINE_NET_VERSION` is `0` in 5.8 (`NetworkVersion.h:12`), so it falls through to
+  `BuildSettings::GetCompatibleChangelist()`, which is the `CompatibleChangelist` field of
+  `<engine>/Engine/Build/Build.version`. On this machine's UE 5.8.1 that is **55116800**.
+* `EngineNetworkVersion` — `FEngineNetworkCustomVersion::LatestVersion`, an engine header constant.
+* `GameNetworkVersion` — `FGameNetworkCustomVersion::LatestVersion`, likewise.
+
+So the default says: *these two machines agree if their engine installs agree*. Two people who both
+believe they are on "UE 5.8" but differ by a hotfix compute different values from identical source,
+and nothing in the failure names the engine.
+
+### What this project does instead
+
+`TraceNet::InstallNetVersionOverride()` (`Source/Trace/UI/TraceNetworking.cpp`), called from
+`FTraceGameModule::StartupModule`, binds `FNetworkVersion::GetLocalNetworkVersionOverride` — the
+engine's own supported hook — to a checksum built from exactly two things, **both of which live in
+this repository**:
+
+```
+"trace netproto <NetProtocolVersion>, project <ProjectVersion>"
+```
+
+* `NetProtocolVersion` — `Source/Trace/UI/TraceNetworking.h`, currently `1`
+* `ProjectVersion` — `Config/DefaultGame.ini`, currently `0.1.0`
+
+Any two builds of the same commit therefore agree by construction, on any platform, on any 5.8
+install. Today's value is **`NET 51920028`** (decimal 1368522792).
+
+### The trade-off, stated where it is made
+
+This **removes** the engine's accidental protection against connecting two different engine versions.
+Two builds of the same commit on 5.8 and on some future 5.9 would now agree on the version number and
+then disagree about the wire format, which fails later and less clearly. That is acceptable for a
+project pinned to one engine by `Trace.uproject`'s `EngineAssociation` — and it is why
+`NetProtocolVersion` exists. **Bump it** when the engine version moves, when a replicated property is
+added/removed/reordered in a way old clients cannot read, or when an RPC signature changes.
+
+### `FCrc::StrCrc32` is portable, and that is checked rather than assumed
+
+`TCHAR` is 2 bytes on Windows and 4 on macOS, so a naive string hash would differ by platform.
+`Crc.h`'s `StrCrc32` widens every character to 32 bits before folding it in and says why in its own
+comment — *"we always want to treat every CRC as if it was based on 4 byte chars ... so we want
+consistency between equivalent strings with different character types"*. The table at `Crc.cpp:211`
+is the standard reflected CRC-32 (`0xEDB88320`). This is also why the engine's own default value
+works cross-platform at all.
+
+### Three ways to read the value
+
+| Who | How |
+|---|---|
+| A player on any build, including Shipping | Title screen, bottom right: `V 0.1.0   NET 51920028` |
+| Anyone with the repository — no engine, no build, one second | `python3 Scripts/netversion.py` |
+| A developer with a console | `Trace.NetVersion` |
+
+The title screen is the one that matters for a playtest: Shipping compiles logging out and has no
+console, so it is the only place a player can see it. `Scripts/netversion.py --verify <log>` checks
+the script against a Development run's own log, so the script is tested against the binary that
+performs the handshake rather than trusted alongside it.
+
+### What is proven and what is not
+
+**Proven on this machine:** the override is installed and in force (`LogNetVersion: Checksum from
+delegate: 1368522792`, and `Trace.NetVersion` reports that the engine's own
+`GetLocalNetworkVersion()` returns the same number); the value is byte-stable across two separate
+builds of the same source; `Scripts/netversion.py` predicts it from source alone; the code renders on
+the title screen; the literals are present in the Shipping artefact.
+
+**Not proven, and cannot be from a Mac:** that a real Windows client connects to a real Mac host.
+There is no Win64 toolchain on this machine and Unreal does not cross-compile a Windows game from
+macOS. What has been removed is the *class* of failure where identical source produces different
+numbers. The first real cross-platform session is still the first real cross-platform session.
+
+**Audited for platform divergence in the net path:** there is no `#if PLATFORM_MAC`,
+`PLATFORM_WINDOWS`, `__APPLE__` or `_WIN32` anywhere under `Source/` (zero occurrences); no
+replicated property uses a platform-sized type (`long`, `size_t`, `PTRINT`); the only custom
+`NetDeltaSerialize` is `FTraceTrailPointArray`'s, which delegates straight to the engine's
+`FFastArraySerializer::FastArrayDeltaSerialize`; and the only project-authored hash that could have
+been TCHAR-width-dependent is the compatibility checksum itself, addressed above. The one other
+`GetTypeHash(FString)` in the project (`TraceCharacterSelect.cpp`, a layout signature) is local
+log de-duplication and never reaches the wire.
+
+---
+
 ## 5. What Trace already does for netcode
 
 Written for someone who has not read the source. Each item names where it lives.

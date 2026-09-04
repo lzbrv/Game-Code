@@ -43,6 +43,7 @@ DO_PAK=1
 DO_COOK=1
 DO_BUILD=1
 DO_ITERATE=0
+DO_DIST=1
 EXTRA_ARGS=()
 
 # Default output lives outside the repo tree's committed paths. Saved/ is already
@@ -73,6 +74,9 @@ OPTIONS
       --iterate           Iterative cook — only recook what changed. Much faster
                           on a re-run, and occasionally wrong; if a packaged run
                           disagrees with the editor, re-cook without this first.
+      --no-dist           Do not build the sendable zip afterwards. The bare .app
+                          is then all you get, and the .app ON ITS OWN IS NOT
+                          SENDABLE — see Scripts/package-mac-dist.sh for why.
   -n, --dry-run           Print the command that would run; run nothing
   -h, --help              This text
 
@@ -107,8 +111,12 @@ EXAMPLES
 
 AFTERWARDS
   Run it:     open <output>/Mac/${TRACE_PROJECT_NAME}.app
-  Sending it to somebody? The bundle is UNSIGNED. Read docs/PLAYTEST.md — macOS
-  quarantines it and the recipient needs one command to clear that.
+  Send it:    this script now BUILDS the sendable artefact itself — a zip holding
+              the app and a README that tells the recipient how to open it. That
+              zip is the only thing to send. The bare .app is not sendable: it is
+              ad-hoc signed, macOS quarantines anything downloaded, and the two
+              together produce "Trace is damaged and can't be opened" on every
+              other Mac. Scripts/package-mac-dist.sh has the measurements.
 EOF
 }
 
@@ -121,6 +129,7 @@ while [ $# -gt 0 ]; do
         --skip-cook)   DO_COOK=0; shift ;;
         --skip-build)  DO_BUILD=0; shift ;;
         --iterate)     DO_ITERATE=1; shift ;;
+        --no-dist)     DO_DIST=0; shift ;;
         -n|--dry-run)  TRACE_DRY_RUN=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         --)            shift; while [ $# -gt 0 ]; do EXTRA_ARGS+=("$1"); shift; done ;;
@@ -341,26 +350,50 @@ if [ "$PLATFORM" = "Mac" ]; then
         trace_msg "Cooked content: ${UASSET_COUNT} loose .uasset file(s) inside the bundle."
     fi
 
-    # Signing status is a distribution fact the recipient will hit within ten
-    # seconds of double-clicking, so say it here rather than letting them find out.
-    if codesign -dv "$APP" >/dev/null 2>&1; then
-        SIGNER="$(codesign -dvv "$APP" 2>&1 | sed -n 's/^Authority=//p' | head -1)"
-        if [ -n "$SIGNER" ]; then
-            trace_msg "Code signature: signed by ${SIGNER}"
-        else
-            trace_msg "Code signature: ad-hoc only (no Developer ID). Gatekeeper WILL block this"
-            trace_msg "                on another Mac. See docs/PLAYTEST.md."
-        fi
+    rm -f "$PACKAGE_LOG"
+
+    # ---- GATE 4 — THE ARTEFACT YOU CAN ACTUALLY SEND ------------------------------------------
+    #
+    # THIS USED TO BE A WARNING AND THAT WAS NOT ENOUGH. The script printed
+    # "the bundle is ad-hoc signed, see docs/PLAYTEST.md" and the owner's
+    # playtesters still could not open it, because a warning at the end of a
+    # forty-minute cook is read once and the artefact it warned about is then
+    # sent on its own, without the instructions, weeks later.
+    #
+    # So the instructions are no longer a document to remember — they are a file
+    # inside the zip, and the zip is built here, every time, by the same command
+    # that built the app. package-mac-dist.sh also gates the things that make a
+    # bundle fail on somebody else's Mac (broken signature, missing network
+    # entitlements, Epic's placeholder bundle id) and then EXPANDS ITS OWN ZIP
+    # AND LAUNCHES WHAT COMES OUT, so "it packaged" and "it runs" are not the
+    # same claim taken on trust.
+    if [ "$DO_DIST" = "1" ]; then
+        trace_msg ""
+        "${TRACE_SCRIPT_DIR}/package-mac-dist.sh" --app "$APP" --output "${OUTPUT}/Mac"
     else
-        trace_warn "The bundle is UNSIGNED. Gatekeeper will refuse to open it on another Mac."
-        trace_warn "Recipients need:  xattr -dr com.apple.quarantine $(basename "$APP")"
-        trace_warn "See docs/PLAYTEST.md for the full instructions to send with it."
+        trace_warn "--no-dist: no sendable zip was built."
+        trace_warn "The bare .app is NOT sendable — it is ad-hoc signed, so a recipient's Mac"
+        trace_warn "quarantines it and refuses it with \"Trace is damaged and can't be opened\"."
+        trace_warn "Build the sendable artefact with:  Scripts/package-mac-dist.sh"
     fi
 
-    rm -f "$PACKAGE_LOG"
-    trace_msg "Next: open \"${APP}\""
-    trace_msg "      or host on this machine's LAN/Tailscale address with:"
-    trace_msg "      \"${EXE}\" ${TRACE_DEFAULT_MAP}?listen -port=${TRACE_DEFAULT_PORT}"
+    trace_msg ""
+    trace_msg "To run it here:  open \"${APP}\""
+    # *** HOSTING FROM THIS BUNDLE IS A BUTTON, NOT A COMMAND LINE. ***
+    # This used to print
+    #     "${EXE}" ${TRACE_DEFAULT_MAP}?listen -port=${TRACE_DEFAULT_PORT}
+    # and that DOES NOT HOST. Measured on the packaged Shipping bundle three times
+    # (?listen?bots=0?half=900 polled for 10 minutes; a plain ?bots=4 sampled at
+    # 75 s): the process never binds a UDP socket and is drawing the title menu
+    # (ATraceMenuHUD::DrawHUD) the whole time — the map URL does not survive into a
+    # packaged launch. Pressing PLAY does host, and that was measured on the same
+    # bundle in the same session: UDP *:7794 appeared within seconds of the key
+    # press, and a Development client then joined it ("Welcomed by server").
+    trace_msg "To host from here on this machine's LAN/Tailscale address:"
+    trace_msg "      open the app and press PLAY. PLAY *is* the host button; the address"
+    trace_msg "      players type is printed on the host's own title screen."
+    trace_msg "      (A ${TRACE_DEFAULT_MAP}?listen URL on the command line does NOT host a"
+    trace_msg "       packaged build — it lands on the title menu and binds nothing.)"
 else
     rm -f "$PACKAGE_LOG"
     trace_msg "Success in ${ELAPSED}s. Build archived under ${OUTPUT}."

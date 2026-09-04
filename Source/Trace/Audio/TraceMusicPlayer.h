@@ -33,6 +33,16 @@
 // ONCE per name and plays nothing; no audio device, a dedicated server and a null world are all
 // quiet no-ops. Nothing here can crash a match and nothing here can fill a log.
 //
+// *** BOTH BEDS ARE CURRENTLY DISABLED, AND EVERYTHING BELOW STILL DESCRIBES THE WIRING. ***
+// The owner asked for MusicTitle and AmbienceMatch to stop playing "until further notice", so
+// UTraceAudioSettings::bMusicBedsEnabled is False in Config/DefaultGame.ini and Play() returns
+// early. NOTHING WAS UNWIRED: the three call sites below still run, still in this order, and the
+// cross-fade behaviour described below is what comes back the moment that flag is True (or
+// `Trace.Music.Beds 1` is typed). Read the rest of this block as "what this does when the beds are
+// on", because that is the state it is one config line away from.
+//
+// The stingers are NOT beds and are unaffected — they never went through this subsystem.
+//
 // WIRED, AND HERE IS WHERE (this block said "NO CALL SITES YET, by design" while the subsystem
 // waited a wave for them; that is no longer true and a stale justification is how this project has
 // repeatedly fooled itself):
@@ -91,14 +101,42 @@ public:
 	 * Cross-fade to @p Track (an event name from Audio/TraceSoundEvents.h; the asset is
 	 * /Game/Trace/Audio/S_<Track>). A NO-OP when @p Track is already the playing track. The
 	 * outgoing track fades to silence over the same @p FadeSeconds the incoming one rises.
+	 *
+	 * *** WHILE THE BEDS ARE DISABLED (UTraceAudioSettings::bMusicBedsEnabled, currently False) THIS
+	 * *** STARTS NOTHING. *** It stops whatever is playing over @p FadeSeconds and clears
+	 * GetCurrentTrack() to NAME_None, so the subsystem never believes a bed is playing when none is.
+	 * Callers do not need to know: the contract "call it unconditionally, it does the right thing"
+	 * is exactly what makes one flag able to turn the beds off without touching a call site.
 	 */
 	void Play(FName Track, float FadeSeconds = 0.8f);
 
 	/** Fade whatever is playing to silence and stop it. Safe to call when nothing plays. */
 	void Stop(float FadeSeconds = 0.8f);
 
-	/** The track Play() would currently treat as already-playing. NAME_None when stopped. */
+	/**
+	 * The track Play() would currently treat as already-playing. NAME_None when stopped — and always
+	 * NAME_None while the beds are disabled, because Play() clears it rather than recording a track
+	 * it did not start.
+	 *
+	 * *** THIS IS NOT A WAY TO ASK WHETHER THE BEDS ARE DISABLED. *** NAME_None also means "the beds
+	 * are on and nothing has started one yet" — mid-travel, before the first BeginPlay, or after a
+	 * device refused the component. Callers that want the SWITCH must ask AreBedsEnabled(); a
+	 * results-screen log line that inferred "beds are off" from this was measured contradicting
+	 * itself two seconds later, in the run that flipped `Trace.Music.Beds 1` mid-match.
+	 */
 	FName GetCurrentTrack() const { return CurrentTrack; }
+
+	/**
+	 * Are the two music beds allowed to play at all right now?
+	 *
+	 * The single source of truth for the switch the owner asked for: `Trace.Music.Beds` (-1 follow
+	 * config / 0 force off / 1 force on) over UTraceAudioSettings::bMusicBedsEnabled. Static, and
+	 * legal with no subsystem, because the answer is a setting and not a piece of subsystem state.
+	 *
+	 * It exists so that code OUTSIDE this file can say "the beds are off" and be RIGHT. Play() is
+	 * still the only thing that consults it to decide what to do; everyone else is describing.
+	 */
+	static bool AreBedsEnabled();
 
 	/**
 	 * Re-applies MasterVolume x MusicVolumeScale to the playing component, for the audio settings

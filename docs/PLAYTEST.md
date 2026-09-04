@@ -26,42 +26,146 @@ all and both are labelled — do not assume the rest is guesswork; it is not.
 
 ### What you got
 
-A zip containing **`Trace-Mac-Shipping.app`**. The zip is **385 MB**; it expands to **717 MB**.
-Unzip it anywhere — Applications, Desktop, Downloads, it does not matter.
+A zip whose name starts with **`Trace-Mac`**. It expands to a folder holding two things:
 
-### It will refuse to open the first time. This is normal.
+* **`Trace-Mac-Shipping.app`** — the game.
+* **`READ ME FIRST - Trace will not open until you do this.txt`** — the same instructions as below,
+  shipped inside the zip so they cannot get separated from the app. Scripts/package-mac-dist.sh
+  writes that file every time a build is packaged; nobody has to remember to attach it.
 
-The app is not code-signed by a registered Apple developer, so macOS quarantines anything downloaded
-and blocks it. **Double-clicking will fail**, and on recent macOS the dialog says the app
-*"is damaged and can't be opened"*.
+The zip is around **375 MB** and expands to **717 MB**.
 
-**That message is a lie.** Nothing is damaged. macOS says "damaged" when it means "unsigned". Do not
-delete it and ask for another copy — you will get the identical result.
+### It will refuse to open the first time. This is normal, and here is exactly why.
 
-**Two ways to fix it. Either works, once, per download.**
+Two separate facts, and it takes **both** of them to produce the failure:
 
-**The easy one — no Terminal:**
+1. **The app is ad-hoc signed.** `codesign -dvv` on it reports `Signature=adhoc` and
+   `TeamIdentifier=not set`. That is a *real, valid* signature — `codesign --verify --deep --strict`
+   passes — it simply has no certificate chain behind it, because nobody has paid Apple $99/year for
+   a Developer ID. Gatekeeper therefore cannot attribute the app to anyone.
+2. **macOS quarantines downloads.** A browser, Messages, AirDrop, Slack or Discord attaches the
+   `com.apple.quarantine` extended attribute to whatever it hands you. The network does not do this;
+   the *downloading application* does.
 
-1. **Right-click** (or Control-click) `Trace-Mac-Shipping.app`
-2. Choose **Open**
-3. In the dialog that appears, click **Open** again
+Quarantine **plus** no Developer ID means macOS refuses to launch it, usually with:
 
-It has to be the right-click menu. Double-clicking will keep failing even after this works once.
+> *"Trace is damaged and can't be opened. You should move it to the Trash."*
 
-**The reliable one — one line in Terminal:**
+**That message is a lie about the cause.** Nothing is damaged. macOS says "damaged" when it means
+"I cannot tell who signed this". Do not delete it and ask for another copy — you will get the
+identical result.
+
+**This was measured, not inferred.** On macOS 26.5, with the real path a recipient takes — quarantine
+set on the zip the way Safari sets it, expanded with Archive Utility by double-clicking, launched
+with `open`:
+
+| | CPU seconds the launch actually used, 20–25 s after `open` |
+|---|---|
+| Downloaded zip, expanded and double-clicked as-is | **0 s** — it never runs |
+| Same zip with quarantine cleared first | **~30 s** — the game is up |
+
+> **Why CPU time and not "did a process appear".** *Both* cases leave a process behind, so counting
+> processes answers the wrong question. A refused launch is also **App-Translocated** — macOS copies
+> the bundle to `/private/var/folders/…/AppTranslocation/<uuid>/d/` and starts it *there*, so it does
+> not even appear under the folder you launched it from. That process then sits at 0.0 % CPU
+> forever. A launch macOS allowed burns tens of CPU-seconds immediately, opening paks and compiling
+> shaders. Four orders of magnitude apart; the process count does not separate them at all.
+
+### *** THE TRAP: THE DOCUMENTED FIX STOPS WORKING THE MOMENT YOU DOUBLE-CLICK ***
+
+This is the thing that was wrong with every previous version of this section, and it is almost
+certainly why playtesters kept hitting the wall despite the remedy being written down.
+
+**macOS locks an app bundle against modification once it has decided not to launch it.** So
+`xattr -dr com.apple.quarantine <app>` — the universally-cited fix, and the one this file used to
+lead with — works perfectly right up until the recipient double-clicks the app, and fails afterwards
+with a wall of `Operation not permitted` on every file inside the bundle. `sudo` does not help; it is
+not that kind of permission.
+
+And of course *double-clicking is what people do first*. Nobody opens a README until something has
+already failed. So the instruction was only valid in the state nobody is in by the time they read it.
+
+**Measured, four for four, on macOS 26.5, same zip, same folder, same minute — the only variable is
+whether the app had been double-clicked before the command was run:**
+
+| Extraction | Double-clicked first? | `xattr -dr` result | Quarantined files left |
+|---|---|---|---|
+| `x2` | no | succeeds silently | **0** |
+| `x3` | yes | `Operation not permitted` ×64 | **64** |
+| `x4` | no | succeeds silently | **0** |
+| `x5` | yes | `Operation not permitted` ×64 | **64** |
+
+So there are three fixes, and **which one you need depends on what you have already done.**
+
+### Fix 0 — do it to the ZIP, before anyone unzips (the one to tell people)
+
+A zip is an ordinary file. None of the app-bundle protections apply to it, so this route cannot get
+into the state above at all:
 
 ```
-xattr -dr com.apple.quarantine ~/Downloads/Trace-Mac-Shipping.app
+xattr -d com.apple.quarantine ~/Downloads/Trace-Mac-Shipping.zip
 ```
 
-Change the path to wherever you actually put it. Then double-click normally. If you are unsure of the
-path, type `xattr -dr com.apple.quarantine ` (with the trailing space) and then drag the app from
-Finder into the Terminal window — it fills the path in for you.
+(no `r`). Then double-click the zip. Everything that comes out is already clean — **verified: 0
+quarantined files in the extraction, and the app launches with no further step.** This is what the
+`SEND-THIS-MESSAGE.txt` that `package.sh` writes tells people to do, because it is the only
+instruction that is still correct after they have ignored it once.
 
-> On macOS 15 and newer, right-click → Open has been removed for some downloads. If you do not get an
-> **Open** button, use the Terminal command, or go to
-> **System Settings → Privacy & Security**, scroll down, and click **Open Anyway** next to the
-> message about Trace.
+### Fix 1 — unzipped, but not double-clicked yet
+
+```
+xattr -dr com.apple.quarantine ~/Downloads/Trace-Mac/Trace-Mac-Shipping.app
+```
+
+Note the `r`: Archive Utility puts the flag on all 64 files inside the bundle, not just the top one.
+
+### Fix 2 — already double-clicked, already saw "damaged" (most people)
+
+Do not fight the lock; step around it. Copy the bundle without its extended attributes, which needs
+no permission on the original because it only *reads* it:
+
+```
+ditto --noextattr --noqtn ~/Downloads/Trace-Mac/Trace-Mac-Shipping.app ~/Trace.app
+```
+
+Then open `~/Trace.app`. **Verified end to end on the shipped artefact, in this order:** the blocked
+copy burns **0 s of CPU**, `xattr -dr` on it fails with `Operation not permitted` and leaves all 64
+flags in place, and the `ditto` copy has no xattrs, still passes `codesign --verify --deep --strict`,
+and **runs (35 s of CPU in 25 s of wall clock)**.
+
+The `Unlock Trace (double-click me).command` shipped inside the zip does exactly this decision: it
+tries Fix 1, checks whether any quarantine flag actually survived (rather than trusting `xattr`'s
+exit status, which is not reliable here), and falls back to Fix 2 automatically, telling the player
+where the working copy is.
+
+### Better still: don't let it get quarantined at all
+
+Quarantine comes from the downloader, so a transfer that is not a download never acquires it. Both of
+these were measured to produce a file with **no** `com.apple.quarantine` attribute at all:
+
+```
+curl -L -o ~/Downloads/Trace-Mac-Shipping.zip "<the link>"
+scp  someone@100.x.x.x:Trace-Mac-Shipping.zip ~/Downloads/
+```
+
+If the group is already on Tailscale to play, `scp` over the tailnet skips this entire section.
+
+### What about right-click → Open?
+
+It used to be the no-Terminal answer and it is no longer reliable. On macOS 15 and newer, Apple
+removed the right-click → Open bypass for apps in this state; for an app that gets the "damaged"
+dialog there is often no **Open** button offered at all, and no **Open Anyway** in
+**System Settings → Privacy & Security** either, because that path exists for apps that are *signed
+by an identifiable developer and not notarized* — which this one is not. Try it if you like; if you
+do not get an **Open** button within two clicks, use the Terminal command above. It always works.
+
+### What an Apple Developer account would change
+
+$99/year buys a *Developer ID Application* certificate. With one, the build would be signed with the
+hardened runtime, submitted to `xcrun notarytool`, and stapled — after which it opens on a
+double-click, on any Mac, with no instructions and no Terminal, and this whole section disappears.
+That is the only thing that removes the problem rather than working around it. Nothing above is a
+substitute for it; it is the best that is reachable without it.
 
 ### Two things that will stop it dead, and are worth checking before you download 717 MB
 
@@ -69,7 +173,24 @@ Finder into the Terminal window — it fills the path in for you.
   it at all, and Rosetta does not help — Rosetta translates Intel code for Apple Silicon, not the
   other way round. Any Mac from roughly 2020 or earlier is out. Check with  → About This Mac; you
   need "Apple M1" or later, not "Intel".
+  *If someone in the group has an Intel Mac,* a universal build is one flag —
+  `Scripts/package.sh -- -architecture=arm64+x86_64` — at the cost of roughly double the build time
+  and a noticeably bigger download. Nothing else about the project changes.
 * **macOS 14 (Sonoma) or newer.** Older macOS refuses to launch it.
+
+### Before you connect: check the two builds match
+
+Bottom right of the title screen, every build prints a version and an eight-character code:
+
+```
+V 0.1.0   NET 51920028
+```
+
+**Everyone in the session must see the same `NET` code.** Windows players see it in the same corner.
+Two machines with different codes cannot connect — the engine refuses the handshake — and the error
+message blames the connection rather than the version. Comparing the two corners takes five seconds
+and saves an evening. §7 explains what the code is made of and how to compare two
+checkouts without launching anything.
 
 ---
 
@@ -370,18 +491,68 @@ out.
 
 The control that makes that a real finding rather than a failure to look: in the same window the
 same two runs *did* write
-`~/Library/Containers/com.YourCompany.Trace/Data/Library/Application Support/Epic/Trace/Saved/Config/Mac/GameUserSettings.ini`
+`~/Library/Containers/io.github.lzbrv.trace/Data/Library/Application Support/Epic/Trace/Saved/Config/Mac/GameUserSettings.ini`
 and two crash-reporter config files, so the app was certainly writing to that container. It just
 never wrote a log into it.
 
 So **do not go hunting** in
-`~/Library/Containers/com.YourCompany.Trace/Data/Library/Logs/Trace/`. If a `Trace.log` is sitting
+`~/Library/Containers/io.github.lzbrv.trace/Data/Library/Logs/Trace/`. If a `Trace.log` is sitting
 there it is stale, from some earlier build, and sending it will mislead whoever reads it — check its
 timestamp before you send anything.
 
 A log that is useful for diagnosis has to come from a **Development** build, which whoever sent you
 the game can produce with one flag (§8.1). Ask them for one; do not try to extract it from this
 build.
+
+### The `NET` code — the five-second check that replaces an evening
+
+Bottom right of every title screen, in every build on every platform:
+
+```
+V 0.1.0   NET 51920028
+```
+
+**If two machines show different `NET` codes they cannot connect.** The engine refuses the handshake
+during connect, and the message a player gets is about the *connection*, not the version — which is
+why this is worth checking first rather than last.
+
+**What the code is.** Unreal normally derives its network compatibility value from a mix of the
+project name, the project version, and *the engine install's own changelist* — and that last term
+comes out of `Engine/Build/Build.version` on the machine that built it, not out of this repository.
+Two people on "UE 5.8" whose installs differ by a hotfix therefore compute different values from
+identical source, and the failure looks like a networking problem. This project does not rely on
+that. It pins the value to two things that both live in the repository:
+
+* `NetProtocolVersion` in `Source/Trace/UI/TraceNetworking.h`
+* `ProjectVersion` in `Config/DefaultGame.ini`
+
+so any two builds of the same commit agree by construction, on any platform, on any 5.8 install. The
+trade-off is stated where it is made: this no longer refuses a connection between two *different
+engine versions*, so `NetProtocolVersion` must be bumped by hand when the engine moves.
+
+**Three ways to read it, in order of who can use them:**
+
+| Who | How |
+|---|---|
+| A player, any build including Shipping | Title screen, bottom right |
+| Anyone with the repository, no build needed | `python3 Scripts/netversion.py` |
+| A developer with a console (Development builds) | `Trace.NetVersion` |
+
+`Scripts/netversion.py` computes the value from the source files in about a second, with no engine
+and no build, and prints the string it hashed as well as the code:
+
+```
+NET 51920028
+  from : "trace netproto 1, project 0.1.0"
+```
+
+Run it on the Mac and on the Windows machine before a session. Identical output means the two builds
+will agree. Different output means the two *checkouts* differ, and rebuilding will not help — pull.
+
+`Scripts/netversion.py --verify <log>` checks the script against a Development run's own log, so the
+script is tested against the binary that actually performs the handshake rather than trusted.
+
+---
 
 ---
 
@@ -395,11 +566,36 @@ Everything above this line is for a player. Everything below needs the repositor
 Scripts/package.sh
 ```
 
-That is the whole command. It cooks content and produces:
+That is the whole command. It cooks content and produces **two** things:
 
 ```
-Saved/Packaged/Mac/Trace-Mac-Shipping.app        717 MB   (385 MB zipped)
+Saved/Packaged/Mac/Trace-Mac-Shipping.app        717 MB   the bundle
+Saved/Packaged/Mac/Trace-Mac-Shipping.zip        385 MB   THE THING YOU SEND
 ```
+
+**Send the zip. Never send the `.app` on its own.** The zip holds the app *and* a README named
+`READ ME FIRST - Trace will not open until you do this.txt`, and the README is the half that makes
+the app openable on somebody else's Mac (§1). This used to be a warning printed at the end of a
+forty-minute cook, and the owner's playtesters still hit the wall — because a warning is read once
+and the artefact it warned about is sent, on its own, weeks later. `Scripts/package-mac-dist.sh`
+now builds the pair, and `package.sh` calls it, so the sendable artefact exists by construction
+rather than by anyone remembering to assemble it.
+
+Before it writes the zip, that script gates the four things that make a bundle fail on somebody
+else's machine in a way that does not look like its own cause, and **refuses to build a
+distributable if any of them fail**:
+
+| Gate | Why it exists |
+|---|---|
+| Code signature verifies | A *broken* signature produces the same "damaged" dialog as quarantine and has a completely different fix. The two must be told apart before the artefact leaves. |
+| Sandbox has `network.client` + `network.server` | Shipping's default Mac entitlements have **no network at all**; the game then runs, reports `COULD NOT LISTEN ON UDP 7777`, and is unjoinable with nothing on the port. See the block in `Config/DefaultEngine.ini`. |
+| `CFBundleIdentifier` is not `com.YourCompany.*` | Epic's placeholder. Every un-renamed UE project ships as `com.YourCompany.<Project>`, so macOS cannot tell this game from any other. |
+| Cooked content present | A bundle with none links, packages, reports success and exits instantly at launch (`KNOWN_LIMITATIONS.md` item 29). |
+
+It then **expands its own zip and launches what comes out**, so "it packaged" and "it runs" are not
+the same claim taken on trust. `--prove-quarantine` adds the other arm: it quarantines a copy exactly
+the way a download does and shows that copy failing to start. That arm is off by default only because
+it deliberately trips Gatekeeper and may put a dialog on your screen.
 
 Roughly a minute and a half on a warm cache; budget much longer for the first cook on a fresh
 machine. `Scripts/package.sh --help` documents the options. The useful ones:
@@ -423,8 +619,11 @@ Scripts/package.sh
 *Both* steps are required, and until 2026-09-04 the second one silently ignored the first — see
 §8.4.
 
-**Send the `.app` as a zip** (Finder → Compress). A `.app` is a directory, and most file-transfer
-services mangle it otherwise.
+**Do not zip it by hand.** `package.sh` already made the zip, with the README inside it and with
+`ditto --sequesterRsrc`, which is what keeps the code signature intact through the round trip. A
+hand-rolled `zip -r` can break the signature, and a broken signature produces the *same* "damaged"
+dialog as quarantine while being immune to the quarantine fix — the worst possible failure, because
+the recipient follows correct instructions and still cannot open it.
 
 ### 8.2 Windows
 
@@ -468,9 +667,20 @@ Getting rid of both prompts means an Apple Developer account ($99/yr, plus notar
 Windows code-signing certificate. For a weekend playtest among friends, telling them about §1 and §2
 in advance is the proportionate answer.
 
-The bundle identifier is still the engine placeholder **`com.YourCompany.Trace`**. Harmless for a
-playtest, but it is why the sandbox container in §7 has that name, and any other project that also
-never changed the placeholder would share it.
+The bundle identifier **is no longer Epic's placeholder**. It was `com.YourCompany.Trace` until
+2026-09-04 — the name every un-renamed UE project ships under, which meant macOS could not tell this
+game from any other unshipped UE project, and any Gatekeeper approval or sandbox container was keyed
+to a name shared with all of them. It is now `io.github.lzbrv.trace`, set by `BundleIdentifier` under
+`[/Script/MacTargetPlatform.XcodeProjectSettings]` in `Config/DefaultEngine.ini`, and it is the
+reason the sandbox container path in §7 has that name.
+
+`io.github.lzbrv` is reverse-DNS for a name the owner actually controls (the GitHub account this
+repository lives under), which is the whole point of reverse-DNS and why it is not `com.trace`.
+Anyone who ran a build from before that date will get a fresh container; for a prototype with no
+saved data that is invisible.
+
+`Scripts/package-mac-dist.sh` refuses to build a distributable from a bundle whose identifier is back
+on the placeholder, so this cannot silently regress.
 
 ### 8.4 The character art was not in the package until 2026-09-04
 
