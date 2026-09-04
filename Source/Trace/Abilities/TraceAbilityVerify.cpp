@@ -712,10 +712,9 @@ namespace TraceAbilityVerify
 		const bool bEnabled = UTraceAbilityComponent::AreCharactersEnabled(WorldPtr);
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[AbilityState] ===== netmode=%d | scoringMode=%s | charactersEnabled=%d (setting=%d) | "
+			TEXT("[AbilityState] ===== netmode=%d | charactersEnabled=%d (setting=%d) | "
 			     "matchClock=%.2f | carrierControlImmune=%d ====="),
 			static_cast<int32>(WorldPtr->GetNetMode()),
-			(TraceGS != nullptr && TraceGS->IsGoalMode()) ? TEXT("B-ThrownCoreAndGoals") : TEXT("A-EndzoneStatusCore"),
 			bEnabled ? 1 : 0, UTraceSettings::Get().bCharactersEnabled ? 1 : 0,
 			(TraceGS != nullptr) ? TraceGS->GetServerWorldTimeSeconds() : 0.0,
 			UTraceSettings::Get().bCarrierImmuneToAbilityControl ? 1 : 0);

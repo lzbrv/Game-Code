@@ -3533,9 +3533,9 @@ namespace TraceMortimerVerifyFile
 						{
 							Run->WatchUntil = Now + 1.0;
 							UE_LOG(LogTraceGame, Display,
-								TEXT("[%s] arm %d: ThrowFromHolder refused. modeB=%d loose=%d carrier=%s "
+								TEXT("[%s] arm %d: ThrowFromHolder refused. loose=%d carrier=%s "
 								     "(wanted %s)."),
-								Tag, Run->ArmIndex, Core->IsModeB() ? 1 : 0, Core->IsLoose() ? 1 : 0,
+								Tag, Run->ArmIndex, Core->IsLoose() ? 1 : 0,
 								*GetNameSafe(Core->GetCarrier()), *GetNameSafe(Pawn));
 							Core->TryPickup(Pawn);
 						}

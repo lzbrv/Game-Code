@@ -226,7 +226,6 @@ void UTraceTitleMenuWidget::NativeOnInitialized()
 	OrderedRows.Add(RowJoin);
 	OrderedRows.Add(RowPractice);
 	OrderedRows.Add(RowDifficulty);
-	OrderedRows.Add(RowMode);
 	OrderedRows.Add(RowSettings);
 	OrderedRows.Add(RowQuit);
 

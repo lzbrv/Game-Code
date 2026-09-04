@@ -889,15 +889,6 @@ void ATraceHUD::DrawHUD()
 	bLocalAlive    = (LocalChar != nullptr) && LocalChar->IsAlive();
 	bLocalCarrying = bLocalAlive && LocalChar->IsCarrier();
 
-	// WHICH OF THE TWO GAMES THIS IS (spec v4 §7), resolved once a frame from the replicated
-	// GameState rather than per pass. Every prompt below has to follow it — mode B changes what LMB
-	// does while carrying, and a HUD that keeps saying "HOLD TO PASS" in a mode where the button
-	// throws is actively teaching the wrong control.
-	//
-	// The GameState, not ATraceCore::IsModeB: the Core is null before it has replicated, and the
-	// mode chip has to be right on the first drawn frame of the warm-up.
-	bGoalMode = (TraceGS != nullptr) && TraceGS->IsGoalMode();
-
 	// Death edge detection, purely local — see the note on LocalDeathTime in the header.
 	if (bLocalAlive)
 	{
@@ -1405,34 +1396,18 @@ void ATraceHUD::UpdateReticleAnchor()
 
 	// ---- Who would receive a pass right now ----------------------------------------------------
 	//
-	// ATraceCore::FindPassTargetFor() is public precisely so the HUD can answer this before the
-	// button is pressed (see its comment). Asking the Core rather than re-implementing the cone here
-	// is the whole point: the highlight can then never disagree with the pass that actually happens.
+	// NOBODY, AND THAT IS NOT A BUG. This probe asked ATraceCore::FindPassTargetFor() — public
+	// precisely so the HUD could answer before the button was pressed, so the highlight could never
+	// disagree with the pass that actually happens — and it was already skipped in goals mode,
+	// because a throw has no receiver to acquire: it goes where the crosshair points and the first
+	// player to touch it takes it, teammate or not (spec v4 §7). The endzone ruleset that had the
+	// hover-pass has been removed, so the probe would now be skipped every frame of every match and
+	// the call is gone rather than left behind a condition that cannot be true.
 	//
-	// SKIPPED ENTIRELY IN MODE B. A throw has no receiver to acquire — it goes where the crosshair
-	// points and the first player to touch it takes it, teammate or not (spec v4 §7). Running the
-	// probe anyway would light a teammate up as "the person this is going to", which is not a thing
-	// mode B does, and would spend a handful of line traces a frame proving it.
-	ATraceCore* Core = (TraceGS != nullptr) ? TraceGS->Core : nullptr;
-	if (Core != nullptr && bLocalCarrying && !bGoalMode)
-	{
-		if ((Now - LastPassTargetPollTime) >= TraceHUDStyle::PassTargetPollInterval)
-		{
-			LastPassTargetPollTime = Now;
-			HoveredPassTarget = Core->FindPassTargetFor(LocalChar.Get());
-		}
-
-		// Once a pass is actually in flight the Core's own choice of receiver outranks our probe:
-		// that is the player the server will hand the Core to, whatever the aim has drifted onto.
-		if (ATraceCharacter* Locked = Core->GetEffectivePassTarget())
-		{
-			HoveredPassTarget = Locked;
-		}
-	}
-	else
-	{
-		HoveredPassTarget = nullptr;
-	}
+	// HoveredPassTarget is deliberately left in place and cleared here. The receiver highlight, the
+	// pass lock alpha and the reticle's locked state all still read it, so this one line is what
+	// keeps them at their "nobody" answer without touching three unrelated draw passes.
+	HoveredPassTarget = nullptr;
 
 	ATraceCharacter* Target = HoveredPassTarget.Get();
 	if (Target != nullptr && !Target->IsAlive())
@@ -1801,55 +1776,26 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 	FString Caption;
 	FLinearColor CaptionColor = TraceHUDStyle::InkDim;
 
-	// ---- MODE B: the caption is the control scheme, and it is a different one ---------------------
+	// ---- THE CAPTION IS THE CONTROL SCHEME -------------------------------------------------------
 	//
 	// Spec v4 §7: "The carrier should be able to throw the core forward by left clicking." There is
 	// no receiver to acquire, no hold, and no teammate to name — the throw goes where the crosshair
-	// points and the first player to reach it, either team, takes it. So mode B gets its own short
-	// caption rather than mode A's, and it takes this branch before any of the receiver logic below
-	// can put a teammate's name under a reticle that does not aim at teammates.
-	if (bGoalMode)
-	{
-		if (bOnCooldown)
-		{
-			Caption = FString::Printf(TEXT("THROW READY IN %.1f"), CooldownRemaining);
-			CaptionColor = TraceHUDStyle::Danger;
-		}
-		else if (bLocalCarrying)
-		{
-			Caption = TEXT("LMB  -  THROW");
-			CaptionColor = TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.35f);
-		}
-
-		if (!Caption.IsEmpty())
-		{
-			DrawTextCentered(Caption, TraceHUDStyle::WithAlpha(CaptionColor, Visibility),
-				X, Y + Radius + (14.f * UIScale), FontSmall, UIScale);
-		}
-		return;
-	}
-
+	// points and the first player to reach it, either team, takes it.
+	//
+	// THE OTHER HALF OF THIS FUNCTION IS GONE WITH THE ENDZONE RULESET. It wrote "PASS READY IN x"
+	// or "HOLD TO PASS - <RECEIVER>", naming the receiver because in a 5v5 with two teammates
+	// overlapping on screen "which one" is a real question and the Core picked whoever was nearest
+	// the crosshair. There is no hover-pass to caption now, so the throw arm — which was already
+	// taken first, before any of that receiver logic could put a teammate's name under a reticle
+	// that does not aim at teammates — is the whole of it.
 	if (bOnCooldown)
 	{
-		Caption = FString::Printf(TEXT("PASS READY IN %.1f"), CooldownRemaining);
+		Caption = FString::Printf(TEXT("THROW READY IN %.1f"), CooldownRemaining);
 		CaptionColor = TraceHUDStyle::Danger;
 	}
-	else if (bLocked)
+	else if (bLocalCarrying)
 	{
-		// The receiver by NAME. In a 5v5 with two teammates overlapping on screen, "which one" is a
-		// real question and the Core picks whoever is nearest the crosshair — so the HUD says so out
-		// loud rather than leaving the player to infer it from a bracket.
-		FString ReceiverName;
-		if (const ATraceCharacter* Target = HoveredPassTarget.Get())
-		{
-			if (const APlayerState* TargetState = Target->GetPlayerState())
-			{
-				ReceiverName = TargetState->GetPlayerName();
-			}
-		}
-		Caption = ReceiverName.IsEmpty()
-			? FString(TEXT("HOLD TO PASS"))
-			: FString::Printf(TEXT("HOLD TO PASS  -  %s"), *ReceiverName.ToUpper());
+		Caption = TEXT("LMB  -  THROW");
 		CaptionColor = TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.35f);
 	}
 
@@ -4712,15 +4658,12 @@ void ATraceHUD::DrawScoresAndClock()
 		FooterText = TraceGS->GetPendingPeriodEndLabel();
 	}
 
-	// The mode is appended rather than given a panel of its own. It has to be visible in EVERY
-	// screenshot — the whole point of the A/B toggle is comparing two builds' worth of footage, and
-	// a capture that does not say which mode it is from is a capture nobody can file — but it is
-	// also a constant, and a constant does not deserve to compete with the clock for attention.
-	if (TraceGS != nullptr)
-	{
-		FooterText = FString::Printf(TEXT("%s   -   %s"), *FooterText,
-			*TraceScoringModeLabel(TraceGS->GetScoringMode()));
-	}
+	// THE MODE USED TO BE APPENDED HERE, and it is gone with the A/B toggle. It had to be visible in
+	// every screenshot while there were two rulesets to compare — a capture that does not say which
+	// mode it is from is a capture nobody can file — and it was appended rather than given a panel of
+	// its own because a constant does not deserve to compete with the clock for attention. With one
+	// ruleset it is a constant that says nothing at all, so the footer is the period and the whistle
+	// again.
 
 	const float FooterY = PanelY + PanelH - (22.f * UIScale);
 
@@ -4835,11 +4778,12 @@ void ATraceHUD::DrawCoreBanner()
 		//   kickoff      — the ~1s grant delay after a whistle or a score, which exists so the Core
 		//                  is not handed over mid-teleport.
 		//
-		// MODE B REINSTATES THE THIRD STATE, and reinstates it as a real instruction: a thrown Core
-		// IS on the field and the first player to touch it takes it, either team. Saying "CORE
-		// LOOSE" in mode A was a lie; refusing to say it in mode B would be the opposite lie, and
-		// the resulting scramble is the single most important thing on screen when it happens.
-		if (bGoalMode && Core->IsLoose())
+		// A THIRD STATE, and a real instruction: a thrown Core IS on the field and the first player
+		// to touch it takes it, either team. Saying "CORE LOOSE" under the endzone ruleset would
+		// have been a lie — nothing was ever loose there — and refusing to say it here would be the
+		// opposite lie; the resulting scramble is the single most important thing on screen when it
+		// happens.
+		if (Core->IsLoose())
 		{
 			BannerText = TEXT("CORE LOOSE - FIRST TOUCH TAKES IT");
 			BannerColor = TraceHUDStyle::Danger;
@@ -4852,12 +4796,11 @@ void ATraceHUD::DrawCoreBanner()
 	}
 	else if (Carrier == LocalChar.Get())
 	{
-		// The verb follows the mode. Spec v4 §7 makes LMB mean two different things while carrying —
-		// the 0.5 s hover-hold pass in mode A, an outright throw in mode B — and the banner is the
-		// one piece of HUD a carrier is guaranteed to be looking at.
-		BannerText = bGoalMode
-			? FString(TEXT("YOU HAVE THE CORE - LMB THROWS"))
-			: FString(TEXT("YOU HAVE THE CORE - HOLD LMB TO PASS"));
+		// The banner is the one piece of HUD a carrier is guaranteed to be looking at, so it names the
+		// verb. Spec v4 §7 made LMB mean two different things while carrying — a 0.5 s hover-hold
+		// pass, or an outright throw — and this line picked between them. The hover-pass went with
+		// the endzone ruleset.
+		BannerText = FString(TEXT("YOU HAVE THE CORE - LMB THROWS"));
 		BannerColor = TraceTeamColor(LocalTeam);
 	}
 	else
@@ -4867,11 +4810,11 @@ void ATraceHUD::DrawCoreBanner()
 		BannerColor = TraceTeamColor(CarrierTeam);
 	}
 
-	// Pulse anything that demands a reaction: you are carrying it, an enemy is, or (mode B) it is
-	// lying on the field and the next person to touch it owns the possession.
+	// Pulse anything that demands a reaction: you are carrying it, an enemy is, or it is lying on
+	// the field and the next person to touch it owns the possession.
 	const bool bUrgent = (Carrier != nullptr)
 		? (Carrier == LocalChar.Get() || Carrier->GetTeam() != LocalTeam)
-		: (bGoalMode && Core->IsLoose());
+		: Core->IsLoose();
 	if (bUrgent)
 	{
 		BannerColor = TraceHUDStyle::WithAlpha(BannerColor, 0.7f + 0.3f * FMath::Sin(Now * 6.f));
@@ -5969,16 +5912,14 @@ void ATraceHUD::DrawMatchResult()
 	DrawTextCentered(ResultText, ResultColor, CX, ViewH * 0.135f, FontLarge, 2.6f * UIScale);
 
 	// One line of plain English under the result. A results screen that says "MERCY RULE" and
-	// nothing else leaves the reader to guess the threshold; this states the rule that fired, and in
-	// the clock case it states which mode the match was played in — which is the fact an A/B
-	// playtest's notes need and the one a screenshot otherwise loses.
+	// nothing else leaves the reader to guess the threshold; this states the rule that fired. It used
+	// to name the scoring mode as well, which was the fact an A/B playtest's notes needed and the one
+	// a screenshot otherwise lost; there is one ruleset now and naming it says nothing.
 	const FString SubText = bMercy
-		? FString::Printf(TEXT("%s LED BY %d - THE MATCH ENDED EARLY (%s)"),
-			*TraceTeamName(Winner).ToString().ToUpper(), FMath::Abs(Blue - Orange),
-			*TraceScoringModeLabel(TraceGS->GetScoringMode()))
-		: FString::Printf(TEXT("%s HALVES ON THE CLOCK  -  %s"),
-			(TraceGS->NumHalves == 2) ? TEXT("TWO") : TEXT("ALL"),
-			*TraceScoringModeLabel(TraceGS->GetScoringMode()));
+		? FString::Printf(TEXT("%s LED BY %d - THE MATCH ENDED EARLY"),
+			*TraceTeamName(Winner).ToString().ToUpper(), FMath::Abs(Blue - Orange))
+		: FString::Printf(TEXT("%s HALVES ON THE CLOCK"),
+			(TraceGS->NumHalves == 2) ? TEXT("TWO") : TEXT("ALL"));
 
 	DrawTextCentered(SubText, TraceHUDStyle::InkDim, CX, ViewH * 0.205f, FontSmall, 1.05f * UIScale);
 
@@ -7541,8 +7482,7 @@ namespace TraceHUDV16Shots
 		TEXT("Spec v16 2. Stages real gameplay state and photographs the bottom-right corner and the "
 		     "crosshair charge ring, RED ARM FIRST (Trace.HUD.V16 0, the superseded HUD) then the same "
 		     "fixture armed. Writes Saved/Screenshots/HudV16_*_pid<n>.png, asserts on the draw record "
-		     "beside every frame, and ends in a verdict. Listen server or standalone only; the ring "
-		     "needs a mode B world (?mode=b)."),
+		     "beside every frame, and ends in a verdict. Listen server or standalone only."),
 		FConsoleCommandWithWorldDelegate::CreateStatic([](UWorld* WorldPtr)
 		{
 			APlayerController* PC = FindLocalAuthorityPC(WorldPtr);
@@ -7565,8 +7505,12 @@ namespace TraceHUDV16Shots
 			Run->Hud = HudPtr;
 			Run->PC = PC;
 
-			const ATraceGameState* GS = WorldPtr->GetGameState<ATraceGameState>();
-			Run->bModeB = (GS != nullptr) && GS->IsGoalMode();
+			// ALWAYS TRUE NOW. This asked ATraceGameState which ruleset was running; the endzone one
+			// was removed, so the mode-A scenes below (case 21's pass ring in particular) are
+			// unreachable. They are left in place rather than deleted because they are this harness's
+			// record of what the shared ring geometry was originally written for, and because the
+			// HUD tranche owns them.
+			Run->bModeB = true;
 
 			Schedule(Run, 0.1f);
 		}));

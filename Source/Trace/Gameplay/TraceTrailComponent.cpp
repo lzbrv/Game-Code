@@ -54,7 +54,7 @@
 
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
-#include "Core/TraceGameState.h"        // ScoringMode, for the mode-A/mode-B grace report
+#include "Core/TraceGameState.h"        // the match state the grace report reads
 #include "Gameplay/TraceCore.h"                // IsTraceInvulnerableFor (spec §4)
 #include "Gameplay/TraceHealthComponent.h"
 #include "Gameplay/TraceParry.h"               // v3 §3 — the second invulnerability source
@@ -10616,7 +10616,7 @@ namespace
 	{
 		Pass = 0,        // §4 "pass completed" — to a LIVING teammate, the case the old gate missed.
 		Turnover,        // an interception / kill steal: the Core crosses to the other team.
-		Throw,           // §4 "throw (mode B)". Skipped with a stated reason in mode A.
+		Throw,           // §4 "throw". Skipped with a stated reason when no throw is available.
 		Kill,            // §4 "carrier killed".
 		Kickoff,         // §4 "score", "half-time", "kickoff", "match end" — one call, see above.
 		Disconnect,      // §4 "carrier disconnected": the pawn goes away underneath the trace.
@@ -10805,15 +10805,15 @@ namespace
 				break;
 
 			case EClearRoute::Throw:
-				// Returns false for a wrong mode, a non-holder, a dead holder, an already-loose Core or
-				// a throw on cooldown. Every one of those is "this route does not exist right now", and
-				// saying so is better than scoring an untaken route as a pass.
+				// Returns false for a non-holder, a dead holder, an already-loose Core or a throw on
+				// cooldown. Every one of those is "this route does not exist right now", and saying so
+				// is better than scoring an untaken route as a pass.
 				bFired = Core->ThrowFromHolder(Subject);
 				if (!bFired)
 				{
 					UE_LOG(LogTraceGame, Display,
-						TEXT("[CLEARROUTES] %s: SKIPPED — ThrowFromHolder refused (mode A, or the throw was on "
-						     "cooldown). Run this again with ScoringMode=ThrownCoreAndGoals to cover it."),
+						TEXT("[CLEARROUTES] %s: SKIPPED — ThrowFromHolder refused (no holder, an already "
+						     "loose Core, or the throw was on cooldown)."),
 						ClearRouteName(Route));
 				}
 				break;
@@ -11548,27 +11548,27 @@ namespace
 	//                             have started.
 	//   Trace.Trail.GraceWatch  — WATCHES a live match for N seconds and reports the same numbers for
 	//                             every possession change that actually happens. This is the one that
-	//                             covers mode B honestly: a throw, an interception in flight and a
-	//                             teammate recovering a loose Core are routes with their own team
-	//                             bookkeeping (GraceOverrideTeam), and staging them would be testing
-	//                             the harness rather than the game.
+	//                             covers the thrown Core honestly: a throw, an interception in flight
+	//                             and a teammate recovering a loose Core are routes with their own
+	//                             team bookkeeping (GraceOverrideTeam), and staging them would be
+	//                             testing the harness rather than the game.
 	//
-	// Both print the EXPECTED grace beside the MEASURED one, and both name the mode they ran in, so
-	// "test it on both modes" is answerable from one log line rather than from a claim.
+	// Both print the EXPECTED grace beside the MEASURED one.
 	// =============================================================================================
 
-	const TCHAR* ScoringModeName(const UWorld* World)
+	/**
+	 * WHAT GAME THESE NUMBERS WERE MEASURED IN, printed on every line below.
+	 *
+	 * It USED TO ASK: spec v4 §7 ran two rulesets and "test it on both modes" had to be answerable
+	 * from one log line rather than from a claim, so this read the published ETraceScoringMode off
+	 * ATraceGameState (falling back to the settings page before a match had published one). The
+	 * endzone ruleset has been removed and there is one answer, so the lookup is gone and the string
+	 * stays — the lines it appears in are the record of a measurement, and a measurement that does
+	 * not say what it was taken in is worth less later than it costs to print now.
+	 */
+	const TCHAR* ScoringModeName(const UWorld* /*World*/)
 	{
-		if (World != nullptr)
-		{
-			if (const ATraceGameState* GameState = World->GetGameState<ATraceGameState>())
-			{
-				return (GameState->GetScoringMode() == ETraceScoringMode::ThrownCoreAndGoals)
-					? TEXT("B (ThrownCoreAndGoals)") : TEXT("A (EndzoneStatusCore)");
-			}
-		}
-		return (UTraceSettings::Get().ScoringMode == ETraceScoringMode::ThrownCoreAndGoals)
-			? TEXT("B (ThrownCoreAndGoals, from settings)") : TEXT("A (EndzoneStatusCore, from settings)");
+		return TEXT("GOALS");
 	}
 
 	enum class EGraceCase : uint8

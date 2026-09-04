@@ -44,7 +44,6 @@
 #include "UObject/ObjectMacros.h"
 #include "UObject/ObjectPtr.h"
 
-#include "TraceSettings.h"           // ETraceScoringMode (the A/B toggle's own enum)
 #include "UI/TraceMatchOptions.h"   // ETraceBotDifficulty, TraceScoring
 #include "UI/TraceNetworking.h"      // FTraceTextEntry, TraceNet
 #include "UI/TraceOptionsMenu.h"     // FTraceOptionsMenu
@@ -93,22 +92,25 @@ enum class ETraceMenuRow : uint8
 	 */
 	Practice   = 2,
 	Difficulty = 3,
-	/**
-	 * SCORING MODE — the A/B toggle (spec v4 §7). Directly under DIFFICULTY, and above SETTINGS,
-	 * because it is the second thing a playtester picks and the entire point of this build: the
-	 * notes ask for the two rulesets to be compared back to back, which means switching between them
-	 * has to be one keypress on the way into a match rather than a trip through a settings panel.
-	 */
-	Mode       = 4,
+	// SCORING MODE WAS HERE, at index 4, directly under DIFFICULTY. It was spec v4 §7's A/B toggle,
+	// and it sat that high because the notes asked for the two rulesets to be compared back to back,
+	// which meant switching between them had to be one keypress on the way into a match rather than
+	// a trip through a settings panel. The endzone ruleset has been removed and goals is simply the
+	// game, so the row is gone and SETTINGS and QUIT have moved up one.
+	//
+	// THE VALUES BELOW ARE INDICES INTO REAL THINGS: FBox2D RowRects[], the WBP_TitleMenu row
+	// widgets Scripts/generate-menu-widgets.py authors (ROW_NAMES there must match this list
+	// exactly, same count and same order, or the widget is refused and the Canvas fallback draws),
+	// and the Down/Up counts TraceIntegrationWalk's MenuWalk types. All three were updated with this.
 	/**
 	 * Sensitivity, invert-Y and the key bindings. Sits above QUIT rather than below the blurb so
 	 * that the things a player might change before their first match are adjacent, and the one
 	 * destructive row stays last.
 	 */
-	Settings   = 5,
-	Quit       = 6,
+	Settings   = 4,
+	Quit       = 5,
 
-	Count      = 7
+	Count      = 6
 };
 
 UCLASS()
@@ -164,7 +166,7 @@ public:
 	/** Up / down. Clamped rather than wrapped: three rows wrap badly and clamping reads as solid. */
 	void MoveSelection(int32 Delta);
 
-	/** Left / right. Only the DIFFICULTY and SCORING MODE rows respond. */
+	/** Left / right. Only the DIFFICULTY row responds. */
 	void AdjustSelection(int32 Delta);
 
 	/** Enter / Space / left click on the selected row. */
@@ -183,9 +185,6 @@ public:
 	void MouseReleased();
 
 	ETraceBotDifficulty GetDifficulty() const { return Difficulty; }
-
-	/** The ruleset PLAY will launch. See ETraceScoringMode. */
-	ETraceScoringMode GetScoringMode() const { return ScoringMode; }
 
 	/**
 	 * True while the settings overlay owns the screen.
@@ -308,15 +307,6 @@ private:
 	ETraceMenuRow Selected = ETraceMenuRow::Play;
 	ETraceBotDifficulty Difficulty = TraceDifficulty::Default;
 
-	/**
-	 * The scoring mode PLAY will launch (spec v4 §7).
-	 *
-	 * Seeded from UTraceSettings in BeginPlay rather than hardcoded to mode A, so returning to the
-	 * title screen after a mode-B match comes back on mode B. Somebody A/B testing plays several
-	 * matches of one mode in a row; making them re-pick it every single time is how a toggle stops
-	 * being used.
-	 */
-	ETraceScoringMode ScoringMode = ETraceScoringMode::EndzoneStatusCore;
 
 	/** Screen rects of the rows as of the last draw, used for mouse hover and click hit testing. */
 	FBox2D RowRects[static_cast<int32>(ETraceMenuRow::Count)];
@@ -470,10 +460,15 @@ private:
 	 * a defect that shipped: spec v20 §0.4's "footer drawn twice, overlapping itself".
 	 *
 	 * The blurb hangs off the bottom of the rows panel, and that panel GROWS WITH THE ROW COUNT,
-	 * while the key hints were anchored to the viewport bottom. At seven rows on a 1080-high screen
-	 * the two arrived within a few pixels of each other and printed one string on top of the other.
+	 * while the footer was anchored to the viewport bottom. At seven rows on a 1080-high screen the
+	 * two arrived within a few pixels of each other and printed one string on top of the other.
 	 * Deriving the footer from the measured blurb means adding a row cannot recreate the collision.
 	 * The UMG renderer had the same bug and was fixed the same way (PlaceFooterBelowBlurb).
+	 *
+	 * D30 removed the KEY LEGEND ("W / S OR ARROWS MOVE ... ESC QUIT"), which was the upper of the
+	 * two footer lines and the one the original collision landed on. This is NOT therefore dead: the
+	 * remaining hint line sits at the same place the legend's own line box did, so the blurb can
+	 * still reach it, and the measurement is what keeps them apart.
 	 */
 	float BlurbBottomY = 0.f;
 

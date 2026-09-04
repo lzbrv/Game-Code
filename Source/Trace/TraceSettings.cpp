@@ -606,15 +606,14 @@ namespace
 		// and is pinned in DefaultGame.ini under [/Script/Trace.TraceGameMode].
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[SettingsDump:%s] SPECv4 respawn=%.2f turnoverGrace=%.2f walkSpeed=%.1f | "
-			     "mercyLead=%d scoringMode=%s goalWidthFrac=%.3f goalRampH=%.0f"),
+			     "mercyLead=%d goalWidthFrac=%.3f goalRampH=%.0f"),
 			Tag, Table.RespawnDelay, Table.CoreTurnoverGraceSeconds, Table.WalkSpeed,
 			Table.MercyRuleLead,
-			(Table.ScoringMode == ETraceScoringMode::ThrownCoreAndGoals) ? TEXT("B-ThrownCoreAndGoals") : TEXT("A-EndzoneStatusCore"),
 			Table.GoalWidthFieldFraction, Table.GoalHeightUU);
 
 		// The slide-jump dumps on the Slide line above, not here — one number, one column.
 		//
-		// EVERY mode-B knob is here now, not four of eight. These are bound to ATraceCore BY NAME at
+		// EVERY thrown-Core knob is here now, not four of eight. These are bound to ATraceCore BY NAME at
 		// runtime, so a misspelled property is a silent no-op rather than a build error; this line is
 		// how "is the value I typed the value being played" gets answered without a debugger. It is
 		// also what caught CoreThrowUpBias, which shipped for a while as "CoreThrowUpwardBias" and
@@ -808,13 +807,13 @@ namespace
 		// SPEC v14. Three lines, and each one exists because the number it prints CANNOT be trusted
 		// from the header.
 		//
-		// LINE 1 IS THE MODE, AND IT IS THE MOST IMPORTANT LINE IN THIS DUMP THIS PASS. §2 is "change
-		// game mode b to the default game mode", and the default lives in three layered places (this
-		// header, DefaultGame.ini which outranks it, and a travel-URL override which outranks both).
-		// The only honest answer is the CDO's value, which is what this prints. It also prints
-		// whether characters are consequently ON, because §2 freezes mode A with no characters at
-		// all — so "mode=A" and "charactersEnabled=True" together still means nobody has a character,
-		// and reading only the toggle would be reading the wrong half.
+		// LINE 1 WAS THE MODE, and while there were two modes it was the most important line in this
+		// dump: §2 asked for "change game mode b to the default game mode", the default lived in three
+		// layered places (this header, DefaultGame.ini which outranked it, and a travel-URL override
+		// which outranked both), and the only honest answer was the CDO's value. The endzone ruleset
+		// and the selector are now removed, so there is one game and nothing left to print. The line
+		// keeps its §3/§4 half, which is still a real question — characters used to be forced off by
+		// the frozen mode regardless of the toggle, and now the toggle is the whole answer.
 		//
 		// LINE 2 IS THE TWO DERIVED NUMBERS §6 explicitly says to derive rather than hardcode. Mace's
 		// magnet is a fraction of CoreCatchRadius and her spike pull is a multiple of the air-strafe
@@ -829,10 +828,9 @@ namespace
 			const float MomentumCeiling  = Table.AirStrafeHardCapSpeed * Table.AirStrafeAsymptoteScale;
 
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[SettingsDump:%s] SPECv14 §2 mode: ScoringMode=%s (v14 wants B) | §3 charactersEnabled=%d "
-				     "(and mode A forces everyone characterless regardless) | §4 carrierControlImmune=%d [ASSUMPTION]"),
+				TEXT("[SettingsDump:%s] SPECv14 §2 mode: goals, always (the A/B scoring toggle is gone) | "
+				     "§3 charactersEnabled=%d | §4 carrierControlImmune=%d [ASSUMPTION]"),
 				Tag,
-				(Table.ScoringMode == ETraceScoringMode::ThrownCoreAndGoals) ? TEXT("B-ThrownCoreAndGoals") : TEXT("A-EndzoneStatusCore"),
 				Table.bCharactersEnabled ? 1 : 0,
 				Table.bCarrierImmuneToAbilityControl ? 1 : 0);
 
@@ -1417,8 +1415,9 @@ namespace
 			// There is deliberately NO knob for "abilities may damage carriers".
 			// =========================================================================================
 
-			// --- v14 §2: which mode a fresh install plays -------------------------------------------
-			{ TEXT("ScoringMode"),                     EKnobType::Enum,  TEXT("v14 §2: MUST read ThrownCoreAndGoals — mode B is the default now") },
+			// v14 §2's "which mode a fresh install plays" knob (ScoringMode) is GONE: the endzone
+			// ruleset was removed and goals is the only game, so there is no longer a value that could
+			// read wrong. Nothing replaces it on this list — a knob that cannot vary is not a knob.
 
 			// --- v14 §§3-5: the framework ------------------------------------------------------------
 			{ TEXT("bCharactersEnabled"),              EKnobType::Bool,  TEXT("v14 §3: the 'turn off all characters' toggle") },

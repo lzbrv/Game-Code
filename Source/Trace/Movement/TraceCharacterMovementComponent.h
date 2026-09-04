@@ -1470,6 +1470,71 @@ public:
 	/** Wall jumps taken since the pawn last touched the ground. Capped at WallJumpMaxConsecutive. */
 	int32 GetWallJumpsSinceGround() const { return WallJumpsSinceGround; }
 
+	// --- D30-RESETS: momentum, put back to what a freshly spawned pawn has ------------------------
+
+	/**
+	 * *** ZEROES THE WHOLE MOVEMENT KIT, NOT JUST Velocity. *** The owner's rule is "momentum should
+	 * reset when halves switch and when you respawn", and StopMovementImmediately() — which is what
+	 * ATraceGameMode::ResetPlayersToSpawns used to call on its own — does not implement it.
+	 *
+	 * TWO REASONS IT IS NOT ENOUGH, both measured rather than argued:
+	 *
+	 *   1. A MID-DASH PAWN PUTS THE VELOCITY STRAIGHT BACK. OnMovementUpdated re-asserts the locked
+	 *      dash velocity through ApplyDashVelocity() on every frame with DashTimeRemaining > 0 (it has
+	 *      to; see the comment there). So a pawn teleported to its spawn with 0.3 s of dash left had
+	 *      its velocity zeroed and then restored on the very next move, and flew off the pad.
+	 *   2. THE KIT CLOCKS SURVIVE A ZERO VELOCITY. SurfExitCarryRemaining holds off the ground
+	 *      overspeed bleed, SurfEntrySpeed is the floor of the surf ceiling, SlideSpeed is folded into
+	 *      GetMaxSpeed(), SlideJumpGraceRemaining/ChainBoosts decide whether the next hop is boosted,
+	 *      and WallJumpWindowRemaining/SinceGround decide whether the next jump is a wall jump. None
+	 *      of them is velocity, all of them are momentum, and all of them used to ride through a half
+	 *      switch.
+	 *
+	 * THE CONTRACT IS "INDISTINGUISHABLE FROM A FRESH PAWN". Every field this writes is written to the
+	 * same value the constructor gives it (charges are refilled from GetMaxDashCharges(), which is what
+	 * BeginPlay does), so there is exactly one list to keep in step and it is the one directly above
+	 * each field's declaration. bKnifeMovementProfile is deliberately NOT in it: that is which weapon
+	 * is in the pawn's hands, not momentum, and clearing it here would silently un-equip the knife.
+	 *
+	 * RUNS ON ANY MACHINE, ON PURPOSE, and that is the half that makes it a reset instead of a
+	 * correction. Velocity and every field above is PREDICTED: zeroing it only on the server leaves
+	 * the owning client replaying its unacknowledged moves from the state it still holds, so the
+	 * server's zero arrives as a position correction the client immediately fights. The authority
+	 * calls this directly (ATraceGameMode::ResetMomentumFor) and the same function reaches the owning
+	 * client through ATracePlayerController::ClientResetMomentum. On the client it ALSO drops the
+	 * unacknowledged saved moves, because otherwise the next correction replays the kit state this
+	 * function just cleared straight back in through FSavedMove_Trace::PrepMoveFor.
+	 *
+	 * Idempotent, and cheap on an already-still pawn. Safe to call on a dead or unpossessed one.
+	 *
+	 * @param Why short label for the log line — "half switch", "respawn". Never null in practice; a
+	 *            null is printed as "unspecified" rather than crashing a shipping build.
+	 */
+	void ResetMomentum(const TCHAR* Why);
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * DEV ONLY. One line naming every field ResetMomentum() clears, for Trace.Resets.Arm's before/after
+	 * and for the reset's own log line. Reads nothing it does not print.
+	 */
+	FString DebugDescribeMomentum() const;
+
+	/**
+	 * DEV ONLY. Fakes a pawn that is carrying a full kit's worth of momentum — planar speed, a live
+	 * dash, a live surf and its exit carry, a live slide, an open wall-jump window — so that a reset
+	 * has something to actually remove. Trace.Resets.Arm calls it; nothing shipped does.
+	 *
+	 * It writes the state DIRECTLY rather than driving BeginDash()/the surf entry, because the point is
+	 * to guarantee the state exists at a chosen instant, not to prove the kit can produce it (the surf
+	 * and dash harnesses already do that). A pawn armed this way is not physically plausible and is not
+	 * meant to be.
+	 *
+	 * @param bLog false for the re-arm loop in Trace.Resets.Arm's hold mode, which runs every frame and
+	 *             would otherwise bury the one line the proof is read from under a hundred copies.
+	 */
+	void DebugArmMomentum(float PlanarSpeed, bool bLog = true);
+#endif
+
 	// --- Momentum readouts (HUD, debug, measurement) --------------------------------------------
 
 	/** Horizontal speed, in uu/s. The number every part of this pass is actually about. */

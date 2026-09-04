@@ -245,6 +245,31 @@ public:
 	/** Which zone the last confirmed hit landed on. Drives the hitmarker's colour and shape. */
 	ETraceHitZone GetLastHitMarkerZone() const { return LastHitMarkerZone; }
 
+	/**
+	 * D30-RESETS (a) — SERVER -> OWNING CLIENT: throw your momentum away, do not wait to be corrected.
+	 *
+	 * The owner's rule is "momentum should reset when halves switch and when you respawn". Velocity
+	 * and the whole movement kit (dash, slide, wall-jump window, surf ride and its exit carry) are
+	 * CLIENT-PREDICTED, so an authority that only zeroes its own copy has not reset anything: the
+	 * client keeps simulating from the state it still holds, and the server's zero reaches it as a
+	 * position correction it immediately fights. The visible result is a rubber-band on the frame a
+	 * half changes, which is the single most-watched frame in the match.
+	 *
+	 * So the reset is performed on BOTH machines, by the same function —
+	 * UTraceCharacterMovementComponent::ResetMomentum — and this RPC is how it reaches the second one.
+	 *
+	 * Reliable: a dropped reset is a player who keeps 1500 uu/s through half time, which is the bug.
+	 *
+	 * Takes no arguments on purpose. There is nothing to synchronise: the target state is "what a
+	 * freshly spawned pawn has", which both machines can name without being told.
+	 *
+	 * A LISTEN HOST'S OWN CONTROLLER IGNORES IT. On a listen server this executes in place, on a
+	 * controller whose pawn the authority already reset directly; running it twice would be harmless
+	 * but would double every [Resets] line in the log and make the host look like it reset twice.
+	 */
+	UFUNCTION(Client, Reliable)
+	void ClientResetMomentum();
+
 	/** Victim-side death notification. Drives the killer line on the death panel. */
 	UFUNCTION(Client, Reliable)
 	void ClientNotifyKilledBy(const FString& KillerName, FName Cause);

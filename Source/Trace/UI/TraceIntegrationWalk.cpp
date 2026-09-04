@@ -161,10 +161,13 @@ namespace TraceIntegrationWalkFile
 	/**
 	 * THE TITLE SCREEN TOUR.
 	 *
-	 * The row order is ETraceMenuRow's: PLAY, JOIN, PRACTICE, DIFFICULTY, SCORING MODE, SETTINGS,
-	 * QUIT. Five Downs from the top lands on SETTINGS and four Ups from there lands on JOIN, so the
-	 * walk never types a row NUMBER — it moves the way a player moves and photographs where it got
-	 * to. If a row is ever inserted, the frames show the wrong screen rather than silently passing.
+	 * The row order is ETraceMenuRow's: PLAY, JOIN, PRACTICE, DIFFICULTY, SETTINGS, QUIT. Four Downs
+	 * from the top lands on SETTINGS and three Ups from there lands on JOIN, so the walk never types
+	 * a row NUMBER — it moves the way a player moves and photographs where it got to. If a row is
+	 * ever inserted or removed, the frames show the wrong screen rather than silently passing.
+	 *
+	 * THE TWO COUNTS MOVED WITH THE ROW. They were five and four while SCORING MODE sat at index 4;
+	 * removing it moved SETTINGS from 5 to 4 and JOIN is still 1, so both counts drop by one.
 	 *
 	 * The gaps are 0.45 s, comfortably more than one frame at any rate this project runs at, because
 	 * the menu reads its keys once per frame and two presses inside one frame are one press.
@@ -175,7 +178,7 @@ namespace TraceIntegrationWalkFile
 		Steps.Add(Shoot(0.60f, TEXT("01_title")));
 
 		float T = 1.40f;
-		for (int32 I = 0; I < 5; ++I, T += 0.45f)
+		for (int32 I = 0; I < 4; ++I, T += 0.45f)
 		{
 			Steps.Add(Press(T, TEXT("Down")));
 		}
@@ -190,7 +193,7 @@ namespace TraceIntegrationWalkFile
 		Steps.Add(Shoot(T + 1.40f, TEXT("04_back_at_title")));
 
 		T += 2.60f;
-		for (int32 I = 0; I < 4; ++I, T += 0.45f)
+		for (int32 I = 0; I < 3; ++I, T += 0.45f)
 		{
 			Steps.Add(Press(T, TEXT("Up")));
 		}

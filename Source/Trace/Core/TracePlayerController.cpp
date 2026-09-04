@@ -2328,7 +2328,7 @@ void ATracePlayerController::OnScoreboardCompleted()
 // SPEC v14 §5 — the ability binds
 //
 // Both handlers are deliberately three lines and hold no rules of their own. Every refusal an
-// ability can have — dead, no pawn, no character, characters disabled (mode A or the toggle),
+// ability can have — dead, no pawn, no character, characters disabled by the toggle,
 // match not live, half-time break, cooldown still running, the character's own CanActivate() —
 // lives in UTraceAbilityComponent::TryActivate(), which is also what the console command and the
 // interim relay call. A second copy of any of those tests here is how the two paths would come to
@@ -3566,6 +3566,35 @@ bool UTraceViewKickModifier::ModifyCamera(float DeltaTime, FMinimalViewInfo& InO
 	// FALSE = keep going down the modifier chain. Returning true would stop every other modifier,
 	// which on this project is nothing today and would be a trap tomorrow.
 	return false;
+}
+
+void ATracePlayerController::ClientResetMomentum_Implementation()
+{
+	// D30-RESETS (a). See the header for why the reset has to happen on this machine as well as on
+	// the server. A listen host's own controller has authority and its pawn was reset directly by
+	// ATraceGameMode::ResetMomentumFor; running it again here would only double the log line.
+	if (HasAuthority())
+	{
+		return;
+	}
+
+	ACharacter* const MyPawn = Cast<ACharacter>(GetPawn());
+	if (MyPawn == nullptr)
+	{
+		// Ordinary, not an error: the reset is sent on the frame the server teleports or re-spawns
+		// the pawn, and the RPC can arrive on this machine before the new pawn's actor channel does.
+		// The client's copy of the OLD pawn is already gone in the respawn case, and in the teleport
+		// case the correction that follows carries the server's (already zeroed) velocity anyway.
+		UE_LOG(LogTraceGame, Verbose,
+			TEXT("[Resets] ClientResetMomentum arrived with no pawn yet; nothing to reset."));
+		return;
+	}
+
+	if (UTraceCharacterMovementComponent* Move =
+			Cast<UTraceCharacterMovementComponent>(MyPawn->GetCharacterMovement()))
+	{
+		Move->ResetMomentum(TEXT("half switch / respawn (client)"));
+	}
 }
 
 void ATracePlayerController::ClientNotifyKilledBy_Implementation(const FString& KillerName, FName Cause)

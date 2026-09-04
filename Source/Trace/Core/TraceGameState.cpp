@@ -4,9 +4,8 @@
 
 #include "Net/UnrealNetwork.h"
 
-#include "Engine/World.h"                // UWorld::GetGameState<> (GetScoringModeFor)
+#include "Engine/World.h"                // AActor::GetWorld() (ApplyTeamSidesInWorld)
 #include "GameFramework/PlayerState.h"
-#include "TraceSettings.h"               // ETraceScoringMode (forward declared in the header)
 #include "Core/TracePlayerState.h"
 #include "Gameplay/TraceCore.h"
 #include "Trace.h"
@@ -50,7 +49,6 @@ void ATraceGameState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 
 	// The scoring mode decides what the world is made of and what the mouse button does, so it has
 	// to reach a late joiner before their first frame — unconditional, like the rest of this block.
-	DOREPLIFETIME(ATraceGameState, ReplicatedScoringMode);
 
 	DOREPLIFETIME(ATraceGameState, MatchEndReason);
 	DOREPLIFETIME(ATraceGameState, MatchWinner);
@@ -295,65 +293,12 @@ void ATraceGameState::NotifyWipeBonus(ETraceTeam BonusTeam)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Scoring mode and result (spec v4 §6, §7)
+// Result (spec v4 §6)
+//
+// Spec v4 §7's scoring mode used to be published beside it, replicated as a byte with an OnRep that
+// broadcast to whatever had to rebuild its world. There is one ruleset now, so there is nothing to
+// publish, nothing to replicate and nothing to rebuild.
 // ---------------------------------------------------------------------------------------------
-
-ETraceScoringMode ATraceGameState::GetScoringMode() const
-{
-	// Clamped, not cast blindly: this is a replicated byte, and a value outside the enum would send
-	// every switch in the codebase down its default branch at once.
-	return static_cast<ETraceScoringMode>(FMath::Clamp<uint8>(ReplicatedScoringMode, 0, 1));
-}
-
-bool ATraceGameState::IsGoalMode() const
-{
-	return GetScoringMode() == ETraceScoringMode::ThrownCoreAndGoals;
-}
-
-bool ATraceGameState::IsEndzoneMode() const
-{
-	return !IsGoalMode();
-}
-
-ETraceScoringMode ATraceGameState::GetScoringModeFor(const UObject* WorldContextObject)
-{
-	if (WorldContextObject == nullptr)
-	{
-		return ETraceScoringMode::EndzoneStatusCore;
-	}
-
-	// GEngine->GetWorldFromContextObject with EGetWorldErrorMode::ReturnNull would work too, but
-	// UObject::GetWorld() is what every other static helper in this codebase uses and it does not
-	// need GEngine to exist — which matters, because this is called from HUD passes and from
-	// component code that runs during a level transition.
-	const UWorld* ContextWorld = WorldContextObject->GetWorld();
-	if (ContextWorld == nullptr)
-	{
-		return ETraceScoringMode::EndzoneStatusCore;
-	}
-
-	const ATraceGameState* TraceGameState = ContextWorld->GetGameState<ATraceGameState>();
-	return (TraceGameState != nullptr) ? TraceGameState->GetScoringMode() : ETraceScoringMode::EndzoneStatusCore;
-}
-
-void ATraceGameState::SetScoringMode(ETraceScoringMode InScoringMode)
-{
-	const uint8 NewValue = static_cast<uint8>(InScoringMode);
-	if (!HasAuthority() || ReplicatedScoringMode == NewValue)
-	{
-		return;
-	}
-
-	ReplicatedScoringMode = NewValue;
-
-	// OnRep never fires on the authority, so drive it by hand: a listen host's own arena has to
-	// rebuild itself from exactly the same callback a remote client's does, or the two diverge.
-	OnRep_ScoringModeChanged();
-
-	// Rare and structural — everything about the field and the Core follows from it. Never wait for
-	// the GameState's normal net update slot.
-	ForceNetUpdate();
-}
 
 ETraceMatchEndReason ATraceGameState::GetMatchEndReason() const
 {
@@ -416,20 +361,6 @@ void ATraceGameState::OnRep_SidesChanged()
 	// Runs on the listen host too, harmlessly: ApplyTeamSides is idempotent and early-outs when the
 	// paint already matches.
 	ATraceArenaBuilder::ApplyTeamSidesInWorld(GetWorld(), TeamOnNegativeSide);
-}
-
-void ATraceGameState::OnRep_ScoringModeChanged()
-{
-	// Display, not Verbose. Which of the two games is running is the first thing anybody reading a
-	// log of an A/B playtest needs to know, and this project has twice lost time to a mechanic that
-	// was merely quiet rather than broken.
-	UE_LOG(LogTraceGame, Display, TEXT("[Mode] Scoring mode is now %s."), *TraceScoringModeLabel(GetScoringMode()));
-
-	// The subscribers are the systems that have to REBUILD something — the arena's ends, the Core's
-	// body. They run on this machine only; every machine gets here through its own OnRep (or, on the
-	// authority, through SetScoringMode calling this by hand), which is what makes a client's world
-	// match the server's without a single extra RPC.
-	OnScoringModeChanged.Broadcast(GetScoringMode());
 }
 
 void ATraceGameState::OnRep_WipeBonus()

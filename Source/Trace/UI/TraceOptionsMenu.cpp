@@ -3832,7 +3832,16 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	}
 	else if (Page == EPage::Root)
 	{
-		Hint = TEXT("W / S  OR  ARROWS   MOVE          ENTER   SELECT          ESC   RESUME");
+		// D30 — BLANK ON PURPOSE, and only on this page. The owner asked for "the text at the bottom:
+		// close trace, w/s..." to go, and the PAUSED root's legend was the same sentence in the same
+		// place as the title screen's: "W / S OR ARROWS MOVE   ENTER SELECT   ESC RESUME". Arrow keys
+		// moving a highlight and Esc closing a pause menu are the two things a player will try first.
+		//
+		// THE OTHER FOUR BRANCHES STAY, and that is a distinction rather than an oversight. Each of
+		// them names a key the screen would otherwise never mention: BKSP unbinds, ESC cancels an
+		// in-progress rebind instead of leaving the page, ENTER commits a call sign. A player cannot
+		// discover any of those by pressing something and watching what happens.
+		Hint = FString();
 	}
 	else if (CallSignEntry.IsActive())
 	{
@@ -3855,8 +3864,15 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 
 	// BODY (spec v26 §2). The footer is a key legend — "BKSP UNBIND" is the same kind of string as the
 	// key names in the rows above it, and it is read at a glance rather than scanned as a heading.
-	DrawTextCentered(HUD, Hint, TraceOptionsStyle::InkDim, CX,
-		PanelY + PanelH - (30.f * UIScale), FontSmall, 1.0f * UIScale, TraceOptionsMenuType::BodyFace);
+	//
+	// Guarded since D30 emptied the PAUSED page's legend: TraceText would lay an empty string out as
+	// one blank line box, which costs nothing to look at but does put a draw call and an atlas
+	// measure on every frame of the pause menu for a string with no glyphs in it.
+	if (!Hint.IsEmpty())
+	{
+		DrawTextCentered(HUD, Hint, TraceOptionsStyle::InkDim, CX,
+			PanelY + PanelH - (30.f * UIScale), FontSmall, 1.0f * UIScale, TraceOptionsMenuType::BodyFace);
+	}
 
 	DrawCursor(HUD);
 }

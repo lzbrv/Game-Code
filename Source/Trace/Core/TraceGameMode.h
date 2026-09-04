@@ -10,7 +10,7 @@
 #include "UObject/ObjectPtr.h"
 #include "UObject/WeakObjectPtrTemplates.h"
 
-#include "Core/TraceMatchTypes.h"                // ETraceScoringMode, ETraceMatchEndReason
+#include "Core/TraceMatchTypes.h"                // ETraceMatchEndReason
 #include "TraceTypes.h"                          // ETraceTeam
 
 #include "TraceGameMode.generated.h"
@@ -29,8 +29,8 @@ class ATraceTeamPlayerStart;
 
 /**
  * Declared in Core/TracePlayerState.h. Forward declared here (legal: the underlying type is fixed)
- * for the same reason ATraceGameState forward declares ETraceScoringMode — this header is included
- * by half the module and does not need to drag the player state in for one return type.
+ * because this header is included by half the module and does not need to drag the player state in
+ * for one return type.
  */
 enum class ETraceCharacterPickResult : uint8;
 
@@ -114,9 +114,10 @@ enum class ETraceHalfTimeVerifyScenario : uint8
  * UTraceSettings::MercyRuleLead (8, or 0 to disable) the whole match ends and that team wins,
  * whichever half it happens in. See CheckMercyRule().
  *
- * SCORING MODE (spec v4 §7): this class resolves which of the two games is being played and
- * publishes it on ATraceGameState::ScoringMode, which is the authority everything else reads. See
- * ResolveScoringMode() / PublishScoringMode().
+ * NO SCORING MODE TO RESOLVE ANY MORE (spec v4 §7). This class used to work out which of the two
+ * rulesets a map load was playing — travel URL, then command line, then Project Settings — and
+ * publish the answer on the GameState for everything else to read. The endzone ruleset was removed
+ * and goals is simply the game, so that whole resolve/publish/poll chain is gone.
  *
  * There is deliberately no separate "Warmup" state: the countdown is expressed through the shared
  * MatchEndServerTime deadline while the state stays WaitingForPlayers, which keeps ETraceMatchState
@@ -273,21 +274,17 @@ public:
 	 */
 	void KickoffCoreAfterGoal(ETraceTeam ScoringTeam);
 
-	/**
-	 * Server: award a point if @p InCharacter is the Core carrier RIGHT NOW and is standing inside an
-	 * endzone their team scores in.
-	 *
-	 * Called by ATraceCore::GrantTo on every possession change, which is the case a trigger volume
-	 * cannot see: a completed pass to a teammate who is ALREADY standing in the enemy endzone (or a
-	 * kill steal taken in there). Nothing overlaps-begins for a player who is not moving, so the
-	 * test has to be re-run against the possession event rather than against the movement event.
-	 *
-	 * The geometry is read off the ATraceEndzone volume itself — never from field bounds or any
-	 * other second copy of where the endzone is — so it stays correct however the zones are sized.
-	 *
-	 * @return true when a point was awarded.
-	 */
-	bool CheckEndzoneScoreForCarrier(ATraceCharacter* InCharacter, const TCHAR* Reason);
+	// CheckEndzoneScoreForCarrier() WAS HERE, and it is gone with the endzone ruleset.
+	//
+	// It awarded a point when a character became the Core carrier while ALREADY standing inside an
+	// endzone their team scores in — a completed pass to a teammate in the enemy endzone, or a kill
+	// steal taken in there — because nothing overlaps-begins for a player who is not moving, so the
+	// test had to be re-run against the POSSESSION event rather than the movement event. It read the
+	// geometry off the ATraceEndzone volume itself, never from field bounds.
+	//
+	// That case still exists and is still covered: ATraceCore::GrantTo runs the same possession-event
+	// test against the goal boxes (CheckGoalScore with From == To). The endzone volumes are furniture
+	// now and never armed, so this function could only ever have found nothing.
 
 	/**
 	 * SPEC v25 §2. Gives @p NewPlayer the one-actor channel their pull button travels on.
@@ -309,15 +306,6 @@ public:
 	const TArray<TWeakObjectPtr<ATraceCharacter>>& GetTrackedCharacters() const;
 
 	ATraceCore* GetCore() const;
-
-	/**
-	 * The scoring mode this match is being played in (spec v4 §7).
-	 *
-	 * Server-side convenience only, and it simply forwards to ATraceGameState::GetScoringMode() so
-	 * the two can never disagree. Anything that also runs on a client — a HUD pass, a component, a
-	 * pawn — must ask the GameState instead: AGameModeBase does not exist outside the server.
-	 */
-	ETraceScoringMode GetScoringMode() const;
 
 	/** Smaller team wins, ties go to Blue. Returns None when both teams are at PlayersPerTeam. */
 	ETraceTeam PickTeamForNewPlayer() const;
@@ -390,7 +378,16 @@ public:
 	 */
 	uint8 FindFreeCharacterForTeam(ETraceTeam InTeam, const ATracePlayerState* Except) const;
 
-	/** Half time (spec v14 §5). Clears every player's activated cooldown. Server only, idempotent. */
+	/**
+	 * Clears every player's activated cooldown. Server only, idempotent.
+	 *
+	 * Spec v14 §5 named half time and that is still where the NAME comes from, but D30-RESETS (b)
+	 * widened the rule to "off cooldown at the beginning of each half", so this now runs from
+	 * BeginHalf() as well as from BeginHalfTimeBreak(). The half-time call is not redundant: it is
+	 * what makes the meter snap to ready at the top of the interval rather than twelve seconds later.
+	 * The BeginHalf() call is what reaches an ability fired in WARM-UP, in front of a first half that
+	 * has no interval before it.
+	 */
 	void ResetAbilityCooldownsForHalfTime();
 
 #if !UE_BUILD_SHIPPING
@@ -597,39 +594,6 @@ protected:
 	 */
 	bool CheckMercyRule(const TCHAR* Cause);
 
-	// --- Scoring mode (spec v4 §7) -------------------------------------------------------------
-
-	/**
-	 * Resolves which game this map load is playing and writes the answer into the UTraceSettings
-	 * CDO, which is where PublishScoringMode() and the live poll both read it from.
-	 *
-	 * Three ways in, in priority order — exactly the shape bot difficulty already uses, because the
-	 * title screen carries both across the same travel:
-	 *   1. "?mode=a|b" on the travel URL (what the main menu's SCORING MODE row sends);
-	 *   2. "-TraceScoringMode=a|b" on the command line, for headless A/B runs;
-	 *   3. UTraceSettings::ScoringMode, i.e. whatever the Project Settings page says.
-	 *
-	 * Writing the resolved answer BACK into the CDO is what makes the settings page honest: after
-	 * this runs, the panel shows the mode that is actually being played, and dragging it there is a
-	 * live change rather than a value fighting a URL nobody can see.
-	 */
-	void ResolveScoringMode(const FString& Options);
-
-	/** Copies UTraceSettings::ScoringMode onto the GameState. Idempotent; safe to call repeatedly. */
-	void PublishScoringMode();
-
-	/**
-	 * Watches UTraceSettings::ScoringMode for an edit made while the game is running, and republishes
-	 * when it moves.
-	 *
-	 * This is what makes the toggle genuinely live rather than a value latched at map load. The
-	 * whole point of spec §7 is A/B playtesting, and "switching must be easy and obvious" is not
-	 * satisfied by a knob that needs a restart. A half-second poll is far cheaper than any hook, and
-	 * PostEditChangeProperty is editor-only, so a poll is also the only mechanism that survives into
-	 * a packaged build where the setting can still be changed by a console command.
-	 */
-	void PollScoringModeSetting();
-
 	// --- Halves ------------------------------------------------------------------------------
 
 	/**
@@ -796,6 +760,23 @@ protected:
 	/** Every controller with a pawn — humans AND bots — back onto a freshly chosen team pad. */
 	void ResetPlayersToSpawns();
 
+	/**
+	 * D30-RESETS (a), verbatim: "momentum should reset when halves switch and when you respawn."
+	 *
+	 * Puts one controller's pawn back to the movement state a freshly spawned pawn has — velocity AND
+	 * the whole predicted kit (dash, slide, ledge grace, wall-jump window, surf ride, surf exit carry)
+	 * — ON BOTH MACHINES. See UTraceCharacterMovementComponent::ResetMomentum for why zeroing Velocity
+	 * on the server is not a reset but a correction the owning client immediately fights, and why
+	 * StopMovementImmediately() alone left a mid-dash pawn to put its own velocity straight back.
+	 *
+	 * Server only, idempotent, safe on a controller with no pawn. Called from exactly two places:
+	 * ResetPlayersToSpawns() for the half switch and the kickoff/goal resets, and RestartPlayerFresh()
+	 * for every respawn.
+	 *
+	 * @param Why short label for the [Resets] log line.
+	 */
+	void ResetMomentumFor(AController* Controller, const TCHAR* Why);
+
 	// --- Bots --------------------------------------------------------------------------------
 
 	/**
@@ -817,9 +798,8 @@ protected:
 
 	/**
 	 * Resolves the characters-on/off toggle for this map load and latches it. See bCharactersEnabled
-	 * for the priority order. Called once, from InitGame, for the same reason ResolveScoringMode is:
-	 * it is the last point at which the raw travel URL is guaranteed to be what the session opened
-	 * with.
+	 * for the priority order. Called once, from InitGame, because that is the last point at which the
+	 * raw travel URL is guaranteed to be what the session opened with.
 	 */
 	void ResolveCharactersEnabled(const FString& Options);
 
@@ -944,18 +924,18 @@ private:
 	 * World time of the last score this class actually processed, for the one-score-at-a-time guard
 	 * in NotifyScored.
 	 *
-	 * There are now two ways in: the ATraceEndzone trigger/poll, and CheckEndzoneScoreForCarrier on
-	 * a possession change. A pass completed inside the endzone satisfies both within the same tenth
-	 * of a second, and a capture must never pay twice. Seeded far in the past (world time starts at
-	 * 0) so the first score of a match is never swallowed.
+	 * There are two ways in: the goal volume's own trigger/poll, and ATraceCore's swept crossing
+	 * test. A carrier running through the mouth satisfies both within the same tenth of a second,
+	 * and a capture must never pay twice. Seeded far in the past (world time starts at 0) so the
+	 * first score of a match is never swallowed.
 	 */
 	float LastScoreProcessedWorldTime = -10000.f;
 
 	/**
 	 * Spec v9 §11. The Core holder's TEAM as of the last poll, so a change of team can be told from
 	 * a change of holder. ETraceTeam::None means "nobody holds it right now" and is deliberately NOT
-	 * treated as a turnover on its own — a mode-B throw passes through None on its way from one team
-	 * to the next, and the loose flight in between is not a dead ball.
+	 * treated as a turnover on its own — a throw passes through None on its way from one team to the
+	 * next, and the loose flight in between is not a dead ball.
 	 *
 	 * Seeded when the whistle is armed, not at match start: it only ever has to describe the window
 	 * during which a whistle is pending.
@@ -973,9 +953,6 @@ private:
 	FTimerHandle PendingPeriodEndCapHandle;
 	FTimerHandle BotFillTimerHandle;
 	FTimerHandle ReturnToMenuTimerHandle;
-
-	/** Drives PollScoringModeSetting(). Looping, half a second, for the whole session. */
-	FTimerHandle ScoringModePollHandle;
 
 	/** Drives PollCharacterSelect(). Looping, quarter second, for the whole session. */
 	FTimerHandle CharacterSelectPollHandle;

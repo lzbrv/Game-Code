@@ -245,10 +245,10 @@ void UTraceAbilityWorldSubsystem::NotifyHalfTime()
 void UTraceAbilityWorldSubsystem::EnforceModeAFreeze()
 {
 	// SPEC §2. "Do not implement abilities or characters into what was game mode a (endzones)" —
-	// with the [ASSUMPTION] that loading mode A forces every player to the default characterless
+	// with the [ASSUMPTION] that switching characters off forces every player to the default characterless
 	// Mannequin. This is that force, and it is a SWEEP rather than a one-shot on purpose: there is
 	// no ordering guarantee between the mode being published and a late joiner's component arriving,
-	// and "mode A but somebody has Rocco" must not be reachable by any interleaving.
+	// and "characters off but somebody has Rocco" must not be reachable by any interleaving.
 	//
 	// It is also the enforcement for the §3 disable toggle, because AreCharactersEnabled() answers
 	// for both and a designer flipping the toggle mid-match should see it take effect.
@@ -265,7 +265,7 @@ void UTraceAbilityWorldSubsystem::EnforceModeAFreeze()
 		if (Comp->GetCharacterId() != ETraceCharacterId::None)
 		{
 			UE_LOG(LogTraceGame, Log,
-				TEXT("[Ability] Characters are OFF (mode A, or the disable toggle) — forcing %s back to the default Mannequin."),
+				TEXT("[Ability] Characters are OFF (the disable toggle) — forcing %s back to the default Mannequin."),
 				*GetNameSafe(Comp->GetOwner()));
 			Comp->ServerSetCharacter(ETraceCharacterId::None);
 		}

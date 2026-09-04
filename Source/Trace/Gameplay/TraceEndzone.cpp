@@ -157,8 +157,8 @@ void ATraceEndzone::BeginPlay()
 	// standing inside the enemy endzone who picks up (or intercepts) the Core there. The 10 Hz poll
 	// in Tick() covers it, and doubles as a safety net if the overlap never fires at all.
 	//
-	// Gated on bZoneActive: in mode B the endzone pair is built but inert, and vice versa, so the
-	// volume belonging to the other mode must not tick, overlap or score.
+	// Gated on bZoneActive: the endzone pair is built but inert (its ruleset was removed), so a
+	// volume that does not score must not tick, overlap or fire an event either.
 	if (Trigger)
 	{
 		Trigger->SetCollisionEnabled(bZoneActive ? ECollisionEnabled::QueryOnly : ECollisionEnabled::NoCollision);
@@ -167,14 +167,14 @@ void ATraceEndzone::BeginPlay()
 	SetActorTickEnabled(bZoneActive);
 
 	// Log, not Verbose. The half extent is the whole contract of this actor - "the zone spans the
-	// full width of the field", or in mode B "the goal is 2000 uu of it and 440 uu tall" (spec v5
+	// full width of the field", or "the goal is 2000 uu of it and 440 uu tall" (spec v5
 	// section 4 shrank both; ATraceArenaBuilder::GoalHalfWidth is where that is decided) - is either
 	// true or the game silently refuses points somewhere, and a fact nobody can see must at least be
 	// one nobody has to raise a verbosity level to read. This project has twice declared a working
 	// mechanic dead over exactly that.
 	const FVector Extent = (Trigger != nullptr) ? Trigger->GetUnscaledBoxExtent() : FVector::ZeroVector;
 	UE_LOG(LogTraceGame, Log, TEXT("%s defended by %s is %s at %s, half extent %s (scored in by %s)."),
-		bGoalVolume ? TEXT("Goal (mode B)") : TEXT("Endzone (mode A)"),
+		bGoalVolume ? TEXT("Goal") : TEXT("Endzone (furniture; the endzone ruleset was removed)"),
 		*TraceTeamName(OwningTeam).ToString(),
 		bZoneActive ? TEXT("LIVE") : TEXT("built but inert"),
 		*GetActorLocation().ToCompactString(),
@@ -186,12 +186,12 @@ void ATraceEndzone::BeginPlay()
 	// playtest of that change asks. It is not readable from a screenshot and it is not derivable
 	// from the half extent alone, so it gets its own line at default verbosity.
 	//
-	// GATED ON bZoneActive as well as on the shape, and that is not tidiness. The ring volumes are
-	// BUILT in mode A too (built and immediately made inert, three lines up), so an ungated line
-	// printed "[ModeB] RING GOAL ... " twice into every mode A run — a "[ModeB]" tag in a mode A log
-	// is exactly the evidence somebody greps for to answer "did the mode B work leak into mode A",
-	// and answering that question wrongly costs a whole investigation. The inert case is already
-	// reported by the "built but inert" line above, which is where it belongs.
+	// GATED ON bZoneActive as well as on the shape, and that is history worth keeping: while the A/B
+	// toggle existed the ring volumes were built in the endzone ruleset too (built and immediately
+	// made inert, three lines up), so an ungated line printed "[ModeB] RING GOAL ..." twice into
+	// every endzone run — which was exactly the evidence somebody would grep for to answer "did the
+	// goal work leak into the other mode". The gate is now belt and braces: it also keeps the inert
+	// case reported by the "built but inert" line above, which is where it belongs.
 	if (IsRingGoal() && bZoneActive)
 	{
 		const FVector Centre = GetRingCentre();
@@ -239,9 +239,9 @@ void ATraceEndzone::Tick(float DeltaSeconds)
 
 bool ATraceEndzone::IsInsideZone(const FVector& WorldLocation) const
 {
-	// An inactive volume contains nothing. Without this, mode B's throw code could ask the mode-A
-	// endzone (which is still built, just disarmed) whether the Core is inside it and get a yes for
-	// a point that must not be awarded.
+	// An inactive volume contains nothing. Without this, the throw code could ask an endzone volume
+	// (still built, permanently disarmed) whether the Core is inside it and get a yes for a point
+	// that must not be awarded.
 	if (Trigger == nullptr || !bZoneActive)
 	{
 		return false;
@@ -261,8 +261,7 @@ bool ATraceEndzone::IsInsideZone(const FVector& WorldLocation) const
 	}
 
 	// SPEC v6 §4.3. A ring goal scores on the DISC inscribed in that slab, not on its corners. The
-	// box test above stays as the broad phase (and is what a non-ring endzone stops at), so mode A
-	// reaches exactly the code it always did.
+	// box test above stays as the broad phase, and is what a non-ring volume stops at.
 	if (IsRingGoal())
 	{
 		return (Local.Y * Local.Y + Local.Z * Local.Z) <= (RingRadius * RingRadius);
@@ -308,8 +307,8 @@ void ATraceEndzone::TryScore(ATraceCharacter* Character)
 	// SPEC v6 §4.3, RING GOALS ONLY. OnTriggerBeginOverlap fires off the CAPSULE touching the box,
 	// and the box is the ring's bounding slab - its corners are wall, not goal. Re-test the carrier
 	// against the disc so the overlap path awards exactly what the poll and ATraceCore's swept test
-	// award. Deliberately gated on IsRingGoal(): mode A's endzone must reach this function on the
-	// same terms it always has, overlap semantics included.
+	// award. Deliberately gated on IsRingGoal(): a plain box volume reaches this function on the same
+	// terms it always has, overlap semantics included.
 	if (IsRingGoal() && !IsInsideZone(Character->GetActorLocation()))
 	{
 		return;
@@ -329,12 +328,13 @@ void ATraceEndzone::TryScore(ATraceCharacter* Character)
 
 	LastScoreTime = Now;
 
-	// The lateral coordinate is in the line on purpose. A mode-A endzone spans the FULL width of the
-	// field (ATraceArenaBuilder::EndzoneHalfWidth), and the only cheap way to prove that from a match
-	// log - rather than by walking into a corner and hoping - is to see scores land at Y values out
-	// near the sidelines as well as down the middle. If every mode-A score in a log sits near Y=0,
-	// the trigger has quietly gone back to being a partial box. In mode B the opposite reading
-	// applies: every score MUST sit inside the printed half width, or the goal is not a goal.
+	// The lateral coordinate is in the line on purpose. For a GOAL, every score MUST sit inside the
+	// printed half width, or the goal is not a goal - and that is the only reading that applies
+	// today. The opposite reading was the endzone's: it spanned the FULL width of the field
+	// (ATraceArenaBuilder::EndzoneHalfWidth), and the only cheap way to prove that from a match log -
+	// rather than by walking into a corner and hoping - was to see scores land at Y values out near
+	// the sidelines as well as down the middle. Kept in the line because if the endzone furniture is
+	// ever armed again this is how it gets checked.
 	const FVector ScoreLocation = Character->GetActorLocation();
 	const float ZoneHalfWidth = (Trigger != nullptr) ? Trigger->GetUnscaledBoxExtent().Y : 0.f;
 
@@ -356,7 +356,7 @@ void ATraceEndzone::TryScore(ATraceCharacter* Character)
 
 	const bool bAwarded = (TraceGameState == nullptr) || (TraceGameState->GetScore(CarrierTeam) > ScoreBefore);
 
-	// --- MODE B: count it as a goal by CARRYING. ---------------------------------------------------
+	// --- Count it as a goal by CARRYING. -----------------------------------------------------------
 	//
 	// THIS IS THE OTHER HALF OF A TALLY THAT WAS LYING BY OMISSION. ATraceCore keeps a per-method
 	// goal count (thrown / carried / granted) so that "bots never carry it in" can be answered with a

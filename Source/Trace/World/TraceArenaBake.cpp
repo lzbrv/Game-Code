@@ -269,7 +269,7 @@ void ATraceArenaBuilder::AdoptBakedArena()
 		return;
 	}
 
-	// Set FIRST, so the ApplyScoringMode call at the bottom is not swallowed by its own
+	// Set FIRST, so the ApplyScoringShape call at the bottom is not swallowed by its own
 	// "legal before the build" early-out. Nothing below constructs geometry; this flag means "the
 	// arena exists", and on a baked level it did before this actor woke up.
 	bArenaBuilt = true;
@@ -282,13 +282,6 @@ void ATraceArenaBuilder::AdoptBakedArena()
 		TEXT("[Arena] Materials: surface '%s', neon '%s' (a baked level's geometry wears the committed ")
 		TEXT("instances under /Game/Trace/Materials/Instances, not these)."),
 		*GetPathNameSafe(SurfaceMaterial), *GetPathNameSafe(NeonMaterial));
-
-	// Same question, same authority, same fallback as BuildArena: ATraceGameState if there is one,
-	// the settings page if the world has not published yet.
-	{
-		const ETraceScoringMode PublishedMode = ATraceGameState::GetScoringModeFor(this);
-		ScoringMode = (World->GetGameState() != nullptr) ? PublishedMode : UTraceSettings::Get().ScoringMode;
-	}
 
 	// --- The geometry, and the two things about it that are not just geometry ---------------------
 	int32 PieceCount = 0;
@@ -601,7 +594,7 @@ void ATraceArenaBuilder::AdoptBakedArena()
 	}
 	ApplyFidelity();
 
-	ApplyScoringMode(ScoringMode);
+	ApplyScoringShape();
 
 	// Which Core spawn this level is playing with, resolved and logged HERE rather than left for the
 	// GameMode's one-line "Core spawned at ..." — spec v17 §0 rule 1 wants the fallback to say so, and
@@ -620,10 +613,10 @@ void ATraceArenaBuilder::AdoptBakedArena()
 		TEXT("[Arena] Baked level adopted, nothing built: %d baked pieces (%d endzone-mode, %d goal-mode), ")
 		TEXT("%d scoring volumes (%d rebuilt from a shapeless legacy bake, %d kept a placed shape the builder ")
 		TEXT("would not make), %d floor lamps, %d side-tinted surfaces promoted to dynamic instances. ")
-		TEXT("Field %.0f x %.0f uu, mode %s."),
+		TEXT("Field %.0f x %.0f uu."),
 		PieceCount, BakedEndzoneModeActors.Num(), BakedGoalModeActors.Num(),
 		VolumeCount, VolumesRebuilt, VolumesDiffering, FloorLamps.Num(), TintedSurfaces,
-		FieldLength, FieldWidth, *TraceScoringModeLabel(ScoringMode));
+		FieldLength, FieldWidth);
 
 	if (PieceCount == 0)
 	{

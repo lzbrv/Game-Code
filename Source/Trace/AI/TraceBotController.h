@@ -9,9 +9,21 @@
 // WHY IT IS A HAND-WRITTEN STATE MACHINE AND NOT A BEHAVIOUR TREE
 // Build contract §2: nothing in this project may depend on a .uasset we author. A Behaviour Tree
 // and a Blackboard are both assets, and a runtime-generated navmesh is fragile (it has to be built
-// after ATraceArenaBuilder runs, which is inside PreInitializeComponents). Direct steering with
-// AddMovementInput plus a wall-repulsion field from ATraceArenaBuilder::GetFieldBounds() is not a
-// compromise here, it is the correct amount of machinery.
+// after ATraceArenaBuilder runs, which is inside PreInitializeComponents). So the steering is
+// direct: AddMovementInput, a wall-repulsion field from ATraceArenaBuilder::GetFieldBounds(), and
+// ONE CAPSULE SWEEP AHEAD OF THE HEADING (ProbeForObstacle).
+//
+// THE SWEEP IS D30 AND IT IS NOT DECORATION — this paragraph used to end "is not a compromise here,
+// it is the correct amount of machinery", and the arena outgrew that. Repulsion from the OUTER
+// bounds says nothing about anything standing inside them, which was survivable while the interior
+// was a scatter of cover boxes and stopped being survivable when the level gained a hand-placed
+// centre kit, four surf rails and two 38,400 uu concave ramps down both sidelines. The owner's
+// report was "they just sit there running into the wall", and measured: 9.2% of every bot-tick that
+// wanted to move was spent standing still, in 207 separate wedges over a six-minute bots=8 match,
+// 114 of them against the single structure the Core spawns on top of. With the probe armed, on the
+// same fixture: 1.5%, 14 wedges, none of them against a structure at all. The probe is the smallest
+// thing that fixes it without a navmesh and without a copy of the level in C++ — see
+// ProbeForObstacle, which knows the shape of a pawn and nothing whatever about the arena.
 //
 // --- MECHANICS SPEC v2: WHAT CHANGED IN THIS CLASS -------------------------------------------
 //
@@ -350,8 +362,47 @@ protected:
 	 */
 	void UpdateParryMinimum(float Now);
 
-	/** Applies wall repulsion + stuck evasion to DesiredMoveDirection and feeds AddMovementInput. */
+	/**
+	 * Turns DesiredMoveDirection into a movement input, in this order and no other: the evade kick,
+	 * field-bounds repulsion, then the D30 forward probe. The probe is LAST because it is the only
+	 * one of the three that asks whether a heading is physically available, and the heading it has to
+	 * ask about is the finished one.
+	 */
 	void ApplySteering(float DeltaSeconds);
+
+	/**
+	 * D30 §2 — ONE CAPSULE SWEEP ALONG @p PlanarDirection, ANSWERING "is there something in the way
+	 * that I cannot simply walk up or step over".
+	 *
+	 * THIS IS THE WHOLE OF THE BOTS' STRUCTURAL AWARENESS, AND IT IS DELIBERATELY IGNORANT. It knows
+	 * nothing about the octagon, the platforms, the surf rails or the two 38,400 uu concave side
+	 * ramps; it knows the shape of the pawn and the rule the pawn's own movement component uses to
+	 * decide what it can climb. That is on purpose and it is the same doctrine
+	 * ATraceArenaBuilder::GetSideRampProbe's header argues for: an avoidance system that carried the
+	 * level's coordinates would be a second copy of the layout living in C++, and the level is edited
+	 * by a human without recompiling. Anything a human places from now on is avoided the day they
+	 * place it, with no code change.
+	 *
+	 * WHAT COUNTS AS "IN THE WAY", precisely:
+	 *   * The sweep capsule is the pawn's own capsule with its BOTTOM RAISED BY MaxStepHeight, so a
+	 *     kerb the character would step over cannot register as a wall. (Every riser the arena
+	 *     builder makes is deliberately under MaxStepHeight — see its header — and without this
+	 *     raise the bots would treat the entire terraced fillet as an obstacle.)
+	 *   * A hit whose ImpactNormal.Z is at or above the movement component's LIVE GetWalkableFloorZ()
+	 *     is NOT an obstacle and is reported as no hit. This is what keeps the side ramps usable: a
+	 *     concave ramp is walkable at the toe and un-walkable at the crest, and the bot is allowed
+	 *     onto exactly as much of it as its own legs can take. Steepen the slope limit in the .ini
+	 *     and the bots get more ramp, for free.
+	 *   * Other characters are ignored. A team-mate is not a structure, and a probe that treated one
+	 *     as a wall would make bots refuse to converge on a contested Core — which is a behaviour the
+	 *     match depends on and this tranche was told not to break.
+	 *
+	 * @param PlanarDirection unit, Z already zeroed. Nothing is swept if it is degenerate.
+	 * @param Length          how far ahead to look, uu.
+	 * @param OutHit          the blocking hit; untouched when this returns false.
+	 * @return true only when a NON-WALKABLE blocking surface was found inside @p Length.
+	 */
+	bool ProbeForObstacle(const FVector& PlanarDirection, float Length, FHitResult& OutHit) const;
 
 	// ------------------------------------------------------------------------------------------
 	// Behaviours
@@ -1106,6 +1157,33 @@ private:
 	/** While world time < EvadeUntilTime, steering is overridden by EvadeDirection. */
 	float EvadeUntilTime = 0.f;
 	FVector EvadeDirection = FVector::ZeroVector;
+
+	/**
+	 * D30 §2. Which way this bot committed to go around the last face it ran square into, and until
+	 * when that commitment holds. +1 is the pawn's right of the heading, -1 its left; 0 is "not
+	 * committed".
+	 *
+	 * THE COMMITMENT IS THE POINT, NOT THE CHOICE. Deciding a side is easy — two probes and take the
+	 * roomier one. Deciding it AGAIN sixty times a second against a flat 38,400 uu ramp face is a
+	 * coin flip per frame whose mean heading is zero, i.e. a bot that vibrates in the wall instead of
+	 * walking round it, which is a worse version of the bug being fixed. Held for
+	 * TraceBotConstants::ProbeSideHoldSeconds.
+	 */
+	float AvoidSideSign = 0.f;
+	float AvoidSideUntilTime = 0.f;
+
+	/**
+	 * D30 §1. World time this bot's current wedge began, or < 0 when it is not wedged.
+	 *
+	 * Separate from StuckSeconds, which is reset by the recovery paths (the evade kick and the
+	 * unstick jump both zero it) and therefore cannot measure how long a wedge LASTED. This is only
+	 * ever written by the instrument, so a retune of the recovery cannot silently shorten the number
+	 * the fix is being judged on.
+	 */
+	float StuckEpisodeStart = -1.f;
+
+	/** True once the current wedge has been counted, so a five-second wedge is one episode, not seven. */
+	bool bStuckEpisodeCounted = false;
 
 	/**
 	 * Per-bot jitter in [0,1), seeded once at possession. Multiplies reaction time and aim error so

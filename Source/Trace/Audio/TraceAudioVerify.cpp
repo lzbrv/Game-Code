@@ -789,13 +789,6 @@ namespace TraceAudioVerify
 				     "sound is game-side and only the authority may announce it."));
 			return;
 		}
-		if (!Core->IsModeB())
-		{
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[TurnoverArm] this match is not in goals mode. There is no drop and no turnover in "
-				     "mode A, so there is nothing here to measure."));
-			return;
-		}
 		if (GTurnoverArm.IsValid() && !GTurnoverArm->bFinished)
 		{
 			UE_LOG(LogTraceGame, Warning, TEXT("[TurnoverArm] a run is already in progress."));

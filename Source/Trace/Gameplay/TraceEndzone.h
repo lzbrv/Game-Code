@@ -19,33 +19,37 @@ class UPrimitiveComponent;
 /**
  * A scoring volume at one end of the field. ONE class, TWO shapes - see the mode note below.
  *
- * SHAPE IN MODE A (ETraceScoringMode::EndzoneStatusCore, the shipped game). Goal line to end wall along X,
- * floor to wall top in Z, and the ENTIRE WIDTH of the field along Y - sideline to sideline, like a
- * real football endzone. ATraceArenaBuilder sizes it from EndzoneHalfWidth() and paints the floor
- * patch, the goal line and the endzone gate from the same number, so the rectangle you can see is
- * the rectangle that scores. If you ever narrow one of them, narrow all of them: a carrier who
- * crosses the line by a sideline and does not score reads as a broken trigger, not as a design
- * decision.
+ * THE ENDZONE SHAPE, which belonged to the retired ruleset. Goal line to end wall along X, floor to
+ * wall top in Z, and the ENTIRE WIDTH of the field along Y - sideline to sideline, like a real
+ * football endzone. ATraceArenaBuilder sizes it from EndzoneHalfWidth() and paints the floor patch,
+ * the goal line and the endzone gate from the same number, so the rectangle you can see is the
+ * rectangle that scores. If you ever narrow one of them, narrow all of them: a carrier who crosses
+ * the line by a sideline and does not score reads as a broken trigger, not as a design decision.
  *
- * SHAPE IN MODE B (ETraceScoringMode::ThrownCoreAndGoals, spec v4 §7, resized by spec v5 §4). A GOAL: the same
+ * THAT SHAPE NO LONGER SCORES. The endzone ruleset was removed and goals is the game, so the two
+ * endzone volumes are built and never armed - see ATraceArenaBuilder::ApplyScoringShape, and the
+ * two-shapes note in its class comment for why the furniture stayed. Everything below still handles
+ * the shape correctly, which is what keeps presenting it again a level-design decision rather than
+ * a code change.
+ *
+ * THE GOAL SHAPE (spec v4 §7, resized by spec v5 §4) - THE ONE THAT SCORES. The same
  * depth along X, but only ATraceArenaBuilder::GoalHalfWidth() either side of the centre line (1000 uu
  * by default, i.e. a 2000 uu mouth in a 9600 uu field) and only ClampedGoalHeight() tall (440 uu), so
  * it reads as a goal rather than as a wall. Both numbers shrank in v5 - "for game mode b ONLY ...
  * decrease the size of the goal (reduce height and width)" - by the same factor, so the mouth kept
- * its proportions. Same rule as mode A: the builder draws the posts, the crossbar and the mouth
- * patch from the same two functions that size this box.
+ * its proportions. Same rule as the endzone: the builder draws the posts, the crossbar and the
+ * mouth patch from the same two functions that size this box.
  *
  * WHY ONE CLASS AND NOT TWO. Everything below - the team check, the carrier check, the debounce, the
  * geometric poll - is identical for both shapes, because "the carrier got inside the volume" is the
- * same question in both modes. Only the box extent and the trim differ, and both arrive through
+ * same question either way. Only the box extent and the trim differ, and both arrive through
  * ConfigureZone. bGoalVolume exists so that a caller can TELL the two apart (and so the log says
- * which it is); it is never used to decide which game is being played. That question has exactly one
- * legal answer, ATraceGameState::GetScoringMode() - see the note at the top of TraceMatchTypes.h.
+ * which it is); it was never used to decide which game is being played, and there is no longer a
+ * question to decide.
  *
- * BOTH SETS EXIST AT ONCE. The builder spawns the endzone pair AND the goal pair and then activates
- * one of them (SetZoneActive), so the A/B toggle is a flag flip rather than a rebuild and no restart
- * is needed. An inactive zone has no collision and does not tick: it cannot score, and it cannot be
- * found by an overlap query either.
+ * BOTH SETS EXIST AT ONCE. The builder spawns the endzone pair AND the goal pair and activates the
+ * goals (SetZoneActive). An inactive zone has no collision and does not tick: it cannot score, and
+ * it cannot be found by an overlap query either - which is exactly what the endzone pair now is.
  *
  * SCORING DIRECTION - read this before touching anything below.
  * OwningTeam is the team that *defends* this zone. You score in your OPPONENT's zone, so a zone
@@ -95,7 +99,7 @@ public:
 	void ConfigureZone(ETraceTeam InOwningTeam, const FVector& BoxHalfExtent, bool bInGoalVolume = false);
 
 	// =============================================================================================
-	// SPEC v6 §4.3 — THE CIRCULAR GOAL. MODE B ONLY.
+	// SPEC v6 §4.3 — THE CIRCULAR GOAL.
 	//
 	// "Raise the goals 1.5x player height from the ground, place them into the back walls, and make
 	// them circular."
@@ -117,13 +121,13 @@ public:
 	 * Makes this goal CIRCULAR: the mouth is the disc of radius @p Radius about the trigger's own
 	 * origin, in the trigger's local Y/Z plane, and the box's X extent becomes the slab depth.
 	 *
-	 * @p Radius <= 0 restores the plain box, which is what mode A's endzones stay as forever.
+	 * @p Radius <= 0 restores the plain box, which is what the endzone volumes stay as forever.
 	 * Call after ConfigureZone (it does not resize the box - the caller owns that, because the box
 	 * has to be the ring's bounding slab and only the caller knows the depth it wants).
 	 */
 	void ConfigureRing(float Radius);
 
-	/** True when this volume scores on a DISC rather than on the whole box. Mode B goals only. */
+	/** True when this volume scores on a DISC rather than on the whole box. Goals only. */
 	bool IsRingGoal() const { return bRingGoal && RingRadius > 0.f; }
 
 	/** Radius of the ring mouth, uu. 0 when this is not a ring. */
@@ -138,7 +142,7 @@ public:
 	/** True when a carrier on @p Team scores by entering this zone. See the class comment. */
 	bool ScoresHere(ETraceTeam Team) const;
 
-	//~ Mode A / mode B surface (spec v4 §7) - the contract the scoring slice reads.
+	//~ Endzone / goal surface (spec v4 §7) - the contract the scoring slice reads.
 
 	/** True if this is the narrow mode-B GOAL rather than the full-width mode-A endzone. */
 	bool IsGoalVolume() const { return bGoalVolume; }
@@ -158,7 +162,7 @@ public:
 	/**
 	 * Point-in-box against the trigger volume, in the trigger's own space.
 	 *
-	 * PUBLIC ON PURPOSE. Mode B scores a THROWN Core as well as a carried one, and the code that owns
+	 * PUBLIC ON PURPOSE. A THROWN Core scores as well as a carried one, and the code that owns
 	 * the throw must be able to ask "is the Core inside the goal" without rebuilding the box from
 	 * width and depth constants and getting it subtly wrong - which is precisely how the visible goal
 	 * and the scoring goal drift apart. This is the same test the tick poll uses, so the answer
@@ -231,7 +235,7 @@ private:
 	bool bGoalVolume = false;
 
 	/**
-	 * Spec v6 §4.3. Circular mouth, mode B only.
+	 * Spec v6 §4.3. Circular mouth, goals only.
 	 *
 	 * Two fields rather than "radius > 0 means circular" alone, so that a zero radius arriving from a
 	 * degenerate settings value reads as a BROKEN ring in the log rather than silently reverting the
@@ -248,7 +252,7 @@ private:
 	 * Whether this volume can score right now. Both pairs are built; one pair is armed.
 	 *
 	 * Defaults TRUE so that a zone nobody ever calls SetZoneActive on behaves exactly as it did
-	 * before mode B existed - a level-placed endzone, or any future caller that spawns one directly,
+	 * before the goals existed - a level-placed endzone, or any future caller that spawns one directly,
 	 * must not be silently dead.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace")

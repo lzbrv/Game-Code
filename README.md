@@ -50,9 +50,9 @@ Two teams of five, one shared Core, one arena.
 
 - There is **one Core**, and **both teams contest the same object**. It is not a flag-per-team
   setup — there is a single ball in play.
-- The default mode is **goals** (`ScoringMode=ThrownCoreAndGoals`, mode B): each end of the field
-  has a raised goal mouth about 2,000 uu wide, and you score by getting the Core through the
-  **opposing team's goal** — carried in or **thrown** in.
+- You score through **goals**: each end of the field has a raised goal mouth about 2,000 uu wide,
+  and you score by getting the Core through the **opposing team's goal** — carried in or
+  **thrown** in. This is the whole game; there is no mode to pick.
 - **The Core is a physical, thrown, interceptable object.** While carrying, **left mouse charges a
   throw and releases it the instant you let go** — a tap is a short lob (15% power), a 0.6 s hold
   is full power, and the throw inherits your own momentum, so a jumping or sprinting throw
@@ -69,9 +69,10 @@ Two teams of five, one shared Core, one arena.
   (a goal, a turnover between teams, or the Core coming down — capped at 60 s). A lead of **8**
   ends the match early (mercy rule). There is no "first to N wins" — the clock is the win
   condition.
-- The older **endzone mode (A)** still exists behind `?mode=a` and plays the original hover-pass
-  ruleset — frozen, and without characters or abilities. In the default goals mode the
-  half-second hover-pass still exists alongside the throw (`PassHoldSeconds=0.5`).
+- There **used** to be a second ruleset — full-width endzones, the Core as a possession status,
+  and a half-second hover-pass on left mouse — selectable from a SCORING MODE row on the title
+  screen and from `?mode=a` on the travel URL. It has been removed: goals is the game, the row is
+  gone from the menu, and there is no setting, URL option or ini key that can select anything else.
 
 ### The carrier
 

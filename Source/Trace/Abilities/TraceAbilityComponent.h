@@ -52,6 +52,18 @@
 //   "They should all reset at halftime."             OnHalfTime() zeroes it. That is the ONLY
 //                                                    automatic reset in the whole framework.
 //
+// D30-RESETS (b) WIDENED THE LAST LINE FROM "at halftime" TO "at the top of every half", and the
+// distinction is the whole of the owner's bug report: "abilities used before the match timer start
+// should reset to be off cooldown at the beginning of each half". An ability fired during WARM-UP
+// writes a deadline on the same absolute clock as everything else — TryActivate() refuses during the
+// half-time interval and NOWHERE ELSE, so warm-up is a live period for activation — and the FIRST
+// half has no interval in front of it to clear it. So ATraceGameMode::BeginHalf() now calls
+// OnHalfTime() for every player as well, and the interval keeps its own call (a player watching their
+// meter drain through the break has been told the rule does not work).
+//
+// THAT IS STILL NOT A SECOND WRITER. It is a second CALLER of the one writer, which is exactly what
+// the rule below asks for.
+//
 // If you are ever tempted to add a second place that writes this value: don't. Add a reason to
 // OnHalfTime() instead.
 
@@ -228,13 +240,48 @@ public:
 	bool GetSecondaryCooldownDisplay(float& OutRemaining, float& OutDuration, FString& OutLabel) const;
 
 	/**
-	 * HALF TIME. Spec §5: "They should all reset at halftime." Zeroes the activated cooldown, wipes
-	 * the per-character transient state and tells the character set to tear down its world actors.
+	 * HALF TIME, AND THE TOP OF EVERY HALF. Spec §5: "They should all reset at halftime." Zeroes the
+	 * activated cooldown, wipes the per-character transient state and tells the character set to tear
+	 * down its world actors.
 	 *
 	 * AUTHORITY ONLY. Called for every player by UTraceAbilityWorldSubsystem when it sees the
-	 * GameState enter the half-time break; safe to call directly from the game mode instead.
+	 * GameState enter the half-time break, and by ATraceGameMode from BeginHalfTimeBreak() and from
+	 * BeginHalf(); safe to call directly from anywhere on the server. Idempotent.
+	 *
+	 * D30-RESETS (b) ADDED THE BeginHalf() CALLER, and it is not redundant with the interval's. The
+	 * owner's case is an ability fired during WARM-UP, before the match clock starts: the first half
+	 * has no interval in front of it, so nothing had ever cleared that cooldown and it was still
+	 * draining at the opening whistle. The rule the owner asked for is per-HALF, not per-interval.
+	 *
+	 * IT ALSO CLEARS THE OWNING CLIENT'S PREDICTION, through the same RPC
+	 * ServerResetActivatedCooldown() uses, and that is not optional — see the .cpp. Without it the
+	 * server was ready and the client's HUD ring was not, because GetActivatedCooldownRemaining()
+	 * returns max(replicated, predicted) and the local prediction out-votes a replicated zero.
 	 */
 	void OnHalfTime();
+
+	/**
+	 * D30-RESETS (b)'s red arm, asked by ATraceGameMode::BeginHalf. True in every real build; false
+	 * only under `Trace.Resets.LegacyCooldowns 1` / -TraceResetsLegacyCooldowns, which restores the
+	 * pre-pass behaviour (the half-time interval clears cooldowns, the start of a half does not) so
+	 * the fix can be shown failing in the same binary.
+	 *
+	 * A static rather than a setting on UTraceSettings because it is A/B evidence, not a player
+	 * option, and because the game mode has no ability component to ask when it wants the answer.
+	 */
+	static bool IsHalfStartCooldownResetEnabled();
+
+	/**
+	 * D30-RESETS (b)'s SECOND red arm, asked by OnHalfTime() itself. True in every real build; false
+	 * only under `Trace.Resets.LegacyClientCooldown 1` / -TraceResetsLegacyClientCooldown, which stops
+	 * the owning client being told its PREDICTED cooldown is cancelled.
+	 *
+	 * It exists because the other arm cannot show this failure. Turning the whole half-start clear off
+	 * makes the server wrong too, so a client reading a stale cooldown proves nothing about the RPC;
+	 * this arm leaves the server clearing and replicating a zero, and the client's ring still drains —
+	 * which is precisely the "a server-only clear leaves the ring lying" case.
+	 */
+	static bool IsHalfResetClientRpcEnabled();
 
 	/**
 	 * SPEC v26 §6a. SERVER ONLY. Clears the activated cooldown so E is ready right now.
@@ -534,13 +581,14 @@ public:
 #endif
 
 	/**
-	 * The master switch, answered from the WORLD so it is correct on clients too.
+	 * The master switch: UTraceSettings::bCharactersEnabled, spec §3's "include a toggle in game
+	 * settings to turn off all characters". Reads the CDO, so it is the same answer everywhere.
 	 *
-	 * False when UTraceSettings::bCharactersEnabled is off (spec §3: "Include a toggle in game
-	 * settings to turn off all characters") OR when the match is MODE A (spec §2: mode A is frozen —
-	 * "Do not implement abilities or characters into what was game mode a"; the [ASSUMPTION] is that
-	 * loading mode A forces every player to the default characterless Mannequin, which is what this
-	 * returning false does).
+	 * It used to be TWO tests. Spec §2 froze the endzone ruleset ("do not implement abilities or
+	 * characters into what was game mode a"), so this also returned false in mode A regardless of
+	 * the toggle. The endzone ruleset has been removed and the toggle is now the whole answer; the
+	 * world context is retained because every call site has one and re-threading them would be churn
+	 * for nothing.
 	 */
 	static bool AreCharactersEnabled(const UObject* WorldContextObject);
 
@@ -743,7 +791,9 @@ protected:
 	/**
 	 * REPLICATED. Absolute match-clock time (GetServerWorldTimeSeconds) at which E comes back.
 	 * Zero means ready. See the cooldown contract at the top of this file — this is the only
-	 * cooldown storage in the framework and half time is the only thing that resets it.
+	 * cooldown storage in the framework, and the START OF A HALF (D30-RESETS (b)), the half-time
+	 * interval and Oyster's poison refund are the only three things that clear it. All three go
+	 * through OnHalfTime() or ServerResetActivatedCooldown(); nothing writes this line directly.
 	 */
 	UPROPERTY(Replicated)
 	float ActivatedCooldownEndMatchTime = 0.f;

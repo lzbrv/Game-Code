@@ -203,9 +203,9 @@ BTN_CAP = 428.0
 BTN_SPRITE_W = BTN_PLATE_W + BTN_GLOW * 2.0
 BTN_SPRITE_H = BTN_PLATE_H + BTN_GLOW * 2.0
 
-# The value chip beside the artist's slider, reused on the DIFFICULTY and
-# SCORING MODE rows because it is the same job: a framed box holding a number
-# that changes.
+# The value chip beside the artist's slider, used on the DIFFICULTY row because
+# it is the same job: a framed box holding a value that changes. It was shared
+# with SCORING MODE until that row was removed.
 VAL_PLATE_W, VAL_PLATE_H = 1034.0, 538.0
 VAL_GLOW = 60.0
 VAL_CAP = 150.0
@@ -351,11 +351,16 @@ PANEL_WIDTH  = 720.0 + PANEL_PAD_X * 2.0
 #
 # Declared up here rather than beside build_title_menu() because PANEL_HEIGHT is
 # derived from its length.
-ROW_NAMES = ["RowPlay", "RowJoin", "RowPractice", "RowDifficulty", "RowMode",
+# RowMode (SCORING MODE) was between RowDifficulty and RowSettings until the
+# endzone ruleset was removed. Deleting it here is half of that change; the other
+# half is ETraceMenuRow, and the two MUST be deleted together or the widget is
+# refused and the Canvas fallback silently draws the old seven-row menu instead.
+ROW_NAMES = ["RowPlay", "RowJoin", "RowPractice", "RowDifficulty",
              "RowSettings", "RowQuit"]
 
-# DERIVED FROM THE ROW COUNT, not a literal, because spec v19 §2 added a seventh
-# row (PRACTICE) and the old hard-coded 495.0 silently cropped it.
+# DERIVED FROM THE ROW COUNT, not a literal, because spec v19 §2 added a row
+# (PRACTICE) and the old hard-coded 495.0 silently cropped it. Removing the
+# SCORING MODE row shrinks the panel through the same expression.
 #
 # The first three terms are TraceMenuStyle::ComputeConsoleLayout's PanelH, copied
 # term for term so the two renderers cannot disagree about where the panel ends:
@@ -1201,8 +1206,8 @@ def build_title_menu(row_asset):
     for index, row_name in enumerate(ROW_NAMES):
         row_widget = unreal.new_object(row_class, tree, row_name)
 
-        # PER INSTANCE: the two rows whose word the sheet actually contains draw it. The other five
-        # cannot - JOIN, PRACTICE, DIFFICULTY, SCORING MODE and QUIT are not on the sheet and no PNG
+        # PER INSTANCE: the two rows whose word the sheet actually contains draw it. The other four
+        # cannot - JOIN, PRACTICE, DIFFICULTY and QUIT are not on the sheet and no PNG
         # can supply them - so they type their label in the stand-in font.
         sprite_name = ROW_WORD_SPRITES.get(row_name)
         if sprite_name is not None and Textures.get(sprite_name) is not None:
@@ -1220,11 +1225,20 @@ def build_title_menu(row_asset):
 
     # ---- 4. Footer ---------------------------------------------------------------------------------
     #
-    # No dark strip any more: the background IS dark. Just the two hint lines.
-    footer_keys = make_text(
-        tree, "FooterKeysText",
-        "W / S  OR  ARROWS   MOVE          A / D   CHANGE          ENTER   SELECT          ESC   QUIT",
-        FS_FOOTER, INK_DIM)
+    # No dark strip any more: the background IS dark. One hint line, and an empty block above it.
+    #
+    # D30 - THE KEY LEGEND IS GONE. FooterKeysText used to be authored with
+    #     "W / S  OR  ARROWS   MOVE   A / D   CHANGE   ENTER   SELECT   ESC   QUIT"
+    # and the owner asked for that line off the screen. It is authored EMPTY rather than dropped from
+    # the tree: FooterKeysText is a required UPROPERTY(meta=(BindWidget)) on UTraceTitleMenuWidget
+    # (see TITLE_BIND_NAMES below, which this script verifies against the reloaded asset), so deleting
+    # it here would produce an asset that fails to bind at runtime. Its slot still anchors the footer
+    # stack - UTraceTitleMenuWidget::PlaceFooterBelowBlurb puts the hint one FooterLineGap under it.
+    #
+    # The authored string is only what a designer sees in the editor preview: ATraceMenuHUD::ApplyView
+    # overwrites it from FTraceTitleMenuView::FooterKeys every frame, and that is empty too. Both
+    # sides are changed so the asset does not go on carrying a string the game will never print.
+    footer_keys = make_text(tree, "FooterKeysText", "", FS_FOOTER, INK_DIM)
     slot_on_canvas(root, footer_keys, anchors(0.5, 0.0), (0.0, 958.4, 0.0, 0.0),
                    alignment=(0.5, 0.0), auto_size=True, z_order=6)
 
@@ -1314,8 +1328,9 @@ TITLE_BIND_NAMES = [
     "Backdrop", "SwooshImage", "Wordmark", "TaglineText", "AddressChip",
     "AddressCaptionText", "AddressValueText", "PortWarningText", "ConsolePanel",
     # Must stay in step with the BindWidget properties on UTraceTitleMenuWidget AND with
-    # ETraceMenuRow. RowPractice is spec v19 section 2.
-    "RowPlay", "RowJoin", "RowPractice", "RowDifficulty", "RowMode", "RowSettings", "RowQuit",
+    # ETraceMenuRow. RowPractice is spec v19 section 2; RowMode (SCORING MODE) was removed with
+    # the endzone ruleset, in all three places at once.
+    "RowPlay", "RowJoin", "RowPractice", "RowDifficulty", "RowSettings", "RowQuit",
     "BlurbText", "FooterKeysText", "FooterHintText", "MenuCursor",
     "TravelOverlay", "TravelWordmark", "TravelCaptionText", "TravelHintText",
     "FailureBanner", "FailureHeadlineText", "FailureDetailText",

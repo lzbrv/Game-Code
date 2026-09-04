@@ -1169,7 +1169,7 @@ bool UTracePracticeRangeSubsystem::ReopenCharacterSelect(APlayerState* Player)
 	{
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[Practice] character switch refused: characters are switched off for this session "
-			     "(mode A, or the settings toggle)."));
+			     "(the settings toggle)."));
 		return false;
 	}
 

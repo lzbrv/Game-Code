@@ -9,7 +9,7 @@
 #include "UObject/ObjectPtr.h"
 
 #include "TraceTypes.h"              // ETraceTeam
-#include "Core/TraceMatchTypes.h"    // TraceIsGoalMode / TraceScoringModeLabel, and ETraceScoringMode
+#include "Core/TraceMatchTypes.h"    // ETraceMatchEndReason (and the arena's own scoring vocabulary)
                                      // itself via TraceSettings.h - the A/B toggle (spec v4 §7)
 #include "World/TraceBakedPiece.h"   // ETraceBakedScoringTag - the bake's mode tag (spec v15 §1)
 
@@ -59,26 +59,30 @@ class UStaticMeshComponent;
  *  - a lit gate spanning the full width of the field just in FRONT of each goal line (it used to
  *    stand on the line; the hoop hangs there now - see BuildEndzones); the endzones themselves run
  *    sideline to sideline - see EndzoneHalfWidth;
- *  - and, for MODE B, a GOAL at each end: since spec v6 section 4.3 that is a 2000 uu CIRCULAR hoop
+ *  - a GOAL at each end: since spec v6 section 4.3 that is a 2000 uu CIRCULAR hoop
  *    (GoalHalfWidth is its radius) with its bottom raised 1.5 player heights off the floor, and
  *    since spec v28 section 8 it FLOATS on the goal line rather than sitting in the back wall, with
  *    a run-up ramp on each face and 2400 uu of playable pocket behind it. See BuildGoalRing.
  *
- * TWO SCORING SHAPES, BOTH BUILT (spec v4 section 7)
- * -------------------------------------------------
- * Mode A scores in full-width endzones; mode B scores in narrow, finite-height goals. The arena
- * builds BOTH sets of furniture - both pairs of ATraceEndzone volumes and both pieces of paint - and
- * then ARMS one of them (ApplyScoringMode). That is what makes the A/B toggle a flag flip a match
- * can survive rather than a rebuild that needs a restart, which is the whole point of an A/B test.
+ * TWO SCORING SHAPES, BOTH STILL BUILT - AND ONLY ONE OF THEM SCORES (spec v4 section 7)
+ * --------------------------------------------------------------------------------------
+ * Spec v4 section 7's A/B toggle had two rulesets: full-width endzones, and narrow finite-height
+ * goals. The arena built BOTH sets of furniture - both pairs of ATraceEndzone volumes and both
+ * pieces of paint - and ARMED one of them, so switching was a flag flip a live match could survive
+ * rather than a rebuild that needs a restart. Rebuilding on the toggle was rejected because the
+ * toggle could be flipped while ten pawns were standing on the geometry being destroyed.
  *
- * The cost is about 80 extra components and two extra server-only trigger actors, all of which are
- * hidden and collisionless in the mode that is not being played. The alternative - rebuilding the
- * endzone furniture on the toggle - was rejected because the toggle can be flipped while ten pawns
- * are standing on the geometry being destroyed.
+ * THE ENDZONE RULESET HAS BEEN REMOVED. Goals is the game; there is nothing to toggle, and
+ * ApplyScoringShape() now presents the goals and hides the endzone furniture unconditionally.
  *
- * NOTHING HERE DECIDES WHICH MODE IS RUNNING. The builder is told, through ApplyScoringMode /
- * ApplyScoringModeInWorld, by the one authority there is: ATraceGameState::GetScoringMode(). See the
- * note at the top of TraceMatchTypes.h.
+ * THE ENDZONE FURNITURE IS STILL BUILT, AND THAT IS DELIBERATE. It is about 80 components and two
+ * server-only trigger actors, all hidden and collisionless exactly as they already were in every
+ * goals match, so keeping them costs what it has always cost and changes nothing a player sees. The
+ * endzones are also PHYSICAL PARTS OF THE MAP - the painted floor patch, the goal line, the edge
+ * rails - and whether the field should still be marked out that way is a level-design question, not
+ * a consequence of retiring a ruleset. Deleting the builders here would answer it by accident. If
+ * the answer is "the markings go too", delete BuildEndzones' furniture and the EndzoneModePieces
+ * list; the scoring code does not care either way.
  *
  * Along both flanks: a row of wall buttresses carrying a continuous high rail, a light bridge per
  * lane pylon out to the side wall, bright lane floor stripes and a pylon in each endzone corner.
@@ -181,8 +185,7 @@ public:
 	/**
 	 * First arena builder in @p World, or null. Cheap enough for occasional use, not per-tick.
 	 *
-	 * Takes a CONST world and const_casts internally, exactly as ApplyScoringModeInWorld and
-	 * ApplyTeamSidesInWorld already did. Finding an actor does not modify the world; the const_cast is
+	 * Takes a CONST world and const_casts internally, exactly as ApplyTeamSidesInWorld already did. Finding an actor does not modify the world; the const_cast is
 	 * paid for by TActorIterator, which has no const form. Widened here rather than at the call sites
 	 * because "I have a const UWorld* and want to ask the arena a question" is the normal case for
 	 * every const query in the codebase (ATraceCore's resting-surface test is the one that found it),
@@ -538,7 +541,7 @@ public:
 	 */
 	float GetSpawnLineX(float EndSign, float Alpha) const;
 
-	// --- MODE B: goals (spec v4 section 7) --------------------------------------------------------
+	// --- GOALS (spec v4 section 7) ----------------------------------------------------------------
 
 	/**
 	 * Half extent of a GOAL along Y, i.e. half the goal mouth.
@@ -550,8 +553,9 @@ public:
 	 * and the mouth patch all measure themselves against it, so what scores and what is painted are
 	 * the same rectangle by construction.
 	 *
-	 * Clamped so a silly fraction can neither produce a zero-width goal nor a full-width one (which
-	 * would silently turn mode B back into mode A with a shorter ceiling).
+	 * Clamped so a silly fraction can neither produce a zero-width goal nor a full-width one - the
+	 * latter being an endzone with a shorter ceiling, which is the shape this game deliberately
+	 * stopped being.
 	 */
 	float GoalHalfWidth() const;
 
@@ -577,7 +581,7 @@ public:
 	 */
 	FBox GetGoalBounds(float EndSign) const;
 
-	// --- MODE B, SPEC v6 §4.3 + SPEC v28 §8: the goal is a FREE-STANDING RING ----------------------
+	// --- SPEC v6 §4.3 + SPEC v28 §8: the goal is a FREE-STANDING RING -----------------------------
 	//
 	// v6 verbatim: "Raise the goals 1.5x player height from the ground, place them into the back
 	// walls, and make them circular."
@@ -594,8 +598,8 @@ public:
 	// which is what "raised in the air floating" now literally means, and it is why:
 	//
 	//   * the four wall panels and the alcove that used to frame it are GONE. There is no wall there
-	//     any more. The end wall is a plain slab again, in both scoring modes, and is no longer
-	//     mode-tagged (it was only tagged because mode B had to replace it with a perforated copy).
+	//     any more. The end wall is a plain slab again and is no longer mode-tagged (it was only
+	//     tagged because the goals had to replace it with a perforated copy).
 	//   * the annulus that closes the square opening down to a circle is now clamped so the whole
 	//     hoop CLEARS THE FLOOR - see GoalRingOuterRadius(). Left at its old 1.55x the bottom of the
 	//     ring would have been 286 uu underground, which is not floating, it is planted.
@@ -733,36 +737,32 @@ public:
 	FVector GetGoalRingCentre(float EndSign) const;
 
 	/**
-	 * The box that actually scores at @p EndSign in the mode currently armed - the goal in mode B,
-	 * the endzone in mode A.
+	 * The box that actually scores at @p EndSign: the goal.
 	 *
-	 * This is the one anything mode-agnostic should call: bot goal-seeking, throw aiming, debug
-	 * draw. Asking for GetEndzoneBounds() in mode B is how a bot ends up running at a target that
-	 * cannot score.
+	 * It used to pick between the goal and the endzone from the armed scoring mode; the endzone
+	 * ruleset is gone, so it forwards to GetGoalBounds(). It is kept as its own name because that is
+	 * what every caller means, and because the endzone bounds still exist for the furniture.
+	 *
+	 * This is the one anything scoring-related should call: bot goal-seeking, throw aiming, debug
+	 * draw. Asking for GetEndzoneBounds() is how a bot ends up running at a target that cannot score.
 	 */
 	FBox GetScoringBounds(float EndSign) const;
 
-	/** The scoring shape the arena is currently presenting. Told to it; never inferred here. */
-	ETraceScoringMode GetScoringMode() const { return ScoringMode; }
-
 	/**
-	 * Presents @p NewMode: arms that mode's scoring volumes, shows its furniture, and hides and
-	 * disarms the other mode's.
+	 * Arms the goals, shows their furniture, and hides and disarms the endzone furniture.
 	 *
 	 * Idempotent, cheap (a visibility and collision push over ~80 components and 4 actors), and legal
 	 * at any point in a match on any machine - no rebuild, no restart. Safe to call before the arena
-	 * is built: the mode is remembered and applied at the end of the build.
+	 * is built, where it is a no-op: BuildArena calls it again at the end.
+	 *
+	 * It TOOK A MODE once, and there was an ApplyScoringModeInWorld beside it that drove every
+	 * machine's builder off ATraceGameState's OnRep, because the builder is not replicated and a
+	 * client had to be told separately. There is no mode to be told any more, so both the parameter
+	 * and the world-wide driver are gone.
 	 */
-	void ApplyScoringMode(ETraceScoringMode NewMode);
+	void ApplyScoringShape();
 
-	/**
-	 * Finds this world's builder and switches it. Called from BOTH sides of the network for the same
-	 * reason ApplyTeamSidesInWorld is: the builder is not replicated, so the server and every client
-	 * has to be driven independently (the game mode on publish, ATraceGameState::OnRep on clients).
-	 */
-	static void ApplyScoringModeInWorld(const UWorld* World, ETraceScoringMode NewMode);
-
-	//~ End mode B surface
+	//~ End goal-shape surface
 
 	/**
 	 * Builds the arena now if it has not been built yet. Idempotent, and legal to call before
@@ -801,7 +801,7 @@ public:
 	 * at ATraceGameMode's fallback location and the bots would steer inside a default box.
 	 *
 	 * It is also what adopts the baked level's endzones, lights and post-process volume back into the
-	 * live state ApplyScoringMode / ApplyTeamSides / ApplyFidelity operate on. See AdoptBakedArena.
+	 * live state ApplyScoringShape / ApplyTeamSides / ApplyFidelity operate on. See AdoptBakedArena.
 	 *
 	 * A second, independent trigger exists so that a designer who deletes and re-places the builder
 	 * does not silently get a double-built level: any actor in the world carrying the
@@ -1664,15 +1664,14 @@ protected:
 	void BuildEndzones(bool bBuildVisuals);
 
 	/**
-	 * The MODE B goals (spec v6 §4.3, rehung by spec v28 §8): a circular neon ring floating on each
-	 * goal line, an approach ramp on each of its faces, the floor lane that leads to it from both
-	 * directions and the scoring volume straddling its mouth. Built unconditionally and then hidden
-	 * if mode A is the one armed - see the two-modes note in the class comment.
+	 * The goals (spec v6 §4.3, rehung by spec v28 §8): a circular neon ring floating on each goal
+	 * line, an approach ramp on each of its faces, the floor lane that leads to it from both
+	 * directions and the scoring volume straddling its mouth.
 	 */
 	void BuildGoals(bool bBuildVisuals);
 
 	/**
-	 * One end's worth of mode-B goal: the annulus that closes a square hole in nothing down to a
+	 * One end's worth of goal: the annulus that closes a square hole in nothing down to a
 	 * circle, the neon hoop on each of its faces, and the two run-up ramps.
 	 *
 	 * WAS BuildGoalWall, AND THE RENAME IS THE CHANGE. Until spec v28 §8 this built a perforated
@@ -1804,7 +1803,7 @@ protected:
 	 * constructing any geometry.
 	 *
 	 * WHY IT IS NEEDED AT ALL. The arena is not just meshes; it is four things this class holds
-	 * pointers to and drives at runtime: the scoring volumes ApplyScoringMode arms, the mode-tagged
+	 * pointers to and drives at runtime: the scoring volumes ApplyScoringShape arms, the mode-tagged
 	 * furniture it shows and hides, the MIDs ApplyTeamSides repaints at half time, and the lights and
 	 * post-process volume ApplyFidelity re-tunes on a quality change. A baked level has all of those
 	 * as placed actors and none of them registered. Skipping the build WITHOUT adopting would give a
@@ -2157,7 +2156,7 @@ protected:
 		/**
 		 * Third counter for the bake (spec v15 §1). A bake builds no components and no instances - it
 		 * records - so without this a mode-tagged build step would collect an empty range and the
-		 * baked level would present mode A's endzone paint and mode B's ring at the same time.
+		 * baked level would present the endzone paint and the goal ring at the same time.
 		 */
 		int32 BakeRecords = 0;
 	};
@@ -2321,20 +2320,13 @@ private:
 	ETraceTeam PaintedTeamOnNegativeSide = ETraceTeam::Blue;
 
 	/**
-	 * The scoring shape currently presented. Defaults to mode A, which is the shipped game.
-	 *
-	 * Set before the build (from ATraceGameState, or from UTraceSettings if no game state exists yet)
-	 * and re-applied by ApplyScoringMode whenever the authority says it changed.
+	 * Furniture belonging to the retired endzone ruleset: the full-width patch, the goal line and the
+	 * endzone edge rails. Still built, permanently hidden. See the two-shapes note in the class
+	 * comment for why it was not deleted along with the ruleset.
 	 */
-	// ENUMERATOR NAMES: EndzoneStatusCore / ThrownCoreAndGoals, as declared in TraceSettings.h and as
-	// serialised by Config/DefaultGame.ini. This line said ETraceScoringMode::Endzones, which does
-	// not exist and failed the whole module; TraceIsGoalMode() is the readable way to test it.
-	ETraceScoringMode ScoringMode = ETraceScoringMode::EndzoneStatusCore;
-
-	/** Furniture that only exists in mode A: the full-width patch, goal line and endzone edge rails. */
 	TArray<FTraceModePiece> EndzoneModePieces;
 
-	/** Furniture that only exists in mode B: the goal posts, crossbar and lit mouth. */
+	/** Furniture for the goals: the posts, the crossbar and the lit mouth. Always presented. */
 	TArray<FTraceModePiece> GoalModePieces;
 
 	/**
@@ -2364,9 +2356,9 @@ private:
 	/**
 	 * Every ATraceEndzone this builder spawned, both shapes, server only.
 	 *
-	 * Weak, and separate from SpawnedActors (which owns them): ApplyScoringMode has to arm one pair
-	 * and disarm the other, and walking a typed list beats filtering the actor list by cast on every
-	 * toggle. Also empty on clients, where no scoring volume is ever spawned.
+	 * Weak, and separate from SpawnedActors (which owns them): ApplyScoringShape has to arm the goals
+	 * and disarm the endzones, and walking a typed list beats filtering the actor list by cast. Also
+	 * empty on clients, where no scoring volume is ever spawned.
 	 */
 	TArray<TWeakObjectPtr<ATraceEndzone>> ScoringVolumes;
 

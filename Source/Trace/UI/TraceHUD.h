@@ -613,19 +613,11 @@ protected:
 	bool bLocalCarrying = false;
 	bool bLocalDead = false;
 
-	/**
-	 * MODE B this frame (spec v4 §7): goals instead of endzones, and a Core that is thrown and
-	 * intercepted. Read from ATraceGameState once at the top of DrawHUD so every pass below branches
-	 * on the same answer.
-	 *
-	 * Not decoration. Mode B changes what the left mouse button does while carrying — it throws
-	 * instead of starting the hover-pass — so a pass that hardcodes mode A's wording is a pass that
-	 * teaches the wrong control for half of the A/B playtest.
-	 *
-	 * A bool rather than the enum so this header does not have to take the 110 kB TraceSettings.h
-	 * for one comparison; passes that need to PRINT the mode ask TraceGS->GetScoringMode().
-	 */
-	bool bGoalMode = false;
+	// bGoalMode IS GONE. Spec v4 §7's A/B toggle put it here — read from ATraceGameState once at the
+	// top of DrawHUD so every pass below branched on the same answer — because the mode changed what
+	// the left mouse button does while carrying, and a prompt that hardcoded the wrong ruleset's
+	// wording taught the wrong control for half of a playtest. The endzone ruleset has been removed:
+	// LMB throws, the banner says so, and there is nothing left to branch on.
 
 	// ---- Reticle anchor, resolved once per frame by UpdateReticleAnchor() ----------------------
 

@@ -32,6 +32,7 @@
 #include "UObject/UnrealType.h"                // FProperty, for the name-bound spec v5 knobs
 
 #if !UE_BUILD_SHIPPING
+#include "Containers/Ticker.h"                 // FTSTicker — Trace.Resets.Arm's hold loop
 #include "Components/StaticMeshComponent.h"    // ledge test: the block it builds for itself
 #include "Engine/Engine.h"
 #include "Gameplay/TraceCore.h"                // spec v8 §5: the real pickup funnel, ATraceCore::TryPickup
@@ -2325,6 +2326,265 @@ float UTraceCharacterMovementComponent::GetPlanarSpeed() const
 bool UTraceCharacterMovementComponent::IsCarryingExcessSpeed() const
 {
 	return IsMovingOnGround() && GetPlanarSpeed() > (GetMaxSpeed() + TraceMoveCfg::SpeedEpsilon);
+}
+
+// =================================================================================================
+// D30-RESETS (a) — "momentum should reset when halves switch and when you respawn"
+//
+// The whole of the owner's rule on the movement side is ResetMomentum() below. See the header for
+// why StopMovementImmediately() alone did not implement it (a mid-dash pawn puts the velocity back
+// on the next move; the surf / slide / wall-jump clocks are momentum and are not velocity).
+// =================================================================================================
+
+#if !UE_BUILD_SHIPPING
+/**
+ * "Which machine is this?" for the reset's log line. There is no engine helper that does not go
+ * through the reflection system, and a UEnum lookup per reset on ten pawns is not worth it — the
+ * three names below are the entire set the pawn can be in.
+ *
+ * Inside the dev guard because every one of its callers is: a Shipping build would carry it as an
+ * unused static, which this module compiles with warnings-as-errors.
+ */
+static const TCHAR* TraceRoleToString(ENetRole Role)
+{
+	switch (Role)
+	{
+		case ROLE_Authority:        return TEXT("server");
+		case ROLE_AutonomousProxy:  return TEXT("owning client");
+		case ROLE_SimulatedProxy:   return TEXT("simulated proxy");
+		default:                    return TEXT("no role");
+	}
+}
+
+/**
+ * THE RED ARM FOR (a). 1 restores exactly what ResetPlayersToSpawns did before this pass — the base
+ * class's StopMovementImmediately() and nothing else — so the same binary can be shown carrying a
+ * dash and a surf ride straight through a half switch.
+ *
+ * Shipping-guarded on the READER, not only on the console registration. That distinction is the
+ * W9-SHIPGUARD bug this file's other legacy arms call out, and it is not being re-introduced here.
+ */
+int32 GTraceResetsLegacyMomentum = 0;
+
+/**
+ * How many times ResetMomentum() has run in this process. Trace.Resets.Arm's hold loop watches it so
+ * it can stop re-arming the instant a reset lands, instead of fighting the thing it is trying to
+ * observe — the half-time whistle is DEFERRED to the next dead ball (spec v9 §11), so there is no
+ * frame a harness could have been told to stop on in advance.
+ */
+int32 GTraceResetsCount = 0;
+#endif
+
+static bool IsResetsLegacyMomentum()
+{
+#if UE_BUILD_SHIPPING
+	return false;
+#else
+	// The command-line form is the reliable one: an ECVF_Cheat variable set from -ExecCmds does not
+	// dependably survive into a session. Same note as IsSurfLegacyExit().
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceResetsLegacyMomentum"));
+	return GTraceResetsLegacyMomentum != 0 || bFromCommandLine;
+#endif
+}
+
+#if !UE_BUILD_SHIPPING
+FString UTraceCharacterMovementComponent::DebugDescribeMomentum() const
+{
+	return FString::Printf(
+		TEXT("speed %.0f (v %.0f,%.0f,%.0f) | dash %.2fs dir(%.2f,%.2f,%.2f) charges %d recharge %.2f | ")
+		TEXT("slide %.2fs spd %.0f buf %.2f grace %.2f chain %d | ledge %.2f | ")
+		TEXT("wall %.2fs n(%.2f,%.2f,%.2f) since %d lock %.2f buf %.2f | ")
+		TEXT("surf %.2fs entry %.0f peak %.0f | exit carry %.2fs spd %.0f"),
+		GetPlanarSpeed(), Velocity.X, Velocity.Y, Velocity.Z,
+		DashTimeRemaining, DashDirection.X, DashDirection.Y, DashDirection.Z, DashCharges, DashRechargeRemaining,
+		SlideTimeRemaining, SlideSpeed, SlideBufferRemaining, SlideJumpGraceRemaining, SlideJumpChainBoosts,
+		GroundGraceRemaining,
+		WallJumpWindowRemaining, WallJumpNormal.X, WallJumpNormal.Y, WallJumpNormal.Z,
+		WallJumpsSinceGround, WallJumpControlLockoutRemaining, WallJumpInputBufferRemaining,
+		SurfContactRemaining, SurfEntrySpeed, SurfPeakSpeed,
+		SurfExitCarryRemaining, SurfExitSpeed);
+}
+
+void UTraceCharacterMovementComponent::DebugArmMomentum(float PlanarSpeed, bool bLog)
+{
+	const float Speed = FMath::Max(1.f, PlanarSpeed);
+
+	FVector Forward = UpdatedComponent != nullptr ? UpdatedComponent->GetForwardVector() : FVector::ForwardVector;
+	Forward.Z = 0.f;
+	if (!Forward.Normalize())
+	{
+		Forward = FVector::ForwardVector;
+	}
+
+	Velocity = Forward * Speed;
+
+	// A live dash, which is the field that makes StopMovementImmediately() alone useless: with this
+	// set, OnMovementUpdated calls ApplyDashVelocity() and puts the velocity back next move.
+	DashTimeRemaining = 5.f;
+	DashDirection = Forward;
+	DashCharges = 0;
+	DashRechargeRemaining = 3.f;
+
+	// A live slide. SlideSpeed is folded into GetMaxSpeed() while it is non-zero.
+	SlideTimeRemaining = 2.f;
+	SlideSpeed = Speed;
+	SlideDirection = Forward;
+	SlideBufferRemaining = 0.5f;
+	SlideJumpGraceRemaining = 0.3f;
+	bSlideJumpGraceWellTimed = 1;
+	SlideJumpChainBoosts = 2;
+	SlideJumpChainCeiling = Speed;
+
+	GroundGraceRemaining = 0.25f;
+
+	// An open wall-jump window, and a consecutive count already part-spent.
+	WallJumpNormal = -Forward;
+	WallJumpWindowRemaining = 0.4f;
+	WallJumpEntryVelocity = Velocity;
+	WallJumpsSinceGround = 2;
+	WallJumpLaunchNormal = -Forward;
+	WallJumpControlLockoutRemaining = 0.3f;
+	WallJumpInputBufferRemaining = 0.2f;
+
+	// A live surf ride and the exit carry that outlives it. SurfExitCarryRemaining is the one that
+	// can disagree with the server while the pawn is on its FEET — see the saved-move block.
+	SurfPlaneNormal = FVector(0.f, 0.6f, 0.8f).GetSafeNormal();
+	SurfContactRemaining = 0.3f;
+	SurfEntrySpeed = Speed;
+	SurfElapsedSeconds = 2.f;
+	SurfPeakSpeed = Speed;
+	SurfExitCarryRemaining = 0.6f;
+	SurfExitSpeed = Speed;
+
+	if (bLog)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[Resets] ARMED %s (%s): %s"),
+			*GetNameSafe(CharacterOwner),
+			CharacterOwner != nullptr ? TraceRoleToString(CharacterOwner->GetLocalRole()) : TEXT("no pawn"),
+			*DebugDescribeMomentum());
+	}
+}
+#endif // !UE_BUILD_SHIPPING
+
+void UTraceCharacterMovementComponent::ResetMomentum(const TCHAR* Why)
+{
+	const TCHAR* const Reason = (Why != nullptr) ? Why : TEXT("unspecified");
+
+#if !UE_BUILD_SHIPPING
+	// Captured BEFORE anything is written, so the log line below is a before/after of the same frame
+	// rather than two readings of the same zero — which is what makes the legacy arm legible.
+	const FString Before = DebugDescribeMomentum();
+#endif
+
+	// The base class's half: Velocity, any root motion, and the pending launch/impulse/force that a
+	// LaunchCharacter or an ability queued for the next move. ClearAccumulatedForces() is separate
+	// because StopMovementImmediately() does not do it, and a queued PendingLaunchVelocity would be
+	// applied on the first move after the reset — a reset the player would see arrive one frame late.
+	StopMovementImmediately();
+	ClearAccumulatedForces();
+
+	if (!IsResetsLegacyMomentum())
+	{
+		// --- The kit, field for field, to the values the constructor gives a fresh pawn ------------
+		//
+		// Dash. Charges are refilled rather than zeroed: BeginPlay() starts a pawn full, so "full" is
+		// what "indistinguishable from a fresh pawn" means, and starting a half with no dash would be
+		// a punishment nobody asked for.
+		DashTimeRemaining = 0.f;
+		DashDirection = FVector::ZeroVector;
+		LastMaxDashCharges = GetMaxDashCharges();
+		DashCharges = LastMaxDashCharges;
+		DashRechargeRemaining = 0.f;
+
+		// Slide, including the slide-jump coyote window and the spec v26 §3 chain. Written directly
+		// rather than through EndSlide(): that function exists to HAND THE MOMENTUM BACK (it sets
+		// Velocity from SlideSpeed × the exit retention), which is the exact opposite of a reset.
+		SlideTimeRemaining = 0.f;
+		SlideCooldownRemaining = 0.f;
+		SlideSpeed = 0.f;
+		SlideDirection = FVector::ZeroVector;
+		SlideBufferRemaining = 0.f;
+		SlideJumpGraceRemaining = 0.f;
+		bSlideJumpGraceWellTimed = 0;
+		SlideJumpChainBoosts = 0;
+		SlideJumpChainCeiling = 0.f;
+		bSlideHeldLastMove = 0;
+		bWasAirborneLastMove = 0;
+
+		// Ledge grace (spec v5 §7).
+		GroundGraceRemaining = 0.f;
+
+		// Wall jump (spec v8 §7) and the spec v10 §5 lockout/buffer pair.
+		WallJumpNormal = FVector::ZeroVector;
+		WallJumpWindowRemaining = 0.f;
+		WallJumpEntryVelocity = FVector::ZeroVector;
+		WallJumpsSinceGround = 0;
+		WallJumpLaunchNormal = FVector::ZeroVector;
+		WallJumpControlLockoutRemaining = 0.f;
+		WallJumpInputBufferRemaining = 0.f;
+
+		// Surf (Patch 28 §5) and its exit carry (Demo 29 item 4).
+		SurfPlaneNormal = FVector::ZeroVector;
+		SurfContactRemaining = 0.f;
+		SurfEntrySpeed = 0.f;
+		SurfElapsedSeconds = 0.f;
+		SurfPeakSpeed = 0.f;
+		SurfExitCarryRemaining = 0.f;
+		SurfExitSpeed = 0.f;
+
+		// The one-shot intent only. bWantsToSlide / bWantsToCrouch / the jump-held level are re-sent
+		// by the owning client on every move (UpdateFromCompressedFlags), so forcing them false here
+		// would be overwritten within a frame on the server and would fight the player's own fingers
+		// on the client. bWantsToDash is different: it is consumed at the end of a move, so one that
+		// was raised and not yet spent would fire a dash out of the reset.
+		bWantsToDash = 0;
+
+		// bKnifeMovementProfile is deliberately untouched — see the header. It is which weapon is in
+		// the pawn's hands, not momentum.
+	}
+
+	// --- The client's own prediction, which is the half a server-side zero cannot reach -----------
+	//
+	// On the autonomous proxy the moves the server has not acknowledged yet are still in the buffer,
+	// and the next correction REPLAYS them: FSavedMove_Trace::PrepMoveFor pushes each move's captured
+	// dash / slide / wall / surf state back into this component before re-simulating it, so a reset
+	// that left them in place would be undone by the very next ClientAdjustPosition. Dropping them is
+	// the same operation the engine performs when the buffer overflows (FNetworkPredictionData_Client_
+	// Character::CreateSavedMove), so it is a supported state to be in: the client simply accepts the
+	// server's next position wholesale instead of replaying on top of it.
+	if (CharacterOwner != nullptr && CharacterOwner->GetLocalRole() == ROLE_AutonomousProxy)
+	{
+		if (FNetworkPredictionData_Client_Character* ClientData = GetPredictionData_Client_Character())
+		{
+			for (const FSavedMovePtr& Move : ClientData->SavedMoves)
+			{
+				ClientData->FreeMove(Move);
+			}
+			ClientData->SavedMoves.Reset();
+
+			// Detached into a local BEFORE it is freed. FreeMove() takes its argument by const
+			// reference and nulls PendingMove inside itself, so handing it ClientData->PendingMove
+			// directly makes its own parameter alias a pointer it has just cleared. Harmless today
+			// and exactly the shape of a bug that stops being harmless after an engine upgrade.
+			if (ClientData->PendingMove.IsValid())
+			{
+				const FSavedMovePtr Pending = ClientData->PendingMove;
+				ClientData->PendingMove = nullptr;
+				ClientData->FreeMove(Pending);
+			}
+		}
+	}
+
+#if !UE_BUILD_SHIPPING
+	++GTraceResetsCount;
+
+	UE_LOG(LogTraceGame, Log, TEXT("[Resets] %s (%s) %s | legacy=%d\n           before: %s\n           after:  %s"),
+		*GetNameSafe(CharacterOwner),
+		CharacterOwner != nullptr ? TraceRoleToString(CharacterOwner->GetLocalRole()) : TEXT("no pawn"),
+		Reason, IsResetsLegacyMomentum() ? 1 : 0, *Before, *DebugDescribeMomentum());
+#else
+	UE_LOG(LogTraceGame, Verbose, TEXT("[Resets] %s %s"), *GetNameSafe(CharacterOwner), Reason);
+#endif
 }
 
 // --- Prediction pipeline ---------------------------------------------------------------------
@@ -5262,6 +5522,175 @@ static FAutoConsoleVariableRef CVarTraceSurfLegacyExit(
 	     "it on and off. Use -TraceSurfLegacyExit on the command line: an ECVF_Cheat variable set from "
 	     "-ExecCmds does not reliably survive into a session."),
 	ECVF_Cheat);
+
+/**
+ * D30-RESETS (a). See GTraceResetsLegacyMomentum's definition for what the arm restores.
+ */
+static FAutoConsoleVariableRef CVarTraceResetsLegacyMomentum(
+	TEXT("Trace.Resets.LegacyMomentum"),
+	GTraceResetsLegacyMomentum,
+	TEXT("D30-RESETS red arm. 1 restores the pre-pass behaviour of a half switch and a respawn: "
+	     "StopMovementImmediately() and nothing else, so the dash / slide / wall-jump / surf clocks "
+	     "ride straight through and a mid-dash pawn puts its velocity back on the next move. Run "
+	     "Trace.Resets.Arm with it on and off in ONE binary and diff the [Resets] before/after lines. "
+	     "Use -TraceResetsLegacyMomentum on the command line: an ECVF_Cheat variable set from "
+	     "-ExecCmds does not reliably survive into a session."),
+	ECVF_Cheat);
+
+/**
+ * D30-RESETS (a). THE ARMING HALF OF THE PROOF.
+ *
+ * A reset that runs on a pawn which was already still proves nothing, and the organic run cannot be
+ * relied on to have somebody mid-surf on the exact frame the whistle goes. This puts a full kit's
+ * worth of momentum on every living pawn on this machine, so that the NEXT half switch or respawn is
+ * observed removing something. Takes an optional planar speed; 1500 uu/s (about a good surf) default.
+ */
+static FAutoConsoleCommandWithWorldAndArgs CmdTraceResetsArm(
+	TEXT("Trace.Resets.Arm"),
+	TEXT("Trace.Resets.Arm [speed] [holdSeconds]. D30-RESETS. Gives THIS MACHINE'S OWN player pawn a "
+	     "fake dash + slide + wall window + surf ride at <speed> uu/s (default 1500) and RE-ARMS it "
+	     "every frame for holdSeconds (default 45), so whenever the next half switch or respawn lands "
+	     "it lands on a pawn that is carrying something. The half-time whistle is DEFERRED to the next "
+	     "dead ball, so there is no frame a harness could have been told to fire on. Read the result "
+	     "from the [Resets] before/after line the reset itself prints. Dev only."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& Args, UWorld* World)
+		{
+			if (World == nullptr)
+			{
+				return;
+			}
+
+			const float Speed = (Args.Num() > 0) ? FCString::Atof(*Args[0]) : 1500.f;
+			const float HoldSeconds = (Args.Num() > 1) ? FCString::Atof(*Args[1]) : 45.f;
+
+			// THIS MACHINE'S OWN PLAYER PAWN, AND DELIBERATELY NOT EVERY PAWN IN THE WORLD.
+			//
+			// On a listen host "every pawn" is nine bots as well, all of them suddenly travelling at
+			// 1500 uu/s into walls, which stops the match producing the dead ball the deferred whistle
+			// is waiting for — the harness would prevent the event it exists to observe. One pawn is
+			// also the honest subject: the half switch resets all ten and the log then shows one line
+			// with something in it and nine with nothing, which is exactly the right picture.
+			//
+			// Named so the ticker below and the immediate arm share ONE implementation: a harness that
+			// arms two different ways is measuring two different things.
+			const auto ArmLocalPawn = [](UWorld* InWorld, float InSpeed, bool bLog) -> int32
+			{
+				int32 Count = 0;
+				for (TActorIterator<ACharacter> It(InWorld); It; ++It)
+				{
+					ACharacter* const Pawn = *It;
+					if (Pawn == nullptr || !Pawn->IsPlayerControlled() || !Pawn->IsLocallyControlled())
+					{
+						continue;
+					}
+
+					if (UTraceCharacterMovementComponent* Move =
+							Cast<UTraceCharacterMovementComponent>(Pawn->GetCharacterMovement()))
+					{
+						Move->DebugArmMomentum(InSpeed, bLog);
+						++Count;
+					}
+				}
+				return Count;
+			};
+
+			const int32 Armed = ArmLocalPawn(World, Speed, /*bLog=*/true);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Resets] Trace.Resets.Arm: %d local pawn(s) armed at %.0f uu/s, hold %.1fs. "
+				     "legacy momentum arm = %d. resets so far = %d."),
+				Armed, Speed, HoldSeconds, GTraceResetsLegacyMomentum, GTraceResetsCount);
+
+			if (Armed == 0)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Resets] Trace.Resets.Arm found no locally-controlled player pawn. NOTHING WAS "
+					     "ARMED, so anything the next reset prints proves nothing."));
+			}
+
+			if (HoldSeconds <= 0.f)
+			{
+				return;
+			}
+
+			TWeakObjectPtr<UWorld> WeakWorld(World);
+			TSharedRef<float> Elapsed = MakeShared<float>(0.f);
+			const int32 CountAtArm = GTraceResetsCount;
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda(
+					[WeakWorld, Speed, HoldSeconds, Elapsed, CountAtArm, ArmLocalPawn](float DeltaTime) -> bool
+				{
+					UWorld* const LiveWorld = WeakWorld.Get();
+					*Elapsed += DeltaTime;
+
+					// IT KEEPS RE-ARMING PAST THE FIRST RESET, ON PURPOSE, and that does not corrupt the
+					// evidence: ResetMomentum() captures its "before" and prints its before/after inside
+					// the same frame it runs, so the reading is already taken by the time this ticker
+					// next gets to write anything. Stopping on the first reset would be worse — in a bot
+					// match a respawn lands within a second or two, and the hold would end long before
+					// the half switch this is usually aimed at.
+					if (LiveWorld == nullptr || *Elapsed >= HoldSeconds)
+					{
+						const int32 Landed = GTraceResetsCount - CountAtArm;
+						if (Landed > 0)
+						{
+							UE_LOG(LogTraceGame, Display,
+								TEXT("[Resets] Arm hold finished after %.1fs: %d reset(s) landed while the "
+								     "pawn was armed. Read the [Resets] before/after lines above."),
+								*Elapsed, Landed);
+						}
+						else
+						{
+							UE_LOG(LogTraceGame, Warning,
+								TEXT("[Resets] Arm hold finished after %.1fs and NO reset ran at all. "
+								     "NOTHING WAS PROVEN either way - the run never reached a half switch "
+								     "or a respawn."),
+								*Elapsed);
+						}
+						return false;
+					}
+
+					ArmLocalPawn(LiveWorld, Speed, /*bLog=*/false);
+					return true;
+				}),
+				0.f);
+		}));
+
+/**
+ * D30-RESETS. Prints the momentum state of every pawn on this machine without touching it, so the
+ * "after" can be read at an arbitrary later moment rather than only from the reset's own log line.
+ */
+static FAutoConsoleCommandWithWorld CmdTraceResetsProbe(
+	TEXT("Trace.Resets.Probe"),
+	TEXT("D30-RESETS. Prints one [Resets] PROBE line per pawn on this machine: planar speed and every "
+	     "dash / slide / ledge / wall-jump / surf field ResetMomentum() clears. Reads only. Dev only."),
+	FConsoleCommandWithWorldDelegate::CreateStatic(
+		[](UWorld* World)
+		{
+			if (World == nullptr)
+			{
+				return;
+			}
+
+			for (TActorIterator<ACharacter> It(World); It; ++It)
+			{
+				ACharacter* const Pawn = *It;
+				if (Pawn == nullptr)
+				{
+					continue;
+				}
+
+				if (const UTraceCharacterMovementComponent* Move =
+						Cast<UTraceCharacterMovementComponent>(Pawn->GetCharacterMovement()))
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("[Resets] PROBE %s (%s): %s"),
+						*GetNameSafe(Pawn), TraceRoleToString(Pawn->GetLocalRole()),
+						*Move->DebugDescribeMomentum());
+				}
+			}
+		}));
 
 static FAutoConsoleVariableRef CVarTraceV18LegacyAirReverse(
 	TEXT("Trace.Move.V18.LegacyAirReverse"),

@@ -963,6 +963,13 @@ void UTraceAbilityComponent::OnHalfTime()
 		return;
 	}
 
+	// Read before anything is written, so the log line and the client RPC below can both tell "this
+	// player was actually cooling" from "this player was already ready". D30-RESETS (b) calls this at
+	// the top of EVERY half as well as at the top of the interval, so on a ten-player match most calls
+	// now arrive at a component with nothing to clear.
+	const float WasRemaining = GetActivatedCooldownRemaining();
+	const bool bHadCooldown = (ActivatedCooldownEndMatchTime > 0.f) || (PredictedCooldownEndMatchTime > 0.f);
+
 	// SPEC §5's AUTOMATIC RESET. The only OTHER writer of these two lines is
 	// ServerResetActivatedCooldown() below, added for spec v26 §6a (Oyster's poison refunds his E);
 	// nothing else in the framework touches them.
@@ -976,8 +983,292 @@ void UTraceAbilityComponent::OnHalfTime()
 		AbilitySet->OnHalfTime();
 	}
 
-	UE_LOG(LogTraceGame, Log, TEXT("[Ability] HALF TIME reset: %s (%s) — cooldown and transient state cleared."),
-		*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(CharacterId));
+	// D30-RESETS (b). *** THE OWNING CLIENT'S PREDICTION, WHICH THE REPLICATED ZERO CANNOT REACH. ***
+	//
+	// The two lines above run on the authority only, and PredictedCooldownEndMatchTime is NOT
+	// replicated — it is each machine's own local memo of an activation it predicted.
+	// GetActivatedCooldownRemaining() returns max(replicated, predicted) precisely so that a local
+	// prediction cannot flash back to READY while the server's answer is in flight, which means the
+	// server's zero is OUT-VOTED on exactly the machine that has to press the button. Before this
+	// call the half-time reset was real on the server and invisible on the client: the HUD ring kept
+	// draining and the button kept refusing, on a cooldown the match no longer had.
+	//
+	// ServerResetActivatedCooldown() below has always done this (its header says so in capitals); the
+	// reset the whole feature is named after did not. Dropped for a bot, which is correct — a bot has
+	// no connection and no HUD to correct.
+	//
+	// Sent only when there was something to cancel. It is a RELIABLE RPC and this function now runs
+	// for every player at the top of every half; firing it at ten already-ready players three times a
+	// match would be pure noise on the wire.
+	const bool bToldTheClient = bHadCooldown && IsHalfResetClientRpcEnabled();
+	if (bToldTheClient)
+	{
+		ClientCooldownWasReset(0.f);
+	}
+
+	// The third arm of the message is not decoration: under the red arm the RPC is suppressed and a
+	// line that still claimed the client had been told would be the log lying about the very thing
+	// the arm exists to expose.
+	UE_LOG(LogTraceGame, Log,
+		TEXT("[Ability] HALF reset: %s (%s) — %.2fs of cooldown and the transient state cleared%s."),
+		*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(CharacterId), WasRemaining,
+		bToldTheClient  ? TEXT(", on the server AND on the owning client")
+		: bHadCooldown  ? TEXT(" ON THE SERVER ONLY - Trace.Resets.LegacyClientCooldown is ON, so the "
+		                       "owning client's prediction was NOT cancelled and its ring still drains")
+		                : TEXT(" (nothing was running)"));
+}
+
+/**
+ * D30-RESETS (b)'s RED ARM. 1 restores the pre-pass behaviour: cooldowns are cleared at the half-time
+ * INTERVAL only, so an ability fired during warm-up — before the match clock starts — is still on
+ * cooldown at the opening whistle, which is the case the owner hit.
+ */
+#if !UE_BUILD_SHIPPING
+int32 GTraceResetsLegacyCooldowns = 0;
+
+static FAutoConsoleVariableRef CVarTraceResetsLegacyCooldowns(
+	TEXT("Trace.Resets.LegacyCooldowns"),
+	GTraceResetsLegacyCooldowns,
+	TEXT("D30-RESETS red arm. 1 stops ATraceGameMode::BeginHalf clearing ability cooldowns, which is "
+	     "the pre-pass behaviour: an ability used in warm-up is still cooling at kickoff. The half-time "
+	     "interval's own reset is untouched. Use -TraceResetsLegacyCooldowns on the command line: an "
+	     "ECVF_Cheat variable set from -ExecCmds does not reliably survive into a session."),
+	ECVF_Cheat);
+
+/**
+ * D30-RESETS (b)'s SECOND red arm. See UTraceAbilityComponent::IsHalfResetClientRpcEnabled() for why
+ * one arm was not enough: this is the one that leaves the SERVER right and the CLIENT wrong.
+ */
+int32 GTraceResetsLegacyClientCooldown = 0;
+
+static FAutoConsoleVariableRef CVarTraceResetsLegacyClientCooldown(
+	TEXT("Trace.Resets.LegacyClientCooldown"),
+	GTraceResetsLegacyClientCooldown,
+	TEXT("D30-RESETS red arm. 1 stops OnHalfTime() telling the owning client its predicted cooldown is "
+	     "cancelled. The server still clears the cooldown and still replicates the zero - and the "
+	     "client's HUD ring still drains, because GetActivatedCooldownRemaining() returns "
+	     "max(replicated, predicted). Run Trace.Resets.AbilityProbe ON THE CLIENT with it on and off. "
+	     "Use -TraceResetsLegacyClientCooldown on the command line."),
+	ECVF_Cheat);
+
+// -------------------------------------------------------------------------------------------------
+// D30-RESETS (b) — the two commands the live proof is read from.
+//
+// THEY RUN ON WHATEVER MACHINE TYPES THEM, and that is the point. The owner's case is an ability used
+// BEFORE THE MATCH TIMER STARTS, so the fire has to happen during warm-up — which the normal harnesses
+// all refuse, because every one of them waits for ETraceMatchState::InProgress first. And the HUD ring
+// the rule is really about is drawn from a CLIENT's copy of the cooldown, which is the max of a
+// replicated value and a local prediction; only a probe running on the client can see the second one.
+// -------------------------------------------------------------------------------------------------
+
+namespace TraceResetsAbilityProbe
+{
+	/** The locally-controlled player's ability component on this machine, or null. */
+	static UTraceAbilityComponent* LocalAbilities(const UWorld* World)
+	{
+		const APlayerController* const LocalController =
+			(World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+
+		return (LocalController != nullptr)
+			? UTraceAbilityComponent::Get(LocalController->PlayerState)
+			: nullptr;
+	}
+
+	/** Server, owning client or listen host, for the log line. */
+	static const TCHAR* MachineLabel(const UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return TEXT("no world");
+		}
+
+		switch (World->GetNetMode())
+		{
+			case NM_DedicatedServer: return TEXT("dedicated server");
+			case NM_ListenServer:    return TEXT("listen host");
+			case NM_Client:          return TEXT("client");
+			default:                 return TEXT("standalone");
+		}
+	}
+}
+
+static FAutoConsoleCommandWithWorldAndArgs CmdTraceResetsFireAbility(
+	TEXT("Trace.Resets.FireAbility"),
+	TEXT("D30-RESETS (b). Fires the local player's E through the SHIPPING path (TryActivate), whatever "
+	     "the match state is - so it can be used during WARM-UP, which is the case the owner hit and "
+	     "which every other ability harness refuses. Optional argument: a roster id to take first. "
+	     "Retries for a few seconds while a character is assigned. Dev only."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(
+		[](const TArray<FString>& Args, UWorld* World)
+		{
+			if (World == nullptr)
+			{
+				return;
+			}
+
+			const int32 WantedId = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 0;
+			TWeakObjectPtr<UWorld> WeakWorld(World);
+
+			// A ticker rather than a straight call: on a CLIENT the character has to be requested
+			// from the server and arrives a round trip later, and during warm-up the auto-assign may
+			// not have run yet either. Five seconds of patience, then it says why it could not fire
+			// instead of silently doing nothing.
+			TSharedRef<float> Elapsed = MakeShared<float>(0.f);
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([WeakWorld, WantedId, Elapsed](float DeltaTime) -> bool
+				{
+					const UWorld* const LiveWorld = WeakWorld.Get();
+					UTraceAbilityComponent* const Abilities =
+						TraceResetsAbilityProbe::LocalAbilities(LiveWorld);
+
+					*Elapsed += DeltaTime;
+
+					if (Abilities == nullptr)
+					{
+						if (*Elapsed < 5.f)
+						{
+							return true;
+						}
+						UE_LOG(LogTraceGame, Warning,
+							TEXT("[Resets] FireAbility: no local player with an ability component after "
+							     "%.1fs. NOTHING WAS FIRED."), *Elapsed);
+						return false;
+					}
+
+					if (Abilities->GetCharacterId() == ETraceCharacterId::None)
+					{
+						const ETraceCharacterId Pick = (WantedId > 0)
+							? static_cast<ETraceCharacterId>(WantedId)
+							: ETraceCharacterId::Chut;
+
+						// The authority sets it directly; a client has to ask, and the answer comes
+						// back by replication, which is why this is inside the retry loop.
+						if (Abilities->GetOwner() != nullptr && Abilities->GetOwner()->HasAuthority())
+						{
+							Abilities->ServerSetCharacter(Pick);
+						}
+						else
+						{
+							Abilities->ServerRequestSetCharacter(Pick);
+						}
+
+						if (*Elapsed < 5.f)
+						{
+							return true;
+						}
+
+						UE_LOG(LogTraceGame, Warning,
+							TEXT("[Resets] FireAbility: still no character after %.1fs. NOTHING WAS FIRED."),
+							*Elapsed);
+						return false;
+					}
+
+					// THE SHIPPING PATH. TryActivate() is literally what the E key calls, so this
+					// writes the cooldown exactly as a player pressing E in warm-up would - including
+					// the local PREDICTION on a client, which is the half a server-only clear misses.
+					const bool bFired = Abilities->TryActivate();
+
+					if (!bFired && *Elapsed < 5.f)
+					{
+						return true;   // dead, mid-select, or a character that is refusing right now
+					}
+
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[Resets] FireAbility on %s: %s (%s) -> fired=%d, cooldown now %.2fs. "
+						     "match state at fire: %d (0 = WaitingForPlayers, i.e. warm-up)"),
+						TraceResetsAbilityProbe::MachineLabel(LiveWorld),
+						*GetNameSafe(Abilities->GetOwningPlayerState()),
+						TraceCharacterIdToString(Abilities->GetCharacterId()),
+						bFired ? 1 : 0, Abilities->GetActivatedCooldownRemaining(),
+						(LiveWorld != nullptr && LiveWorld->GetGameState<ATraceGameState>() != nullptr)
+							? static_cast<int32>(LiveWorld->GetGameState<ATraceGameState>()->TraceMatchState)
+							: -1);
+					return false;
+				}),
+				0.f);
+		}));
+
+static FAutoConsoleCommandWithWorld CmdTraceResetsAbilityProbe(
+	TEXT("Trace.Resets.AbilityProbe"),
+	TEXT("D30-RESETS (b). Prints every player's activated-ability cooldown AS THIS MACHINE SEES IT - "
+	     "i.e. max(replicated, locally predicted), which is exactly what the HUD ring draws. Run it on "
+	     "the client as well as the server: a server-only clear leaves the client's prediction in "
+	     "place and the ring lying, and this is what shows that. Reads only. Dev only."),
+	FConsoleCommandWithWorldDelegate::CreateStatic(
+		[](UWorld* World)
+		{
+			if (World == nullptr)
+			{
+				return;
+			}
+
+			const AGameStateBase* const BaseState = World->GetGameState();
+			const ATraceGameState* const TraceState = World->GetGameState<ATraceGameState>();
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Resets] ===== ABILITY PROBE on %s | state=%d (0=warm-up 1=in progress 2=post) ")
+				TEXT("half=%d break=%d clock=%.1f ====="),
+				TraceResetsAbilityProbe::MachineLabel(World),
+				(TraceState != nullptr) ? static_cast<int32>(TraceState->TraceMatchState) : -1,
+				(TraceState != nullptr) ? TraceState->CurrentHalf : -1,
+				(TraceState != nullptr && TraceState->IsHalfTimeBreak()) ? 1 : 0,
+				(BaseState != nullptr) ? BaseState->GetServerWorldTimeSeconds() : -1.0);
+
+			if (BaseState == nullptr)
+			{
+				return;
+			}
+
+			const UTraceAbilityComponent* const Local = TraceResetsAbilityProbe::LocalAbilities(World);
+
+			for (APlayerState* const EachState : BaseState->PlayerArray)
+			{
+				const UTraceAbilityComponent* const Abilities = UTraceAbilityComponent::Get(EachState);
+				if (Abilities == nullptr)
+				{
+					continue;
+				}
+
+				const float Remaining = Abilities->GetActivatedCooldownRemaining();
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[Resets]   %-24s %-8s cooldown=%.2f ready=%d%s"),
+					*GetNameSafe(EachState), TraceCharacterIdToString(Abilities->GetCharacterId()),
+					Remaining, (Remaining <= 0.f) ? 1 : 0,
+					(Abilities == Local) ? TEXT("   <-- THIS MACHINE'S OWN PLAYER (the HUD ring)") : TEXT(""));
+			}
+		}));
+#endif
+
+bool UTraceAbilityComponent::IsHalfResetClientRpcEnabled()
+{
+#if UE_BUILD_SHIPPING
+	return true;
+#else
+	// D30-RESETS (b)'s SECOND red arm, and it isolates a failure the first one cannot show. Turning
+	// off the whole BeginHalf() clear proves the SERVER half of the rule; turning off only this RPC
+	// leaves the server correct and the client wrong, which is the exact shape of the bug the RPC was
+	// added for — the replicated zero arrives and is out-voted by the client's own prediction, so the
+	// HUD ring keeps draining on a cooldown the match no longer has.
+	static const bool bFromCommandLine =
+		FParse::Param(FCommandLine::Get(), TEXT("TraceResetsLegacyClientCooldown"));
+	return GTraceResetsLegacyClientCooldown == 0 && !bFromCommandLine;
+#endif
+}
+
+bool UTraceAbilityComponent::IsHalfStartCooldownResetEnabled()
+{
+#if UE_BUILD_SHIPPING
+	return true;
+#else
+	// D30-RESETS (b)'s RED ARM. See the console variable's own help text. The command-line form is
+	// the reliable one: an ECVF_Cheat variable set from -ExecCmds does not dependably survive into a
+	// session, which is the note Movement/TraceCharacterMovementComponent.cpp learned the hard way.
+	static const bool bFromCommandLine =
+		FParse::Param(FCommandLine::Get(), TEXT("TraceResetsLegacyCooldowns"));
+	return GTraceResetsLegacyCooldowns == 0 && !bFromCommandLine;
+#endif
 }
 
 void UTraceAbilityComponent::ServerResetActivatedCooldown(const TCHAR* Why)
@@ -1334,18 +1625,16 @@ void UTraceAbilityComponent::MarkNetStateDirty()
 // Selection support (spec §3's server-side rules; the screen itself is another slice)
 // =================================================================================================
 
-bool UTraceAbilityComponent::AreCharactersEnabled(const UObject* WorldContextObject)
+bool UTraceAbilityComponent::AreCharactersEnabled(const UObject* /*WorldContextObject*/)
 {
-	if (!UTraceSettings::Get().bCharactersEnabled)
-	{
-		return false;
-	}
-
-	// SPEC §2 — MODE A IS FROZEN. "Do not implement abilities or characters into what was game mode
-	// a (endzones)." Answered from the replicated GameState, so it is the same answer on the server
-	// and on every client, and GetScoringModeFor falls back to mode A when there is no GameState yet
-	// — which is the safe direction: too early means "no characters", never "characters in mode A".
-	return ATraceGameState::GetScoringModeFor(WorldContextObject) == ETraceScoringMode::ThrownCoreAndGoals;
+	// ONE TEST NOW, WHERE THERE WERE TWO. Spec §2 froze the endzone ruleset — "do not implement
+	// abilities or characters into what was game mode a (endzones)" — so this also asked the
+	// replicated scoring mode and returned false in mode A, defaulting to "no characters" whenever
+	// the GameState had not arrived yet. That ruleset has been removed, so the settings toggle is
+	// the whole of the answer and the world context is no longer needed. The parameter is kept
+	// because every call site passes one and this is a static helper reached from components,
+	// actors and HUD passes alike.
+	return UTraceSettings::Get().bCharactersEnabled;
 }
 
 APlayerState* UTraceAbilityComponent::FindTeammateHolding(const UObject* WorldContextObject,
@@ -1356,9 +1645,8 @@ APlayerState* UTraceAbilityComponent::FindTeammateHolding(const UObject* WorldCo
 		return nullptr;
 	}
 
-	// GetWorld() rather than GEngine->GetWorldFromContextObject, for the reason
-	// ATraceGameState::GetScoringModeFor gives: every caller here is an actor or a component, and
-	// UObject::GetWorld() is correct for both without dragging Engine.h in.
+	// GetWorld() rather than GEngine->GetWorldFromContextObject: every caller here is an actor or a
+	// component, and UObject::GetWorld() is correct for both without dragging Engine.h in.
 	const UWorld* WorldPtr = (WorldContextObject != nullptr) ? WorldContextObject->GetWorld() : nullptr;
 	const AGameStateBase* BaseState = (WorldPtr != nullptr) ? WorldPtr->GetGameState() : nullptr;
 	if (BaseState == nullptr)

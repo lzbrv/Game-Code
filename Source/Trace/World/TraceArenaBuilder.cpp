@@ -6,7 +6,7 @@
 #include "TraceTypes.h"
 #include "TraceSettings.h"              // GoalWidthFieldFraction / GoalHeightUU (spec v4 section 7, resized v5 section 4)
 #include "Core/TraceCharacter.h"        // PlayerHeightUU() reads the capsule off the CDO
-#include "Core/TraceGameState.h"        // GetScoringModeFor - the one authority on which mode runs
+#include "Core/TraceGameState.h"        // Trace.Arena.GoalSides reads the live score
 #include "Gameplay/TraceCore.h"        // Trace.Arena.GoalSides grants the Core and reads the tally
 #include "Gameplay/TraceEndzone.h"
 #include "World/TraceCoreSpawn.h"       // spec v17 §2 - the placed Core spawn marker
@@ -146,15 +146,16 @@ namespace TraceArenaConstants
 	// a few metres further out the floor measured 0.0867, i.e. BRIGHTER than the figure standing on
 	// it. A silhouette with no value edge against its own ground, at any range.
 	//
-	// WHICH SURFACE IS ACTUALLY UNDERFOOT DEPENDS ON THE SCORING MODE, and getting that wrong is how
-	// a fix like this misses. The arena builds both shapes and presents one:
-	//   * mode A (ENDZONES): `EndzonePatch`, Depth x ZoneWidth, the full-width floor paint.
-	//   * mode B (GOALS, the shipped mode): the endzone paint is tagged EndzoneModePieces and
-	//     HIDDEN. What a player stands on is `GoalMouthPatch` - one Depth-deep lane each side of
-	//     the goal line - and the two `GoalRamp` faces. Measured on the procedural map in GOALS
-	//     mode, the 0.0402 above IS the goal-mouth patch; dimming only the endzone paint changed
-	//     the frame by 0.0002 relL, which is nothing.
-	// So all three move together, or the fix only works in the mode nobody plays.
+	// WHICH SURFACE IS ACTUALLY UNDERFOOT is not the endzone paint, and getting that wrong is how a
+	// fix like this misses. The arena builds both shapes and presents the goals:
+	//   * `EndzonePatch`, Depth x ZoneWidth, the full-width floor paint, is tagged EndzoneModePieces
+	//     and HIDDEN. It belonged to the endzone ruleset, which has been removed.
+	//   * what a player actually stands on is `GoalMouthPatch` - one Depth-deep lane each side of the
+	//     goal line - and the two `GoalRamp` faces. Measured on the procedural map, the 0.0402 above
+	//     IS the goal-mouth patch; dimming only the endzone paint changed the frame by 0.0002 relL,
+	//     which is nothing.
+	// All three still move together, because the endzone paint is furniture that can be presented
+	// again by a level-design decision and a dim that only half applied would be worse than none.
 	//
 	// WHY THE FLOOR GIVES WAY AND NOT THE CHARACTER. ART_BIBLE §2.2's territory rule requires these
 	// surfaces to wear the defending team's colour, so hue separation is not on the table - value
@@ -180,11 +181,11 @@ namespace TraceArenaConstants
 	// Fresnel rim". Raising roughness to cut their screen-space reflections would arm a rim term on
 	// surfaces seen at a grazing angle across half the frame, which that function's own comment
 	// documents as a white wash rather than an edge.
-	static constexpr float EndzonePatchBaseDim = 0.020f;   // mode A, the full-width endzone paint
+	static constexpr float EndzonePatchBaseDim = 0.020f;   // the full-width endzone paint (furniture)
 	static constexpr float EndzonePatchGlow    = 0.100f;
-	static constexpr float GoalMouthBaseDim    = 0.030f;   // mode B, the approach lane on the floor
+	static constexpr float GoalMouthBaseDim    = 0.030f;   // the approach lane on the floor
 	static constexpr float GoalMouthGlow       = 0.160f;
-	static constexpr float GoalRampBaseDim     = 0.035f;   // mode B, the two walkable ramp faces
+	static constexpr float GoalRampBaseDim     = 0.035f;   // the two walkable ramp faces
 	static constexpr float GoalRampGlow        = 0.100f;
 
 	/**
@@ -1581,12 +1582,12 @@ namespace TraceArenaConstants
 	// field, so a 2000 uu mouth) from the goal line back to the end wall, and GoalHeightUU (440) tall.
 	// Both shrank in spec v5 section 4 - "for game mode b ONLY ... decrease the size of the goal
 	// (reduce height and width)" - and both shrank by the SAME factor, so the mouth keeps its
-	// proportions. Mode A never reads either number: its endzones span the full width and wall height. It
-	// is drawn as an actual goal: two posts standing ON the goal line at the edges of the mouth, a
+	// proportions. (The retired endzone ruleset read neither number: its endzones spanned the full
+	// width and the full wall height.) It is drawn as an actual goal: two posts standing ON the goal line at the edges of the mouth, a
 	// crossbar between them at the top of the volume, a lit sill across the mouth on the floor and a
 	// lit patch of floor inside it. That set of five lines is what makes the volume READ - a player
-	// has to be able to see, from midfield, both where the mouth is and how high it goes, because in
-	// mode B the throw is aimed at it.
+	// has to be able to see, from midfield, both where the mouth is and how high it goes, because the
+	// throw is aimed at it.
 	//
 	// WHY THE POSTS BLOCK. They are the only piece of mode-B furniture with collision, and it is
 	// deliberate: a goal you can throw THROUGH the frame of is not a goal, and a post you can bounce
@@ -1609,9 +1610,9 @@ namespace TraceArenaConstants
 	static constexpr float GlowGoalFrame = 5.2f;
 
 	/**
-	 * Clamps on the two mode-B settings, so a live edit in PIE can never build a degenerate goal.
-	 * The upper width bound is 0.9 rather than 1.0 because a full-width "goal" is an endzone, and
-	 * silently rebuilding mode A inside mode B is worse than refusing.
+	 * Clamps on the two goal settings, so a live edit in PIE can never build a degenerate goal. The
+	 * upper width bound is 0.9 rather than 1.0 because a full-width "goal" is an endzone, and
+	 * silently rebuilding the retired ruleset's shape is worse than refusing.
 	 */
 	static constexpr float MinGoalWidthFraction = 0.05f;
 	static constexpr float MaxGoalWidthFraction = 0.90f;
@@ -2696,7 +2697,9 @@ FBox ATraceArenaBuilder::GetGoalBounds(float EndSign) const
 
 FBox ATraceArenaBuilder::GetScoringBounds(float EndSign) const
 {
-	return TraceIsGoalMode(ScoringMode) ? GetGoalBounds(EndSign) : GetEndzoneBounds(EndSign);
+	// It used to pick between the two shapes from the armed scoring mode. The endzone ruleset is
+	// gone; the goal is the only thing that scores.
+	return GetGoalBounds(EndSign);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -2897,18 +2900,11 @@ void ATraceArenaBuilder::BuildArena()
 	bBuildingSquareCorners = (GArenaWallCove == 0)
 		|| FParse::Param(FCommandLine::Get(), TEXT("TraceArenaSquareCorners"));
 
-	// WHICH SCORING SHAPE TO PRESENT, decided once here and re-applied whenever the authority says it
-	// changed (ApplyScoringModeInWorld). ATraceGameState is the authority and it is asked first; on a
-	// machine that has no game state yet - the editor preview, or a build that runs before the game
-	// mode has published - the settings page is the best available guess, and it is only a guess, so
-	// the later ApplyScoringMode call is what makes it right. Both shapes are built either way, so a
-	// wrong guess here costs a flag flip and nothing else.
-	{
-		const ETraceScoringMode PublishedMode = ATraceGameState::GetScoringModeFor(this);
-		ScoringMode = (GetWorld() != nullptr && GetWorld()->GetGameState() != nullptr)
-			? PublishedMode
-			: UTraceSettings::Get().ScoringMode;
-	}
+	// WHICH SCORING SHAPE TO PRESENT used to be decided here, by asking ATraceGameState (or, on a
+	// machine with no game state yet - the editor preview, or a build that runs before the game mode
+	// has published - the settings page, as a guess the later re-apply would correct). Goals is the
+	// only shape that scores now, so there is nothing to ask and nothing to guess. Both shapes are
+	// still BUILT; ApplyScoringShape() at the end of the build presents the right one.
 
 	// A dedicated server needs collision and triggers, nothing else: material shaders are not cooked
 	// for server targets and nothing there ever renders.
@@ -3027,7 +3023,7 @@ void ATraceArenaBuilder::BuildArena()
 
 	// EVERY POOL GOES LIVE HERE, and the position of this line in the function is a correctness
 	// constraint rather than a tidiness one. It has to be AFTER the last CollectPiecesSince (which is
-	// what decides a pool's mobility) and BEFORE ApplyScoringMode (which rewrites instance transforms
+	// what decides a pool's mobility) and BEFORE ApplyScoringShape (which rewrites instance transforms
 	// through components that must already be registered at the right mobility).
 	FlushInstancePools();
 
@@ -3046,15 +3042,12 @@ void ATraceArenaBuilder::BuildArena()
 	}
 	ApplyFidelity();
 
-	// Present one of the two scoring shapes and disarm the other. Forced rather than early-returned
-	// on "the mode did not change", because at this point NOTHING has been presented yet: the goal
-	// furniture is built visible and the endzone triggers are built armed, so mode A needs this call
-	// exactly as much as mode B does.
-	ApplyScoringMode(ScoringMode);
+	// Present the goals and hide the endzone furniture. Unconditional, because at this point nothing
+	// has been presented yet: every piece is built visible.
+	ApplyScoringShape();
 
-	// Spelled out at Log because the proportion, the flat playfield width and which game is being
-	// played are the things a playtester asks about first, and none of them is readable from a
-	// screenshot.
+	// Spelled out at Log because the proportion and the flat playfield width are the things a
+	// playtester asks about first and neither is readable from a screenshot.
 	// The primitive census, spelled out, because "how many things does this hand the renderer" is the
 	// question spec v7 §8 is about and GetComponents().Num() alone answers it wrongly now: one pooled
 	// ISM is one component and several hundred blocks.
@@ -3071,13 +3064,12 @@ void ATraceArenaBuilder::BuildArena()
 
 	UE_LOG(LogTraceGame, Log,
 		TEXT("Arena built (%.0f x %.0f x %.0f uu, %.2f:1, flat playfield %.0f wide, banks %s at %.0f uu, ")
-		TEXT("mode %s, visuals=%s, authority=%s, geometry=%s): %d components, %d of them primitives ")
+		TEXT("visuals=%s, authority=%s, geometry=%s): %d components, %d of them primitives ")
 		TEXT("(%d Movable), carrying %d instanced blocks in %d pools."),
 		FieldLength, FieldWidth, WallHeight,
 		(FieldWidth > 0.f) ? (FieldLength / FieldWidth) : 0.f,
 		BankInnerHalfWidth() * 2.f,
 		bBuildCornerBanks ? TEXT("on") : TEXT("off"), BankHeight,
-		*TraceScoringModeLabel(ScoringMode),
 		bBuildVisuals ? TEXT("yes") : TEXT("no"),
 		HasAuthority() ? TEXT("yes") : TEXT("no"),
 		bBuildingInstancedGeometry ? TEXT("instanced") : TEXT("legacy one-component-per-block"),
@@ -3141,16 +3133,16 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 		? MakeSurfaceMID(TraceArenaConstants::WallColor, 0.55f, 0.f, TraceArenaConstants::NeonNeutral, 0.022f)
 		: nullptr;
 
-	// NO WALL IS MODE-TAGGED ANY MORE (spec v28 §8), and deleting that tagging is a load-bearing part
-	// of this pass rather than tidying. From spec v6 §4.3 until now, mode B needed a 2000 uu hole
-	// through each end wall for the ring goal - which cannot be done by subtracting from a box - so
-	// mode B built a perforated REPLACEMENT and this solid slab was presented only in mode A. The hoop
-	// now floats on the goal line with ClampedEndzoneDepth() of playable pocket between it and the
-	// wall, so the wall has no hole in it in either mode and there is exactly one end wall again.
+	// NO WALL IS MODE-TAGGED ANY MORE (spec v28 §8), and deleting that tagging was a load-bearing part
+	// of that pass rather than tidying. From spec v6 §4.3 until then, the goals needed a 2000 uu hole
+	// through each end wall for the ring - which cannot be done by subtracting from a box - so a
+	// perforated REPLACEMENT wall was built and this solid slab was presented only in the endzone
+	// ruleset. The hoop now floats on the goal line with ClampedEndzoneDepth() of playable pocket
+	// between it and the wall, so the wall has no hole in it and there is exactly one end wall again.
 	//
 	// Leaving the tag in place would have been the worst kind of leftover: SetPiecesPresented would
-	// have hidden and DE-COLLIDED both end walls for the whole of a mode B match, and the first thing
-	// anybody did in the new pocket would have been to walk out of the world.
+	// have hidden and DE-COLLIDED both end walls for a whole match, and the first thing anybody did
+	// in the new pocket would have been to walk out of the world.
 	for (const FWallSpec& Wall : Walls)
 	{
 		AddCollisionBlock(Wall.Center, Wall.Size, Wall.Name);
@@ -3275,10 +3267,10 @@ void ATraceArenaBuilder::BuildFloorAndWalls(bool bBuildVisuals)
 			TeamTrimMID, false, TEXT("EndTrim"));
 
 		// THE BAND, THE KICK BAND AND THE RIBS ARE NOW PERMANENT TOO (spec v28 §8). They used to be
-		// mode A only, because they crossed the height and the width the mode-B hoop occupied and
-		// would have been three glowing bars drawn straight across the goal. The hoop hangs on the
-		// goal line now, a whole pocket in front of this wall, and nothing on the wall is behind it -
-		// so the end wall gets its full dressing in both modes, which is what the pocket needs: it is
+		// tagged to the endzone ruleset only, because they crossed the height and the width the hoop
+		// occupied and would have been three glowing bars drawn straight across the goal. The hoop
+		// hangs on the goal line now, a whole pocket in front of this wall, and nothing on the wall is
+		// behind it - so the end wall gets its full dressing, which is what the pocket needs: it is
 		// the only structure a player standing at their own spawn is looking at.
 		AddMeshBlock(CubeMesh, FVector(Sign * (HalfX - TraceArenaConstants::EndBandSize * 0.5f), 0.f, BandZ),
 			FVector(TraceArenaConstants::EndBandSize, FieldWidth, TraceArenaConstants::EndBandSize),
@@ -9179,9 +9171,11 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 			// with a faint emissive term rather than a neon block, so it reads as a floor that glows
 			// rather than as a light panel, and the goal line in front of it stays the bright thing.
 			//
-			// HOW FAINT IS THE WHOLE POINT: in mode A this is the ground a character stands on
-			// inside its own endzone, and both numbers come from one place so the built MID and the
-			// registration the half-time switch repaints from cannot drift apart. The measurement
+			// HOW FAINT IS THE WHOLE POINT: this was the ground a character stood on inside its own
+			// endzone while that ruleset existed, and both numbers come from one place so the built
+			// MID and the registration the half-time switch repaints from cannot drift apart. The
+			// paint is hidden furniture now; the numbers are kept together so that presenting it
+			// again is one decision and not a hunt. The measurement
 			// that set the scale, and why the answer is value and not hue, is on
 			// EndzonePatchBaseDim.
 			const FEndzoneFloorPaint FloorPaint = EndzoneFloorPaint(
@@ -9311,15 +9305,18 @@ void ATraceArenaBuilder::BuildEndzones(bool bBuildVisuals)
 		// standing on anything built inside the zone.
 		Zone->ConfigureZone(Team, FVector(Depth * 0.5f, HalfY, WallHeight * 0.5f), /*bInGoalVolume=*/false);
 
-		// Armed state BEFORE BeginPlay, not after. ApplyScoringMode at the end of BuildArena would
-		// reach the same answer, but the zone logs what it is on BeginPlay and a mode-B run would
-		// otherwise print "Endzone ... is LIVE" a few lines before quietly disarming it. This project
-		// has twice lost a day to a log line that said the wrong thing.
-		Zone->SetZoneActive(!TraceIsGoalMode(ScoringMode));
+		// Armed state BEFORE BeginPlay, not after. ApplyScoringShape at the end of BuildArena would
+		// reach the same answer, but the zone logs what it is on BeginPlay and would otherwise print
+		// "Endzone ... is LIVE" a few lines before quietly disarming it. This project has twice lost
+		// a day to a log line that said the wrong thing.
+		//
+		// FALSE, ALWAYS, since the endzone ruleset was removed: this volume is furniture now and
+		// never scores. It is still spawned - see the two-shapes note in the class comment.
+		Zone->SetZoneActive(false);
 		Zone->FinishSpawning(ZoneTransform);
 
-		// Remembered so ApplyScoringMode can arm this pair and disarm the goals (or the reverse)
-		// without a cast-and-filter walk of every actor in the world on every toggle.
+		// Remembered so ApplyScoringShape can arm the goals and disarm this pair without a
+		// cast-and-filter walk of every actor in the world.
 		ScoringVolumes.Add(Zone);
 
 		// Logged at Log, not Verbose, and with the numbers spelled out: "does the endzone really
@@ -9365,8 +9362,8 @@ void ATraceArenaBuilder::BuildGoalRing(float Sign, bool bBuildVisuals)
 	// is deleted rather than disabled - the hoop frames the pocket, which is real playable floor with
 	// the spawn fan and the end wall's own dressing in it.
 	//
-	// Everything built here is collected into GoalModePieces by the caller and hidden (and
-	// de-collided) while mode A is armed.
+	// Everything built here is collected into GoalModePieces by the caller and presented always. The
+	// hide-and-de-collide path still exists for the endzone furniture on the other side of the pair.
 	// ---------------------------------------------------------------------------------------------
 
 	const float PlaneX = Sign * GoalLineX();
@@ -9588,8 +9585,8 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 	// The floor dressing is the approach lane, and since v28 it is drawn on BOTH sides of the goal
 	// line - the sill on the line, a tinted patch and two rails running away from it up the pitch AND
 	// back into the pocket - because "which lane is the goal in" is now a question a carrier asks from
-	// behind the goal as well as in front of it. Everything here is tagged into GoalModePieces and
-	// hidden (and de-collided) while mode A is being played.
+	// behind the goal as well as in front of it. Everything here is tagged into GoalModePieces, which
+	// is the set that is always presented.
 	// ---------------------------------------------------------------------------------------------
 
 	UWorld* World = GetWorld();
@@ -9599,9 +9596,9 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 	const float CentreZ = GoalRingCentreZ();
 	const float SlabHalfDepth = GoalSlabHalfDepth();
 
-	// Mark BEFORE anything is built, collision included: the ring BLOCKS, and on a dedicated server
-	// (which builds collision and no visuals at all) an untagged hoop would be a solid obstacle
-	// hanging over the goal line through the whole of mode A.
+	// Mark BEFORE anything is built, collision included: the ring BLOCKS, and the tag is what lets
+	// SetPiecesPresented de-collide it. It is presented in every match today; the marking is what
+	// makes that a decision rather than an accident, and it cost nothing to keep.
 	const FTraceBuildMark GoalMark = MarkBuiltComponents();
 
 	// Say the finished shape out loud, in uu, at Display. This is the line a playtest of spec v6 and
@@ -9726,7 +9723,7 @@ void ATraceArenaBuilder::BuildGoals(bool bBuildVisuals)
 
 		Goal->ConfigureZone(Team, FVector(SlabHalfDepth, Radius, Radius), /*bInGoalVolume=*/true);
 		Goal->ConfigureRing(Radius);
-		Goal->SetZoneActive(TraceIsGoalMode(ScoringMode));   // see the matching note in BuildEndzones
+		Goal->SetZoneActive(true);   // see the matching note in BuildEndzones
 		Goal->FinishSpawning(ZoneTransform);
 		ScoringVolumes.Add(Goal);
 
@@ -12112,9 +12109,9 @@ void ATraceArenaBuilder::SetPiecesPresented(const TArray<FTraceModePiece>& Piece
 
 		Component->SetVisibility(bPresented, /*bPropagateToChildren=*/true);
 
-		// Visibility alone is not enough and this is the important half: an invisible goal post that
-		// still blocks is an invisible wall standing in the endzone for the whole of mode A, which is
-		// the worst kind of bug - it has no visual symptom at all.
+		// Visibility alone is not enough and this is the important half: a hidden piece that still
+		// blocks is an invisible wall standing on the field, which is the worst kind of bug - it has
+		// no visual symptom at all. It is what keeps the hidden endzone furniture out of the way.
 		if (UPrimitiveComponent* Primitive = Cast<UPrimitiveComponent>(Component))
 		{
 			Primitive->SetCollisionEnabled(bPresented ? Piece.Collision.GetValue() : ECollisionEnabled::NoCollision);
@@ -12127,29 +12124,25 @@ void ATraceArenaBuilder::SetPiecesPresented(const TArray<FTraceModePiece>& Piece
 	}
 }
 
-void ATraceArenaBuilder::ApplyScoringMode(ETraceScoringMode NewMode)
+void ATraceArenaBuilder::ApplyScoringShape()
 {
-	ScoringMode = NewMode;
-
-	// Legal before the build: the mode is remembered above and BuildArena calls this again at the
-	// end, so an early call (the game mode publishing before the arena exists) is not a lost edit.
+	// Legal before the build: BuildArena calls this again at the end, so an early call is not a lost
+	// edit, it is simply nothing to do yet.
 	if (!bArenaBuilt)
 	{
 		return;
 	}
 
-	const bool bGoalMode = TraceIsGoalMode(ScoringMode);
-
-	SetPiecesPresented(EndzoneModePieces, !bGoalMode);
-	SetPiecesPresented(GoalModePieces, bGoalMode);
+	SetPiecesPresented(EndzoneModePieces, false);
+	SetPiecesPresented(GoalModePieces, true);
 
 	// The same two sets on a baked level, where a piece is a whole actor. Exactly one of the two
 	// mechanisms is ever non-empty - see BakedEndzoneModeActors - so this costs a pair of empty loops
 	// on the procedural path.
-	SetBakedActorsPresented(BakedEndzoneModeActors, !bGoalMode);
-	SetBakedActorsPresented(BakedGoalModeActors, bGoalMode);
+	SetBakedActorsPresented(BakedEndzoneModeActors, false);
+	SetBakedActorsPresented(BakedGoalModeActors, true);
 
-	// Arm one pair of volumes, disarm the other. Empty on clients (no scoring volume is ever spawned
+	// Arm the goals, disarm the endzone volumes. Empty on clients (no scoring volume is ever spawned
 	// there), which is correct: a client has nothing to arm.
 	int32 Armed = 0;
 	for (const TWeakObjectPtr<ATraceEndzone>& Weak : ScoringVolumes)
@@ -12160,41 +12153,26 @@ void ATraceArenaBuilder::ApplyScoringMode(ETraceScoringMode NewMode)
 			continue;
 		}
 
-		const bool bWanted = (Zone->IsGoalVolume() == bGoalMode);
+		const bool bWanted = Zone->IsGoalVolume();
 		Zone->SetZoneActive(bWanted);
 		Armed += bWanted ? 1 : 0;
 	}
 
-	// Display, not Log: this is the answer to "which game am I looking at", and on an A/B toggle
-	// that is the first thing anybody reading a log wants to see.
+	// Display, not Log: "how many volumes actually score" is the first thing anybody reading a log
+	// of a match that would not score wants to see, and it is two lines of arithmetic away from
+	// anything else that could tell them.
 	//
 	// BOTH COUNTS, and that is not padding. On a baked level the component counts are legitimately
 	// zero and the actor counts carry the whole meaning; reporting only the first pair printed
 	// "0 endzone pieces hidden, 0 goal pieces shown" over a level that had just correctly hidden 24
 	// pieces and shown 84, which is precisely the sort of log line this project has lost a day to.
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[Arena] Presenting %s: %d endzone pieces %s, %d goal pieces %s (baked actors: %d / %d), ")
-		TEXT("%d of %d volumes armed."),
-		*TraceScoringModeLabel(ScoringMode),
-		EndzoneModePieces.Num(), bGoalMode ? TEXT("hidden") : TEXT("shown"),
-		GoalModePieces.Num(), bGoalMode ? TEXT("shown") : TEXT("hidden"),
+		TEXT("[Arena] Presenting GOALS: %d endzone pieces hidden, %d goal pieces shown ")
+		TEXT("(baked actors: %d / %d), %d of %d volumes armed."),
+		EndzoneModePieces.Num(),
+		GoalModePieces.Num(),
 		BakedEndzoneModeActors.Num(), BakedGoalModeActors.Num(),
 		Armed, ScoringVolumes.Num());
-}
-
-void ATraceArenaBuilder::ApplyScoringModeInWorld(const UWorld* World, ETraceScoringMode NewMode)
-{
-	if (World == nullptr)
-	{
-		return;
-	}
-
-	// One per world, and not replicated, so the server and every client has to be driven separately -
-	// the same reason ApplyTeamSidesInWorld exists in this shape.
-	for (TActorIterator<ATraceArenaBuilder> It(const_cast<UWorld*>(World)); It; ++It)
-	{
-		It->ApplyScoringMode(NewMode);
-	}
 }
 
 void ATraceArenaBuilder::ApplyTeamSidesInWorld(const UWorld* World, ETraceTeam TeamOnNegativeSide)
@@ -12302,7 +12280,7 @@ void ATraceArenaBuilder::DestroyBuiltArena()
 	PaintedTeamOnNegativeSide = ETraceTeam::Blue;
 
 	// The mode tags point at components that have just been destroyed. Weak pointers make that safe
-	// rather than fatal, but a stale entry would still make the next ApplyScoringMode walk a list of
+	// rather than fatal, but a stale entry would still make the next ApplyScoringShape walk a list of
 	// nulls and report a component count that no longer means anything.
 	EndzoneModePieces.Reset();
 	GoalModePieces.Reset();

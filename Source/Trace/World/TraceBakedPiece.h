@@ -92,8 +92,8 @@ struct FTraceBakedSideTint
  * individually selected, retargeted or deleted.
  *
  * TWO PIECES OF STATE TRAVEL WITH THE ACTOR because the runtime builder can no longer hold them in
- * memory across a save: ScoringModeTag (which of the A/B shapes this belongs to) and SideTints (which
- * of its materials the half-time switch repaints). ATraceArenaBuilder::AdoptBakedArena reads both
+ * memory across a save: ScoringModeTag (which scoring shape this piece belongs to) and SideTints
+ * (which of its materials the half-time switch repaints). ATraceArenaBuilder::AdoptBakedArena reads both
  * back on load — see the skip-the-build note on ATraceArenaBuilder::bLevelIsPreBaked.
  *
  * ==================================================================================================
@@ -142,7 +142,14 @@ public:
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Baked")
 	TObjectPtr<USceneComponent> PieceRoot;
 
-	/** Which scoring shape presents this piece. Always for everything that is not endzone furniture. */
+	/**
+	 * Which scoring shape presents this piece. Always for everything that is not scoring furniture.
+	 *
+	 * KEEP THE NAME AND THE ENUMERATORS. This value is SERIALISED into every baked arena on disk, so
+	 * renaming either would silently re-tag a level nobody re-baked. The endzone ruleset the tag was
+	 * invented for has been removed and EndzoneModeOnly pieces are now permanently hidden furniture,
+	 * which is a decision about the level and not about this field.
+	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Baked")
 	ETraceBakedScoringTag ScoringModeTag = ETraceBakedScoringTag::Always;
 

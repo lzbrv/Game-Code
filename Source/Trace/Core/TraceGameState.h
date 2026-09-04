@@ -15,27 +15,6 @@
 class ATraceCore;
 
 /**
- * Declared in TraceSettings.h. Forward declared (legal: the underlying type is fixed) so this
- * header stays free of the 110 kB settings header — exactly as TraceCore.h does, and for the same
- * reason: most includers of this file only ever want IsGoalMode().
- */
-enum class ETraceScoringMode : uint8;
-
-/**
- * Broadcast on EVERY machine — server and clients alike — when the active scoring mode changes.
- *
- * Systems whose WORLD has to change with the mode (the arena builder swapping endzones for goals,
- * the Core swapping between a status and a physical body) subscribe to this rather than polling,
- * because the change has to land on clients too and clients only learn about it through
- * replication. Systems that merely BRANCH on the mode per frame should not subscribe at all: call
- * ATraceGameState::GetScoringMode() at the point of use and stay correct for free.
- *
- * Declared at file scope rather than inside the UCLASS so UnrealHeaderTool never has to parse a
- * delegate macro inside a generated body.
- */
-DECLARE_MULTICAST_DELEGATE_OneParam(FTraceScoringModeChanged, ETraceScoringMode /*NewMode*/);
-
-/**
  * The replicated half of the match: scores, phase, the shared deadline and a handle to the one Core.
  *
  * Written only by ATraceGameMode (server). Everything else — HUD, endzones, characters, weapons —
@@ -161,27 +140,18 @@ public:
 	float LastWipeBonusServerTime = 0.f;
 
 	// ------------------------------------------------------------------------------------------
-	// Scoring mode (spec v4 §7) — THE match-wide answer to "which game is this?"
+	// NO SCORING MODE HERE ANY MORE.
 	//
-	// Written only by ATraceGameMode::PublishScoringMode(), which resolves it from the travel URL /
-	// command line / UTraceSettings and then pushes the SAME value here and into ATraceCore. Read it
-	// through GetScoringMode() / IsGoalMode().
+	// Spec v4 §7 replicated a uint8 here — THE match-wide answer to "which game is this?" — because
+	// the A/B toggle had to reach clients, and because the Core (which the mode decides the nature
+	// of) is null before PreInitializeComponents and on any client that has not received it yet,
+	// while the HUD has to say which mode it is from the first drawn frame. ATraceGameMode was the
+	// single writer of both copies, which is what kept them from disagreeing.
 	//
-	// WHY IT IS ALSO HERE AND NOT ONLY ON ATraceCore. The Core latches the mode too (it has to: the
-	// mode decides what the Core *is*), but the Core is a gameplay actor that is null before
-	// PreInitializeComponents has run and on any client that has not received it yet — and the HUD
-	// has to tell the player which mode they are in from the first drawn frame, including during
-	// warm-up. The GameState is always there and always relevant, so this is the copy that UI, bots
-	// and anything else asks. ATraceGameMode is the single writer of both, which is what keeps them
-	// from ever disagreeing.
-	//
-	// Stored as a uint8 rather than the enum for the header-weight reason above; the accessors below
-	// hand back the real type.
+	// The endzone ruleset is gone and goals is simply the game, so there is no fact to replicate, no
+	// OnRep to fire and no delegate for the arena and the Core to rebuild off. Anything that needs
+	// to know what game this is can read the code: it is this one.
 	// ------------------------------------------------------------------------------------------
-
-	/** ETraceScoringMode as a uint8. 0 is mode A (endzones), which is the default. */
-	UPROPERTY(ReplicatedUsing = OnRep_ScoringModeChanged)
-	uint8 ReplicatedScoringMode = 0;
 
 	// ------------------------------------------------------------------------------------------
 	// Result (spec v4 §6)
@@ -199,9 +169,6 @@ public:
 	/** Who won. ETraceTeam::None is a genuine draw, and only ever happens on a clock finish. */
 	UPROPERTY(Replicated)
 	ETraceTeam MatchWinner = ETraceTeam::None;
-
-	/** Fires on every machine when ScoringMode changes. See FTraceScoringModeChanged. */
-	FTraceScoringModeChanged OnScoringModeChanged;
 
 	int32 GetScore(ETraceTeam Team) const;
 
@@ -281,33 +248,8 @@ public:
 	void NotifyWipeBonus(ETraceTeam BonusTeam);
 
 	// ------------------------------------------------------------------------------------------
-	// Scoring mode and result — the accessors every other system should use
+	// Result — the accessors every other system should use
 	// ------------------------------------------------------------------------------------------
-
-	/**
-	 * THE question "which game is this?", answered from replicated state. Correct on the server and
-	 * on every client, in every phase, including before the match starts.
-	 */
-	ETraceScoringMode GetScoringMode() const;
-
-	/** Mode B: narrow goals, physical throwable Core. Sugar over GetScoringMode(). */
-	bool IsGoalMode() const;
-
-	/** Mode A: full-width endzones, the Core is a possession status. Sugar over GetScoringMode(). */
-	bool IsEndzoneMode() const;
-
-	/**
-	 * The mode, from anything with a world — a component, an actor, a HUD pass — without each
-	 * caller writing the same GetWorld()->GetGameState<>() null dance.
-	 *
-	 * Falls back to mode A when there is no GameState yet (a construction script, an early
-	 * BeginPlay, a client that has not received it). That fallback is the shipped game, so a system
-	 * that asks too early behaves like the default rather than like something nobody has played.
-	 */
-	static ETraceScoringMode GetScoringModeFor(const UObject* WorldContextObject);
-
-	/** Server only. Publishes the mode and broadcasts OnScoringModeChanged. Idempotent. */
-	void SetScoringMode(ETraceScoringMode InScoringMode);
 
 	ETraceMatchEndReason GetMatchEndReason() const;
 	ETraceTeam GetMatchWinner() const;
@@ -320,9 +262,6 @@ public:
 
 	UFUNCTION()
 	void OnRep_Scores();
-
-	UFUNCTION()
-	void OnRep_ScoringModeChanged();
 
 	UFUNCTION()
 	void OnRep_HalfChanged();

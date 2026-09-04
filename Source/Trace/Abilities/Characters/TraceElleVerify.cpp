@@ -1006,11 +1006,11 @@ namespace TraceElleVerify
 			// ---- Phase 7: THROWING it raises the cloak too — §2's other trigger -------------------
 			if (State->Phase == 7)
 			{
-				if (CoreActor == nullptr || !ATraceCore::IsModeB(TickWorld))
+				if (CoreActor == nullptr)
 				{
 					UE_LOG(LogTraceGame, Warning,
-						TEXT("[ELLEVERIFY]   SKIPPED the THROW half — this match is mode A, where the Core is never "
-						     "thrown. The pass above is the mode-A trigger and it is the same code path."));
+						TEXT("[ELLEVERIFY]   SKIPPED the THROW half — there is no Core actor in this world to "
+						     "throw."));
 					State->Phase = 8;
 					State->PhaseStartReal = NowReal;
 					return true;

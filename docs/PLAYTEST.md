@@ -292,9 +292,15 @@ reason to retry is that the host has just fixed their firewall.
 
 ### Controls on the title screen
 
-```
-W / S  OR  ARROWS   MOVE      A / D   CHANGE      ENTER   SELECT      ESC   QUIT
-```
+The screen no longer prints these — the key legend that used to run along the bottom was taken off
+in D30 — so this is now the only place they are written down:
+
+| Key | Does |
+| --- | --- |
+| `W` / `S`, or the up/down arrows | Move the highlight |
+| `A` / `D` | Change the value on the row you are on |
+| `Enter` | Select |
+| `Esc` | Jump to QUIT, then quit |
 
 `Esc` first jumps the highlight to **QUIT** rather than quitting immediately, so a stray Escape
 cannot close the game. Press it again to actually quit.
@@ -532,7 +538,9 @@ Read this before reporting any of them. All are known, deliberate or accepted, a
 * **The surf rails are not in the map the game loads.** The mechanic exists and works; the four rails
   are only built by the procedural arena, and both PLAY and PRACTICE open the baked one. Nothing you
   can do in this build will find them. (item 30)
-* **Mode A (endzones) is frozen** — no characters, no abilities. Deliberate. Play Mode B.
+* **The endzone ruleset is gone.** There used to be a SCORING MODE row on the title screen that
+  switched between full-width endzones and goals. Goals is the game now; the row, the `?mode=a` URL
+  option and the setting behind them have all been removed, so there is nothing to look for.
 * **Bots score sometimes.** They are meant to. How well they should defend is an open design question,
   not a defect.
 

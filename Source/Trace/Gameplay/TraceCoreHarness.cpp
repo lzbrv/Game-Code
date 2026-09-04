@@ -209,12 +209,6 @@ static void TraceModeBRunThrowSpread(UWorld* World, int32 Throws, float HoldSeco
 			TEXT("speed this measures exists nowhere else."));
 		return;
 	}
-	if (!Core->IsModeB())
-	{
-		UE_LOG(LogTraceGame, Warning, TEXT("[ThrowSpread] mode A has no throw. Launch with ?mode=b."));
-		return;
-	}
-
 	// Shared with the ticker below by value; it outlives this scope by design, exactly as
 	// DebugTakeCore's does.
 	struct FSpreadState
@@ -615,12 +609,6 @@ void ATraceCore::RunThrowMomentumTest()
 		return;
 	}
 
-	if (!IsModeB())
-	{
-		UE_LOG(LogTraceGame, Warning, TEXT("[ModeBMomentum] mode A: there is no throw. Launch with ?mode=b."));
-		return;
-	}
-
 	// A JOINING CLIENT'S PAWN FIRST, and that preference is spec v8 §0, not tidiness. Measuring this
 	// on the listen host's own pawn would prove only that the arithmetic runs somewhere - the host is
 	// the machine on which every one of this pass's three complaints is invisible by definition. Using
@@ -973,12 +961,6 @@ void ATraceCore::RunRunningThrowTest()
 		UE_LOG(LogTraceGame, Warning,
 			TEXT("[ModeBRunThrow] server only - a throw and its first frame of flight both resolve on ")
 			TEXT("the authority."));
-		return;
-	}
-
-	if (!IsModeB())
-	{
-		UE_LOG(LogTraceGame, Warning, TEXT("[ModeBRunThrow] mode A has no throw. Launch with ?mode=b."));
 		return;
 	}
 
@@ -1375,9 +1357,9 @@ static FAutoConsoleCommand GTraceModeBCoreProbeCmd(
 
 			const TCHAR* Machine = (World->GetNetMode() == NM_Client) ? TEXT("CLIENT") : TEXT("SERVER/LOCAL");
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[ModeB] CORE PROBE (%s): mode %s | holder %s | loose %d | repl pos %s | repl vel %s ")
+				TEXT("[ModeB] CORE PROBE (%s): holder %s | loose %d | repl pos %s | repl vel %s ")
 				TEXT("(%.0f uu/s, Z %+.0f) | drawn at %s"),
-				Machine, Core->IsModeB() ? TEXT("B") : TEXT("A"), *GetNameSafe(Core->GetCarrier()),
+				Machine, *GetNameSafe(Core->GetCarrier()),
 				Core->IsLoose() ? 1 : 0, *FVector(Core->LooseLocation).ToCompactString(),
 				*FVector(Core->LooseVelocity).ToCompactString(),
 				FVector(Core->LooseVelocity).Size(), FVector(Core->LooseVelocity).Z,
@@ -1968,7 +1950,7 @@ static TAutoConsoleVariable<int32> CVarModeBVerifySurfacesRequested(
 bool ATraceCore::DebugLaunchLoose(const FVector& From, const FVector& LaunchVelocity, ETraceTeam FromTeam,
 	bool bAsThrow)
 {
-	if (!HasAuthority() || !IsModeB() || bCoreStateLocked)
+	if (!HasAuthority() || bCoreStateLocked)
 	{
 		return false;
 	}
@@ -2021,13 +2003,6 @@ void ATraceCore::TickModeBVerification()
 
 		if (!bFullRequested && !bSurfacesRequested)
 		{
-			return;
-		}
-		if (!IsModeB())
-		{
-			UE_LOG(LogTraceGame, Warning, TEXT("[ModeBVerify] refused: the match is playing mode A."));
-			CVarModeBVerifyRequested->Set(0, ECVF_SetByConsole);
-			CVarModeBVerifySurfacesRequested->Set(0, ECVF_SetByConsole);
 			return;
 		}
 		// Wait for a settled, running half. Arming during the pre-match window put the very first
@@ -3332,7 +3307,7 @@ void ATraceCore::TickTurnoverRepro()
 		// the pre-match window puts the first shot on the kickoff frame, which cancels it and makes the
 		// harness report on a rule that never ran.
 		const ATraceGameState* GameState = World->GetGameState<ATraceGameState>();
-		if (!IsModeB() || GameState == nullptr
+		if (GameState == nullptr
 			|| GameState->TraceMatchState != ETraceMatchState::InProgress
 			|| GameState->IsHalfTimeBreak()
 			|| !IsValid(Carrier) || !Carrier->IsAlive() || bLoose)
@@ -3629,15 +3604,6 @@ bool ATraceCore::DebugStageCoreArt(UWorld* World, int32 Which, float DistanceUU,
 		OutReport = TEXT("this machine is not the server; stage on the listen host");
 		return false;
 	}
-	if (!Core->IsModeB())
-	{
-		OutReport = TEXT("mode A: the Core is never loose, so only state 2 (carried) exists. Launch with ?mode=b.");
-		if (Which != 2)
-		{
-			return false;
-		}
-	}
-
 	APlayerController* PC = World->GetFirstPlayerController();
 	ATraceCharacter* Local = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
 	if (!IsValid(Local))
@@ -4330,8 +4296,8 @@ namespace TraceCoreArtShots
 		// 4 Hz and needs a team first, so for the first fraction of a second of a session the screen
 		// is not open YET and the flag above is a false negative. "Locked in" is only false-negative
 		// in the direction that costs a wait. Skipped entirely when characters are switched off for
-		// the session (mode A, or the settings toggle), where nobody is ever locked in and requiring
-		// it would hang forever.
+		// the session by the settings toggle, where nobody is ever locked in and requiring it would
+		// hang forever.
 		if (UTraceAbilityComponent::AreCharactersEnabled(World) && !LocalState->bCharacterLocked)
 		{
 			OutWhyNot = TEXT("the local player has not locked in a character yet");
@@ -5128,7 +5094,7 @@ namespace TraceCoreTurnoverVerify
 
 bool ATraceCore::DebugRegisterTurnover(ETraceTeam DroppingTeam, const FVector& Where)
 {
-	if (!HasAuthority() || !IsModeB() || DroppingTeam == ETraceTeam::None)
+	if (!HasAuthority() || DroppingTeam == ETraceTeam::None)
 	{
 		return false;
 	}
@@ -5165,12 +5131,6 @@ bool ATraceCore::DebugStageTurnoverAtLocalCrosshair(UWorld* World, float Distanc
 		OutReport = TEXT("this machine is not the server; stage the turnover on the listen host");
 		return false;
 	}
-	if (!Core->IsModeB())
-	{
-		OutReport = TEXT("this match is not in goals mode; spec v25 §2 is goals mode only");
-		return false;
-	}
-
 	APlayerController* PC = World->GetFirstPlayerController();
 	ATraceCharacter* Local = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
 	if (!IsValid(Local) || Local->GetTeam() == ETraceTeam::None)
@@ -5766,13 +5726,6 @@ void ATraceCore::TickTurnoverVerify()
 	{
 	case 0:
 	{
-		if (!IsModeB())
-		{
-			Skip(TEXT("this match is not in goals mode; spec v25 §2 is goals mode only."));
-			TurnoverVerifyStep = 5;
-			break;
-		}
-
 		TArray<ATraceCharacter*> All;
 		GatherCharacters(All);
 
@@ -6311,18 +6264,6 @@ void ATraceCore::StartKickoffProbe()
 	if (GameMode == nullptr)
 	{
 		UE_LOG(LogTraceGame, Error, TEXT("[KickoffProbe] no ATraceGameMode; nothing to drive."));
-		return;
-	}
-
-	if (!IsModeB())
-	{
-		// NOT A FAILURE, AND IT MUST NOT BE REPORTED AS ONE. Mode A has no loose Core, so "retrieve"
-		// and "locked out" have no mechanism to be true or false about. The PLACEMENT half of §3 still
-		// applies there and is covered by the capture, not by this.
-		UE_LOG(LogTraceGame, Warning,
-			TEXT("[KickoffProbe] this match is in mode A (endzones), where the Core is a possession ")
-			TEXT("status and there is nothing to walk onto. Run it in goals mode (?mode=b, or the ")
-			TEXT("shipped DefaultGame.ini default)."));
 		return;
 	}
 

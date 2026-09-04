@@ -253,8 +253,11 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UTraceMenuRow> RowDifficulty;
 
-	UPROPERTY(meta = (BindWidget))
-	TObjectPtr<UTraceMenuRow> RowMode;
+	// RowMode (SCORING MODE) was here. A BindWidget property is a HARD requirement on the asset:
+	// leaving it declared after the row was removed from ETraceMenuRow and from
+	// Scripts/generate-menu-widgets.py's ROW_NAMES makes WBP_TitleMenu fail to compile with
+	// "a required widget binding RowMode was not found", which is the loud failure the discipline at
+	// the top of this header exists to produce. All three had to be deleted together.
 
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UTraceMenuRow> RowSettings;

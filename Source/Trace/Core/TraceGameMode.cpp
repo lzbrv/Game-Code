@@ -2,7 +2,7 @@
 
 #include "Core/TraceGameMode.h"
 
-#include "Components/BoxComponent.h"                     // endzone trigger extent (see CheckEndzoneScoreForCarrier)
+#include "Components/BoxComponent.h"                     // scoring-volume trigger extent
 #include "EngineUtils.h"                                 // TActorIterator
 #include "Engine/World.h"
 #include "GameFramework/CharacterMovementComponent.h"     // StopMovementImmediately on respawn
@@ -193,16 +193,6 @@ namespace TraceGameModeConstants
 	static constexpr float ScoreDebounceSeconds = 0.5f;
 
 	/**
-	 * Seconds between checks of UTraceSettings::ScoringMode for a live edit (spec v4 §7).
-	 *
-	 * Half a second is imperceptible to somebody dragging a toggle in the details panel and is two
-	 * ticks per second of one enum comparison, which does not register on any profile. It is not a
-	 * hook because PostEditChangeProperty is editor-only and the toggle has to keep working in a
-	 * packaged A/B build.
-	 */
-	static constexpr float ScoringModePollInterval = 0.5f;
-
-	/**
 	 * Spec v9 §11. Seconds between dead-ball checks while a half/full time is pending.
 	 *
 	 * 20 Hz. Two accessor reads on one actor, and only during the seconds between a clock expiring
@@ -280,17 +270,13 @@ void ATraceGameMode::InitGame(const FString& MapName, const FString& Options, FS
 	// are no-ops once this one has run.
 	UTraceSettings::ResolveBotDifficultyFromOptions(Options, /*bForceReresolve=*/true);
 
-	// Which of the two games (spec v4 §7). Same three-way resolution as the difficulty above and for
-	// the same reason: the title screen sends it on the travel URL, a headless run sends it on the
-	// command line, and everything else falls back to the Project Settings page. Must happen HERE —
-	// InitGame is the last point before PreInitializeComponents builds the arena, and the arena is
-	// one of the things the mode decides the shape of.
-	ResolveScoringMode(Options);
-
-	// Characters on or off for this match (spec v14 §3's settings toggle). AFTER ResolveScoringMode,
-	// which is not merely tidy: AreCharactersEnabled() gates on mode B, and resolving the toggle
-	// before the mode was published would log "characters are ON" for a mode A match that will never
-	// have any. Same three-way resolution as the mode and the difficulty above.
+	// Characters on or off for this match (spec v14 §3's settings toggle). Same three-way resolution
+	// as the difficulty above: travel URL, then command line, then the Project Settings page.
+	//
+	// This used to have to run AFTER a ResolveScoringMode() call, because AreCharactersEnabled()
+	// also gated on the scoring mode and resolving the toggle first would log "characters are ON"
+	// for an endzone match that would never have any. The scoring mode is gone, so this toggle is
+	// now the whole of the answer and the ordering constraint went with it.
 	ResolveCharactersEnabled(Options);
 
 	// Test hook for the MERCY RULE, and it earns its place for the same reason the half-length hooks
@@ -377,12 +363,6 @@ void ATraceGameMode::PreInitializeComponents()
 	// publishes the Core on it, so Super has to run first.
 	Super::PreInitializeComponents();
 
-	// BEFORE the arena is built and before anybody logs in: the mode decides what the ends of the
-	// field are (endzones or goals) and what the Core is, so every system that reads it during its
-	// own construction has to find the right answer already published. Super created the GameState
-	// immediately above, which is the earliest this can possibly run.
-	PublishScoringMode();
-
 	// See the header for the LoadMap ordering this exists to get ahead of. Short version: every
 	// ATraceTeamPlayerStart must exist before AGameModeBase::Login calls FindPlayerStart, and Login
 	// happens before any BeginPlay in the world.
@@ -407,7 +387,6 @@ void ATraceGameMode::BeginPlay()
 
 	// Belt and braces for paths that skip PreInitializeComponents' happy case — seamless travel, a
 	// Blueprint subclass that forgets to call Super, PIE quirks. Both are idempotent.
-	PublishScoringMode();
 	EnsureArenaBuilt();
 	SpawnCoreIfNeeded();
 	ApplyTeamSides(GetNegativeSideTeamForHalf(1));
@@ -428,16 +407,10 @@ void ATraceGameMode::BeginPlay()
 	// The host is already logged in, so this is the first point at which the phase machine may run.
 	CheckMatchStartConditions();
 
-	// Makes the A/B toggle live for the rest of the session. See PollScoringModeSetting().
-	GetWorldTimerManager().SetTimer(ScoringModePollHandle, this, &ATraceGameMode::PollScoringModeSetting,
-		TraceGameModeConstants::ScoringModePollInterval, /*bLoop=*/true,
-		TraceGameModeConstants::ScoringModePollInterval);
-
 	// Character selection (spec v14 §3). Started here rather than from PostLogin because the listen
-	// server's host logs in during map load, before this class has a GameState to read the mode from
-	// — and because the poll has to keep running to close screens when the A/B toggle switches the
-	// match to mode A. First fire is immediate so the host is offered a pick on the opening frames
-	// rather than a quarter second in. See PollCharacterSelect().
+	// server's host logs in during map load, before this class has a GameState at all. First fire is
+	// immediate so the host is offered a pick on the opening frames rather than a quarter second in.
+	// See PollCharacterSelect().
 	GetWorldTimerManager().SetTimer(CharacterSelectPollHandle, this, &ATraceGameMode::PollCharacterSelect,
 		TraceGameModeConstants::CharacterSelectPollInterval, /*bLoop=*/true,
 		TraceGameModeConstants::CharacterSelectPollInterval);
@@ -1360,6 +1333,62 @@ void ATraceGameMode::RestartPlayerFresh(AController* Controller)
 			}
 		}
 	}
+
+	// D30-RESETS (a). "Momentum should reset ... when you respawn."
+	//
+	// EVERY path that hands out a pawn funnels through here, so this is where the rule belongs — the
+	// same argument the wipe latch above makes. The pawn is usually brand new and therefore already
+	// still, and that is exactly why this is worth a call rather than an assumption: RestartPlayer()
+	// REUSES the pawn whenever the controller still owns a living one (only a corpse is destroyed,
+	// twenty lines up), so a living player restarted by a reset keeps their velocity and their whole
+	// movement kit unless something takes it away.
+	//
+	// It is also what sends the owning client its own reset. A brand-new pawn is still on the server
+	// AND on the client, so that call is a no-op in the common case; it is the reused-pawn case it is
+	// here for.
+	ResetMomentumFor(Controller, TEXT("respawn"));
+}
+
+// ---------------------------------------------------------------------------------------------
+// D30-RESETS (a) — "momentum should reset when halves switch and when you respawn"
+//
+// One function, called from the two places that place a pawn: ResetPlayersToSpawns() (the half
+// switch, the kickoff reset and the goal reset) and RestartPlayerFresh() (every respawn).
+// ---------------------------------------------------------------------------------------------
+
+void ATraceGameMode::ResetMomentumFor(AController* Controller, const TCHAR* Why)
+{
+	if (!HasAuthority() || !IsValid(Controller))
+	{
+		return;
+	}
+
+	ACharacter* const Pawn = Cast<ACharacter>(Controller->GetPawn());
+	if (Pawn == nullptr)
+	{
+		return;   // Dead and not yet restarted. The fresh pawn gets its own call.
+	}
+
+	if (UTraceCharacterMovementComponent* TraceMovement =
+			Cast<UTraceCharacterMovementComponent>(Pawn->GetCharacterMovement()))
+	{
+		TraceMovement->ResetMomentum(Why);
+	}
+	else if (UCharacterMovementComponent* BaseMovement = Pawn->GetCharacterMovement())
+	{
+		// A pawn whose movement is not ours — nothing in the shipped game, but the practice range and
+		// the debug spawners can produce one. The pre-D30 behaviour, unchanged, is right for it: there
+		// is no Trace kit on it to clear.
+		BaseMovement->StopMovementImmediately();
+	}
+
+	// *** AND THE OWNING CLIENT, WHICH IS THE HALF THAT MAKES IT A RESET INSTEAD OF A CORRECTION. ***
+	// Velocity and the whole kit are client-predicted; see ATracePlayerController::ClientResetMomentum.
+	// Bots are AAIControllers and are skipped by the cast, which is correct: a bot IS the server.
+	if (ATracePlayerController* PlayerController = Cast<ATracePlayerController>(Controller))
+	{
+		PlayerController->ClientResetMomentum();
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1554,110 +1583,6 @@ bool ATraceGameMode::CheckMercyRule(const TCHAR* Cause)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Scoring mode (spec v4 §7)
-// ---------------------------------------------------------------------------------------------
-
-ETraceScoringMode ATraceGameMode::GetScoringMode() const
-{
-	const ATraceGameState* TraceGameState = GetGameState<ATraceGameState>();
-	return (TraceGameState != nullptr) ? TraceGameState->GetScoringMode() : ETraceScoringMode::EndzoneStatusCore;
-}
-
-void ATraceGameMode::ResolveScoringMode(const FString& Options)
-{
-	// The default is whatever the settings page already says, so the two overrides below are genuine
-	// overrides rather than a reset to the shipped mode.
-	UTraceSettings* MutableSettings = GetMutableDefault<UTraceSettings>();
-	if (MutableSettings == nullptr)
-	{
-		return;
-	}
-
-	ETraceScoringMode ResolvedMode = MutableSettings->ScoringMode;
-	const TCHAR* Source = TEXT("Project Settings");
-
-	if (UGameplayStatics::HasOption(Options, TraceScoringModeUrlOption))
-	{
-		ResolvedMode = TraceScoringModeFromUrlValue(
-			UGameplayStatics::ParseOption(Options, TraceScoringModeUrlOption));
-		Source = TEXT("travel URL");
-	}
-	else
-	{
-		FString CommandLineValue;
-		if (FParse::Value(FCommandLine::Get(), TEXT("TraceScoringMode="), CommandLineValue))
-		{
-			ResolvedMode = TraceScoringModeFromUrlValue(CommandLineValue);
-			Source = TEXT("command line");
-		}
-	}
-
-	// Written BACK into the CDO, which is the whole trick that makes this both authoritative and
-	// live. After this line the Project Settings panel shows the mode actually being played, the
-	// poll below has nothing to fight, and dragging the toggle there is a real change rather than a
-	// value silently losing to a URL the player cannot see.
-	MutableSettings->ScoringMode = ResolvedMode;
-
-	UE_LOG(LogTraceGame, Display, TEXT("[Mode] %s selected (from the %s)."),
-		*TraceScoringModeLabel(ResolvedMode), Source);
-}
-
-void ATraceGameMode::PublishScoringMode()
-{
-	if (!HasAuthority())
-	{
-		return;
-	}
-
-	ATraceGameState* TraceGameState = GetTraceGameState();
-	if (TraceGameState == nullptr)
-	{
-		return;
-	}
-
-	const ETraceScoringMode DesiredMode = UTraceSettings::Get().ScoringMode;
-
-	// SetScoringMode early-outs when nothing changed, so this is free on the second and third call
-	// and no OnRep storms out of the belt-and-braces re-runs in BeginPlay.
-	TraceGameState->SetScoringMode(DesiredMode);
-
-	// THE CORE HOLDS NO MODE OF ITS OWN. It used to, and the latch was deleted: a second copy of the
-	// fact that decides what that actor IS meant the two could disagree for a frame, and the Core's
-	// own log caught exactly that — mode A latched, then flipped to B a frame later. ATraceCore::
-	// IsModeB() now asks ATraceGameState every time, so the GameState line above is the whole of the
-	// publish.
-	//
-	// This call is therefore a RECONCILE-NOW hook, not a setter: it tells the Core to pick up the
-	// new mode on the frame the mode is published rather than on its next tick, and it logs a
-	// warning if what it is handed disagrees with the GameState instead of obeying it.
-	if (ATraceCore* TheCore = GetCore())
-	{
-		TheCore->SetScoringMode(DesiredMode);
-	}
-}
-
-void ATraceGameMode::PollScoringModeSetting()
-{
-	const ATraceGameState* TraceGameState = GetTraceGameState();
-	if (TraceGameState == nullptr)
-	{
-		return;
-	}
-
-	const ETraceScoringMode DesiredMode = UTraceSettings::Get().ScoringMode;
-	if (DesiredMode == TraceGameState->GetScoringMode())
-	{
-		return;
-	}
-
-	UE_LOG(LogTraceGame, Display,
-		TEXT("[Mode] Live change: %s -> %s. Subscribers to OnScoringModeChanged rebuild from here."),
-		*TraceScoringModeLabel(TraceGameState->GetScoringMode()), *TraceScoringModeLabel(DesiredMode));
-
-	PublishScoringMode();
-}
-
-// ---------------------------------------------------------------------------------------------
 // Scoring
 // ---------------------------------------------------------------------------------------------
 
@@ -1675,9 +1600,9 @@ void ATraceGameMode::NotifyScored(ETraceTeam ScoringTeam)
 		return;
 	}
 
-	// One capture, one point. Two independent detectors now feed this — the endzone's own trigger
-	// and poll, and CheckEndzoneScoreForCarrier on a possession change — and a pass completed
-	// inside the endzone trips both within a tenth of a second of each other. Everything below
+	// One capture, one point. Two independent detectors feed this — the goal volume's own trigger
+	// and 10 Hz poll, and ATraceCore's swept crossing test — and a carrier who runs through the
+	// mouth can trip both within a tenth of a second of each other. Everything below
 	// (kickoff, teleporting ten pawns) is a field reset that takes several frames to settle, so
 	// re-entering it before it has is never right, whichever detector got here first.
 	const float NowWorld = static_cast<float>(World->GetTimeSeconds());
@@ -1784,89 +1709,6 @@ void ATraceGameMode::NotifyScored(ETraceTeam ScoringTeam)
 	ResetPlayersToSpawns();
 }
 
-bool ATraceGameMode::CheckEndzoneScoreForCarrier(ATraceCharacter* InCharacter, const TCHAR* Reason)
-{
-	UWorld* World = GetWorld();
-	if (!HasAuthority() || World == nullptr || !IsValid(InCharacter) || !InCharacter->IsAlive())
-	{
-		return false;
-	}
-
-	// The carrier is asked of the Core, not of the pawn's replicated flag: this runs on the frame
-	// possession changes, and the flag is a mirror that may not have been written yet.
-	const ATraceCore* TheCore = GetCore();
-	if (TheCore == nullptr || TheCore->GetCarrier() != InCharacter)
-	{
-		return false;
-	}
-
-	const ETraceTeam CarrierTeam = InCharacter->GetTeam();
-	if (CarrierTeam == ETraceTeam::None)
-	{
-		return false;
-	}
-
-	const FVector CarrierLocation = InCharacter->GetActorLocation();
-
-	for (TActorIterator<ATraceEndzone> It(World); It; ++It)
-	{
-		ATraceEndzone* Zone = *It;
-		if (!IsValid(Zone) || Zone->Trigger == nullptr)
-		{
-			continue;
-		}
-
-		// DISARMED ZONES DO NOT SCORE. The arena builds both shapes — full-width endzones for mode A
-		// and narrow goals for mode B — and arms one pair, so two of the four ATraceEndzone actors
-		// in the world are always inactive. Without this test a mode-B match could award a point off
-		// the disarmed FULL-WIDTH endzone, i.e. score by walking over the goal line anywhere along a
-		// 9600 uu sideline, which is precisely the thing mode B exists to stop.
-		if (!Zone->IsZoneActive())
-		{
-			continue;
-		}
-
-		// ATraceEndzone::ScoresHere() is the single authority on scoring direction (OwningTeam
-		// DEFENDS the zone; its opponent scores in it), and it is re-pointed at half time by
-		// ApplyTeamSides. Asking it means this can never be the copy that goes stale.
-		if (!Zone->ScoresHere(CarrierTeam))
-		{
-			continue;
-		}
-
-		// ASKED OF THE ZONE, NOT REBUILT HERE (spec v28 §8). This used to be a hand-rolled
-		// point-in-box against the trigger's unscaled extent, which was the same test the zone polls
-		// with in mode A and a DIFFERENT one in mode B: a mode-B goal is a disc inscribed in its
-		// bounding slab (ATraceEndzone::ConfigureRing), and the corners of that slab are not goal.
-		// So a possession change inside the slab but outside the hoop could award a point the poll
-		// and ATraceCore's swept test would both have refused.
-		//
-		// That mattered little while the slab was buried in a wall and half of it was unreachable.
-		// It matters now: v28 §8 centres the slab ON the ring plane so the goal can be scored through
-		// from either side, which puts the whole of it in the open with players standing in it. One
-		// authority for "is this location inside this scoring volume", and it is the volume's own.
-		//
-		// IsInsideZone() is also side-agnostic for free - it works in the trigger's local space and
-		// tests |X| against the half extent - so "scored from behind" needs no case here.
-		if (!Zone->IsInsideZone(CarrierLocation))
-		{
-			continue;
-		}
-
-		UE_LOG(LogTraceGame, Log,
-			TEXT("[ENDZONE] %s (%s) took the Core inside the %s endzone (%s) - %s scores without moving."),
-			*GetNameSafe(InCharacter), *TraceTeamName(CarrierTeam).ToString(),
-			*TraceTeamName(Zone->OwningTeam).ToString(),
-			Reason != nullptr ? Reason : TEXT("possession change"),
-			*TraceTeamName(CarrierTeam).ToString());
-
-		NotifyScored(CarrierTeam);
-		return true;
-	}
-
-	return false;
-}
-
 void ATraceGameMode::ResetPlayersToSpawns()
 {
 	UWorld* World = GetWorld();
@@ -1903,6 +1745,12 @@ void ATraceGameMode::ResetPlayersToSpawns()
 
 		ATraceCharacter* TraceCharacter = Cast<ATraceCharacter>(Controller->GetPawn());
 
+		// D30-RESETS (a). Which of the two branches below ran, so the momentum reset at the bottom is
+		// not done twice: RestartPlayerFresh() performs its own (that is where the "when you respawn"
+		// half of the rule lives), and repeating it here would double every [Resets] line and send the
+		// owning client a second, redundant reliable RPC.
+		bool bRestartedFresh = false;
+
 		if (TraceCharacter == nullptr || !TraceCharacter->IsAlive())
 		{
 			// Dead or pawnless: hand them a brand new pawn at a freshly chosen start, and drop the
@@ -1910,6 +1758,7 @@ void ATraceGameMode::ResetPlayersToSpawns()
 			ClearPendingRespawn(Controller);
 			RestartPlayerFresh(Controller);
 			TraceCharacter = Cast<ATraceCharacter>(Controller->GetPawn());
+			bRestartedFresh = true;
 		}
 		else if (AActor* StartSpot = FindPlayerStart(Controller))
 		{
@@ -1947,10 +1796,15 @@ void ATraceGameMode::ResetPlayersToSpawns()
 			TrailComponent->ClearTrail();
 		}
 
-		// A teleport preserves velocity, which would fling a sprinting player straight off the pad.
-		if (UCharacterMovementComponent* MovementComponent = TraceCharacter->GetCharacterMovement())
+		// D30-RESETS (a). A teleport preserves velocity, which would fling a sprinting player straight
+		// off the pad — and the movement kit's clocks (dash, slide, wall window, surf ride and its exit
+		// carry) survive a zeroed velocity, which is what "momentum should reset when halves switch"
+		// is actually about. This used to be a bare StopMovementImmediately(); see ResetMomentumFor().
+		//
+		// Skipped for a player who was just restarted: RestartPlayerFresh() already did it.
+		if (!bRestartedFresh)
 		{
-			MovementComponent->StopMovementImmediately();
+			ResetMomentumFor(Controller, TEXT("half switch / reset to spawns"));
 		}
 
 		TraceCharacter->ApplyTeamColors();
@@ -2752,11 +2606,6 @@ void ATraceGameMode::BeginMatch()
 	// match would be a lie nobody would think to look for.
 	TraceGameState->SetMatchResult(ETraceTeam::None, ETraceMatchEndReason::NotEnded);
 
-	// The mode is latched for the match at the opening whistle in the sense that this is the last
-	// unconditional publish; a live edit after this point still takes effect through the poll, which
-	// is exactly what A/B playtesting needs.
-	PublishScoringMode();
-
 	TraceGameState->TraceMatchState = ETraceMatchState::InProgress;
 	TraceGameState->ForceNetUpdate();
 
@@ -3027,6 +2876,35 @@ void ATraceGameMode::BeginHalf(int32 HalfIndex)
 	// latch carried in from the previous half would describe a team that is no longer down.
 	bBlueWipeLatched = false;
 	bOrangeWipeLatched = false;
+
+	// D30-RESETS (b), verbatim: "abilities used before the match timer start should reset to be off
+	// cooldown at the beginning of each half".
+	//
+	// A PERIOD OF PLAY OPENS WITH EVERY ABILITY READY. BeginHalfTimeBreak() already cleared cooldowns
+	// at the top of the interval and still does, but that call can only ever reach the SECOND half —
+	// the first has no interval in front of it, it has WARM-UP, and UTraceAbilityComponent::TryActivate
+	// refuses during the interval and nowhere else. So an ability fired while the clock read 0:00
+	// before kickoff wrote a deadline on the same absolute clock as any other, and was still draining
+	// when the whistle went. That is the case the owner hit.
+	//
+	// BEFORE the pawns are placed and before the deadline goes on the wire, so a client that is
+	// watching cannot draw one frame of a half that has started with a ring still filling.
+	//
+	// The condition is the red arm and nothing else; see UTraceAbilityComponent::
+	// IsHalfStartCooldownResetEnabled(). It is TRUE in every real build.
+	if (UTraceAbilityComponent::IsHalfStartCooldownResetEnabled())
+	{
+		ResetAbilityCooldownsForHalfTime();
+	}
+	else
+	{
+		// ClampedHalf rather than the GameState's label: SetHalfState has not run yet, so the state
+		// still describes the period that just ended and the label would name the wrong half.
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Ability] Trace.Resets.LegacyCooldowns is ON: half %d starts WITHOUT clearing "
+			     "cooldowns. This is the D30-RESETS red arm, never a shipping configuration."),
+			ClampedHalf);
+	}
 
 	TraceGameState->SetHalfState(ClampedHalf, Halves, /*bInHalfTimeBreak=*/false);
 	TraceGameState->MatchEndServerTime = static_cast<float>(TraceGameState->GetServerWorldTimeSeconds() + Duration);
@@ -3338,12 +3216,18 @@ void ATraceGameMode::BeginHalfTimeBreak()
 	ResetPlayersToSpawns();
 
 	// Spec v14 §5, verbatim: "They should all reset at halftime." HERE, at the top of the interval,
-	// and not at the start of the second half — a player who spends the break watching an ability
+	// and not ONLY at the start of the second half — a player who spends the break watching an ability
 	// meter that is still counting down has been told the rule does not work, and the fact that it
 	// would have snapped to ready twelve seconds later does not help them.
 	//
-	// This is also the ONLY reset in the codebase. Death, respawns and goals deliberately do not
-	// touch ActivatedCooldownEndServerTime; see the note on that property in TracePlayerState.h.
+	// D30-RESETS (b) ADDED A SECOND CALL, at the top of every half (see BeginHalf), and this one is
+	// NOT redundant with it — the sentence above is why. The two together are what make the owner's
+	// wider rule true: "abilities used before the match timer start should reset to be off cooldown at
+	// the beginning of each half". Warm-up sits in front of the FIRST half, which has no interval in
+	// front of it at all, so this call alone could never have reached it.
+	//
+	// Death, respawns and goals still deliberately do not touch the cooldown; see the note on that
+	// property in TracePlayerState.h and the contract in Abilities/TraceAbilityComponent.h.
 	ResetAbilityCooldownsForHalfTime();
 
 	// The scores deliberately survive: the second half continues the first (spec §9 q5).
@@ -3547,11 +3431,10 @@ void ATraceGameMode::FinishMatch(ETraceTeam WinningTeam, ETraceMatchEndReason Re
 
 	// Players keep their pawns and keep respawning after the whistle — the HUD switches to the FINAL
 	// banner, and leaving everyone alive means nobody is staring at a corpse on the results screen.
-	UE_LOG(LogTraceGame, Display, TEXT("Match over by %s. Winner: %s (Blue %d - Orange %d, %s)"),
+	UE_LOG(LogTraceGame, Display, TEXT("Match over by %s. Winner: %s (Blue %d - Orange %d)"),
 		TraceMatchEndReasonHeadline(Reason),
 		(WinningTeam == ETraceTeam::None) ? TEXT("draw") : *TraceTeamName(WinningTeam).ToString(),
-		TraceGameState->BlueScore, TraceGameState->OrangeScore,
-		*TraceScoringModeLabel(TraceGameState->GetScoringMode()));
+		TraceGameState->BlueScore, TraceGameState->OrangeScore);
 
 	// PostMatch is a phase with an exit, not a dead end. The HUD renders the same countdown from
 	// the same constant, so what the player is told is what actually happens.
@@ -4146,7 +4029,10 @@ void ATraceGameMode::ResetAbilityCooldownsForHalfTime()
 		}
 	}
 
-	UE_LOG(LogTraceGame, Log, TEXT("[Ability] Half time: %d running cooldown(s) reset."), ResetCount);
+	// "Half boundary" rather than "Half time": D30-RESETS (b) calls this at the top of every half as
+	// well as at the top of the interval, and a line that said "half time" at the opening whistle
+	// would send the next reader looking for an interval that never happened.
+	UE_LOG(LogTraceGame, Log, TEXT("[Ability] Half boundary: %d running cooldown(s) reset."), ResetCount);
 }
 
 #if !UE_BUILD_SHIPPING
@@ -4707,9 +4593,8 @@ void ATraceGameMode::DumpCharacterState() const
 {
 	const AGameStateBase* BaseGameState = GameState;
 
-	UE_LOG(LogTraceGame, Display, TEXT("[CharDump] ===== characters %s, mode %s, timeout %.0fs ====="),
+	UE_LOG(LogTraceGame, Display, TEXT("[CharDump] ===== characters %s, timeout %.0fs ====="),
 		AreCharactersEnabled() ? TEXT("ON") : TEXT("OFF"),
-		(GetTraceGameState() != nullptr && GetTraceGameState()->IsGoalMode()) ? TEXT("B (goals)") : TEXT("A (endzones)"),
 		CharacterSelectTimeout);
 
 	if (BaseGameState == nullptr)
@@ -4754,11 +4639,9 @@ void ATraceGameMode::StartCharacterSelectVerify(bool bRedArm)
 	}
 
 	const bool bEnabledNow = AreCharactersEnabled();
-	const bool bGoalModeNow = (GetTraceGameState() != nullptr) && GetTraceGameState()->IsGoalMode();
 
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[CharVerify] ===== START: mode %s, characters %s, select-slice rules %s ====="),
-		bGoalModeNow ? TEXT("B (goals)") : TEXT("A (endzones)"),
+		TEXT("[CharVerify] ===== START: characters %s, select-slice rules %s ====="),
 		bEnabledNow ? TEXT("ON") : TEXT("OFF"),
 		(GTraceEnforceSelectRules != 0) ? TEXT("ENFORCED") : TEXT("*** DISABLED (RED ARM) ***"));
 

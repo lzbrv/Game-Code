@@ -200,10 +200,8 @@ bool ATraceCore::CanPullNow(const ATraceCharacter* Puller, const TCHAR** OutReas
 		*OutReason = TEXT("legal");
 	}
 
-	if (!IsModeB())
-	{
-		return Refuse(TEXT("not goals mode"));                     // Spec v25: goals mode only.
-	}
+	// There was a "not goals mode" refusal here (spec v25 made the pull goals-only). Goals is the
+	// only mode now, so it could never fire.
 	if (!IsValid(Puller) || !Puller->IsAlive())
 	{
 		return Refuse(TEXT("no living puller"));
@@ -465,9 +463,9 @@ void ATraceCore::ClearTurnover(const TCHAR* Why)
 
 void ATraceCore::RequestPullInput(bool bPressed, ATraceCharacter* Requester)
 {
-	if (!IsValid(Requester) || !IsModeB())
+	if (!IsValid(Requester))
 	{
-		return;   // Goals mode only. Mode A never sees this function do anything.
+		return;
 	}
 
 	if (Requester->HasAuthority())

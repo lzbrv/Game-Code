@@ -573,7 +573,16 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 		? FString()
 		: FString(TEXT("PORT 7777 IS BUSY ON THIS MACHINE - THE HUD WILL SHOW THE REAL PORT IN-GAME"));
 
-	OutView.FooterKeys = TEXT("W / S  OR  ARROWS   MOVE          A / D   CHANGE          ENTER   SELECT          ESC   QUIT");
+	// D30 — THE KEY LEGEND IS GONE, at the owner's request ("remove the text at the bottom: close
+	// trace, w/s..."). It read
+	//     W / S  OR  ARROWS   MOVE     A / D   CHANGE     ENTER   SELECT     ESC   QUIT
+	// and it was the only line on this screen that told a player nothing they would not find by
+	// pressing one key. The FIELD stays and is emptied rather than being deleted, for two reasons:
+	// FooterKeysText is a required meta=(BindWidget) on UTraceTitleMenuWidget, so the block has to go
+	// on existing in the asset whatever it says; and TraceText::Measure reports ONE line box for an
+	// empty string (SplitLines yields a single empty line), so the footer stack keeps its height and
+	// the hint below does not move up onto the blurb. The Canvas twin is ATraceMenuHUD::DrawFooter.
+	OutView.FooterKeys = FString();
 
 	// WP8.1 — the address prints in TWO places (the chip above, and the JOIN modal's "THIS MACHINE
 	// IS"), not five. This hint used to end "... AND TYPE YOUR ADDRESS ABOVE", which was repetition
@@ -705,12 +714,6 @@ void ATraceMenuHUD::BeginPlay()
 	// (and the arena's game mode applies whatever arrives in the URL), so this is belt and braces.
 	TraceDifficulty::ApplyToSettings(Difficulty);
 
-	// The mode goes the other way: it is READ from the settings rather than pushed to them, so a
-	// player who has run three mode-B matches comes back to the title screen still on mode B. The
-	// settings CDO is the single storage for the toggle (see TraceScoring::ApplyToSettings), so
-	// there is nothing to reconcile — this is a load, not a second copy.
-	ScoringMode = TraceScoring::GetCurrentSetting();
-
 	// Bound here rather than in a module startup because both HUDs need it and neither owns the
 	// other; the call is idempotent and the handlers outlive every world. Without it a failed join
 	// is completely silent, which is the single thing that made the reported bug undiagnosable from
@@ -721,8 +724,8 @@ void ATraceMenuHUD::BeginPlay()
 	// exactly when the prompt falls back to showing an example instead.
 	LastJoinAddress = TraceNet::LoadLastJoinAddress();
 
-	UE_LOG(LogTraceGame, Log, TEXT("Title screen up. Difficulty %s, %s."),
-		*TraceDifficulty::ToDisplayName(Difficulty), *TraceScoringModeLabel(ScoringMode));
+	UE_LOG(LogTraceGame, Log, TEXT("Title screen up. Difficulty %s."),
+		*TraceDifficulty::ToDisplayName(Difficulty));
 
 	// The address other machines dial to reach this one, and whether we can actually bind it. Logged
 	// at Display on every title screen: when a playtest fails to connect this is the first line
@@ -959,19 +962,13 @@ void ATraceMenuHUD::ArmAutoPlay()
 		Difficulty = TraceDifficulty::FromUrlValue(DifficultyArg);
 	}
 
-	// And an explicit scoring mode, for the same reason: an A/B toggle whose second half can only be
-	// reached by a human pressing an arrow key is an A/B toggle that never gets tested headlessly.
-	// "-TraceMenuScoringMode=b" drives the whole menu -> mode B match -> results -> menu loop.
-	FString ScoringModeArg;
-	if (FParse::Value(FCommandLine::Get(), TEXT("TraceMenuScoringMode="), ScoringModeArg))
-	{
-		ScoringMode = TraceScoringModeFromUrlValue(ScoringModeArg);
-		TraceScoring::ApplyToSettings(ScoringMode);
-	}
+	// "-TraceMenuScoringMode=b" USED TO BE PARSED HERE, so a headless run could drive the whole
+	// menu -> mode B match -> results -> menu loop without a human pressing an arrow key. There is
+	// one ruleset now; the switch it drove no longer exists and the argument is silently ignored.
 
 	DelaySeconds = FMath::Max(0.01f, DelaySeconds);
-	UE_LOG(LogTraceGame, Display, TEXT("[AutoPlay] Pressing PLAY in %.2fs at difficulty %s, %s."),
-		DelaySeconds, *TraceDifficulty::ToDisplayName(Difficulty), *TraceScoringModeLabel(ScoringMode));
+	UE_LOG(LogTraceGame, Display, TEXT("[AutoPlay] Pressing PLAY in %.2fs at difficulty %s."),
+		DelaySeconds, *TraceDifficulty::ToDisplayName(Difficulty));
 
 	World->GetTimerManager().SetTimer(AutoPlayTimer,
 		FTimerDelegate::CreateWeakLambda(this, [this]() { StartMatch(); }), DelaySeconds, false);
@@ -1548,13 +1545,10 @@ void ATraceMenuHUD::AdjustSelection(int32 Delta)
 		return;
 	}
 
-	if (Selected == ETraceMenuRow::Mode)
-	{
-		// Applied on every change rather than only on PLAY, so the value on screen is never a
-		// promise the match fails to keep — the same reason the difficulty does it.
-		ScoringMode = TraceScoringModeStep(ScoringMode, Delta);
-		TraceScoring::ApplyToSettings(ScoringMode);
-	}
+	// SCORING MODE used to be the second value row and the other half of this function. It stepped
+	// the A/B toggle and applied it on every change rather than only on PLAY, so the value on screen
+	// was never a promise the match failed to keep. The endzone ruleset is gone, so DIFFICULTY is
+	// the only row that answers a left/right key.
 }
 
 bool ATraceMenuHUD::AcceptsActivation() const
@@ -1608,15 +1602,6 @@ void ATraceMenuHUD::ActivateSelection()
 		// direction" to offer, so stopping dead at HARD would just look broken.
 		Difficulty = static_cast<ETraceBotDifficulty>((static_cast<int32>(Difficulty) + 1) % TraceDifficulty::Count);
 		TraceDifficulty::ApplyToSettings(Difficulty);
-		break;
-
-	case ETraceMenuRow::Mode:
-		// Same rule as DIFFICULTY: a click has no "other direction" to offer, so activating the row
-		// wraps instead of stopping dead at the far end. With two modes this is simply a toggle,
-		// which is exactly what an A/B switch should feel like to click.
-		ScoringMode = static_cast<ETraceScoringMode>(
-			(static_cast<int32>(ScoringMode) + 1) % TraceScoringModeCount);
-		TraceScoring::ApplyToSettings(ScoringMode);
 		break;
 
 	case ETraceMenuRow::Settings:
@@ -1836,7 +1821,6 @@ void ATraceMenuHUD::StartMatch()
 	// the option and applies it itself, but in standalone this call is what makes the very first
 	// match honour the setting even if the URL is ever dropped on the floor.
 	TraceDifficulty::ApplyToSettings(Difficulty);
-	TraceScoring::ApplyToSettings(ScoringMode);
 
 	// A new attempt: whatever went wrong last time is no longer what is happening now.
 	TraceNet::ClearFailure();
@@ -1853,16 +1837,19 @@ void ATraceMenuHUD::StartMatch()
 	// NOTE THE SEPARATOR. UE URL options are chained with '?', NOT with '&' — writing "a=1&b=2"
 	// parses as ONE option called "a" whose value is "1&b=2", so the first appears to work and the
 	// second is silently ignored. That has already happened once in this project (see
-	// ATraceGameMode::InitGame), and it is exactly the kind of bug that makes an A/B toggle look
-	// like it does nothing.
+	// ATraceGameMode::InitGame), and it is exactly the kind of bug that makes a toggle look like it
+	// does nothing.
 	//
-	// "?characters=0|1" joins them for spec v14 §3's toggle, and it goes on the URL rather than being
-	// left to the destination's own settings read for the same reason the mode does: the settings
-	// page the player just used lives in THIS process, and a listen server that resolved the toggle
-	// from its own ini would honour a value the player may have changed a second ago.
-	const FString Options = FString::Printf(TEXT("%s=%s?%s=%s?%s=%d?listen"),
+	// "?mode=a|b" USED TO BE THE MIDDLE OPTION HERE, carrying the A/B scoring toggle across the
+	// travel. The endzone ruleset was removed, so there is no mode to carry and no option to parse
+	// at the other end (ATraceGameMode::ResolveScoringMode is gone with it).
+	//
+	// "?characters=0|1" carries spec v14 §3's toggle, and it goes on the URL rather than being left
+	// to the destination's own settings read because the settings page the player just used lives in
+	// THIS process, and a listen server that resolved the toggle from its own ini would honour a
+	// value the player may have changed a second ago.
+	const FString Options = FString::Printf(TEXT("%s=%s?%s=%d?listen"),
 		TraceDifficulty::UrlOption, *TraceDifficulty::ToUrlValue(Difficulty),
-		TraceScoringModeUrlOption, *TraceScoringModeToUrlValue(ScoringMode),
 		TraceCharacters::UrlOption, TraceCharacters::GetEnabledSetting() ? 1 : 0);
 
 	// Checked BEFORE travelling, and the reason is subtle enough to be worth spelling out.
@@ -1892,8 +1879,8 @@ void ATraceMenuHUD::StartMatch()
 		? FString::Printf(TEXT("HOSTING ON %s"), *TraceNet::GetHostEndpoint())
 		: FString(TEXT("PORT 7777 IS BUSY - CHECK THE HUD FOR THE REAL ADDRESS"));
 
-	UE_LOG(LogTraceGame, Display, TEXT("Title screen: PLAY -> %s?%s  (%s)  hosting on %s, port %s"),
-		TraceMaps::Arena, *Options, *TraceScoringModeLabel(ScoringMode),
+	UE_LOG(LogTraceGame, Display, TEXT("Title screen: PLAY -> %s?%s  hosting on %s, port %s"),
+		TraceMaps::Arena, *Options,
 		*TraceNet::GetHostEndpoint(), bPortFree ? TEXT("free") : TEXT("IN USE"));
 
 	UGameplayStatics::OpenLevel(this, FName(TraceMaps::Arena), /*bAbsolute=*/true, Options);
@@ -2733,8 +2720,10 @@ void ATraceMenuHUD::DrawMenuRows()
 	}
 	bRowRectsValid = true;
 
-	// Remembered, not recomputed: DrawFooter() places the key hints under this line rather than at a
-	// fixed height, so that adding a menu row cannot slide the blurb onto them. See BlurbBottomY.
+	// Remembered, not recomputed: DrawFooter() places the footer hint under this line rather than at
+	// a fixed height, so that adding a menu row cannot slide the blurb onto it. See BlurbBottomY.
+	// (D30 deleted the KEY LEGEND that used to be the first of the two footer lines; the hint under
+	// it is still there and can still be collided with, so this measurement still earns its keep.)
 	const FString Blurb = BuildBlurb();
 	const float BlurbY = PanelY + PanelH - (36.f * UIScale);
 	DrawTextCentered(Blurb, TraceMenuStyle::InkDim, CX, BlurbY, FontSmall, 1.1f * UIScale);
@@ -2762,14 +2751,21 @@ FString ATraceMenuHUD::BuildBlurb() const
 	case ETraceMenuRow::Practice:
 		return TEXT("ALONE IN THE ARENA WITH FIVE DUMMIES.  NO MATCH, NO CLOCK, NO SCORE.");
 
-	case ETraceMenuRow::Mode:
-		return FString(TraceScoringModeBlurb(ScoringMode));
-
 	case ETraceMenuRow::Settings:
 		return TEXT("MOUSE SENSITIVITY, INVERT Y AND EVERY KEY BINDING.");
 
 	case ETraceMenuRow::Quit:
-		return TEXT("CLOSE TRACE.");
+		// D30 — deliberately blank. "CLOSE TRACE." is the "close trace" in the owner's "remove the
+		// text at the bottom: close trace, w/s...", and it is the one blurb in this switch that only
+		// said its own row's label back. Every other case earns its line by saying something the
+		// label does not (PLAY silently hosts; JOIN remembers an address; PRACTICE has no clock).
+		//
+		// EMPTY, not a deleted case: both renderers place the footer under the blurb's MEASURED
+		// bottom, and both measure an empty string as one line box (ATraceMenuHUD::MeasureHeight
+		// ignores the text outright; TraceText::Measure splits "" into one empty line). Returning
+		// nothing therefore leaves the footer exactly where it is instead of letting it jump a line
+		// whenever QUIT happens to be the selected row.
+		return FString();
 
 	default:
 		return TraceMenuStyle::DifficultyBlurb(Difficulty);
@@ -2800,7 +2796,6 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 	case ETraceMenuRow::Join:       OutView.Label = TEXT("JOIN");         break;
 	case ETraceMenuRow::Practice:   OutView.Label = TEXT("PRACTICE");     break;
 	case ETraceMenuRow::Difficulty: OutView.Label = TEXT("DIFFICULTY");   break;
-	case ETraceMenuRow::Mode:       OutView.Label = TEXT("SCORING MODE"); break;
 	case ETraceMenuRow::Settings:   OutView.Label = TEXT("SETTINGS");     break;
 	case ETraceMenuRow::Quit:       OutView.Label = TEXT("QUIT");         break;
 	default:                        OutView.Label = TEXT("");             break;
@@ -2819,38 +2814,22 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 		OutView.Status = LastJoinAddress.IsEmpty() ? FString(TEXT("ENTER AN ADDRESS")) : LastJoinAddress;
 	}
 
-	// The two VALUE rows share one description: right-aligned value, arrows either side, dimmed at
-	// the ends of the range.
-	if (Row == ETraceMenuRow::Difficulty || Row == ETraceMenuRow::Mode)
+	// DIFFICULTY is the VALUE row: right-aligned value, arrows either side, dimmed at the ends of
+	// the range. It shared this block with SCORING MODE until the endzone ruleset was removed.
+	if (Row == ETraceMenuRow::Difficulty)
 	{
-		const bool bIsModeRow = (Row == ETraceMenuRow::Mode);
+		OutView.Value = TraceDifficulty::ToDisplayName(Difficulty);
 
-		// *** SPEC v25 §8 — "goals is just goals, not game mode B." ***
-		//
-		// This row is the ONE player-visible mode string in the game that did not already come from
-		// TraceScoringModeLabel(): it built its own "B - GOALS" out of the letter and the name,
-		// because the label used to carry a "MODE " prefix that would have read as a repeat of the
-		// row's own "SCORING MODE" caption at 720p. §8 deletes that prefix at the source, so the
-		// shared label is now exactly what this row wanted all along — and using it means the menu
-		// and the in-match scoreboard can no longer disagree about what the mode is called.
-		OutView.Value = bIsModeRow
-			? TraceScoringModeLabel(ScoringMode)
-			: TraceDifficulty::ToDisplayName(Difficulty);
-
-		// One cyan for BOTH value rows — the art bible §2.4 guard rail: menu accents on one screen
-		// come from at most two systems, and only team-flavoured values may be amber. Mode B used to
-		// wear amber and DIFFICULTY used to colour-code its setting (mint/cyan/amber), which put a
-		// third and fourth accent voice on a screen whose selection language is already amber ring +
-		// rail. The WORDS carry the settings; the colour stays neutral.
+		// Cyan, and the art bible §2.4 guard rail is why: menu accents on one screen come from at
+		// most two systems, and only team-flavoured values may be amber. The mode row used to wear
+		// amber and DIFFICULTY used to colour-code its setting (mint/cyan/amber), which put a third
+		// and fourth accent voice on a screen whose selection language is already amber ring + rail.
+		// The WORDS carry the setting; the colour stays neutral.
 		OutView.ValueColor = TraceMenuStyle::Cyan;
 
 		OutView.bShowArrows = true;
-		OutView.bCanLeft = bIsModeRow
-			? (ScoringMode != ETraceScoringMode::EndzoneStatusCore)
-			: (Difficulty != ETraceBotDifficulty::Easy);
-		OutView.bCanRight = bIsModeRow
-			? (ScoringMode != ETraceScoringMode::ThrownCoreAndGoals)
-			: (Difficulty != ETraceBotDifficulty::Hard);
+		OutView.bCanLeft = (Difficulty != ETraceBotDifficulty::Easy);
+		OutView.bCanRight = (Difficulty != ETraceBotDifficulty::Hard);
 	}
 }
 
@@ -2969,51 +2948,62 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 void ATraceMenuHUD::DrawFooter()
 {
 	const float CX = ViewW * 0.5f;
-	// Both lines have to clear the bezel's bottom rail, which sits 3.8% of the height up from the
-	// edge; anchoring off the bottom in reference pixels alone puts the second line under it.
+
+	// D30 — THIS FOOTER IS NOW ONE LINE, NOT TWO. The key legend that used to sit on the first
+	// baseline ("W / S OR ARROWS MOVE ... ESC QUIT") is gone at the owner's request; only the hint
+	// under it remains. The MATHS below is deliberately untouched — Y is still the vanished first
+	// line's position and the hint is still drawn one 24px line under it — because the UMG twin
+	// (UTraceTitleMenuWidget::PlaceFooterBelowBlurb) lays its hint out at exactly KeysY +
+	// FooterLineGap and the two renderers have to keep landing in the same place. Emptying the
+	// string on one side and moving the line on the other is how they would drift apart.
+	//
+	// The line has to clear the bezel's bottom rail, which sits 3.8% of the height up from the edge;
+	// anchoring off the bottom in reference pixels alone puts it under the rail.
 	float Y = ViewH - (100.f * UIScale) - (ViewH * 0.02f);
 
-	// ---- ...AND they have to clear the CONSOLE BLURB (spec v20 §0.4) -----------------------------
+	// ---- ...AND it has to clear the CONSOLE BLURB (spec v20 §0.4) --------------------------------
 	//
 	// The line above is anchored to the viewport bottom; the blurb is anchored to the bottom of the
 	// rows panel, which grows with the row count. At seven rows on a 1080-high screen they met, and
 	// the screen printed "HOSTS A GAME ON <addr>. OTHERS PICK JOIN AND TYPE THAT." straight through
 	// "W/S OR ARROWS MOVE ... ESC QUIT" on one baseline. That is the defect the spec lists as "the
-	// footer text is drawn twice, overlapping itself", and it is still reachable here because this
-	// Canvas renderer is the fallback whenever the widget asset is missing or -TraceNoMenuUMG is set.
+	// footer text is drawn twice, overlapping itself". Deleting the key legend removes one of the two
+	// strings that could collide, but NOT the collision: the blurb can still reach the hint, so the
+	// measurement stays. It is also still reachable here because this Canvas renderer is the fallback
+	// whenever the widget asset is missing or -TraceNoMenuUMG is set.
 	//
 	// Taking the MEASURED bottom of the blurb (DrawMenuRows ran earlier this frame and recorded it)
 	// rather than a second hard-coded constant is what stops another row from recreating it. The
 	// FMath::Max keeps the old position whenever there is already room, so nothing moves on the
 	// layouts that were fine — only the crowded ones change.
-	// 26, not 8: the dark strip below starts 22px ABOVE Y, and that strip is opaque. Clearing only
-	// the text would tuck the blurb under the strip instead of under the words - the same line lost,
-	// by a different mechanism. 22 puts the strip's top edge on the blurb's last row of pixels; the
-	// extra 4 is the visible gap.
+	// 26, not 8: the dark strip below is opaque and starts 22px above whatever the topmost footer
+	// line is. Clearing only the text would tuck the blurb under the strip instead of under the
+	// words - the same line lost, by a different mechanism. 22 puts the strip's top edge on the
+	// blurb's last row of pixels; the extra 4 is the visible gap.
 	const float MinGap = 26.f * UIScale;
 	if (BlurbBottomY > 0.f)
 	{
 		Y = FMath::Max(Y, BlurbBottomY + MinGap);
 	}
 
-	// Never off the bottom edge: the second line sits 24px under the first and still needs its own
-	// height. If the panel is so tall that even this cannot fit, the hints win and the blurb is what
-	// gets overlapped - the keys are the line a stuck player actually needs.
+	// Never off the bottom edge: the hint sits 24px under Y and still needs its own height. If the
+	// panel is so tall that even this cannot fit, the hint wins and the blurb is what gets
+	// overlapped — the blurb repeats itself every time the selection moves, the hint does not.
 	Y = FMath::Min(Y, ViewH - (46.f * UIScale));
 
-	// The grid runs all the way to the bottom edge, so the key hints get their own dark strip.
-	// Same reasoning as the console panel above: legibility beats atmosphere every time.
-	const float BandY = Y - (22.f * UIScale);
+	// The grid runs all the way to the bottom edge, so the hint gets its own dark strip. Same
+	// reasoning as the console panel above: legibility beats atmosphere every time. It hugs the one
+	// remaining line by the same 22px it used to give the key legend, rather than keeping a band
+	// sized for two lines with a blank row at the top of it.
+	const float HintY = Y + (24.f * UIScale);
+	const float BandY = HintY - (22.f * UIScale);
 	DrawRect(FLinearColor(0.004f, 0.014f, 0.026f, 0.92f), 0.f, BandY, ViewW, ViewH - BandY);
 	DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.24f), 0.f, BandY, ViewW, FMath::Max(1.f, 1.f * UIScale));
-
-	DrawTextCentered(TEXT("W / S  OR  ARROWS   MOVE          A / D   CHANGE          ENTER   SELECT          ESC   QUIT"),
-		TraceMenuStyle::InkDim, CX, Y, FontSmall, 1.05f * UIScale);
 
 	// WP8.1 — no address repetition here any more; the chip under the tagline is the one source.
 	DrawTextCentered(TEXT("PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE"),
 		TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.6f),
-		CX, Y + (24.f * UIScale), FontSmall, 1.f * UIScale);
+		CX, HintY, FontSmall, 1.f * UIScale);
 }
 
 void ATraceMenuHUD::DrawVersionString()

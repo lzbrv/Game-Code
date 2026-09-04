@@ -16,7 +16,7 @@
 
 #include "CoreMinimal.h"
 
-#include "Core/TraceMatchTypes.h"   // ETraceScoringMode (forward declaration) + its string helpers
+#include "Core/TraceMatchTypes.h"   // ETraceMatchEndReason
 
 /**
  * The three levels in the project.
@@ -101,38 +101,20 @@ namespace TraceDifficulty
 	TRACE_API void ApplyToSettings(ETraceBotDifficulty Difficulty);
 }
 
-/**
- * The A/B scoring-mode toggle's half of the menu/match contract (spec v4 §7).
- *
- * Deliberately thin, and deliberately shaped exactly like TraceDifficulty above: the two things the
- * title screen chooses travel the same way, so they should be selected, applied and carried the
- * same way. Everything about NAMING the modes lives in Core/TraceMatchTypes.h, which this header
- * includes; the URL option is TraceScoringModeUrlOption ("mode") from the same place.
- */
-namespace TraceScoring
-{
-	/**
-	 * Writes @p Mode onto the UTraceSettings CDO, which is what ATraceGameMode publishes from and
-	 * what the Project Settings page displays.
-	 *
-	 * Called by the title screen when the row changes AND again on PLAY, for the same reason
-	 * TraceDifficulty::ApplyToSettings is: the travel URL is the authority for the destination map,
-	 * but a standalone launch where the URL is ever dropped must still honour what the player picked.
-	 *
-	 * It is also what keeps the settings page honest while sitting on the title screen — the panel
-	 * shows the mode the next match will actually play, rather than the last one written to ini.
-	 */
-	TRACE_API void ApplyToSettings(ETraceScoringMode Mode);
-
-	/** The mode currently on the UTraceSettings CDO. The title screen's starting value. */
-	TRACE_API ETraceScoringMode GetCurrentSetting();
-}
+// THE TraceScoring NAMESPACE IS GONE, and with it the third thing the title screen used to choose.
+//
+// Spec v4 §7's A/B scoring toggle had exactly this shape — ApplyToSettings / GetCurrentSetting,
+// deliberately identical to TraceDifficulty above, because the things the title screen picks should
+// be selected, applied and carried the same way — and it carried "?mode=a|b" across the travel. The
+// endzone ruleset has been removed and goals is simply the game, so there is no mode to write onto
+// the settings CDO, nothing for the Project Settings page to show, and no URL option to parse. The
+// SCORING MODE row went with it (see ETraceMenuRow).
 
 /**
  * The "turn off all characters" toggle's half of the menu/match contract (spec v14 §3).
  *
  * Verbatim: "Include a toggle in game settings to turn off all characters". Shaped exactly like
- * TraceDifficulty and TraceScoring above, because it travels the same way and for the same reason:
+ * TraceDifficulty above, because it travels the same way and for the same reason:
  * the settings menu chooses it, the URL carries it, and ATraceGameMode::ResolveCharactersEnabled
  * resolves it.
  *

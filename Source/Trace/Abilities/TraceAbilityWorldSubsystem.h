@@ -15,8 +15,8 @@
 //      once per break. ATraceGameMode may call NotifyHalfTime() directly instead; the edge detector
 //      is idempotent, so having both is safe and one of them being removed later is also safe.
 //
-//   3. MODE A IS FROZEN. Spec §2: "Do not implement abilities or characters into what was game
-//      mode a (endzones)." When the match is mode A this subsystem forces every player back to
+//   3. THE DISABLE TOGGLE. Spec §3's "include a toggle in game settings to turn off all
+//      characters". When it is off this subsystem forces every player back to
 //      ETraceCharacterId::None — the default characterless Mannequin — and keeps doing so, so there
 //      is no ordering between "the mode replicated" and "somebody picked a character".
 //
@@ -82,7 +82,7 @@ private:
 	/** Rising edge of ATraceGameState::bHalfTimeBreak, and any change of CurrentHalf. */
 	void PollHalfTime();
 
-	/** Spec §2: mode A forces everybody to the characterless Mannequin. */
+	/** Spec §3: characters switched off forces everybody to the characterless Mannequin. */
 	void EnforceModeAFreeze();
 
 	FDelegateHandle PostLoginHandle;

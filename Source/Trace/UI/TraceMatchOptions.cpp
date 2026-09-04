@@ -73,33 +73,6 @@ void TraceDifficulty::ApplyToSettings(ETraceBotDifficulty Difficulty)
 }
 
 // ---------------------------------------------------------------------------------------------
-// Scoring mode (spec v4 §7)
-// ---------------------------------------------------------------------------------------------
-
-void TraceScoring::ApplyToSettings(ETraceScoringMode Mode)
-{
-	// GetMutableDefault, not a static latch. The difficulty uses a latch because the thing being
-	// selected is WHICH of three profiles is in force, which is not a single property. The mode IS a
-	// single property, and it is the one the details panel edits — so writing it here means the
-	// title screen, the travel URL, the Project Settings page and ATraceGameMode all read and write
-	// the same storage, and there is no second copy to fall out of step.
-	UTraceSettings* MutableSettings = GetMutableDefault<UTraceSettings>();
-	if (MutableSettings == nullptr || MutableSettings->ScoringMode == Mode)
-	{
-		return;
-	}
-
-	MutableSettings->ScoringMode = Mode;
-
-	UE_LOG(LogTraceGame, Log, TEXT("Scoring mode set to %s."), *TraceScoringModeLabel(Mode));
-}
-
-ETraceScoringMode TraceScoring::GetCurrentSetting()
-{
-	return UTraceSettings::Get().ScoringMode;
-}
-
-// ---------------------------------------------------------------------------------------------
 // Characters on / off (spec v14 §3)
 // ---------------------------------------------------------------------------------------------
 

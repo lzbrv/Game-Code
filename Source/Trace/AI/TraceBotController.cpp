@@ -68,6 +68,78 @@ namespace TraceBotConstants
 	/** How long an evade kick steers sideways before normal steering resumes. */
 	static constexpr float EvadeDuration = 0.6f;
 
+	// --- D30: FORWARD PROBING (see ATraceBotController::ProbeForObstacle) --------------------------
+	//
+	// THE MEASUREMENT THAT PUT THESE NUMBERS HERE. Three pairs of headless bots=8 soaks on
+	// /Game/Maps/Arena_Baked, the two arms of Trace.Bot.Avoidance run side by side in the same
+	// machine load. With the probe DISARMED the bots spent 8.2 / 12.2 / 9.2 % of every bot-tick that
+	// wanted to move standing still, in 165 / 198 / 207 separate wedges; with it armed, 1.8 / 2.4 /
+	// 1.5 % in 20 / 16 / 14. The three ranges do not overlap on any measure. On the longest pair
+	// (431 s vs 421 s) the total time wedged fell from 31.1 s to 0.6 s and the worst single wedge
+	// from 2.6 s to 0.7 s, and the unstick jump — the old last resort — went from 20 uses to none.
+	//
+	// AND THE BRIEF WAS WRONG ABOUT WHERE, WHICH ONLY THE INSTRUMENT COULD HAVE SHOWN. D30 expected
+	// the two 38,400 uu concave side ramps. The wedge sites say the centre pillar: 114 of the 207
+	// disarmed-arm wedges were against the ONE StaticMeshActor the Core spawns on top of, and the
+	// occupancy histogram says the bots spend 92.9 % of their time inside |Y|/half-width 0.50 and
+	// essentially never reach the ramps at all, because every behaviour in this class is drawn to a
+	// Core that lives in the middle. See the ProbeForObstacle header and Trace.Bots.StructureDrill.
+
+	/**
+	 * How far ahead the obstacle sweep looks, expressed as SECONDS OF TRAVEL and not as a distance.
+	 *
+	 * A probe has exactly one job: give the steering enough room to turn before the capsule arrives.
+	 * That is a time, not a length — WalkSpeed is 800 uu/s today and the carrier is faster still, and
+	 * a typed 280 would silently become half a probe the day either moves. Clamped below by
+	 * ProbeLengthMin so a bot that has ALREADY stalled (speed ~0, and therefore lead ~0) still has a
+	 * probe to steer out of the stall with, which is the exact case this whole block exists for.
+	 */
+	static constexpr float ProbeLeadSeconds = 0.36f;
+
+	/** Floor and ceiling on the probe length, uu. The floor is what a stalled bot gets. */
+	static constexpr float ProbeLengthMin = 200.f;
+	static constexpr float ProbeLengthMax = 520.f;
+
+	/**
+	 * How far off the desired heading the two head-on tie-break probes look.
+	 *
+	 * Only used when the surface tangent is degenerate (running square into a face), which is the one
+	 * case sliding along the surface cannot answer on its own. 62 degrees is wide enough that the
+	 * side probe is genuinely asking about a different piece of the world and not re-measuring the
+	 * same face at a slight angle.
+	 */
+	static constexpr float ProbeSideAngleDegrees = 62.f;
+
+	/**
+	 * Weight of the outward (away-from-surface) term in the deflected heading, at contact.
+	 *
+	 * The deflection is TANGENT-FIRST: the bot slides along what it hit, which is what keeps it
+	 * making progress instead of bouncing. This term only leans it off the surface as the gap
+	 * closes, and it is deliberately well under 1 so it can never overpower the tangent and turn a
+	 * wall-follow into a rebound.
+	 */
+	static constexpr float ProbeOutwardWeight = 0.55f;
+
+	/**
+	 * Below this |dot(heading, surface normal)| the tangent is treated as degenerate and the side
+	 * probes decide instead.
+	 *
+	 * 0.20 is about 11.5 degrees off square. Under that the tangent's direction is being decided by
+	 * floating-point noise in the impact normal, which is exactly the dithering that makes a bot
+	 * shuffle left-right against a flat wall.
+	 */
+	static constexpr float ProbeTangentDegenerate = 0.20f;
+
+	/**
+	 * How long a head-on side choice sticks before it may be re-decided.
+	 *
+	 * WITHOUT THIS THE FIX MAKES THINGS WORSE. Re-picking a side every frame against a 38,400 uu
+	 * flat ramp face is a coin flip every 16 ms, and a bot that flips its avoidance side at 60 Hz
+	 * has a net heading of zero — it stands in the wall more convincingly than the version with no
+	 * probe at all. Committing for most of a second makes the choice a decision instead of noise.
+	 */
+	static constexpr float ProbeSideHoldSeconds = 0.85f;
+
 	/** Second LOS probe, low on the body. See ATraceBotController::HasLineOfSight. */
 	static constexpr float TargetLowOffsetZ = -55.f;
 
@@ -725,6 +797,30 @@ static TAutoConsoleVariable<int32> CVarTraceBotInterceptFix(
 	TEXT("Never ship a run with this below 2."),
 	ECVF_Default);
 
+/**
+ * D30 §2 — THE STRUCTURAL-AWARENESS ARM. "Bots ignore the hand made structures and run straight
+ * into them... They just sit there running into the wall."
+ *
+ * 0  the reported symptom, kept reachable: outer field-bounds repulsion plus stuck detection, and
+ *    NOTHING that can see a piece of geometry before hitting it. This is what the owner played.
+ * 1  (default) forward probing: one capsule sweep along the heading the bot is about to commit to,
+ *    and a tangent deflection off whatever non-walkable surface it finds.
+ *
+ * A SWITCH RATHER THAN A DELETION, for the same reason Trace.Bot.InterceptFix is one: "the bots do
+ * not get stuck any more" is a claim about a difference, and a difference needs both arms in the
+ * same build, on the same map, with the same telemetry. Trace.BotMetrics 1 prints [BotStuck], which
+ * is the line the two arms are compared on.
+ */
+static TAutoConsoleVariable<int32> CVarTraceBotAvoidance(
+	TEXT("Trace.Bot.Avoidance"),
+	1,
+	TEXT("1 (default, D30 §2): bots sweep ahead of the heading they are about to commit to and\n")
+	TEXT("   steer along whatever non-walkable surface they find. Walkable slopes are NOT avoided,\n")
+	TEXT("   so the side ramps' shallow half stays usable.\n")
+	TEXT("0: TEST ARM. No forward probe at all - field-bounds repulsion and the stuck kick only,\n")
+	TEXT("   which is the behaviour that produced 'they just sit there running into the wall'."),
+	ECVF_Cheat);
+
 #endif // !UE_BUILD_SHIPPING
 
 /**
@@ -796,6 +892,16 @@ static int32 BotInterceptFixLevel()
 	return CVarTraceBotInterceptFix.GetValueOnAnyThread();
 #else
 	return 2;
+#endif
+}
+
+/** D30 §2. True while bots are allowed to look ahead. Always true in a shipping build. */
+static bool BotForwardProbeEnabled()
+{
+#if !UE_BUILD_SHIPPING
+	return CVarTraceBotAvoidance.GetValueOnAnyThread() != 0;
+#else
+	return true;
 #endif
 }
 
@@ -961,6 +1067,59 @@ namespace TraceBotTelemetry
 		/** Sum/count of the perpendicular gap on hunt ticks that had a plan, for a mean. */
 		double HuntPerpSum = 0.0;
 		int32  HuntPerpSamples = 0;
+
+		// --- D30 §1: WHERE, AND FOR HOW LONG, A BOT STOPS MOVING ------------------------------------
+		//
+		// "Bots seem stuck" is not a measurement and cannot be regressed against. These are, and they
+		// are deliberately keyed on the SAME condition ApplySteering already uses to decide a bot is
+		// stuck (wants to move, planar speed under StuckSpeedThreshold), so the instrument and the
+		// behaviour can never drift apart.
+		//
+		// THE BANDS ARE FRACTIONS OF THE LIVE HALF-WIDTH, not distances. The structures this tranche
+		// is about are the two concave side ramps, which occupy the outermost 760 uu of each sideline
+		// on today's 9600-wide pitch — |Y|/half-width 0.833 to 1.0. A typed 4000 would stop meaning
+		// "on the ramp" the first time the pitch or the ramp is resized; a fraction keeps pointing at
+		// the sideline. Bands: [0,.5) midfield, [.5,.75) the lane, [.75,.85) the ramp toe, [.85,1]
+		// the ramp face and the wall behind it.
+		int32 SteerTicks   = 0;   // bot-ticks with a movement intent (the denominator for the rest)
+		int32 BlockedTicks = 0;   // ...and the bot was not actually moving
+		int32 BlockedByBand[4] = { 0, 0, 0, 0 };   // blocked ticks by |Y| / half-width, above
+		int32 BlockedByEnd[3]  = { 0, 0, 0 };      // ...and by |X| / half-length: <.4, .4-.7, >.7
+
+		/**
+		 * OCCUPANCY: every steering tick by the same |Y| bands, blocked or not.
+		 *
+		 * WITHOUT THIS THE BLOCKED HISTOGRAM CANNOT BE READ. "Zero blocked ticks out by the sideline"
+		 * means one of two opposite things — the ramps are navigable, or the bots never go near them
+		 * — and only the denominator tells them apart. It is also the guard against the cheapest
+		 * possible false fix: an avoidance rule that stops bots getting stuck on a structure by
+		 * making them refuse to approach it at all would show up here as the outer bands emptying.
+		 */
+		int32 SteerByBand[4] = { 0, 0, 0, 0 };
+
+		double SteerSecondsTotal = 0.0;  // bot-seconds of movement intent (the denominator for below)
+
+		int32  StuckEpisodes     = 0;    // times a bot crossed StuckTriggerSeconds (a real wedge)
+		double StuckSecondsTotal = 0.0;  // wall-clock spent past that trigger, summed over all bots
+		float  LongestStuck      = 0.f;  // the worst single episode, seconds
+
+		// The probe's own health. `hit` far above `deflect` would mean the probe sees things and the
+		// steering ignores them, which is a different bug from "the probe sees nothing".
+		int32 ProbeTicks       = 0;
+		int32 ProbeHitTicks    = 0;
+		int32 ProbeDeflections = 0;
+		int32 ProbeHeadOnPicks = 0;
+
+		/**
+		 * Episodes keyed by the actor a bot was pressed against, resolved by the probe at the moment
+		 * the wedge is declared.
+		 *
+		 * THIS IS THE LINE THAT NAMES THE STRUCTURE. A position histogram says "they stop near the
+		 * sideline"; this says which placed actor they stop on, which is what makes the owner's
+		 * report and the measurement the same sentence. Empty when the probe finds nothing, which is
+		 * itself the answer for a bot wedged on another bot.
+		 */
+		TMap<FName, int32> StuckBlockers;
 	};
 
 	struct FState
@@ -982,6 +1141,9 @@ namespace TraceBotTelemetry
 
 		/** Printed once, the first time a bot possesses a pawn. See the capability adapter above. */
 		bool bLoggedCapabilities = false;
+
+		/** D30 §1. How many [BotWedge] site lines have been printed, so a bad run cannot flood a log. */
+		int32 WedgeLinesLogged = 0;
 	};
 
 	static FState& Get()
@@ -1005,6 +1167,121 @@ namespace TraceBotTelemetry
 		}
 		K.HuntPerpSum += static_cast<double>(Perp);
 		++K.HuntPerpSamples;
+	}
+
+	// --- D30 §1: the stuck instrument -------------------------------------------------------------
+
+	/**
+	 * One steering tick, from ApplySteering, with the bot's position expressed as FRACTIONS of the
+	 * live field half-extents so the bands survive a resize of the pitch. Fractions of < 0 mean the
+	 * arena bounds have not resolved yet and only the totals are recorded.
+	 */
+	static void NoteSteerTick(bool bWantedToMove, bool bBlocked, float AbsYFraction, float AbsXFraction, float DeltaSeconds, float EpisodeSeconds)
+	{
+		if (!bWantedToMove)
+		{
+			return;
+		}
+
+		FKit& K = Kit();
+		++K.SteerTicks;
+		K.SteerSecondsTotal += static_cast<double>(DeltaSeconds);
+
+		// EpisodeSeconds < 0 is "not inside a counted wedge". Anything else is this wedge's age, so
+		// the worst case is a running maximum and needs no end-of-episode hook to be correct even if
+		// the match ends with a bot still stuck.
+		if (EpisodeSeconds >= 0.f)
+		{
+			K.StuckSecondsTotal += static_cast<double>(DeltaSeconds);
+			K.LongestStuck = FMath::Max(K.LongestStuck, EpisodeSeconds);
+		}
+
+		const int32 Band = (AbsYFraction < 0.f) ? INDEX_NONE
+			: (AbsYFraction < 0.50f) ? 0 : (AbsYFraction < 0.75f) ? 1 : (AbsYFraction < 0.85f) ? 2 : 3;
+
+		if (Band != INDEX_NONE)
+		{
+			++K.SteerByBand[Band];
+		}
+
+		if (!bBlocked)
+		{
+			return;
+		}
+
+		++K.BlockedTicks;
+
+		if (Band != INDEX_NONE)
+		{
+			++K.BlockedByBand[Band];
+		}
+
+		if (AbsXFraction >= 0.f)
+		{
+			const int32 End = (AbsXFraction < 0.40f) ? 0 : (AbsXFraction < 0.70f) ? 1 : 2;
+			++K.BlockedByEnd[End];
+		}
+	}
+
+	/** A wedge crossed StuckTriggerSeconds. @p Blocker is NAME_None when the probe found nothing. */
+	static void NoteStuckEpisode(FName Blocker)
+	{
+		FKit& K = Kit();
+		++K.StuckEpisodes;
+
+		if (!Blocker.IsNone())
+		{
+			++K.StuckBlockers.FindOrAdd(Blocker);
+		}
+	}
+
+	/**
+	 * ONE LINE PER WEDGE SITE, which is the only form of this measurement that can be cross-checked
+	 * against the level by a human.
+	 *
+	 * The summary can say "26 distinct blockers, the worst one 74 episodes"; it CANNOT say which
+	 * structure that is, because the name a baked level gives a placed actor
+	 * (`StaticMeshActor_UAID_…_2106710690`) means nothing until you can put it on the pitch. So this
+	 * prints the actor's class, its world position and the bot's, and the plan direction the bot was
+	 * pushing in. Capped, because a bad run would otherwise print thousands and the information is
+	 * all in the first few dozen.
+	 */
+	static void NoteWedgeSite(const FVector& BotLocation, const AActor* Blocker, const FVector& InwardNormal, float AbsYFraction)
+	{
+		FState& S = Get();
+		constexpr int32 MaxWedgeLines = 240;
+		if (S.WedgeLinesLogged >= MaxWedgeLines)
+		{
+			return;
+		}
+		++S.WedgeLinesLogged;
+
+		if (Blocker == nullptr)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BotWedge] #%d bot at %s (|Y|/halfW %.3f) | nothing solid ahead - wedged on a pawn or a ledge"),
+				S.WedgeLinesLogged, *BotLocation.ToCompactString(), AbsYFraction);
+			return;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[BotWedge] #%d bot at %s (|Y|/halfW %.3f) | into %s [%s] whose origin is %s | face normal %s"),
+			S.WedgeLinesLogged,
+			*BotLocation.ToCompactString(), AbsYFraction,
+			*Blocker->GetName(),
+			*Blocker->GetClass()->GetName(),
+			*Blocker->GetActorLocation().ToCompactString(),
+			*InwardNormal.ToCompactString());
+	}
+
+	/** One forward probe, and what it did with the answer. */
+	static void NoteProbe(bool bHit, bool bDeflected, bool bHeadOnPick)
+	{
+		FKit& K = Kit();
+		++K.ProbeTicks;
+		K.ProbeHitTicks    += bHit ? 1 : 0;
+		K.ProbeDeflections += bDeflected ? 1 : 0;
+		K.ProbeHeadOnPicks += bHeadOnPick ? 1 : 0;
 	}
 
 	static bool Enabled()
@@ -1402,6 +1679,73 @@ namespace TraceBotTelemetry
 			K.HuntClosestPerp,
 			(K.HuntPerpSamples > 0) ? (K.HuntPerpSum / K.HuntPerpSamples) : 0.0);
 
+		// D30 §1. The stuck line. Printed unconditionally — including when everything is zero,
+		// because "blocked=0 of 41000" is the after-picture this tranche is judged on and a line
+		// that only appears when something is wrong cannot be the evidence that nothing is.
+		{
+			auto SteerPct = [&K](int32 N) -> double
+			{
+				return (K.SteerTicks > 0) ? (100.0 * N / K.SteerTicks) : 0.0;
+			};
+			auto BlockedPct = [&K](int32 N) -> double
+			{
+				return (K.BlockedTicks > 0) ? (100.0 * N / K.BlockedTicks) : 0.0;
+			};
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[BotStuck] t=%.0fs | steerticks=%d blocked=%d (%.1f%%) | episodes=%d stuck-time=%.1fs (%.1f%% of steer) longest=%.1fs ")
+				TEXT("| blocked by |Y|/halfW: <.50=%d (%.1f%%) .50-.75=%d (%.1f%%) .75-.85=%d (%.1f%%) >.85=%d (%.1f%%) ")
+				TEXT("| by |X|/halfL: <.40=%d .40-.70=%d >.70=%d ")
+				TEXT("| WHERE BOTS ACTUALLY WERE, |Y|/halfW: <.50=%.1f%% .50-.75=%.1f%% .75-.85=%.1f%% >.85=%.1f%% ")
+				TEXT("| probe: ran=%d hit=%d (%.1f%%) deflect=%d head-on=%d"),
+				Elapsed,
+				K.SteerTicks, K.BlockedTicks, SteerPct(K.BlockedTicks),
+				K.StuckEpisodes, K.StuckSecondsTotal,
+				(K.SteerSecondsTotal > 0.0) ? (100.0 * K.StuckSecondsTotal / K.SteerSecondsTotal) : 0.0,
+				K.LongestStuck,
+				K.BlockedByBand[0], BlockedPct(K.BlockedByBand[0]),
+				K.BlockedByBand[1], BlockedPct(K.BlockedByBand[1]),
+				K.BlockedByBand[2], BlockedPct(K.BlockedByBand[2]),
+				K.BlockedByBand[3], BlockedPct(K.BlockedByBand[3]),
+				K.BlockedByEnd[0], K.BlockedByEnd[1], K.BlockedByEnd[2],
+				SteerPct(K.SteerByBand[0]), SteerPct(K.SteerByBand[1]),
+				SteerPct(K.SteerByBand[2]), SteerPct(K.SteerByBand[3]),
+				K.ProbeTicks, K.ProbeHitTicks,
+				(K.ProbeTicks > 0) ? (100.0 * K.ProbeHitTicks / K.ProbeTicks) : 0.0,
+				K.ProbeDeflections, K.ProbeHeadOnPicks);
+
+			// The blocker table on its own line, and only when there is one: an empty table is the
+			// normal state of a healthy run and a line of "| top blockers:" saying nothing is noise.
+			if (K.StuckBlockers.Num() > 0)
+			{
+				// Copied out and sorted here rather than sorting the map in place: this whole dump
+				// reads a CONST view of the telemetry, and a summary that reorders the thing it is
+				// summarising is a summary that can change the next summary.
+				TArray<TPair<FName, int32>> Ranked;
+				Ranked.Reserve(K.StuckBlockers.Num());
+				for (const TPair<FName, int32>& Entry : K.StuckBlockers)
+				{
+					Ranked.Add(Entry);
+				}
+				Ranked.Sort([](const TPair<FName, int32>& A, const TPair<FName, int32>& B)
+				{
+					return A.Value > B.Value;
+				});
+
+				FString Table;
+				const int32 Show = FMath::Min(6, Ranked.Num());
+				for (int32 Printed = 0; Printed < Show; ++Printed)
+				{
+					Table += FString::Printf(TEXT("%s%s=%d"), (Printed > 0) ? TEXT(", ") : TEXT(""),
+						*Ranked[Printed].Key.ToString(), Ranked[Printed].Value);
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[BotStuck] t=%.0fs | wedged against (episodes, %d distinct): %s"),
+					Elapsed, K.StuckBlockers.Num(), *Table);
+			}
+		}
+
 		// Mode B, on its own line and only when it has anything to say. In mode A every one of these
 		// is zero and the line is suppressed, so its mere presence in a log is the evidence that the
 		// mode-B bot code ran — and its absence is the evidence that mode A did not touch it.
@@ -1436,10 +1780,39 @@ namespace TraceBotTelemetry
 #define TRACE_BOT_KIT(Field) (++TraceBotTelemetry::Kit().Field)
 #define TRACE_BOT_HUNT_PERP(Value) TraceBotTelemetry::NoteHuntPerp(Value)
 
+// D30 §1. Variadic because these carry a position and a duration, not just a name — but otherwise
+// exactly the TRACE_BOT_KIT bargain: the increment is free, the dump is gated, and the whole thing
+// compiles out of a shipping build so the instrument can never cost the owner a frame.
+#define TRACE_BOT_STEER(...)  TraceBotTelemetry::NoteSteerTick(__VA_ARGS__)
+#define TRACE_BOT_WEDGE(...)  TraceBotTelemetry::NoteStuckEpisode(__VA_ARGS__)
+#define TRACE_BOT_PROBE(...)  TraceBotTelemetry::NoteProbe(__VA_ARGS__)
+#define TRACE_BOT_WEDGE_SITE(...) \
+	do { if (TraceBotTelemetry::Enabled()) { TraceBotTelemetry::NoteWedgeSite(__VA_ARGS__); } } while (0)
+
 #else
+
+namespace TraceBotTelemetryOff
+{
+	/**
+	 * Swallows the arguments of the compiled-out telemetry macros.
+	 *
+	 * `do {} while (0)` would be enough for a counter, but the D30 macros are handed LOCALS that
+	 * exist only to be reported (`bDeflected`, `bHeadOnPick`, the position fractions). Dropping the
+	 * arguments on the floor makes those locals set-but-never-read, which is a -Wunused-but-set-
+	 * variable in a shipping build and therefore a broken release gate for a diagnostic that is not
+	 * even compiled in. They are pure reads of values already computed for the steering itself, so
+	 * evaluating and discarding them costs nothing.
+	 */
+	template <typename... ArgTypes>
+	FORCEINLINE void Unused(ArgTypes&&...) {}
+}
 
 #define TRACE_BOT_KIT(Field) do {} while (0)
 #define TRACE_BOT_HUNT_PERP(Value) do {} while (0)
+#define TRACE_BOT_STEER(...) TraceBotTelemetryOff::Unused(__VA_ARGS__)
+#define TRACE_BOT_WEDGE(...) TraceBotTelemetryOff::Unused(__VA_ARGS__)
+#define TRACE_BOT_PROBE(...) TraceBotTelemetryOff::Unused(__VA_ARGS__)
+#define TRACE_BOT_WEDGE_SITE(...) TraceBotTelemetryOff::Unused(__VA_ARGS__)
 
 #endif // !UE_BUILD_SHIPPING
 
@@ -2152,8 +2525,12 @@ void ATraceBotController::GatherWorldState()
 	// This is the ONE place this class asks the Core actor anything about possession, and it is
 	// unavoidable: "the Core is loose" is a fact about an object, and the roster scan above - which
 	// deliberately asks the PLAYERS who is carrying, so that the bots do not depend on ATraceCore -
-	// cannot see it, because while the Core is loose nobody is carrying. In mode A the answer is
-	// always false and the bots' dependency on the Core is exactly what it was.
+	// cannot see it, because while the Core is loose nobody is carrying.
+	//
+	// bModeB NOW MEANS "THERE IS A CORE ACTOR IN THIS WORLD", which is all it ever added on top of
+	// that: it used to be `Core exists AND the A/B toggle says goals`, and the endzone ruleset has
+	// been removed, so the second half is always true. The member keeps its name because it is the
+	// bot slice's, not this change's, to rename - every read of it below is still correct.
 	bModeB = false;
 	bCoreLoose = false;
 	LooseCorePoint = FVector::ZeroVector;
@@ -2169,7 +2546,7 @@ void ATraceBotController::GatherWorldState()
 
 	if (const ATraceCore* TheCore = ATraceCore::Get(GetWorld()))
 	{
-		bModeB = TheCore->IsModeB();
+		bModeB = true;
 		if (bModeB)
 		{
 			// SPEC v28 §6 — "the bots just stand on top of a locked out core".
@@ -7003,6 +7380,76 @@ bool ATraceBotController::FindTrailInterceptPointLegacy(FVector& OutPoint, FVect
 // Steering
 // =================================================================================================
 
+bool ATraceBotController::ProbeForObstacle(const FVector& PlanarDirection, float Length, FHitResult& OutHit) const
+{
+	const UWorld* World = GetWorld();
+	const ATraceCharacter* BotCharacter = GetBotCharacter();
+	if (World == nullptr || BotCharacter == nullptr || Length <= 1.f || PlanarDirection.IsNearlyZero())
+	{
+		return false;
+	}
+
+	const UCapsuleComponent* Capsule = BotCharacter->GetCapsuleComponent();
+	const UCharacterMovementComponent* Movement = BotCharacter->GetCharacterMovement();
+	if (Capsule == nullptr || Movement == nullptr)
+	{
+		return false;
+	}
+
+	// The pawn's own capsule, raised off its feet by one step. Read live off the components rather
+	// than from TraceCharacterLayout: a crouched or sliding bot has a SHORTER capsule and probing
+	// with the standing one would have it swerve around ceilings it fits under.
+	const float PawnRadius = Capsule->GetScaledCapsuleRadius();
+	const float PawnHalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+	const float StepHeight = FMath::Max(0.f, Movement->MaxStepHeight);
+
+	// Half the step is taken off the top and half added at the bottom, so the capsule's FOOT rises by
+	// a full step while its head stays where it was. Clamped so a very short capsule against a very
+	// generous step height degenerates to a sphere rather than to an inverted capsule.
+	const float ProbeHalfHeight = FMath::Max(PawnRadius, PawnHalfHeight - StepHeight * 0.5f);
+	const FVector Start = BotCharacter->GetActorLocation() + FVector(0.f, 0.f, StepHeight * 0.5f);
+	const FVector End = Start + PlanarDirection * Length;
+
+	FCollisionQueryParams Params(TEXT("TraceBotForwardProbe"), /*bTraceComplex=*/false, BotCharacter);
+
+	// Every other player, not just team-mates: a probe that swerved around opponents would refuse to
+	// close on a carrier, and closing on the carrier is the behaviour the hunt telemetry measures.
+	// The Core carrier included — the bots are supposed to run INTO them.
+	if (const ATraceGameMode* GameMode = GetTraceGameMode())
+	{
+		for (const TWeakObjectPtr<ATraceCharacter>& Weak : GameMode->GetTrackedCharacters())
+		{
+			if (const ATraceCharacter* Other = Weak.Get())
+			{
+				Params.AddIgnoredActor(Other);
+			}
+		}
+	}
+
+	FHitResult Hit;
+	// ECC_Pawn, and it matters: the arena wraps its surf structures in "standoff shells" — invisible
+	// boxes that block ECC_Pawn AND NOTHING ELSE (see ATraceArenaBuilder's header). A probe on
+	// ECC_Visibility or ECC_WorldStatic would walk a bot straight through the one piece of collision
+	// the movement code will actually stop it on.
+	if (!World->SweepSingleByChannel(Hit, Start, End, FQuat::Identity, ECC_Pawn,
+			FCollisionShape::MakeCapsule(PawnRadius, ProbeHalfHeight), Params))
+	{
+		return false;
+	}
+
+	// A slope the legs can take is not an obstacle. THIS IS THE LINE THAT LETS THE BOTS USE THE SIDE
+	// RAMPS: the owner's concave profile starts flat at the toe and only leaves the walkable band
+	// part-way up, so a bot is waved onto the shallow half and turned away at the point its own
+	// movement component would have refused it anyway.
+	if (Hit.ImpactNormal.Z >= Movement->GetWalkableFloorZ())
+	{
+		return false;
+	}
+
+	OutHit = Hit;
+	return true;
+}
+
 void ATraceBotController::ApplySteering(float DeltaSeconds)
 {
 	UWorld* World = GetWorld();
@@ -7018,23 +7465,127 @@ void ATraceBotController::ApplySteering(float DeltaSeconds)
 
 	const bool bWantedToMove = !Direction.IsNearlyZero();
 
-	// --- Stuck detection ------------------------------------------------------------------------
-	// There is no navmesh, so arena obstacles are handled the cheap way: notice that we are pushing
-	// into something and are not moving, then kick sideways — and if that does not work either,
-	// UpdateMovementTech() escalates to a jump over the top.
-	if (bWantedToMove && BotCharacter->GetVelocity().Size2D() < TraceBotConstants::StuckSpeedThreshold)
+	// D30 §1. Where this bot is, as FRACTIONS of the live field half-extents, computed once and used
+	// by both the histogram and the per-wedge site line. Negative means the arena has not resolved
+	// yet, in which case only the totals are recorded — a bot that ticks before ATraceArenaBuilder is
+	// findable has no meaningful "how far out towards the sideline".
+	float AbsYFraction = -1.f;
+	float AbsXFraction = -1.f;
+	if (bBoundsValid)
 	{
+		const FVector Where = BotCharacter->GetActorLocation();
+		const FVector Extent = FieldBounds.GetExtent();
+		const FVector Centre = FieldBounds.GetCenter();
+		if (Extent.Y > 1.f)
+		{
+			AbsYFraction = static_cast<float>(FMath::Abs(Where.Y - Centre.Y) / Extent.Y);
+		}
+		if (Extent.X > 1.f)
+		{
+			AbsXFraction = static_cast<float>(FMath::Abs(Where.X - Centre.X) / Extent.X);
+		}
+	}
+
+	// --- Stuck detection ------------------------------------------------------------------------
+	// There is no navmesh, so arena obstacles are handled two ways: the forward probe below steers
+	// around what it can see, and this notices that we are pushing into something we did not see and
+	// are not moving, then kicks sideways — and if that does not work either, UpdateMovementTech()
+	// escalates to a jump over the top. The probe demoted this from the ONLY defence to the backstop
+	// it always read like; it is deliberately still here, because a bot wedged on another bot is a
+	// case the probe cannot see by design.
+	const bool bBlockedThisTick = bWantedToMove
+		&& BotCharacter->GetVelocity().Size2D() < TraceBotConstants::StuckSpeedThreshold;
+
+	if (bBlockedThisTick)
+	{
+		if (StuckEpisodeStart < 0.f)
+		{
+			StuckEpisodeStart = Now;
+			bStuckEpisodeCounted = false;
+		}
+
 		StuckSeconds += DeltaSeconds;
 		if (StuckSeconds > TraceBotConstants::StuckTriggerSeconds && Now >= EvadeUntilTime)
 		{
 			EvadeUntilTime = Now + TraceBotConstants::EvadeDuration;
-			const float Sign = (FMath::FRand() < 0.5f) ? -1.f : 1.f;
+
+			// The kick used to be a coin flip. It still is when the bot cannot see what it is caught
+			// on — but when the probe HAS a surface, kicking along that surface instead of at random
+			// is strictly better information for the same cost, and it is the same tangent the
+			// deflection below would have used.
+			float Sign = (FMath::FRand() < 0.5f) ? -1.f : 1.f;
+			FName Blocker = NAME_None;
+			const AActor* BlockerActor = nullptr;
+			FVector BlockerNormal = FVector::ZeroVector;
+
+			// *** THE PROBE RUNS IN BOTH ARMS HERE, AND ONLY THE STEERING IS GATED. *** Naming what a
+			// bot is wedged against is the measurement this whole tranche was asked for, and a
+			// measurement that exists only in the fixed build cannot be a before-and-after of
+			// anything. In the disarmed arm the answer is recorded and thrown away; the coin flip
+			// below is untouched, so arm 0 still moves exactly as the owner's build did.
+			FHitResult Wedge;
+			if (ProbeForObstacle(Direction.GetSafeNormal(), TraceBotConstants::ProbeLengthMin, Wedge))
+			{
+				BlockerActor = Wedge.GetActor();
+				if (BlockerActor != nullptr)
+				{
+					Blocker = BlockerActor->GetFName();
+				}
+
+				BlockerNormal = Wedge.ImpactNormal;
+
+				FVector WedgeNormal = Wedge.ImpactNormal;
+				WedgeNormal.Z = 0.f;
+				WedgeNormal = WedgeNormal.GetSafeNormal();
+				if (BotForwardProbeEnabled() && !WedgeNormal.IsNearlyZero())
+				{
+					const FVector Right = FVector::CrossProduct(FVector::UpVector, Direction.GetSafeNormal());
+					// Slide the way the surface already leans us, so the kick and the deflection do
+					// not fight each other for the 0.6 s the kick lasts.
+					const float Lean = static_cast<float>(FVector::DotProduct(Right, WedgeNormal));
+					if (FMath::Abs(Lean) > KINDA_SMALL_NUMBER)
+					{
+						Sign = (Lean > 0.f) ? 1.f : -1.f;
+					}
+				}
+			}
+
 			EvadeDirection = FVector::CrossProduct(FVector::UpVector, Direction.GetSafeNormal()) * Sign;
+
+			// ONCE PER WEDGE, not once per kick. A bot held against a wall re-arms the kick every
+			// EvadeDuration and UpdateMovementTech's jump zeroes StuckSeconds on its own schedule, so
+			// counting kicks would report a single five-second wedge as seven "episodes" and make a
+			// fix that shortened wedges look like one that multiplied them.
+			if (!bStuckEpisodeCounted)
+			{
+				bStuckEpisodeCounted = true;
+				TRACE_BOT_WEDGE(Blocker);
+
+				// The POSITION, not a formatted string: in a shipping build this macro compiles to
+				// "discard the arguments", and building an FString there would be a real allocation
+				// for a diagnostic that is not even present.
+				TRACE_BOT_WEDGE_SITE(BotCharacter->GetActorLocation(), BlockerActor, BlockerNormal, AbsYFraction);
+			}
 		}
 	}
 	else
 	{
 		StuckSeconds = 0.f;
+		StuckEpisodeStart = -1.f;
+		bStuckEpisodeCounted = false;
+	}
+
+	// D30 §1. The instrument, and the ONLY place bots-not-moving is counted. The position fractions
+	// were computed above, so the histogram and the per-wedge site line can never disagree about
+	// where a bot was.
+	{
+		// Negative means "not wedged"; anything else is how long THIS wedge has run, which is both
+		// the time budget and the running worst case.
+		const float EpisodeSeconds = (bStuckEpisodeCounted && StuckEpisodeStart >= 0.f)
+			? (Now - StuckEpisodeStart)
+			: -1.f;
+
+		TRACE_BOT_STEER(bWantedToMove, bBlockedThisTick, AbsYFraction, AbsXFraction, DeltaSeconds, EpisodeSeconds);
 	}
 
 	if (Now < EvadeUntilTime && !EvadeDirection.IsNearlyZero())
@@ -7067,6 +7618,109 @@ void ATraceBotController::ApplySteering(float DeltaSeconds)
 		{
 			Direction = (Direction.GetSafeNormal() + Push * TraceBotConstants::WallAvoidWeight).GetSafeNormal();
 		}
+	}
+
+	// --- D30 §2: FORWARD PROBE AND TANGENT DEFLECTION ---------------------------------------------
+	//
+	// LAST, AND THAT IS THE DESIGN. Everything above — the behaviour's desired heading, the evade
+	// kick, the field-bounds repulsion — decides where the bot WANTS to go. This asks whether that
+	// heading is physically available and bends it if it is not, so what gets probed is the vector
+	// actually about to be handed to AddMovementInput and not an earlier draft of it. Probing before
+	// the repulsion would have measured a heading the bot was never going to take.
+	//
+	// WHY A PROBE AND NOT AVOIDANCE VOLUMES. The three honest options without a navmesh were forward
+	// probing, obstacle-weighted steering, and registering the known structures as volumes the bots
+	// consult. The third was rejected on the same grounds ATraceArenaBuilder::GetSideRampProbe states
+	// for itself: the centre kit and the side ramps are StaticMeshActors a human placed on
+	// /Game/Maps/Arena_Baked, and a table of their extents in C++ is a second copy of a level that is
+	// edited without recompiling — it would be wrong the first time the collaborator nudged a ramp.
+	// The second is the first with extra steps, since the weights have to come from a query anyway.
+	// The probe costs ONE capsule sweep per bot per tick (nine sweeps a frame at a full fill, on the
+	// broadphase, with every pawn pre-ignored) and it is correct for geometry nobody has built yet.
+	if (BotForwardProbeEnabled() && bWantedToMove)
+	{
+		const FVector Heading = Direction.GetSafeNormal();
+		const float Speed = static_cast<float>(BotCharacter->GetVelocity().Size2D());
+		const float ProbeLength = FMath::Clamp(Speed * TraceBotConstants::ProbeLeadSeconds,
+			TraceBotConstants::ProbeLengthMin, TraceBotConstants::ProbeLengthMax);
+
+		FHitResult Ahead;
+		const bool bHit = ProbeForObstacle(Heading, ProbeLength, Ahead);
+		bool bDeflected = false;
+		bool bHeadOnPick = false;
+
+		if (bHit)
+		{
+			FVector Normal = Ahead.ImpactNormal;
+			Normal.Z = 0.f;
+			Normal = Normal.GetSafeNormal();
+
+			if (Normal.IsNearlyZero())
+			{
+				// A purely vertical impact normal on a non-walkable surface means we clipped a
+				// ceiling or an overhang rather than a wall; there is nothing to steer around in the
+				// plane, so fall back to pushing away from the contact point.
+				FVector Away = BotCharacter->GetActorLocation() - Ahead.ImpactPoint;
+				Away.Z = 0.f;
+				Normal = Away.GetSafeNormal();
+			}
+
+			if (!Normal.IsNearlyZero())
+			{
+				const float Approach = static_cast<float>(FVector::DotProduct(Heading, Normal));
+
+				// Approach >= 0 is a surface we are already leaving — a glancing hit on the inside of
+				// a curve. Steering off it would be steering away from nothing.
+				if (Approach < 0.f)
+				{
+					FVector Tangent = (Heading - Normal * Approach).GetSafeNormal();
+
+					if (Tangent.IsNearlyZero() || FMath::Abs(Approach) > (1.f - TraceBotConstants::ProbeTangentDegenerate))
+					{
+						// SQUARE ON. The tangent is noise here, so pick a side by asking the world
+						// which one has more room — and then HOLD that answer, because re-asking
+						// every frame is how a fix like this turns into a bot vibrating in a wall.
+						const FVector Right = FVector::CrossProduct(FVector::UpVector, Heading);
+
+						if (Now >= AvoidSideUntilTime || AvoidSideSign == 0.f)
+						{
+							const float SideAngle = FMath::DegreesToRadians(TraceBotConstants::ProbeSideAngleDegrees);
+							const FVector RightProbe = Heading.RotateAngleAxisRad(SideAngle, FVector::UpVector);
+							const FVector LeftProbe = Heading.RotateAngleAxisRad(-SideAngle, FVector::UpVector);
+
+							FHitResult RightHit;
+							FHitResult LeftHit;
+							const float RightRoom = ProbeForObstacle(RightProbe, ProbeLength, RightHit)
+								? static_cast<float>(RightHit.Distance) : ProbeLength;
+							const float LeftRoom = ProbeForObstacle(LeftProbe, ProbeLength, LeftHit)
+								? static_cast<float>(LeftHit.Distance) : ProbeLength;
+
+							AvoidSideSign = (RightRoom >= LeftRoom) ? 1.f : -1.f;
+							AvoidSideUntilTime = Now + TraceBotConstants::ProbeSideHoldSeconds;
+							bHeadOnPick = true;
+						}
+
+						Tangent = Right * AvoidSideSign;
+					}
+					else
+					{
+						// A well-defined tangent is its own commitment — it is a continuous function
+						// of the heading and the face, so it cannot flip-flop the way a coin does.
+						// Drop any held side choice so the next square-on hit is decided fresh.
+						AvoidSideUntilTime = 0.f;
+					}
+
+					if (!Tangent.IsNearlyZero())
+					{
+						const float Closeness = 1.f - FMath::Clamp(static_cast<float>(Ahead.Distance) / ProbeLength, 0.f, 1.f);
+						Direction = (Tangent + Normal * (Closeness * TraceBotConstants::ProbeOutwardWeight)).GetSafeNormal();
+						bDeflected = true;
+					}
+				}
+			}
+		}
+
+		TRACE_BOT_PROBE(bHit, bDeflected, bHeadOnPick);
 	}
 
 	Direction = Direction.GetSafeNormal();
@@ -7778,6 +8432,345 @@ namespace TraceBotLockoutTest
 		TEXT("Dev only, server only. SPEC v28 §6: stages a real turnover and measures how close each side's "
 		     "bots get to a Core they may not touch, red arm (pre-v28) first, then shipped."),
 		FConsoleCommandDelegate::CreateStatic(&RunLockoutTest));
+}
+
+// =================================================================================================
+// Trace.Bots.SideRampDrill — D30 §3, PUTTING BOTS ON A STRUCTURE THEY NEVER VOLUNTEER TO VISIT
+// -------------------------------------------------------------------------------------------------
+// THE MEASUREMENT THAT MADE THIS NECESSARY, and it contradicted the brief. D30 was written expecting
+// the two 38,400 uu concave side ramps to be where the bots were wedging. They are not, because the
+// bots never go there: over a 6-minute bots=8 soak the OCCUPANCY histogram recorded 92.4% of all
+// steering ticks inside |Y|/half-width 0.50 and 0.0% outside 0.75 — the Core lives on the centre
+// pillar and every behaviour in this class is drawn to the Core. The wedges were on the centre kit,
+// and the ramps produced no evidence at all, in either arm.
+//
+// NO EVIDENCE IS NOT EVIDENCE OF SAFETY. "The bots do not get stuck on the side ramps" and "the bots
+// have never touched the side ramps" produce identical telemetry, and only one of them is a claim
+// about the fix. So this drill manufactures the case: it teleports every living bot onto the ramp
+// band on both sidelines, waits, and measures how many of them are still standing there. Run it with
+// Trace.Bot.Avoidance 0 and again with 1 and the two numbers are the before and the after on the
+// structure the owner named.
+//
+// IT CAN FAIL, AND IT HAS — BUT NOT ON THE RAMPS, AND THAT IS THE FINDING. Pointed at the centre
+// pillar (`Trace.Bots.StructureDrill 6 0.02 0.035`) the disarmed arm stranded 3 of 33 placements and
+// the armed arm 2 of 32, so the detector demonstrably fires. Pointed at the side ramps, its default,
+// it stranded 0 of 44 with the probe DISARMED and 0 of 45 with it armed.
+//
+// READ THAT SECOND RESULT PROPERLY: it is not "the fix works on the ramps", it is "the ramps do not
+// wedge bots at all, and never could". A bot dropped on the ramp is heading for a Core that is
+// always further INWARD than it is, so its desired direction points down the slope and off the
+// structure — the ramps can only ever be crossed, never pushed into. The wedges the owner saw are
+// the centre kit; the ramps were an assumption, and this is the check that retired it.
+// =================================================================================================
+
+namespace TraceBotRampDrill
+{
+	/**
+	 * Where on the sideline bots are dropped, as a FRACTION of the live half-width.
+	 *
+	 * 0.90 of 4800 is |Y| 4320, which on today's ramp is 320 uu up its shallow half — past the toe,
+	 * below the point the parabola leaves the walkable band, and therefore somewhere a bot can stand
+	 * and CANNOT stay: it has to steer out of it. A fraction rather than a distance for the reason
+	 * every other position in this file is one — the ramp is 760 uu of a 4800 uu half-width today and
+	 * the number that stays true if either changes is the ratio.
+	 */
+	static constexpr float DefaultBandFraction = 0.90f;
+
+	/**
+	 * How far down the field, as a fraction of half-LENGTH, the stations spread either side of the
+	 * centre line.
+	 *
+	 * 0.55 of 19,200 spreads nine bots over 21,000 uu of sideline, which is what you want when the
+	 * thing under test runs the whole length of the wall. Hand in a SMALL span instead and the same
+	 * drill becomes a test of one central structure: `Trace.Bots.StructureDrill 4 0.02 0.035` puts
+	 * the nine of them in a 1300 x 200 uu box around the middle of the pitch, which on this level is
+	 * hard against the centre pillar the match telemetry says they actually wedge on. That second
+	 * invocation is the drill's own negative control — see the header block.
+	 */
+	static constexpr float DefaultXSpan = 0.55f;
+
+	/** How long a bot is given to get off the band before it is called stranded. */
+	static constexpr float DefaultSettleSeconds = 6.f;
+
+	/** A bot that has moved less than this in the plane in that time has not got off. */
+	static constexpr float StrandedRadius = 250.f;
+
+	struct FPlacement
+	{
+		TWeakObjectPtr<ATraceCharacter> Pawn;
+		FVector Where = FVector::ZeroVector;
+		float StartYFraction = 0.f;
+	};
+
+	struct FState
+	{
+		FTSTicker::FDelegateHandle Handle;
+		TWeakObjectPtr<UWorld> World;
+		TArray<FPlacement> Placed;
+
+		int32 RoundsLeft = 0;
+		int32 RoundIndex = 0;
+		double MeasureAtReal = 0.0;
+		bool bWaiting = false;
+
+		int32 TotalPlaced = 0;
+		int32 TotalStranded = 0;
+		double SumEndYFraction = 0.0;
+		double SumMoved = 0.0;
+	};
+
+	static UWorld* AuthoritativeWorld()
+	{
+		if (GEngine == nullptr)
+		{
+			return nullptr;
+		}
+
+		for (const FWorldContext& Context : GEngine->GetWorldContexts())
+		{
+			UWorld* Candidate = Context.World();
+			if (Candidate != nullptr && Candidate->IsGameWorld() && Candidate->GetNetMode() != NM_Client)
+			{
+				return Candidate;
+			}
+		}
+		return nullptr;
+	}
+
+	/**
+	 * Drops @p Bot onto the ramp band and returns where it landed, or false if there is no surface.
+	 *
+	 * The Z is TRACED, never assumed: this class does not know how tall the ramp is and must not
+	 * learn, so it starts a capsule-height above the top of the field bounds and takes the first
+	 * thing it lands on. On a map with no ramp that is the floor, which is a perfectly good negative
+	 * control — the drill then reports every bot walking away, because nothing was in their way.
+	 */
+	static bool PlaceOnBand(UWorld* World, ATraceCharacter* Bot, const FBox& Field, float BandFraction,
+		float XFraction, float YSign, FVector& OutWhere)
+	{
+		const UCapsuleComponent* Capsule = Bot->GetCapsuleComponent();
+		if (Capsule == nullptr)
+		{
+			return false;
+		}
+
+		const FVector Centre = Field.GetCenter();
+		const FVector Extent = Field.GetExtent();
+		const float X = static_cast<float>(Centre.X + Extent.X * XFraction);
+		const float Y = static_cast<float>(Centre.Y + Extent.Y * BandFraction * YSign);
+		const float TopZ = static_cast<float>(Field.Max.Z);
+
+		FCollisionQueryParams Params(TEXT("TraceBotRampDrillDrop"), /*bTraceComplex=*/false, Bot);
+		FHitResult Hit;
+		if (!World->LineTraceSingleByChannel(Hit, FVector(X, Y, TopZ), FVector(X, Y, Field.Min.Z - 200.f),
+				ECC_Visibility, Params))
+		{
+			return false;
+		}
+
+		OutWhere = Hit.ImpactPoint + FVector(0.f, 0.f, Capsule->GetScaledCapsuleHalfHeight() + 4.f);
+		return Bot->TeleportTo(OutWhere, Bot->GetActorRotation(), /*bIsATest=*/false, /*bNoCheck=*/true);
+	}
+
+	static void RunRound(FState& State, float BandFraction, float XSpan)
+	{
+		UWorld* World = State.World.Get();
+		const ATraceArenaBuilder* Arena = (World != nullptr) ? ATraceArenaBuilder::Get(World) : nullptr;
+		if (World == nullptr || Arena == nullptr)
+		{
+			return;
+		}
+
+		const FBox Field = Arena->GetFieldBounds();
+		State.Placed.Reset();
+
+		// Nine is the full fill, and the stations are laid out for it rather than for however many
+		// bots happen to be alive this round, so a round with a dead bot in it still places the
+		// survivors on the SAME stations as every other round. Otherwise the spacing — and therefore
+		// which piece of geometry each bot meets — would change every time somebody respawned.
+		constexpr int32 Stations = 9;
+
+		int32 Index = 0;
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			ATraceCharacter* Bot = *It;
+			if (!IsValid(Bot) || !Bot->IsAlive())
+			{
+				continue;
+			}
+
+			const APlayerState* BotState = Bot->GetPlayerState<APlayerState>();
+			if (BotState == nullptr || !BotState->IsABot())
+			{
+				continue;   // The human is not what this drill is about.
+			}
+
+			// Alternating sides and spread along the field, so one round exercises BOTH sidelines (or,
+			// at a small span, both faces of a central structure) and several stations along each,
+			// rather than piling nine capsules on one spot — where they would be measuring each other
+			// instead of the geometry.
+			const float YSign = ((Index % 2) == 0) ? 1.f : -1.f;
+			const float Step = (Stations > 1) ? (2.f * XSpan / static_cast<float>(Stations - 1)) : 0.f;
+			const float XFraction = -XSpan + Step * static_cast<float>(Index);
+
+			FVector Where = FVector::ZeroVector;
+			if (PlaceOnBand(World, Bot, Field, BandFraction, FMath::Clamp(XFraction, -0.90f, 0.90f), YSign, Where))
+			{
+				FPlacement Placement;
+				Placement.Pawn = Bot;
+				Placement.Where = Where;
+				Placement.StartYFraction = static_cast<float>(
+					FMath::Abs(Where.Y - Field.GetCenter().Y) / FMath::Max(1.0, Field.GetExtent().Y));
+				State.Placed.Add(Placement);
+			}
+			++Index;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[RampDrill] round %d: placed %d bot(s) at |Y|/halfW %.3f, |X|/halfL within %.3f, both sides."),
+			State.RoundIndex + 1, State.Placed.Num(), BandFraction, XSpan);
+	}
+
+	static void MeasureRound(FState& State)
+	{
+		UWorld* World = State.World.Get();
+		const ATraceArenaBuilder* Arena = (World != nullptr) ? ATraceArenaBuilder::Get(World) : nullptr;
+		if (World == nullptr || Arena == nullptr)
+		{
+			return;
+		}
+
+		const FBox Field = Arena->GetFieldBounds();
+		const double HalfWidth = FMath::Max(1.0, Field.GetExtent().Y);
+		const double CentreY = Field.GetCenter().Y;
+
+		int32 Alive = 0;
+		int32 Stranded = 0;
+		double SumMoved = 0.0;
+		double SumEndY = 0.0;
+
+		for (const FPlacement& Placement : State.Placed)
+		{
+			const ATraceCharacter* Bot = Placement.Pawn.Get();
+			if (Bot == nullptr || !Bot->IsAlive())
+			{
+				continue;   // Died in the drill; it neither passes nor fails.
+			}
+
+			++Alive;
+			const FVector Now = Bot->GetActorLocation();
+			const double Moved = FVector::Dist2D(Now, Placement.Where);
+			const double EndY = FMath::Abs(Now.Y - CentreY) / HalfWidth;
+
+			SumMoved += Moved;
+			SumEndY += EndY;
+
+			if (Moved < StrandedRadius)
+			{
+				++Stranded;
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[RampDrill]   STRANDED %s: moved %.0f uu in %.1fs, |Y|/halfW %.3f -> %.3f, at %s"),
+					*Bot->GetName(), Moved, DefaultSettleSeconds, Placement.StartYFraction, EndY,
+					*Now.ToCompactString());
+			}
+		}
+
+		State.TotalPlaced += Alive;
+		State.TotalStranded += Stranded;
+		State.SumMoved += SumMoved;
+		State.SumEndYFraction += SumEndY;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[RampDrill] round %d result: %d of %d still on the band after %.1fs (moved < %.0f uu) "
+			     "| mean travel %.0f uu | mean |Y|/halfW now %.3f"),
+			State.RoundIndex + 1, Stranded, Alive, DefaultSettleSeconds, StrandedRadius,
+			(Alive > 0) ? (SumMoved / Alive) : 0.0,
+			(Alive > 0) ? (SumEndY / Alive) : 0.0);
+	}
+
+	static void RunDrill(const TArray<FString>& Args)
+	{
+		UWorld* World = AuthoritativeWorld();
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[RampDrill] No authoritative game world. Run this in a match."));
+			return;
+		}
+		if (ATraceArenaBuilder::Get(World) == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[RampDrill] No ATraceArenaBuilder in this world."));
+			return;
+		}
+
+		const int32 Rounds = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 20) : 4;
+		const float BandFraction = (Args.Num() > 1)
+			? FMath::Clamp(FCString::Atof(*Args[1]), 0.f, 0.99f)
+			: DefaultBandFraction;
+		const float XSpan = (Args.Num() > 2)
+			? FMath::Clamp(FCString::Atof(*Args[2]), 0.005f, 0.90f)
+			: DefaultXSpan;
+
+		TSharedPtr<FState> State = MakeShared<FState>();
+		State->World = World;
+		State->RoundsLeft = Rounds;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[RampDrill] ===== %d round(s), band |Y|/halfW %.3f, |X|/halfL span %.3f, %.1fs to get "
+			     "clear, Trace.Bot.Avoidance is %d ====="),
+			Rounds, BandFraction, XSpan, DefaultSettleSeconds,
+			BotForwardProbeEnabled() ? 1 : 0);
+
+		RunRound(*State, BandFraction, XSpan);
+		State->bWaiting = true;
+		State->MeasureAtReal = FPlatformTime::Seconds() + DefaultSettleSeconds;
+
+		State->Handle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			[State, BandFraction, XSpan](float /*Delta*/) -> bool
+		{
+			if (!State->World.IsValid())
+			{
+				return false;
+			}
+			if (!State->bWaiting || FPlatformTime::Seconds() < State->MeasureAtReal)
+			{
+				return true;
+			}
+
+			MeasureRound(*State);
+			++State->RoundIndex;
+			--State->RoundsLeft;
+
+			if (State->RoundsLeft > 0)
+			{
+				RunRound(*State, BandFraction, XSpan);
+				State->MeasureAtReal = FPlatformTime::Seconds() + DefaultSettleSeconds;
+				return true;
+			}
+
+			const double StrandedPct = (State->TotalPlaced > 0)
+				? (100.0 * State->TotalStranded / State->TotalPlaced) : 0.0;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[RampDrill] ===== TOTAL: %d of %d placements stranded (%.1f%%) | mean travel %.0f uu "
+				     "| mean |Y|/halfW after %.3f (placed at %.3f) | avoidance=%d ====="),
+				State->TotalStranded, State->TotalPlaced, StrandedPct,
+				(State->TotalPlaced > 0) ? (State->SumMoved / State->TotalPlaced) : 0.0,
+				(State->TotalPlaced > 0) ? (State->SumEndYFraction / State->TotalPlaced) : 0.0,
+				BandFraction,
+				BotForwardProbeEnabled() ? 1 : 0);
+
+			State->bWaiting = false;
+			return false;
+		}));
+	}
+
+	static FAutoConsoleCommand CmdStructureDrill(
+		TEXT("Trace.Bots.StructureDrill"),
+		TEXT("Dev only, server only. D30 §3: teleports every living bot onto a band of the pitch, waits, "
+		     "and reports how many are still standing there. Args: [rounds=4] [|Y|/halfW band=0.90] "
+		     "[|X|/halfL span=0.55]. Defaults aim at the two side ramps; '4 0.02 0.035' aims at the "
+		     "centre pillar instead. Compare with Trace.Bot.Avoidance 0 and 1."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&RunDrill));
 }
 
 #endif   // !UE_BUILD_SHIPPING

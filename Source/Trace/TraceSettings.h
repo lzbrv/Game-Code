@@ -79,44 +79,6 @@ enum class EBotDifficulty : uint8
 	Hard   = 2
 };
 
-/**
- * Which of the two scoring rulesets the match plays. Spec v4 §7, verbatim: "Create a toggle which
- * can switch between the current game state(a) ... to a game state (b) where the core can be thrown
- * and intercepted, so that we can test which feels better."
- *
- * This is an A/B TESTING TOGGLE, not a game type ladder — the whole point is that one build can play
- * both so the two can be compared back to back. It lives here (and is mirrored on the main menu,
- * which writes "?mode=a|b" onto the travel URL) rather than being a second game mode class, because
- * a second class would double every rule that the two modes share.
- *
- * SPEC v14 §2 CHANGED WHICH ONE IS DEFAULT. ThrownCoreAndGoals (mode B) is now the default
- * everywhere — settings, menu, fresh install. EndzoneStatusCore (mode A) is FROZEN: it must keep
- * working exactly as it does, it takes no characters and no abilities, and every player in it is
- * the default characterless Mannequin.
- *
- *   EndzoneStatusCore     Endzones spanning the full field width. The Core is a STATUS, not an
- *                         object: it cannot exist on the ground, LMB starts the 0.5 s hover-pass,
- *                         and possession moves on kill / trace break / completed pass.
- *   ThrownCoreAndGoals    CIRCULAR goals set into the back walls (spec v6 §4.3) instead of
- *                         endzones — a hoop of diameter GoalWidthFieldFraction of the field width,
- *                         its bottom raised 1.5 player heights off the floor. The Core is a
- *                         physical entity:
- *                         LMB THROWS it at CoreThrowSpeed, and the first player of either team to
- *                         come within CorePickupRadius takes it. A Core left on the ground for
- *                         CoreLooseResetSeconds returns to play so it cannot be lost forever.
- *
- * Grace rules are shared: possession crossing TEAMS costs CoreTurnoverGraceSeconds of trace grace in
- * both modes, possession moving WITHIN a team costs none in both modes.
- */
-UENUM()
-enum class ETraceScoringMode : uint8
-{
-	/** Mode A — endzones, Core is a status, LMB is the hover-pass. The shipped game. */
-	EndzoneStatusCore = 0 UMETA(DisplayName = "A - Endzones, Core is a status"),
-
-	/** Mode B — goals, Core is a physical thrown/intercepted object, LMB throws. */
-	ThrownCoreAndGoals = 1 UMETA(DisplayName = "B - Goals, Core is thrown")
-};
 
 /**
  * The whole bot skill curve, one struct per difficulty.
@@ -596,7 +558,7 @@ public:
 	/**
 	 * ON: the clock expiring ARMS the whistle instead of blowing it. Play continues, the HUD shows
 	 * the clock at 0:00 with "HALF/MATCH ENDS AT NEXT DEAD BALL", and the period actually ends at
-	 * the next goal, between-team turnover, or (mode B) Core coming down.
+	 * the next goal, between-team turnover, or the Core coming down.
 	 *
 	 * OFF restores the pre-v9 behaviour exactly: the period ends on the tick the clock does, in the
 	 * middle of whatever was happening. Kept as a switch because "the half ended late" and "the half
@@ -621,44 +583,21 @@ public:
 	float PeriodEndMaxDeferSeconds = 60.f;
 
 	// ==========================================================================================
-	// SCORING MODE  —  the A/B toggle (spec v4 §7)
+	// GOALS  —  the geometry of the thing you score in
 	//
-	// Two complete rulesets in one binary so they can be played back to back and compared. See
-	// ETraceScoringMode above for what each mode actually changes; the three knobs here are the
-	// mode selector and the geometry mode B needs and mode A does not.
+	// HISTORY, because the shape of the code below only makes sense with it. Spec v4 §7 asked for an
+	// A/B toggle between two complete rulesets — endzones with the Core as a possession status, and
+	// goals with the Core as a thrown object — so they could be played back to back and compared.
+	// Spec v14 §2 made goals the default. The comparison is over: the owner picked goals, and the
+	// endzone ruleset, the ETraceScoringMode enum that selected it, the "?mode=a|b" travel option and
+	// the title screen's SCORING MODE row are all GONE. There is one game now.
 	//
-	// LATCHING: the mode must be read ONCE at match start and held for the match. It changes what
-	// the Core IS (a status versus an actor) and what the scoring volumes ARE, so flipping it with a
-	// carrier mid-run is not a live retune, it is a mid-air rules change. The menu writes
-	// "?mode=a|b" onto the travel URL; this property is what a direct launch into the arena uses.
+	// What survives is everything the goal game needs, which is what the two knobs below are. They
+	// still say "mode B" in a few nearby comments; read that as "the game".
 	// ==========================================================================================
 
 	/**
-	 * Which ruleset the next match plays.
-	 *
-	 * *** SPEC v14 §2: MODE B IS NOW THE DEFAULT. *** Verbatim: "Change game mode b to the default
-	 * game mode." This property is THE fresh-install default and it is the only thing that had to
-	 * change to make that true everywhere:
-	 *
-	 *   settings default   this line, mirrored in Config/DefaultGame.ini (and the ini wins).
-	 *   menu default       ATraceMenuHUD::BeginPlay READS the mode from here rather than holding its
-	 *                      own copy ("The mode goes the other way: it is READ from the settings"),
-	 *                      so the title screen comes up on B without a UI change.
-	 *   match default      ATraceGameMode::ResolveScoringMode starts from this value and only a
-	 *                      travel-URL "?mode=a" or "-TraceScoringMode=a" overrides it.
-	 *
-	 * MODE A IS FROZEN, NOT DELETED (§2): it must keep working exactly as it does, and selecting it
-	 * still plays the shipped endzone game — with no characters and no abilities, because
-	 * UTraceAbilityComponent::AreCharactersEnabled returns false in mode A.
-	 *
-	 * NOT a live knob in the way the rest of this page is: read it at match start, not at the point
-	 * of use. See the latching note above.
-	 */
-	UPROPERTY(config, EditAnywhere, Category = "Match|Scoring Mode", meta = (DisplayName = "Scoring Mode (A/B test) [v14 §2: B IS THE DEFAULT]"))
-	ETraceScoringMode ScoringMode = ETraceScoringMode::ThrownCoreAndGoals;
-
-	/**
-	 * MODE B ONLY. Width of each goal as a fraction of the FULL field width.
+	 * Width of each goal as a fraction of the FULL field width.
 	 *
 	 * Verbatim (v4): "The goal should not be the entire width of the map, like the endzone."
 	 * Verbatim (v5 §4): "For game mode b ONLY ... decrease the size of the goal (reduce height and
@@ -669,15 +608,14 @@ public:
 	 * character-widths of margin either side of a defender — and now narrow enough that ONE defender
 	 * standing in front of it is a real obstacle, which is the point of shrinking it.
 	 *
-	 * Ignored entirely in mode A, where the endzone spans the full width by design. Keep it under
-	 * ~0.6 or the distinction the spec is asking for stops existing; below ~0.12 (1150 uu) a thrown
-	 * Core has to be threaded and mode B stops scoring at all.
+	 * Keep it under ~0.6 or the distinction the spec is asking for — a goal, not a wall — stops
+	 * existing; below ~0.12 (1150 uu) a thrown Core has to be threaded and nothing scores at all.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Match|Scoring Mode", meta = (DisplayName = "Goal Width (fraction of field width) [mode B]", ClampMin = "0.05", ClampMax = "1.0", UIMin = "0.1", UIMax = "0.6"))
+	UPROPERTY(config, EditAnywhere, Category = "Match|Goals", meta = (DisplayName = "Goal Width (fraction of field width)", ClampMin = "0.05", ClampMax = "1.0", UIMin = "0.1", UIMax = "0.6"))
 	float GoalWidthFieldFraction = 0.2083f;
 
 	/**
-	 * MODE B ONLY. Height of the goal volume, uu, measured from the floor.
+	 * Height of the goal volume, uu, measured from the floor.
 	 *
 	 * REPOINTED BY SPEC v6 §4.3 — READ THIS BEFORE TUNING IT. Until v6 this was the height of a
 	 * free-standing goal between the goal line and the end wall. There is no such goal any more: the
@@ -692,7 +630,7 @@ public:
 	 * and the run-up gets lower, which makes carrying one in harder; 0 removes the ramp entirely and
 	 * leaves throwing as the only way to score.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Match|Scoring Mode", meta = (DisplayName = "Goal Approach Ramp Height (uu) [mode B]", ClampMin = "50.0", ClampMax = "5000.0", UIMin = "200.0", UIMax = "2000.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Match|Goals", meta = (DisplayName = "Goal Approach Ramp Height (uu)", ClampMin = "50.0", ClampMax = "5000.0", UIMin = "200.0", UIMax = "2000.0"))
 	float GoalHeightUU = 440.f;
 
 	// DEAD PROPERTY REMOVED: MatchDuration.
@@ -2877,41 +2815,42 @@ public:
 	 * turnovers doesn't seem to be working. Test it on both modes, fix it if needed. If it IS
 	 * working, increase to .75seconds." IT IS WORKING — measured, in both modes, by
 	 * Trace.Trail.GraceTest, which drives a real turnover through ATraceCore::GrantTo and times the
-	 * new holder's first laid point on the shared clock: mode A 0.506 s and mode B 0.512 s against
-	 * 0.500 configured, with a same-team pass at 0.009 / 0.012 s (no grace, as designed) and the v9
-	 * §3 instant clear composing with both. So this is the "increase" branch, not the "fix it" one.
+	 * new holder's first laid point on the shared clock: 0.512 s against 0.500 configured, with a
+	 * same-team pass at 0.012 s (no grace, as designed) and the v9 §3 instant clear composing with
+	 * both. So this is the "increase" branch, not the "fix it" one.
 	 *
 	 * IT DELAYS FORMATION, NOT LETHALITY, and that distinction is the most likely reason a player
 	 * would report it as not working: trace already on the ground kills throughout the window.
 	 * Raising this number does not change that and never will.
 	 *
-	 * Applies only when the Core changes SIDE. A pass between teammates has no grace, by design —
-	 * and in mode B (ScoringMode = ThrownCoreAndGoals) the same rule holds for a thrown Core:
-	 * intercepted by an enemy = this grace, recovered by a teammate = none. Spec v4 §7.
+	 * Applies only when the Core changes SIDE. A pass between teammates has no grace, by design, and
+	 * the same rule holds for a thrown Core: intercepted by an enemy = this grace, recovered by a
+	 * teammate = none. Spec v4 §7.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Core", meta = (DisplayName = "Turnover Trace Grace (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "2.0"))
 	float CoreTurnoverGraceSeconds = 0.75f;
 
 	// ==========================================================================================
-	// CORE — MODE B ONLY  (the thrown, interceptable Core; spec v4 §7)
+	// CORE — THE THROWN, INTERCEPTABLE CORE  (spec v4 §7)
 	//
-	// INERT IN MODE A. Nothing below is read unless ScoringMode is ThrownCoreAndGoals, because in
-	// mode A the Core is a status and cannot be thrown, dropped or stood on. They are grouped in
-	// their own category and named "[mode B]" so that is obvious from the panel — a knob that does
-	// nothing in the mode you are playing is the same trap as a knob that does nothing at all,
-	// unless the panel says so.
+	// Every knob below is live in every match. It was not always: these arrived behind the A/B
+	// scoring toggle and were inert in the endzone ruleset, where the Core was a status that could
+	// not be thrown, dropped or stood on. That ruleset is gone, so the "[mode B]" the panel used to
+	// print on these rows is gone with it — it would now be a distinction with nothing on the other
+	// side of it, which is its own kind of dead knob.
 	//
-	// This is NOT the physical Core the project deleted in spec v2 being reverted. It is a second
-	// possession model behind the mode enum, sharing the trace, parry and grace logic with mode A.
+	// This is NOT the physical Core the project deleted in spec v2 being reverted. It arrived as a
+	// second possession model behind the scoring-mode enum, sharing the trace, parry and grace logic
+	// with the endzone ruleset; the enum and that ruleset are gone and this is what is left.
 	// ==========================================================================================
 
 	/**
-	 * Launch speed, uu/s, of a Core thrown with LMB in mode B.
+	 * Launch speed, uu/s, of a Core thrown with LMB.
 	 *
 	 * Verbatim: "The carrier should be able to throw the core forward by left clicking."
 	 * Fast enough to be a pass across a lane, slow enough that the "first player to contact the core
 	 * picks it up" rule has something to work with — a Core that crosses the field in half a second
-	 * cannot be intercepted by anyone, which deletes the whole point of mode B.
+	 * cannot be intercepted by anyone, which deletes the whole point of a thrown Core.
 	 *
 	 * *** PATCH 28 ITEM 4: 3300 -> 2900. *** Verbatim: "Reduce core throw speed max to 2900uu/s,
 	 * adjusting Mortimer accordingly." THE "ADJUSTING MORTIMER ACCORDINGLY" HALF IS ALREADY DONE BY
@@ -2942,7 +2881,7 @@ public:
 	 * Range goes as the SQUARE of the speed, so a 12.1% speed cut is a 22.8% range cut. That is the
 	 * number to quote if anybody asks whether "2900" felt bigger than it reads.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Speed (uu/s, before weight) [mode B; Patch 28 §4: 3300 -> 2900]", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "500.0", UIMax = "8000.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Throw Speed (uu/s, before weight) [Patch 28 §4: 3300 -> 2900]", ClampMin = "100.0", ClampMax = "20000.0", UIMin = "500.0", UIMax = "8000.0"))
 	float CoreThrowSpeed = 2900.f;
 
 	/**
@@ -2958,7 +2897,7 @@ public:
 	 * lookup could not find, so the panel slider moved nothing and the CVar default was played
 	 * instead. Do not rename either half alone.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Upward Bias (fraction of speed) [mode B]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.5"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Throw Upward Bias (fraction of speed)", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "0.5"))
 	float CoreThrowUpBias = 0.12f;
 
 	/**
@@ -2987,7 +2926,7 @@ public:
 	 * says so at runtime — the mode-B binding check prints "NO UTraceSettings PROPERTY FOUND FOR:"
 	 * with the name if it is renamed here alone.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Velocity Inheritance (fraction) [mode B]", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "1.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Throw Velocity Inheritance (fraction)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "1.0"))
 	float CoreThrowVelocityInheritance = 1.0f;
 
 	/**
@@ -3004,7 +2943,7 @@ public:
 	 * NAME IS LOAD-BEARING: ATraceCore resolves this by reflection under exactly this spelling, same
 	 * as CoreThrowVelocityInheritance above.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Velocity Inheritance, Downward Multiplier [mode B]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Throw Velocity Inheritance, Downward Multiplier", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float CoreThrowVelocityInheritanceDown = 0.0f;
 
 	// ------------------------------------------------------------------------------------------
@@ -3048,7 +2987,7 @@ public:
 	// recomputes Power from the server's own held-time, so a client cannot ask for more power than
 	// they held for.
 	//
-	// BOTS MUST CHARGE (spec §6): a bot that always taps throws at the floor fraction and mode B
+	// BOTS MUST CHARGE (spec §6): a bot that always taps throws at the floor fraction and the throw
 	// looks broken. That is bot logic, not a knob — the bot picks a hold time from the distance it
 	// wants, using exactly the expression above.
 	// ------------------------------------------------------------------------------------------
@@ -3068,7 +3007,7 @@ public:
 	 * rather than at 0, so "I disabled charging" is done by raising the floor fraction to 1, which
 	 * says what it means.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Charge Time (s) [v13 §6]", ClampMin = "0.05", ClampMax = "10.0", UIMin = "0.25", UIMax = "3.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Throw Charge Time (s) [v13 §6]", ClampMin = "0.05", ClampMax = "10.0", UIMin = "0.25", UIMax = "3.0"))
 	float CoreThrowChargeSeconds = 0.6f;
 
 	/**
@@ -3086,7 +3025,7 @@ public:
 	 * 1.0 is legal and disables charging entirely (every throw full power) — the A/B arm for "is the
 	 * charge-up an improvement", and the honest way to turn the feature off.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Charge Floor (fraction of full) [v13 §6]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.05", UIMax = "0.5"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Throw Charge Floor (fraction of full) [v13 §6]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.05", UIMax = "0.5"))
 	float CoreThrowChargeFloorFraction = 0.15f;
 
 	/**
@@ -3100,7 +3039,7 @@ public:
 	 * Set false to allow OVERCHARGE up to CoreThrowChargeMaxFraction below, which is the pair of
 	 * knobs spec §6 asked for as "max multiplier, and whether it clamps".
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Charge Clamps At Full [v13 §6]"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Throw Charge Clamps At Full [v13 §6]"))
 	bool bCoreThrowChargeClampsAtFull = true;
 
 	/**
@@ -3112,12 +3051,12 @@ public:
 	 * unticks a box is an overcharge nobody chose. At 1.5 a 1.5 s hold throws at 1.5x
 	 * CoreThrowSpeed, and the linear rule above is simply extrapolated.
 	 *
-	 * RAISING THIS RE-TUNES MODE B, not just the throw: CoreThrowGravityScale, the goal distance and
+	 * RAISING THIS RE-TUNES THE WHOLE GAME, not just the throw: CoreThrowGravityScale, the goal distance and
 	 * the 450 uu catch radius were all tuned against a base throw ceiling that has since moved twice
 	 * (3000, then 3300, and 2900 as of Patch 28 §4). Treat it as an experiment knob, not a difficulty
 	 * dial.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Charge Max (x full, clamp off) [v13 §6]", ClampMin = "1.0", ClampMax = "4.0", UIMin = "1.0", UIMax = "2.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Throw Charge Max (x full, clamp off) [v13 §6]", ClampMin = "1.0", ClampMax = "4.0", UIMin = "1.0", UIMax = "2.0"))
 	float CoreThrowChargeMaxFraction = 1.0f;
 
 	/**
@@ -3150,7 +3089,7 @@ public:
 	 * CoreThrowChargeSeconds (also 0.6): the whole point is that sitting on a full charge is not a
 	 * free option, so the grace period must not exceed the work it took to earn it.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Full-Charge Auto-Release Window (s, 0 = off) [v28 §7]", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "2.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Full-Charge Auto-Release Window (s, 0 = off) [v28 §7]", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "2.0"))
 	float CoreThrowFullChargeAutoReleaseSeconds = 0.6f;
 
 	/**
@@ -3164,11 +3103,11 @@ public:
 	 * UNCHANGED THIS PASS, like CoreThrowSpeed and for the same reason: CoreMassScale multiplies it
 	 * at the point of use, so moving both would apply spec v5 §4's weight twice.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Gravity Scale (before weight) [mode B]", ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "1.5"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Throw Gravity Scale (before weight)", ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "1.5"))
 	float CoreThrowGravityScale = 0.55f;
 
 	/**
-	 * MODE B ONLY. HOW HEAVY THE CORE IS IN FLIGHT, relative to the light Core that shipped before
+	 * HOW HEAVY THE CORE IS IN FLIGHT, relative to the light Core that shipped before
 	 * spec v5. 1.0 is exactly the old flight. THIS IS THE "WEIGHT" KNOB (spec v5 §4).
 	 *
 	 * Verbatim: "For game mode b ONLY, increase the weight of the core".
@@ -3192,11 +3131,11 @@ public:
 	 * ~5000 -> ~3400 uu, apex ~120 -> ~215 uu. The base is 2900 as of Patch 28 §4, where the same
 	 * M = 1.8 gives launch 2161.5 uu/s and flat range ~2791 uu; gravity and apex do not depend on it.
 	 *
-	 * INERT IN MODE A, which has no thrown Core at all. NAME IS LOAD-BEARING: ATraceCore resolves it
+	 * NAME IS LOAD-BEARING: ATraceCore resolves it
 	 * BY NAME as "CoreMassScale". Sane range 1.2 to 2.5; 1.0 restores the pre-v5 flight exactly,
 	 * which is the A/B the design owner needs to judge the feel.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Core Weight (mass scale, 1 = pre-v5) [mode B]", ClampMin = "0.25", ClampMax = "6.0", UIMin = "1.0", UIMax = "3.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Core Weight (mass scale, 1 = pre-v5)", ClampMin = "0.25", ClampMax = "6.0", UIMin = "1.0", UIMax = "3.0"))
 	float CoreMassScale = 1.8f;
 
 	/**
@@ -3208,7 +3147,7 @@ public:
 	 * so the thrower's proximity poll re-takes it on the very next tick and the throw looks like it
 	 * never happened.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Thrower Re-Pickup Lockout (s) [mode B]", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "1.5"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Thrower Re-Pickup Lockout (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "1.5"))
 	float CoreThrowerPickupLockoutSeconds = 0.35f;
 
 	/**
@@ -3216,7 +3155,7 @@ public:
 	 * landing on the same frame, which reads as the Core bouncing off a player rather than being
 	 * caught, and lets an interception be seen before it is undone.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Throw Cooldown After Pickup (s) [mode B]", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "2.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Throw Cooldown After Pickup (s)", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.0", UIMax = "2.0"))
 	float CoreThrowCooldownSeconds = 0.35f;
 
 	/**
@@ -3224,7 +3163,7 @@ public:
 	 * bounce. Low by default so a missed throw settles somewhere a player can contest rather than
 	 * pinballing off the banks into a corner.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Loose Core Bounce [mode B]", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Loose Core Bounce", ClampMin = "0.0", ClampMax = "1.0", UIMin = "0.0", UIMax = "1.0"))
 	float CoreThrowBounce = 0.35f;
 
 	/**
@@ -3237,7 +3176,7 @@ public:
 	 * was standing in its path. That failure reads as "interception is broken", not as "I was too
 	 * slow". Sane range 90 to 200.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Pickup Radius (uu) [mode B]", ClampMin = "10.0", ClampMax = "1000.0", UIMin = "50.0", UIMax = "400.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Pickup Radius (uu)", ClampMin = "10.0", ClampMax = "1000.0", UIMin = "50.0", UIMax = "400.0"))
 	float CorePickupRadius = 120.f;
 
 	/**
@@ -3256,11 +3195,11 @@ public:
 	 * reset at all — the exact opposite of what this tooltip promises. The floor is gone and the
 	 * use site now treats <= 0 as "leave it lying there".
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Loose Core Reset (s, 0 = never) [mode B]", ClampMin = "0.0", ClampMax = "120.0", UIMin = "0.0", UIMax = "30.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Loose Core Reset (s, 0 = never)", ClampMin = "0.0", ClampMax = "120.0", UIMin = "0.0", UIMax = "30.0"))
 	float CoreLooseResetSeconds = 12.f;
 
 	// ------------------------------------------------------------------------------------------
-	// CATCH ZONE  (spec v6 §4.1, mode B only)
+	// CATCH ZONE  (spec v6 §4.1)
 	//
 	// Verbatim: "create a small invisible radius around players that acts as a 'catch zone,' so that
 	// when the core enters that area, it curves towards the player like a magnet. This is intended
@@ -3282,8 +3221,8 @@ public:
 	 * stop feeling earned.
 	 *
 	 * SPEC v12 §4: 500 -> 450. Verbatim: "Reduce the 'magnet' radius for catching in game mode b by
-	 * 10%". Mode A never reads this block at all (ServerApplyCatchZone is only reached from the
-	 * mode-B loose-Core tick), so the cut is mode B only by construction rather than by a mode test.
+	 * 10%". ServerApplyCatchZone is only reached from the loose-Core tick, so this block is read
+	 * exactly when there is a Core in flight to curve and never otherwise.
 	 *
 	 * WHAT THE 10% ACTUALLY COSTS, because it is not 10% of anything a player experiences. The pull
 	 * is a falloff cone — full strength on the capsule, ZERO at the boundary — so shrinking the
@@ -3296,7 +3235,7 @@ public:
 	 * fast Core stops being catchable, RAISE CoreCatchCurveStrength rather than putting this back —
 	 * strength is what the fast case is short of, radius is what the user asked to cut.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Catch Zone Radius (uu) [mode B]", ClampMin = "0.0", ClampMax = "3000.0", UIMin = "0.0", UIMax = "1200.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Catch Zone Radius (uu)", ClampMin = "0.0", ClampMax = "3000.0", UIMin = "0.0", UIMax = "1200.0"))
 	float CoreCatchRadius = 450.f;
 
 	/**
@@ -3307,7 +3246,7 @@ public:
 	 * Too high and a throw at open ground snaps sideways into whoever is nearest, which reads as
 	 * aim assist rather than a catch. Sane range 3 to 10.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Catch Zone Curve Strength [mode B]", ClampMin = "0.0", ClampMax = "30.0", UIMin = "0.0", UIMax = "12.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Catch Zone Curve Strength", ClampMin = "0.0", ClampMax = "30.0", UIMin = "0.0", UIMax = "12.0"))
 	float CoreCatchCurveStrength = 6.f;
 
 	/**
@@ -3318,7 +3257,7 @@ public:
 	 * Every other player, friend or enemy, is magnetised from the first frame: interception is a
 	 * feature (spec v6 §4.1 [ASSUMPTION]).
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Catch Zone Thrower Lockout (s) [mode B]", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "1.5"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Catch Zone Thrower Lockout (s)", ClampMin = "0.0", ClampMax = "5.0", UIMin = "0.0", UIMax = "1.5"))
 	float CoreCatchThrowerLockoutSeconds = 0.5f;
 
 	/**
@@ -3352,7 +3291,7 @@ public:
 	 * two pawns would reach a different answer at the boundary and draw the Core curving to the
 	 * wrong player.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Catch Contest Hysteresis (uu) [v13 §5]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "0.0", UIMax = "150.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Catch Contest Hysteresis (uu) [v13 §5]", ClampMin = "0.0", ClampMax = "500.0", UIMin = "0.0", UIMax = "150.0"))
 	float CoreCatchContestHysteresisUU = 50.f;
 
 	/**
@@ -3372,7 +3311,7 @@ public:
 	 * places; lowering it toward 0 demands an almost perfectly flat surface to turn a Core over.
 	 * Trace.ModeB.SurfaceMaxSlopeDegrees overrides it live.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Surface Max Slope (deg) [mode B]", ClampMin = "0.0", ClampMax = "89.0", UIMin = "10.0", UIMax = "60.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Surface Max Slope (deg)", ClampMin = "0.0", ClampMax = "89.0", UIMin = "10.0", UIMax = "60.0"))
 	float CoreSurfaceMaxSlopeDegrees = 45.f;
 
 	/**
@@ -3404,7 +3343,7 @@ public:
 	 *
 	 * Trace.ModeB.LandingMinDescentDegrees overrides it live.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Landing Min Descent (deg) [v13 §8]", ClampMin = "0.0", ClampMax = "89.0", UIMin = "0.0", UIMax = "45.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Landing Min Descent (deg) [v13 §8]", ClampMin = "0.0", ClampMax = "89.0", UIMin = "0.0", UIMax = "45.0"))
 	float CoreLandingMinDescentDegrees = 20.f;
 
 	// ==========================================================================================
@@ -3446,7 +3385,7 @@ public:
 	 *
 	 * Trace.ModeB.TurnoverLockoutSeconds overrides it live.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Turnover Lockout (s) [v25 §2]", ClampMin = "0.0", ClampMax = "60.0", UIMin = "0.0", UIMax = "15.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Turnover Lockout (s) [v25 §2]", ClampMin = "0.0", ClampMax = "60.0", UIMin = "0.0", UIMax = "15.0"))
 	float CoreTurnoverLockoutSeconds = 5.f;
 
 	/**
@@ -3461,7 +3400,7 @@ public:
 	 * player watches fill is the server's clock rather than their own (spec v25: "Do not let a client
 	 * decide it won a race"). Trace.ModeB.PullHoldSeconds overrides it live.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Pull Hold (s) [v25 §2]", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.1", UIMax = "1.5"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Pull Hold (s) [v25 §2]", ClampMin = "0.0", ClampMax = "10.0", UIMin = "0.1", UIMax = "1.5"))
 	float CorePullHoldSeconds = 0.3f;
 
 	/**
@@ -3477,7 +3416,7 @@ public:
 	 * crowd, and a pull picks the one stationary object on the floor. Trace.ModeB.PullAimConeDegrees
 	 * overrides it live.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Pull Aim Cone (deg) [v25 §2]", ClampMin = "0.0", ClampMax = "45.0", UIMin = "1.0", UIMax = "15.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Pull Aim Cone (deg) [v25 §2]", ClampMin = "0.0", ClampMax = "45.0", UIMin = "1.0", UIMax = "15.0"))
 	float CorePullAimConeDegrees = 4.f;
 
 	/**
@@ -3487,7 +3426,7 @@ public:
 	 * player is aiming at a ball they can see, so the forgiveness is measured off that ball.
 	 * Trace.ModeB.PullAimSlackUU overrides it live.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Pull Aim Slack (uu) [v25 §2]", ClampMin = "0.0", ClampMax = "400.0", UIMin = "0.0", UIMax = "150.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Pull Aim Slack (uu) [v25 §2]", ClampMin = "0.0", ClampMax = "400.0", UIMin = "0.0", UIMax = "150.0"))
 	float CorePullAimSlackUU = 60.f;
 
 	/**
@@ -3499,7 +3438,7 @@ public:
 	 * across a 33600 uu pitch is its own range limit. The knob exists so a playtest that disagrees
 	 * can put a number on it without a rebuild. Trace.ModeB.PullMaxRangeUU overrides it live.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Pull Max Range (uu, 0 = none) [v25 §2]", ClampMin = "0.0", ClampMax = "60000.0", UIMin = "0.0", UIMax = "8000.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Pull Max Range (uu, 0 = none) [v25 §2]", ClampMin = "0.0", ClampMax = "60000.0", UIMin = "0.0", UIMax = "8000.0"))
 	float CorePullMaxRangeUU = 0.f;
 
 	/**
@@ -3515,7 +3454,7 @@ public:
 	 * a different object from across the field rather than as the same one slightly closer.
 	 * Trace.ModeB.TurnoverBeamScale overrides it live.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Core|Mode B", meta = (DisplayName = "Turnover Beam Scale (x normal) [v25 §2]", ClampMin = "0.1", ClampMax = "10.0", UIMin = "1.0", UIMax = "4.0"))
+	UPROPERTY(config, EditAnywhere, Category = "Core|Thrown Core", meta = (DisplayName = "Turnover Beam Scale (x normal) [v25 §2]", ClampMin = "0.1", ClampMax = "10.0", UIMin = "1.0", UIMax = "4.0"))
 	float CoreTurnoverBeamScale = 2.2f;
 
 	// ==========================================================================================
@@ -4610,8 +4549,9 @@ public:
 	 * no E, no V. The whole framework becomes inert rather than partially active, which is the only
 	 * safe meaning for a switch a playtest will flip mid-session.
 	 *
-	 * NOTE THIS IS NOT THE ONLY THING THAT DISABLES CHARACTERS. Mode A does too, unconditionally and
-	 * with no knob (spec §2 freezes mode A). UTraceAbilityComponent::AreCharactersEnabled answers
+	 * NOTE: this used to share the decision with the scoring mode — the frozen endzone ruleset
+	 * disabled characters unconditionally and with no knob. That ruleset is gone, so this toggle is
+	 * now the whole of the answer. UTraceAbilityComponent::AreCharactersEnabled answers
 	 * for both, and is the only correct way to ask.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Framework", meta = (DisplayName = "Characters And Abilities Enabled [v14 §3]"))
@@ -4908,7 +4848,7 @@ public:
 	/**
 	 * §6: "+30% magnet radius ... The base is now 450 uu (reduced 10% in Demo 12), so Mace's is
 	 * 585 uu. DERIVE IT, DO NOT HARDCODE." So this is the 0.30 and the base stays CoreCatchRadius
-	 * under Core|Mode B. 450 x 1.30 = 585. If somebody retunes the base, Mace follows for free.
+	 * under Core|Thrown Core. 450 x 1.30 = 585. If somebody retunes the base, Mace follows for free.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Magnet Radius Bonus (fraction of Core Catch Radius) [v14 §6: derive, do not hardcode]", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "0.6"))
 	float MaceMagnetRadiusBonus = 0.3f;
@@ -5075,9 +5015,25 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Poison Burst Radius (uu)", ClampMin = "50.0", ClampMax = "3000.0", UIMin = "200.0", UIMax = "800.0"))
 	float OysterPoisonRadiusUU = 380.f;
 
-	/** §6: "jumping while stood on one of his jars breaks it and boosts him upward." */
+	/**
+	 * §6: "jumping while stood on one of his jars breaks it and boosts him upward."
+	 *
+	 * D30, owner's call: 1050 -> 1550 uu/s. Inside both meta limits (UIMax 1600, ClampMax 3000), so
+	 * the editor slider still reaches it without the field clamping the number back down.
+	 *
+	 * WHAT THAT BUYS, and why it does not put him through the roof. Apex is v^2 / 2g, and g here is
+	 * the PAWN's, not the world's: MovementGravityScale is 1.12 (Config/DefaultGame.ini, spec v9 §8),
+	 * so g = 980 * 1.12 = 1097.6 uu/s^2. 1050 reached 502 uu; 1550 reaches 1094 uu. The arena ceiling
+	 * is 1640 uu — the same ceiling DashExitVerticalSpeedMultiplier was clamped against — so this is
+	 * still ~546 uu clear of it and a jar-jump cannot be capped by the roof.
+	 *
+	 * CHANGE THIS AND Config/DefaultGame.ini TOGETHER. This class is UCLASS(config = Game,
+	 * defaultconfig): the ini's pinned OysterJarJumpZVelocity OVERWRITES this default at load, so a
+	 * header-only edit is a no-op in game and leaves the header lying to whoever reads it for the
+	 * shipped number. Same rule OysterPicklerPullRadiusUU below states for itself.
+	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Jar-Jump Z Velocity (uu/s)", ClampMin = "0.0", ClampMax = "3000.0", UIMin = "400.0", UIMax = "1600.0"))
-	float OysterJarJumpZVelocity = 1050.f;
+	float OysterJarJumpZVelocity = 1550.f;
 
 	/** How close to a jar Oyster must be standing for the jar-jump to trigger instead of a jump. */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Oyster", meta = (DisplayName = "Jar-Jump Stand Radius (uu)", ClampMin = "20.0", ClampMax = "400.0", UIMin = "50.0", UIMax = "200.0"))

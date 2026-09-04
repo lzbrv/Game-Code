@@ -2543,7 +2543,7 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 			//
 			// This runs the INSTIGATOR's outgoing passives and the TARGET's incoming ones — Chut's
 			// Chud is "30% less damage from body shots", and a body shot is this line. It is a no-op
-			// for a Mannequin and for every player who has not picked a character, so mode A and bots
+			// for a Mannequin and for every player who has not picked a character, so bots
 			// are unaffected.
 			//
 			// *** X's VULNERABLE IS NOT APPLIED HERE, AND MUST NOT BE. *** "+25% damage from all

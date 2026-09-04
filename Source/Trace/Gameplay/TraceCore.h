@@ -70,28 +70,24 @@ class USkeletalMeshComponent;
 class UStaticMesh;
 class UStaticMeshComponent;
 
-/**
- * Declared in TraceSettings.h. Forward declared (legal: the underlying type is fixed) so that this
- * header stays free of the 110 kB settings header — every other file in the module includes this
- * one, and most of them only ever need IsModeB().
- */
-enum class ETraceScoringMode : uint8;
-
 // =================================================================================================
-// MODE B — THE THROWABLE, INTERCEPTABLE CORE (spec v4 §7)
+// THE THROWABLE, INTERCEPTABLE CORE (spec v4 §7)
 //
-// Everything above this line describes MODE A, which is unchanged and still the default. Mode B is
-// a second ruleset living behind UTraceSettings::ScoringMode, and it is built as an ADDITION to the
-// model above rather than a replacement:
+// HOW THIS GOT ITS SHAPE. Everything above this line was written for the ENDZONE ruleset, where the
+// Core was a possession status and LMB started a 0.5 s hover-pass; spec v4 §7 added a second ruleset
+// behind an A/B toggle in which the Core is a physical object and LMB throws it. The endzone ruleset
+// has since been REMOVED — goals is simply the game — but the addition-not-replacement shape it was
+// built in is still exactly what the code looks like, and that is worth knowing before reading it:
 //
 //   * possession, the trace, the turnover grace, the kill steal, the parry and the fallback are the
-//     SAME code. GrantTo() is still the single funnel; ReleaseHolder() is still the single exit.
-//   * what mode B adds is one extra place the Core can be: LOOSE. bLoose is true from the moment a
-//     throw leaves the holder's hands until somebody takes it (or the reset timer fires).
-//   * LMB is mode-dependent. RequestPassInput(true) starts the 0.5 s hover-pass in mode A and
-//     CHARGES A THROW in mode B (spec v13 §6 — the press winds the throw up, the RELEASE launches
-//     it instantly), so every existing caller — a human's mouse, DoPassPressed, the bots'
-//     ApplyPassInput — reaches the right verb without knowing the mode exists.
+//     SAME code they were under the old ruleset. GrantTo() is still the single funnel; ReleaseHolder()
+//     is still the single exit.
+//   * what the thrown Core added is one extra place it can be: LOOSE. bLoose is true from the moment
+//     a throw leaves the holder's hands until somebody takes it (or the reset timer fires).
+//   * LMB CHARGES A THROW (spec v13 §6 — the press winds the throw up, the RELEASE launches it
+//     instantly). The entry point is still called RequestPassInput, because every caller — a human's
+//     mouse, DoPassPressed, the bots' ApplyPassInput — reached the verb through it and none of them
+//     had to learn the mode existed. The hover-pass it used to reach is gone with its ruleset.
 //
 // WHAT THIS IS DELIBERATELY *NOT*. Spec v2 deleted a physical Core built from a
 // UProjectileMovementComponent, a pickup sphere and a replicated "loose" enum, and that model had a
@@ -110,15 +106,12 @@ enum class ETraceScoringMode : uint8;
 //     indivisible: any re-entrant throw / pickup / reset while one is in progress is refused
 //     outright rather than interleaved.
 //
-// Scoring in mode B is a discrete GOAL at each end, never the full-width endzone. The geometry is
-// never reconstructed here: it is read from the goal volumes ATraceArenaBuilder already builds
-// (ATraceEndzone::IsGoalVolume / IsZoneActive / GetZoneBounds), with RegisterGoalVolume as a hook
-// for any other system that owns a goal. Asking the volume that scores is what keeps the goal a
+// Scoring is a discrete GOAL at each end, never the full-width endzone the old ruleset used. The
+// geometry is never reconstructed here: it is read from the goal volumes ATraceArenaBuilder already
+// builds (ATraceEndzone::IsGoalVolume / IsZoneActive / GetZoneBounds), with RegisterGoalVolume as a
+// hook for any other system that owns a goal. Asking the volume that scores is what keeps the goal a
 // player can see and the goal that awards points the same box, across the half-time side switch and
 // any change to field size.
-//
-// WHICH MODE IS BEING PLAYED is likewise not stored here. ATraceGameState publishes it and this
-// class asks (IsModeB()) at the point of use.
 // =================================================================================================
 
 /** Why the Core changed hands. Logging, kill-feed and (for the grace rule) behaviour. */
@@ -142,8 +135,8 @@ enum class ETraceCoreGrantReason : uint8
 	// "Turnovers in game state b should retain the grace period from game state a. However,
 	// teammates picking up the core should not have a grace period." Interception crosses teams and
 	// buys the 0.5 s trace grace; recovery does not and buys nothing. Splitting them here means the
-	// grace decision is made by the same `AreAllies(PreviousTeam, NewTeam)` line mode A uses, and
-	// the reason is only what the log and the kill feed print.
+	// grace decision is made by the same `AreAllies(PreviousTeam, NewTeam)` line every other grant
+	// uses, and the reason is only what the log and the kill feed print.
 
 	/** A loose Core taken by a player on the OTHER team from the one that last held it. */
 	Interception = 5,
@@ -312,14 +305,14 @@ public:
 	UPROPERTY(Replicated)
 	float PassCooldownEndServerTime = 0.f;
 
-	// --- Mode B state. All of it is inert, and stays at these defaults, in mode A. ----------------
+	// --- Loose-Core state. Inert, at these defaults, whenever somebody is holding it. -------------
 
 	/**
-	 * MODE B. True while the Core is in flight or resting on the ground with no holder.
+	 * True while the Core is in flight or resting on the ground with no holder.
 	 *
-	 * This is the state spec v2 deleted, brought back deliberately and confined to mode B: in mode A
-	 * it is false for the entire match and every mode-B branch below is dead code. It is NOT the old
-	 * ECoreState enum — there is exactly one extra bit of state ("is it out in the world"), because
+	 * This is the state spec v2 deleted, brought back deliberately by spec v4 §7 (and, while the A/B
+	 * scoring toggle existed, confined to mode B, where it was false for a whole endzone match). It
+	 * is NOT the old ECoreState enum — there is exactly one extra bit of state ("is it out in the world"), because
 	 * "in flight" versus "at rest" is a fact about LooseVelocity and not something anybody needs
 	 * replicated separately.
 	 */
@@ -378,7 +371,7 @@ public:
 	UPROPERTY(Replicated)
 	FVector_NetQuantize LooseVelocity = FVector::ZeroVector;
 
-	// --- SPEC v25 §2. The turnover window. Inert (None / empty) outside it and in mode A. ----------
+	// --- SPEC v25 §2. The turnover window. Inert (None / empty) outside it. -----------------------
 
 	/**
 	 * THE TEAM THAT DROPPED IT, i.e. the team that is LOCKED OUT. None = no turnover is running.
@@ -418,7 +411,7 @@ public:
 	UPROPERTY(Replicated)
 	TObjectPtr<ATraceCharacter> PullWinner = nullptr;
 
-	// --- SPEC v28 §7. The full-charge deadline. Inert (-1) in mode A and whenever nobody is charging.
+	// --- SPEC v28 §7. The full-charge deadline. Inert (-1) whenever nobody is charging. -----------
 	/**
 	 * SERVER TRUTH. Shared-clock instant this holder's charge reached FULL, or < 0 when it has not.
 	 *
@@ -533,9 +526,7 @@ public:
 	 *                        callers hand over the SURFACE and never have to know the ball's size.
 	 * @param LockedOutTeam   Refused the Core for the reset window (spec v25 §2's turnover clock).
 	 *                        ETraceTeam::None at a half start, where both teams may contest it.
-	 * @param FavouredTeam    Mode A has no loose Core at all (the Core is a possession status there),
-	 *                        so mode A parks at the same point and grants to this team exactly as it
-	 *                        always did. It is also the backstop in mode B: see
+	 * @param FavouredTeam    The backstop when nobody contests the kickoff: see
 	 *                        TraceCoreTuning::ContestedKickoffBackstopSeconds. NOT named FallbackTeam:
 	 *                        ATraceCore already has a member of that name and MSVC C4458 makes the
 	 *                        shadow a hard error on Windows, which macOS cannot even warn about.
@@ -625,46 +616,18 @@ public:
 #endif // !UE_BUILD_SHIPPING
 
 	// =============================================================================================
-	// MODE B — scoring mode, the throw, the loose Core, the goals
+	// The throw, the loose Core, the goals
 	//
-	// Every function here is a no-op (or returns the mode-A answer) while ScoringMode is mode A, so
-	// callers never have to branch on the mode themselves.
+	// This block used to be gated on IsModeB() — every function here was a no-op, or returned the
+	// endzone ruleset's answer, whenever the A/B toggle said mode A. The toggle and that ruleset are
+	// gone, so these are simply the game and the gate has been removed rather than pinned to true.
 	// =============================================================================================
 
-	/**
-	 * True when this match is playing mode B: goals, and a Core that can be thrown and intercepted.
-	 *
-	 * ASKED OF ATraceGameState, EVERY TIME, and never cached here. The mode is published once by
-	 * ATraceGameMode::PublishScoringMode() from the travel URL and replicated on the GameState,
-	 * which makes it the one legal answer; a copy latched on this actor would be a second source of
-	 * truth for a fact that decides what this actor IS, and the two would eventually disagree on
-	 * exactly the frame it mattered.
-	 */
-	bool IsModeB() const;
-
-	/** Mode test for anybody holding only a UObject. False when there is no match yet. */
-	static bool IsModeB(const UWorld* World);
-
-	/**
-	 * Server. "The scoring mode has just been published; reconcile now."
-	 *
-	 * NOT A SETTER, despite the name it kept so that ATraceGameMode::PublishScoringMode still
-	 * compiles. It does not store the mode — ATraceGameState does, and this class asks. What it does
-	 * is run the mode-change reconciliation on THIS frame rather than on the next tick, which
-	 * matters because the frame a mode is published is also the frame the arena arms the other pair
-	 * of volumes and the GameMode kicks off.
-	 *
-	 * @p PublishedMode is compared against what the GameState is actually reporting, and a
-	 * disagreement is logged rather than obeyed: if those two ever differ, the ordering bug is the
-	 * thing worth knowing about, and silently preferring either one would hide it.
-	 */
-	void SetScoringMode(ETraceScoringMode PublishedMode);
-
-	/** MODE B. True while the Core is loose in the world with no holder. Always false in mode A. */
+	/** True while the Core is loose in the world with no holder. */
 	bool IsLoose() const { return bLoose; }
 
 	/**
-	 * MODE B. True while a loose Core is sitting still on something rather than flying.
+	 * True while a loose Core is sitting still on something rather than flying.
 	 *
 	 * Server truth. Exposed for DEMO 29 §3's capture log line, which has to be able to say that the
 	 * ball in the photograph is PARKED on the pillar and not caught mid-bounce over it — a
@@ -687,7 +650,7 @@ public:
 	// these is reading the server's answer late rather than a guess of its own.
 	// =============================================================================================
 
-	/** True while a registered turnover's lockout window is still running. False in mode A. */
+	/** True while a registered turnover's lockout window is still running. */
 	bool IsTurnoverActive() const;
 
 	/** The team that DROPPED the Core and is locked out of it. None when no turnover is running. */
@@ -1232,9 +1195,10 @@ public:
 	/**
 	 * The centre of the goal @p AttackingTeam scores in, for bot steering and HUD markers.
 	 *
-	 * In mode B this is the narrow goal mouth; in mode A there are no goals and this returns false,
-	 * which is the caller's cue to keep using the endzone. Answered from the same boxes that score,
-	 * so a bot cannot run at a goal the rule does not recognise.
+	 * The narrow goal mouth. False when no armed goal defends against @p AttackingTeam — before the
+	 * arena has built, on a client that has not received it, or on a map with no goals at all — which
+	 * is the caller's cue to steer at nothing rather than at a guess. Answered from the same boxes
+	 * that score, so a bot cannot run at a goal the rule does not recognise.
 	 */
 	static bool GetAttackGoalCentre(const UWorld* World, ETraceTeam AttackingTeam, FVector& OutCentre);
 
@@ -1258,9 +1222,9 @@ public:
 	 * model is: ATraceBotController would otherwise have to rebuild it from the arena's constants and
 	 * would silently disagree with the rule the moment either changed.
 	 *
-	 * @return false in mode A, and false in mode B if the armed goal is not a ring (an externally
-	 *         registered box goal, for instance) - in which case the caller should fall back to
-	 *         GetAttackGoalBox.
+	 * @return false when there is no armed goal for this team, and false when the armed goal is not
+	 *         a ring (an externally registered box goal, for instance) - in which case the caller
+	 *         should fall back to GetAttackGoalBox.
 	 */
 	static bool GetAttackGoalRing(const UWorld* World, ETraceTeam AttackingTeam, FVector& OutCentre,
 		float& OutRadius, FVector& OutAxis);
@@ -1347,10 +1311,10 @@ public:
 	static float GetThrowVelocityInheritanceDown();
 
 	/**
-	 * MODE B. The inherited term on its own: @p Thrower's current velocity times the fraction above,
-	 * with spec v31 §2's down-scale applied to a descending Z.
+	 * The inherited term on its own: @p Thrower's current velocity times the fraction above, with
+	 * spec v31 §2's down-scale applied to a descending Z.
 	 *
-	 * Zero for a null or non-pawn actor, and zero in mode A, so it is safe to add unconditionally.
+	 * Zero for a null or non-pawn actor, so it is safe to add unconditionally.
 	 */
 	static FVector GetInheritedThrowVelocity(const AActor* Thrower);
 
@@ -2359,7 +2323,7 @@ private:
 	 * live match cannot be asked to arrange on cue. Every check the harness makes afterwards goes
 	 * through CanPullNow / RequestPullInput / ServerTickTurnover — the real ones.
 	 *
-	 * @return false when the Core could not be put loose (mode A, a locked state, no team).
+	 * @return false when the Core could not be put loose (a locked state, no team).
 	 */
 	bool DebugRegisterTurnover(ETraceTeam DroppingTeam, const FVector& Where);
 
@@ -2516,17 +2480,6 @@ private:
 	bool bMomentumTestRun = false;
 #endif // !UE_BUILD_SHIPPING
 
-	/**
-	 * Called when the observed scoring mode changes. Normalises anything the new mode cannot
-	 * represent — in practice, a Core that is loose when mode A is selected, which mode A has no
-	 * pickup for and would leave lying there forever.
-	 *
-	 * It does NOT touch the scoring volumes. ATraceArenaBuilder builds both pairs and arms the
-	 * right one (ATraceEndzone::SetZoneActive), so a second arming pass here would be one system
-	 * fighting another over the same flag.
-	 */
-	void OnScoringModeChanged();
-
 
 	// --- Server state ----------------------------------------------------------------------------
 
@@ -2625,8 +2578,9 @@ private:
 	 * Set immediately before the one GrantTo() call that follows a loose pickup, and consumed (and
 	 * cleared) inside it.
 	 *
-	 * A single-use override rather than an extra parameter on GrantTo, because GrantTo is the shared
-	 * funnel both modes drive and mode A must not grow an argument it can only ever pass None to.
+	 * A single-use override rather than an extra parameter on GrantTo, because GrantTo is the funnel
+	 * EVERY grant drives — kickoff, pass, kill steal, fallback — and only this one path has an answer
+	 * to give it.
 	 */
 	ETraceTeam GraceOverrideTeam = ETraceTeam::None;
 
@@ -2672,7 +2626,7 @@ private:
 	 */
 	ETraceTeam ContestedFallbackTeam = ETraceTeam::None;
 
-	/** Shared-clock time the holder may next throw. Mirrors the pass cooldown's role in mode A. */
+	/** Shared-clock time the holder may next throw. The throw's own version of a pass cooldown. */
 	float ThrowCooldownEndServerTime = 0.f;
 
 	// --- SPEC v13 §6, the charge. Server truth and the owning machine's prediction, side by side. ---
@@ -2979,10 +2933,6 @@ private:
 	/** Refreshed on a slow cadence so the half-time side switch is picked up without polling cost. */
 	TArray<FTraceGoalBox> GoalBoxes;
 	float GoalBoxRefreshTime = 0.f;
-
-	/** The mode OnScoringModeChanged() has already acted on, so a steady mode costs one compare. */
-	bool bAppliedModeB = false;
-	bool bModeEverApplied = false;
 
 #if !UE_BUILD_SHIPPING
 	// --- Trace.ModeB.Verify scenario state (diagnostics only) --------------------------------------
