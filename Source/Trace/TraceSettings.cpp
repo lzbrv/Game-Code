@@ -1552,6 +1552,7 @@ namespace
 			// designer to touch it. The properties exist now and the same line reads 32 bound, 0 on
 			// built-in defaults. Listed here, on the pass that introduces them, for the v8 reason.
 			{ TEXT("bSurfEnabled"),                    EKnobType::Bool,  TEXT("Patch 28 §5: master switch. False restores the engine's ComputeSlideVector / LimitAirControl / CanStepUp on every surface, i.e. the pre-patch air game [by-name bind]") },
+			{ TEXT("bSurfBlocksJump"),                 EKnobType::Bool,  TEXT("Buttress pass, owner item 7: a jump press is refused for as long as IsSurfing() is true, so a rider cannot hop off the middle of a ride. Refused inside DoJump, so it is predicted and identical on client and server [by-name bind]") },
 			{ TEXT("SurfMinNormalZ"),                  EKnobType::Float, TEXT("Patch 28 §5: FLOOR of the surf band (normal Z). Surfable is this < Nz < the LIVE walkable limit, so a face you can stand on is never surfable. Keep it above WallJumpMaxNormalZ - wall, surf plane and floor must not overlap [by-name bind]") },
 			{ TEXT("SurfOverbounce"),                  EKnobType::Float, TEXT("Patch 28 §5: Source's PM_ClipVelocity overbounce. 1.0 = a pure plane projection; above 1 the ramp bounces you, below 1 you sink into it [by-name bind]") },
 			{ TEXT("SurfContactGraceSeconds"),         EKnobType::Float, TEXT("Patch 28 §5: how long the surf state survives the last contact, so a fan of facets does not flicker it (and the ceiling hanging off it) once per joint. NOT a coyote time [by-name bind]") },

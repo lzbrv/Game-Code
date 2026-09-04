@@ -2357,6 +2357,30 @@ public:
 	bool bSurfEnabled = true;
 
 	/**
+	 * Whether a jump press is REFUSED for as long as the pawn is surfing.
+	 *
+	 * The owner's request, verbatim: "A player should not be able to jump while surfing on the
+	 * buttresses." True is that; false is the behaviour every build before the buttress pass had,
+	 * where a press mid-ride either took the ordinary air jump the raised JumpMaxCount allows or, with
+	 * a wall window open, a wall jump off the ramp.
+	 *
+	 * WHY IT IS A RULE AND NOT A SIDE EFFECT OF THE GEOMETRY. A surf plane is not a wall, so it never
+	 * opens a wall-jump window by itself — but JumpMaxCount is 2 on this project (the wall jump needs
+	 * the engine to ASK a second time), and UTraceCharacterMovementComponent::DoJump's ordinary exit
+	 * would otherwise hand a rider a free vertical launch off the middle of a ride. On a 1096 uu wall
+	 * run that is the difference between "hold the strafe and read the curve" and "hop up the face".
+	 *
+	 * PREDICTED, AND ON BOTH MACHINES. The refusal is inside DoJump, which is the engine's own
+	 * predicted jump entry point, and it tests IsSurfing(), whose two inputs (SurfContactRemaining and
+	 * SurfPlaneNormal) already ride the saved move. A replay therefore refuses exactly the presses the
+	 * first run refused, and the server refuses the same ones — see the block comment at the refusal.
+	 *
+	 * Bound BY NAME as "bSurfBlocksJump".
+	 */
+	UPROPERTY(config, EditAnywhere, Category = "Movement|Surf", meta = (DisplayName = "No Jump While Surfing [buttress pass, owner item 7]"))
+	bool bSurfBlocksJump = true;
+
+	/**
 	 * FLOOR OF THE SURF BAND, as a surface normal Z. A face is surfable when
 	 *
 	 *     this  <  Normal.Z  <  GetWalkableFloorZ()

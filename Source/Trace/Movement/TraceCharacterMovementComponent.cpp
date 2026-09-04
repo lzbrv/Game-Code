@@ -886,6 +886,21 @@ void UTraceCharacterMovementComponent::BeginPlay()
 				MaxWalkSpeed,
 				GetSurfExitCarrySeconds(), GetSurfExitCarryBleedScale(), GetSurfExitRolloutRetention(),
 				GetSurfSpeedCeilingMax(), IsSurfLegacyExit() ? 1 : 0);
+
+			// BUTTRESS PASS, ITEM 7, on this line rather than a sixth one: it is one bool, and it
+			// belongs with the entry rule it is the mirror of.
+			//
+			// *** READING IT HERE IS WHAT PUTS IT IN THE MOVEKNOB REPORT AT ALL. *** That report walks
+			// TraceMoveKnob's bind map, and a name only enters the map when something RESOLVES it —
+			// so a knob first read from DoJump would be missing from the report on every run where
+			// nobody pressed jump before BeginPlay's sweep, which is all of them. MEASURED: before
+			// this call the report listed 32 bound / 5 fallback with bSurfBlocksJump absent, and
+			// Trace.VerifyKnobs said "OK bSurfBlocksJump = true" the whole time — i.e. the property
+			// was fine and the hygiene line simply could not see it.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("MOVECFG-BUT NO JUMP WHILE SURFING  rule=%d (owner item 7; false restores the "
+				     "pre-buttress behaviour, where a mid-ride press armed the wall-jump input buffer)"),
+				DoesSurfBlockJump() ? 1 : 0);
 			}
 
 			// The knob hygiene check the project's own history demands. A name-bound knob that does
@@ -1804,6 +1819,15 @@ float UTraceCharacterMovementComponent::GetWallJumpMaxNormalZ() const
 bool UTraceCharacterMovementComponent::IsSurfEnabled() const
 {
 	return TraceMoveKnob::Bool(TEXT("bSurfEnabled"), true);
+}
+
+bool UTraceCharacterMovementComponent::DoesSurfBlockJump() const
+{
+	// BUTTRESS PASS, OWNER ITEM 7. False restores the pre-pass behaviour, where a press mid-ride took
+	// the ordinary air jump. Gated on IsSurfEnabled() as well so that turning surf off cannot leave a
+	// jump-refusal rule hanging off a mechanic that no longer exists — the same shape as
+	// IsSurfGroundEntryEnabled()'s gate, and for the same reason.
+	return IsSurfEnabled() && TraceMoveKnob::Bool(TEXT("bSurfBlocksJump"), true);
 }
 
 float UTraceCharacterMovementComponent::GetSurfMinNormalZ() const
@@ -4104,6 +4128,61 @@ bool UTraceCharacterMovementComponent::CanAttemptJump() const
 
 bool UTraceCharacterMovementComponent::DoJump(bool bReplayingMoves, float DeltaTime)
 {
+	// =============================================================================================
+	// OWNER ITEM 7 — NO JUMP WHILE SURFING. FIRST, AND BEFORE ANYTHING IS TOUCHED.
+	//
+	// "A player should not be able to jump while surfing on the buttresses."
+	//
+	// WHY IT IS THE FIRST STATEMENT IN THE FUNCTION AND NOT A CLAUSE FURTHER DOWN. Everything below
+	// this point has a SIDE EFFECT that a later refusal cannot undo:
+	//
+	//   * IsSlideJumpAvailable() is read and EndSlide() is called, which charges the between-slides
+	//     cooldown. You cannot be sliding and surfing at once (surf implies airborne) so this is not
+	//     reachable today — but "not reachable today" is exactly how the next mantle or dash state
+	//     ends up spending a cooldown on a refused press.
+	//   * Super::DoJump() writes Velocity.Z = max(Z, JumpZVelocity). The wall-jump branch below has to
+	//     put that back by hand from PreJumpVelocity, and a rider's velocity mid-ride is the single
+	//     most correction-sensitive quantity in this file.
+	//   * The wall-jump branch ARMS WallJumpInputBufferRemaining on a "no wall yet" refusal. A press
+	//     made mid-ride is not a press that was one tick early for a wall; buffering it would fire a
+	//     wall jump the instant the ride ended next to a wall, which is the same free launch by a
+	//     slower route.
+	//
+	// Refusing here does none of those things: it returns false having read one bool and one clock,
+	// and ACharacter::CheckJumpInput does not increment JumpCurrentCount for a DoJump that returned
+	// false, so the press is simply spent.
+	//
+	// IDENTICAL ON BOTH MACHINES, WHICH IS THE PART THAT MATTERS FOR A PREDICTED MOVE. The test is
+	// IsSurfing(), whose entire state is SurfContactRemaining and SurfPlaneNormal, and both of those
+	// already ride the saved move (SavedSurfContactRemaining / SavedSurfPlaneNormal — see the
+	// PREDICTION block in the header). So:
+	//   * the owning client refuses the press during PerformMovement;
+	//   * the server, replaying the same ServerMove against the same geometry, has the same clock and
+	//     the same normal and refuses it too;
+	//   * a correction replay restores both fields before re-running the move, so the replay refuses
+	//     the same presses the first run did.
+	// Nothing new is added to the saved move, because nothing new is remembered.
+	//
+	// WHAT IT DELIBERATELY DOES NOT DO: it does not touch the grace clock. IsSurfing() stays true for
+	// GetSurfContactGraceSeconds() after the last facet contact, so a press in that window is refused
+	// too. That is intended — the grace is what stops a fan of facets flickering the ride state, and a
+	// jump that only worked in the gaps between facets would be a frame-timing exploit, not a move.
+	// The moment the ride genuinely ends (the clock runs out, or the pawn lands) the jump is back.
+	// =============================================================================================
+	if (DoesSurfBlockJump() && IsSurfing())
+	{
+#if !UE_BUILD_SHIPPING
+		// COUNTED, so "you cannot jump while surfing" is a number in Trace.Move.SurfReport rather than
+		// a claim in this comment. Only on the machine that owns the press, and never on a replay, or
+		// one refused press would be counted several times by a single correction.
+		if (CharacterOwner != nullptr && !CharacterOwner->bClientUpdating && !bReplayingMoves)
+		{
+			++SurfJumpsRefused;
+		}
+#endif
+		return false;
+	}
+
 	// Capture BEFORE anything is touched: EndSlide() below rewrites every one of these.
 	const bool bSlideJump = IsSlideJumpAvailable();
 	const bool bWellTimed = IsSlideJumpWellTimed();

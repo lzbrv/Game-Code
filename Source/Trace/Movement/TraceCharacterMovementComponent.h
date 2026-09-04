@@ -2165,8 +2165,22 @@ protected:
 	/**
 	 * Whether a WALKING pawn that leans into a surf plane leaves the ground and starts a ride.
 	 * Off restores "a rail is a thing you scrape along", which is the whole of complaint 4(b).
+	 *
+	 * SINCE THE BUTTRESS PASS THIS IS ALSO THE ONLY WAY ONTO THE SIDE-WALL RIDE. The wall run has no
+	 * walkable segment at all any more (owner item 5), so "run at it and lean in" is the entrance —
+	 * see the block comment in TraceSideRampProfile.h. Turning this off does not merely make the rails
+	 * scrape, it closes the wall run to anyone not already airborne.
 	 */
 	bool IsSurfGroundEntryEnabled() const;
+
+	/**
+	 * Whether a jump press is REFUSED while IsSurfing() is true (owner item 7).
+	 *
+	 * Refused inside DoJump — the engine's own predicted entry point — so client and server refuse the
+	 * same presses and a correction replay refuses them again. See the refusal itself for why it is at
+	 * the very top of that function rather than beside the wall-jump branch.
+	 */
+	bool DoesSurfBlockJump() const;
 
 	/**
 	 * How much of the approach must be heading INTO the face before a floor-level run becomes a ride,
@@ -2903,6 +2917,16 @@ protected:
 	int32 SurfRolloutCount = 0;
 	float SurfRolloutGainSum = 0.f;
 	int32 SurfGroundEntries = 0;
+
+	/**
+	 * BUTTRESS PASS, OWNER ITEM 7, COUNTED. Jump presses DoJump refused because IsSurfing() was true.
+	 *
+	 * A number rather than a comment for the reason every other counter here is one: "a player cannot
+	 * jump while surfing" is only a claim until a run shows presses arriving and being refused, and a
+	 * zero here during a ride with jump held is the failure — it means the presses never reached
+	 * DoJump at all and the rule was never exercised.
+	 */
+	int32 SurfJumpsRefused = 0;
 
 	/** World time the current surf's correction-attribution window closes. Never saved. */
 	float SurfAttributionUntil = -1000.f;

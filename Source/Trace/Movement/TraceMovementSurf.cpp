@@ -738,6 +738,21 @@ namespace TraceMovementSurf
 	static FSurfApproachSample& RigApproach() { static FSurfApproachSample S; return S; }
 	static FVector& RigGroundStart()   { static FVector V = FVector::ZeroVector; return V; }
 
+	/**
+	 * -TraceSurfJumpTest, the BUTTRESS PASS ITEM 7 ARM: hold JUMP for the whole of every ride the
+	 * approach rig buys, and count what happens.
+	 *
+	 * It exists because "a player cannot jump while surfing" is unfalsifiable without presses. The
+	 * counter UTraceCharacterMovementComponent::SurfJumpsRefused reads zero both when the rule is
+	 * working and when nothing ever pressed the key, and those two are the cases that have to be told
+	 * apart. So the rig presses, on every surfing frame, and reports three numbers per run: how many
+	 * presses it made, how many the component refused, and the highest upward Velocity.Z the pawn
+	 * reached during the ride. A jump that got through would put ~+420 (JumpZVelocity) in that last
+	 * column on the frame it fired; a ride that is only ever pushed up the face by the strafe does not.
+	 */
+	static int32& RigJumpPresses()     { static int32 N = 0; return N; }
+	static float& RigJumpPeakVz()      { static float V = 0.f; return V; }
+
 	/** The exit rig's entry ladder. The same five rungs as Patch 28, so the two tables line up. */
 	static constexpr float SurfExitLadder[] = { 400.f, 800.f, 1200.f, 1600.f, 2000.f };
 	static constexpr int32 SurfExitLadderCount = UE_ARRAY_COUNT(SurfExitLadder);
@@ -1035,6 +1050,17 @@ namespace TraceMovementSurf
 		return false;
 #else
 		static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfSideRampTest"));
+		return bFromCommandLine;
+#endif
+	}
+
+	/** -TraceSurfJumpTest. See RigJumpPresses(). Guarded like every other arm in this file. */
+	static bool SurfJumpTestArm()
+	{
+#if UE_BUILD_SHIPPING
+		return false;
+#else
+		static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceSurfJumpTest"));
 		return bFromCommandLine;
 #endif
 	}
@@ -2262,6 +2288,17 @@ void UTraceCharacterMovementComponent::TickSurfApproachRun(float DeltaSeconds)
 			Row.bSurfed = true;
 			Row.SurfSeconds += DeltaSeconds;
 
+			// BUTTRESS PASS ITEM 7. Hold jump for the whole ride, so the refusal is exercised rather
+			// than assumed. ACharacter::Jump() only sets bPressedJump; CheckJumpInput turns it into a
+			// DoJump call at the start of the next PerformMovement, which is the same path a human
+			// press takes — so this measures the shipped rule and not a harness-local copy of it.
+			if (SurfJumpTestArm())
+			{
+				CharacterOwner->Jump();
+				++RigJumpPresses();
+				RigJumpPeakVz() = FMath::Max(RigJumpPeakVz(), static_cast<float>(Velocity.Z));
+			}
+
 			// Once a ride HAS started the rig strafes it, because "can you gain speed by surfing into a
 			// ramp" is a question about the ride the approach buys, not only about the first frame.
 			DriveIdealSurfStrafe(CharacterOwner, PC, Probe.RunDirection, GetSurfPlaneNormal(),
@@ -2295,6 +2332,26 @@ void UTraceCharacterMovementComponent::TickSurfApproachRun(float DeltaSeconds)
 				*Row.ContactAt.ToCompactString(), Row.MinAfterContact, Row.PeakAfterContact,
 				Row.FinalSpeed, Row.bSurfed ? 1 : 0, Row.SurfSeconds, Row.bReachedFace ? 1 : 0,
 				Row.HighestZ, -Row.DeepestInset, *Row.EndedAt.ToCompactString());
+
+			// BUTTRESS PASS ITEM 7, per run, on its own line so it can be read next to the ride it
+			// belongs to. The three numbers together are the claim: presses ARRIVED, the component
+			// REFUSED them, and no upward launch appeared in the velocity while it did.
+			//
+			// READ THE PEAK Vz AGAINST GetJumpZVelocity(): a jump that got through writes
+			// Velocity.Z = max(Z, JumpZVelocity) on the frame it fires, so the peak would be at least
+			// that. A ride pushed up the face by the strafe alone stays well under it.
+			if (SurfJumpTestArm())
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("SURFJUMP     run %d/%d  rule=%s | jump presses made while surfing: %d | refused "
+					     "by the component so far: %d | peak upward Vz during the ride: %+.1f uu/s "
+					     "(JumpZVelocity is %.0f, so a jump that got through could not hide here)"),
+					RigRun() + 1, SurfApproachCount,
+					DoesSurfBlockJump() ? TEXT("ON") : TEXT("OFF"),
+					RigJumpPresses(), SurfJumpsRefused, RigJumpPeakVz(), JumpZVelocity);
+			}
+			RigJumpPresses() = 0;
+			RigJumpPeakVz() = 0.f;
 
 			++RigRun();
 			RigPhase() = ESurfRigPhase::Place;
@@ -2732,6 +2789,14 @@ void UTraceCharacterMovementComponent::LogSurfReport() const
 		     "landings that rolled a ride's descent into the floor: %d (mean +%.0f uu/s each)"),
 		*GetNameSafe(CharacterOwner), SurfGroundEntries, SurfRolloutCount,
 		SurfRolloutGainSum / static_cast<float>(FMath::Max(1, SurfRolloutCount)));
+
+	// BUTTRESS PASS ITEM 7. Its own line, beside the ground-entry count it is the mirror of: one says
+	// how many rides the ramp GAVE from the floor, the other how many exits off it the rule REFUSED.
+	UE_LOG(LogTraceGame, Display,
+		TEXT("SURFREPORT %-16s ITEM7  | rule %s | jump presses REFUSED because a ride was live: %d"),
+		*GetNameSafe(CharacterOwner),
+		DoesSurfBlockJump() ? TEXT("ON (no jump while surfing)") : TEXT("OFF (jumping mid-ride allowed)"),
+		SurfJumpsRefused);
 
 	UE_LOG(LogTraceGame, Display,
 		TEXT("SURFREPORT %-16s rides=%d closed=%d | entry mean %6.0f -> exit mean %6.0f uu/s "

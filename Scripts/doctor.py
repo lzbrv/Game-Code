@@ -133,7 +133,13 @@ if os.path.isdir(ext):
                     names[key] += 1
     print("\n         shipping map: {0} actor packages".format(total))
     print("         concave side ramps (SideRamp): {0}".format(names["SideRamp"]))
-    print("         surf rails (Surf_Rail):        {0}".format(names["Surf_Rail"]))
+    # ZERO IS THE RIGHT ANSWER FOR THE RAILS SINCE THE BUTTRESS PASS, and the line says so
+    # rather than leaving a reader to read a 0 as "my pull is broken". The owner asked for the
+    # free-standing lane rails to be removed ("remove the added surf ramps") and for the side
+    # walls to carry the ride instead; the 36 Surf_Rail_* actors were deleted from the map and
+    # ATraceArenaBuilder::bBuildSurfRails now defaults false, so a correct map has none.
+    print("         surf rails (Surf_Rail):        {0}  (0 is CORRECT - removed by the buttress "
+          "pass; the side walls are the ride now)".format(names["Surf_Rail"]))
     print("         old straight ramps (Kit_Ramp_03): {0}".format(names["Kit_Ramp_03"]))
     if names["SideRamp"] >= 4 and names["Kit_Ramp_03"] == 0:
         say(OK, "The shipping map on disk HAS the new concave side ramps.")

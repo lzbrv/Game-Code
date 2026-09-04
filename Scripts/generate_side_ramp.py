@@ -115,6 +115,7 @@ def read_design(header_path):
     wanted = {
         "kDepthUU": float, "kHeightUU": float, "kLengthUU": float,
         "kCrestOutFromWallUU": float, "kFacetCount": int, "kProfileExponent": int,
+        "kProfileStartFrac": float,
         "kOwnerRun": float, "kOwnerRise": float, "kOwnerWidth": float,
     }
     out = {}
@@ -125,6 +126,49 @@ def read_design(header_path):
                              .format(name, header_path))
         out[name] = caster(float(m.group(1)))
     return out
+
+
+# -----------------------------------------------------------------------------
+# THE BUILT FACE IS A SEGMENT OF THE OWNER'S CURVE, NOT THE WHOLE OF IT.
+#
+# kProfileStartFrac says where on the owner's parabola the built face starts. The
+# whole curve runs u = 0..1; this sweeps u = kProfileStartFrac..1 and translates
+# it so its toe is on the floor. See the long comment in TraceSideRampProfile.h
+# for WHY (the owner asked for a face that is not walkable anywhere, and a
+# parabola from u = 0 is walkable at its toe by construction).
+#
+# One function returns everything the sweep needs, so the shell, the trim and the
+# report cannot each hold their own copy of the arithmetic.
+# -----------------------------------------------------------------------------
+def face_curve(design):
+    """(y, z, slope) of the BUILT face at s in [0,1] along it, plus the full curve."""
+    D = design["kDepthUU"]
+    H = design["kHeightUU"]
+    P = int(design["kProfileExponent"])
+    u0 = design["kProfileStartFrac"]
+    if not (0.0 < u0 < 1.0):
+        raise SystemExit("FATAL: kProfileStartFrac {0} is not in (0,1); the built face would not be "
+                         "a segment of the owner's curve.".format(u0))
+    full_d = D / (1.0 - u0)
+    full_h = H / (1.0 - u0 ** P)
+    z_unbuilt = full_h * (u0 ** P)
+
+    def u_at(s):
+        return u0 + (1.0 - u0) * s
+
+    def y_at(s):
+        # full_d * (u - u0) collapses to D * s exactly, because full_d * (1 - u0) == D.
+        return D * s
+
+    def z_at(s):
+        return full_h * (u_at(s) ** P) - z_unbuilt
+
+    def slope_at(s):
+        # dz/dy on the FULL curve at this u. The face's own frame is a translation,
+        # so the slope is untouched by the truncation.
+        return P * full_h * (u_at(s) ** (P - 1)) / full_d
+
+    return y_at, z_at, slope_at, u_at, full_d, full_h, z_unbuilt
 
 
 # -----------------------------------------------------------------------------
@@ -160,8 +204,13 @@ def owner_profile(obj_path):
 
 def verify_profile(design, owner_obj):
     owner, run, rise = owner_profile(owner_obj)
-    n = design["kFacetCount"]
-    p = design["kProfileExponent"]
+    n = int(design["kFacetCount"])
+    p = int(design["kProfileExponent"])
+    u0 = design["kProfileStartFrac"]
+
+    # ---- (1) IS THE CURVE THIS SCRIPT SWEEPS THE OWNER'S CURVE? -------------
+    # Unaffected by the truncation: h = u^p is asserted over the WHOLE of the
+    # owner's measured run, so a change to kProfileExponent still fails here.
     worst = 0.0
     worst_u = 0.0
     for u, h in owner:
@@ -170,19 +219,72 @@ def verify_profile(design, owner_obj):
             worst, worst_u = abs(h - shipped), u
     print("VERIFY  owner ramp_shell: run {0:.4f} rise {1:.4f}, {2} stations"
           .format(run, rise, len(owner)))
-    print("VERIFY  shipped profile : h = u^{0}, {1} spans, D {2:.1f} uu x H {3:.1f} uu"
+    print("VERIFY  shipped profile : h = u^{0}, {1} spans, face D {2:.1f} uu x H {3:.1f} uu"
           .format(p, n, design["kDepthUU"], design["kHeightUU"]))
     print("VERIFY  MAX NORMALISED DEVIATION shipped-vs-owner: {0:.4e}  (at u = {1:.4f})"
           .format(worst, worst_u))
-    # A check that cannot fail proves nothing: 1e-3 normalised is 0.66 uu at this
+    # A check that cannot fail proves nothing: 1e-3 normalised is 1.1 uu at this
     # height, i.e. smaller than one facet's rise, and a genuinely different curve
     # (a circular arc through the same endpoints peaks 6e-2 away) fails it by 60x.
     if worst > 1e-3:
         raise SystemExit("FATAL: the shipped profile is NOT the owner's curve "
                          "(deviation {0:.4e} > 1e-3).".format(worst))
-    print("VERIFY  PASS - the shipped profile is the owner's curve.")
-    # And the same measurement for the circular arc this design deliberately is NOT,
-    # so the tolerance above is shown to be discriminating rather than generous.
+    print("VERIFY  PASS - the curve this script sweeps is the owner's curve.")
+
+    # ---- (2) AND IS THE *BUILT SEGMENT* A PIECE OF IT, IN PLACE? ------------
+    # The face is a TRUNCATION now, so (1) alone no longer covers the shipped
+    # geometry: the sweep could be mapped back onto the curve wrongly and (1)
+    # would still pass. So the ACTUAL BUILT HEIGHTS are compared against the
+    # OWNER'S MEASURED STATIONS, interpolated and re-normalised over the built
+    # segment only:
+    #
+    #     z_built(s) / kHeightUU   must equal   (h_owner(u) - h_owner(u0))
+    #                                           / (h_owner(1) - h_owner(u0))
+    #
+    # NOTHING ON THE LEFT COMES FROM face_curve's own derived quantities, which is
+    # the whole point: an earlier draft of this check divided by full_h and added
+    # z_unbuilt back, so the two cancelled and it passed with the truncation term
+    # deleted — a check that could not fail. MEASURED after the fix: setting
+    # z_unbuilt to 0 reports 5.2e-1, i.e. 516x the tolerance, and the run aborts.
+    y_at, z_at, _slope, u_at, full_d, full_h, z_unbuilt = face_curve(design)
+    face_h = design["kHeightUU"]
+    owner_u = [u for u, _h in owner]
+    owner_h = [h for _u, h in owner]
+
+    def owner_at(u):
+        if u <= owner_u[0]:
+            return owner_h[0]
+        for k in range(1, len(owner_u)):
+            if u <= owner_u[k]:
+                span = owner_u[k] - owner_u[k - 1]
+                t = 0.0 if span <= 0.0 else (u - owner_u[k - 1]) / span
+                return owner_h[k - 1] + t * (owner_h[k] - owner_h[k - 1])
+        return owner_h[-1]
+
+    owner_lo = owner_at(u0)
+    owner_span = owner_at(1.0) - owner_lo
+    if owner_span <= 0.0:
+        raise SystemExit("FATAL: the owner's curve does not rise over the built segment.")
+    seg_worst = 0.0
+    seg_worst_u = 0.0
+    for i in range(n + 1):
+        s_frac = i / float(n)
+        u = u_at(s_frac)
+        h_built = z_at(s_frac) / face_h                       # the geometry, as built
+        h_owner = (owner_at(u) - owner_lo) / owner_span       # the owner, over the same segment
+        d = abs(h_built - h_owner)
+        if d > seg_worst:
+            seg_worst, seg_worst_u = d, u
+    print("VERIFY  built segment   : u {0:.4f}..1.0000 of a full parabola {1:.1f} x {2:.1f} uu; "
+          "its lower {3:.1f} uu of rise is not built".format(u0, full_d, full_h, z_unbuilt))
+    print("VERIFY  MAX NORMALISED DEVIATION built-segment-vs-owner: {0:.4e}  (at u = {1:.4f})"
+          .format(seg_worst, seg_worst_u))
+    if seg_worst > 1e-3:
+        raise SystemExit("FATAL: the BUILT FACE does not lie on the owner's curve "
+                         "(deviation {0:.4e} > 1e-3).".format(seg_worst))
+    print("VERIFY  PASS - the built face is a segment of the owner's curve, in place.")
+
+    # ---- (3) the control, so the tolerance is shown to discriminate ---------
     arc_worst = max(abs(h - (1.0 - math.sqrt(max(0.0, 1.0 - u * u)))) for u, h in owner)
     print("VERIFY  (control) a circular arc through the same endpoints would deviate "
           "{0:.4e} - {1:.0f}x the tolerance. The tolerance discriminates."
@@ -279,7 +381,8 @@ def build_shell(design):
     H = design["kHeightUU"]
     L = design["kLengthUU"]
     N = int(design["kFacetCount"])
-    P = int(design["kProfileExponent"])
+
+    y_at, z_at, slope_at, _u_at, _fd, _fh, _z0 = face_curve(design)
 
     obj = Obj()
     deck = obj.group("sideramp_deck")
@@ -287,10 +390,10 @@ def build_shell(design):
     x0, x1 = -L * 0.5, L * 0.5
 
     def prof_y(i):
-        return D * i / N
+        return y_at(i / float(N))
 
     def prof_z(i):
-        return H * (i / float(N)) ** P
+        return z_at(i / float(N))
 
     def prof_normal(i):
         # ANALYTIC normal of the parabola at station i, not the facet's own.
@@ -298,7 +401,7 @@ def build_shell(design):
         # point is that it reads as a curve; the collision still uses the facet
         # planes (complex-as-simple traces geometry, not vertex normals), so this
         # changes how it LOOKS and not one degree of how it RIDES.
-        slope = P * H * (i / float(N)) ** (P - 1) / D
+        slope = slope_at(i / float(N))
         inv = 1.0 / math.sqrt(1.0 + slope * slope)
         return (0.0, -slope * inv, inv)
 
@@ -343,10 +446,9 @@ def build_shell(design):
 def build_trim(design, report):
     """Every neon line, as one mesh with two material slots and no collision."""
     D = design["kDepthUU"]
-    H = design["kHeightUU"]
     L = design["kLengthUU"]
-    N = int(design["kFacetCount"])
-    P = int(design["kProfileExponent"])
+
+    y_at, z_at, slope_at, _u_at, _fd, _fh, _z0 = face_curve(design)
 
     # ---- the owner's own dressing, in their units ---------------------------
     OWNER_RUN = design["kOwnerRun"]        # 4.20
@@ -383,10 +485,10 @@ def build_trim(design, report):
     lane = obj.group("sideramp_neon_lane")
     lip = obj.group("sideramp_neon_lip")
 
-    def surf(u):
-        """Point on the deck at normalised depth u, plus the outward normal there."""
-        y, z = D * u, H * (u ** P)
-        slope = P * H * (u ** (P - 1)) / D
+    def surf(s):
+        """Point on the deck at fraction s ALONG THE BUILT FACE, plus its outward normal."""
+        y, z = y_at(s), z_at(s)
+        slope = slope_at(s)
         inv = 1.0 / math.sqrt(1.0 + slope * slope)
         return (y, z), (0.0, -slope * inv, inv)
 
@@ -482,9 +584,16 @@ def main():
                 ("sideramp_neon_lip", (0.55, 0.92, 1.00))])
     trim_tris = sum(len(t) for _, t in trim.groups)
 
-    # The numbers a report has to quote, computed here rather than restated.
-    D, H, N, Pw = design["kDepthUU"], design["kHeightUU"], int(design["kFacetCount"]), int(design["kProfileExponent"])
-    facet_deg = [math.degrees(math.atan((H / D) * (2 * i + 1) / N)) for i in range(N)]
+    # The numbers a report has to quote, computed here rather than restated. The facet
+    # angles are CHORD angles, because complex-as-simple collision reports chord normals
+    # and those are what the C++ header's asserts and the in-game probe both measure.
+    D, H, N = design["kDepthUU"], design["kHeightUU"], int(design["kFacetCount"])
+    _y, _z, _slope, u_at, full_d, full_h, z_unbuilt = face_curve(design)
+    facet_deg = []
+    for i in range(N):
+        ya, za = _y(i / float(N)), _z(i / float(N))
+        yb, zb = _y((i + 1) / float(N)), _z((i + 1) / float(N))
+        facet_deg.append(math.degrees(math.atan((zb - za) / (yb - ya))))
     print("")
     print("SHELL   {0}  {1} triangles, {2} verts".format(shell_path, shell_tris, len(shell.v)))
     print("TRIM    {0}  {1} triangles, {2} verts".format(trim_path, trim_tris, len(trim.v)))
@@ -492,8 +601,11 @@ def main():
           "{3:+.3f}% to close on the length), {4} ribs total"
           .format(report["repeats"], report["period"], report["ideal_period"],
                   100.0 * (report["period"] / report["ideal_period"] - 1.0), report["ribs"]))
-    print("FACETS  {0} facets, {1:.3f} deg at the toe to {2:.3f} deg at the lip"
+    print("FACETS  {0} facets, {1:.3f} deg at the toe to {2:.3f} deg at the lip (CHORDS)"
           .format(N, facet_deg[0], facet_deg[-1]))
+    print("SEGMENT u {0:.4f}..1.0000 of a full parabola {1:.1f} uu x {2:.1f} uu; its lower "
+          "{3:.1f} uu of rise is NOT built (that is the part that would be walkable)"
+          .format(design["kProfileStartFrac"], full_d, full_h, z_unbuilt))
     print("SIZE    {0:.0f} uu long x {1:.0f} uu deep x {2:.0f} uu tall".format(
         design["kLengthUU"], D, H))
 

@@ -7,8 +7,17 @@
 // two band tangents from the LIVE numbers and reports the comparison either way.
 //
 // It reports on the way through rather than only on failure, because the pass line is the evidence:
-// "the shipped face spans 45.50..59.87 deg inside a live band of 44.77..63.26" is a measurement a
+// "the shipped face spans 46.90..61.16 deg inside a live band of 44.77..63.26" is a measurement a
 // report can quote, and "no error was logged" is not.
+//
+// WHAT THIS FILE HAD TO STOP CHECKING. Before the buttress rewrite the shipped ramp started at u = 0
+// and its lower half was walkable, so this function's headline test was "does it START walkable" —
+// the walk-up WAS the entrance and a ramp without one was unreachable. The owner has since asked for
+// a face that is not walkable anywhere, and the entrance is now the ground-entry rule in
+// UTraceCharacterMovementComponent::HandleImpact rather than a strip of geometry. So the sign of that
+// test is INVERTED here, not deleted: a toe facet that has become walkable is now the failure, and it
+// is the same failure it always was — an .ini that quietly moves the walkable limit up past 46.9
+// degrees turns this surface back into a staircase and nothing else would say so.
 // =================================================================================================
 #include "World/TraceSideRampProfile.h"
 
@@ -47,74 +56,80 @@ namespace TraceSideRampProfile
 		const double ShallowDeg = FMath::RadiansToDegrees(FMath::Atan(kShallowestFacetTangent));
 		const double SteepDeg = FMath::RadiansToDegrees(FMath::Atan(kSteepestFacetTangent));
 
-		// Where the handoff falls under the LIVE band, recomputed rather than quoted: the header's
-		// kFirstSurfableFacet was resolved against the literals, and the whole point of this function
-		// is that the literals may no longer be the band.
-		int32 LiveFirstSurfable = kFacetCount;
+		// HOW MUCH OF THE FACE THE LIVE BAND STILL ACCEPTS, COUNTED FACET BY FACET rather than
+		// asserted from the two ends. A band that has narrowed from the middle — somebody raises the
+		// walkable limit AND lowers SurfMinNormalZ — could leave both ends outside it while the count
+		// below is what says how much ride is actually left.
+		int32 SurfableFacets = 0;
+		int32 WalkableFacets = 0;
+		int32 WallFacets = 0;
 		for (int32 Facet = 0; Facet < kFacetCount; ++Facet)
 		{
-			if (FacetTangent(Facet) > LiveLoTan)
+			const double Tangent = FacetTangent(Facet);
+			if (Tangent <= LiveLoTan)
 			{
-				LiveFirstSurfable = Facet;
-				break;
+				++WalkableFacets;
+			}
+			else if (Tangent >= LiveHiTan)
+			{
+				++WallFacets;
+			}
+			else
+			{
+				++SurfableFacets;
 			}
 		}
 
-		const bool bStartsWalkable = kShallowestFacetTangent < LiveLoTan;
-		const bool bBecomesSurfable = kSteepestFacetTangent > LiveLoTan;
+		const bool bNeverWalkable = kShallowestFacetTangent > LiveLoTan;
 		const bool bNeverAWall = kSteepestFacetTangent < LiveHiTan;
+		const bool bAllSurfable = (SurfableFacets == kFacetCount);
 		const bool bDriftedFromLiterals =
 			FMath::Abs(LiveLoTan - kBandLoTangent) > 1e-3 || FMath::Abs(LiveHiTan - kBandHiTangent) > 1e-3;
 
-		const double LiveWalkDepth =
-			kDepthUU * static_cast<double>(LiveFirstSurfable) / static_cast<double>(kFacetCount);
-		const double LiveHandoffZ =
-			HeightAt(static_cast<double>(LiveFirstSurfable) / static_cast<double>(kFacetCount));
-
 		OutReason = FString::Printf(
-			TEXT("live band %.4f..%.4f deg (Nz %.4f..%.4f); shipped facets %.4f..%.4f deg; handoff at "
-			     "facet %d of %d = %.1f uu deep / %.1f uu up; walk-up %.1f uu deep, face %.1f uu deep and "
-			     "%.1f uu of vertical; headroom below the surf ceiling %.3f deg%s"),
+			TEXT("live band %.4f..%.4f deg (Nz %.4f..%.4f); shipped facets %.4f..%.4f deg over %.1f uu "
+			     "of depth and %.1f uu of rise; %d of %d facets surfable (%d walkable, %d wall); "
+			     "margins: toe %+.3f deg above the walkable limit, crest %+.3f deg below the ceiling%s"),
 			LiveLoDeg, LiveHiDeg, LiveWalkableFloorZ, LiveSurfMinNormalZ,
-			ShallowDeg, SteepDeg, LiveFirstSurfable, kFacetCount, LiveWalkDepth, LiveHandoffZ,
-			LiveWalkDepth, kDepthUU - LiveWalkDepth, kHeightUU - LiveHandoffZ,
-			LiveHiDeg - SteepDeg,
+			ShallowDeg, SteepDeg, kDepthUU, kHeightUU,
+			SurfableFacets, kFacetCount, WalkableFacets, WallFacets,
+			ShallowDeg - LiveLoDeg, LiveHiDeg - SteepDeg,
 			bDriftedFromLiterals
 				? TEXT("  [!! the band has MOVED from the tangents TraceSideRampProfile.h asserts "
 				       "against — update kBandLoTangent / kBandHiTangent and re-check the build asserts]")
 				: TEXT(""));
 
-		if (!bStartsWalkable)
+		if (!bNeverWalkable)
 		{
-			OutReason += TEXT("  FAIL: the ramp's first facet is not walkable — there is no way on to it.");
-		}
-		if (!bBecomesSurfable)
-		{
-			OutReason += TEXT("  FAIL: the ramp's steepest facet is still walkable — it is a run-up only.");
+			OutReason += TEXT("  FAIL: the toe facet is WALKABLE under the live band — the face is a "
+			                  "staircase, which is the owner's item 5 broken by an .ini.");
 		}
 		if (!bNeverAWall)
 		{
 			OutReason += TEXT("  FAIL: the ramp's steepest facet is past the surf ceiling — its top is a wall.");
 		}
+		if (bNeverWalkable && bNeverAWall && !bAllSurfable)
+		{
+			OutReason += TEXT("  FAIL: both ends are inside the band but some facet in the middle is not, "
+			                  "which means the live band is narrower than the face.");
+		}
 
-		return bStartsWalkable && bBecomesSurfable && bNeverAWall && !bDriftedFromLiterals;
+		return bAllSurfable && !bDriftedFromLiterals;
 	}
 
 	FString Describe()
 	{
 		return FString::Printf(
-			TEXT("owner's parabola z = H*(y/D)^2 (h=u^2 measured to 2.3e-5 on ramp_shell's 65 stations) "
-			     "at D %.0f uu x H %.0f uu x L %.0f uu, %d facets: walk-up %.1f uu deep climbing to %.1f uu "
-			     "(%.2f..%.2f deg), face %.1f uu deep with %.1f uu of vertical (%.2f..%.2f deg); crest at "
-			     "out %.0f (the pawn standoff's own face), toe at out %.0f; deck %.1f uu over the fillet's "
-			     "%.0f uu terrace edge; a capsule can reach Z %.1f, so %.1f uu of the face is ridable"),
-			kDepthUU, kHeightUU, kLengthUU, kFacetCount,
-			kWalkableDepthUU, kHandoffHeightUU,
+			TEXT("owner's parabola z = Hfull*u^2 (h=u^2 measured to 2.3e-5 on ramp_shell's 65 stations), "
+			     "ridden over u %.4f..1 of itself so no part of it is walkable: face %.0f uu deep x %.0f uu "
+			     "high x %.0f uu long, %d facets at %.2f..%.2f deg (the surf rails' own band edges); cut "
+			     "from a full parabola %.0f x %.0f with its lower %.0f uu of rise not built; crest at out "
+			     "%.0f (the pawn standoff's own face), toe at out %.0f; deck %.1f uu over the fillet's "
+			     "%.0f uu terrace edge; a capsule can reach Z %.1f, and all %.1f uu of that is ride"),
+			kProfileStartFrac, kDepthUU, kHeightUU, kLengthUU, kFacetCount,
 			FMath::RadiansToDegrees(FMath::Atan(kShallowestFacetTangent)),
-			FMath::RadiansToDegrees(FMath::Atan(FacetTangent(kFirstSurfableFacet - 1))),
-			kSurfableDepthUU, kSurfableVerticalUU,
-			FMath::RadiansToDegrees(FMath::Atan(FacetTangent(kFirstSurfableFacet))),
 			FMath::RadiansToDegrees(FMath::Atan(kSteepestFacetTangent)),
+			kFullDepthUU, kFullHeightUU, kUnbuiltRiseUU,
 			kCrestOutFromWallUU, kToeOutFromWallUU,
 			kHeightOverFilletEdgeUU, kFilletOuterTerraceTopUU,
 			kReachableTopUU, kReachableSurfableVerticalUU);

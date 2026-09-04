@@ -1277,13 +1277,31 @@ public:
 	/**
 	 * PATCH 28 §5. The four curved SURF RAILS in the outer lanes. See BuildSurfRails().
 	 *
-	 * Its own switch, like the banks' and the flanks', for the same reason: "the arena with the rails"
-	 * and "the arena without them" both have to be lookable-at while the movement feature they exist
-	 * for is being tuned, and an A/B of a movement mechanic against the geometry it runs on is worth
-	 * one bool.
+	 * *** DEFAULT FALSE SINCE THE BUTTRESS PASS, BY THE OWNER'S OWN INSTRUCTION. ***
+	 *
+	 *     "Remove the added surf ramps (not the curved buttresses on the side of the map)."
+	 *     "Essentially, the surf ramps work very well but they need to be positioned where the
+	 *      buttresses currently are."
+	 *
+	 * These rails ARE "the added surf ramps": four FREE-STANDING structures in the outer lanes at
+	 * |Y| 2644..3500, 616 uu tall, each with its own access ramp — measured on Arena_Baked, and
+	 * nowhere near the side walls at |Y| 4800. The thing the owner wants kept is the continuous curved
+	 * run against the wall, and the second sentence is the whole instruction: not two surf structures,
+	 * one, and at the wall. The wall run is now cut at these rails' own face angles
+	 * (TraceSideRampProfile::kToeTangent / kCrestTangent are the tangents of exactly the two degrees
+	 * BuildSurfRails cuts its arc between), so the ride the owner liked is what moved, not just its
+	 * name.
+	 *
+	 * NOT DELETED, and that is deliberate: BuildSurfRails() and every accessor it derives from the
+	 * live surf band are intact and still compiled, so flipping this back to true (or the
+	 * `Trace.Arena.SurfRails 1` cvar it already honours) restores them exactly. If the owner wants the
+	 * lane rails back alongside the wall run, that is one bool and no geometry work.
+	 *
+	 * The switch also still does its original job: "the arena with the rails" and "the arena without
+	 * them" both have to be lookable-at while the movement feature they exist for is being tuned.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Layout")
-	bool bBuildSurfRails = true;
+	bool bBuildSurfRails = false;
 
 	// --- THE SIDE-WALL SURF BANDS ------------------------------------------------------------------
 	//

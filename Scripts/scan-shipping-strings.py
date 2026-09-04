@@ -76,6 +76,14 @@ DEFAULT_FORBIDDEN = [
     # shipped build - and both are listed so the gate would SEE it if a guard were ever removed.
     "TraceSurfWalkUpTest",
     "TraceSurfApproachSpeed",
+    # The buttress pass's item-7 rig: it holds JUMP for the whole of every ride the approach rig
+    # buys, so "a player cannot jump while surfing" is measured against presses that actually
+    # arrived. Its arm returns false outright under UE_BUILD_SHIPPING and it lives inside
+    # TraceMovementSurf.cpp's file-level #if !UE_BUILD_SHIPPING, so it cannot be reached in a
+    # shipped build - listed here for the reason every switch above it is: the gate would SEE it
+    # if either guard were ever removed. NOTE that the RULE it tests is not a dev switch and DOES
+    # ship: bSurfBlocksJump is a UTraceSettings config property and is expected in the artefact.
+    "TraceSurfJumpTest",
 ]
 
 # A string we KNOW ships, used as a positive control. Without one of these, "zero

@@ -908,10 +908,12 @@ namespace TraceArenaConstants
 	// routes and hand the navmesh-less bots more to grind against. Instead everything here is either
 	// flush against a wall or above head height:
 	//
-	//   buttresses ... 30 pilasters standing on the perimeter, giving the walls a rhythm and a
-	//                  near-field object to judge distance and speed against
-	//   high rail .... a continuous glowing line at 1640 uu carried along the tops of the tall
-	//                  buttresses, which is what actually fills the upper half of a flank frame
+	//   buttresses ... 12 pilasters standing on the two END walls. The 26 that used to stand on the
+	//                  SIDE walls are gone: the side-wall ride replaced them (see the note where the
+	//                  SideButtresses table was). The side walls get their rhythm and their near-field
+	//                  speed reference from that run's own neon motif instead, 468 uu apart.
+	//   high rail .... a continuous glowing line at 1640 uu along both side walls, which is what
+	//                  actually fills the upper half of a flank frame
 	//   bridges ...... one beam per quadrant running from the top of a lane pylon out to the wall,
 	//                  so the pylons read as part of a structure instead of as loose columns
 	//   stripes ...... two bright floor lines per side, which the near-mirror floor doubles
@@ -920,10 +922,20 @@ namespace TraceArenaConstants
 	//
 	// AFTER THE SECTION 7 REBUILD the void this was written for is much smaller - the field is 9600
 	// wide rather than 12000, and the outer 1500 uu of each side is now a corner bank, which is
-	// terrain the player can stand on rather than empty floor. All of it is kept because all of it
-	// is either flush with a wall or above head height, so none of it fights the banks: the
-	// buttresses and corner pylons are built from Z = 0 and simply emerge from the bank they stand
-	// on, and the rail and bridges are at 1640 and 1240 uu, far above the 352 uu bank crest.
+	// terrain the player can stand on rather than empty floor. What is left is kept because it is
+	// either flush with a wall or above head height, so none of it fights the banks: the end
+	// buttresses and the corner pylons are built from Z = 0 and simply emerge from the ground they
+	// stand on, and the rail and bridges are at 1640 and 1240 uu, far above the 352 uu bank crest.
+	//
+	// AND AFTER THE BUTTRESS PASS one more rule applies to everything in this section: NOTHING MAY
+	// STAND ON THE SIDE-WALL RIDE. The ride line is |Y| 4000..4760 on both walls, floor to 1096 uu,
+	// for the whole 38400 uu length, and a solid inside that volume is a crash at 1500 uu/s rather
+	// than a piece of dressing. That is why the side buttress row is gone, and it is why the gate
+	// towers and the corner pylons moved inboard (see GateTowerWallGap and CornerPylonYFrac). The
+	// pieces that stayed are the ones measured to be clear of it: the high rail (1640, and at |Y|
+	// 4536..4600 where the deck is 818 uu), the light bridges (1240, same reason), the flank stripes
+	// (|Y| 2016 and 3168, on the floor) and the wall's own trim (all of it at |Y| >= 4754, i.e.
+	// behind the crest inside the pawn standoff shell).
 
 	struct FButtressSpec
 	{
@@ -931,26 +943,33 @@ namespace TraceArenaConstants
 		float Height;
 	};
 
-	/**
-	 * Side walls (constant Y). Mirrored into +/-X and +/-Y, so 0.f is built once per wall.
-	 *
-	 * FIVE -> SEVEN for the 3.5:1 field. The row's job is to give 33600 uu of wall a beat you can
-	 * judge your own speed against, and a beat is a function of SPACING, not of count: at the old
-	 * five fractions the gap between the centre buttress and its neighbour would have gone from 2400
-	 * uu to 3360 and the next from 3600 to 5040. Seven lands them 2520 uu apart, which is the old
-	 * spacing to within a hundred uu. Tall (1600) and short (1050) alternate so the high rail they
-	 * carry has something to sit on every other bay.
-	 */
-	static const FButtressSpec SideButtresses[] =
-	{
-		{ 0.0000f, 1700.f },   // 0      - midfield marker, the tallest of the row
-		{ 0.1500f, 1050.f },   // 2520
-		{ 0.3000f, 1600.f },   // 5040
-		{ 0.4500f, 1050.f },   // 7560
-		{ 0.6000f, 1600.f },   // 10080
-		{ 0.7300f, 1050.f },   // 12264
-		{ 0.8600f, 1600.f }    // 14448  - just behind the goal line, inside the endzone
-	};
+	// THERE IS NO SideButtresses TABLE ANY MORE, AND THAT IS THE BUTTRESS PASS IN ONE PLACE.
+	//
+	// It used to hold seven fractions per side wall, mirrored into 26 piers 420 uu wide, 200 uu deep
+	// and 1050/1600/1700 uu tall, standing from Z = 0 flush against the wall. The owner's list:
+	//
+	//     "Change the buttresses to match the shape and steepness of the surf ramps, but keep them
+	//      into the wall."
+	//     "Remove the pillars which block the buttresses on the side of the map."
+	//     "The buttresses should now be steep enough that players can A/D into them to move up ...
+	//      They should not be walkable."
+	//
+	// A 420 x 200 box cannot be any of that, and MEASURED on Arena_Baked those 26 boxes were not
+	// merely beside the ride, they were ON it: the concave wall run's deck at the pier's inboard face
+	// (|Y| 4574) is 376 uu up, and the pier stands to 1050 or 1600 — i.e. every one of them was a
+	// 472 uu wide wall (420 + its 26 uu pawn standoff each side) standing 674 uu proud of the ride
+	// surface, every 2520 uu, on both walls. That is what the owner is hitting.
+	//
+	// So the row IS the ride now. The continuous curved run against each side wall — the owner's own
+	// parabola, cut to the surf rails' band by TraceSideRampProfile.h and swept 38400 uu — replaces
+	// all 26 of them: same wall, same Z = 0 start, same "flush with the wall", 1096 uu tall instead of
+	// 1050/1600, and rideable end to end instead of every other bay. The wall keeps its rhythm from
+	// the neon motif the sweep carries (82 repeats of the owner's own ramp width, 468 uu apart, which
+	// is a FINER beat than the 2520 uu the piers gave) rather than from a row of boxes.
+	//
+	// The END wall row below is untouched: the owner scoped the request to "the side of the map", the
+	// end walls carry no ride, and those six piers are the only thing giving a 9600 uu end wall any
+	// depth at all.
 
 	/** End walls (constant X). Mirrored into +/-Y and +/-X. Y = 0 is left clear for the scoring lane. */
 	static const FButtressSpec EndButtresses[] =
@@ -964,12 +983,24 @@ namespace TraceArenaConstants
 	static constexpr float ButtressDepth = 200.f;
 
 	/**
-	 * Height of the rail running along the buttress row.
+	 * Height of the rail running along the side walls.
 	 *
-	 * Sits 40 uu above the 1600 uu buttresses so it reads as something they CARRY. It is unlit neon
-	 * with no collision, which matters: at 1640 uu it is well above any jump (JumpZVelocity 420
-	 * gives a ~90 uu apex) so nobody can ever touch it, and a blocking box up there would only ever
-	 * be an invisible obstacle for hitscan.
+	 * IT NO LONGER SITS ON ANYTHING, and the number is kept anyway. It was 40 uu above the 1600 uu
+	 * buttresses so it read as something they CARRY; the buttress row is gone (see the note where its
+	 * table used to be) and the rail is now a free line at 1640, in the same idiom as the light
+	 * bridges and the wall trim. That is not a loss: what the rail is FOR is filling the empty middle
+	 * band of a flank frame with a continuous glowing line running to the vanishing point, and it does
+	 * that whether or not there are piers under it. It also now reads as the top edge of the wall run
+	 * rather than as a lintel — the run's crest is 1096, so the rail is 544 uu above it.
+	 *
+	 * MOVING IT DOWN ONTO THE CREST WAS CONSIDERED AND REFUSED. At 1640 it is unlit neon with no
+	 * collision and well above any jump — MEASURED this pass by Trace.Move.AuditV16, which reconstructs
+	 * the launch from the flight: 639.7 uu/s against a 640 uu/s JumpZVelocity, for a 186.4 uu apex
+	 * under gravity 1098 uu/s^2. (An older note here said 420 and ~90 uu; both were stale.) Even
+	 * standing on the ride's 1096 uu crest, an apex of 186 uu reaches 1282 and the rail is at 1608.
+	 * On the crest it would be a proud strip across the top of a surface players cross at
+	 * 1500 uu/s — the exact thing BuildSurfRails' neon note refuses for the rails, and the exact thing
+	 * the owner's item 6 is complaining about.
 	 */
 	static constexpr float FlankRailZ = 1640.f;
 	static constexpr float FlankRailSize = 64.f;
@@ -1462,8 +1493,18 @@ namespace TraceArenaConstants
 	 * They now stand at the MIDDLE OF THE ENDZONE (goal line + half the depth, X = 15600), which is
 	 * where they were in spirit on the old field and where they stay whatever the field does. Y is
 	 * still a width fraction, because the width is what it is dressing.
+	 *
+	 * 0.8500 -> 0.7750 FOR THE BUTTRESS PASS, for the reason GateTowerWallGap moved. At 0.85 the pylon
+	 * spanned |Y| 3930..4230 (3904..4256 with its standoff), so its outer 256 uu stood inside the
+	 * side-wall ride's |Y| 4000..4760 — a 300 uu wide, 3000 uu tall column through the bottom 271 uu
+	 * of the ride surface, four times over. 0.7750 spans |Y| 3570..3870 (3544..3896 with standoff),
+	 * 104 uu clear of the ride's toe at |Y| 4000, which is three capsule radii.
+	 *
+	 * The clearance to the gate tower this note was written about is UNCHANGED in spirit and better in
+	 * fact: the tower's inboard face is now at |Y| 3480 and the pylon's is at 3570, but they are 2400
+	 * uu apart in X (15296 against 18000), so they cannot foul each other at all.
 	 */
-	static constexpr float CornerPylonYFrac = 0.8500f;   // 4080
+	static constexpr float CornerPylonYFrac = 0.7750f;   // 3720
 	static constexpr float CornerPylonSide = 300.f;
 
 	/**
@@ -1553,12 +1594,26 @@ namespace TraceArenaConstants
 	 * sidelines with a beam right across say the true thing, and they clear the scoring lane in the
 	 * middle of the goal line, which is where the carrier is actually running.
 	 *
-	 * GateTowerWallGap is measured from the side wall's inner face to the tower's OUTER face. 300
-	 * clears the buttress row (ButtressDepth 200) and the flank rail hanging off it (FlankRailSize 64
-	 * immediately inboard of that) with 36 uu to spare, so the gate never intersects the flank
-	 * dressing. Re-check it if you change either of those.
+	 * GateTowerWallGap is measured from the side wall's inner face to the tower's OUTER face.
+	 *
+	 * 300 -> 900 FOR THE BUTTRESS PASS, AND THE OLD VALUE WAS A MEASURED BLOCKER. At 300 the tower's
+	 * outer face stood at |Y| 4500 and its pawn standoff at 4526, i.e. 526 uu INSIDE the side-wall
+	 * ride, which runs |Y| 4000..4760. On Arena_Baked that put a 420 uu wide, 2300 uu tall solid
+	 * across the ride surface from the deck's 4 uu at the tower's inboard face up to 698 uu at its
+	 * outboard face — four times over, twice per wall, at |X| ~15300. That is the owner's
+	 * "remove the pillars which block the buttresses on the side of the map", in numbers.
+	 *
+	 * 900 puts the outer face at |Y| 3900 and its standoff at 3926, which is 74 uu clear of the ride's
+	 * toe at |Y| 4000 — more than a capsule radius (34), so a body cannot be pinched between the two.
+	 * The old constraint still holds too: it clears the flank rail (|Y| 4536..4600) by 636 uu.
+	 *
+	 * WHY MOVED AND NOT DELETED. The towers are the gate's legs and the gate is what says "the endzone
+	 * starts here"; deleting them leaves a 9600 uu beam floating at Z 2300 over nothing. The floor at
+	 * |Y| 3480..3900 is flat (the wall fillet does not start until |Y| 4200), so the towers stand on
+	 * ground rather than emerging from anything, and the beam still lands on them because it spans the
+	 * whole width regardless.
 	 */
-	static constexpr float GateTowerWallGap = 300.f;
+	static constexpr float GateTowerWallGap = 900.f;
 	static constexpr float GateTowerSide = 420.f;
 	static constexpr float GateTowerHeight = 2300.f;
 	static constexpr float GateBeamSize = 300.f;
@@ -4262,8 +4317,12 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	// lost their bearings in a corner can work out which way they are attacking from the wall alone —
 	// so the three MIDs are REGISTERED for the half-time repaint (release overhaul, MAP plan §5.3),
 	// or that player would be reading the FIRST half's answer for the whole of the second. This one
-	// registration also covers the corner pylons and the end buttresses, which share HalfNeon. The
-	// on-axis centreline buttress makes its own neutral MID below and stays out of the repaint.
+	// registration also covers the corner pylons and the end buttresses, which share HalfNeon.
+	//
+	// THE NEUTRAL CENTRELINE MID IS GONE WITH THE SIDE BUTTRESS ROW. It existed for exactly one piece,
+	// the on-axis buttress at PositionFrac 0, whose half was ambiguous; there is no such piece now.
+	// The halfway line is still marked, by the floor grid's own centre strip, which is where that
+	// idiom came from in the first place.
 	UMaterialInstanceDynamic* HalfNeon[2] = { nullptr, nullptr };
 	UMaterialInstanceDynamic* HalfBridge[2] = { nullptr, nullptr };
 	UMaterialInstanceDynamic* HalfStripe[2] = { nullptr, nullptr };
@@ -4286,35 +4345,12 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	auto HalfIndex = [](float XSign) { return (XSign < 0.f) ? 0 : 1; };
 
 	// --- Buttresses ------------------------------------------------------------------------------
-
-	for (const float YSign : { -1.f, 1.f })
-	{
-		for (const TraceArenaConstants::FButtressSpec& Spec : TraceArenaConstants::SideButtresses)
-		{
-			// PositionFrac 0 lands on the centreline and must be built once, not twice.
-			const bool bOnAxis = FMath::IsNearlyZero(Spec.PositionFrac);
-			for (const float XSign : { -1.f, 1.f })
-			{
-				if (bOnAxis && XSign > 0.f)
-				{
-					continue;
-				}
-
-				const float X = XSign * HalfX * Spec.PositionFrac;
-				const float Y = YSign * (HalfY - TraceArenaConstants::ButtressDepth * 0.5f);
-
-				// On the centreline the half is ambiguous; neutral cyan marks it as the halfway line,
-				// which is exactly what the floor grid does with its own centre strip.
-				UMaterialInstanceDynamic* NeonMID = bOnAxis
-					? (bBuildVisuals ? MakeNeonMID(TraceArenaConstants::NeonNeutralPale, TraceArenaConstants::GlowPylon) : nullptr)
-					: HalfNeon[HalfIndex(XSign)];
-
-				AddWallButtress(FVector2D(X, Y), FVector2D(0.f, -YSign),
-					TraceArenaConstants::ButtressWidth, TraceArenaConstants::ButtressDepth, Spec.Height,
-					BodyMID, NeonMID, TEXT("SideButtress"));
-			}
-		}
-	}
+	//
+	// END WALLS ONLY. The side-wall row was 26 piers standing from Z = 0 flush against the wall, and
+	// it is gone — the side-wall ride IS the buttress row now, at the owner's instruction. The full
+	// argument and the measurement are in the note where TraceArenaConstants::SideButtresses used to
+	// be; the one-line version is that a 420 x 200 box standing 674 uu proud of a ride surface is an
+	// obstacle, not a pilaster, and the owner is the one who hit it.
 
 	for (const float XSign : { -1.f, 1.f })
 	{
@@ -4339,12 +4375,16 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	// kind, the endzone floor being otherwise flat - and it is still flat, because the corner banks
 	// deliberately stop at the goal line. A tall column in each corner closes the room off and,
 	// incidentally, gives a defender something to fight around. They stand at the MIDDLE of the
-	// endzone (X = 15600 on the shipped field) rather than at a fraction of the half length - see
-	// CornerPylonYFrac for why that distinction cost a gate tower 80 uu of clearance.
+	// endzone (X = 18000 on the shipped 38400 field) rather than at a fraction of the half length -
+	// see CornerPylonYFrac for why that distinction cost a gate tower 80 uu of clearance.
 	//
-	// Checked on the 33600 field: (15600, 4080) with a 300 uu side leaves 840 uu to the gate tower
-	// face at X = 14610, 1050 uu to the end wall, and 1200 uu in Y to the outermost endzone respawn
-	// pad at (15600, 2880).
+	// CLEARANCES RE-MEASURED FOR THE BUTTRESS PASS, on the shipped 38400 x 9600 field, after
+	// CornerPylonYFrac moved from 0.85 to 0.775 to get out of the side-wall ride:
+	//     ride toe (|Y| 4000)          pylon standoff reaches 3896: 104 uu clear, three capsule radii
+	//     end wall (|X| 19200)         pylon reaches 18150: 1050 uu clear, unchanged
+	//     gate tower (|X| 15296)       2400 uu apart in X; they cannot foul at any Y
+	//     outermost respawn pad        PlayerStart at (18314, 2880); the pylon spans |Y| 3570..3870,
+	//                                  so 690 uu in Y and 164 uu in X, both clear
 	//
 	// Built BEFORE the visuals-only section on purpose: these block, and a dedicated server has to
 	// build the same collision the clients are predicting against.

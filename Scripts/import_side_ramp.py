@@ -524,6 +524,22 @@ def place(design):
     # Yaw, never a negative scale. Mirroring by scale flips triangle winding, and
     # complex-as-simple collision built from inside-out triangles is a surface a
     # pawn falls through.
+    # HOW FAR THE TOE END IS ALLOWED TO BE FROM y = 0, and why it is not 1 uu any more.
+    #
+    # The trim's neon stands 3 uu PROUD ALONG THE SURFACE NORMAL, so the toe line's
+    # own bounding box hangs off the toe by 3 * sin(toe angle). That was written
+    # when the profile started at 0.8 degrees and the overhang was 0.04 uu, i.e.
+    # invisible against a 1 uu tolerance. The buttress pass cut the toe at 46.9
+    # degrees (TraceSideRampProfile.h: the face is inside the surf band end to end
+    # now, so there is no shallow start) and the same 3 uu became 2.2 - MEASURED, and
+    # it failed this check with "SM_SideRampConcaveTrim has local Y -757.4..2.2".
+    #
+    # 2% of the depth is 15.2 uu at the shipped 760, which swallows the neon at any
+    # toe angle the band allows (3 uu at 90 degrees would still only be 3) and is
+    # still fifty times smaller than the crest end it has to be distinguished from.
+    # A mesh whose toe genuinely is not at zero fails exactly as before.
+    toe_tolerance = max(1.0, 0.02 * design["kDepthUU"])
+
     def crest_local_y(mesh, label):
         box = mesh.get_bounding_box()
         lo = float(box.min.y)
@@ -531,9 +547,9 @@ def place(design):
         # The toe sits on y = 0 by construction; the crest is whichever end is far
         # from it. If BOTH ends are away from zero the mesh is not what we think it
         # is, and guessing would place a 384 m ramp wrong.
-        if min(abs(lo), abs(hi)) > 1.0:
-            fail("{0} has local Y {1:.1f}..{2:.1f}; neither end is the toe at y=0"
-                 .format(label, lo, hi))
+        if min(abs(lo), abs(hi)) > toe_tolerance:
+            fail("{0} has local Y {1:.1f}..{2:.1f}; neither end is within {3:.1f} uu of the toe "
+                 "at y=0".format(label, lo, hi, toe_tolerance))
         return lo if abs(lo) > abs(hi) else hi
 
     shell_crest = crest_local_y(shell, SHELL_NAME)
