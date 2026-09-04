@@ -356,30 +356,88 @@ be seen by a colleague and least likely to be seen on a developer's monitor.
 
 ## E. Build, packaging and anti-cheat
 
-### 29. "Both build configs green" has never meant the shipped game **runs** — **OPEN, and important**
+### 29. "Both build configs green" never meant the shipped game **ran** — **CLOSED 2026-09-03**
 
-`Scripts/build.sh --prove-shipping` proves the Shipping target **compiles and links**. That is exactly
-what its help text claims, and it is all seven waves ever exercised. The artefact itself was run for
-the first time on 2026-08-28, and it does not start:
+Filed when `Scripts/build.sh --prove-shipping` was the only packaging-adjacent thing the project had.
+That script proves the Shipping target **compiles and links**, which is exactly what its help text
+claims, and for seven waves nobody went further. The two symptoms filed here were real. Both are now
+explained, and neither was a defect in the game:
 
-* **The bare binary aborts at launch.**
-  `dyld: Library not loaded: @rpath/libmetalirconverter.dylib`, SIGABRT, confirmed by macOS's own
-  crash report. The library exists, under
-  `<engine>/Engine/Binaries/ThirdParty/Apple/MetalShaderConverter/Mac/`. The binary's own rpath is
-  `@loader_path/../../../../../../../Shared/Epic Games/UE_5.8/…` — **seven** `..` from
-  `Binaries/Mac/`, which walks past `/` and asks for a non-existent `/Shared/Epic Games/…`. Seven is
-  the correct count from **inside the `.app` bundle**, three levels deeper. Reproduce with
-  `otool -l Binaries/Mac/Trace-Mac-Shipping | grep -A2 LC_RPATH`.
-* **The `.app` copy clears dyld and then exits 1 with no output**, because a Shipping game target
-  compiles logging out — and because **there is no cooked or packaged content anywhere in the
-  project**: a whole-tree `find . -type d \( -name 'Cooked*' -o -name 'StagedBuilds' -o -name
-  'Packaged*' \)` returns nothing.
+* **"The bare binary aborts at launch"** — `dyld: Library not loaded: @rpath/libmetalirconverter.dylib`.
+  **This was an artefact of running the wrong file, not a misconfiguration.** Proved both ways on
+  2026-09-03: `Binaries/Mac/Trace-Mac-Shipping` still aborts exactly as described, while the *same
+  code* inside a bundle runs. The rpath `@loader_path/../../../../../../../Shared/Epic Games/…` is
+  seven levels up, which is correct from `…app/Contents/MacOS/` and walks off the root from
+  `Binaries/Mac/`. A packaged bundle never uses that arm anyway: it carries **its own copy** of the
+  library at `Contents/UE/Engine/Binaries/ThirdParty/Apple/MetalShaderConverter/Mac/`, reached by the
+  earlier `@executable_path/../UE/…` rpath. Reproduce the contrast with
+  `otool -l <binary> | grep -A2 LC_RPATH` on each.
+* **"There is no cooked content anywhere in the project"** — true when filed, and the actual reason
+  nothing ran. There was no packaging script. There is one now: **`Scripts/package.sh`**.
 
-Neither is a regression, and neither means the code is wrong: a UE game target legitimately needs
-cooked content, and the rpath depth is an install-layout artefact of an engine under `/Users/Shared`
-with the project under `/Users/<user>`. What it means is that **the packaged-game path is wholly
-unexercised**. The supported path is the editor plus `Scripts/run-listen-server.sh`, and that path is
-exercised heavily.
+**The packaged Mac game now runs, plays and networks**, verified on 2026-09-03 against
+`Saved/Packaged/Mac/Trace-Mac-Shipping.app` (703 MB, cooked content inside the bundle): title screen,
+PLAY into `Arena_Baked` with the concave side ramps present, a listen server holding `UDP *:7777`
+(`lsof`), and a second packaged instance joining over this machine's Tailscale address with the
+server logging `Join succeeded`.
+
+**Two real defects were found and fixed on the way, and both were invisible to `build.sh`:**
+
+1. **`ProjectID` had hyphens** (`Config/DefaultGame.ini`). `FGuid::ImportTextItem` accepts only
+   `EGuidFormats::Digits` — 32 hex characters, no hyphens — so the value could never parse. The
+   editor shrugs; the **cook commandlet counts the error, ends "Failure - 1 error(s)" and exits 1**,
+   which BuildCookRun reports as `Cook failed` / `Error_UnknownCookFailure` with no mention of a GUID.
+   A cook that had already written all 710 packages and printed "Done!" still failed the build on it.
+2. **Shipping Mac builds were signed with a no-network sandbox.** Engine default
+   (`BaseEngine.ini:3461-3462`) gives Development `Sandbox.Server.entitlements` but Shipping
+   `Sandbox.NoNet.entitlements`, which grants neither `network.client` nor `network.server`. The
+   packaged game therefore could not open a socket at all: it bounced off `?listen` with
+   `NETDRIVERLISTENFAILURE` and reported "PORT 7777 IS BUSY" while `lsof` showed nothing on the port
+   and a plain `python3` socket bound it fine. Fixed by overriding
+   `ShippingSpecificMacEntitlements` in `Config/DefaultEngine.ini`.
+
+**A THIRD defect, found on 2026-09-04 while writing the playtest guide: the package contained no
+character art, and adding the art to `Content/` did not fix it.** `ATraceCharacter` names Epic's
+Mannequin through a **soft** reference — `TSoftObjectPtr` / `TSoftClassPtr` built from the string
+paths at `TraceCharacterInternal.h:1239,1249` (`TraceCharacter.cpp:260-261`). The cooker does not
+follow soft references, and `/Game/Characters` was not in `DirectoriesToAlwaysCook`. So with the
+import run and 128 `.uasset` files sitting on disk since 2026-08-24, the 703 MB artefact shipped with
+**zero** Mannequin packages: every player a fallback primitive under a red `CHARACTER ART NOT
+INSTALLED` banner telling them to run `./Scripts/import-mannequin.sh` — which a playtester holding a
+`.app` and no repository cannot do. This is the *same class* of bug the `DirectoriesToAlwaysCook`
+comment block in `Config/DefaultGame.ini` was written to prevent; that comment enumerated four
+directories and said "these five lines are the whole fix", and both counts were simply wrong.
+
+Fixed with `+DirectoriesToAlwaysCook=(Path="/Game/Characters")`. Measured on the shipped
+`Trace-Mac.utoc`: `SKM_Manny_Simple` / `ABP_Unarmed` / `SK_Mannequin` go **0 → 1** occurrence each,
+with `SM_SideRampConcave` at 4 in *both* scans and a deliberately absent needle at 0 in *both*, so
+neither reading is a scan artefact. Then confirmed on screen, both ways: the packaged Shipping build
+now draws **no** art banner and renders the detailed viewmodel, and the same binary launched with
+`-TraceNoCharacterArt` draws `CHARACTER ART DISABLED (-TraceNoCharacterArt)` top-left with the
+fallback arms — so the absence of a banner is a signal and not a surface that never draws. Cost:
++14 MB, 703 → 717 MB.
+
+Two consequences worth keeping. **An absent `AlwaysCook` directory is silently ignored** — tested
+with a deliberately nonexistent path, which cooked to `Success - 0 error(s), 6 warning(s)` and
+`BUILD SUCCESSFUL`, the same 6 warnings as without it, and no mention of the missing path anywhere in
+the log. So this line is safe on a clone that never ran the import. And **whoever builds the artefact
+must still run `Scripts/import-mannequin.sh` first**, because the art is gitignored.
+
+**What is still true, and worth keeping:** `Scripts/build.sh --prove-shipping` on its own still proves
+only that the target links. Linking is not shipping. Use `Scripts/package.sh` for the artefact, and
+read `docs/PLAYTEST.md` before sending it to anybody.
+
+**And a fourth thing that is not a defect but reads like one:** the shipped Shipping build writes
+**no log file at all**. Two full packaged sessions on 2026-09-04 left
+`~/Library/Containers/com.YourCompany.Trace/Data/Library/Logs/Trace/` untouched while writing
+`GameUserSettings.ini` and two crash-reporter configs in the same container in the same minutes — so
+the app was writing, just never a log. Anything already in that Logs directory is from an earlier
+Development run. Ask a playtester for a log only after sending them a `-c Development` package.
+
+**Still open, deliberately (see docs/PLAYTEST.md):** the bundle is **ad-hoc signed, not Developer ID
+signed and not notarized** (`spctl -a` returns `rejected`), it is **arm64-only** so Intel Macs cannot
+run it, it requires **macOS 14+**, and its bundle identifier is still the engine placeholder
+`com.YourCompany.Trace`.
 
 ### 36. Twenty shipped rule arms are not cheat-flagged — **OPEN, one word each**
 
