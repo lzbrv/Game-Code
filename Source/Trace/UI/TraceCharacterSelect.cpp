@@ -20,6 +20,7 @@
 #include "InputKeyEventArgs.h"          // FInputKeyEventArgs — same injector
 #include "Misc/CoreMiscDefines.h"       // FInputDeviceId
 
+#include "Core/TracePlayerController.h"   // D31-TEAMS — the team-select session lives on it
 #include "Core/TracePlayerState.h"
 #include "Trace.h"                      // LogTraceGame
 #include "TraceTypes.h"                 // TraceTeamColor / TraceTeamName
@@ -1871,10 +1872,9 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 				*TraceTeamName(LocalState->Team).ToString(), LocalState->GetCharacterSelectTimeRemaining(),
 				*RosterBelief);
 
-			if (OnOpened)
-			{
-				OnOpened();
-			}
+			// OnOpened IS NOT FIRED HERE ANY MORE (D31-TEAMS). It is fired off the COMBINED overlay
+			// edge further down, so that the team screen closing and this one opening on consecutive
+			// frames does not hand movement back for the frame in between. See bOverlayOpen.
 		}
 		else
 		{
@@ -1885,10 +1885,7 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 			// verdict, instead of the one that goes quiet.
 			ReportClickTest(LocalState);
 #endif
-			if (OnClosed)
-			{
-				OnClosed();
-			}
+			// OnClosed is fired off the COMBINED overlay edge below. See the note at OnOpened above.
 		}
 	}
 
@@ -1924,6 +1921,57 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 		{
 			TraceHardwareCursor::RenewSuppression(PC,
 				bOverlayInFront ? TEXT("pause / settings overlay") : TEXT("character select"));
+		}
+	}
+
+	// =============================================================================================
+	// D31-TEAMS — the team screen, and the H that opens it
+	// =============================================================================================
+	//
+	// HERE, ABOVE THE EARLY RETURN, because this is the one call in a match that runs every single
+	// frame whether or not anything is open (ATraceHUD::DrawHUD calls this outside every gate — see
+	// the comment at that call site). H has to be answerable while NOTHING is up, which is exactly
+	// the frames the early return below discards.
+	//
+	// DRAWN UNDER THIS SCREEN, and that ordering is a safety net rather than a layout choice: the two
+	// are mutually exclusive by construction, because ATraceGameMode::PollCharacterSelect refuses to
+	// open a character screen while the team screen is up and ServerRequestOpenTeamSelect refuses the
+	// reverse. If replication ever delivered both flags in the wrong order for a frame, the screen
+	// with the running auto-pick clock is the one that must be on top and taking the keys — which is
+	// this one, and which is why the team screen is handed `bInputAllowed && !bOpen`.
+	{
+		ATracePlayerController* const TracePC = Cast<ATracePlayerController>(PC);
+
+		if (TracePC != nullptr && !bOpen && !TeamSelect.IsOpen() && bInputAllowed)
+		{
+			FTraceTeamSelect::PollOpenHotkey(TracePC);
+		}
+
+		TeamSelect.Tick(HUD, TracePC, LocalState, ViewW, ViewH, UIScale, Now, bInputAllowed && !bOpen);
+	}
+
+	// ---- The COMBINED overlay edge --------------------------------------------------------------
+	//
+	// One open/close pair for the whole flow. The host's OnOpened silences gameplay input and hands
+	// the mouse back; firing it per screen would restore movement for the single frame between the
+	// team screen closing and the character screen opening, and a held W in that frame walks the
+	// player out of the arena behind a menu.
+	{
+		const bool bAnyOpen = bOpen || TeamSelect.IsOpen();
+		if (bAnyOpen != bOverlayOpen)
+		{
+			bOverlayOpen = bAnyOpen;
+			if (bAnyOpen)
+			{
+				if (OnOpened)
+				{
+					OnOpened();
+				}
+			}
+			else if (OnClosed)
+			{
+				OnClosed();
+			}
 		}
 	}
 

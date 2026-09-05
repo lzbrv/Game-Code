@@ -9,6 +9,7 @@
 #include "Camera/PlayerCameraManager.h"    // FX plan §1.5 — the view kick's modifier lives on it
 #include "Containers/Ticker.h"             // FTSTicker — the v13 §2 hotkey probe
 #include "Core/TraceCharacter.h"
+#include "Core/TraceGameMode.h"                 // D31-TEAMS — the balance rule and the team change
 #include "Core/TracePlayerState.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
@@ -34,6 +35,7 @@
 #include "InputTriggers.h"                 // ETriggerEvent
 #include "Misc/CommandLine.h"              // -TraceNoInputAssets (spec v17 §6)
 #include "Misc/Parse.h"                    // FParse::Param
+#include "Net/UnrealNetwork.h"              // DOREPLIFETIME — the team-select session
 #include "UObject/Package.h"               // LoadObject / DuplicateObject for the input assets
 #include "Gameplay/TraceCore.h"            // spec v25 §7 — the right-mouse pull probe's second rung
 #include "Gameplay/TraceKnifeView.h"       // TraceKnifeView::RequestInspect (spec v31 §5 — the F bind)
@@ -3656,6 +3658,306 @@ void ATracePlayerController::ServerRequestRespawn_Implementation()
 	{
 		GameMode->RestartPlayer(this);
 	}
+}
+
+// =================================================================================================
+// D31-TEAMS — the team-select session and the mid-match character switch
+//
+// EVERYTHING BELOW RUNS ON THE SERVER except ClientTeamChangeResult, which is one line of client
+// bookkeeping for a message the screen prints. That is not a style preference: a client-side team
+// swap the server did not agree with is worse than no feature at all, because the two machines then
+// disagree about who is shooting whom. So the client's only powers here are ASKING and DRAWING.
+//
+// The RULES live in ATraceGameMode (the balance rule, the roster, the respawn); this class owns the
+// SESSION — is this player's screen up, how long have they got — for the two reasons written at the
+// declaration: a PlayerController is bOnlyRelevantToOwner (so the flag costs nothing on the other
+// connections) and it is the actor the client OWNS (so the request RPCs are legal on it at all).
+// =================================================================================================
+
+void ATracePlayerController::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+	// No COND_OwnerOnly needed and none written: AController sets bOnlyRelevantToOwner, so this actor
+	// is only ever replicated to its own connection in the first place. Spelling a condition out here
+	// would suggest the alternative exists.
+	DOREPLIFETIME(ATracePlayerController, bTeamSelectOpen);
+	DOREPLIFETIME(ATracePlayerController, TeamSelectDeadlineServerTime);
+}
+
+float ATracePlayerController::GetTeamSelectTimeRemaining() const
+{
+	if (TeamSelectDeadlineServerTime <= 0.f)
+	{
+		return 0.f;
+	}
+
+	const AGameStateBase* const BaseGameState = (GetWorld() != nullptr) ? GetWorld()->GetGameState() : nullptr;
+	if (BaseGameState == nullptr)
+	{
+		return 0.f;
+	}
+
+	const double Remaining = static_cast<double>(TeamSelectDeadlineServerTime) - BaseGameState->GetServerWorldTimeSeconds();
+	return FMath::Max(0.f, static_cast<float>(Remaining));
+}
+
+void ATracePlayerController::ServerSetTeamSelectOpen(bool bOpen, float DurationSeconds)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	UWorld* const World = GetWorld();
+	const AGameStateBase* const BaseGameState = (World != nullptr) ? World->GetGameState() : nullptr;
+
+	bTeamSelectOpen = bOpen;
+
+	// The old timeout goes first and unconditionally. A player who answers at 14.9 s must not have
+	// their next screen closed half a second later by the timer their last one armed.
+	if (World != nullptr)
+	{
+		World->GetTimerManager().ClearTimer(TeamSelectTimeoutHandle);
+	}
+
+	if (bOpen && DurationSeconds > 0.f && BaseGameState != nullptr && World != nullptr)
+	{
+		TeamSelectDeadlineServerTime = static_cast<float>(BaseGameState->GetServerWorldTimeSeconds() + DurationSeconds);
+		World->GetTimerManager().SetTimer(TeamSelectTimeoutHandle, this,
+			&ATracePlayerController::CloseTeamSelectOnTimeout, DurationSeconds, /*bLoop=*/false);
+	}
+	else
+	{
+		// Zero means "no deadline", which is what the screen draws when TeamSelectTimeout is off.
+		TeamSelectDeadlineServerTime = 0.f;
+	}
+
+	// A PlayerController replicates on the ordinary schedule; this is a one-shot, highly visible
+	// change that puts a modal in front of somebody, so push it now for the same reason
+	// ATracePlayerState::SetTeam does.
+	ForceNetUpdate();
+}
+
+void ATracePlayerController::CloseTeamSelectOnTimeout()
+{
+	if (!HasAuthority() || !bTeamSelectOpen)
+	{
+		return;
+	}
+
+	const ATracePlayerState* const State = GetTracePlayerState();
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[TeamSelect] '%s' did not answer in time; keeping %s. The character screen opens next."),
+		(State != nullptr) ? *State->GetPlayerName() : TEXT("<no state>"),
+		(State != nullptr) ? *TraceTeamName(State->Team).ToString() : TEXT("?"));
+
+	ServerSetTeamSelectOpen(/*bOpen=*/false, /*DurationSeconds=*/0.f);
+}
+
+bool ATracePlayerController::ServerRequestOpenTeamSelect_Validate()
+{
+	return true;
+}
+
+void ATracePlayerController::ServerRequestOpenTeamSelect_Implementation()
+{
+	// Contract §8: never check() on network input — validate and return.
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	UWorld* const World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	// Anti-spam, the same shape ServerRequestRespawn uses. A held H would otherwise re-arm somebody's
+	// timeout sixty times a second.
+	const float TimeNow = World->GetTimeSeconds();
+	if (TimeNow - LastTeamRequestTime < TeamRequestCooldown)
+	{
+		return;
+	}
+	LastTeamRequestTime = TimeNow;
+
+	// NOT WHILE THE CHARACTER SCREEN IS UP. The two screens are one flow and the order is team then
+	// character (see the ordering gate in ATraceGameMode::PollCharacterSelect); letting H reopen the
+	// team screen over a character screen would put the flow back to front and leave the character
+	// screen's auto-pick clock running behind a modal about something else.
+	if (const ATracePlayerState* const State = GetTracePlayerState())
+	{
+		if (State->IsCharacterSelectOpen())
+		{
+			UE_LOG(LogTraceGame, Log,
+				TEXT("[TeamSelect] '%s' pressed H while still picking a character - ignored; pick first."),
+				*State->GetPlayerName());
+			return;
+		}
+	}
+
+	if (ATraceGameMode* const Rules = World->GetAuthGameMode<ATraceGameMode>())
+	{
+		Rules->OpenTeamSelectFor(this);
+	}
+}
+
+bool ATracePlayerController::ServerRequestCloseTeamSelect_Validate()
+{
+	return true;
+}
+
+void ATracePlayerController::ServerRequestCloseTeamSelect_Implementation()
+{
+	if (!HasAuthority() || !bTeamSelectOpen)
+	{
+		return;
+	}
+
+	ServerSetTeamSelectOpen(/*bOpen=*/false, /*DurationSeconds=*/0.f);
+}
+
+bool ATracePlayerController::ServerRequestTeam_Validate(ETraceTeam DesiredTeam)
+{
+	// The wire value is a byte. Anything that is not one of the two real teams is a malformed or
+	// hostile call, and Validate is the documented place to say so.
+	return DesiredTeam == ETraceTeam::Blue || DesiredTeam == ETraceTeam::Orange;
+}
+
+void ATracePlayerController::ServerRequestTeam_Implementation(ETraceTeam DesiredTeam)
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	UWorld* const World = GetWorld();
+	ATraceGameMode* const Rules = (World != nullptr) ? World->GetAuthGameMode<ATraceGameMode>() : nullptr;
+	ATracePlayerState* const State = GetTracePlayerState();
+
+	if (Rules == nullptr || State == nullptr)
+	{
+		ClientTeamChangeResult(DesiredTeam, ETraceTeamChangeResult::NotAllowed);
+		return;
+	}
+
+	// THE SESSION IS THE PERMISSION. Exactly the shape ATraceGameMode::RequestCharacter uses for
+	// "the select screen is not open for this player - nothing was being asked": without it a
+	// modified client could change team at will from anywhere in the match, with no screen involved.
+	if (!bTeamSelectOpen)
+	{
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[TeamSelect] '%s' asked for %s with no team screen open - refused."),
+			*State->GetPlayerName(), *TraceTeamName(DesiredTeam).ToString());
+		ClientTeamChangeResult(DesiredTeam, ETraceTeamChangeResult::NotAllowed);
+		return;
+	}
+
+	const ETraceTeamChangeResult Result = Rules->RequestTeamChange(State, DesiredTeam);
+
+	// Closed on a decision, LEFT OPEN on a refusal. A refusal is the one case where the player still
+	// has something to do — read why, and choose the other row — and a screen that vanished on
+	// "THAT WOULD MAKE IT 3 V 1" would look exactly like the button not working.
+	if (Result == ETraceTeamChangeResult::Granted || Result == ETraceTeamChangeResult::AlreadyOnTeam)
+	{
+		ServerSetTeamSelectOpen(/*bOpen=*/false, /*DurationSeconds=*/0.f);
+	}
+
+	ClientTeamChangeResult(DesiredTeam, Result);
+}
+
+bool ATracePlayerController::ServerRequestCharacterSwitch_Validate()
+{
+	return true;
+}
+
+void ATracePlayerController::ServerRequestCharacterSwitch_Implementation()
+{
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	UWorld* const World = GetWorld();
+	ATracePlayerState* const State = GetTracePlayerState();
+	if (World == nullptr || State == nullptr || State->IsABot())
+	{
+		return;
+	}
+
+	const float TimeNow = World->GetTimeSeconds();
+	if (TimeNow - LastTeamRequestTime < TeamRequestCooldown)
+	{
+		return;
+	}
+	LastTeamRequestTime = TimeNow;
+
+	if (!UTraceAbilityComponent::AreCharactersEnabled(this))
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TeamSelect] '%s' asked to change character, but characters are OFF for this match "
+			     "(mode A, or the settings toggle). There is nothing to change to."),
+			*State->GetPlayerName());
+		return;
+	}
+
+	if (State->IsCharacterSelectOpen())
+	{
+		return;   // Already choosing; a second nudge would only reset their deadline.
+	}
+
+	// ---- THE SWITCH, AND IT IS THE PRACTICE RANGE'S MECHANISM VERBATIM --------------------------
+	//
+	// Hand the character back, clear the lock, and let ATraceGameMode::PollCharacterSelect (4 Hz)
+	// notice that a human on a team has no character and open the SHIPPED screen. The pick then goes
+	// through ATracePlayerState::ServerRequestCharacter -> ATraceGameMode::RequestCharacter, which is
+	// the real per-team uniqueness rule and the real lock. No second selection path exists, which is
+	// the whole point: UTracePracticeRangeSubsystem::ReopenCharacterSelect already proved this shape
+	// works and then refuses to run outside the practice range — so this is the same door, opened in
+	// a real match, rather than a new one.
+	//
+	// ServerSetCharacter(None) is documented as always allowed and never refused, which is what makes
+	// it an infallible first step rather than a request that might bounce and leave the player locked
+	// to a character they have already lost.
+	//
+	// WHAT SURVIVES THE SWITCH, because it is the half a player notices:
+	//   * HEALTH is re-clamped by ServerSetCharacter itself (UTraceHealthComponent::ReclampToMax) —
+	//     that is spec v19 §3, and it is the fix for exactly the Lily-at-60 shape of bug. Downward
+	//     only, so switching AWAY from Lily is not a free heal.
+	//   * THE E COOLDOWN IS DELIBERATELY NOT RESET. The ability component's own comment says it:
+	//     "swapping character mid-match must not be a way to buy a free E", and spec §5 gives exactly
+	//     one automatic reset — half time. A switch mid-cooldown therefore lands mid-cooldown.
+	//   * THE CARRIED CORE AND THE TRAIL are untouched, and correctly so: this switch does not
+	//     destroy the pawn (unlike a team change), so the body that was carrying the Core is the same
+	//     body afterwards. The one visible consequence is that the carrier keeps carrying while their
+	//     screen is up and their input is silenced — which is also true of the shipped select screen.
+	if (UTraceAbilityComponent* const Abilities = UTraceAbilityComponent::Get(State))
+	{
+		Abilities->ServerSetCharacter(ETraceCharacterId::None);
+	}
+	State->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
+
+	// The team screen closes so the character screen can open: the ordering gate in
+	// PollCharacterSelect will not open one while this is up, and leaving it up would make the
+	// CHANGE CHARACTER row look as if it had done nothing at all.
+	ServerSetTeamSelectOpen(/*bOpen=*/false, /*DurationSeconds=*/0.f);
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[TeamSelect] '%s' handed their character back mid-match; the select screen reopens on "
+		     "the next poll. No reconnect involved."),
+		*State->GetPlayerName());
+}
+
+void ATracePlayerController::ClientTeamChangeResult_Implementation(ETraceTeam RequestedTeam, ETraceTeamChangeResult Result)
+{
+	LastTeamResult = Result;
+	LastTeamResultTeam = RequestedTeam;
+	LastTeamResultLocalTime = (GetWorld() != nullptr) ? GetWorld()->GetTimeSeconds() : 0.f;
+
+	UE_LOG(LogTraceGame, Display, TEXT("[TeamSelect] Server verdict on %s: %d."),
+		*TraceTeamName(RequestedTeam).ToString(), static_cast<int32>(Result));
 }
 
 

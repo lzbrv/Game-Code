@@ -652,12 +652,21 @@ namespace TraceOptionsMenuArt
 namespace
 {
 	/**
-	 * Every key a player is allowed to bind, built once.
+	 * Every key the KEYBIND page is allowed to capture, built once.
 	 *
 	 * EKeys::GetAllKeys() is a few hundred entries including every gamepad axis and every gesture,
 	 * and this list is walked once per frame during a rebind capture. Filtering it up front keeps
 	 * that walk to the ~150 real buttons and, more importantly, means an axis can never be captured
 	 * as a binding — Dash on "MouseX" would fire every time the player looked around.
+	 *
+	 * *** D31-PAD: IsBindableKeyboardKey, NOT IsBindableKey — THE PAD BUTTONS ARE GONE FROM HERE. ***
+	 * They used to be in this list, because IsBindableKey accepts them and still does. Leaving them
+	 * would mean the keybind page could put the A button into the KEYBOARD table while the controller
+	 * page has it in the PAD table: one physical button mapped in two contexts at once, the
+	 * higher-priority one consuming it, and the other page's row silently doing nothing at all. See
+	 * IsBindableKeyboardKey in Settings/TraceUserSettings.h for the argument, and note that a saved
+	 * .ini line naming a pad button is still honoured — this is about what a player may CREATE here,
+	 * never about what loads.
 	 */
 	const TArray<FKey>& BindableKeys()
 	{
@@ -669,7 +678,35 @@ namespace
 			Keys.Reserve(All.Num());
 			for (const FKey& Key : All)
 			{
-				if (UTraceUserSettings::IsBindableKey(Key))
+				if (UTraceUserSettings::IsBindableKeyboardKey(Key))
+				{
+					Keys.Add(Key);
+				}
+			}
+		}
+		return Keys;
+	}
+
+	/**
+	 * D31-PAD — every key the controller page is allowed to capture, built once.
+	 *
+	 * A SECOND LIST AND NOT A FILTER ON THE FIRST at capture time, for the same reason BindableKeys
+	 * exists at all: this is walked once per frame during a capture, and EKeys::GetAllKeys() is a few
+	 * hundred entries. It is also the thing that makes the two pages a PARTITION — the keyboard page
+	 * can capture nothing that is on a pad and this page can capture nothing that is not, so one
+	 * physical button can never end up in both tables and therefore never in both mapping contexts.
+	 */
+	const TArray<FKey>& PadBindableKeys()
+	{
+		static TArray<FKey> Keys;
+		if (Keys.Num() == 0)
+		{
+			TArray<FKey> All;
+			EKeys::GetAllKeys(All);
+			Keys.Reserve(32);
+			for (const FKey& Key : All)
+			{
+				if (UTraceUserSettings::IsBindablePadKey(Key))
 				{
 					Keys.Add(Key);
 				}
@@ -791,6 +828,24 @@ namespace
 			else
 			{
 				UE_LOG(LogTraceGame, Warning, TEXT("[Options] Trace.Menu.Audio: no HUD is drawing an overlay yet."));
+			}
+		}));
+
+	FAutoConsoleCommand CmdMenuController(
+		TEXT("Trace.Menu.Controller"),
+		TEXT("D31-PAD. Opens the CONTROLLER settings page on whichever HUD is up. Works on the title ")
+		TEXT("screen and in a match. Fourth of the Trace.Menu.* family and it exists for the same ")
+		TEXT("reason: a headless run has no keyboard and no pad, so without it there is no way to ")
+		TEXT("photograph this page at all. -TraceExec=Trace.Menu.Controller."),
+		FConsoleCommandDelegate::CreateLambda([]()
+		{
+			if (GActiveOptionsMenu != nullptr)
+			{
+				GActiveOptionsMenu->OpenController();
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Options] Trace.Menu.Controller: no HUD is drawing an overlay yet."));
 			}
 		}));
 
@@ -1588,6 +1643,29 @@ void FTraceOptionsMenu::OpenAudio()
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Audio settings opened."));
 }
 
+void FTraceOptionsMenu::OpenController()
+{
+	Page = EPage::Controller;
+	bCapturingKey = false;
+	bCapturingPadKey = false;
+
+	// Closed, not Settings: this entry point IS the top of the stack, so BACK has to close rather than
+	// drop the player onto a settings page they never asked for. Same contract as OpenVideo.
+	ControllerReturnPage = EPage::Closed;
+	IgnoreInputBeforeFrame = GFrameCounter + 1;
+
+#if !UE_BUILD_SHIPPING
+	// See TickAutoActivate: the capture hook is armed per opening, not per process.
+	DrawsSinceOpen = 0;
+	bAutoActivateDone = false;
+#endif
+	// SPEC v28 §3a — before the first frame the player can click on. See SetPressDeliveryOverride.
+	SetPressDeliveryOverride(true);
+
+	RebuildRows();
+	UE_LOG(LogTraceGame, Display, TEXT("[Options] Controller settings opened."));
+}
+
 void FTraceOptionsMenu::Close()
 {
 	if (Page == EPage::Closed)
@@ -1605,6 +1683,9 @@ void FTraceOptionsMenu::Close()
 
 	Page = EPage::Closed;
 	bCapturingKey = false;
+	// D31-PAD — reset with its partner and never on its own. A stale bCapturingPadKey would make the
+	// NEXT capture walk the pad list and refuse every key the player pressed on the keybind page.
+	bCapturingPadKey = false;
 	CapturingAction = ETraceInputAction::Count;
 
 	// UI PLAN WP2.2 — an abandoned edit is an abandoned edit. Ending the field rather than committing
@@ -1810,6 +1891,56 @@ void FTraceOptionsMenu::RebuildRows()
 		AddAction(TEXT("RESET TO DEFAULTS"), EAction::ResetAudioDefaults);
 		AddAction(TEXT("BACK"), EAction::Back);
 	}
+	else if (Page == EPage::Controller)
+	{
+		// ---- D31-PAD — THE STICKS FIRST, THEN THE BUTTONS ---------------------------------------
+		//
+		// The order is the order a player who has just plugged a pad in needs. A controller that is
+		// bound perfectly and whose look stick is too fast, too slow or drifting is a controller the
+		// owner will report as broken — so the analog feel comes first, above every bind, and the
+		// binds are what a player scrolls down to once the thing feels right.
+		//
+		// MOVE AND LOOK HAVE NO BIND ROWS AT ALL, and the note says so rather than leaving a reader
+		// to wonder where they went. They are the two sticks, they are not per-action buttons, and
+		// there is nothing to rebind about them but the numbers immediately below.
+		AddHeader(TEXT("CONTROLLER"));
+		AddValue(ERowKind::Toggle, TEXT("CONTROLLER INPUT"), ESetting::PadEnabled);
+		AddNote(TEXT("LEFT STICK MOVES, RIGHT STICK LOOKS. THE KEYBOARD AND MOUSE KEEP WORKING."));
+
+		AddHeader(TEXT("LOOK STICK"));
+		AddValue(ERowKind::Slider, TEXT("LOOK SPEED"),          ESetting::PadLookRate);
+		AddValue(ERowKind::Slider, TEXT("VERTICAL SPEED"),      ESetting::PadLookYScale);
+		AddValue(ERowKind::Toggle, TEXT("INVERT LOOK Y"),       ESetting::PadInvertY);
+		AddValue(ERowKind::Slider, TEXT("LOOK DEAD ZONE"),      ESetting::PadLookDeadzone);
+		AddNote(TEXT("RAISE THIS IF THE VIEW DRIFTS WHEN YOU ARE NOT TOUCHING THE STICK."));
+
+		AddHeader(TEXT("MOVE STICK"));
+		AddValue(ERowKind::Slider, TEXT("MOVE DEAD ZONE"),      ESetting::PadMoveDeadzone);
+
+		AddHeader(TEXT("BUTTONS"));
+
+		// EVERY ACTION EXCEPT THE FOUR KEYBOARD MOVE ROWS. Walking the shared table rather than a
+		// hand-written list, so an action added to ETraceInputAction gets a row on this page for
+		// free — the same argument the CONTROLS block on the settings page makes.
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			if (Info.Action == ETraceInputAction::MoveForward || Info.Action == ETraceInputAction::MoveBack
+				|| Info.Action == ETraceInputAction::MoveLeft || Info.Action == ETraceInputAction::MoveRight)
+			{
+				continue;
+			}
+
+			FRow Row;
+			Row.Kind = ERowKind::PadBinding;
+			Row.Label = Info.DisplayName;   // one display name per verb, shared with the keyboard page
+			Row.Binding = Info.Action;
+			Rows.Add(MoveTemp(Row));
+		}
+
+		AddHeader(TEXT(""));
+		AddAction(TEXT("RESET TO DEFAULTS"), EAction::ResetControllerDefaults);
+		AddAction(TEXT("BACK"), EAction::Back);
+	}
 	else if (Page == EPage::Settings)
 	{
 		// ---- UI PLAN WP2 — THE PLAYER'S OWN NAME, FIRST ON THE PAGE -----------------------------
@@ -1843,6 +1974,15 @@ void FTraceOptionsMenu::RebuildRows()
 		// a page about the master volume have nothing to say to each other.
 		AddHeader(TEXT("SOUND"));
 		AddAction(TEXT("AUDIO"), EAction::OpenAudio);
+
+		// D31-PAD. Its own header for the same reason SOUND has one — a page about a controller is
+		// neither how the game looks nor how it sounds — and ABOVE the MOUSE and CONTROLS blocks
+		// rather than below them, which is the placement decision on this page. A player who has just
+		// paired a pad and opened SETTINGS is looking for the word CONTROLLER, and twenty-one keybind
+		// rows between them and it is the burial spec v11 §0 already argued against once. It is also
+		// the only route the title screen has to the page.
+		AddHeader(TEXT("CONTROLLER"));
+		AddAction(TEXT("CONTROLLER SETTINGS"), EAction::OpenController);
 
 		// ---- Match rules (spec v14 §3) ----------------------------------------------------------
 		//
@@ -2183,10 +2323,31 @@ void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 	if (PC->WasInputKeyJustPressed(EKeys::Escape))
 	{
 		bCapturingKey = false;
+		bCapturingPadKey = false;
 		CapturingAction = ETraceInputAction::Count;
 		UE_LOG(LogTraceGame, Display, TEXT("[Options] Rebind cancelled."));
 		return;
 	}
+
+	// D31-PAD — a pad capture is cancelled by MENU/START as well as by Escape, because a player who
+	// opened this page with a controller may have no keyboard within reach. It is the ONE pad button
+	// the layout leaves unclaimed (Trace.Pad.Verify asserts that), which is exactly what makes it
+	// available to mean "cancel" here and "pause" everywhere else.
+	if (bCapturingPadKey && PC->WasInputKeyJustPressed(EKeys::Gamepad_Special_Right))
+	{
+		bCapturingKey = false;
+		bCapturingPadKey = false;
+		CapturingAction = ETraceInputAction::Count;
+		IgnoreInputBeforeFrame = GFrameCounter + 1;
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] Controller rebind cancelled (MENU/START)."));
+		return;
+	}
+
+	// The list this capture walks. THE TWO ARE DISJOINT: BindableKeys() holds no pad button and
+	// PadBindableKeys() holds nothing else, so a keyboard key pressed over a pad row is ignored and
+	// a pad button pressed over a keybind row is ignored. That partition is what stops one physical
+	// button from landing in both tables and therefore in both mapping contexts.
+	const TArray<FKey>& CaptureList = bCapturingPadKey ? PadBindableKeys() : BindableKeys();
 
 	// First poll of a fresh capture: record what was already down. A key that was held before the
 	// capture existed was never a choice made inside it.
@@ -2194,7 +2355,7 @@ void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 	{
 		bCaptureNeedsHeldSnapshot = false;
 		KeysHeldWhenCaptureOpened.Reset();
-		for (const FKey& Held : BindableKeys())
+		for (const FKey& Held : CaptureList)
 		{
 			if (PC->IsInputKeyDown(Held))
 			{
@@ -2212,7 +2373,7 @@ void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 		}
 	}
 
-	for (const FKey& Key : BindableKeys())
+	for (const FKey& Key : CaptureList)
 	{
 		if (!PC->WasInputKeyJustPressed(Key))
 		{
@@ -2228,6 +2389,7 @@ void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 		// SPEC v28 §3c — into the SLOT the player was pointing at, not always the first one.
 		const ETraceInputAction Action = CapturingAction;
 		const int32 Slot = FMath::Clamp(CapturingSlot, 0, UTraceUserSettings::MaxKeysPerAction - 1);
+		const bool bPad = bCapturingPadKey;
 
 		// *** SPEC v28 §3a — CLOSE THE CAPTURE BEFORE THE WRITE, NOT AFTER IT. ***
 		//
@@ -2238,14 +2400,27 @@ void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 		// the capture over at the moment the key is decided, which is also what the player is told by
 		// the row: the chip stops flashing PRESS A KEY on the same frame their key lands in it.
 		bCapturingKey = false;
+		bCapturingPadKey = false;
 		CapturingAction = ETraceInputAction::Count;
 		KeysHeldWhenCaptureOpened.Reset();
 		bCaptureNeedsHeldSnapshot = false;
 
-		UTraceUserSettings::Get().SetKey(Action, Slot, Key);
-		UE_LOG(LogTraceGame, Display, TEXT("[Options] Bound %s slot %d to '%s'. The action now holds %s."),
-			TraceInputActions::Info(Action).DisplayName, Slot + 1, *UTraceUserSettings::DescribeKey(Key),
-			*UTraceUserSettings::Get().DescribeBinding(Action));
+		if (bPad)
+		{
+			// D31-PAD — SetPadKey saves, and the save re-applies the pad's mapping context through
+			// UTraceUserSettings::OnChanged, so the new button drives the game on the very next frame.
+			// That is the same synchronous path the line below relies on for the keyboard.
+			UTraceUserSettings::Get().SetPadKey(Action, Key);
+			UE_LOG(LogTraceGame, Display, TEXT("[Options] Bound %s to controller '%s'."),
+				TraceInputActions::Info(Action).DisplayName, *UTraceUserSettings::DescribePadKey(Key));
+		}
+		else
+		{
+			UTraceUserSettings::Get().SetKey(Action, Slot, Key);
+			UE_LOG(LogTraceGame, Display, TEXT("[Options] Bound %s slot %d to '%s'. The action now holds %s."),
+				TraceInputActions::Info(Action).DisplayName, Slot + 1, *UTraceUserSettings::DescribeKey(Key),
+				*UTraceUserSettings::Get().DescribeBinding(Action));
+		}
 
 		// One more frame of quiet: the key that was just bound is still down, and if it happens to be
 		// Enter or a mouse button the very next poll would read it as "activate this row again".
@@ -2256,10 +2431,35 @@ void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 
 void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 {
+	// ---- D31-PAD — THE PAD DRIVES THIS OVERLAY TOO ----------------------------------------------
+	//
+	// Without this the controller settings page is a page a controller cannot reach: the pad opens the
+	// pause menu (UTraceGamepadInputSubsystem turns MENU/START into Escape) and then cannot move the
+	// highlight off RESUME. "Instead of a mouse or trackpad" is in the owner's sentence, so the
+	// overlay has to be operable with nothing but the pad.
+	//
+	// THE STICK IS READ AS ITS FOUR DIGITAL KEYS (Gamepad_LeftStick_Up and friends), not as an axis.
+	// The engine synthesises those from the stick with its own threshold, which means the repeat
+	// logic below — written for a key that is either down or not — works unchanged, and a stick held
+	// at half deflection does not scroll the list at half speed.
+	//
+	// NO CONFLICT WITH GAMEPLAY. ATracePlayerController::SetGameInputSuppressed makes every gameplay
+	// handler early-return while this overlay is open, which is exactly what ETraceInputStates::Menu's
+	// comment in Settings/TraceUserSettings.h says: a match action and the menu can never contend. So
+	// the A button being both "select" here and JUMP in a match is not an overload.
+	auto PadDown = [PC](const FKey& A, const FKey& B)
+	{
+		return PC->IsInputKeyDown(A) || PC->IsInputKeyDown(B)
+			|| PC->WasInputKeyJustPressed(A) || PC->WasInputKeyJustPressed(B);
+	};
+
 	// ---- Vertical: move the selection -----------------------------------------------------------
 	int32 NavDir = 0;
 	if (AnyDown(PC, EKeys::Down, EKeys::S)) { NavDir += 1; }
 	if (AnyDown(PC, EKeys::Up,   EKeys::W)) { NavDir -= 1; }
+	if (PadDown(EKeys::Gamepad_DPad_Down, EKeys::Gamepad_LeftStick_Down)) { NavDir += 1; }
+	if (PadDown(EKeys::Gamepad_DPad_Up,   EKeys::Gamepad_LeftStick_Up))   { NavDir -= 1; }
+	NavDir = FMath::Clamp(NavDir, -1, 1);
 
 	if (NavDir != 0)
 	{
@@ -2281,6 +2481,9 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 	int32 AdjustDir = 0;
 	if (AnyDown(PC, EKeys::Right, EKeys::D)) { AdjustDir += 1; }
 	if (AnyDown(PC, EKeys::Left,  EKeys::A)) { AdjustDir -= 1; }
+	if (PadDown(EKeys::Gamepad_DPad_Right, EKeys::Gamepad_LeftStick_Right)) { AdjustDir += 1; }
+	if (PadDown(EKeys::Gamepad_DPad_Left,  EKeys::Gamepad_LeftStick_Left))  { AdjustDir -= 1; }
+	AdjustDir = FMath::Clamp(AdjustDir, -1, 1);
 
 	if (AdjustDir != 0)
 	{
@@ -2298,13 +2501,22 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 	LastAdjustDir = AdjustDir;
 
 	// ---- Buttons --------------------------------------------------------------------------------
-	if (PC->WasInputKeyJustPressed(EKeys::Enter) || PC->WasInputKeyJustPressed(EKeys::SpaceBar))
+	// A is SELECT, which is the convention on every pad. Nothing else needs saying — the choke-point
+	// comment in ActivateSelected has claimed "the gamepad face button" funnels here since spec v26
+	// §9, and as of D31-PAD that is finally true rather than aspirational.
+	if (PC->WasInputKeyJustPressed(EKeys::Enter) || PC->WasInputKeyJustPressed(EKeys::SpaceBar)
+		|| PC->WasInputKeyJustPressed(EKeys::Gamepad_FaceButton_Bottom))
 	{
 		ActivateSelected();
 		return;
 	}
 
-	if (PC->WasInputKeyJustPressed(EKeys::Escape))
+	// B is BACK. Escape reaches here from the keyboard and, on a pad, from MENU/START by way of the
+	// synthetic Escape UTraceGamepadInputSubsystem injects — so a pad has two ways back, which is
+	// right: B is what a player's thumb reaches for, and MENU is what closes the whole overlay from
+	// the pause root.
+	if (PC->WasInputKeyJustPressed(EKeys::Escape)
+		|| PC->WasInputKeyJustPressed(EKeys::Gamepad_FaceButton_Right))
 	{
 		GoBack();
 		return;
@@ -2312,9 +2524,22 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 
 	// Explicit unbind. Every options screen that lets you bind should let you UNbind, and without it
 	// there is no way to express "I do not want a parry key" short of hiding it under some other one.
-	if (PC->WasInputKeyJustPressed(EKeys::BackSpace) || PC->WasInputKeyJustPressed(EKeys::Delete))
+	// D31-PAD — Y unbinds on a pad, because BKSP is not on a controller. It is the face button the
+	// layout leaves free of any MENU meaning, and it only does anything on a row that has something
+	// to unbind.
+	if (PC->WasInputKeyJustPressed(EKeys::BackSpace) || PC->WasInputKeyJustPressed(EKeys::Delete)
+		|| PC->WasInputKeyJustPressed(EKeys::Gamepad_FaceButton_Top))
 	{
-		if (Rows.IsValidIndex(Selected) && Rows[Selected].Kind == ERowKind::Binding)
+		if (Rows.IsValidIndex(Selected) && Rows[Selected].Kind == ERowKind::PadBinding)
+		{
+			// ClearPadKey, not SetPadKey(invalid): SetPadKey refuses an invalid key on purpose,
+			// because "invalid" is also what an unparseable .ini line produces and a load path must
+			// never be able to wipe a binding. Unbinding is a separate, explicit intent.
+			//
+			// THE WHOLE ROW, not a slot: MaxPadKeysPerAction is 1, so there is exactly one button.
+			UTraceUserSettings::Get().ClearPadKey(Rows[Selected].Binding);
+		}
+		else if (Rows.IsValidIndex(Selected) && Rows[Selected].Kind == ERowKind::Binding)
 		{
 			// ClearKey, not SetKey: SetKey refuses an invalid key on purpose, because "invalid" is
 			// what an unparseable .ini entry looks like and it must never be able to wipe a binding.
@@ -2655,6 +2880,57 @@ void FTraceOptionsMenu::GetSettingValue(ESetting Setting, float& OutValue, float
 		OutStep = 5.f;
 		break;
 
+	// ---- D31-PAD — the controller page's six analog / toggle rows ---------------------------
+	//
+	// RANGES COME FROM UTraceUserSettings' OWN CONSTANTS, the rule the crosshair block above states.
+	// The dead zones are shown as PERCENT because "0.20" means nothing to a player and "20%" means
+	// "a fifth of the stick's travel"; the multiply here and the divide in SetSettingNormalised are
+	// the pair, and neither may move without the other.
+	case ESetting::PadEnabled:
+		OutValue = Settings.bPadEnabled ? 1.f : 0.f;
+		OutMin = 0.f;
+		OutMax = 1.f;
+		OutStep = 1.f;
+		break;
+
+	case ESetting::PadLookRate:
+		OutValue = Settings.GetPadLookRateX();
+		OutMin = UTraceUserSettings::MinPadLookRate;
+		OutMax = UTraceUserSettings::MaxPadLookRate;
+		// TEN DEGREES PER SECOND A PRESS. The range is 660 wide, so a step of 1 would take 660
+		// presses to cross and a step of 50 would give the player thirteen usable values.
+		OutStep = 10.f;
+		break;
+
+	case ESetting::PadLookYScale:
+		OutValue = FMath::Clamp(Settings.PadLookYScale,
+			UTraceUserSettings::MinPadLookYScale, UTraceUserSettings::MaxPadLookYScale);
+		OutMin = UTraceUserSettings::MinPadLookYScale;
+		OutMax = UTraceUserSettings::MaxPadLookYScale;
+		OutStep = 0.05f;
+		break;
+
+	case ESetting::PadInvertY:
+		OutValue = Settings.bPadInvertLookY ? 1.f : 0.f;
+		OutMin = 0.f;
+		OutMax = 1.f;
+		OutStep = 1.f;
+		break;
+
+	case ESetting::PadLookDeadzone:
+		OutValue = Settings.GetPadLookDeadzone() * 100.f;
+		OutMin = UTraceUserSettings::MinPadDeadzone * 100.f;
+		OutMax = UTraceUserSettings::MaxPadDeadzone * 100.f;
+		OutStep = 1.f;
+		break;
+
+	case ESetting::PadMoveDeadzone:
+		OutValue = Settings.GetPadMoveDeadzone() * 100.f;
+		OutMin = UTraceUserSettings::MinPadDeadzone * 100.f;
+		OutMax = UTraceUserSettings::MaxPadDeadzone * 100.f;
+		OutStep = 1.f;
+		break;
+
 	// UI PLAN WP2.2 — CallSign is a TextEntry row and has no numeric value. It never reaches here
 	// (DrawRow and ActivateSelected both branch on the row KIND, and AdjustSelected returns before
 	// this is called), and it is named rather than left to `default:` so a reader can see that the
@@ -2840,6 +3116,12 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 	// saying ENABLED while another's say ON.
 	case ESetting::CrosshairDot:
 	case ESetting::CrosshairOutline:
+	// D31-PAD — and the same argument holds a fourth time. MISSING THIS WAS A REAL DEFECT, caught in
+	// the first capture of the controller page: both rows drew "1.00" and "0.00", which is the raw
+	// slider value leaking through the default branch below. A toggle that prints a float reads as a
+	// broken control, not as an off switch.
+	case ESetting::PadEnabled:
+	case ESetting::PadInvertY:
 		return (Value >= 0.5f) ? TEXT("ON") : TEXT("OFF");
 
 	// ---- SPEC v29 §3 --------------------------------------------------------------------------
@@ -2869,6 +3151,23 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 	case ESetting::MasterVolume:
 	case ESetting::SfxVolume:
 	case ESetting::MusicVolume:
+		// Already in percent — see GetSettingValue, which is the only place the conversion happens.
+		return FString::Printf(TEXT("%d%%"), FMath::RoundToInt(Value));
+
+	// ---- D31-PAD ------------------------------------------------------------------------------
+	//
+	// UNITS ON EVERY ROW, because none of these numbers is self-explanatory. "220" tells a player
+	// nothing; "220 DEG/S" tells them it is a turn rate and that doubling it doubles the turn. The
+	// two dead zones read as a percentage of the stick's travel, which is the only form in which a
+	// player can compare them to what their thumb is doing.
+	case ESetting::PadLookRate:
+		return FString::Printf(TEXT("%d DEG/S"), FMath::RoundToInt(Value));
+
+	case ESetting::PadLookYScale:
+		return FString::Printf(TEXT("%.2fx"), Value);
+
+	case ESetting::PadLookDeadzone:
+	case ESetting::PadMoveDeadzone:
 		// Already in percent — see GetSettingValue, which is the only place the conversion happens.
 		return FString::Printf(TEXT("%d%%"), FMath::RoundToInt(Value));
 
@@ -3039,6 +3338,25 @@ void FTraceOptionsMenu::SetSettingNormalised(ESetting Setting, float Alpha)
 	case ESetting::SfxVolume:          Settings.AudioSfxVolume    = Snapped * 0.01f; break;
 	case ESetting::MusicVolume:        Settings.AudioMusicVolume  = Snapped * 0.01f; break;
 
+	// ---- D31-PAD ------------------------------------------------------------------------------
+	//
+	// *** EVERY CONTROLLER ROW MUST APPEAR HERE OR IT SILENTLY DOES NOTHING. *** The `default: return`
+	// below is the trapdoor this switch's own comment describes, and this page has fallen through it
+	// once already. Both toggles are plain assignments of Snapped and not clamping increments, for
+	// the reason the crosshair block states: an increment can be turned on and never off.
+	//
+	// The caller — AdjustSelected, then Save() — is what re-applies the pad's mapping context, so a
+	// dead zone dragged on this page is live on the frame the drag ends and not on the next launch.
+	case ESetting::PadEnabled:       Settings.bPadEnabled     = (Snapped >= 0.5f); break;
+	case ESetting::PadLookRate:      Settings.PadLookRate     = Snapped; break;
+	case ESetting::PadLookYScale:    Settings.PadLookYScale   = Snapped; break;
+	case ESetting::PadInvertY:       Settings.bPadInvertLookY = (Snapped >= 0.5f); break;
+
+	// Back out of the row's percent into the 0..1 the setting stores — the twin of the multiply in
+	// GetSettingValue, exactly as CROSSHAIR OPACITY's and the three faders' are above.
+	case ESetting::PadLookDeadzone:  Settings.PadLookDeadzone = Snapped * 0.01f; break;
+	case ESetting::PadMoveDeadzone:  Settings.PadMoveDeadzone = Snapped * 0.01f; break;
+
 	default: return;
 	}
 
@@ -3090,6 +3408,14 @@ void FTraceOptionsMenu::AdjustSelected(int32 Delta)
 	{
 		SelectedBindingSlot = FMath::Clamp(ActiveBindingSlot() + FMath::Clamp(Delta, -1, 1),
 			0, UTraceUserSettings::MaxKeysPerAction - 1);
+		return;
+	}
+
+	// D31-PAD — a pad row has ONE chip, so the horizontal axis has nothing to pick and does nothing.
+	// Named rather than left to the kind test below, because "why does left/right work on the keybind
+	// page and not this one" is a real question with a real answer: MaxPadKeysPerAction is 1.
+	if (Row.Kind == ERowKind::PadBinding)
+	{
 		return;
 	}
 
@@ -3233,6 +3559,24 @@ void FTraceOptionsMenu::ActivateSelected()
 			UTraceUserSettings::MaxKeysPerAction);
 		return;
 
+	case ERowKind::PadBinding:
+		// D31-PAD — the SAME capture, with one flag set. See bCapturingPadKey in the header for why
+		// this is one boolean rather than a second state machine: every line below is the Binding
+		// case's, including spec v28 §3a's held-key snapshot, and only the key LIST and the SETTER
+		// differ (PollKeyCapture branches on the flag for both).
+		bCapturingKey = true;
+		bCapturingPadKey = true;
+		CapturingAction = Row.Binding;
+		CapturingSlot = 0;   // MaxPadKeysPerAction is 1; there is no other slot to point at.
+		IgnoreInputBeforeFrame = GFrameCounter + 1;
+		KeysHeldWhenCaptureOpened.Reset();
+		bCaptureNeedsHeldSnapshot = true;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Options] Waiting for a CONTROLLER button to bind to %s. Keyboard keys are refused ")
+			TEXT("here — this row is the pad's."),
+			TraceInputActions::Info(Row.Binding).DisplayName);
+		return;
+
 	default:
 		break;
 	}
@@ -3293,6 +3637,24 @@ void FTraceOptionsMenu::ActivateSelected()
 			Music->RefreshVolume();
 		}
 		UE_LOG(LogTraceGame, Display, TEXT("[Options] Audio volumes reset to defaults."));
+		break;
+
+	case EAction::OpenController:
+		// Remember where we came from, exactly as the three doors above do. Only the settings page
+		// carries this row today, but "back" must mean the place the player actually came from rather
+		// than one hardcoded parent — Trace.Menu.Controller can also land them here from nowhere.
+		ControllerReturnPage = Page;
+		Page = EPage::Controller;
+		IgnoreInputBeforeFrame = GFrameCounter + 1;
+		RebuildRows();
+		break;
+
+	case EAction::ResetControllerDefaults:
+		// The pad table and the five analog values, and NOTHING else — not the mouse, not a single
+		// keyboard bind, not the crosshair. See EAction::ResetControllerDefaults in the header, and
+		// Trace.Pad.Verify item 6, which asserts the converse as well.
+		UTraceUserSettings::Get().ResetPadToDefaults();
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] Controller layout reset to defaults."));
 		break;
 
 	case EAction::ResetCrosshairDefaults:
@@ -3384,6 +3746,23 @@ void FTraceOptionsMenu::GoBack()
 		if (VideoReturnPage == EPage::Root || VideoReturnPage == EPage::Settings)
 		{
 			Page = VideoReturnPage;
+			IgnoreInputBeforeFrame = GFrameCounter + 1;
+			RebuildRows();
+			return;
+		}
+
+		Close();
+		return;
+	}
+
+	if (Page == EPage::Controller)
+	{
+		// No queued apply to flush, unlike the video page: every row on this page is written and saved
+		// on the press or the mouse-up that made it, and each of those saves already re-applied the
+		// pad's mapping context through UTraceUserSettings::OnChanged.
+		if (ControllerReturnPage == EPage::Root || ControllerReturnPage == EPage::Settings)
+		{
+			Page = ControllerReturnPage;
 			IgnoreInputBeforeFrame = GFrameCounter + 1;
 			RebuildRows();
 			return;
@@ -3737,6 +4116,14 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 		// than the whitespace it costs.
 		PanelW = FMath::Min(ViewW * 0.50f, 560.f * UIScale);
 	}
+	else if (Page == EPage::Controller)
+	{
+		// D31-PAD — WIDER THAN THE CROSSHAIR PAGE and as wide as the settings page. Its value column
+		// carries "D-PAD RIGHT" and "A  (DOWN)" against labels as long as "ABILITY (SECONDARY)", and
+		// at 720p those two meet in the middle of a 560px panel. Measured against the longest pair on
+		// the page rather than eyeballed, which is the same test the video page's width states.
+		PanelW = FMath::Min(ViewW * 0.74f, 880.f * UIScale);
+	}
 	else if (Page == EPage::Audio)
 	{
 		// UI PLAN WP3 — six rows of short labels and percentages. Same width as the crosshair page
@@ -3792,6 +4179,7 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	else if (Page == EPage::Video)      { Title = TEXT("VIDEO"); }
 	else if (Page == EPage::Crosshair)  { Title = TEXT("CROSSHAIR"); }
 	else if (Page == EPage::Audio)      { Title = TEXT("AUDIO"); }
+	else if (Page == EPage::Controller) { Title = TEXT("CONTROLLER"); }
 
 	// SOFACHROME, and the spec names this string: "the word SETTINGS at the top of the settings page
 	// stays Sofachrome while the rows beneath it become Erbaum" (v26 §2). PAUSED and VIDEO are the
@@ -3826,7 +4214,14 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 
 	// ---- Footer --------------------------------------------------------------------------------
 	FString Hint;
-	if (bCapturingKey)
+	if (bCapturingKey && bCapturingPadKey)
+	{
+		// D31-PAD — a different sentence, because a different thing is being asked for and a
+		// different key cancels. A player at this prompt may have no keyboard in reach at all, so the
+		// legend has to name the pad's own cancel.
+		Hint = TEXT("PRESS A CONTROLLER BUTTON          MENU / ESC   CANCEL");
+	}
+	else if (bCapturingKey)
 	{
 		Hint = TEXT("PRESS ANY KEY TO BIND          ESC   CANCEL");
 	}
@@ -3850,6 +4245,13 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 		// selection. The footer says what the keys do RIGHT NOW, exactly as the rebind capture's does
 		// three branches up.
 		Hint = TEXT("TYPE YOUR CALL SIGN          ENTER   SAVE          ESC   CANCEL");
+	}
+	else if (Page == EPage::Controller)
+	{
+		// D31-PAD — the pad's own legend, in the pad's own vocabulary. A player who reached this page
+		// with a controller cannot use a legend that names ARROWS, ENTER and BKSP; a player who
+		// reached it with a keyboard still has all three, and PollNavigation accepts both sets.
+		Hint = TEXT("D-PAD  MOVE / ADJUST      A  SELECT      Y  UNBIND      B  BACK");
 	}
 	else if (Page == EPage::Video || Page == EPage::Crosshair || Page == EPage::Audio)
 	{
@@ -4218,6 +4620,77 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 
 			NextRight = ChipX - ChipGap;
 		}
+		return;
+	}
+
+	// ---- D31-PAD — the CONTROLLER page's bind row ----------------------------------------------
+	//
+	// ONE CHIP, and everything else is the Binding branch above with the loop taken out:
+	// MaxPadKeysPerAction is 1, so there is no slot to point at, no "+" invitation and no active-chip
+	// wash to distinguish two of them. The chip geometry, the minimum width, the wash and the face
+	// are deliberately the SAME numbers, because the two pages are read one after the other and a pad
+	// chip a different size from a key chip would read as a different control.
+	if (Row.Kind == ERowKind::PadBinding)
+	{
+		const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
+		const bool bWaiting = bCapturingKey && bCapturingPadKey && CapturingAction == Row.Binding;
+		const FKey Key = UserSettings.GetPadKey(Row.Binding);
+
+		const float ChipY = Y + H * 0.14f;
+		const float ChipH = H * 0.72f;
+
+		FString ValueText;
+		FLinearColor ValueColor;
+
+		// The THROW / PASS CORE row is not unbound, it is already bound — the same fact the keyboard
+		// page states as "LMB (WHILE CARRYING)" (UI plan WP6.3), and it is just as true on a pad: the
+		// fire trigger throws at a goal and passes in an endzone while you are carrying the Core, so a
+		// second mapping on it would dispatch one press twice. Amber UNBOUND here would read as "the
+		// central mechanic of this game is broken on a controller", which is precisely the misreading
+		// WP6.3 was written to fix.
+		bool bPassNote = false;
+
+		if (bWaiting)
+		{
+			ValueText = TEXT("PRESS A BUTTON");
+			ValueColor = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, 0.6f + 0.4f * FMath::Sin(Now * 9.f));
+		}
+		else if (Key.IsValid())
+		{
+			ValueText = UTraceUserSettings::DescribePadKey(Key);
+			ValueColor = TraceOptionsStyle::Ink;
+		}
+		else if (Row.Binding == ETraceInputAction::Pass)
+		{
+			ValueText = FString::Printf(TEXT("%s  (WHILE CARRYING)"),
+				*UTraceUserSettings::DescribePadKey(UserSettings.GetPadKey(ETraceInputAction::Fire)));
+			ValueColor = TraceOptionsStyle::InkDim;
+			bPassNote = true;
+		}
+		else
+		{
+			ValueText = TEXT("UNBOUND");
+			ValueColor = TraceOptionsStyle::Amber;
+		}
+
+		const float TextW = MeasureWidth(HUD, ValueText, FontMedium, LabelScale, TraceOptionsMenuType::BodyFace);
+		const float PlateW = bPassNote ? TextW : FMath::Max(TextW + (16.f * UIScale), 120.f * UIScale);
+		const float ChipX = ValueRight - PlateW;
+
+		const bool bChipDrawn = !bPassNote && DrawValueChip(HUD, ChipX, ChipY, PlateW, ChipH);
+		if (!bPassNote)
+		{
+			const float Wash = bWaiting ? 0.22f : (bSelected ? 0.16f : (bChipDrawn ? 0.05f : 0.10f));
+			HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, Wash), ChipX, ChipY, PlateW, ChipH);
+		}
+
+		DrawTextCentered(HUD, ValueText, ValueColor, ChipX + PlateW * 0.5f, TextY, FontMedium, LabelScale,
+			TraceOptionsMenuType::BodyFace);
+
+		// Slot 0's rect, so the hover/click path finds the same target it does on a keybind row. Slot 1
+		// stays invalid: there is no second chip and a stale rect would be a click target with nothing
+		// under it.
+		Row.KeyChip[0] = FBox2D(FVector2D(ChipX, ChipY), FVector2D(ChipX + PlateW, ChipY + ChipH));
 		return;
 	}
 

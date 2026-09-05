@@ -38,6 +38,7 @@
 #include "Engine/EngineTypes.h"          // EEndPlayReason
 #include "GameFramework/PlayerController.h"
 #include "Gameplay/TraceHitZones.h"      // ETraceHitZone (ClientNotifyHit's payload)
+#include "TraceTypes.h"                  // ETraceTeam (D31-TEAMS — the team-select session)
 #include "UObject/ObjectMacros.h"
 #include "UObject/ObjectPtr.h"
 
@@ -71,6 +72,29 @@ enum class ETraceViewKick : uint8
 	QuakeFar = 2,
 	/** Your own rocket went off near you. 2.5 deg / 0.30 s / 8 Hz. */
 	RocketSelf = 3,
+};
+
+/**
+ * D31-TEAMS (a). What the server said about a request to change team.
+ *
+ * Shaped exactly like ETraceCharacterPickResult and for the identical reason spelled out at the top
+ * of TracePlayerState.h: a button that silently does nothing is indistinguishable from a dropped
+ * packet, and the player's next move is to press it again forever. Every refusal below names WHICH
+ * rule refused, because the balance rule in particular is one a player is entitled to argue with.
+ */
+UENUM()
+enum class ETraceTeamChangeResult : uint8
+{
+	/** Done. The player is on the requested team and has been respawned on that side. */
+	Granted = 0,
+	/** They already were. Not an error; the screen just closes. */
+	AlreadyOnTeam,
+	/** THE BALANCE RULE. Taking the slot would leave the sides more than one player apart. */
+	WouldUnbalance,
+	/** The destination is at PlayersPerTeam and has no bot whose slot could be taken. */
+	TeamFull,
+	/** Not a team (None), or a bot asked, or the match has no game mode to ask. */
+	NotAllowed
 };
 
 class APawn;
@@ -166,6 +190,8 @@ public:
 	ATracePlayerController();
 
 	//~ Begin AActor / APlayerController interface
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void SetupInputComponent() override;
@@ -301,6 +327,98 @@ public:
 	/** Asks the server to put us back in the game. See the implementation for the exact rules. */
 	UFUNCTION(Server, Reliable)
 	void ServerRequestRespawn();
+
+	// -----------------------------------------------------------------------------------------
+	// D31-TEAMS — the team-select session, and the mid-match character switch
+	//
+	// WHY THE SESSION LIVES ON THE CONTROLLER AND NOT ON THE PLAYER STATE, which is where the
+	// character-select session lives. Two reasons, and the second is the load-bearing one:
+	//
+	//   1. It is nobody else's business. A PlayerState replicates to EVERY client (the scoreboard
+	//      needs it); a PlayerController is bOnlyRelevantToOwner, so a flag here reaches exactly the
+	//      one machine that draws the screen and costs nothing on the other nine connections. The
+	//      character-select session had to pay for COND_OwnerOnly by hand to get the same property.
+	//   2. It is the actor the CLIENT OWNS, so the request RPCs below are legal on it. That is not a
+	//      convenience: a Server RPC may only be sent on an actor the sending connection owns, which
+	//      is exactly why ATracePlayerState::ServerRequestCharacter had to justify itself in its own
+	//      comment (AController::InitPlayerState makes the controller the state's Owner).
+	//
+	// THE SERVER IS THE ONLY WRITER. Nothing below is set on a client, and the client's own screen
+	// draws off the replicated flag rather than off its own guess — the same "the server decides, the
+	// screen reports" contract the character-select screen's header states at length. A client-side
+	// team swap the server did not agree with is worse than no feature at all.
+	// -----------------------------------------------------------------------------------------
+
+	/**
+	 * True while this player's team-select screen is up. Replicated from the server; the ONLY
+	 * condition the screen draws on.
+	 */
+	UPROPERTY(Replicated)
+	bool bTeamSelectOpen = false;
+
+	/**
+	 * Absolute server time (AGameStateBase::GetServerWorldTimeSeconds) at which an unanswered team
+	 * select closes itself and keeps whatever team the balancer already gave this player. Zero = no
+	 * deadline.
+	 *
+	 * A DEADLINE RATHER THAN A REMAINING DURATION, for the reason RespawnEndServerTime and
+	 * CharacterSelectDeadlineServerTime both give: a client that joins late, or one whose screen is
+	 * re-opened, is immediately correct instead of restarting somebody else's countdown.
+	 */
+	UPROPERTY(Replicated)
+	float TeamSelectDeadlineServerTime = 0.f;
+
+	bool IsTeamSelectOpen() const { return bTeamSelectOpen; }
+
+	/** Seconds until the team select closes itself, clamped at zero. Zero when no deadline runs. */
+	float GetTeamSelectTimeRemaining() const;
+
+	/** Server only. Opens or closes the session and arms/clears the timeout. */
+	void ServerSetTeamSelectOpen(bool bOpen, float DurationSeconds);
+
+	/** H, or Trace.Teams.Select. Asks the server to put the team-select screen up. */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerRequestOpenTeamSelect();
+
+	/** H again, or the screen's CLOSE row. Asks the server to take it down with nothing changed. */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerRequestCloseTeamSelect();
+
+	/**
+	 * THE REQUEST. Forwards to ATraceGameMode::RequestTeamChange, which owns the balance rule, and
+	 * reports the verdict back through ClientTeamChangeResult. It decides nothing itself.
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerRequestTeam(ETraceTeam DesiredTeam);
+
+	/**
+	 * D31-TEAMS (b). "Switch characters while in a game, without needing to disconnect."
+	 *
+	 * Hands the character back and lets ATraceGameMode::PollCharacterSelect notice — the SHIPPED
+	 * select screen reopens, the shipped per-team uniqueness rule runs on the pick, and the shipped
+	 * lock re-closes it. That is deliberately the identical mechanism
+	 * UTracePracticeRangeSubsystem::ReopenCharacterSelect uses in the practice range, rather than a
+	 * second way to change character: the range's version is restricted to the range, and a second
+	 * writer is exactly the drift this codebase keeps getting bitten by.
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerRequestCharacterSwitch();
+
+	/** The verdict, back to the requesting client only. Granted is sent too — silence is not an answer. */
+	UFUNCTION(Client, Reliable)
+	void ClientTeamChangeResult(ETraceTeam RequestedTeam, ETraceTeamChangeResult Result);
+
+	// ---- Last verdict, for the team-select screen's message line -------------------------------
+	//
+	// CLIENT-LOCAL AND NOT REPLICATED, exactly like ATracePlayerState::LastPickResult and for the
+	// same reason: it is the answer to one RPC this player sent, it means nothing to anybody else,
+	// and replicating it would put a refusal in front of a player who never pressed anything.
+
+	ETraceTeamChangeResult LastTeamResult = ETraceTeamChangeResult::Granted;
+	ETraceTeam LastTeamResultTeam = ETraceTeam::None;
+
+	/** UWorld::GetTimeSeconds on the client when the verdict landed. Far in the past = none yet. */
+	float LastTeamResultLocalTime = -1000.f;
 
 	/** The possessed pawn as an ATraceCharacter, or null (unpossessed, or a non-Trace pawn). */
 	ATraceCharacter* GetTraceCharacter() const;
@@ -1013,6 +1131,27 @@ private:
 
 	/** Server-side: world time of the last respawn request we acted on. */
 	float LastRespawnRequestTime = NeverHitSentinel;
+
+	// ---- D31-TEAMS ---------------------------------------------------------------------------
+
+	/**
+	 * Server-side: closes an unanswered team select. A ONE-SHOT TIMER rather than a tick, because
+	 * this class does not otherwise tick on the server and adding one for a countdown that fires at
+	 * most once per player per opening would be a per-frame cost for a per-minute event.
+	 *
+	 * Cleared whenever the session closes for any other reason, so a player who picks at 14.9 s
+	 * cannot have their screen "closed" again half a second later.
+	 */
+	FTimerHandle TeamSelectTimeoutHandle;
+
+	/** Server-side: world time of the last team-select request we acted on. Anti-spam, like respawn. */
+	float LastTeamRequestTime = NeverHitSentinel;
+
+	/** Minimum seconds between honoured team-select requests from one client. */
+	static constexpr float TeamRequestCooldown = 0.25f;
+
+	/** Fired by TeamSelectTimeoutHandle. Closes the session and keeps the team the balancer gave. */
+	void CloseTeamSelectOnTimeout();
 
 	// -----------------------------------------------------------------------------------------
 	// VIEW KICK (FX_AUDIO_PLAN §1.5) — three numbers and a start time, all local to this machine.

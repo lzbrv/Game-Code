@@ -30,6 +30,7 @@
 #include "Gameplay/TraceEndzone.h"
 #include "Gameplay/TraceHealthComponent.h"
 #include "Gameplay/TraceTrailComponent.h"
+#include "Modes/TracePracticeRange.h"   // D31-TEAMS — the range gets no team screen; see OpenTeamSelectFor
 #include "Trace.h"
 #include "TraceSettings.h"
 #include "TraceTypes.h"
@@ -103,7 +104,40 @@ namespace
 		     "ROCCO every time, so Trace.Characters.BotVerify can be shown to FAIL. Prefer "
 		     "'Trace.Characters.BotVerifyRed', which scopes it to one run. Dev only, absent from shipping."),
 		ECVF_Cheat);
+
+	/**
+	 * THE RED ARM FOR THE D31 REFILL — "bots should respawn if a player leaves, so there is no 4v5".
+	 *
+	 * 1 (default): ATraceGameMode::Logout schedules a bot fill when a PERSON leaves, which is the one
+	 * line that makes the departure heal itself.
+	 *
+	 * 0: that schedule is skipped and nothing else changes, so the roster is left exactly as it was
+	 * before D31 — four against five until the next join. Trace.Bots.LeaveRefillTest must then FAIL
+	 * on its refill assertion while still PASSING the Core assertion, because the Core rescue is a
+	 * different mechanism that this switch deliberately cannot reach.
+	 *
+	 * Cheat-only and compiled out of shipping: a player must not be able to turn team balance off.
+	 */
+	int32 GTraceRefillBotOnHumanLeave = 1;
+
+	FAutoConsoleVariableRef CVarTraceRefillBotOnHumanLeave(
+		TEXT("Trace.Bots.RefillOnLeave"),
+		GTraceRefillBotOnHumanLeave,
+		TEXT("1 (default): a human leaving schedules the bot fill, so their slot is taken by AI and the "
+		     "teams stay level. 0 restores the pre-D31 behaviour (the hole stays open) so "
+		     "'Trace.Bots.LeaveRefillTest' can be shown to FAIL. Dev only, absent from shipping."),
+		ECVF_Cheat);
 #endif
+
+	/** The red arm above, as one call that is honest in shipping (where the arm does not exist). */
+	bool IsRefillOnHumanLeaveEnabled()
+	{
+#if UE_BUILD_SHIPPING
+		return true;
+#else
+		return GTraceRefillBotOnHumanLeave != 0;
+#endif
+	}
 }
 
 namespace TraceGameModeConstants
@@ -637,6 +671,20 @@ void ATraceGameMode::AssignTeamIfNeeded(APlayerController* NewPlayer)
 	}
 
 	TracePlayerState->SetTeam(PickedTeam);
+
+	// ---- D31-TEAMS: "players should load into team select before character select" --------------
+	//
+	// The balancer's answer above is still applied, and applied FIRST, on purpose: a player with no
+	// team has no spawn side, no friendly-fire protection and no scoring, and PollCharacterSelect
+	// refuses to open a character screen for them at all. So they arrive on a real team and are then
+	// asked whether they want the other one — which is a question, not a hole in the roster.
+	//
+	// THE ORDERING IS ENFORCED IN PollCharacterSelect, not here: that poll will not open a character
+	// screen while this player's team screen is up. Doing it the other way round — opening both and
+	// letting the team screen draw on top — would leave the 30 s auto-pick clock running behind a
+	// modal the player is still reading, and they would be assigned a character for a team they had
+	// not chosen yet.
+	OpenTeamSelectFor(NewPlayer);
 }
 
 #if !UE_BUILD_SHIPPING
@@ -686,9 +734,26 @@ void ATraceGameMode::Logout(AController* Exiting)
 	{
 		ClearPendingRespawn(Exiting);
 
+		// WHO ACTUALLY REACHES THIS BRANCH, MEASURED RATHER THAN ASSUMED (D31).
+		//
+		// It reads as "the quitter path", and the quitter is the one case it does NOT get: a
+		// disconnecting player arrives here WITH NO PAWN. APlayerController::Destroyed runs
+		// PawnLeavingGame() (which destroys the pawn) or UnPossess() BEFORE AController::Destroyed
+		// calls Logout, and AController::Destroyed is the engine's only caller of Logout — so by the
+		// time this cast runs there is nothing to cast. A two-process run with a REAL client killed
+		// while carrying, LogTraceGame at Verbose, logged ZERO "[Bounds] core drop via logout" lines
+		// and, in the same frame as the disconnect, one "Core: holder became invalid; applying
+		// fallback": ATraceCore's own holder-sanity tick is what keeps a quitter's Core in the match,
+		// and it performs the same release-and-fallback this branch would have.
+		//
+		// What does reach it is a controller destroyed WHILE STILL POSSESSING: RemoveOneBotFromTeam's
+		// manual Logout(Bot) ahead of its UnPossess, and Trace.Bounds.CoreDropClampTest, which copies
+		// that sequence deliberately. This is therefore the BOT departure path, and the F6 clamp below
+		// is exercised there. Keep it for people too — it costs one null cast, and a future caller
+		// that logs a live-pawned player out would otherwise leave the Core riding a doomed actor —
+		// but do not read it as the thing that saves a quitter's Core, because it is not.
 		if (ATraceCharacter* TraceCharacter = Cast<ATraceCharacter>(Exiting->GetPawn()))
 		{
-			// Never let the one Core disappear with a quitter.
 			if (ATraceCore* TheCore = GetCore())
 			{
 				if (TheCore->GetCarrier() == TraceCharacter)
@@ -731,6 +796,37 @@ void ATraceGameMode::Logout(AController* Exiting)
 	{
 		World->GetTimerManager().SetTimerForNextTick(this, &ATraceGameMode::CheckMatchStartConditions);
 	}
+
+	// D31. A PERSON WHO LEAVES MID-MATCH LEAVES A HOLE, AND THE HOLE IS AI-SHAPED.
+	//
+	// The owner's ask is "no 4v5". This needs no new machinery: UpdateBotFill is written as a TARGET
+	// ROSTER SIZE per side — PlayersPerTeam bodies, however many of them happen to be people — so the
+	// same pass PostLogin schedules when somebody arrives is the whole refill when somebody goes. All
+	// that was missing was this call.
+	//
+	// DEFERRED BY A TICK, for the reason stated directly above rather than out of caution: the leaver
+	// is still in PlayerArray in this frame (their PlayerState is destroyed by CleanupPlayerState the
+	// moment this returns), and a fill computed now would count the team as full and do nothing. The
+	// deferral is also what makes "four of them quit at once" one pass that spawns four bots instead
+	// of four passes racing each other.
+	//
+	// ONLY FOR PEOPLE, and not because a bot's departure is harmless. RemoveOneBotFromTeam routes its
+	// bots through this same function (see the essay there), and every one of those removals is a
+	// decision UpdateBotFill has just taken — including the whole-roster sweep "?bots=0" performs.
+	// Scheduling from there would re-run the fill once per bot removed to confirm what it had itself
+	// just done. Nothing is left uncovered: a bot that DIES is respawned by the ordinary respawn
+	// path, and a bot that is removed was removed on purpose.
+	//
+	// ON THE F7 LATCH ABOVE, WHICH THIS IS THE FIRST ADDITION TO USE AS ADVERTISED. A disconnecting
+	// player reaches this function exactly once (AController::Destroyed is the engine's only caller);
+	// it is the manual Logout(Bot) in RemoveOneBotFromTeam that arrives twice, and the bot filter
+	// here already excludes it. So the latch is belt to this braces — but it is what would keep one
+	// departure from queueing two fills if a future path calls Logout for a person twice, and the
+	// cost of being wrong about that is bot-count drift nowhere near this line.
+	if (IsRefillOnHumanLeaveEnabled() && HasAuthority() && Exiting != nullptr && Exiting->IsA<APlayerController>())
+	{
+		ScheduleBotFill();
+	}
 }
 
 ETraceTeam ATraceGameMode::PickTeamForNewPlayer() const
@@ -764,6 +860,339 @@ ETraceTeam ATraceGameMode::PickTeamForNewPlayer() const
 	}
 
 	return ETraceTeam::None;
+}
+
+// =============================================================================================
+// D31-TEAMS — CHANGING TEAM
+//
+// See the essay above IsTeamSwitchAllowed's declaration in the header for the rule and for why the
+// bot clause is the design rather than an exception to it. Three things live here:
+//
+//   * IsTeamSwitchAllowed — the rule, a pure function of the replicated roster so the SCREEN gets
+//     the same answer the SERVER will;
+//   * OpenTeamSelectFor  — putting the screen up, at join and on H;
+//   * RequestTeamChange  — the server's verdict, and everything a granted switch has to tidy up.
+//
+// NOT HERE, ON PURPOSE: anything that spawns, removes or re-teams a BOT. UpdateBotFill()'s target is
+// a roster SIZE per team, so it absorbs a human arriving on one side and leaving the other on its
+// own — this file only has to call ScheduleBotFill() and let it. Bot backfill belongs to tranche
+// D31-BOTS and two owners editing one fill is how a bot count drifts.
+// =============================================================================================
+
+bool ATraceGameMode::IsTeamSwitchAllowed(const AGameStateBase* InGameState, const ATracePlayerState* Mover,
+	ETraceTeam DesiredTeam, FString& OutReason, bool* OutDestinationFull)
+{
+	OutReason.Reset();
+	if (OutDestinationFull != nullptr)
+	{
+		*OutDestinationFull = false;
+	}
+
+	if (Mover == nullptr || DesiredTeam == ETraceTeam::None)
+	{
+		OutReason = TEXT("NOT A TEAM");
+		return false;
+	}
+
+	if (Mover->Team == DesiredTeam)
+	{
+		return true;   // Already there. RequestTeamChange answers AlreadyOnTeam; the rule has no view.
+	}
+
+	if (InGameState == nullptr)
+	{
+		// A client that has not received a GameState yet cannot compute a belief. Say YES rather than
+		// NO: this function greys the screen's options out, and a screen that refuses everything for
+		// the first few frames after a travel is indistinguishable from a broken feature. The SERVER
+		// re-asks with a real GameState before anything happens, which is the answer that counts.
+		return true;
+	}
+
+	// Counted here rather than through ATraceGameState::CountTeamMembers so this stays static and
+	// usable from the UI slice on a client, and so bots are counted in the same sweep. The spectator
+	// skip is copied from CountTeamMembers deliberately: two functions that disagree about who is on
+	// a team would make the screen and the server disagree about the rule.
+	int32 SizeDest = 0;
+	int32 SizeOther = 0;
+	int32 BotsDest = 0;
+	const ETraceTeam OtherTeam = TraceOpposingTeam(DesiredTeam);
+
+	for (const APlayerState* const EachState : InGameState->PlayerArray)
+	{
+		const ATracePlayerState* const Member = Cast<ATracePlayerState>(EachState);
+		if (Member == nullptr || Member->IsOnlyASpectator())
+		{
+			continue;
+		}
+
+		if (Member->Team == DesiredTeam)
+		{
+			++SizeDest;
+			if (Member->IsABot())
+			{
+				++BotsDest;
+			}
+		}
+		else if (Member->Team == OtherTeam)
+		{
+			++SizeOther;
+		}
+	}
+
+	const int32 TeamCap = FMath::Max(1, UTraceSettings::Get().PlayersPerTeam);
+
+	// After the move. The mover leaves the OTHER side only if they were on it — a teamless player
+	// (both sides full at join, or a spectator promoted) takes a slot without vacating one, and the
+	// rule has to see that rather than assume a symmetric swap.
+	const int32 DestAfter = SizeDest + 1;
+	const int32 OtherAfter = (Mover->Team == OtherTeam) ? (SizeOther - 1) : SizeOther;
+
+	// ---- THE BOT CLAUSE ------------------------------------------------------------------------
+	//
+	// A bot on the destination is a slot a human may take: UpdateBotFill() removes one there
+	// (DesiredBots falls as Humans rises) and puts one back on the side that was vacated, on the next
+	// tick, keeping both sides at PlayersPerTeam. Nothing can stack while that is true, so the +1
+	// test below would only ever refuse switches that the fill was about to make harmless.
+	if (BotsDest > 0)
+	{
+		return true;
+	}
+
+	if (DestAfter > TeamCap)
+	{
+		if (OutDestinationFull != nullptr)
+		{
+			*OutDestinationFull = true;
+		}
+		OutReason = FString::Printf(TEXT("%s IS FULL (%d/%d) AND HAS NO BOT TO STAND DOWN"),
+			*TraceTeamName(DesiredTeam).ToString().ToUpper(), SizeDest, TeamCap);
+		return false;
+	}
+
+	if (DestAfter > OtherAfter + 1)
+	{
+		OutReason = FString::Printf(TEXT("THAT WOULD MAKE IT %d V %d"), DestAfter, OtherAfter);
+		return false;
+	}
+
+	return true;
+}
+
+void ATraceGameMode::OpenTeamSelectFor(APlayerController* ForPlayer)
+{
+	if (!HasAuthority() || ForPlayer == nullptr)
+	{
+		return;
+	}
+
+	ATracePlayerController* const TracePC = Cast<ATracePlayerController>(ForPlayer);
+	if (TracePC == nullptr)
+	{
+		return;
+	}
+
+	const ATracePlayerState* const State = ForPlayer->GetPlayerState<ATracePlayerState>();
+	if (State != nullptr && State->IsABot())
+	{
+		return;   // A bot has no client to draw a screen and nobody to press a key. See PollCharacterSelect.
+	}
+
+	if (TracePC->IsTeamSelectOpen())
+	{
+		return;   // Already choosing; a second nudge would only reset their deadline.
+	}
+
+	// NOT IN THE PRACTICE RANGE. ATracePracticeGameMode derives from this class, so without this the
+	// range — a single-player sandbox with no opposing team to switch to — would open a 15 second
+	// team screen in front of every session before the character screen it actually wants. The range
+	// has its own character-switch pad and its own Trace.Practice.SwitchCharacter, which is exactly
+	// the mechanism D31-TEAMS (b) reuses for real matches, so nothing is lost there either.
+	//
+	// Asked of TracePracticeRange::IsActive rather than tested with IsA<>: that function is the one
+	// answer the whole range slice already uses, it is server-sided by construction, and it carries
+	// the range's own red arm.
+	if (TracePracticeRange::IsActive(GetWorld()))
+	{
+		return;
+	}
+
+	const ATraceGameState* const TraceGameState = GetGameState<ATraceGameState>();
+
+	// NOT AFTER FULL TIME. The match-result takeover owns the screen then, there is nothing left to
+	// change team FOR, and RequestTeamChange would respawn somebody into a finished match. This poll
+	// is the one place that decides the screen exists at all, so it is the only place that needs to
+	// know.
+	if (TraceGameState != nullptr && TraceGameState->TraceMatchState == ETraceMatchState::PostMatch)
+	{
+		return;
+	}
+
+	TracePC->ServerSetTeamSelectOpen(/*bOpen=*/true, TeamSelectTimeout);
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[TeamSelect] Screen opened for '%s' (currently %s)%s. Blue %d, Orange %d, cap %d."),
+		(State != nullptr) ? *State->GetPlayerName() : TEXT("<no state>"),
+		(State != nullptr) ? *TraceTeamName(State->Team).ToString() : TEXT("?"),
+		(TeamSelectTimeout > 0.f) ? *FString::Printf(TEXT("; closes in %.0fs"), TeamSelectTimeout) : TEXT("; no timeout"),
+		(TraceGameState != nullptr) ? TraceGameState->CountTeamMembers(ETraceTeam::Blue) : -1,
+		(TraceGameState != nullptr) ? TraceGameState->CountTeamMembers(ETraceTeam::Orange) : -1,
+		FMath::Max(1, UTraceSettings::Get().PlayersPerTeam));
+}
+
+ETraceTeamChangeResult ATraceGameMode::RequestTeamChange(ATracePlayerState* Requester, ETraceTeam DesiredTeam)
+{
+	if (!HasAuthority() || Requester == nullptr || DesiredTeam == ETraceTeam::None)
+	{
+		return ETraceTeamChangeResult::NotAllowed;
+	}
+
+	// A bot is placed by UpdateBotFill and has no screen to have pressed anything on, so this can
+	// only be a malformed or hostile call. Refused rather than served, for the reason
+	// RequestCharacter refuses a bot: a second, unordered way to move a bot between teams would make
+	// the fill's arithmetic unreproducible.
+	if (Requester->IsABot())
+	{
+		return ETraceTeamChangeResult::NotAllowed;
+	}
+
+	if (Requester->Team == DesiredTeam)
+	{
+		return ETraceTeamChangeResult::AlreadyOnTeam;
+	}
+
+	// THE RULE, re-asked on the server. The client already asked it to grey the option out; that
+	// answer was a belief about a PlayerArray one round trip old and is not evidence of anything.
+	FString Reason;
+	bool bDestinationFull = false;
+	if (!IsTeamSwitchAllowed(GameState, Requester, DesiredTeam, Reason, &bDestinationFull))
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TeamSelect] REFUSED '%s' -> %s: %s"),
+			*Requester->GetPlayerName(), *TraceTeamName(DesiredTeam).ToString(), *Reason);
+
+		// TeamFull and WouldUnbalance are both refusals; they are split because "the other side is
+		// full" is a fact a player can act on (wait) and "that would make it 3 v 1" is one they can
+		// argue with (ask somebody to swap back).
+		return bDestinationFull
+			? ETraceTeamChangeResult::TeamFull
+			: ETraceTeamChangeResult::WouldUnbalance;
+	}
+
+	const ETraceTeam FromTeam = Requester->Team;
+	AController* const Owner = Requester->GetOwningController();
+
+	// ---- The team itself -----------------------------------------------------------------------
+	//
+	// FIRST, and before the respawn: ChoosePlayerStart_Implementation reads GetTeamForController to
+	// choose the endzone pad, so a restart ordered before this line would put the player back on the
+	// side they just left. SetTeam also runs OnRep_Team by hand, which is what repaints the pawn — so
+	// a player who somehow keeps their body still changes colour.
+	Requester->SetTeam(DesiredTeam);
+
+	// ---- Per-team uniqueness follows them across ------------------------------------------------
+	//
+	// Spec v14 §3 is a rule about a TEAM, so carrying Rocco from Blue to an Orange that already has a
+	// Rocco would break it silently — two team-mates with one character, which is precisely the state
+	// every other path in this file exists to prevent. Handing the character back and letting
+	// PollCharacterSelect reopen the shipped screen is the same mechanism the mid-match character
+	// switch uses, and it re-runs the real rule on whatever they pick next.
+	//
+	// ONLY ON A CONFLICT. A player whose character is free on the new side keeps it: making everybody
+	// re-pick on every switch would turn a team change into a two-screen ordeal.
+	const uint8 CarriedCharacter = Requester->GetSelectedCharacter();
+	if (TraceCharacterRoster::IsValidId(CarriedCharacter)
+		&& IsCharacterTakenOnTeam(DesiredTeam, CarriedCharacter, Requester))
+	{
+		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Requester))
+		{
+			// Documented as always allowed and never refused, which is what makes this an infallible
+			// first step rather than a request that could bounce and strand them mid-switch.
+			Abilities->ServerSetCharacter(ETraceCharacterId::None);
+		}
+		Requester->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TeamSelect] '%s' brought %s to %s, where a team-mate already holds it - character "
+			     "handed back; the select screen reopens on the next poll."),
+			*Requester->GetPlayerName(), *TraceCharacterRoster::NameFor(CarriedCharacter),
+			*TraceTeamName(DesiredTeam).ToString());
+	}
+
+	// ---- The body ------------------------------------------------------------------------------
+	//
+	// ONLY A LIVING SWITCHER IS RESPAWNED, and the dead case is a deliberate refusal to be clever.
+	// A player waiting out RespawnDelay already has a pending respawn on the game mode's timer, and
+	// that timer calls ChoosePlayerStart, which reads the team we have just written — so a dead
+	// player lands on their NEW side at the moment they were always going to land, and nothing has
+	// to be rescheduled. Restarting them here instead would clear RespawnEndServerTime and put them
+	// back on the field immediately, which turns "change team" into "skip the respawn delay": a
+	// free, repeatable escape from the one cost the game charges for dying.
+	ATraceCharacter* const Body = (Owner != nullptr) ? Cast<ATraceCharacter>(Owner->GetPawn()) : nullptr;
+	const bool bBodyIsStanding = (Body != nullptr) && Body->IsAlive();
+
+	if (bBodyIsStanding)
+	{
+		// THE SAME THREE THINGS THE LOGOUT PATH DOES, and for the same three reasons: the one
+		// Core must never disappear with a body that is about to be destroyed, a trail must never
+		// outlive its emitter, and a destroyed character must leave the server's tracked roster
+		// (the weapon's lag-compensated resolver walks it).
+		if (ATraceCore* const TheCore = GetCore())
+		{
+			if (TheCore->GetCarrier() == Body)
+			{
+				// F6's clamp, exactly as Logout uses it: "where the carrier was" can be out of
+				// bounds, and changing team is one more way to stop existing out there.
+				const FVector DropLocation = ClampCoreDropLocation(Body->GetActorLocation());
+				TheCore->DropAt(DropLocation, FVector::ZeroVector);
+
+				UE_LOG(LogTraceGame, Log,
+					TEXT("[TeamSelect] '%s' was carrying the Core; dropped at %s before the switch."),
+					*Requester->GetPlayerName(), *DropLocation.ToCompactString());
+			}
+		}
+
+		if (UTraceTrailComponent* const TrailComponent = Body->Trail)
+		{
+			TrailComponent->SetEmitting(false);
+			TrailComponent->ClearTrail();
+		}
+
+		UnregisterCharacter(Body);
+
+		// RestartPlayerFresh only tears down a pawn that is NOT alive (see its comment), so a
+		// living switcher would be "restarted" as the same body standing where it was, on the
+		// wrong side of the field. Destroy it by hand and let the restart spawn a fresh one on
+		// the new team's pad.
+		Owner->UnPossess();
+		Body->Destroy();
+
+		RestartPlayerFresh(Owner);
+	}
+	else
+	{
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[TeamSelect] '%s' was not standing, so their pending respawn puts them on %s "
+			     "instead of a restart here (a restart would refund their respawn delay)."),
+			*Requester->GetPlayerName(), *TraceTeamName(DesiredTeam).ToString());
+	}
+
+	// ---- Let the fill settle the slot arithmetic ------------------------------------------------
+	//
+	// One call, no bot logic. UpdateBotFill's per-team target is PlayersPerTeam - Humans, so it takes
+	// a bot OFF the side this player just joined and puts one BACK on the side they left, which is
+	// what makes "a human displaces a bot rather than making it 6 v 4" true without this slice
+	// knowing how a bot is spawned. Next tick, because PlayerArray is only truthful then.
+	ScheduleBotFill();
+
+	const ATraceGameState* const TraceGameState = GetGameState<ATraceGameState>();
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[TeamSelect] GRANTED '%s': %s -> %s. Roster now Blue %d, Orange %d (before the fill settles)."),
+		*Requester->GetPlayerName(), *TraceTeamName(FromTeam).ToString(),
+		*TraceTeamName(DesiredTeam).ToString(),
+		(TraceGameState != nullptr) ? TraceGameState->CountTeamMembers(ETraceTeam::Blue) : -1,
+		(TraceGameState != nullptr) ? TraceGameState->CountTeamMembers(ETraceTeam::Orange) : -1);
+
+	return ETraceTeamChangeResult::Granted;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2072,6 +2501,13 @@ void ATraceGameMode::RemoveOneBotFromTeam(ETraceTeam Team)
 		// (a counter, a score adjustment, a queue push) — which is exactly what the F6 core-drop
 		// clamp above it now is. Keep the latch if you refactor this pair; without it, the symptom
 		// shows up as a bot-count drift nowhere near this line.
+		//
+		// D31 ADDED THE SECOND SUCH THING: Logout now schedules a bot fill so a departure heals
+		// itself. THIS call must not trigger it — the removal below is a decision UpdateBotFill has
+		// already taken, and answering it with another fill would be a function confirming its own
+		// work once per bot it retired. That is why the schedule there is filtered to
+		// APlayerControllers rather than left to the latch: the latch stops a controller being
+		// logged out twice, not a bot from being treated as a departing player.
 		Logout(Bot);
 
 		if (APawn* BotPawn = Bot->GetPawn())
@@ -3909,6 +4345,26 @@ void ATraceGameMode::PollCharacterSelect()
 		if (Candidate->Team == ETraceTeam::None)
 		{
 			continue;
+		}
+
+		// ---- D31-TEAMS: TEAM SELECT COMES FIRST -------------------------------------------------
+		//
+		// "Players should load into team select before character select." THIS LINE IS THAT ORDERING,
+		// and it is here rather than on the drawing side because the thing that must not happen is
+		// not a screen appearing — it is the 30 s AUTO-PICK CLOCK starting. A character screen opened
+		// underneath the team screen would keep counting while the player reads it and would assign
+		// them a character for a team they have not chosen yet; the drawing order would look right
+		// and the behaviour would be wrong.
+		//
+		// It is also why this is not a test of "is a team-select overlay drawn on that machine": that
+		// is a client-side fact this server cannot see. bTeamSelectOpen is written here and
+		// replicated outwards, which makes the condition the same one on every machine.
+		if (const ATracePlayerController* const TeamChooser = Cast<ATracePlayerController>(Candidate->GetOwningController()))
+		{
+			if (TeamChooser->IsTeamSelectOpen())
+			{
+				continue;
+			}
 		}
 
 		// ---- Already sorted --------------------------------------------------------------------
@@ -5831,6 +6287,364 @@ namespace
 		     "field, and the engine's second Logout for the same controller must be swallowed by the F7 "
 		     "latch. Run with '?bots=8'."),
 		FConsoleCommandWithWorldDelegate::CreateStatic(&CoreDropClampTestCommand));
+
+	// =============================================================================================
+	// D31 — "BOTS SHOULD RESPAWN IF A PLAYER LEAVES, SO THAT THERE IS NO 4v5"
+	//
+	//   Trace.Bots.LeaveRefillTest [WatchSeconds=30] [nocore]
+	//
+	// A TWO-PROCESS TEST, and it cannot be anything else: the behaviour under test is a real client
+	// dropping a real connection, and the one thing a single process cannot do is disconnect from
+	// itself. So this arms a watcher on the SERVER and then waits for somebody to kill the client.
+	//
+	// At arm time it:
+	//   * finds a REMOTE human — a PlayerController this machine is not the local controller of —
+	//     and refuses to run without one. No client, no departure, nothing to measure;
+	//   * unless 'nocore' is passed, hands that human the Core, so the case the owner actually
+	//     asked about (leaving WHILE CARRYING) is the case being measured rather than whichever
+	//     case happened to be convenient. If the grant does not take, it refuses rather than
+	//     reporting a carrier case that is not one;
+	//   * photographs the roster out of GameState->PlayerArray — the array the scoreboard reads,
+	//     deliberately NOT the GameMode's own Bots list, because a fill that updated its
+	//     bookkeeping and put nobody on the field would pass a test written against Bots.Num().
+	//
+	// Then it polls at 4 Hz. Every assertion below can find the opposite case:
+	//   1. the client really left (its PlayerState left PlayerArray). A run where nobody kills the
+	//      client FAILS HERE, and says so, instead of reporting anything about bots;
+	//   2. the leaver's side is back to the size it was before they went;
+	//   3. it got there through a bot that DID NOT EXIST at arm time — names are compared, so
+	//      re-counting the bots that were already standing there cannot pass;
+	//   4. the new bot is on the LEAVER'S side and the other side is unchanged. A fill that levels
+	//      the teams by making the wrong one six is not a pass;
+	//   5. the Core is still in the match — held by a VALID, LIVING carrier, or loose. The quitter's
+	//      pawn is destroyed by the engine before Logout is even called, so "the Core left with
+	//      them" cannot satisfy IsValid() and this assertion is exactly what would catch it.
+	//
+	// 'Trace.Bots.RefillOnLeave 0' is the red arm. That run must FAIL 2 and 3 while still PASSING 5:
+	// the Core rescue is ATraceCore's own holder-sanity tick, a different mechanism that this switch
+	// deliberately cannot reach, and a red arm that took both down would prove less rather than more.
+	// =============================================================================================
+
+	struct FLeaveRefillRoster
+	{
+		int32 Total = 0;
+		int32 Bots = 0;
+		TSet<FString> BotNames;
+	};
+
+	FLeaveRefillRoster ReadTeamRoster(const ATraceGameState* State, ETraceTeam Team)
+	{
+		FLeaveRefillRoster Out;
+		if (State == nullptr)
+		{
+			return Out;
+		}
+
+		for (const APlayerState* PlayerState : State->PlayerArray)
+		{
+			// Cast<To>(const From*) yields const To*, so the template argument stays non-const.
+			const ATracePlayerState* TracePlayerState = Cast<ATracePlayerState>(PlayerState);
+			if (TracePlayerState == nullptr || TracePlayerState->IsOnlyASpectator()
+				|| TracePlayerState->Team != Team)
+			{
+				continue;
+			}
+
+			++Out.Total;
+			if (TracePlayerState->IsABot())
+			{
+				++Out.Bots;
+				Out.BotNames.Add(TracePlayerState->GetPlayerName());
+			}
+		}
+
+		return Out;
+	}
+
+	struct FLeaveRefillWatch
+	{
+		TWeakObjectPtr<ATraceGameState> State;
+		TWeakObjectPtr<ATraceCore> Core;
+		TWeakObjectPtr<APlayerState> LeaverState;
+
+		FString LeaverName;
+		ETraceTeam Team = ETraceTeam::None;
+
+		int32 TeamBefore = 0;
+		int32 BotsBefore = 0;
+		int32 OtherBefore = 0;
+		TSet<FString> BotNamesBefore;
+
+		bool bAskedForCore = false;
+		FString CarrierBefore;
+
+		double ArmedAt = 0.0;
+		double WatchSeconds = 30.0;
+		double DepartedAt = -1.0;
+		double RefilledAt = -1.0;
+		double CoreOkAt = -1.0;
+		FString NewBotName;
+		FString CoreVerdictNow;
+
+		bool bActive = false;
+	};
+
+	FLeaveRefillWatch GLeaveRefill;
+	FTimerHandle GLeaveRefillTimer;
+
+	void FinishLeaveRefill(UWorld* World, const TCHAR* Why)
+	{
+		const ATraceGameState* State = GLeaveRefill.State.Get();
+		const FLeaveRefillRoster Team = ReadTeamRoster(State, GLeaveRefill.Team);
+		const FLeaveRefillRoster Other = ReadTeamRoster(State, TraceOpposingTeam(GLeaveRefill.Team));
+
+		const bool bDeparted = GLeaveRefill.DepartedAt >= 0.0;
+		const bool bRefilled = GLeaveRefill.RefilledAt >= 0.0;
+		const bool bOtherUnchanged = (Other.Total == GLeaveRefill.OtherBefore);
+		const bool bCoreOk = GLeaveRefill.CoreOkAt >= 0.0;
+		const bool bCoreCounts = GLeaveRefill.bAskedForCore;
+
+		const bool bPass = bDeparted && bRefilled && bOtherUnchanged && (!bCoreCounts || bCoreOk);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[LeaveRefill] VERDICT: %s (%s) — refillArm=%d, leaver '%s' on %s, carrying=%d. ")
+			TEXT("departed=%d@%.2fs refilled=%d@%.2fs newBot='%s' | %s %d->%d (bots %d->%d), %s %d->%d unchanged=%d | ")
+			TEXT("core: was '%s', now %s (ok=%d@%.2fs)."),
+			bPass ? TEXT("PASS") : TEXT("FAIL"), Why, IsRefillOnHumanLeaveEnabled() ? 1 : 0,
+			*GLeaveRefill.LeaverName, *TraceTeamName(GLeaveRefill.Team).ToString(),
+			GLeaveRefill.bAskedForCore ? 1 : 0,
+			bDeparted ? 1 : 0, GLeaveRefill.DepartedAt,
+			bRefilled ? 1 : 0, GLeaveRefill.RefilledAt,
+			GLeaveRefill.NewBotName.IsEmpty() ? TEXT("<none>") : *GLeaveRefill.NewBotName,
+			*TraceTeamName(GLeaveRefill.Team).ToString(), GLeaveRefill.TeamBefore, Team.Total,
+			GLeaveRefill.BotsBefore, Team.Bots,
+			*TraceTeamName(TraceOpposingTeam(GLeaveRefill.Team)).ToString(), GLeaveRefill.OtherBefore, Other.Total,
+			bOtherUnchanged ? 1 : 0,
+			*GLeaveRefill.CarrierBefore,
+			GLeaveRefill.CoreVerdictNow.IsEmpty() ? TEXT("<not evaluated>") : *GLeaveRefill.CoreVerdictNow,
+			bCoreOk ? 1 : 0, GLeaveRefill.CoreOkAt);
+
+		GLeaveRefill.bActive = false;
+		if (World != nullptr)
+		{
+			World->GetTimerManager().ClearTimer(GLeaveRefillTimer);
+		}
+	}
+
+	void LeaveRefillPoll(UWorld* World)
+	{
+		if (!GLeaveRefill.bActive)
+		{
+			return;
+		}
+
+		ATraceGameState* State = GLeaveRefill.State.Get();
+		if (World == nullptr || State == nullptr)
+		{
+			FinishLeaveRefill(World, TEXT("the world or the GameState went away mid-watch"));
+			return;
+		}
+
+		const double Elapsed = FPlatformTime::Seconds() - GLeaveRefill.ArmedAt;
+		const bool bOutOfTime = Elapsed > GLeaveRefill.WatchSeconds;
+
+		// ---- 1. THE DEPARTURE ITSELF, read off the roster rather than off a log line ------------
+		if (GLeaveRefill.DepartedAt < 0.0)
+		{
+			const APlayerState* Leaver = GLeaveRefill.LeaverState.Get();
+			if (Leaver != nullptr && State->PlayerArray.Contains(Leaver))
+			{
+				if (bOutOfTime)
+				{
+					FinishLeaveRefill(World,
+						TEXT("the client never disconnected — kill the client process while this is armed"));
+				}
+				return;
+			}
+
+			GLeaveRefill.DepartedAt = Elapsed;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[LeaveRefill] '%s' left %s after %.2fs; watching for the slot to be filled."),
+				*GLeaveRefill.LeaverName, *TraceTeamName(GLeaveRefill.Team).ToString(), Elapsed);
+		}
+
+		// ---- 2/3/4. THE REFILL, and that it is a NEW bot on the RIGHT side ----------------------
+		if (GLeaveRefill.RefilledAt < 0.0)
+		{
+			const FLeaveRefillRoster Team = ReadTeamRoster(State, GLeaveRefill.Team);
+			for (const FString& Name : Team.BotNames)
+			{
+				if (!GLeaveRefill.BotNamesBefore.Contains(Name))
+				{
+					GLeaveRefill.NewBotName = Name;
+					break;
+				}
+			}
+
+			if (!GLeaveRefill.NewBotName.IsEmpty() && Team.Total >= GLeaveRefill.TeamBefore)
+			{
+				GLeaveRefill.RefilledAt = Elapsed;
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[LeaveRefill] %s is back to %d with '%s' at %.2fs (%.2fs after the departure)."),
+					*TraceTeamName(GLeaveRefill.Team).ToString(), Team.Total, *GLeaveRefill.NewBotName,
+					Elapsed, Elapsed - GLeaveRefill.DepartedAt);
+			}
+		}
+
+		// ---- 5. THE CORE DID NOT LEAVE WITH THEM ------------------------------------------------
+		if (GLeaveRefill.CoreOkAt < 0.0)
+		{
+			const ATraceCore* TheCore = GLeaveRefill.Core.Get();
+			const ATraceCharacter* Carrier = (TheCore != nullptr) ? TheCore->GetCarrier() : nullptr;
+			const bool bHeldByTheLiving = IsValid(Carrier) && Carrier->IsAlive();
+			const bool bLoose = (TheCore != nullptr) && TheCore->IsLoose();
+
+			GLeaveRefill.CoreVerdictNow = (TheCore == nullptr)
+				? FString(TEXT("<no Core actor>"))
+				: FString::Printf(TEXT("carrier='%s' living=%d loose=%d at %s"),
+					*GetNameSafe(TheCore->GetCarrier()), bHeldByTheLiving ? 1 : 0, bLoose ? 1 : 0,
+					*TheCore->GetActorLocation().ToCompactString());
+
+			if (bHeldByTheLiving || bLoose)
+			{
+				GLeaveRefill.CoreOkAt = Elapsed;
+			}
+		}
+
+		const bool bCoreSettled = (GLeaveRefill.CoreOkAt >= 0.0) || !GLeaveRefill.bAskedForCore;
+		if (GLeaveRefill.RefilledAt >= 0.0 && bCoreSettled)
+		{
+			FinishLeaveRefill(World, TEXT("all assertions settled"));
+			return;
+		}
+
+		if (bOutOfTime)
+		{
+			FinishLeaveRefill(World, TEXT("watch window expired"));
+		}
+	}
+
+	void LeaveRefillTestCommand(const TArray<FString>& Args, UWorld* World)
+	{
+		ATraceGameMode* GameMode = (World != nullptr) ? World->GetAuthGameMode<ATraceGameMode>() : nullptr;
+		ATraceGameState* State = (World != nullptr) ? World->GetGameState<ATraceGameState>() : nullptr;
+		if (GameMode == nullptr || State == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[LeaveRefill] server only (mode=%s state=%s)."), *GetNameSafe(GameMode), *GetNameSafe(State));
+			return;
+		}
+
+		double WatchSeconds = 30.0;
+		bool bWantCore = true;
+		for (const FString& Arg : Args)
+		{
+			if (Arg.Equals(TEXT("nocore"), ESearchCase::IgnoreCase))
+			{
+				bWantCore = false;
+			}
+			else if (Arg.IsNumeric())
+			{
+				WatchSeconds = FMath::Clamp(FCString::Atod(*Arg), 5.0, 300.0);
+			}
+		}
+
+		// THE REMOTE HUMAN. IsLocalController() is the discriminator that matters: on a listen server
+		// the host is a PlayerController too, and the host is not the one about to disconnect.
+		APlayerController* RemoteHuman = nullptr;
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* Candidate = It->Get();
+			if (Candidate == nullptr || Candidate->IsLocalController())
+			{
+				continue;
+			}
+
+			const ATracePlayerState* CandidateState = Candidate->GetPlayerState<ATracePlayerState>();
+			if (CandidateState == nullptr || CandidateState->IsABot() || CandidateState->Team == ETraceTeam::None)
+			{
+				continue;
+			}
+
+			RemoteHuman = Candidate;
+			break;
+		}
+
+		if (RemoteHuman == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[LeaveRefill] no remote client with a team is connected. This test needs a second ")
+				TEXT("process joined to this server — there is nothing here that can leave."));
+			return;
+		}
+
+		ATracePlayerState* LeaverState = RemoteHuman->GetPlayerState<ATracePlayerState>();
+		ATraceCharacter* LeaverPawn = Cast<ATraceCharacter>(RemoteHuman->GetPawn());
+		ATraceCore* TheCore = ATraceCore::Get(World);
+
+		if (bWantCore)
+		{
+			if (TheCore == nullptr || LeaverPawn == nullptr || !LeaverPawn->IsAlive())
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[LeaveRefill] cannot stage the CARRIER case (core=%s pawn=%s alive=%d). Re-run with ")
+					TEXT("'nocore' for the plain departure rather than reporting a carrier case that is not one."),
+					*GetNameSafe(TheCore), *GetNameSafe(LeaverPawn),
+					(LeaverPawn != nullptr && LeaverPawn->IsAlive()) ? 1 : 0);
+				return;
+			}
+
+			TheCore->GrantTo(LeaverPawn, ETraceCoreGrantReason::Debug);
+			if (TheCore->GetCarrier() != LeaverPawn)
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[LeaveRefill] the Core grant did not take (carrier is '%s'); refusing to arm."),
+					*GetNameSafe(TheCore->GetCarrier()));
+				return;
+			}
+		}
+
+		const ETraceTeam Team = LeaverState->Team;
+		const FLeaveRefillRoster Before = ReadTeamRoster(State, Team);
+		const FLeaveRefillRoster OtherBefore = ReadTeamRoster(State, TraceOpposingTeam(Team));
+
+		GLeaveRefill = FLeaveRefillWatch();
+		GLeaveRefill.State = State;
+		GLeaveRefill.Core = TheCore;
+		GLeaveRefill.LeaverState = LeaverState;
+		GLeaveRefill.LeaverName = LeaverState->GetPlayerName();
+		GLeaveRefill.Team = Team;
+		GLeaveRefill.TeamBefore = Before.Total;
+		GLeaveRefill.BotsBefore = Before.Bots;
+		GLeaveRefill.BotNamesBefore = Before.BotNames;
+		GLeaveRefill.OtherBefore = OtherBefore.Total;
+		GLeaveRefill.bAskedForCore = bWantCore;
+		GLeaveRefill.CarrierBefore = (TheCore != nullptr) ? GetNameSafe(TheCore->GetCarrier()) : TEXT("<no Core>");
+		GLeaveRefill.ArmedAt = FPlatformTime::Seconds();
+		GLeaveRefill.WatchSeconds = WatchSeconds;
+		GLeaveRefill.bActive = true;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[LeaveRefill] ===== ARMED for %.0fs. Leaver '%s' (%s), carrying=%d. %s has %d (%d bots: %s), ")
+			TEXT("%s has %d. Kill the client now. ====="),
+			WatchSeconds, *GLeaveRefill.LeaverName, *TraceTeamName(Team).ToString(), bWantCore ? 1 : 0,
+			*TraceTeamName(Team).ToString(), Before.Total, Before.Bots,
+			*FString::Join(Before.BotNames, TEXT(", ")),
+			*TraceTeamName(TraceOpposingTeam(Team)).ToString(), OtherBefore.Total);
+
+		World->GetTimerManager().ClearTimer(GLeaveRefillTimer);
+		World->GetTimerManager().SetTimer(GLeaveRefillTimer,
+			FTimerDelegate::CreateWeakLambda(GameMode, [World]() { LeaveRefillPoll(World); }),
+			0.25f, /*bLoop=*/true, /*FirstDelay=*/0.25f);
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs CmdLeaveRefillTest(
+		TEXT("Trace.Bots.LeaveRefillTest"),
+		TEXT("Dev only, SERVER, TWO PROCESSES. D31. Arms a watcher, hands the connected client the Core "
+		     "(pass 'nocore' to skip that), and waits for you to kill that client: their side must come "
+		     "back to full strength with a bot that did not exist before, the other side must not grow, "
+		     "and the Core must still be in the match. 'Trace.Bots.RefillOnLeave 0' makes it FAIL."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&LeaveRefillTestCommand));
 }
 
 #endif // !UE_BUILD_SHIPPING

@@ -298,6 +298,73 @@ namespace
 	 * It does not: the table above leaves the button unclaimed.
 	 */
 	FKey Default_Melee()            { return EKeys::RightMouseButton; }
+
+	// =============================================================================================
+	// D31-PAD — THE SHIPPED CONTROLLER LAYOUT
+	//
+	// "Create a default mapping, so that if a player connects a controller ... they can use a
+	// controller." The whole of that sentence is this block plus the two sticks in
+	// Settings/TraceGamepadInput.cpp; everything else in the feature only lets a player CHANGE it.
+	//
+	// THE NAMES ARE UE's, THE LAYOUT IS THE XBOX ONE, and on macOS a DualSense or a Switch Pro pad
+	// paired over Bluetooth arrives through the same EKeys::Gamepad_* names — FaceButton_Bottom is
+	// A / Cross / B-on-a-Switch-pad. That is why nothing here names a vendor.
+	//
+	// *** THE ORGANISING RULE: A VERB YOU NEED WHILE AIMING NEVER TAKES A THUMB OFF A STICK. ***
+	// A pad has exactly six controls that satisfy that (two triggers, two bumpers, two stick clicks)
+	// and Trace has exactly six verbs that need it — fire, parry, melee, the Core pull, the secondary
+	// ability and crouch/slide. They get those six. Everything that can survive a thumb moving for a
+	// fifth of a second — jump aside, which is too fundamental not to be under the thumb already —
+	// goes on the face buttons and the D-pad.
+	//
+	//     RT  FIRE            the universal shooter trigger, and no other choice was considered
+	//     LT  PARRY           the other trigger is the defensive one on every pad ever made, and
+	//                         parry is the carrier's defensive verb (ETraceInputStates::Carrying)
+	//     RB  MELEE           melee on the right bumper is the convention this game's players have
+	//     LB  PULL CORE       the offensive twin of the parry trigger, on the twin of its bumper
+	//     L3  CROUCH / SLIDE  stick-click crouch is the console convention, and a slide is initiated
+	//                         at a run, i.e. with the left thumb already on that stick
+	//     R3  ABILITY (2nd)   the last thumb-free control, for the verb that is used least of the six
+	//
+	//     A   JUMP            universal
+	//     B   DASH            beside jump, because they are one movement idea two fingers apart
+	//     X   RELOAD          the Xbox convention, and the one face button a player presses between
+	//                         fights rather than during one
+	//     Y   ABILITY         the character power. Y is where a shooter player's thumb goes for the
+	//                         "special" button, and the HUD's ability chip is the thing that teaches it
+	//
+	//     D-PAD LEFT/UP/RIGHT  PISTOL / SMG / KNIFE — spec v31 §1's 1-2-3 order, laid left to right
+	//     D-PAD DOWN           INSPECT — a flourish, and the D-pad's leftover
+	//
+	//     VIEW/BACK            SCOREBOARD, which is Tab's job and a Tab-shaped button
+	//     MENU/START           DELIBERATELY UNCLAIMED. UTraceGamepadInputSubsystem turns it into the
+	//                          pause key; see TraceGamepadInput.cpp for why that is a synthesised
+	//                          Escape rather than a bind, and why Escape is the one key in this build
+	//                          for which that is provably safe (IsBindableKey refuses it, so no
+	//                          gameplay action can ever be sitting on it).
+	//
+	// NOTHING HERE COLLIDES. Every button above appears exactly once, and SetPadKey's stealing rule
+	// would log it at load if one did not — Trace.Pad.Verify asserts the whole table.
+	// =============================================================================================
+
+	FKey Default_Pad_Jump()             { return EKeys::Gamepad_FaceButton_Bottom; }
+	FKey Default_Pad_Dash()             { return EKeys::Gamepad_FaceButton_Right; }
+	FKey Default_Pad_Reload()           { return EKeys::Gamepad_FaceButton_Left; }
+	FKey Default_Pad_Ability()          { return EKeys::Gamepad_FaceButton_Top; }
+
+	FKey Default_Pad_Fire()             { return EKeys::Gamepad_RightTrigger; }
+	FKey Default_Pad_Parry()            { return EKeys::Gamepad_LeftTrigger; }
+	FKey Default_Pad_Melee()            { return EKeys::Gamepad_RightShoulder; }
+	FKey Default_Pad_PullCore()         { return EKeys::Gamepad_LeftShoulder; }
+	FKey Default_Pad_Crouch()           { return EKeys::Gamepad_LeftThumbstick; }
+	FKey Default_Pad_AbilitySecondary() { return EKeys::Gamepad_RightThumbstick; }
+
+	FKey Default_Pad_EquipPistol()      { return EKeys::Gamepad_DPad_Left; }
+	FKey Default_Pad_EquipSmg()         { return EKeys::Gamepad_DPad_Up; }
+	FKey Default_Pad_EquipKnife()       { return EKeys::Gamepad_DPad_Right; }
+	FKey Default_Pad_Inspect()          { return EKeys::Gamepad_DPad_Down; }
+
+	FKey Default_Pad_Scoreboard()       { return EKeys::Gamepad_Special_Left; }
 }
 
 const TArray<FTraceInputActionInfo>& TraceInputActions::All()
@@ -305,17 +372,24 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 	// Function-local static: built on first use, after EKeys is up, and never rebuilt.
 	static const TArray<FTraceInputActionInfo> Table =
 	{
-		// SPEC v28 §3b — THE FOURTH COLUMN IS THE EXCLUSION GROUP, and it is the whole conflict rule.
+		// SPEC v28 §3b — THE LAST COLUMN IS THE EXCLUSION GROUP, and it is the whole conflict rule.
 		// ETraceInputStates::Match means "live whether or not this pawn is carrying the Core", which is
 		// true of everything a player does with their feet, their weapon slots and their abilities. The
 		// four rows that are NOT Match are the four the note is about; each one argues for itself below.
-		{ ETraceInputAction::MoveForward, TEXT("MoveForward"), TEXT("MOVE FORWARD"), &Default_MoveForward, &Default_None, ETraceInputStates::Match },
-		{ ETraceInputAction::MoveBack,    TEXT("MoveBack"),    TEXT("MOVE BACK"),    &Default_MoveBack,    &Default_None, ETraceInputStates::Match },
-		{ ETraceInputAction::MoveLeft,    TEXT("MoveLeft"),    TEXT("STRAFE LEFT"),  &Default_MoveLeft,    &Default_None, ETraceInputStates::Match },
-		{ ETraceInputAction::MoveRight,   TEXT("MoveRight"),   TEXT("STRAFE RIGHT"), &Default_MoveRight,   &Default_None, ETraceInputStates::Match },
-		{ ETraceInputAction::Jump,        TEXT("Jump"),        TEXT("JUMP"),         &Default_Jump,        &Default_None, ETraceInputStates::Match },
-		{ ETraceInputAction::Crouch,      TEXT("Crouch"),      TEXT("CROUCH / SLIDE"), &Default_Crouch,    &Default_None, ETraceInputStates::Match },
-		{ ETraceInputAction::Dash,        TEXT("Dash"),        TEXT("DASH"),         &Default_Dash,        &Default_None, ETraceInputStates::Match },
+		//
+		// D31-PAD ADDED THE COLUMN BEFORE IT: the shipped GAMEPAD button. It used to be the fourth of
+		// four and it is now the fifth of five, which is why this comment says "last" rather than
+		// naming a number a sixth column would falsify. The pad layout is argued as a whole where the
+		// Default_Pad_* functions are defined, not row by row — a controller layout is a single
+		// decision about where six thumb-free controls go, and splitting that argument across twenty
+		// rows would leave it stated nowhere.
+		{ ETraceInputAction::MoveForward, TEXT("MoveForward"), TEXT("MOVE FORWARD"), &Default_MoveForward, &Default_None, &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::MoveBack,    TEXT("MoveBack"),    TEXT("MOVE BACK"),    &Default_MoveBack,    &Default_None, &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::MoveLeft,    TEXT("MoveLeft"),    TEXT("STRAFE LEFT"),  &Default_MoveLeft,    &Default_None, &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::MoveRight,   TEXT("MoveRight"),   TEXT("STRAFE RIGHT"), &Default_MoveRight,   &Default_None, &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::Jump,        TEXT("Jump"),        TEXT("JUMP"),         &Default_Jump,        &Default_None, &Default_Pad_Jump, ETraceInputStates::Match },
+		{ ETraceInputAction::Crouch,      TEXT("Crouch"),      TEXT("CROUCH / SLIDE"), &Default_Crouch,    &Default_None, &Default_Pad_Crouch, ETraceInputStates::Match },
+		{ ETraceInputAction::Dash,        TEXT("Dash"),        TEXT("DASH"),         &Default_Dash,        &Default_None, &Default_Pad_Dash, ETraceInputStates::Match },
 		// *** SPEC v25 §7. BOTH ConfigIds ON THESE TWO ROWS ARE DELIBERATELY NEW STRINGS. ***
 		//
 		// Read this before "tidying" them back. Changing a DEFAULT key does nothing at all for anyone
@@ -349,19 +423,19 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// PARRY IS `Carrying` AND NOTHING ELSE: TraceParry::RequestParry refuses with
 		// ETraceParryRefusal::NotCarrying, so a parry key is dead weight for a player who is not holding
 		// the Core — which is exactly what makes it shareable with the pull and with fire.
-		{ ETraceInputAction::Parry,       TEXT("ParryKeys"),   TEXT("PARRY"),        &Default_Parry,       &Default_ParryAlt, ETraceInputStates::Carrying },
+		{ ETraceInputAction::Parry,       TEXT("ParryKeys"),   TEXT("PARRY"),        &Default_Parry,       &Default_ParryAlt, &Default_Pad_Parry, ETraceInputStates::Carrying },
 		// FIRE IS `NotCarrying`, WHICH IS THE OWNER'S OWN SENTENCE: "firing only while NOT carrying".
 		// ATraceCharacter::DoFirePressed returns early into DoPassPressed the moment bIsCarrier is true,
 		// so the gun genuinely cannot be fired while holding the Core. That overload is why the note can
 		// ask for the throw on this very button and be right: on a shared key the carrier's press reaches
 		// the throw twice (once through fire's overload, once through the throw's own handler) and
 		// ATraceCore::RequestPassInput is a latch, so the second arrival is absorbed.
-		{ ETraceInputAction::Fire,        TEXT("Fire"),        TEXT("FIRE"),         &Default_Fire,        &Default_None, ETraceInputStates::NotCarrying },
+		{ ETraceInputAction::Fire,        TEXT("Fire"),        TEXT("FIRE"),         &Default_Fire,        &Default_None, &Default_Pad_Fire, ETraceInputStates::NotCarrying },
 		// THE THROW IS `Carrying`: ATraceCore::RequestPassInput only arms for the pawn that is holding
 		// the Core. Fire's NotCarrying and this row's Carrying are disjoint, so ActionsMayShareAKey says
 		// yes and spec v28 §3b's example — throw core on the same button as fire — is legal.
-		{ ETraceInputAction::Pass,        TEXT("ThrowCore"),   TEXT("THROW / PASS CORE"), &Default_Pass, &Default_None, ETraceInputStates::Carrying },
-		{ ETraceInputAction::Scoreboard,  TEXT("Scoreboard"),  TEXT("SCOREBOARD"),   &Default_Scoreboard,  &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::Pass,        TEXT("ThrowCore"),   TEXT("THROW / PASS CORE"), &Default_Pass, &Default_None, &Default_None, ETraceInputStates::Carrying },
+		{ ETraceInputAction::Scoreboard,  TEXT("Scoreboard"),  TEXT("SCOREBOARD"),   &Default_Scoreboard,  &Default_None, &Default_Pad_Scoreboard, ETraceInputStates::Match },
 		// SPEC v13 §2. These two rows exist for the options screen as much as for the game: the
 		// rebind list IS this table, walked in order, so an action that is not here is an action the
 		// player cannot see or rebind however well it is wired up in the controller. "Both new binds
@@ -414,18 +488,18 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// The options page takes its label straight from this table (v29 §5 deleted the
 		// `TraceOptionsBindingRowLabel` override that used to sit over it), so these three DisplayName
 		// strings are the whole of what the keybind page shows.
-		{ ETraceInputAction::EquipKnife,  TEXT("KnifeSlot"),  TEXT("KNIFE"),  &Default_EquipKnife,  &Default_None, ETraceInputStates::Match },
-		{ ETraceInputAction::EquipGun,    TEXT("PistolSlot"), TEXT("PISTOL"), &Default_EquipPistol, &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::EquipKnife,  TEXT("KnifeSlot"),  TEXT("KNIFE"),  &Default_EquipKnife,  &Default_None, &Default_Pad_EquipKnife, ETraceInputStates::Match },
+		{ ETraceInputAction::EquipGun,    TEXT("PistolSlot"), TEXT("PISTOL"), &Default_EquipPistol, &Default_None, &Default_Pad_EquipPistol, ETraceInputStates::Match },
 		// SPEC v14 §5. Same reasoning as the two rows above: the rebind list IS this table, so an
 		// ability the player cannot see here is an ability they cannot rebind however well it is
 		// wired in the controller. The ConfigIds are the two strings ATraceHUD and
 		// UTraceAbilityInputRelay already search for by name — do not rename them.
-		{ ETraceInputAction::Ability,          TEXT("Ability"),          TEXT("ABILITY"),           &Default_Ability,          &Default_None, ETraceInputStates::Match },
-		{ ETraceInputAction::AbilitySecondary, TEXT("AbilitySecondary"), TEXT("ABILITY (SECONDARY)"), &Default_AbilitySecondary, &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::Ability,          TEXT("Ability"),          TEXT("ABILITY"),           &Default_Ability,          &Default_None, &Default_Pad_Ability, ETraceInputStates::Match },
+		{ ETraceInputAction::AbilitySecondary, TEXT("AbilitySecondary"), TEXT("ABILITY (SECONDARY)"), &Default_AbilitySecondary, &Default_None, &Default_Pad_AbilitySecondary, ETraceInputStates::Match },
 		// SPEC v16 §1, "R to reload". Same reasoning as every row above: the options screen's rebind
 		// list IS this table walked in order, so an action missing from here is an action the player
 		// cannot see or rebind however well it is wired up in the controller.
-		{ ETraceInputAction::Reload,           TEXT("Reload"),           TEXT("RELOAD"),            &Default_Reload,           &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::Reload,           TEXT("Reload"),           TEXT("RELOAD"),            &Default_Reload,           &Default_None, &Default_Pad_Reload, ETraceInputStates::Match },
 		// SPEC v26 §1 — "Make parry and pull core two separate binds in the settings menu."
 		//
 		// THIS LINE IS WHAT PUTS THE PULL ON THE KEYBIND PAGE, and nothing else does. The options
@@ -452,7 +526,7 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// `PullCore=F` line names an id this table no longer has, is DISCARDED by RefreshFromConfig,
 		// and they land on the shipped G. The full argument, including the one-line revert, is on
 		// Default_PullCore and on ETraceInputAction::Inspect.
-		{ ETraceInputAction::PullCore,         TEXT("PullCoreKey"),      TEXT("PULL CORE"),         &Default_PullCore,         &Default_None, ETraceInputStates::NotCarrying },
+		{ ETraceInputAction::PullCore,         TEXT("PullCoreKey"),      TEXT("PULL CORE"),         &Default_PullCore,         &Default_None, &Default_Pad_PullCore, ETraceInputStates::NotCarrying },
 
 		// *** SPEC v28 §10 — THE MELEE BIND, AND THE ONE THING NEITHER §3 NOR §10 COULD SHIP ALONE. ***
 		//
@@ -468,7 +542,7 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// consequence that matters: melee may NOT share a key with FIRE or PULL CORE, and PULL CORE is the
 		// one that would actually have hurt — the pull already rides this button under §10's precedence,
 		// so a second PullCore bind on it would dispatch the same verb twice from one press.
-		{ ETraceInputAction::Melee,            TEXT("Melee"),            TEXT("MELEE"),             &Default_Melee,            &Default_None, ETraceInputStates::NotCarrying },
+		{ ETraceInputAction::Melee,            TEXT("Melee"),            TEXT("MELEE"),             &Default_Melee,            &Default_None, &Default_Pad_Melee, ETraceInputStates::NotCarrying },
 		// *** SPEC v31 §1 — "2 is smg." THE THIRD WEAPON ROW, ON THE 2 KEY SINCE v31. ***
 		//
 		// LAST IN THE LIST, hence last on the page, for the reason the PULL CORE row above gives:
@@ -480,7 +554,7 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// "EquipSmg", so every player who has opened the options screen since now HAS an
 		// `EquipSmg=Three` line and RefreshFromConfig would honour it — leaving the SMG on 3 while the
 		// keybind page, the HUD and this table all said 2. The fresh id drops that line.
-		{ ETraceInputAction::EquipSmg,         TEXT("SmgSlot"),          TEXT("SMG"),               &Default_EquipSmg,         &Default_None, ETraceInputStates::Match },
+		{ ETraceInputAction::EquipSmg,         TEXT("SmgSlot"),          TEXT("SMG"),               &Default_EquipSmg,         &Default_None, &Default_Pad_EquipSmg, ETraceInputStates::Match },
 
 		// *** SPEC v31 §5 — THE KNIFE FLOURISH, ON F, AS A ROW ON THE KEYBIND PAGE. ***
 		//
@@ -500,7 +574,7 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 		// makes the Core a two-hand cradle. So this key is genuinely dead while carrying and may
 		// legally share with a Carrying-only action (the parry, the throw) if a player wants that. It
 		// may NOT share with FIRE, MELEE or PULL CORE, which is the answer we want.
-		{ ETraceInputAction::Inspect,          TEXT("Inspect"),          TEXT("INSPECT KNIFE"),     &Default_Inspect,          &Default_None, ETraceInputStates::NotCarrying },
+		{ ETraceInputAction::Inspect,          TEXT("Inspect"),          TEXT("INSPECT KNIFE"),     &Default_Inspect,          &Default_None, &Default_Pad_Inspect, ETraceInputStates::NotCarrying },
 	};
 
 	// 19 -> 20 for spec v31 §5's INSPECT row. This assert did exactly the job it was written for: the
@@ -544,6 +618,9 @@ UTraceUserSettings::UTraceUserSettings()
 {
 	// SPEC v28 §3c — MaxKeysPerAction slots per action, flat. See the Bindings declaration.
 	Bindings.SetNum(static_cast<int32>(ETraceInputAction::Count) * MaxKeysPerAction);
+
+	// D31-PAD — one pad button per action, indexed straight by the enum.
+	PadBindings.SetNum(static_cast<int32>(ETraceInputAction::Count));
 }
 
 UTraceUserSettings& UTraceUserSettings::Get()
@@ -1161,6 +1238,14 @@ bool UTraceUserSettings::IsBindableKey(const FKey& Key)
 	//
 	// Gestures and touch are not reachable on this platform. Everything else — keyboard, mouse
 	// buttons, wheel clicks, gamepad face buttons — is fair game.
+	//
+	// *** D31-PAD DID NOT CHANGE THAT, AND DELIBERATELY. *** A gamepad button still passes here,
+	// because this predicate is what the .ini LOADER uses and a returning player whose file already
+	// says `Fire=Gamepad_FaceButton_Bottom` must keep it rather than have the line silently dropped.
+	// What changed is which page may CREATE such a binding: the keybind page now captures through
+	// IsBindableKeyboardKey (bindable AND not on a pad) and the controller page through
+	// IsBindablePadKey, so the two pages partition the key space and one button can never be entered
+	// into both tables. Trace.Pad.Verify asserts the partition in both directions.
 	if (Key.IsAxis1D() || Key.IsAxis2D() || Key.IsAxis3D() || Key.IsGesture() || Key.IsTouch())
 	{
 		return false;
@@ -1183,6 +1268,12 @@ bool UTraceUserSettings::IsBindableKey(const FKey& Key)
 	}
 
 	return true;
+}
+
+bool UTraceUserSettings::IsBindableKeyboardKey(const FKey& Key)
+{
+	// See the header for why this is a second predicate and not a narrowing of the one above.
+	return IsBindableKey(Key) && !Key.IsGamepadKey();
 }
 
 FString UTraceUserSettings::DescribeKey(const FKey& Key)
@@ -1532,6 +1623,11 @@ void UTraceUserSettings::RefreshFromConfig()
 		}
 	}
 
+	// D31-PAD — the pad table loads on the same lazy trigger and behind the same flag. Two separate
+	// bLoaded bits would give this class a state in which one device's binds exist and the other's
+	// do not, and every caller would then have to know which of the two it had.
+	RefreshPadFromConfig();
+
 	bLoaded = true;
 }
 
@@ -1612,6 +1708,11 @@ void UTraceUserSettings::Save()
 {
 	FlattenToConfig();
 
+	// D31-PAD — the pad table is written by the SAME Save(), so a controller rebind persists by
+	// exactly the route a keyboard rebind does and there is no second code path to forget to call.
+	// SaveConfig() below writes every `config` property of this class, PadKeyBindings included.
+	FlattenPadToConfig();
+
 	// SaveConfig writes into GConfig's in-memory copy of the file. Without the explicit Flush the
 	// values only reach disk at a clean shutdown — and this build is normally ended with pkill, so
 	// "clean shutdown" is the case that does not happen.
@@ -1621,14 +1722,339 @@ void UTraceUserSettings::Save()
 		GConfig->Flush(false, GetClass()->GetConfigName());
 	}
 
-	// One listener today (ATracePlayerController) but broadcast unconditionally: the title screen
-	// has no controller at all, and a future one must not have to be remembered here.
+	// TWO listeners since D31-PAD — ATracePlayerController rebuilds the keyboard/mouse mapping
+	// context, UTraceGamepadInputSubsystem rebuilds the pad's — but still broadcast unconditionally,
+	// because the title screen has neither and a third listener must not have to be remembered here.
 	OnChanged().Broadcast();
 
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[Settings] Saved. sensitivity=%.2f yScale=%.2f invertY=%d -> %s"),
+		TEXT("[Settings] Saved. sensitivity=%.2f yScale=%.2f invertY=%d; pad %s rate=%.0f deg/s ")
+		TEXT("yScale=%.2f invertY=%d deadzone look=%.2f move=%.2f -> %s"),
 		MouseSensitivity, MouseSensitivityYScale, bInvertMouseY ? 1 : 0,
+		bPadEnabled ? TEXT("ON") : TEXT("OFF"), GetPadLookRateX(), PadLookYScale,
+		bPadInvertLookY ? 1 : 0, GetPadLookDeadzone(), GetPadMoveDeadzone(),
 		*GetClass()->GetConfigName());
+}
+
+// =================================================================================================
+// D31-PAD — the gamepad half
+//
+// Everything below is a twin of something above it, deliberately and line for line: the same parse
+// loop, the same "defaults first, then let the file override entry by entry" degradation, the same
+// exclusion-group stealing rule, the same write-every-slot flatten. A pad table that invented its
+// own conventions would be a second thing to reason about for no gain, and the two would drift the
+// first time one of them was fixed.
+// =================================================================================================
+
+bool UTraceUserSettings::IsBindablePadKey(const FKey& Key)
+{
+	if (!Key.IsValid())
+	{
+		return false;
+	}
+
+	// *** THE ONE RULE THIS DOES NOT SHARE WITH IsBindableKey: IT MUST BE ON A PAD. ***
+	//
+	// FKey::IsGamepadKey() is the engine's own answer (FKeyDetails::GamepadKey, set when the key is
+	// registered), so it stays right for a pad this build has never heard of. Without it the
+	// controller page would capture the space bar — and a keyboard key in the pad context is a key
+	// mapped in two contexts at once, where the higher-priority one silently eats the other.
+	if (!Key.IsGamepadKey())
+	{
+		return false;
+	}
+
+	// AXES ARE REFUSED FOR THE SAME REASON THE KEYBOARD TABLE REFUSES THEM, and it matters more here:
+	// Gamepad_LeftX / Gamepad_RightY / Gamepad_Left2D are exactly what the two sticks deliver, and a
+	// JUMP bound to Gamepad_LeftY would fire continuously for as long as the player walked forward.
+	// The sticks are mapped by UTraceGamepadInputSubsystem, which is not a per-action button table
+	// and does not come through here.
+	//
+	// The DIGITAL stick keys (Gamepad_LeftStick_Up and friends) are buttons in UE's model and stay
+	// bindable, which is what a player who wants a verb on "flick the stick up" expects. So do the
+	// digital triggers, Gamepad_LeftTrigger / Gamepad_RightTrigger — the analog ones are the *Axis
+	// pair, and the fire trigger's default is the digital one for precisely that reason.
+	if (Key.IsAxis1D() || Key.IsAxis2D() || Key.IsAxis3D())
+	{
+		return false;
+	}
+
+	// AnyKey is not a gamepad key so it cannot reach here, and Escape is not either — but the two
+	// exclusions the keyboard table makes are both about keys this test has already refused, which is
+	// why there is no copy of them below. Trace.Pad.Verify checks that claim rather than asserting it.
+	return true;
+}
+
+FString UTraceUserSettings::DescribePadKey(const FKey& Key)
+{
+	if (!Key.IsValid())
+	{
+		return TEXT("UNBOUND");
+	}
+
+	// *** THE SHORT NAMES, AND THEY ARE NOT COSMETIC. *** Key.GetDisplayName() returns
+	// "Gamepad Face Button Bottom" — twenty-eight characters for a button every player calls A. The
+	// controller page draws these inside a chip sized to the string, so the long form would make the
+	// value column wider than the label column at 720p and the two would meet in the middle.
+	//
+	// A / B / X / Y AND NOT CROSS / CIRCLE / SQUARE / TRIANGLE. UE gives every pad the same
+	// Gamepad_FaceButton_* names and does not tell us which vendor is attached, so there is no honest
+	// way to draw the PlayStation glyphs — and half-right glyphs are worse than a consistent
+	// convention. The POSITION suffix disambiguates for a player holding a DualSense: "A (DOWN)"
+	// names the button by where the thumb goes, which is true on every pad ever made.
+	static const TMap<FKey, const TCHAR*> ShortNames =
+	{
+		{ EKeys::Gamepad_FaceButton_Bottom,  TEXT("A  (DOWN)")      },
+		{ EKeys::Gamepad_FaceButton_Right,   TEXT("B  (RIGHT)")     },
+		{ EKeys::Gamepad_FaceButton_Left,    TEXT("X  (LEFT)")      },
+		{ EKeys::Gamepad_FaceButton_Top,     TEXT("Y  (UP)")        },
+		{ EKeys::Gamepad_LeftShoulder,       TEXT("LB")             },
+		{ EKeys::Gamepad_RightShoulder,      TEXT("RB")             },
+		{ EKeys::Gamepad_LeftTrigger,        TEXT("LT")             },
+		{ EKeys::Gamepad_RightTrigger,       TEXT("RT")             },
+		{ EKeys::Gamepad_LeftThumbstick,     TEXT("L3")             },
+		{ EKeys::Gamepad_RightThumbstick,    TEXT("R3")             },
+		{ EKeys::Gamepad_DPad_Up,            TEXT("D-PAD UP")       },
+		{ EKeys::Gamepad_DPad_Down,          TEXT("D-PAD DOWN")     },
+		{ EKeys::Gamepad_DPad_Left,          TEXT("D-PAD LEFT")     },
+		{ EKeys::Gamepad_DPad_Right,         TEXT("D-PAD RIGHT")    },
+		{ EKeys::Gamepad_Special_Left,       TEXT("VIEW / BACK")    },
+		{ EKeys::Gamepad_Special_Right,      TEXT("MENU / START")   },
+		{ EKeys::Gamepad_LeftStick_Up,       TEXT("L-STICK UP")     },
+		{ EKeys::Gamepad_LeftStick_Down,     TEXT("L-STICK DOWN")   },
+		{ EKeys::Gamepad_LeftStick_Left,     TEXT("L-STICK LEFT")   },
+		{ EKeys::Gamepad_LeftStick_Right,    TEXT("L-STICK RIGHT")  },
+		{ EKeys::Gamepad_RightStick_Up,      TEXT("R-STICK UP")     },
+		{ EKeys::Gamepad_RightStick_Down,    TEXT("R-STICK DOWN")   },
+		{ EKeys::Gamepad_RightStick_Left,    TEXT("R-STICK LEFT")   },
+		{ EKeys::Gamepad_RightStick_Right,   TEXT("R-STICK RIGHT")  },
+	};
+
+	if (const TCHAR* const* Found = ShortNames.Find(Key))
+	{
+		return FString(*Found);
+	}
+
+	// A pad button this table has never heard of — a vendor extra, a touchpad click. It is still
+	// bindable and still has to draw as SOMETHING, so it falls back to the engine's own name with the
+	// noise word removed. "Gamepad Special Right" is already handled above; this is for the rest.
+	return Key.GetDisplayName().ToString().ToUpper().Replace(TEXT("GAMEPAD "), TEXT(""));
+}
+
+FKey UTraceUserSettings::GetPadKey(ETraceInputAction Action) const
+{
+	const int32 Index = static_cast<int32>(Action);
+	return PadBindings.IsValidIndex(Index) ? PadBindings[Index] : FKey();
+}
+
+void UTraceUserSettings::SetPadKey(ETraceInputAction Action, const FKey& Key)
+{
+	const int32 Index = static_cast<int32>(Action);
+	if (!PadBindings.IsValidIndex(Index) || !IsBindablePadKey(Key))
+	{
+		return;
+	}
+
+	// SPEC v28 §3b's rule, applied to the pad table. It is the same question — "can these two verbs
+	// ever be legal at the same instant" is about the GAME and not about the device — so THROW / PASS
+	// CORE and FIRE may share a pad button exactly as they may share a mouse button, and FIRE and
+	// PULL CORE may not. The two tables are stolen from independently: taking RT on the pad must not
+	// blank a player's mouse binding, which is the whole reason for the separate table.
+	for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+	{
+		if (Info.Action == Action)
+		{
+			continue;
+		}
+
+		const int32 OtherIndex = static_cast<int32>(Info.Action);
+		if (!PadBindings.IsValidIndex(OtherIndex) || PadBindings[OtherIndex] != Key)
+		{
+			continue;
+		}
+
+		if (ActionsMayShareAKey(Action, Info.Action))
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Settings] Pad '%s' is now SHARED by %s and %s. Allowed: their states are ")
+				TEXT("exclusive (%s vs %s)."),
+				*DescribePadKey(Key), TraceInputActions::Info(Action).DisplayName, Info.DisplayName,
+				*LexTraceInputStates(TraceInputActions::Info(Action).States),
+				*LexTraceInputStates(Info.States));
+			continue;
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Settings] Pad '%s' taken from %s and given to %s — they can both be legal at once."),
+			*DescribePadKey(Key), Info.DisplayName, TraceInputActions::Info(Action).DisplayName);
+		PadBindings[OtherIndex] = FKey();
+	}
+
+	PadBindings[Index] = Key;
+	Save();
+}
+
+void UTraceUserSettings::ClearPadKey(ETraceInputAction Action)
+{
+	const int32 Index = static_cast<int32>(Action);
+	if (!PadBindings.IsValidIndex(Index) || !PadBindings[Index].IsValid())
+	{
+		return;
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[Settings] %s pad button unbound (was '%s')."),
+		TraceInputActions::Info(Action).DisplayName, *DescribePadKey(PadBindings[Index]));
+	PadBindings[Index] = FKey();
+	Save();
+}
+
+void UTraceUserSettings::RefreshPadFromConfig()
+{
+	const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
+
+	PadBindings.Reset();
+	PadBindings.SetNum(Table.Num());
+
+	// Defaults first, then the file overrides entry by entry — the keyboard loader's shape, and it
+	// buys the same thing: a truncated or corrupt file degrades to "some defaults" rather than to
+	// "no controller".
+	for (int32 Index = 0; Index < Table.Num(); ++Index)
+	{
+		PadBindings[Index] = (Table[Index].DefaultPadKey != nullptr) ? Table[Index].DefaultPadKey() : FKey();
+	}
+
+	for (const FString& Entry : PadKeyBindings)
+	{
+		FString ConfigId;
+		FString KeyName;
+		if (!Entry.Split(TEXT("="), &ConfigId, &KeyName))
+		{
+			continue;
+		}
+
+		ConfigId.TrimStartAndEndInline();
+		KeyName.TrimStartAndEndInline();
+
+		const int32 Index = Table.IndexOfByPredicate(
+			[&ConfigId](const FTraceInputActionInfo& Info) { return ConfigId.Equals(Info.ConfigId, ESearchCase::IgnoreCase); });
+
+		if (Index == INDEX_NONE)
+		{
+			// An action that no longer exists. Dropped in silence, exactly as the keyboard loader
+			// drops `SwapWeapon=F`, and for the same reason.
+			continue;
+		}
+
+		// The explicit unbound marker, which is what a stolen button and a deliberate BKSP both leave.
+		if (KeyName.IsEmpty() || KeyName.Equals(TEXT("None"), ESearchCase::IgnoreCase))
+		{
+			PadBindings[Index] = FKey();
+			continue;
+		}
+
+		const FKey Key(*KeyName);
+		if (IsBindablePadKey(Key))
+		{
+			PadBindings[Index] = Key;
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Settings] Ignoring pad key '%s' for action '%s': not a bindable pad button. ")
+				TEXT("Keeping the default."),
+				*KeyName, *ConfigId);
+		}
+	}
+}
+
+void UTraceUserSettings::FlattenPadToConfig()
+{
+	const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
+
+	PadKeyBindings.Reset(Table.Num());
+	for (int32 Index = 0; Index < Table.Num(); ++Index)
+	{
+		const FKey Key = GetPadKey(static_cast<ETraceInputAction>(Index));
+
+		// GetFName() and not the display name, for the reason FlattenToConfig gives: the display name
+		// cannot be read back. Note that this is the ENGINE name ("Gamepad_FaceButton_Bottom"), not
+		// DescribePadKey's "A (DOWN)" — the short names are for the screen and never for the file.
+		//
+		// EVERY action gets a line, "None" included, so the file is a complete statement of intent and
+		// a deliberately-cleared pad button cannot be handed back on the next launch.
+		PadKeyBindings.Add(FString::Printf(TEXT("%s=%s"), Table[Index].ConfigId,
+			Key.IsValid() ? *Key.GetFName().ToString() : TEXT("None")));
+	}
+}
+
+void UTraceUserSettings::ResetPadToDefaults()
+{
+	PadLookRate      = DefaultPadLookRate;
+	PadLookYScale    = DefaultPadLookYScale;
+	PadLookDeadzone  = DefaultPadLookDeadzone;
+	PadMoveDeadzone  = DefaultPadMoveDeadzone;
+	bPadInvertLookY  = bDefaultPadInvertLookY;
+	bPadEnabled      = bDefaultPadEnabled;
+
+	// THE KEYBOARD IS NOT TOUCHED, and that is the point of a per-page reset. See
+	// EAction::ResetVideoDefaults in UI/TraceOptionsMenu.h, where the project states the rule: a reset
+	// row belongs to the page it is drawn on.
+	PadKeyBindings.Reset();
+	RefreshPadFromConfig();
+	Save();
+}
+
+bool UTraceUserSettings::IsPadAtDefaults() const
+{
+	if (!FMath::IsNearlyEqual(PadLookRate, DefaultPadLookRate)
+		|| !FMath::IsNearlyEqual(PadLookYScale, DefaultPadLookYScale)
+		|| !FMath::IsNearlyEqual(PadLookDeadzone, DefaultPadLookDeadzone)
+		|| !FMath::IsNearlyEqual(PadMoveDeadzone, DefaultPadMoveDeadzone)
+		|| bPadInvertLookY != bDefaultPadInvertLookY
+		|| bPadEnabled != bDefaultPadEnabled)
+	{
+		return false;
+	}
+
+	const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
+	for (int32 Index = 0; Index < Table.Num(); ++Index)
+	{
+		const FKey Default = (Table[Index].DefaultPadKey != nullptr) ? Table[Index].DefaultPadKey() : FKey();
+		if (GetPadKey(static_cast<ETraceInputAction>(Index)) != Default)
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+float UTraceUserSettings::GetPadLookRateX() const
+{
+	// Clamped rather than trusted, for the reason every accessor in this file is: a hand-edited .ini
+	// is a supported way to configure this game. A zero would silently disable stick look; the ceiling
+	// keeps a typo from spinning the player once per frame.
+	return FMath::Clamp(PadLookRate, MinPadLookRate, MaxPadLookRate);
+}
+
+float UTraceUserSettings::GetPadLookRateY() const
+{
+	const float Rate = GetPadLookRateX() * FMath::Clamp(PadLookYScale, MinPadLookYScale, MaxPadLookYScale);
+
+	// The SIGN is the inversion, exactly as it is for the mouse (GetLookScaleY). Folding it into the
+	// scalar rather than adding or removing a Negate keeps the pad context's modifier list a fixed
+	// shape, so a live rebuild only ever changes numbers.
+	return bPadInvertLookY ? -Rate : Rate;
+}
+
+float UTraceUserSettings::GetPadLookDeadzone() const
+{
+	return FMath::Clamp(PadLookDeadzone, MinPadDeadzone, MaxPadDeadzone);
+}
+
+float UTraceUserSettings::GetPadMoveDeadzone() const
+{
+	return FMath::Clamp(PadMoveDeadzone, MinPadDeadzone, MaxPadDeadzone);
 }
 
 #if !UE_BUILD_SHIPPING

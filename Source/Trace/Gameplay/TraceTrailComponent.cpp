@@ -27,6 +27,7 @@
 #include "Misc/Paths.h"                        // Trace.Trail.WallClip's screenshot path
 #include "GameFramework/Pawn.h"                 // Trace.Trail.DebugLookBack
 #include "GameFramework/PlayerController.h"    // IsLocalPlayerController() (own-trace near hide)
+#include "GameFramework/PlayerState.h"         // D31 — GetPingInMilliseconds() on the audit lines
 #include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
 #include "Math/NumericLimits.h"                // TNumericLimits (trip-test broad phase)
@@ -162,6 +163,19 @@ namespace
 	 * 22.5 + 54 = 76.5uu (+35%), and in the measured dash pose to 66.5uu (+18%). 20uu is 0.2m and
 	 * under half a ribbon width (the trace is 45uu across), so even the ceiling case is a hit inside
 	 * the silhouette the player is watching rather than a connection at visible distance.
+	 *
+	 * *** D31 MEASURED THE ABOVE IN A LIVE MATCH AND THE PARAGRAPH BEFORE IT IS WRONG ABOUT WHICH
+	 * CLAMP BINDS. *** "20 exists only as headroom for a more extreme pose than the one that was
+	 * measured" was written off a standing/mid-dash reading of 32.7 / 41.3uu. Over 258 logged
+	 * dash-vs-trace evaluations across four runs (Trace.Trail.DashAudit), EffectiveRadius came out at
+	 * the CEILING — 54.0uu, margin +20.0, bMeshMeasured=1 — on 198 of them and at the floor (44.0uu)
+	 * on 33; the 45 [TRACEMODEL] widening lines say the same. So the ceiling is the OPERATING POINT,
+	 * not headroom, and the horizontal threshold in play is 76.5uu rather than 66.5uu.
+	 *
+	 * Nothing here has been changed on the strength of that. It is stated because it is the number
+	 * this knob's own justification rests on, it moves the scoring band by 10uu, and it is in the
+	 * direction that HELPS the dasher — so it is not a cause of "my dash did not kill". Anyone
+	 * retuning the band should start from the measured 54, not from the 41.3 above.
 	 */
 	float GModelMarginMax = 20.f;
 
@@ -1696,6 +1710,395 @@ namespace
 		return (Horizontal <= 0.0) && (Vertical <= 0.0);
 	}
 
+#if !UE_BUILD_SHIPPING
+	// =============================================================================================
+	// D31 — "THEIR DASH WAS HITTING THE TRACE AND NOT KILLING IT". THE INSTRUMENTS.
+	//
+	// The complaint arrived from a PACKAGED, over-the-network playtest, and every part of the trip
+	// test is server-authoritative. So the only honest way to answer it is to write down, IN ONE RUN,
+	// both of the things the two machines can disagree about —
+	//
+	//   what the DASHER'S machine believed the trace was when its player committed to the dash, and
+	//   what the SERVER actually tested that dash against —
+	//
+	// and subtract. Everything in this block exists for that subtraction. It is off by default, it is
+	// compiled out of Shipping, and nothing in it can change a verdict: every number it prints is read
+	// from the same variables the shipping test read, after the test has read them.
+	//
+	// THE ONE PIECE THAT IS NOT BEHIND THE SWITCH is the teleport-guard line in ServerRunTripTest. A
+	// sweep longer than MinTeleportSweepDistance is DISCARDED, and until now it was discarded in
+	// silence. A whole dash is DashSpeed x DashDuration = 594uu against a 600uu guard, so a dash the
+	// server simulates inside a single frame — which is what a burst of a lagging client's queued
+	// moves produces — is 6uu away from vanishing with nothing written down anywhere. A mechanic that
+	// can no-op invisibly is how a report like this one reaches a playtest.
+	// =============================================================================================
+
+	/**
+	 * 0 (default) off. 1 = the server's per-dash audit plus the trail-state heartbeat on whichever
+	 * machine it is set on. 2 = also the CLIENT-SIDE MIRROR: the local pawn's own swept segment
+	 * evaluated against the local pawn's own copy of the trace, which is "what the player saw",
+	 * expressed as the trip test's own verdict rather than as an impression.
+	 *
+	 * Set it on BOTH processes of a two-process run. The two logs are correlated afterwards on
+	 * BirthServerTime, which is the replicated shared clock and therefore the one number in either
+	 * log that means the same thing on both machines.
+	 */
+	int32 GDashAudit = 0;
+
+	FAutoConsoleVariableRef CVarDashAudit(
+		TEXT("Trace.Trail.DashAudit"),
+		GDashAudit,
+		TEXT("D31. 0 (default) off. 1 = server per-dash audit + trail-state heartbeat. 2 = also the "
+		     "client-side mirror of the trip test, so 'what the dasher saw' and 'what the server "
+		     "tested' are two lines in one run. Set it on both processes."),
+		ECVF_Cheat);
+
+	/**
+	 * Seconds between [TRAILSTATE] heartbeat lines, per trace.
+	 *
+	 * 20Hz, and the number is a measurement decision rather than a taste one. The effect being
+	 * measured is the replication delay on the point array, which is tens of milliseconds; at the
+	 * 4Hz this started at, the sampling quantisation was BIGGER THAN THE EFFECT and the paired
+	 * differences came out as a histogram of the sampling interval. 0.05s puts the quantisation an
+	 * order of magnitude under the smallest thing worth reporting.
+	 */
+	constexpr double DashAuditHeartbeatSeconds = 0.05;
+
+	/** Client-mirror lines are printed for crossings and for near misses inside this many uu. */
+	constexpr double DashAuditNearMissUU = 40.0;
+
+	/**
+	 * HOW CLOSE A SWEEP CAME TO SCORING, in uu, asked of the SAME predicate the kill is decided by.
+	 *
+	 * UTraceTrailComponent::SweepIntersectsTrace scores when some segment answers
+	 * (HorizontalGap <= TripperRadius && VerticalGap <= TripperHalfHeight), i.e. when
+	 * max(H - r, V - hh) <= 0. So the minimum of that expression over every segment IS the test's own
+	 * margin: at or below 0 it scored, above 0 is how many uu short it was. Deriving the margin from
+	 * the predicate rather than beside it is the whole point — a second copy of this arithmetic could
+	 * report a near miss on a frame the game scored a kill, and the report would be worthless.
+	 */
+	void MeasureSweepMargin(const TArray<FVector>& Positions, const FVector& From, const FVector& To,
+		double TraceRadius, double TraceHalfHeight, double TripperRadius, double TripperHalfHeight,
+		double& OutMissBy, double& OutHorizontalGap, double& OutVerticalGap, int32& OutSegment)
+	{
+		OutMissBy = TNumericLimits<double>::Max();
+		OutHorizontalGap = -1.0;
+		OutVerticalGap = -1.0;
+		OutSegment = INDEX_NONE;
+
+		if (Positions.Num() == 0)
+		{
+			return;
+		}
+
+		const bool bFlatCaps = (GTrailFlatEndCaps != 0);
+		const int32 LastSegment = FMath::Max(0, Positions.Num() - 2);
+
+		for (int32 SegmentIndex = 0; SegmentIndex <= LastSegment; ++SegmentIndex)
+		{
+			const FVector& A = Positions[SegmentIndex];
+			const FVector& B = Positions[FMath::Min(SegmentIndex + 1, Positions.Num() - 1)];
+
+			double Horizontal = 0.0;
+			double Vertical = 0.0;
+			bool bBeyond = false;
+			SegmentGapToTraceVolume(A, B, bFlatCaps, bFlatCaps, From, To,
+				TraceRadius, TraceHalfHeight, Horizontal, Vertical, bBeyond);
+
+			const double MissBy = FMath::Max(Horizontal - TripperRadius, Vertical - TripperHalfHeight);
+			if (MissBy < OutMissBy)
+			{
+				OutMissBy = MissBy;
+				OutHorizontalGap = Horizontal;
+				OutVerticalGap = Vertical;
+				OutSegment = SegmentIndex;
+			}
+		}
+	}
+
+	/**
+	 * One machine's whole opinion of one trace, in the fields two machines can disagree about.
+	 *
+	 * The two BIRTH stamps are the load-bearing ones, and they are why this is not merely a point
+	 * count: BirthServerTime is stamped on AGameStateBase's replicated clock, so the oldest and newest
+	 * stamps mean the same thing in the server's log and in the client's. The difference between the
+	 * two logs is therefore the replication error stated in SECONDS, rather than inferred from a count
+	 * of points whose spacing depends on how fast the carrier happened to be moving.
+	 */
+	struct FDashAuditTrailState
+	{
+		int32 Points = 0;
+		int32 Lethal = 0;
+		double PathLength = 0.0;
+		double LethalLength = 0.0;
+		float OldestBirth = -1.f;
+		float NewestBirth = -1.f;
+		float NewestLethalBirth = -1.f;
+	};
+
+	void ReadTrailState(const UTraceTrailComponent* Trail, FDashAuditTrailState& Out)
+	{
+		Out = FDashAuditTrailState();
+		if (Trail == nullptr)
+		{
+			return;
+		}
+
+		const TArray<FTraceTrailPoint>& Items = Trail->TrailPoints.Items;
+		Out.Points = Items.Num();
+		if (Out.Points == 0)
+		{
+			return;
+		}
+
+		Out.Lethal = Trail->ComputeLastLethalIndex() + 1;
+		Out.OldestBirth = Items[0].BirthServerTime;
+		Out.NewestBirth = Items.Last().BirthServerTime;
+		Out.NewestLethalBirth = (Out.Lethal > 0) ? Items[Out.Lethal - 1].BirthServerTime : -1.f;
+
+		for (int32 Index = 1; Index < Out.Points; ++Index)
+		{
+			const double Step = FVector::Dist(Items[Index - 1].Location, Items[Index].Location);
+			Out.PathLength += Step;
+			if (Index < Out.Lethal)
+			{
+				Out.LethalLength += Step;
+			}
+		}
+	}
+
+	const TCHAR* DashAuditNetRole(const UWorld* World)
+	{
+		if (World == nullptr)
+		{
+			return TEXT("none");
+		}
+		switch (World->GetNetMode())
+		{
+		case NM_Standalone:      return TEXT("STANDALONE");
+		case NM_ListenServer:    return TEXT("HOST");
+		case NM_Client:          return TEXT("CLIENT");
+		case NM_DedicatedServer: return TEXT("DEDICATED");
+		default:                 return TEXT("unknown");
+		}
+	}
+
+	/** Ping in ms as THIS machine knows it, or -1 for a pawn with no player state (a bot, or a join). */
+	float DashAuditPingMs(const AActor* Actor)
+	{
+		const APawn* AsPawn = Cast<const APawn>(Actor);
+		const APlayerState* State = (AsPawn != nullptr) ? AsPawn->GetPlayerState() : nullptr;
+		return (State != nullptr) ? State->GetPingInMilliseconds() : -1.f;
+	}
+
+	/** Next heartbeat due, per component. Weak keys: a destroyed trace simply stops being found. */
+	TMap<TWeakObjectPtr<const UTraceTrailComponent>, double>& DashAuditHeartbeatDue()
+	{
+		static TMap<TWeakObjectPtr<const UTraceTrailComponent>, double> Map;
+		return Map;
+	}
+
+	/**
+	 * THE HEARTBEAT. One line per trace per quarter second, printed by EVERY machine that has that
+	 * trace — the server about the array it kills with, each client about the array it draws.
+	 *
+	 * Deliberately NOT conditional on anybody dashing. The gap between the two machines exists whether
+	 * or not a dash happens, and sampling it only on the frames a dash lands would put the sample size
+	 * at the mercy of whatever drove the dashes. Correlate the two logs on the birth stamps:
+	 *
+	 *   serverNewestLethalBirth - clientNewestLethalBirth = how far BEHIND the client's newest lethal
+	 *                                                       point is, in shared-clock seconds.
+	 *   serverOldestBirth       - clientOldestBirth       = how much RETIRED trace the client is still
+	 *                                                       drawing, in shared-clock seconds. Positive
+	 *                                                       means the client draws trace that no longer
+	 *                                                       exists on the machine that decides kills.
+	 */
+	void TickDashAuditHeartbeat(const UTraceTrailComponent* Trail, float SharedNow)
+	{
+		if (GDashAudit <= 0 || Trail == nullptr)
+		{
+			return;
+		}
+
+		const UWorld* World = Trail->GetWorld();
+		if (World == nullptr)
+		{
+			return;
+		}
+
+		FDashAuditTrailState State;
+		ReadTrailState(Trail, State);
+		if (State.Points == 0)
+		{
+			return;
+		}
+
+		const double Now = World->GetTimeSeconds();
+		double& Due = DashAuditHeartbeatDue().FindOrAdd(Trail, 0.0);
+		if (Now < Due)
+		{
+			return;
+		}
+		Due = Now + DashAuditHeartbeatSeconds;
+
+		const AActor* Owner = Trail->GetOwner();
+		const ATraceCharacter* Holder = Cast<const ATraceCharacter>(Owner);
+
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[TRAILSTATE] %s t=%.3f holder=%s ping=%.0f pts=%d lethal=%d len=%.1f lethalLen=%.1f "
+			     "birthOldest=%.3f birthNewest=%.3f birthNewestLethal=%.3f headGap=%.1f speed=%.0f "
+			     "carrier=%d emitting=%d"),
+			DashAuditNetRole(World), SharedNow, *GetNameSafe(Owner), DashAuditPingMs(Owner),
+			State.Points, State.Lethal, State.PathLength, State.LethalLength,
+			State.OldestBirth, State.NewestBirth, State.NewestLethalBirth,
+			Trail->MeasureHeadGap(),
+			(Owner != nullptr) ? Owner->GetVelocity().Size() : 0.0,
+			(Holder != nullptr && Holder->IsCarrier()) ? 1 : 0,
+			Trail->IsEmitting() ? 1 : 0);
+	}
+
+	/** The locally controlled pawn's swept segment this frame, computed once however many traces exist. */
+	struct FDashAuditLocalSweep
+	{
+		TWeakObjectPtr<const ATraceCharacter> Pawn;
+		FVector Previous = FVector::ZeroVector;
+		FVector Current = FVector::ZeroVector;
+		uint64 Frame = 0;
+		bool bValid = false;
+	};
+
+	FDashAuditLocalSweep& DashAuditLocalSweep()
+	{
+		static FDashAuditLocalSweep Sweep;
+		return Sweep;
+	}
+
+	/**
+	 * Refreshes the local sweep at most once per engine frame, whichever trace asks for it first.
+	 *
+	 * A per-COMPONENT previous position would be wrong here and not merely wasteful: there is one
+	 * local pawn and it made one movement this frame, so every trace has to be asked about the SAME
+	 * segment or two traces would be judged against two different versions of the same dash.
+	 */
+	const FDashAuditLocalSweep& UpdateDashAuditLocalSweep(const UWorld* World)
+	{
+		FDashAuditLocalSweep& Sweep = DashAuditLocalSweep();
+		if (Sweep.Frame == GFrameCounter)
+		{
+			return Sweep;
+		}
+		Sweep.Frame = GFrameCounter;
+
+		const ATraceCharacter* LocalPawn = nullptr;
+		if (World != nullptr)
+		{
+			for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+			{
+				const APlayerController* PC = It->Get();
+				if (PC != nullptr && PC->IsLocalController())
+				{
+					LocalPawn = Cast<const ATraceCharacter>(PC->GetPawn());
+					if (LocalPawn != nullptr)
+					{
+						break;
+					}
+				}
+			}
+		}
+
+		if (LocalPawn == nullptr)
+		{
+			Sweep.bValid = false;
+			Sweep.Pawn = nullptr;
+			return Sweep;
+		}
+
+		const FVector Location = LocalPawn->GetActorLocation();
+		const bool bContinuous = Sweep.bValid && (Sweep.Pawn.Get() == LocalPawn);
+		Sweep.Previous = bContinuous ? Sweep.Current : Location;
+		Sweep.Current = Location;
+		Sweep.Pawn = LocalPawn;
+		Sweep.bValid = true;
+		return Sweep;
+	}
+
+	/**
+	 * THE CLIENT-SIDE MIRROR — "what the player saw", stated as the trip test's own verdict.
+	 *
+	 * Runs on a machine that is NOT the authority, over the LOCALLY CONTROLLED pawn's own predicted
+	 * movement this frame, against THIS machine's copy of the trace. Same geometry, same thresholds,
+	 * same lethal set as the server's; the only things that differ are the two inputs the network
+	 * delays, which is exactly the isolation the question needs.
+	 *
+	 * It kills nothing and it touches nothing. It also does not care whether the pawn is dashing: the
+	 * player's belief that they crossed the ribbon is formed by where their body went, not by whether
+	 * a dash timer was still running when the server got round to looking.
+	 */
+	void TickDashAuditClientMirror(const UTraceTrailComponent* Trail, float SharedNow,
+		const FVector& PawnPrevious, const FVector& PawnCurrent, const ATraceCharacter* LocalPawn)
+	{
+		if (GDashAudit < 2 || Trail == nullptr || LocalPawn == nullptr)
+		{
+			return;
+		}
+
+		const ATraceCharacter* Holder = Cast<const ATraceCharacter>(Trail->GetOwner());
+		if (Holder == nullptr || Holder == LocalPawn)
+		{
+			return;
+		}
+
+		FDashAuditTrailState State;
+		ReadTrailState(Trail, State);
+		if (State.Lethal <= 0)
+		{
+			return;
+		}
+
+		TArray<FVector> Positions;
+		Positions.Reserve(State.Lethal);
+		for (int32 Index = 0; Index < State.Lethal; ++Index)
+		{
+			Positions.Add(Trail->TrailPoints.Items[Index].Location);
+		}
+
+		const double TrailRadius =
+			FMath::Max(0.0, static_cast<double>(UTraceTrailComponent::GetTraceTrailRadius()));
+		const double TrailHalfHeight =
+			FMath::Max(0.0, static_cast<double>(UTraceTrailComponent::GetTraceTrailHeight())) * 0.5;
+		const FTraceModelReach Reach = UTraceTrailComponent::MeasureModelReach(LocalPawn);
+
+		double MissBy = 0.0;
+		double HorizontalGap = 0.0;
+		double VerticalGap = 0.0;
+		int32 Segment = INDEX_NONE;
+		MeasureSweepMargin(Positions, PawnPrevious, PawnCurrent, TrailRadius, TrailHalfHeight,
+			Reach.EffectiveRadius, Reach.EffectiveHalfHeight,
+			MissBy, HorizontalGap, VerticalGap, Segment);
+
+		// Only the frames that are ABOUT something: a crossing, or a genuine near miss. A line for
+		// every frame a player is loosely near a trace would bury the crossings this exists to show.
+		if (MissBy > DashAuditNearMissUU)
+		{
+			return;
+		}
+
+		const UTraceCharacterMovementComponent* Movement = LocalPawn->GetTraceMovement();
+
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[DASHAUDIT/C] t=%.3f local=%s holder=%s ping=%.0f dashing=%d sweep=%.1f "
+			     "pts=%d lethal=%d birthOldest=%.3f birthNewestLethal=%.3f seg=%d missBy=%+.2f "
+			     "hGap=%.2f (r=%.1f) vGap=%.2f (hh=%.1f) verdict=%s"),
+			SharedNow, *GetNameSafe(LocalPawn), *GetNameSafe(Holder), DashAuditPingMs(LocalPawn),
+			(Movement != nullptr && Movement->IsDashing()) ? 1 : 0,
+			FVector::Dist(PawnPrevious, PawnCurrent),
+			State.Points, State.Lethal, State.OldestBirth, State.NewestLethalBirth,
+			Segment, MissBy, HorizontalGap, Reach.EffectiveRadius, VerticalGap, Reach.EffectiveHalfHeight,
+			(MissBy <= 0.0) ? TEXT("THIS MACHINE SAYS THE DASH CROSSED THE TRACE") : TEXT("near miss"));
+	}
+#endif // !UE_BUILD_SHIPPING
+
+
 	// =============================================================================================
 	// GHOST KNOBS: UTraceSettings is the authority, the CVars are overrides
 	//
@@ -2255,6 +2658,31 @@ void UTraceTrailComponent::TickComponent(float DeltaTime, ELevelTick TickType, F
 	// head, and on a listen client's screen every judgement a player makes about where the trace is.
 	// A no-op on authority and on any client whose array happens to have arrived in order.
 	RestoreReplicatedPointOrder();
+
+#if !UE_BUILD_SHIPPING
+	// D31, THE AUDIT'S SAMPLING POINT, AND ITS POSITION IN THE FRAME IS PART OF THE MEASUREMENT.
+	//
+	// AFTER the order repair, because the repaired array is the one this machine DRAWS and therefore
+	// the one whose shape its player formed a belief about. BEFORE the visuals and the predicted head,
+	// because neither of those may change a point and a sample taken after them would invite the
+	// question. On the authority this is the same array ServerRunTripTest just killed with, so the
+	// server's heartbeat and the server's verdicts cannot describe two different traces.
+	if (GDashAudit > 0)
+	{
+		const float SharedNow = GetServerTimeSeconds();
+		TickDashAuditHeartbeat(this, SharedNow);
+
+		if (!Owner->HasAuthority())
+		{
+			const FDashAuditLocalSweep& LocalSweep = UpdateDashAuditLocalSweep(GetWorld());
+			if (LocalSweep.bValid)
+			{
+				TickDashAuditClientMirror(this, SharedNow, LocalSweep.Previous, LocalSweep.Current,
+					LocalSweep.Pawn.Get());
+			}
+		}
+	}
+#endif
 
 	// Listen servers draw the trace too; only a headless server skips it.
 	if (GetNetMode() != NM_DedicatedServer)
@@ -4632,9 +5060,18 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		// still credited to this frame's sweep, but DashTimeRemaining has already hit zero, and the
 		// player watches themselves dash through the trace with nothing happening. The movement
 		// component latches the last instant it was authoritatively dashing; accept that too.
-		if (Settings.bRequireDashToTripTrail && !Candidate->IsDashing())
+		//
+		// D31 NAMED THE TWO CLAUSES instead of leaving them folded into one condition, and the audit
+		// below is why: "the dash was admitted" and "the dash was admitted only by the trailing
+		// window" are different facts about the network, and a log line that cannot tell them apart is
+		// not evidence about the clause that exists to cover the network. The condition itself is
+		// unchanged — bRequireDashToTripTrail && !dashing && !recentlyDashed — and so is its cost:
+		// GetLastDashActiveWorldTime() is a float compare.
+		const bool bDashingNow = Candidate->IsDashing();
+
+		bool bRecentlyDashed = false;
+		if (!bDashingNow)
 		{
-			bool bRecentlyDashed = false;
 			if (const UWorld* World = GetWorld())
 			{
 				if (const UTraceCharacterMovementComponent* CandidateMovement = Candidate->GetTraceMovement())
@@ -4643,11 +5080,11 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 						<= RecentDashGraceSeconds;
 				}
 			}
+		}
 
-			if (!bRecentlyDashed)
-			{
-				continue;
-			}
+		if (Settings.bRequireDashToTripTrail && !bDashingNow && !bRecentlyDashed)
+		{
+			continue;
 		}
 
 		// --- swept geometry -------------------------------------------------------------------
@@ -4655,6 +5092,33 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		const double SweepDistance = FVector::Dist(PreviousLocation, CurrentLocation);
 		if (SweepDistance > MaxSweepDistance)
 		{
+#if !UE_BUILD_SHIPPING
+			// D31 — THE ONE WAY A DASH IS THROWN AWAY WITH NOTHING WRITTEN DOWN ANYWHERE.
+			//
+			// The guard is right in principle — a respawn must not scythe the whole arena — and it is
+			// very nearly wrong in practice. MinTeleportSweepDistance is 600uu and a whole dash is
+			// DashSpeed x DashDuration = 594uu (v16 raised DashSpeed 3000 -> 3300 and left the guard
+			// where it was, which took the margin from 60uu to 6uu). The server advances a remote
+			// client's dash clock inside MoveAutonomous and can consume several queued client moves in
+			// ONE server frame — the comment on the dash gate above says so — so a lagging client's
+			// whole dash can arrive as a single sweep, and anything past 600uu is discarded entire.
+			//
+			// Reported at Warning, and only for a pawn that was eligible AND near the trace, so the
+			// respawn teleport the guard exists for never prints. The absence of this line in a run is
+			// therefore a real negative: the guard is not that run's explanation.
+			if (TestPositions.Num() > 0
+				&& MinSweepDistanceToTraceXY(TestPositions, PreviousLocation, CurrentLocation) < 400.0)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[TRACEDASH] %s's %.0fuu sweep past %s's trace was DISCARDED AS A TELEPORT and "
+					     "never tested (guard %.0fuu, serverDt=%.4f, dashing=%d recent=%d). A whole dash "
+					     "is %.0fuu, so this pawn's movement covered more than one frame between two "
+					     "trip tests."),
+					*GetNameSafe(Candidate), SweepDistance, *GetNameSafe(Holder),
+					MaxSweepDistance, DeltaTime, bDashingNow ? 1 : 0, bRecentlyDashed ? 1 : 0,
+					static_cast<double>(Settings.DashSpeed) * static_cast<double>(Settings.DashDuration));
+			}
+#endif
 			continue;   // Teleport, not movement.
 		}
 
@@ -4702,6 +5166,65 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		const bool bHitLethal = bNearTrace
 			&& SweepIntersectsTrace(TestPositions, PreviousLocation, CurrentLocation,
 				TrailRadius, TrailHalfHeight, Reach.EffectiveRadius, Reach.EffectiveHalfHeight);
+
+#if !UE_BUILD_SHIPPING
+		// D31 — THE SERVER'S HALF OF THE TWO-MACHINE COMPARISON.
+		//
+		// What this frame's sweep was actually tested against, and by how many uu it missed if it
+		// missed. MeasureSweepMargin minimises exactly the expression SweepIntersectsTrace thresholds
+		// (max(H - r, V - hh) over every segment), so this line and bHitLethal above are the same
+		// predicate read twice and cannot disagree: missBy <= 0 iff bHitLethal.
+		//
+		// The EXEMPT STUB is measured beside it, because "you hit the one stretch that is deliberately
+		// not lethal" and "you missed by 5uu" are different answers to the same complaint and only the
+		// numbers can separate them.
+		if (GDashAudit > 0 && bNearTrace)
+		{
+			double AuditMissBy = 0.0;
+			double AuditHorizontal = 0.0;
+			double AuditVertical = 0.0;
+			int32 AuditSegment = INDEX_NONE;
+			MeasureSweepMargin(TestPositions, PreviousLocation, CurrentLocation,
+				TrailRadius, TrailHalfHeight, Reach.EffectiveRadius, Reach.EffectiveHalfHeight,
+				AuditMissBy, AuditHorizontal, AuditVertical, AuditSegment);
+
+			double StubMissBy = TNumericLimits<double>::Max();
+			double StubHorizontal = 0.0;
+			double StubVertical = 0.0;
+			int32 StubSegment = INDEX_NONE;
+			if (ExemptPositions.Num() > 1)
+			{
+				MeasureSweepMargin(ExemptPositions, PreviousLocation, CurrentLocation,
+					TrailRadius, TrailHalfHeight, Reach.EffectiveRadius, Reach.EffectiveHalfHeight,
+					StubMissBy, StubHorizontal, StubVertical, StubSegment);
+			}
+
+			if (AuditMissBy <= DashAuditNearMissUU || StubMissBy <= DashAuditNearMissUU)
+			{
+				const float OldestBirth = TrailPoints.Items[0].BirthServerTime;
+				const float NewestLethalBirth = (LastTestableIndex >= 0)
+					? TrailPoints.Items[LastTestableIndex].BirthServerTime : -1.f;
+
+				UE_LOG(LogTraceGame, Log,
+					TEXT("[DASHAUDIT/S] t=%.3f dasher=%s ping=%.0f holder=%s dashing=%d recent=%d "
+					     "sweep=%.1f (guard=%.0f) pts=%d lethal=%d birthOldest=%.3f birthNewestLethal=%.3f "
+					     "headGap=%.1f seg=%d missBy=%+.2f hGap=%.2f (r=%.1f) vGap=%.2f (hh=%.1f) "
+					     "stubMissBy=%+.2f parry=%d passWindow=%d verdict=%s"),
+					TripServerTime, *GetNameSafe(Candidate), DashAuditPingMs(Candidate),
+					*GetNameSafe(Holder), bDashingNow ? 1 : 0, bRecentlyDashed ? 1 : 0,
+					SweepDistance, MaxSweepDistance, TrailPoints.Items.Num(), TestPositions.Num(),
+					OldestBirth, NewestLethalBirth, MeasureHeadGap(),
+					AuditSegment, AuditMissBy, AuditHorizontal, Reach.EffectiveRadius,
+					AuditVertical, Reach.EffectiveHalfHeight,
+					(StubMissBy == TNumericLimits<double>::Max()) ? 999.0 : StubMissBy,
+					bParry ? 1 : 0, bPassWindow ? 1 : 0,
+					bHitLethal
+						? (bInvulnerable ? TEXT("HIT, but the carrier was invulnerable") : TEXT("HIT — KILL"))
+						: ((StubMissBy <= 0.0) ? TEXT("MISS — crossed only the NON-LETHAL head stub")
+						                       : TEXT("MISS")));
+			}
+		}
+#endif
 
 		if (bHitLethal)
 		{
@@ -14312,6 +14835,589 @@ namespace
 
 			GRibbonUpright = SavedUpright;
 			GTrailFlatEndCaps = SavedFlatCaps;
+		}));
+
+	// =============================================================================================
+	// Trace.Trail.DashProof — THE OWNER'S LITERAL QUESTION, ANSWERED BY THE GEOMETRY ITSELF
+	//
+	// "Could it be that there's a requirement for the dash passing fully through the trace?"
+	//
+	// That is a claim about ONE predicate — the one SweepIntersectsTrace applies per segment — so it
+	// is answered here by driving that predicate directly over sweeps whose end points are chosen
+	// arithmetically, with no world, no pawn, no bots and no frame rate. Same answer every run.
+	//
+	// IT MUST BE ABLE TO SAY NO. Three of the nine cases below expect a MISS, and they are not
+	// padding: a harness whose every case passes proves only that it was written to pass. Case C
+	// stops the sweep ONE uu outside the scoring band and case H puts it 60uu past the flat end cap,
+	// and if either of those ever reports a hit the trace has grown an invisible kill volume.
+	//
+	// WHAT IT DELIBERATELY DOES NOT TEST is the teleport guard, because that is not geometry: it is a
+	// length comparison made before the geometry is ever consulted. It is reported as arithmetic at
+	// the end, against the dash's own reach, because that comparison is where the margin has quietly
+	// shrunk to 6uu.
+	// =============================================================================================
+
+	struct FDashProofCase
+	{
+		const TCHAR* Name;
+		const TCHAR* Why;
+		FVector From;
+		FVector To;
+		bool bExpectHit;
+	};
+
+	FAutoConsoleCommand CmdTrailDashProof(
+		TEXT("Trace.Trail.DashProof"),
+		TEXT("D31. Drives the SHIPPING trip-test predicate over hand-placed sweeps to answer 'does a "
+		     "dash have to pass fully through the trace to kill?' — and prints the head-grace and "
+		     "teleport-guard arithmetic beside it. No world needed; the same answer every run."),
+		FConsoleCommandDelegate::CreateStatic([]()
+		{
+			const UTraceSettings& Settings = UTraceSettings::Get();
+
+			// A STRAIGHT TRACE ALONG +X, at the shipping spacing, laid at Z = 0. Straight on purpose:
+			// a corner would put a second segment within reach of some of these sweeps and every
+			// number below would then be about a piece of trace the case is not talking about — the
+			// exact mistake Trace.Trail.ModelHitTest's own comment records having made once already.
+			const double Spacing = FMath::Max(1.0, static_cast<double>(Settings.TrailPointSpacing));
+			const int32 PointCount = 11;
+			TArray<FVector> Trace;
+			Trace.Reserve(PointCount);
+			for (int32 Index = 0; Index < PointCount; ++Index)
+			{
+				Trace.Add(FVector(Index * Spacing, 0.0, 0.0));
+			}
+			const double TraceEndX = (PointCount - 1) * Spacing;
+
+			const double TrailRadius =
+				FMath::Max(0.0, static_cast<double>(UTraceTrailComponent::GetTraceTrailRadius()));
+			const double TrailHalfHeight =
+				FMath::Max(0.0, static_cast<double>(UTraceTrailComponent::GetTraceTrailHeight())) * 0.5;
+
+			// THE DASHER'S REACH. There is no pawn here to measure, so this uses MeasureModelReach's
+			// own FLOOR — capsule + ModelMarginMin — and says so rather than pretending otherwise.
+			//
+			// EVERY VERDICT BELOW IS INDEPENDENT OF THIS NUMBER, which is why a fixture may use it:
+			// each case is placed relative to Band = TrailRadius + TripperRadius, so moving the reach
+			// moves the case with it and the hit/miss pattern is unchanged.
+			//
+			// AND THE NUMBER A LIVE MATCH ACTUALLY USES IS NOT THE FLOOR. Measured over 258 logged
+			// dash-vs-trace evaluations in the D31 runs: EffectiveRadius was 54.0uu (the CEILING,
+			// capsule + ModelMarginMax) on 198 of them and 44.0uu (the floor) on 33, with the rest
+			// spread between. The reach does track the pose — that part of the v10 §2 claim holds —
+			// but in the poses a dash is seen in it is the CEILING that binds, not the floor, so the
+			// scoring band in play is 76.5uu either side of the centreline rather than 66.5uu. See
+			// GModelMarginMax, whose comment predicted the opposite.
+			const double CapsuleRadius = 34.0;
+			const double TripperRadius = CapsuleRadius + 10.0;
+			const double TripperHalfHeight = 88.0;
+
+			const double Band = TrailRadius + TripperRadius;
+			const double VerticalBand = TrailHalfHeight + TripperHalfHeight;
+			const double Mid = TraceEndX * 0.5;
+
+			const FDashProofCase Cases[] =
+			{
+				{ TEXT("A STOPS 1uu INSIDE THE BAND"),
+				  TEXT("perpendicular approach that STOPS before the centreline. THE OWNER'S QUESTION."),
+				  FVector(Mid, Band + 200.0, 0.0), FVector(Mid, Band - 1.0, 0.0), true },
+
+				{ TEXT("B STOPS ON THE DRAWN SURFACE"),
+				  TEXT("ends with the capsule centre exactly on the ribbon's own edge."),
+				  FVector(Mid, Band + 200.0, 0.0), FVector(Mid, TrailRadius, 0.0), true },
+
+				{ TEXT("C STOPS 1uu OUTSIDE THE BAND"),
+				  TEXT("*** MUST MISS *** — one uu the other side of the same line as case A."),
+				  FVector(Mid, Band + 200.0, 0.0), FVector(Mid, Band + 1.0, 0.0), false },
+
+				{ TEXT("D FULL PASS-THROUGH"),
+				  TEXT("in one side and out the other, the shape the hypothesis says is required."),
+				  FVector(Mid, 300.0, 0.0), FVector(Mid, -300.0, 0.0), true },
+
+				{ TEXT("E BEGINS AND ENDS INSIDE"),
+				  TEXT("a dash started ON the trace: neither end leaves the volume."),
+				  FVector(Mid - 20.0, 0.0, 0.0), FVector(Mid + 20.0, 0.0, 0.0), true },
+
+				{ TEXT("F STANDING STILL INSIDE IT"),
+				  TEXT("zero-length sweep. Contact, not crossing, is what the predicate asks for."),
+				  FVector(Mid, 10.0, 0.0), FVector(Mid, 10.0, 0.0), true },
+
+				{ TEXT("G CLEARS IT IN THE AIR"),
+				  TEXT("*** MUST MISS *** — dead over the ribbon, 1uu above the vertical band."),
+				  FVector(Mid, 300.0, VerticalBand + 1.0), FVector(Mid, -300.0, VerticalBand + 1.0), false },
+
+				{ TEXT("H 60uu PAST THE FLAT END CAP"),
+				  TEXT("*** MUST MISS *** — on the centreline, but past where the ribbon stops."),
+				  FVector(TraceEndX + 60.0, 200.0, 0.0), FVector(TraceEndX + 60.0, 0.0, 0.0), false },
+
+				{ TEXT("I 20uu PAST THE FLAT END CAP"),
+				  TEXT("inside the dasher's own reach of the cap, so it still scores."),
+				  FVector(TraceEndX + 20.0, 200.0, 0.0), FVector(TraceEndX + 20.0, 0.0, 0.0), true },
+			};
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[DASHPROOF] trace: %d points %.0fuu apart along +X (%.0fuu long), half width %.1fuu, "
+				     "half height %.1fuu. Dasher: capsule r=%.1f, effective r=%.1f (ModelMarginMin floor), "
+				     "half height %.1f. SCORING BAND = %.1fuu either side of the centreline, %.1fuu above "
+				     "and below it. flatEndCaps=%d wholeModelTrip=%d"),
+				PointCount, Spacing, TraceEndX, TrailRadius, TrailHalfHeight,
+				CapsuleRadius, TripperRadius, TripperHalfHeight, Band, VerticalBand,
+				GTrailFlatEndCaps, GWholeModelTrip);
+
+			int32 Failures = 0;
+			for (const FDashProofCase& Case : Cases)
+			{
+				double MissBy = 0.0;
+				double Horizontal = 0.0;
+				double Vertical = 0.0;
+				int32 Segment = INDEX_NONE;
+				MeasureSweepMargin(Trace, Case.From, Case.To, TrailRadius, TrailHalfHeight,
+					TripperRadius, TripperHalfHeight, MissBy, Horizontal, Vertical, Segment);
+
+				const bool bHit = (MissBy <= 0.0);
+				const bool bAsExpected = (bHit == Case.bExpectHit);
+				Failures += bAsExpected ? 0 : 1;
+
+				// DID THE SWEEP CROSS THE CENTRELINE? This is the hypothesis under test, measured
+				// rather than asserted: the two ends' signed lateral offsets having the same sign means
+				// the dash never reached the far side of the trace.
+				const double FromSide = Case.From.Y;
+				const double ToSide = Case.To.Y;
+				const bool bCrossed = (FromSide * ToSide) < 0.0;
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[DASHPROOF] %-30s %-4s expected=%-4s crossedCentreline=%d missBy=%+8.2fuu "
+					     "hGap=%7.2f vGap=%7.2f seg=%2d  %s  %s"),
+					Case.Name, bHit ? TEXT("HIT") : TEXT("MISS"),
+					Case.bExpectHit ? TEXT("HIT") : TEXT("MISS"),
+					bCrossed ? 1 : 0, MissBy, Horizontal, Vertical, Segment,
+					bAsExpected ? TEXT("ok  ") : TEXT("*** UNEXPECTED ***"), Case.Why);
+			}
+
+			// ---- THE HEAD-GRACE STUB, IN uu, FROM THE SHIPPING RULE ----------------------------
+			//
+			// ComputeLastLethalIndex exempts the newest point outright and then walks BACK along the
+			// chain while the accumulated distance is within one TrailRadius. At the shipping spacing
+			// the first step back already exceeds that, so the exemption is exactly one point — and
+			// the stretch of path that cannot kill runs from the last lethal point to the carrier's
+			// own feet, i.e. one spacing plus however far they have moved since the last append.
+			const int32 MaxExempt = FMath::Max(0, Settings.TrailHeadGracePoints);
+			const double GraceDistance = TrailRadius;
+			int32 ExemptCount = (MaxExempt == 0) ? 0 : 1;
+			double Walked = 0.0;
+			while (ExemptCount > 0 && ExemptCount < MaxExempt && (Walked + Spacing) <= GraceDistance)
+			{
+				Walked += Spacing;
+				++ExemptCount;
+			}
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[DASHPROOF] HEAD GRACE: TrailHeadGracePoints=%d caps it, the distance rule stops it "
+				     "at one TrailRadius (%.1fuu) and the spacing is %.0fuu, so %d point(s) are exempt. "
+				     "The stretch behind the carrier that is NEITHER DRAWN NOR LETHAL therefore runs "
+				     "%.0f..%.0fuu — one spacing to the last lethal point, plus up to one more spacing "
+				     "of travel since the newest point was laid."),
+				MaxExempt, GraceDistance, Spacing, ExemptCount, Spacing, Spacing * 2.0);
+
+			// ---- THE TELEPORT GUARD, AS ARITHMETIC ---------------------------------------------
+			const double DashReach =
+				static_cast<double>(Settings.DashSpeed) * static_cast<double>(Settings.DashDuration);
+			const double Guard60 = FMath::Max(MinTeleportSweepDistance,
+				static_cast<double>(Settings.DashSpeed) * (1.0 / 60.0) * 2.0);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[DASHPROOF] TELEPORT GUARD: a sweep longer than max(%.0fuu, DashSpeed*dt*2) is "
+				     "DISCARDED before any geometry runs. At 60Hz that is %.0fuu. One whole dash is "
+				     "DashSpeed %.0f x DashDuration %.2f = %.0fuu, so the margin is %.0fuu (%.1f%%). "
+				     "The server can simulate more than one frame of a remote client's movement between "
+				     "two trip tests, and everything past the guard is discarded ENTIRE."),
+				MinTeleportSweepDistance, Guard60, Settings.DashSpeed, Settings.DashDuration,
+				DashReach, Guard60 - DashReach, 100.0 * (Guard60 - DashReach) / Guard60);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[DASHPROOF] VERDICT: %s"),
+				(Failures == 0)
+					? TEXT("PASS — contact is enough. A sweep that STOPS inside the scoring band kills "
+					       "(cases A, B, E, F, I); passing fully through is one way to make contact and "
+					       "not a requirement. There is NO PASS-THROUGH RULE anywhere in the predicate. "
+					       "The three cases that must miss missed.")
+					: TEXT("*** FAIL — a case did not behave as stated; the numbers above say which. ***"));
+		}));
+
+	// =============================================================================================
+	// Trace.Trail.DashDrive — A CLIENT THAT ACTUALLY DASHES AT TRACES, SO THE AUDIT HAS SOMETHING TO
+	// AUDIT.
+	//
+	// Every existing trail harness either runs on the authority (Trace.Trail.ModelHitTest stages the
+	// pawn INSIDE the trip test, which is exactly right for geometry and useless for a network
+	// question) or measures a carrier rather than a dasher. The reported defect belongs to a JOINED
+	// CLIENT'S DASHER, and there is no way to get one of those without hands — so this grows the
+	// hands: face the nearest enemy trace, run at it through AddMovementInput, and fire a real dash
+	// through UTraceCharacterMovementComponent::StartDash() when it is in range.
+	//
+	// IT DRIVES THE SHIPPING ENTRY POINTS AND NOTHING ELSE. No teleport, no forced dash state, no
+	// authority call: on a client every one of those inputs goes into a saved move, is replayed on
+	// correction and is sent upstream exactly as a key press would be. That is the whole point — a rig
+	// that shortcut any of it would measure a dash the network had never had to carry.
+	// =============================================================================================
+
+	struct FDashDriveState
+	{
+		double Remaining = 0.0;
+		double TriggerDistance = 380.0;
+		int32 Attempts = 0;
+		int32 IdleFrames = 0;
+		double NextAllowedDash = 0.0;
+	};
+
+	bool TickDashDrive(TSharedRef<FDashDriveState> State, float DeltaTime)
+	{
+		State->Remaining -= DeltaTime;
+
+		UWorld* World = FindTrailDebugWorld();
+		if (World == nullptr || State->Remaining <= 0.0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[DASHDRIVE] finished on %s: %d dash(es) fired at enemy traces."),
+				DashAuditNetRole(World), State->Attempts);
+			return false;
+		}
+
+		// The pawn a human would be playing on this machine, and nothing else. On a listen host that
+		// is the host's own pawn; on a joined client it is the one whose movement is predicted, which
+		// is the case the report is about.
+		ATraceCharacter* LocalPawn = nullptr;
+		for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+		{
+			APlayerController* PC = It->Get();
+			if (PC != nullptr && PC->IsLocalController())
+			{
+				LocalPawn = Cast<ATraceCharacter>(PC->GetPawn());
+				if (LocalPawn != nullptr)
+				{
+					break;
+				}
+			}
+		}
+
+		if (LocalPawn == nullptr || !LocalPawn->IsAlive())
+		{
+			if ((++State->IdleFrames % 300) == 0)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[DASHDRIVE] waiting for a live local pawn."));
+			}
+			return true;
+		}
+
+		// The nearest LETHAL point of an ENEMY trace. Lethal and not merely drawn, so the drive aims
+		// at the thing the server would actually kill on — aiming at the head stub would manufacture
+		// the very miss this run is trying to measure the natural rate of.
+		TArray<ATraceCharacter*> Characters;
+		GatherTrailDebugCharacters(World, Characters);
+
+		const FVector PawnLocation = LocalPawn->GetActorLocation();
+		FVector Target = FVector::ZeroVector;
+		double BestDistance = TNumericLimits<double>::Max();
+		const ATraceCharacter* TargetHolder = nullptr;
+
+		for (const ATraceCharacter* Holder : Characters)
+		{
+			const UTraceTrailComponent* Trail = (Holder != nullptr) ? Holder->Trail : nullptr;
+			if (Trail == nullptr || Holder == LocalPawn || !Holder->IsAlive())
+			{
+				continue;
+			}
+			if (Holder->GetTeam() == ETraceTeam::None || LocalPawn->GetTeam() == ETraceTeam::None
+				|| Holder->GetTeam() == LocalPawn->GetTeam())
+			{
+				continue;
+			}
+
+			const int32 Lethal = Trail->ComputeLastLethalIndex() + 1;
+			for (int32 Index = 0; Index < Lethal; ++Index)
+			{
+				const FVector Point(Trail->TrailPoints.Items[Index].Location);
+				const double Distance = FVector::Dist(PawnLocation, Point);
+				if (Distance < BestDistance)
+				{
+					BestDistance = Distance;
+					Target = Point;
+					TargetHolder = Holder;
+				}
+			}
+		}
+
+		if (TargetHolder == nullptr)
+		{
+			// AN IDLE HARNESS MUST SAY WHY IT IS IDLE — this project's own rule, and it cost this run
+			// two hundred seconds before it was applied here. The first version printed "waiting for an
+			// enemy trace to exist" and nothing else, and the actual cause was that the local pawn had
+			// killed a carrier, taken the Core and stood still: there was no enemy trace because THIS
+			// pawn was the only carrier. A census names that in one line.
+			if ((++State->IdleFrames % 300) == 0)
+			{
+				int32 Carriers = 0;
+				int32 CarriersWithPoints = 0;
+				int32 EnemyCarriers = 0;
+				for (const ATraceCharacter* Other : Characters)
+				{
+					if (Other == nullptr || !Other->IsCarrier() || !Other->IsAlive())
+					{
+						continue;
+					}
+					++Carriers;
+					const UTraceTrailComponent* OtherTrail = Other->Trail;
+					if (OtherTrail != nullptr && OtherTrail->ComputeLastLethalIndex() >= 0)
+					{
+						++CarriersWithPoints;
+						if (Other != LocalPawn && Other->GetTeam() != ETraceTeam::None
+							&& LocalPawn->GetTeam() != ETraceTeam::None
+							&& Other->GetTeam() != LocalPawn->GetTeam())
+						{
+							++EnemyCarriers;
+						}
+					}
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[DASHDRIVE] idle %d frames: localTeam=%d localIsCarrier=%d | %d carrier(s), "
+					     "%d with a lethal point, %d of those an ENEMY of the local pawn. %s"),
+					State->IdleFrames, static_cast<int32>(LocalPawn->GetTeam()),
+					LocalPawn->IsCarrier() ? 1 : 0, Carriers, CarriersWithPoints, EnemyCarriers,
+					LocalPawn->IsCarrier()
+						? TEXT("THE LOCAL PAWN IS THE CARRIER — run Trace.Trail.DashDriveRig on the SERVER.")
+						: TEXT("waiting for an enemy carrier to lay one."));
+			}
+			return true;
+		}
+
+		State->IdleFrames = 0;
+
+		// Aim, then walk. The control rotation IS the movement basis, so these two lines are one act:
+		// turn to face the trace and run at it. Pitch stays level — a dash composes its direction from
+		// the aim, and a pitched one would leave the ground and turn every miss into an argument about
+		// height.
+		const FVector ToTarget = Target - PawnLocation;
+		const FRotator Facing(0.0, FMath::RadiansToDegrees(FMath::Atan2(ToTarget.Y, ToTarget.X)), 0.0);
+		if (APlayerController* PC = Cast<APlayerController>(LocalPawn->GetController()))
+		{
+			PC->SetControlRotation(Facing);
+		}
+		LocalPawn->AddMovementInput(Facing.Vector(), 1.f);
+
+		UTraceCharacterMovementComponent* Movement = LocalPawn->GetTraceMovement();
+		const double Now = World->GetTimeSeconds();
+
+		if (Movement != nullptr && BestDistance <= State->TriggerDistance
+			&& Now >= State->NextAllowedDash && Movement->CanDash())
+		{
+			Movement->StartDash();
+			++State->Attempts;
+			State->NextAllowedDash = Now + 0.6;
+
+			UE_LOG(LogTraceGame, Log,
+				TEXT("[DASHDRIVE] attempt #%d on %s: dash fired at %.0fuu from the nearest LETHAL point "
+				     "of %s's trace. ping=%.0fms"),
+				State->Attempts, DashAuditNetRole(World), BestDistance, *GetNameSafe(TargetHolder),
+				DashAuditPingMs(LocalPawn));
+		}
+
+		return true;
+	}
+
+	// =============================================================================================
+	// Trace.Trail.DashDriveRig — KEEP THE CORE ON A BOT, SO THERE IS SOMETHING TO DASH AT.
+	//
+	// MEASURED, not anticipated: the first two-process run produced ONE dash in two hundred seconds,
+	// and the reason was in the data rather than in the rig. The host's drive killed a carrier with a
+	// trace dash, the Core passed to the killer — the host's own pawn — and a pawn with no input
+	// beyond "walk at the nearest enemy trace" then stood perfectly still holding it for a hundred and
+	// sixty seconds. A stationary carrier lays exactly one point (spec v7 §1 deleted time-based
+	// expiry, so nothing retires it and nothing new arrives), so the match had ONE trace, one point
+	// long, belonging to the very pawn that was supposed to be dashing at traces.
+	//
+	// The rig is one rule: A HUMAN MAY NOT HOLD THE CORE. It is granted straight back to a living bot,
+	// alternating the recipient's TEAM every RigTeamSwapSeconds so that both humans in a two-process
+	// run get an enemy carrier roughly half of the time. Nothing else is touched — the bots play the
+	// match, lay the traces and fight over the Core exactly as they always do.
+	// =============================================================================================
+
+	struct FDashDriveRigState
+	{
+		double Remaining = 0.0;
+		double Elapsed = 0.0;
+		int32 Grants = 0;
+		int32 IdleTicks = 0;
+	};
+
+	/** How long the Core stays on one team's bots before the rig hands it to the other team's. */
+	constexpr double RigTeamSwapSeconds = 12.0;
+
+	bool TickDashDriveRig(TSharedRef<FDashDriveRigState> State, float DeltaTime)
+	{
+		State->Remaining -= DeltaTime;
+		State->Elapsed += DeltaTime;
+
+		UWorld* World = FindTrailDebugWorld();
+		if (World == nullptr || State->Remaining <= 0.0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[DASHRIG] finished: %d grant(s) taken off human pawns and given to bots."),
+				State->Grants);
+			return false;
+		}
+
+		if (World->GetNetMode() == NM_Client)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[DASHRIG] possession is server state; run this on the SERVER."));
+			return false;
+		}
+
+		ATraceCore* TheCore = ATraceCore::Get(World);
+		if (TheCore == nullptr)
+		{
+			return true;
+		}
+
+		ATraceCharacter* Carrier = TheCore->GetCarrier();
+
+		const bool bHumanCarrier = (Carrier != nullptr)
+			&& (Cast<APlayerController>(Carrier->GetController()) != nullptr);
+
+		const int32 Phase = static_cast<int32>(State->Elapsed / RigTeamSwapSeconds);
+		const ETraceTeam WantTeam = ((Phase % 2) == 0) ? ETraceTeam::Blue : ETraceTeam::Orange;
+
+		// TWO REASONS TO ACT, AND THE SECOND ONE WAS MEASURED INTO EXISTENCE.
+		//
+		//   1. A HUMAN holds it. Always wrong for this rig: a drive whose only input is "walk at the
+		//      nearest enemy trace" stands still the moment it becomes the carrier.
+		//   2. THE PHASE CHANGED AND THE CORE IS ON THE WRONG TEAM. Without this the rig only ever
+		//      fired on rule 1, so once the bots had it they kept it — and in a two-process run the
+		//      Core sat on ONE team for minutes, which makes the human on that team a spectator. The
+		//      first lagged run produced two client dashes in 260s for exactly that reason: the client
+		//      is Orange, the Core lived on Blue, and its census said so in as many words ("1 carrier,
+		//      1 with a lethal point, 0 of those an ENEMY of the local pawn").
+		const bool bWrongTeam = (Carrier == nullptr) || (Carrier->GetTeam() != WantTeam);
+		if (!bHumanCarrier && !bWrongTeam)
+		{
+			State->IdleTicks = 0;
+			return true;
+		}
+
+		TArray<ATraceCharacter*> Characters;
+		GatherTrailDebugCharacters(World, Characters);
+
+		// Where the humans are, so the Core can be put NEAR them. A trace laid at the far end of the
+		// arena is a trace no drive reaches before it is retired, and a run whose samples all come from
+		// a two-hundred-metre jog is a run about pathfinding rather than about the trip test.
+		TArray<FVector> HumanLocations;
+		for (const ATraceCharacter* TraceChar : Characters)
+		{
+			if (TraceChar != nullptr && TraceChar->IsAlive()
+				&& Cast<APlayerController>(TraceChar->GetController()) != nullptr)
+			{
+				HumanLocations.Add(TraceChar->GetActorLocation());
+			}
+		}
+
+		ATraceCharacter* Preferred = nullptr;
+		double PreferredDistance = TNumericLimits<double>::Max();
+		ATraceCharacter* Fallback = nullptr;
+		for (ATraceCharacter* TraceChar : Characters)
+		{
+			if (TraceChar == nullptr || !TraceChar->IsAlive() || TraceChar == Carrier)
+			{
+				continue;
+			}
+			if (Cast<APlayerController>(TraceChar->GetController()) != nullptr)
+			{
+				continue;   // another human; the rig exists to keep the Core off them
+			}
+
+			// No humans in this process (a dedicated server) leaves every bot equally good, which is
+			// the honest answer rather than a silent zero that would make the first bot always win.
+			double ToNearestHuman = 0.0;
+			for (const FVector& Where : HumanLocations)
+			{
+				ToNearestHuman = FMath::Min(
+					(ToNearestHuman > 0.0) ? ToNearestHuman : TNumericLimits<double>::Max(),
+					FVector::Dist(Where, TraceChar->GetActorLocation()));
+			}
+
+			if (TraceChar->GetTeam() == WantTeam && ToNearestHuman < PreferredDistance)
+			{
+				Preferred = TraceChar;
+				PreferredDistance = ToNearestHuman;
+			}
+			if (Fallback == nullptr)
+			{
+				Fallback = TraceChar;
+			}
+		}
+
+		ATraceCharacter* Recipient = (Preferred != nullptr) ? Preferred : Fallback;
+		if (Recipient == nullptr)
+		{
+			if ((++State->IdleTicks % 20) == 0)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[DASHRIG] no living bot to hand the Core to (%d characters seen)."), Characters.Num());
+			}
+			return true;
+		}
+
+		TheCore->GrantTo(Recipient, ETraceCoreGrantReason::Debug);
+		++State->Grants;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[DASHRIG] grant #%d: Core taken off %s and given to bot %s (team %d, phase wants %d)."),
+			State->Grants, (Carrier != nullptr) ? *GetNameSafe(Carrier) : TEXT("nobody"),
+			*GetNameSafe(Recipient), static_cast<int32>(Recipient->GetTeam()),
+			static_cast<int32>(WantTeam));
+		return true;
+	}
+
+	FAutoConsoleCommand CmdTrailDashDriveRig(
+		TEXT("Trace.Trail.DashDriveRig"),
+		TEXT("Trace.Trail.DashDriveRig [Seconds] — D31, SERVER ONLY. Keeps the Core on a living BOT by "
+		     "granting it away from any human pawn that takes it, alternating the recipient's team every "
+		     "12s. Without it a drive that kills a carrier inherits the Core and then stands still, and "
+		     "the match runs out of traces to dash at."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			TSharedRef<FDashDriveRigState> State = MakeShared<FDashDriveRigState>();
+			State->Remaining = (Args.Num() > 0) ? FMath::Clamp(FCString::Atod(*Args[0]), 1.0, 900.0) : 200.0;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[DASHRIG] armed for %.0fs: no human may hold the Core."), State->Remaining);
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) -> bool
+				{
+					return TickDashDriveRig(State, DeltaTime);
+				}), 0.25f);
+		}));
+
+	FAutoConsoleCommand CmdTrailDashDrive(
+		TEXT("Trace.Trail.DashDrive"),
+		TEXT("Trace.Trail.DashDrive [Seconds] [TriggerUU] — D31. Drives THIS machine's local pawn at "
+		     "the nearest enemy trace and fires real dashes through StartDash() when it is within "
+		     "TriggerUU of a lethal point. Run it on the CLIENT with Trace.Trail.DashAudit 2."),
+		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
+		{
+			TSharedRef<FDashDriveState> State = MakeShared<FDashDriveState>();
+			State->Remaining = (Args.Num() > 0) ? FMath::Clamp(FCString::Atod(*Args[0]), 1.0, 900.0) : 90.0;
+			State->TriggerDistance = (Args.Num() > 1)
+				? FMath::Clamp(FCString::Atod(*Args[1]), 60.0, 900.0) : 380.0;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[DASHDRIVE] armed for %.0fs, dashing within %.0fuu of the nearest lethal point."),
+				State->Remaining, State->TriggerDistance);
+
+			FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateLambda([State](float DeltaTime) -> bool
+				{
+					return TickDashDrive(State, DeltaTime);
+				}), 0.f);
 		}));
 }
 #endif // !UE_BUILD_SHIPPING

@@ -1,4 +1,10 @@
-// Trace — the player's own settings: mouse feel and key bindings.
+// Trace — the player's own settings: mouse feel, key bindings, and (D31-PAD) the gamepad.
+//
+// THREE INPUT SURFACES LIVE HERE AND THEY ARE DELIBERATELY NOT ONE. The mouse block, the keyboard
+// binding table (KeyBindings) and the gamepad block (PadKeyBindings plus the five analog values)
+// are separate because a reset of one must not touch another, because their bindability rules
+// differ, and because a stick is a rate where a mouse is a delta. The D31-PAD block below the
+// keyboard section argues all three at length.
 //
 // WHY THIS IS SEPARATE FROM UTraceSettings
 // UTraceSettings is a UDeveloperSettings marked `defaultconfig`: it is the DESIGNER's table, it
@@ -32,8 +38,12 @@
 /**
  * Every rebindable action, in the order the options screen lists them.
  *
- * Look is deliberately absent: it is the mouse, it has no discrete key, and everything a player
- * could want to change about it is a sensitivity or an inversion rather than a binding.
+ * Look is deliberately absent: it is the mouse — or, since D31-PAD, the right stick — it has no
+ * discrete key on either device, and everything a player could want to change about it is a
+ * sensitivity, a dead zone or an inversion rather than a binding. Both devices' look settings are
+ * therefore properties on this class and rows on a page, never entries in this enum. So is MOVE on a
+ * pad: the four rows below are keyboard keys, and the left stick is one Axis2D mapping that no
+ * per-action button table can express (see FTraceInputActionInfo::DefaultPadKey).
  *
  * Fire and Pass are BOTH listed even though the spec has mouse1 double as "pass"/"throw" while
  * carrying the Core. That overload is a gameplay rule inside the weapon/character slice, not an
@@ -372,12 +382,24 @@ enum class ETraceInputAction : uint8
  *
  * WHY "MENU" IS A BIT AND HOLDS NOTHING TODAY. The spec names two axes — "carrying vs not carrying,
  * menu vs match" — and the second one has a real answer: NO action in this table is live while the
- * settings/pause overlay is up. FTraceOptionsMenu polls its own keys (Escape, Enter, the arrows,
- * Backspace), none of which are rebindable, and ATracePlayerController::SetGameInputSuppressed makes
- * every gameplay handler early-return for as long as the overlay is open. So a match action and the
- * menu can never contend, the bit is unoccupied, and that is the finding rather than an omission. It
+ * settings/pause overlay is up, because ATracePlayerController::SetGameInputSuppressed makes every
+ * gameplay handler early-return for as long as the overlay is open. So a match action and the menu
+ * can never contend, the bit is unoccupied, and that is the finding rather than an omission. It
  * exists so that a menu action added later (a chat key, say) states its context in the same place as
  * everything else and gets the correct answer without anybody rewriting the check.
+ *
+ * *** D31-PAD REMOVED THE SECOND HALF OF THAT ARGUMENT, AND THE FIRST HALF STILL CARRIES IT. ***
+ * This comment used to add "FTraceOptionsMenu polls its own keys — Escape, Enter, the arrows,
+ * Backspace — none of which are rebindable". That is no longer true: the overlay now also polls the
+ * D-pad, the left stick's digital keys and the four face buttons, so that a player with a controller
+ * and no keyboard can reach the controller page at all — and A, B and Y ARE rebindable, on the pad
+ * page. A is both "select this row" and JUMP.
+ *
+ * IT IS STILL NOT A CONTENTION, and the reason is the half that was always doing the work:
+ * suppression. While the overlay is open no gameplay handler runs, so the A button cannot select a
+ * row and jump; while it is closed the overlay does not poll, so a jump cannot move a highlight.
+ * The two are separated in TIME by a flag, which is a stronger guarantee than "the menu happens to
+ * use keys nobody binds" ever was.
  */
 enum class ETraceInputStates : uint8
 {
@@ -415,6 +437,26 @@ struct FTraceInputActionInfo
 	 * button — and every other row names Default_None, which is honest and greppable.
 	 */
 	FKey (*DefaultKeyAlt)();
+	/**
+	 * D31-PAD — the shipped GAMEPAD button for this action, or an invalid FKey for "no pad default".
+	 *
+	 * *** A THIRD COLUMN AND NOT A THIRD SLOT ON DefaultKey. *** The pad has its own table
+	 * (PadBindings), its own page and its own mapping context, for the reason the PadBindings
+	 * property spells out: a stick is not a key and a pad bind must survive a keyboard reset. What
+	 * they DO share is this one row, because "which verb is this" is the same question on both
+	 * devices — one action, one display name, one exclusion group, two devices.
+	 *
+	 * A function pointer for the same reason the two above are: EKeys' statics are built during
+	 * module startup, so a namespace-scope FKey cannot be trusted to exist yet.
+	 *
+	 * TWO ROWS RETURN AN INVALID KEY ON PURPOSE — the four MOVE rows and nothing else. Movement on a
+	 * pad is the LEFT STICK, an analog Axis2D that no per-action button table can express, so it is
+	 * mapped by TraceGamepadInput's context instead and the four rows are absent from the controller
+	 * page entirely. THROW / PASS CORE is the third, and it matches the keyboard exactly: the fire
+	 * button already throws while carrying (spec v25 §7), so a second mapping on it would dispatch
+	 * one press twice.
+	 */
+	FKey (*DefaultPadKey)();
 	/** SPEC v28 §3b — the exclusion group. See ETraceInputStates. */
 	ETraceInputStates States;
 };
@@ -679,8 +721,235 @@ public:
 	/** True if @p Key is something a player could sensibly bind: a real button, not an axis. */
 	static bool IsBindableKey(const FKey& Key);
 
+	/**
+	 * D31-PAD — true if @p Key may be CAPTURED on the KEYBOARD page: bindable, and not on a pad.
+	 *
+	 * *** THIS AND IsBindablePadKey PARTITION THE KEY SPACE, AND THE PARTITION IS LOAD-BEARING. ***
+	 * IsBindableKey still accepts gamepad buttons and always has (see its own comment, and
+	 * Trace.VerifyBindableKeys, both of which are unchanged) — so without this the keybind page would
+	 * happily capture the A button into the KEYBOARD table while the controller page has it in the
+	 * PAD table. One physical button would then be mapped in two contexts at once, the higher-priority
+	 * one would consume it, and the other page's row would be a control that took input and changed
+	 * nothing. That is the single worst failure an options screen has, and it is why this exists.
+	 *
+	 * A SEPARATE PREDICATE RATHER THAN A NARROWING OF IsBindableKey, because the two answer different
+	 * questions. IsBindableKey is "can this key be STORED in a binding table" and is what the .ini
+	 * loader uses — a returning player whose file already says `Fire=Gamepad_FaceButton_Bottom` keeps
+	 * it, because silently dropping a saved line is worse than not offering the bind. This one is
+	 * "may the player CREATE that binding on this page", and the answer is no.
+	 */
+	static bool IsBindableKeyboardKey(const FKey& Key);
+
 	/** "SPACE BAR" / "LEFT SHIFT" / "UNBOUND". Upper case, for the options screen. */
 	static FString DescribeKey(const FKey& Key);
+
+	// ---------------------------------------------------------------------------------------------
+	// D31-PAD — THE GAMEPAD
+	//
+	// "Add a subpage within settings for controller keybinds. Create a default mapping, so that if a
+	// player connects a controller with Bluetooth instead/in addition to a mouse or trackpad they can
+	// use a controller."
+	//
+	// *** WHY THE PAD GETS ITS OWN TABLE INSTEAD OF A THIRD SLOT IN KeyBindings. *** Three reasons,
+	// and the first one alone decides it:
+	//
+	//   1. A KEYBOARD RESET MUST NOT WIPE A PAD BIND. ResetToDefaults() clears KeyBindings whole;
+	//      that row belongs to the CONTROLS page and a player who pressed it did not ask to lose the
+	//      controller layout on another page. The project already states this rule three times (see
+	//      EAction::ResetVideoDefaults and its two successors in UI/TraceOptionsMenu.h): a reset row
+	//      belongs to the page it is drawn on. Two tables is what makes that possible.
+	//   2. THE SLOT COUNT IS A DIFFERENT NUMBER. MaxKeysPerAction is 2 because the keybind row draws
+	//      two chips; a pad row wants one, because a pad has sixteen buttons and no player has ever
+	//      wanted two of them on one verb.
+	//   3. THE BINDABILITY RULE IS DIFFERENT. IsBindableKey accepts anything that is not an axis;
+	//      IsBindablePadKey accepts only keys that are physically ON a pad, so the controller page
+	//      cannot capture the space bar and the keyboard page cannot capture the A button.
+	//
+	// *** WHAT ACTUALLY DRIVES THE GAME. *** ATracePlayerController::ApplyControlSettings builds the
+	// keyboard/mouse context out of GetKeys() and NOTHING HERE CHANGES THAT — GetKeys() still returns
+	// keyboard slots only, so a pad bind can never appear in the mouse context and the two devices
+	// can never contend for one mapping. The pad's own mappings (these buttons, plus the two sticks)
+	// are laid down in a SECOND mapping context by UTraceGamepadInputSubsystem in
+	// Settings/TraceGamepadInput.h. Both contexts are live at once, which is the whole of the
+	// hot-plug story: nothing is conditional on a pad being present, so a pad connected over
+	// Bluetooth mid-match is playable on the frame macOS finishes pairing it, and the keyboard never
+	// stops working because nothing ever removed its context.
+	// ---------------------------------------------------------------------------------------------
+
+	/**
+	 * ONE pad button per action.
+	 *
+	 * Written over this constant rather than over a literal 1 so that the loops below read the same
+	 * as their keyboard twins, but raising it would also need a wider value column on the controller
+	 * page — the same trade MaxKeysPerAction documents.
+	 */
+	static constexpr int32 MaxPadKeysPerAction = 1;
+
+	/**
+	 * Serialised pad bindings, one "ConfigId=KeyName" string per entry — the same format and the same
+	 * ConfigIds as KeyBindings, in a separate array.
+	 *
+	 *     Jump=Gamepad_FaceButton_Bottom
+	 *     Fire=Gamepad_RightTrigger
+	 *     ThrowCore=None
+	 *
+	 * THE ConfigIds ARE SHARED WITH KeyBindings ON PURPOSE. They name the ACTION, not the device, so
+	 * a future action rename migrates both tables at once and the two can never drift into disagreeing
+	 * about what "Melee" is. The two arrays are different properties in the same .ini section, so a
+	 * `Melee=` line in one is never read by the other.
+	 *
+	 * Not the runtime source of truth — PadBindings' parsed twin below is. This is what hits disk.
+	 */
+	UPROPERTY(config)
+	TArray<FString> PadKeyBindings;
+
+	/**
+	 * The pad button bound to @p Action, or an invalid FKey when the player has cleared it.
+	 *
+	 * Deliberately NOT folded into GetKey(): every existing caller of GetKey — the HUD's ability chip,
+	 * the pull ring's "HOLD [G]" caption, the movement tutorial — wants the KEYBOARD key to print, and
+	 * silently handing them a pad button would put "GAMEPAD FACE BUTTON RIGHT" in a HUD caption on a
+	 * machine with no pad attached.
+	 */
+	FKey GetPadKey(ETraceInputAction Action) const;
+
+	/**
+	 * Binds @p Key to @p Action, taking it only from actions that GENUINELY conflict.
+	 *
+	 * Same rule and the same ActionsMayShareAKey test as the keyboard's SetKey, because it is the same
+	 * question — spec v28 §3b's "may these two verbs ever be legal at the same instant" is a statement
+	 * about the GAME, not about the device the press came from. Refuses anything IsBindablePadKey
+	 * refuses, so a stray keyboard key can never reach this table.
+	 */
+	void SetPadKey(ETraceInputAction Action, const FKey& Key);
+
+	/** Explicitly unbinds @p Action's pad button. The controller page's BKSP. */
+	void ClearPadKey(ETraceInputAction Action);
+
+	/** True if @p Key is a button a player could sensibly put on the controller page. */
+	static bool IsBindablePadKey(const FKey& Key);
+
+	/**
+	 * "A" / "RT" / "D-PAD UP" / "UNBOUND". Short, upper case, for the controller page's chip.
+	 *
+	 * NOT Key.GetDisplayName(), which returns "Gamepad Face Button Bottom" — twenty-eight characters
+	 * for a button every player on earth calls A. A chip sized to that string would be wider than the
+	 * row's label at 720p, which is the same argument the WP6.3 pass makes about the PASS note.
+	 */
+	static FString DescribePadKey(const FKey& Key);
+
+	/** Restores the shipped pad layout and the five analog values, and saves. Nothing else. */
+	void ResetPadToDefaults();
+
+	/** True when every pad bind and every analog value is on its shipped default. Dims the reset row. */
+	bool IsPadAtDefaults() const;
+
+	/** Populates the runtime pad table from PadKeyBindings, filling any gap with the default. */
+	void RefreshPadFromConfig();
+
+	// ---- The analog half. A stick is not a mouse. ------------------------------------------------
+	//
+	// *** THIS IS THE HALF THAT DECIDES WHETHER THE OWNER THINKS CONTROLLERS WORK. *** A right stick
+	// mapped straight onto the Look action with the mouse's own Scalar produces two failures that
+	// both read as "the pad is broken": at rest, a stick that reports 0.04 of drift turns the view
+	// forever, and in motion, a stick is a RATE (hold it and keep turning) where a mouse is a DELTA
+	// (move it once and stop), so a per-frame scalar makes the turn speed a function of frame rate.
+	// Both are fixed in the modifier stack UTraceGamepadInputSubsystem builds out of these numbers —
+	// a radial dead zone, then an exponential response curve, then this rate, then ScaleByDeltaTime.
+
+	/** Shipped defaults, in one place, so the property, the reset and the at-defaults test cannot drift. */
+	static constexpr float DefaultPadLookRate      = 220.00f;
+	static constexpr float DefaultPadLookYScale    = 0.75f;
+	static constexpr float DefaultPadLookDeadzone  = 0.20f;
+	static constexpr float DefaultPadMoveDeadzone  = 0.18f;
+	static constexpr bool  bDefaultPadInvertLookY  = false;
+	static constexpr bool  bDefaultPadEnabled      = true;
+
+	/**
+	 * Clamps for all four. Every accessor clamps, for the reason the crosshair block gives at length:
+	 * a hand-edited .ini is a supported way to configure this game and therefore a supported way to
+	 * arrive here with a look rate of 40000.
+	 *
+	 * THE DEAD-ZONE FLOOR IS NOT ZERO, and that is the one clamp worth arguing. A zero dead zone is
+	 * not a setting, it is a broken game on any pad whose sticks have worn — which after two years of
+	 * use is most of them. 0.05 still feels like "no dead zone" to a hand and still eats the drift.
+	 */
+	static constexpr float MinPadLookRate     = 60.00f;
+	static constexpr float MaxPadLookRate     = 720.00f;
+	static constexpr float MinPadLookYScale   = 0.25f;
+	static constexpr float MaxPadLookYScale   = 2.00f;
+	static constexpr float MinPadDeadzone     = 0.05f;
+	static constexpr float MaxPadDeadzone     = 0.45f;
+
+	/**
+	 * Degrees of yaw per second at FULL stick deflection, after the response curve.
+	 *
+	 * DEGREES PER SECOND AND NOT A UNITLESS "SENSITIVITY", because that is what the number physically
+	 * is once ScaleByDeltaTime is in the chain, and because it is the only form in which the value can
+	 * be checked against something: 220 deg/s is a 180 in 0.8 s, which is a fraction slower than a
+	 * console shooter's default and deliberately so — this arena's fights are close and the third
+	 * mouse-speed flick is not available to a stick anyway.
+	 *
+	 * IT IS NOT SHARED WITH MouseSensitivity, and must not be. They are different units (deg per
+	 * mouse count vs deg per second), so one slider driving both would move one of them by a factor
+	 * of a hundred; and a player who has tuned a mouse over years has said nothing whatever about
+	 * what they want from a stick.
+	 */
+	UPROPERTY(config)
+	float PadLookRate = DefaultPadLookRate;
+
+	/**
+	 * Extra multiplier on the PITCH axis only, on top of PadLookRate.
+	 *
+	 * SHIPS BELOW 1.0 where the mouse's twin ships at exactly 1.0, and the asymmetry is deliberate:
+	 * pitch has a 180-degree range against yaw's unbounded one, and on a stick — where the same
+	 * physical deflection is held for as long as the player wants to keep turning — an equal-rate
+	 * pitch overshoots the target every time. 0.75 is the value every console shooter converges on.
+	 */
+	UPROPERTY(config)
+	float PadLookYScale = DefaultPadLookYScale;
+
+	/** Invert the stick's vertical axis. FALSE is standard: push the stick forward, look up. */
+	UPROPERTY(config)
+	bool bPadInvertLookY = bDefaultPadInvertLookY;
+
+	/** Radial dead zone on the LOOK stick, 0..1. Below this the stick reads as exactly centred. */
+	UPROPERTY(config)
+	float PadLookDeadzone = DefaultPadLookDeadzone;
+
+	/**
+	 * Radial dead zone on the MOVE stick, 0..1.
+	 *
+	 * ITS OWN NUMBER AND NOT THE LOOK ONE. A dead zone that is generous enough to stop a worn look
+	 * stick from turning the camera is bigger than a player wants on the move stick, where the cost
+	 * of a small dead zone is only a slow walk and the cost of a big one is that a gentle lean does
+	 * nothing at all. Shipped slightly tighter than the look stick for exactly that reason.
+	 */
+	UPROPERTY(config)
+	float PadMoveDeadzone = DefaultPadMoveDeadzone;
+
+	/**
+	 * The off switch for the whole pad.
+	 *
+	 * NOT AN ENABLE-ON-DETECT. Nothing in this feature is conditional on a pad being present — see
+	 * the block comment above on hot-plug — so this exists for the one case a player genuinely needs
+	 * it: a pad with a worn stick left plugged in, drifting the view of somebody who is playing on
+	 * the mouse and does not know why their aim keeps sliding. Turning it OFF removes the pad's
+	 * mapping context and nothing else; the keyboard is untouched, because the keyboard was never in
+	 * that context.
+	 */
+	UPROPERTY(config)
+	bool bPadEnabled = bDefaultPadEnabled;
+
+	/** Clamped. Degrees per second of yaw at full deflection. */
+	float GetPadLookRateX() const;
+
+	/** Clamped, sign included: negative means "inverted". Degrees per second of pitch. */
+	float GetPadLookRateY() const;
+
+	/** Clamped 0..1. */
+	float GetPadLookDeadzone() const;
+	float GetPadMoveDeadzone() const;
 
 	// ---------------------------------------------------------------------------------------------
 	// SPEC v29 §3 — THE CROSSHAIR
@@ -1027,11 +1296,22 @@ private:
 	 */
 	TArray<FKey> Bindings;
 
+	/**
+	 * D31-PAD — the runtime pad table. Never serialised; PadKeyBindings is.
+	 *
+	 * Indexed straight by ETraceInputAction, with no slot arithmetic, because MaxPadKeysPerAction is
+	 * 1. If it ever stops being 1 this wants SlotIndex's treatment and not an ad-hoc multiply.
+	 */
+	TArray<FKey> PadBindings;
+
 	/** The one place that knows the Bindings layout. INDEX_NONE for an out-of-range action or slot. */
 	static int32 SlotIndex(ETraceInputAction Action, int32 Slot);
 
 	/** Mirrors Bindings back into KeyBindings before a save. */
 	void FlattenToConfig();
+
+	/** Mirrors PadBindings back into PadKeyBindings before a save. Twin of FlattenToConfig. */
+	void FlattenPadToConfig();
 
 	bool bLoaded = false;
 };

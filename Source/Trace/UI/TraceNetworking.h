@@ -234,7 +234,15 @@ namespace TraceNet
 	 * a way old clients cannot read, an RPC signature changes, or a cooked-content change would make
 	 * two builds disagree about the world. Do NOT bump it for a fix that both sides can carry.
 	 */
-	inline constexpr int32 NetProtocolVersion = 1;
+	// 1 -> 2, Demo 31: ATracePlayerController gained two replicated properties for the team-select
+	// session. That is exactly the "a replicated property is added" case above, and the reason it is
+	// bumped here rather than left alone is a hazard the verification pass caught: the compatibility
+	// value is built from THIS constant and ProjectVersion, neither of which a feature commit
+	// touches, so a Windows build made before Demo 31 and a Mac build made after it would both print
+	// NET 51920028, agree, connect — and then disagree about the replicated layout of the actor the
+	// client owns. Refusing at the handshake with a version message is a far better failure than a
+	// session that connects and then behaves inexplicably.
+	inline constexpr int32 NetProtocolVersion = 2;
 
 	/**
 	 * The exact string GetNetVersionChecksum() CRCs, e.g. "trace netproto 1, project 0.1.0".

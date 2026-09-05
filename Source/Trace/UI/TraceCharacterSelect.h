@@ -50,11 +50,13 @@
 #include "UObject/WeakObjectPtr.h"
 
 #include "Core/TraceCharacterRoster.h"
+#include "UI/TraceTeamSelect.h"   // D31-TEAMS — the team screen this one hosts; see below
 
 class AHUD;
 class APlayerController;
 class ATracePlayerState;
 class UFont;
+class ATracePlayerController;
 
 /**
  * The select overlay.
@@ -77,7 +79,18 @@ public:
 	TFunction<void()> OnOpened;
 	TFunction<void()> OnClosed;
 
-	bool IsOpen() const { return bOpen; }
+	/**
+	 * True while EITHER screen in this flow is up — the character select, or the team select this
+	 * class hosts (D31-TEAMS).
+	 *
+	 * DELIBERATELY ONE ANSWER FOR BOTH, and that is the whole reason the team screen is hosted here
+	 * rather than registered separately with ATraceHUD. This predicate is what hides the UMG ammo
+	 * corner (ATraceHUD::DrawHUD's bOverlayOwnsScreen) and what stops the pause menu handing movement
+	 * back to a player who is still behind a modal. A second overlay with its own IsOpen() would have
+	 * needed both of those call sites to learn about it, and either one missed is a player left
+	 * unable to move or an ammo counter drawn over a full-screen menu.
+	 */
+	bool IsOpen() const { return bOpen || TeamSelect.IsOpen(); }
 
 	/**
 	 * Poll input and draw. Call exactly once per frame from the owning AHUD::DrawHUD.
@@ -152,6 +165,25 @@ private:
 	// ---- State ----------------------------------------------------------------------------------
 
 	bool bOpen = false;
+
+	// ---- D31-TEAMS ------------------------------------------------------------------------------
+
+	/**
+	 * The team-select screen. Ticked from this class's Tick, drawn under this one, and reported
+	 * through IsOpen() above. See TraceTeamSelect.h for why it lives here.
+	 */
+	FTraceTeamSelect TeamSelect;
+
+	/**
+	 * bOpen || TeamSelect.IsOpen() as of the last frame.
+	 *
+	 * OnOpened / OnClosed fire off THIS rather than off bOpen, because what the host does with them —
+	 * silence gameplay input, hand the mouse back — is about "is a modal up", not about which one.
+	 * Firing them per screen would restore movement for one frame in the gap between the team screen
+	 * closing and the character screen opening, which is a frame in which a held W walks the player
+	 * out of the arena behind a menu.
+	 */
+	bool bOverlayOpen = false;
 
 	/**
 	 * 0..Count-1, an index into TraceCharacterRoster::All(). Never an id; convert at the point of use.

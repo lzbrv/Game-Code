@@ -159,7 +159,26 @@ public:
 		 * seeing all three tracks stacked — which is exactly the argument the QUALITY block on the
 		 * video page makes for its nine.
 		 */
-		Audio
+		Audio,
+
+		/**
+		 * D31-PAD — "Add a subpage within settings for controller keybinds."
+		 *
+		 * ITS OWN PAGE, which is what the owner asked for in as many words and is also the only shape
+		 * that works: the settings page is already twenty-eight rows, and sixteen pad binds plus six
+		 * analog controls would take it past fifty and clamp the pitch to its 18px floor at 720p. The
+		 * same argument VIDEO, CROSSHAIR and AUDIO each make, with a bigger number.
+		 *
+		 * REACHED FROM SETTINGS AND NOT FROM THE PAUSE ROOT, like CROSSHAIR and AUDIO. VIDEO earned
+		 * its root row by an emergency (spec v11 §0: a collapsed frame rate). A pad that needs
+		 * rebinding is not one, and the pause root stays five rows.
+		 *
+		 * IT IS ALSO THE ONE PAGE A PLAYER MAY ARRIVE AT WITH NO KEYBOARD. That is why the pad drives
+		 * this whole overlay — see PollNavigation, which reads the D-pad, the left stick and the face
+		 * buttons alongside the arrow keys — and why UTraceGamepadInputSubsystem turns MENU/START into
+		 * the Escape that opens the pause root in the first place.
+		 */
+		Controller
 	};
 
 	// ---- Host callbacks -------------------------------------------------------------------------
@@ -206,6 +225,15 @@ public:
 	 * `Trace.Menu.Audio` is the only way a run with no keyboard can photograph this page.
 	 */
 	void OpenAudio();
+
+	/**
+	 * D31-PAD — opens straight on the controller page, with BACK closing the overlay.
+	 *
+	 * Fourth of the family, and it exists for the identical headless reason the other three state:
+	 * `Trace.Menu.Controller` is the only way a run with no keyboard can photograph this page, and a
+	 * page nobody can photograph is a page nobody can be shown to have checked.
+	 */
+	void OpenController();
 
 	/** Closes, fires OnClosed, and abandons any rebind that was in progress. */
 	void Close();
@@ -347,6 +375,16 @@ private:
 		/** A rebindable action. */
 		Binding,
 		/**
+		 * D31-PAD — a rebindable action's GAMEPAD button. One chip, never two.
+		 *
+		 * A KIND OF ITS OWN rather than a flag on Binding, because five things about the row differ:
+		 * it reads GetPadKey instead of GetKey, it writes SetPadKey, it captures only pad buttons, it
+		 * draws one chip where Binding draws up to two, and BKSP clears the whole thing where
+		 * Binding clears one slot. A boolean threaded through five call sites is how the two would
+		 * eventually diverge in one of them and not the others.
+		 */
+		PadBinding,
+		/**
 		 * UI PLAN WP2.2 — a one-line string the player TYPES. Exactly one row is one: CALL SIGN.
 		 *
 		 * A KIND OF ITS OWN and not a Choice over a list of names, because the value is unbounded:
@@ -370,6 +408,8 @@ private:
 		OpenCrosshair,
 		/** UI PLAN WP3 — the AUDIO row on the settings page. */
 		OpenAudio,
+		/** D31-PAD — the CONTROLLER row on the settings page. */
+		OpenController,
 		ReturnToTitle,
 		Quit,
 		ResetDefaults,
@@ -400,6 +440,16 @@ private:
 		 * UTraceUserSettings::ResetAudioToDefaults, which touches the three faders and no other field.
 		 */
 		ResetAudioDefaults,
+		/**
+		 * D31-PAD — puts the CONTROLLER page back to its shipped layout, and nothing else.
+		 *
+		 * A fifth separate reset. The rule is stated three times above and holds here without further
+		 * argument: a reset row belongs to the page it is drawn on. It goes through
+		 * UTraceUserSettings::ResetPadToDefaults, which touches the pad table and the five analog
+		 * values and no other field — in particular it does not touch a single keyboard bind, which
+		 * Trace.Pad.Verify asserts in both directions.
+		 */
+		ResetControllerDefaults,
 		Back
 	};
 
@@ -473,6 +523,22 @@ private:
 		MasterVolume,
 		SfxVolume,
 		MusicVolume,
+
+		/**
+		 * D31-PAD — the controller page's six non-binding rows.
+		 *
+		 * *** ABOVE THE VIDEO BLOCK, for the fourth time and for the same load-bearing reason. ***
+		 * IsVideoSetting() is `>= ResolutionScale`; a look rate routed through UTraceGameUserSettings
+		 * would be a row that took input and changed nothing, and the player would report that
+		 * controller sensitivity does not work. All six live on UTraceUserSettings, which is where a
+		 * player's own feel belongs (see the header of Settings/TraceUserSettings.h).
+		 */
+		PadEnabled,
+		PadLookRate,
+		PadLookYScale,
+		PadInvertY,
+		PadLookDeadzone,
+		PadMoveDeadzone,
 
 		// ---- Video. IsVideoSetting() is the boundary and depends on this ordering. ----
 		ResolutionScale,
@@ -813,6 +879,9 @@ private:
 	/** UI PLAN WP3 — where BACK goes from the AUDIO page. Same contract as CrosshairReturnPage. */
 	EPage AudioReturnPage = EPage::Settings;
 
+	/** D31-PAD — twin of the three above. See OpenController for why the direct entry sets Closed. */
+	EPage ControllerReturnPage = EPage::Settings;
+
 	/**
 	 * UI PLAN WP2.2 — the CALL SIGN field.
 	 *
@@ -883,6 +952,17 @@ private:
 
 	/** SPEC v28 §3c — which of the action's two slots the pending capture will write. */
 	int32 CapturingSlot = 0;
+
+	/**
+	 * D31-PAD — true while the open capture belongs to a PadBinding row rather than a Binding row.
+	 *
+	 * ONE MORE BOOLEAN AND NOT A SECOND CAPTURE STATE MACHINE. Everything about a capture is the same
+	 * on both pages — swallow all input, ignore keys held when it opened, Escape cancels, one press
+	 * lands the key — and only two things differ: which key list is walked, and which setter is
+	 * called. Two state machines would be two places for the spec v28 §3a stale-mouse-edge fix to
+	 * live, and one of them would not have it.
+	 */
+	bool bCapturingPadKey = false;
 
 	/**
 	 * SPEC v28 §3c — which key chip the selection is on, for the Binding row under `Selected`.

@@ -38,6 +38,18 @@
 #     mode). The controller duplicates the loaded asset per player, so nothing
 #     the game does at runtime can dirty or mutate the asset on disk.
 #
+# NOT WRITTEN HERE AT ALL, and deliberately:
+#   * THE GAMEPAD (D31-PAD). The controller's mappings - the two sticks and
+#     every pad button - live in a SECOND mapping context that
+#     UTraceGamepadInputSubsystem builds in C++ at
+#     Source/Trace/Settings/TraceGamepadInput.cpp. There is no
+#     IMC_TracePad.uasset and there should not be: that context carries the
+#     player's own dead zones, look rate and inversion as live modifier values
+#     and is rebuilt on every settings change, so an asset picture of it would
+#     be stale the first time somebody moved a slider. IMC_Trace below is
+#     untouched by that feature - which is exactly why adding it did not change
+#     the mapping count Trace.Input.VerifyAssets expects.
+#
 # NOT AUTHORITATIVE:
 #   * IMC_Trace's key mapping list. The player's own binds live in
 #     Saved/Config/<Platform>/TraceUserSettings.ini and the SHIPPED DEFAULTS live

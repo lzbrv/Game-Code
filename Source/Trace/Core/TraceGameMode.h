@@ -35,6 +35,15 @@ class ATraceTeamPlayerStart;
 enum class ETraceCharacterPickResult : uint8;
 
 /**
+ * D31-TEAMS. Forward declared for the same reason ETraceCharacterPickResult above is: it is defined
+ * in Core/TracePlayerController.h (the actor a client OWNS, and therefore the only actor its request
+ * RPC may travel on), and this header is included by half the module. Declaring a scoped enum with a
+ * fixed underlying type is a complete declaration for a return type; RequestTeamChange is not a
+ * UFUNCTION, so UHT never needs to see the definition here either.
+ */
+enum class ETraceTeamChangeResult : uint8;
+
+/**
  * Who gets the Core after a goal.
  *
  * The design doc specifies who starts each HALF but says nothing about what follows a score, so
@@ -310,6 +319,72 @@ public:
 	/** Smaller team wins, ties go to Blue. Returns None when both teams are at PlayersPerTeam. */
 	ETraceTeam PickTeamForNewPlayer() const;
 
+	// ------------------------------------------------------------------------------------------
+	// D31-TEAMS — CHANGING TEAM, AND THE BALANCE RULE
+	//
+	// PickTeamForNewPlayer above is the balancer's opinion. What follows is what happens when a
+	// player disagrees with it — at join, from the team-select screen they now load into, or mid
+	// match by pressing H.
+	//
+	// ***** THE RULE, IN ONE SENTENCE. *****
+	// A switch is refused when the destination team would end up MORE THAN ONE PLAYER LARGER than
+	// the team being left — UNLESS the destination has a BOT, in which case the bot gives up its
+	// slot and the fill puts one back on the side that was vacated, so both sides stay at full
+	// strength and nothing can stack.
+	//
+	// WHY THE BOT CLAUSE IS THE WHOLE DESIGN, and not an exception bolted onto it. Bots occupy real
+	// team slots and UpdateBotFill()'s target is expressed as a ROSTER SIZE per team
+	// (DesiredBots = PlayersPerTeam - Humans), so it absorbs a human arriving and a human leaving
+	// for free, on the very next tick, with no edit to the fill at all — which is why this slice
+	// calls ScheduleBotFill() and does not touch bot logic (that belongs to tranche D31-BOTS).
+	// With bots on, four friends piling onto Blue is 5-v-5 in slots and is a legal, popular and
+	// deliberately permitted configuration. With "?bots=0" there is nothing elastic left, the bot
+	// clause cannot fire, and the +1 rule is the only thing standing between a playtest and a 2-v-0
+	// — which is exactly the case it refuses.
+	// ------------------------------------------------------------------------------------------
+
+	/**
+	 * THE BALANCE RULE, and it is deliberately a PURE FUNCTION OF THE REPLICATED ROSTER.
+	 *
+	 * Static, const, and reads nothing but PlayerArray and UTraceSettings::PlayersPerTeam — so the
+	 * team-select SCREEN on a remote client computes the identical answer the server will, greys the
+	 * illegal option out and prints the reason, without a round trip and without a second rulebook.
+	 * That is the same "believe locally, decide on the server" split the character-select screen's
+	 * header describes, and the same honesty about it: this is a BELIEF on a client (PlayerArray
+	 * there is one round trip old) and the VERDICT on the server, which is the only machine whose
+	 * answer counts. RequestTeamChange asks it again on the server before doing anything.
+	 *
+	 * @param OutReason  filled with a short all-caps line the screen can print verbatim on refusal.
+	 * @param OutDestinationFull  optional. Set to true when the refusal is "that side is at
+	 *                            PlayersPerTeam with no bot to stand down", which is a different
+	 *                            thing for a player to do about it than "that would stack the
+	 *                            teams" — one is waited out, the other is argued with. Returned as a
+	 *                            flag rather than sniffed out of OutReason, because a refusal
+	 *                            classified by matching the text of its own message breaks silently
+	 *                            the first time somebody rewords the message.
+	 */
+	static bool IsTeamSwitchAllowed(const AGameStateBase* InGameState, const ATracePlayerState* Mover,
+		ETraceTeam DesiredTeam, FString& OutReason, bool* OutDestinationFull = nullptr);
+
+	/**
+	 * THE arbitration entry point for a team change. Server only. Called by
+	 * ATracePlayerController::ServerRequestTeam.
+	 *
+	 * On a grant it sets the team, respawns the player on their new side, hands the Core back if
+	 * they were carrying it, reopens character select if their character is already held on the new
+	 * team, and schedules the bot fill so the slot arithmetic settles.
+	 */
+	ETraceTeamChangeResult RequestTeamChange(ATracePlayerState* Requester, ETraceTeam DesiredTeam);
+
+	/**
+	 * Server only. Puts the team-select screen up for @p ForPlayer and arms its timeout.
+	 *
+	 * Called from AssignTeamIfNeeded (so a joining player lands on TEAM select before CHARACTER
+	 * select, which is the ordering D31-TEAMS asks for) and from
+	 * ATracePlayerController::ServerRequestOpenTeamSelect (the H key, mid match).
+	 */
+	void OpenTeamSelectFor(APlayerController* ForPlayer);
+
 	/** Living, non-spectating members of @p Team that currently possess an alive ATraceCharacter. */
 	int32 CountLivingOnTeam(ETraceTeam Team) const;
 
@@ -536,6 +611,20 @@ public:
 	 */
 	UPROPERTY(config, EditDefaultsOnly, Category = "Trace|Characters")
 	float CharacterSelectTimeout = 30.f;
+
+	/**
+	 * D31-TEAMS. Seconds the team-select screen stays up before it closes itself and keeps whatever
+	 * team the balancer already handed out.
+	 *
+	 * HALF the character-select timeout, because it is half the decision: two options rather than
+	 * ten, and no prose to read. It also comes FIRST — a player who ignores both screens is behind a
+	 * modal for TeamSelectTimeout + CharacterSelectTimeout seconds, and that sum is the number that
+	 * matters rather than either half. Zero or less leaves the screen up until the player answers,
+	 * which is a legitimate private-match setting and a bad public one, exactly as it is for
+	 * CharacterSelectTimeout.
+	 */
+	UPROPERTY(config, EditDefaultsOnly, Category = "Trace|Teams")
+	float TeamSelectTimeout = 15.f;
 
 protected:
 	/** Spawned at the origin if the level does not already contain an ATraceArenaBuilder. */
@@ -784,7 +873,8 @@ protected:
 	 *
 	 * Idempotent and self-correcting in both directions, which is what makes it safe to call from
 	 * BeginPlay, after a login and after a logout: a second human joining a listen server pushes a
-	 * bot out rather than making an 11th player.
+	 * bot out rather than making an 11th player, and (D31) a human leaving is replaced by one rather
+	 * than leaving their side to play 4v5.
 	 */
 	void UpdateBotFill();
 
