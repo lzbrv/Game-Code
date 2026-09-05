@@ -97,7 +97,14 @@ SHADOWED = {
 DECL_RE = re.compile(
     r"(?:^|[;{}(,]|\bconst\b|\bstatic\b)\s*"
     r"(?:const\s+|volatile\s+|struct\s+|class\s+|typename\s+)*"
-    r"[A-Za-z_][A-Za-z0-9_:<>,\s]*?[\s*&]\s*"
+    # THE TYPE. `*` and `&` belong INSIDE this class, not only as its final
+    # character. Without them the pattern cannot cross a pointer star, so it
+    # matched `AController* Owner` but NOT `AController* const Owner` — the
+    # qualifier after the star put `const` where the name had to be. That blind
+    # spot shipped a C4458 to a collaborator's Windows build in Demo 31
+    # (TraceGameMode.cpp:1082, `AController* const Owner`). The trailing
+    # `[\s*&]` is kept so a bare `Owner = x;` assignment still cannot match.
+    r"[A-Za-z_][A-Za-z0-9_:<>,\s\*&]*?[\s*&]\s*"
     r"(" + "|".join(sorted(SHADOWED)) + r")\s*(?==[^=]|;|\)|,)"
 )
 

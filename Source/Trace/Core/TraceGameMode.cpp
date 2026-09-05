@@ -1079,7 +1079,10 @@ ETraceTeamChangeResult ATraceGameMode::RequestTeamChange(ATracePlayerState* Requ
 	}
 
 	const ETraceTeam FromTeam = Requester->Team;
-	AController* const Owner = Requester->GetOwningController();
+	// NOT `Owner`: AActor::Owner exists, and MSVC's C4458 is an ERROR in this project's Windows
+	// build. Cost a collaborator a compile. See Scripts/check-engine-member-shadowing.py, which
+	// missed this exact line and was widened for it in the same change.
+	AController* const RequesterController = Requester->GetOwningController();
 
 	// ---- The team itself -----------------------------------------------------------------------
 	//
@@ -1127,7 +1130,7 @@ ETraceTeamChangeResult ATraceGameMode::RequestTeamChange(ATracePlayerState* Requ
 	// to be rescheduled. Restarting them here instead would clear RespawnEndServerTime and put them
 	// back on the field immediately, which turns "change team" into "skip the respawn delay": a
 	// free, repeatable escape from the one cost the game charges for dying.
-	ATraceCharacter* const Body = (Owner != nullptr) ? Cast<ATraceCharacter>(Owner->GetPawn()) : nullptr;
+	ATraceCharacter* const Body = (RequesterController != nullptr) ? Cast<ATraceCharacter>(RequesterController->GetPawn()) : nullptr;
 	const bool bBodyIsStanding = (Body != nullptr) && Body->IsAlive();
 
 	if (bBodyIsStanding)
@@ -1163,10 +1166,10 @@ ETraceTeamChangeResult ATraceGameMode::RequestTeamChange(ATracePlayerState* Requ
 		// living switcher would be "restarted" as the same body standing where it was, on the
 		// wrong side of the field. Destroy it by hand and let the restart spawn a fresh one on
 		// the new team's pad.
-		Owner->UnPossess();
+		RequesterController->UnPossess();
 		Body->Destroy();
 
-		RestartPlayerFresh(Owner);
+		RestartPlayerFresh(RequesterController);
 	}
 	else
 	{
