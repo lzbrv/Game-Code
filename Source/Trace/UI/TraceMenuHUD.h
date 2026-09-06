@@ -50,6 +50,7 @@
 
 #include "TraceMenuHUD.generated.h"
 
+class APlayerController;
 class UFont;
 class UTraceTitleMenuWidget;
 struct FTraceMenuRowView;
@@ -161,7 +162,13 @@ public:
 	 */
 	bool GetCanvasRowRect(int32 InRowIndex, FBox2D& OutRect) const;
 
-	// ---- Input entry points, called by ATraceMenuPlayerController --------------------------------
+	// ---- Input entry points ----------------------------------------------------------------------
+	//
+	// Called by ATraceMenuPlayerController's bound keys and mouse, AND (D32-PADMENU) by this class's
+	// own PollPadInput. TWO DEVICES, ONE SET OF VERBS: the pad calls exactly these four functions and
+	// therefore inherits every guard in them — the travel latch, the activation grace window, the
+	// "an overlay is open" early-outs. Nothing here changed when the pad arrived, which is the whole
+	// reason the pad could be added without touching the keyboard.
 
 	/** Up / down. Clamped rather than wrapped: three rows wrap badly and clamping reads as solid. */
 	void MoveSelection(int32 Delta);
@@ -192,6 +199,9 @@ public:
 	 * ATraceMenuPlayerController's key bindings still fire while it is up — they are bound to the
 	 * controller, not to the menu — so every input entry point above checks this and returns. The
 	 * overlay polls its own input instead; see FTraceOptionsMenu for why.
+	 *
+	 * D32-PADMENU — and PollPadInput stands down on the same condition, because the overlay has read
+	 * the pad itself since D31-PAD. Two readers would walk the title selection underneath the panel.
 	 */
 	bool IsOptionsOpen() const { return OptionsMenu.IsOpen(); }
 
@@ -202,8 +212,23 @@ public:
 	 * W as navigation keys, and those are letters somebody typing "aya.tail1234.ts.net" needs. Every
 	 * entry point above returns early while this is true, and FTraceTextEntry polls the keyboard
 	 * itself.
+	 *
+	 * D32-PADMENU — the PAD does not stand down here, it is REROUTED: PollPadInput hands the frame to
+	 * PollPadJoinPrompt instead, where A connects, B cancels and X pastes. A pad that went quiet at
+	 * this prompt would be a pad player trapped in a modal with no keyboard to leave it with.
 	 */
 	bool IsJoinPromptOpen() const { return JoinEntry.IsActive(); }
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * D32-PADMENU — prints which row is highlighted and what state the screen is in, in one line.
+	 *
+	 * Exists because a synthetic pad press has to be checkable. Every other verification surface on
+	 * this screen photographs it or clicks it; neither answers "did D-pad DOWN move the highlight from
+	 * PLAY to JOIN, exactly once", which is the whole claim of this tranche. Reads only.
+	 */
+	void LogMenuState(const TCHAR* Why) const;
+#endif
 
 protected:
 	// ---- Draw passes, back to front --------------------------------------------------------------
@@ -302,6 +327,85 @@ protected:
 
 	/** Width the same call to DrawStrokeTextCentered would occupy. */
 	static float MeasureStrokeText(const FString& Text, float Height);
+
+	// ---- D32-PADMENU — the controller on the title screen ---------------------------------------
+	//
+	// THE OWNER'S ASK, VERBATIM: "Make a connected controller work on the main menu and character
+	// select menus."
+	//
+	// D31-PAD made the pause/settings overlay pad-navigable and left this screen out, and its report
+	// says so in as many words: "the title screen is not pad-navigable ... a pad-only player can
+	// pause, use every settings page and quit, but needs a keyboard or mouse to start a match".
+	// A pad that reaches the settings page and nothing else is worse than a pad that does nothing,
+	// because it looks like it works.
+	//
+	// *** POLLED, NOT BOUND, AND THE KEYBOARD IS STILL BOUND. ***
+	// The arrows, W/A/S/D, Enter, Escape and the mouse arrive through
+	// ATraceMenuPlayerController::SetupInputComponent and are ENTIRELY UNTOUCHED by this tranche —
+	// that file is not in its ownership line, and every entry point they call (MoveSelection,
+	// AdjustSelection, ActivateSelection, CancelPressed) is the same function the pad calls. Two
+	// devices, one set of verbs; nothing had to be duplicated and nothing about the keyboard changed.
+	//
+	// Polling is also the only shape that can express a HELD direction: BindKey delivers one
+	// IE_Pressed edge per physical press and the OS repeats KEYS, not D-pads, so a bound pad would
+	// move the highlight exactly once however long it was held. See TracePadMenu in
+	// Settings/TraceGamepadInput.h for the button table and the repeat clock, which are shared with
+	// the other two screens rather than restated here.
+
+	/**
+	 * Reads the pad once per DrawHUD and routes it to the same verbs the keyboard uses.
+	 *
+	 * A no-op while the settings overlay is up: FTraceOptionsMenu polls the pad itself (D31-PAD), and
+	 * a second reader would move the title selection underneath the panel — the same trap
+	 * MoveSelection's own IsOpen() guard exists for, arriving from the other side.
+	 */
+	void PollPadInput();
+
+	/**
+	 * The title rows: D-pad/stick move and adjust, A activates, B is Escape.
+	 *
+	 * The three button edges are computed ONCE by the caller and handed down rather than re-read here,
+	 * because they are remembered edges (see bPadConfirmWasDown) and a reader that sampled them twice
+	 * in one frame would consume the first sample's edge and see nothing on the second.
+	 */
+	void PollPadTitle(APlayerController* PC, bool bConfirm, bool bBack);
+
+	/** The JOIN address prompt: A connects, B cancels, X pastes. See the .cpp for why not more. */
+	void PollPadJoinPrompt(bool bConfirm, bool bBack, bool bAlt);
+
+	/**
+	 * True when the footer and the JOIN panel should print pad captions.
+	 *
+	 * Gated on a pad having been SEEN, never on one being usable: a keyboard-only player is not told
+	 * about buttons they do not have, and the caption appears the moment a controller is touched.
+	 * Input itself is never gated this way — the first press has to work.
+	 */
+	bool ShouldShowPadHints() const;
+
+	/** Previous frame's pad direction and the time the next repeat is due, per axis. */
+	int32 PadNavY = 0;
+	int32 PadNavX = 0;
+	float PadNextNavTime = 0.f;
+	float PadNextAdjustTime = 0.f;
+
+	/**
+	 * Previous poll's down-state for the three face buttons — TracePadMenu::RisingEdge's memory.
+	 *
+	 * *** THE TITLE SCREEN NEEDS A TRUE EDGE AND THE OTHER SCREENS DO NOT. *** Measured: one physical
+	 * A was reported as "just pressed" on two consecutive frames on the frame a ClientTravel began
+	 * (frames 93 and 94 of the 2026-09-06 title run — the full argument is on
+	 * TracePadMenu::ConfirmPressed). On this screen the second report is not harmless: A on the JOIN
+	 * row opens the address prompt, and the next frame's A would be read BY THAT PROMPT as "connect",
+	 * submitting a field the player has not looked at yet. A remembered down-state cannot do that.
+	 *
+	 * ONE SET FOR BOTH POLLERS, not one per screen state, and that is the point: the bool that
+	 * suppresses the second read has to survive the switch from the title rows to the prompt, which is
+	 * exactly the frame the problem happens on.
+	 */
+	bool bPadConfirmWasDown = false;
+	bool bPadBackWasDown = false;
+	bool bPadAltWasDown = false;
+
 
 private:
 	ETraceMenuRow Selected = ETraceMenuRow::Play;

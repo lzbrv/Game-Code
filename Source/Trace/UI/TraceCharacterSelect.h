@@ -22,6 +22,16 @@
 // Nothing here changed in that pass; it draws and behaves exactly as it did.
 //
 // ---------------------------------------------------------------------------------------------
+// D32-PADMENU — A CONTROLLER DRIVES THIS SCREEN
+// ---------------------------------------------------------------------------------------------
+// The D-pad and the left stick walk the grid, A locks a card in. The buttons come from TracePadMenu
+// (Settings/TraceGamepadInput.h) so that four screens cannot disagree about what A means; the repeat
+// clock stays this screen's own, shared with its arrow keys, so a thumb and a finger walk the grid at
+// the same speed. B IS DELIBERATELY UNMAPPED HERE — the team screen this one follows is refused by
+// the server while a character pick is open, so a B that asked for it would be a button that visibly
+// does nothing. See the note above the commit branch in PollInput.
+//
+// ---------------------------------------------------------------------------------------------
 // WHAT THIS CLASS IS NOT ALLOWED TO DECIDE
 // ---------------------------------------------------------------------------------------------
 // It does not decide whether a character is available. It cannot: two clients cannot see each other,

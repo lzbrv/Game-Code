@@ -10,6 +10,8 @@
 #include "TimerManager.h"                        // the repeating report
 #include "InputCoreTypes.h"
 
+#include "Settings/TraceGamepadInput.h"   // D32-PADMENU — TracePadMenu, the shared pad vocabulary
+
 #include "Core/TraceGameMode.h"          // IsTeamSwitchAllowed — the ONE copy of the balance rule
 #include "Core/TracePlayerController.h"  // the session, and every request RPC
 #include "Core/TracePlayerState.h"
@@ -89,6 +91,15 @@ namespace TraceTeamSelectLayout
 
 	constexpr float VerdictY    = 812.f;
 	constexpr float FooterY     = 900.f;
+
+	/**
+	 * D32-PADMENU — the pad legend's baseline, below the keyboard's.
+	 *
+	 * 28 rather than the 24 the body face would need on its own: the two lines are the same size and
+	 * a gap equal to the leading reads as one wrapped paragraph rather than as two legends for two
+	 * devices.
+	 */
+	constexpr float PadFooterGap = 28.f;
 
 	constexpr float SizeDisplay = 46.f;
 	constexpr float SizeLead    = 22.f;
@@ -271,6 +282,24 @@ bool FTraceTeamSelect::PollOpenHotkey(ATracePlayerController* PC)
 	// names it literally: "Players can hit H". Adding a rebindable action for it means touching the
 	// input asset generator, the keybind page and the settings file format, which is a bigger change
 	// than the feature. It is in the report as a known limitation.
+	// *** D32-PADMENU — THERE IS NO PAD BUTTON HERE, AND THAT IS MEASURED RATHER THAN OVERLOOKED. ***
+	//
+	// This poll runs during GAMEPLAY, on every frame both screens are closed, so anything it read
+	// would have to be a button no gameplay verb is using. The shipped pad layout uses all sixteen a
+	// standard controller has — A B X Y, four D-pad, two shoulders, two triggers, two stick clicks,
+	// VIEW for the scoreboard — and the sixteenth, MENU/START, is the pause key (see
+	// UTraceGamepadInputSubsystem::TickMenuButton). `Trace.Pad.Verify` asserts that count from the
+	// live table, so it is a fact about the build and not a claim in a comment.
+	//
+	// A chord or a long-press was the alternative and was refused: every one of those buttons does
+	// something the instant it is touched in a match, and "hold LB for half a second" would fire PULL
+	// CORE first. So mid-match REOPENING of this screen is keyboard-only, and it is written up as a
+	// known limitation with the two fixes that would remove it — a row on the pause menu, or a
+	// gameplay verb giving a button back.
+	//
+	// NOTHING A PAD PLAYER NEEDS IS BEHIND THIS. The join flow OPENS this screen by itself
+	// (ATracePlayerController::bTeamSelectOpen, replicated), and once it is up a pad drives all of it,
+	// including X to reach the character screen. This is the convenience path, not the only one.
 	if (!PC->WasInputKeyJustPressed(EKeys::H))
 	{
 		return false;
@@ -370,10 +399,26 @@ void FTraceTeamSelect::Tick(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 void FTraceTeamSelect::PollInput(ATracePlayerController* PC, ATracePlayerState* LocalState)
 {
 	// ---- H closes it again. The key that opens a screen should close it. ------------------------
-	if (PC->WasInputKeyJustPressed(EKeys::H))
+	//
+	// D32-PADMENU — and B, because that is what BACK means on every other screen in this build (see
+	// TracePadMenu in Settings/TraceGamepadInput.h). It is the whole reason this screen is not a trap
+	// for a pad: without it a player who opened team select — or who was PUT here by the join flow,
+	// which is the common case since D31 — could highlight a plate and never leave.
+	//
+	// MENU/START gets out too, by a different door: the subsystem turns it into an Escape, ATraceHUD
+	// opens the pause menu on that, and this screen keeps drawing underneath with bInputAllowed
+	// false. That is a pause, not a close, and B is the one that actually dismisses the screen.
 	{
-		PC->ServerRequestCloseTeamSelect();
-		return;
+		const bool bPadBack = TracePadMenu::BackPressed(PC);
+		if (PC->WasInputKeyJustPressed(EKeys::H) || bPadBack)
+		{
+			if (bPadBack)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[TeamSelect] Pad B -> close."));
+			}
+			PC->ServerRequestCloseTeamSelect();
+			return;
+		}
 	}
 
 	// ---- C — D31-TEAMS (b), the mid-match character switch --------------------------------------
@@ -382,10 +427,23 @@ void FTraceTeamSelect::PollInput(ATracePlayerController* PC, ATracePlayerState* 
 	// choice: one hotkey (H) opens one menu that carries both of the changes a player can make to
 	// themselves mid-match. A second free-floating key would be a second thing to discover and a
 	// second thing to press by accident with a Core in hand.
-	if (PC->WasInputKeyJustPressed(EKeys::C))
+	//
+	// D32-PADMENU — X is the pad's C. It is TracePadMenu's "second verb" slot, which exists for
+	// exactly this: a screen whose whole job is two choices, where A must stay CONFIRM and B must
+	// stay BACK. Y is deliberately left alone — the options overlay spends it on UNBIND, and a
+	// button that means "delete a binding" on one screen and "change your character" on the next is
+	// the kind of overload this tranche exists to avoid.
 	{
-		PC->ServerRequestCharacterSwitch();
-		return;
+		const bool bPadAlt = TracePadMenu::AltPressed(PC);
+		if (PC->WasInputKeyJustPressed(EKeys::C) || bPadAlt)
+		{
+			if (bPadAlt)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[TeamSelect] Pad X -> change character."));
+			}
+			PC->ServerRequestCharacterSwitch();
+			return;
+		}
 	}
 
 	// ---- Direct number keys. One key per plate — no walking required. ---------------------------
@@ -403,10 +461,17 @@ void FTraceTeamSelect::PollInput(ATracePlayerController* PC, ATracePlayerState* 
 	}
 
 	// ---- Left / right, with repeat --------------------------------------------------------------
+	//
+	// D32-PADMENU — the D-pad and the left stick fold into the SAME direction and the SAME repeat
+	// clock as the arrow keys, rather than getting one of their own. Two clocks would have meant this
+	// screen scrolling at one speed under a thumb and another under a finger, and a player holding
+	// both would have stepped twice per repeat.
 	const bool bLeft  = PC->IsInputKeyDown(EKeys::Left)  || PC->IsInputKeyDown(EKeys::A);
 	const bool bRight = PC->IsInputKeyDown(EKeys::Right) || PC->IsInputKeyDown(EKeys::D);
 
-	const int32 NavDir = (bRight ? 1 : 0) - (bLeft ? 1 : 0);
+	const int32 PadDir = TracePadMenu::NavX(PC);
+	const int32 NavDir = FMath::Clamp((bRight ? 1 : 0) - (bLeft ? 1 : 0) + PadDir, -1, 1);
+	const int32 HighlightBefore = Highlighted;
 	if (NavDir != 0)
 	{
 		if (NavDir != LastNavDir)
@@ -426,19 +491,62 @@ void FTraceTeamSelect::PollInput(ATracePlayerController* PC, ATracePlayerState* 
 		LastNavDir = 0;
 	}
 
-	// ---- Commit ---------------------------------------------------------------------------------
-	if (PC->WasInputKeyJustPressed(EKeys::Enter) || PC->WasInputKeyJustPressed(EKeys::SpaceBar))
+	// D32-PADMENU — a line per PAD-driven move, and only for a pad-driven one.
+	//
+	// This screen is a highlight and two plates; nothing else it does is visible in a log, so without
+	// this there is no way to tell a stick that moved the highlight from a stick that did nothing —
+	// the difference is one outlined rectangle in a screenshot. It is also the first thing to read
+	// when a player says "my controller does not move the selection".
+	//
+	// GATED ON THE PAD HAVING CONTRIBUTED, not on the highlight having moved, so the keyboard's own
+	// arrow keys log exactly what they logged before this tranche: nothing. And gated on the highlight
+	// actually CHANGING as well, because the clamp means a held direction at either end calls this
+	// every repeat while the screen stands still.
+	if (PadDir != 0 && Highlighted != HighlightBefore)
 	{
-		Confirm(PC, LocalState);
-		return;
+		UE_LOG(LogTraceGame, Display, TEXT("[TeamSelect] Pad %s -> %s."),
+			(PadDir > 0) ? TEXT("RIGHT") : TEXT("LEFT"),
+			*TraceTeamName(TeamForRow(Highlighted)).ToString());
+	}
+
+	// ---- Commit ---------------------------------------------------------------------------------
+	//
+	// D32-PADMENU — A, through the SAME Confirm the keyboard and the mouse call, so the screen's own
+	// belief test and its request cooldown apply to a pad exactly as they do to a key.
+	{
+		const bool bPadConfirm = TracePadMenu::ConfirmPressed(PC);
+		if (PC->WasInputKeyJustPressed(EKeys::Enter) || PC->WasInputKeyJustPressed(EKeys::SpaceBar)
+			|| bPadConfirm)
+		{
+			if (bPadConfirm)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[TeamSelect] Pad A -> confirm %s."),
+					*TraceTeamName(TeamForRow(Highlighted)).ToString());
+			}
+			Confirm(PC, LocalState);
+			return;
+		}
 	}
 
 	// ---- Mouse ----------------------------------------------------------------------------------
 	float MouseX = 0.f;
 	float MouseY = 0.f;
+
+	// Measured before CursorPos is overwritten — the hover guard below compares against the PREVIOUS
+	// frame's position.
+	bool bCursorMoved = false;
 	if (PC->GetMousePosition(MouseX, MouseY))
 	{
-		CursorPos = FVector2D(MouseX, MouseY);
+		const FVector2D NewPos(MouseX, MouseY);
+
+		// THE FIRST SAMPLE IS NOT A MOVE. bHasCursor is false for the frames before the screen has
+		// ever read a pointer position, and counting that first read as movement would hand the
+		// highlight to whatever the pointer happens to be resting over at the instant the screen
+		// opens — which is exactly the opening choice this screen works to get right (the first
+		// plate no team-mate is believed to hold). Measured: without this the end-to-end run opened
+		// on card 3 instead of card 1, because the pointer was parked there from the title screen.
+		bCursorMoved = bHasCursor && FVector2D::DistSquared(NewPos, CursorPos) > 4.f;   // 2 px
+		CursorPos = NewPos;
 		bHasCursor = true;
 	}
 
@@ -457,15 +565,26 @@ void FTraceTeamSelect::PollInput(ATracePlayerController* PC, ATracePlayerState* 
 		if (RowRects[Row].bIsValid && RowRects[Row].IsInside(CursorPos))
 		{
 			HoveredRow = Row;
-			Highlighted = Row;
 			break;
 		}
+	}
+
+	// *** THE POINTER HAS TO HAVE MOVED BEFORE IT MAY TAKE THE HIGHLIGHT. ***
+	// The same guard, for the same measured reason, as the character select's — read the long note
+	// there. Two plates fill most of this screen, so a resting pointer is MORE likely to be over one
+	// here than over a card there, and the effect was the same: nothing else could move the highlight.
+	if (HoveredRow != INDEX_NONE && bCursorMoved)
+	{
+		Highlighted = HoveredRow;
 	}
 
 	// ONE PRESS = ONE ACTION (spec v15 §4). The action fires on RELEASE inside the plate the press
 	// began over, which is the convention the rest of the menus use.
 	if (bJustReleased && HoveredRow != INDEX_NONE)
 	{
+		// A click takes the plate it lands on whether or not the pointer moved first. See the note in
+		// the character select's twin of this line.
+		Highlighted = HoveredRow;
 		Confirm(PC, LocalState);
 	}
 }
@@ -620,10 +739,60 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 	}
 
 	// ---- Footer ---------------------------------------------------------------------------------
-	TraceTeamSelectFile::Text(HUD,
-		FString::Printf(TEXT("1 / 2 OR ARROWS + ENTER   SELECT TEAM        C   CHANGE CHARACTER        %s   CLOSE"),
-			OpenKeyName()),
-		InkSoft, CenterX, FooterY * S, SizeBody * S, TrackLabel * S, TraceText::EHAlign::Center);
+	//
+	// D32-PADMENU — ONE line, not two, and the pad's half only appears once a controller has been
+	// seen on this machine (UTraceGamepadInputSubsystem::HasSeenGamepadInput). A keyboard-only player
+	// reads exactly what they read before this tranche; a player holding a pad is told the three
+	// buttons that do something here and nothing else. The hint is gated, the INPUT never is — the
+	// first button a player presses has to work, and it cannot if the screen is waiting to have seen
+	// one.
+	{
+		const FString KeyboardLine = FString::Printf(
+			TEXT("1 / 2 OR ARROWS + ENTER   SELECT TEAM        C   CHANGE CHARACTER        %s   CLOSE"),
+			OpenKeyName());
+
+		// A SECOND LINE, NOT A LONGER ONE. The keyboard line is already 95 characters and fills a
+		// 1280-wide window at this point size; appending the pad's three buttons to it would have run
+		// off both edges, and the shrink-to-fit below would then have answered by making the whole
+		// legend too small to read. The reference layout is 1080 high and this line sits at 900, so
+		// there is room under it — measured, not assumed: FooterY + PadFooterGap is 928 of 1080.
+		const bool bPadLine = TracePadMenu::HasSeenPad(PC);
+		const FString PadLine = TEXT("A   SELECT TEAM        X   CHANGE CHARACTER        B   CLOSE");
+
+		// ---- FIT, and it turned out to be needed for a line that predates this tranche -----------
+		//
+		// PHOTOGRAPHED, not assumed: at 800x600 the KEYBOARD line above already ran off BOTH edges of
+		// the screen — it is typeset against a 1920-wide reference and UIScale only follows the
+		// HEIGHT, so a 4:3 window gets full-size type in two thirds of the width. The pad line is
+		// shorter and fitted anyway; both are measured together and given the SAME scale, because two
+		// legends for two devices set at two sizes would read as a mistake.
+		//
+		// The 0.70 floor is the same trade UI plan WP5 made on the JOIN panel: below it the type is
+		// unreadable and clipping is the better failure. Nothing changes at 16:9, where both lines
+		// already fit at 1.0 — verified at 1280x720.
+		const float FooterRoom = ViewW - 2.f * Margin * S;
+		float FooterScale = 1.f;
+		{
+			float Widest = TraceTeamSelectFile::Width(KeyboardLine, SizeBody * S, TrackLabel * S);
+			if (bPadLine)
+			{
+				Widest = FMath::Max(Widest, TraceTeamSelectFile::Width(PadLine, SizeBody * S, TrackLabel * S));
+			}
+			if (Widest > FooterRoom && Widest > 1.f)
+			{
+				FooterScale = FMath::Max(0.70f, FooterRoom / Widest);
+			}
+		}
+
+		TraceTeamSelectFile::Text(HUD, KeyboardLine, InkSoft, CenterX, FooterY * S,
+			SizeBody * S * FooterScale, TrackLabel * S * FooterScale, TraceText::EHAlign::Center);
+
+		if (bPadLine)
+		{
+			TraceTeamSelectFile::Text(HUD, PadLine, Ink, CenterX, (FooterY + PadFooterGap) * S,
+				SizeBody * S * FooterScale, TrackLabel * S * FooterScale, TraceText::EHAlign::Center);
+		}
+	}
 
 	DrawCursor(HUD);
 }

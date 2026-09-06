@@ -21,6 +21,7 @@
 #include "Misc/CoreMiscDefines.h"       // FInputDeviceId
 
 #include "Core/TracePlayerController.h"   // D31-TEAMS — the team-select session lives on it
+#include "Settings/TraceGamepadInput.h"   // D32-PADMENU — TracePadMenu, the shared pad vocabulary
 #include "Core/TracePlayerState.h"
 #include "Trace.h"                      // LogTraceGame
 #include "TraceTypes.h"                 // TraceTeamColor / TraceTeamName
@@ -2066,14 +2067,24 @@ void FTraceCharacterSelect::PollInput(APlayerController* PC, ATracePlayerState* 
 	const bool bNavUp   = PC->IsInputKeyDown(EKeys::Up)   || PC->IsInputKeyDown(EKeys::W);
 	const bool bNavDown = PC->IsInputKeyDown(EKeys::Down) || PC->IsInputKeyDown(EKeys::S);
 
+	// D32-PADMENU — the D-pad and the left stick's digital keys fold into the SAME two directions and
+	// the SAME repeat clock as the arrow keys, rather than getting a second set of their own. Two
+	// clocks would have meant the grid walking at one speed under a thumb and another under a finger,
+	// and a player resting a hand on both would have stepped twice per repeat. The button table is
+	// TracePadMenu's (Settings/TraceGamepadInput.h); the timing stays this screen's, so the pad feels
+	// like the keyboard HERE rather than like the title screen somewhere else.
+	const int32 PadX = TracePadMenu::NavX(PC);
+	const int32 PadY = TracePadMenu::NavY(PC);
+
 	// One repeat clock for both axes, and horizontal wins a diagonal. Two independent clocks would
 	// let a player holding right-and-down travel twice as fast as one holding either.
-	int32 NavDir = (bRight ? 1 : 0) - (bLeft ? 1 : 0);
+	int32 NavDir = FMath::Clamp((bRight ? 1 : 0) - (bLeft ? 1 : 0) + PadX, -1, 1);
 	if (NavDir == 0)
 	{
-		NavDir = ((bNavDown ? 1 : 0) - (bNavUp ? 1 : 0)) * TraceSelectGrid::Columns;
+		NavDir = FMath::Clamp((bNavDown ? 1 : 0) - (bNavUp ? 1 : 0) + PadY, -1, 1) * TraceSelectGrid::Columns;
 	}
 
+	const int32 HighlightBefore = Highlighted;
 	if (NavDir != 0)
 	{
 		if (NavDir != LastNavDir)
@@ -2093,19 +2104,70 @@ void FTraceCharacterSelect::PollInput(APlayerController* PC, ATracePlayerState* 
 		LastNavDir = 0;
 	}
 
-	// ---- Commit ---------------------------------------------------------------------------------
-	if (PC->WasInputKeyJustPressed(EKeys::Enter) || PC->WasInputKeyJustPressed(EKeys::SpaceBar))
+	// D32-PADMENU — a line per PAD-driven move, and only for a pad-driven one.
+	//
+	// The highlight is a rectangle in a screenshot and nothing else; this is what lets a headless run
+	// show that a D-pad press moved it, and what a player who reports "my stick does nothing on the
+	// character screen" produces in a log. GATED ON THE PAD HAVING CONTRIBUTED, so the arrow keys log
+	// exactly what they logged before this tranche — nothing — and gated on the highlight ACTUALLY
+	// changing, because MoveHighlight clamps and a held direction at the end of the grid would
+	// otherwise print a line per repeat while the screen stands still.
+	if ((PadX != 0 || PadY != 0) && Highlighted != HighlightBefore
+		&& TraceCharacterRoster::All().IsValidIndex(Highlighted))
 	{
-		ConfirmHighlighted(LocalState);
-		return;
+		UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Pad %s -> %s (card %d of %d)."),
+			(PadX > 0) ? TEXT("RIGHT") : (PadX < 0) ? TEXT("LEFT") : (PadY > 0) ? TEXT("DOWN") : TEXT("UP"),
+			*TraceCharacterRoster::NameFor(TraceCharacterRoster::All()[Highlighted].Id),
+			Highlighted + 1, TraceCharacterRoster::Count);
+	}
+
+	// ---- Commit ---------------------------------------------------------------------------------
+	//
+	// D32-PADMENU — A, through the SAME ConfirmHighlighted a key and a click reach, so the pending
+	// request latch, the believed-taken refusal and the server round trip all apply to a pad exactly
+	// as they do to a keyboard. A pad that called ServerRequestCharacter itself would have been a
+	// second way to pick with a different set of guards.
+	//
+	// *** B IS DELIBERATELY UNMAPPED ON THIS SCREEN, AND THAT IS THE HONEST ANSWER. ***
+	// There is nothing to go back TO. The team screen that ran before this one is refused by the
+	// server while a character pick is open (ATracePlayerController::ServerRequestOpenTeamSelect
+	// checks exactly that), so a B that asked for it would be a button the player presses and watches
+	// do nothing — which is worse than a button that is documented as doing nothing. The way out of
+	// this screen is to pick, or to let the auto-pick clock in the header run down; MENU/START still
+	// opens the pause menu over the top, and B backs out of THAT.
+	{
+		const bool bPadConfirm = TracePadMenu::ConfirmPressed(PC);
+		if (PC->WasInputKeyJustPressed(EKeys::Enter) || PC->WasInputKeyJustPressed(EKeys::SpaceBar)
+			|| bPadConfirm)
+		{
+			if (bPadConfirm)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[CharSelect] Pad A -> lock in card %d."), Highlighted + 1);
+			}
+			ConfirmHighlighted(LocalState);
+			return;
+		}
 	}
 
 	// ---- Mouse ----------------------------------------------------------------------------------
 	float MouseX = 0.f;
 	float MouseY = 0.f;
+
+	// *** MEASURED BEFORE CursorPos IS OVERWRITTEN. *** See the hover guard below; the whole point is
+	// the comparison against the PREVIOUS frame's position.
+	bool bCursorMoved = false;
 	if (PC->GetMousePosition(MouseX, MouseY))
 	{
-		CursorPos = FVector2D(MouseX, MouseY);
+		const FVector2D NewPos(MouseX, MouseY);
+
+		// THE FIRST SAMPLE IS NOT A MOVE. bHasCursor is false for the frames before the screen has
+		// ever read a pointer position, and counting that first read as movement would hand the
+		// highlight to whatever the pointer happens to be resting over at the instant the screen
+		// opens — which is exactly the opening choice this screen works to get right (the first
+		// card no team-mate is believed to hold). Measured: without this the end-to-end run opened
+		// on card 3 instead of card 1, because the pointer was parked there from the title screen.
+		bCursorMoved = bHasCursor && FVector2D::DistSquared(NewPos, CursorPos) > 4.f;   // 2 px
+		CursorPos = NewPos;
 		bHasCursor = true;
 	}
 
@@ -2124,9 +2186,32 @@ void FTraceCharacterSelect::PollInput(APlayerController* PC, ATracePlayerState* 
 		if (CardRects[Index].bIsValid && CardRects[Index].IsInside(CursorPos))
 		{
 			HoveredCard = Index;
-			Highlighted = Index;
 			break;
 		}
+	}
+
+	// *** THE POINTER HAS TO HAVE MOVED BEFORE IT MAY TAKE THE HIGHLIGHT. ***
+	//
+	// D32-PADMENU found this with a screenshot and a log, and it is a defect that predates the pad:
+	// this used to assign Highlighted = HoveredCard on EVERY frame the pointer was inside a card, so
+	// a pointer left resting anywhere over the grid pinned the highlight there and NOTHING ELSE COULD
+	// MOVE IT — not a controller, and not the arrow keys either. The end-to-end run of 2026-09-06
+	// printed the whole thing in three lines: "Pad RIGHT -> OYSTER (card 4)", "Pad LEFT -> CHUT
+	// (card 2)", and then "lock in card 3", because the mouse put it back on card 3 in between.
+	//
+	// The title screen has had exactly this guard since spec v15 and states the reason in the same
+	// words — "without the movement test a cursor parked over QUIT would silently override every
+	// keyboard press". This screen simply never got it. The owner's case makes it urgent rather than
+	// theoretical: the brief for the controller work is a pad used *in addition to* a mouse or a
+	// trackpad, which is precisely a machine where a pointer is resting somewhere on the screen.
+	//
+	// 2 px, and per frame rather than latched: a stationary pointer reports the same coordinates
+	// exactly, and the moment the player nudges it the hover takes the highlight back — which is the
+	// behaviour a mouse should have. HoveredCard itself is still recomputed every frame, because the
+	// click path below and the release-inside-the-card rule depend on it.
+	if (HoveredCard != INDEX_NONE && bCursorMoved)
+	{
+		Highlighted = HoveredCard;
 	}
 
 	// ACTIVATION ON RELEASE, matching the options overlay: a press that started on one card and
@@ -2134,6 +2219,10 @@ void FTraceCharacterSelect::PollInput(APlayerController* PC, ATracePlayerState* 
 	// the whole match.
 	if (bJustReleased && HoveredCard != INDEX_NONE)
 	{
+		// A CLICK SELECTS WHAT IT LANDS ON whether or not the pointer moved first — a player who
+		// clicks a card without nudging the mouse must still get that card and not whatever the pad
+		// was last on. This is the one place the movement guard above must not apply.
+		Highlighted = HoveredCard;
 		ConfirmHighlighted(LocalState);
 	}
 }
@@ -3091,6 +3180,23 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 		}
 		Controls.Add({ TEXT("ARROWS"), TEXT("MOVE") });
 		Controls.Add({ TEXT("ENTER"), TEXT("LOCK IN") });
+
+		// D32-PADMENU — the pad's two chips, and ONLY once a controller has been seen on this machine
+		// (UTraceGamepadInputSubsystem::HasSeenGamepadInput). A keyboard-only player reads exactly the
+		// row they read before this tranche. The hint is gated; the INPUT above never is.
+		//
+		// AHEAD of CLICK deliberately: this row can outgrow a narrow window, and the degradation below
+		// drops from the END, so whatever is least necessary has to be last. That is CLICK — a mouse
+		// announces itself the moment it is moved, and a pad does not.
+		// HUD, not a controller, as the world context: Draw() is not handed one, and any UObject in
+		// the world resolves the game instance the subsystem lives on.
+		const bool bPadHints = TracePadMenu::HasSeenPad(HUD);
+		if (bPadHints)
+		{
+			Controls.Add({ TEXT("D-PAD"), TEXT("MOVE") });
+			Controls.Add({ TEXT("A"), TEXT("LOCK IN") });
+		}
+
 		Controls.Add({ TEXT("CLICK"), TEXT("A CARD") });
 
 		const float CapH = 30.f * S;
@@ -3099,27 +3205,49 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 
 		// Measured first, then drawn, because a centred row of variable-width chips cannot be laid out
 		// left to right without knowing the total.
-		float TotalWidth = 0.f;
-		for (int32 Index = 0; Index < Controls.Num(); ++Index)
+		auto MeasureRow = [&]() -> float
 		{
-			const float CapW = FMath::Max(CapH,
-				TraceCharacterSelectType::Width(HUD, Controls[Index].Cap, nullptr, TraceSelectLayout::SizeLabel * S, 1.4f * S)
-				+ CapH * 0.90f);
-			TotalWidth += CapW;
-
-			if (!Controls[Index].Label.IsEmpty())
+			float Width = 0.f;
+			for (int32 Index = 0; Index < Controls.Num(); ++Index)
 			{
-				TotalWidth += CapGap + TraceCharacterSelectType::Width(HUD, Controls[Index].Label,
-					nullptr, TraceSelectLayout::SizeLabel * S, TraceSelectLayout::TrackLabel * S);
-				if (Index + 1 < Controls.Num())
+				const float CapW = FMath::Max(CapH,
+					TraceCharacterSelectType::Width(HUD, Controls[Index].Cap, nullptr, TraceSelectLayout::SizeLabel * S, 1.4f * S)
+					+ CapH * 0.90f);
+				Width += CapW;
+
+				if (!Controls[Index].Label.IsEmpty())
 				{
-					TotalWidth += GroupGap;
+					Width += CapGap + TraceCharacterSelectType::Width(HUD, Controls[Index].Label,
+						nullptr, TraceSelectLayout::SizeLabel * S, TraceSelectLayout::TrackLabel * S);
+					if (Index + 1 < Controls.Num())
+					{
+						Width += GroupGap;
+					}
+				}
+				else
+				{
+					Width += CapGap;
 				}
 			}
-			else
-			{
-				TotalWidth += CapGap;
-			}
+			return Width;
+		};
+
+		float TotalWidth = MeasureRow();
+
+		// ---- The fit, and what it gives up first ----------------------------------------------------
+		//
+		// FITTED RATHER THAN ASSUMED, because two more chips is exactly the change that quietly runs a
+		// centred row off both edges — the same defect UI plan WP5 photographed on the JOIN panel's
+		// hint line. It cannot shrink: DrawChip's cap height and the label size are the screen's type
+		// ramp, and a footer typeset smaller than SizeLabel is a footer nobody reads. So it drops a
+		// GROUP instead, from the end, one at a time, and it can never drop past the third — CHOOSE,
+		// MOVE and LOCK IN are the row's whole content and a screen that printed none of them would be
+		// worse than one that overflowed.
+		const float FooterRoom = ViewW - (2.f * TraceSelectLayout::Margin * S);
+		while (TotalWidth > FooterRoom && Controls.Num() > 3)
+		{
+			Controls.Pop();
+			TotalWidth = MeasureRow();
 		}
 
 		// LabelH is the header's, and it is deliberately reused rather than re-declared: the footer's

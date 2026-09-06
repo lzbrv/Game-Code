@@ -22,7 +22,9 @@
 #include "Misc/ConfigCacheIni.h"      // GConfig — the WP8.2 version string reads ProjectVersion once
 #include "Misc/CoreMiscDefines.h"     // FInputDeviceId
 #include "Misc/Parse.h"
+#include "HAL/PlatformApplicationMisc.h"   // D32-PADMENU — X pastes into the JOIN field
 #include "HAL/PlatformTime.h"
+#include "Settings/TraceGamepadInput.h"   // D32-PADMENU — TracePadMenu, the shared pad vocabulary
 #include "Settings/TraceUserSettings.h"
 #include "TextureResource.h"          // WP9 — the RHI-readiness guard on the Canvas title's sprites
 #include "TimerManager.h"
@@ -597,7 +599,17 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 	// on existing in the asset whatever it says; and TraceText::Measure reports ONE line box for an
 	// empty string (SplitLines yields a single empty line), so the footer stack keeps its height and
 	// the hint below does not move up onto the blurb. The Canvas twin is ATraceMenuHUD::DrawFooter.
-	OutView.FooterKeys = FString();
+	//
+	// D32-PADMENU FILLS IT AGAIN, BUT ONLY FOR A PAD, AND THAT IS NOT THE DELETED LINE COMING BACK.
+	// What the owner asked to be rid of was a static keyboard legend telling every player, forever,
+	// what W and S do. This appears only once a controller has actually been touched on this machine
+	// (ShouldShowPadHints -> UTraceGamepadInputSubsystem::HasSeenGamepadInput), says only what a pad
+	// cannot discover by pressing something, and vanishes again on a keyboard-only machine. The slot
+	// it uses is the one the deletion deliberately left in the asset — see the paragraph above — so
+	// no layout moves and the Canvas twin (DrawFooter) prints the same string in the same place.
+	OutView.FooterKeys = ShouldShowPadHints()
+		? FString(TEXT("D-PAD   MOVE          A   SELECT          B   BACK"))
+		: FString();
 
 	// WP8.1 — the address prints in TWO places (the chip above, and the JOIN modal's "THIS MACHINE
 	// IS"), not five. This hint used to end "... AND TYPE YOUR ADDRESS ABOVE", which was repetition
@@ -894,13 +906,23 @@ namespace
 	{
 		static const TArray<FAutoSettingsKey> Script =
 		{
-			// FOUR Downs, not one: CALL SIGN -> VIDEO SETTINGS -> CROSSHAIR -> AUDIO -> CHARACTERS.
-			// See the walk in the block comment above; the count is the number of SELECTABLE rows
-			// between the page's opening selection and this one, and it is the only step in this list
-			// that the release UI plan moved.
+			// FIVE Downs: CALL SIGN -> VIDEO SETTINGS -> CROSSHAIR -> AUDIO -> CONTROLLER SETTINGS ->
+			// CHARACTERS. The count is the number of SELECTABLE rows between the page's opening
+			// selection and this one.
+			//
+			// *** IT WAS FOUR, AND FOUR HAD SILENTLY STOPPED WORKING. *** D31-PAD added the
+			// CONTROLLER SETTINGS door to this page (FTraceOptionsMenu::BuildRows, EPage::Settings)
+			// and did not move this number, so every step after it walked one row early: the four
+			// "sensitivity +" presses landed on the CHARACTERS toggle, the invert-Y red arm landed on
+			// VERTICAL SENSITIVITY and did nothing, and the rebind capture was armed on INVERT MOUSE Y
+			// instead. The run still printed a DONE line full of numbers, and the numbers were the
+			// UNTOUCHED DEFAULTS — sensitivity 1.50 is UTraceUserSettings::DefaultSensitivity, not
+			// four steps of anything. Nothing read that line, so nothing complained for a whole demo.
+			// The verdict below is the fix for THAT, and this count is the fix for the walk.
 			{ []{ return EKeys::Down;  }, TEXT("-> video settings (from call sign)") },
 			{ []{ return EKeys::Down;  }, TEXT("-> crosshair") },
 			{ []{ return EKeys::Down;  }, TEXT("-> audio") },
+			{ []{ return EKeys::Down;  }, TEXT("-> controller settings (D31-PAD added this door)") },
 			{ []{ return EKeys::Down;  }, TEXT("-> characters (spec v14 3)") },
 
 			// LEFT/RIGHT rather than ENTER. This is now belt-and-braces: ActivateSelected on a
@@ -1163,17 +1185,54 @@ void ATraceMenuHUD::AutoSettingsStep()
 
 	if (!Script.IsValidIndex(AutoSettingsIndex))
 	{
-		// Report the end state at Display. This line IS the test result: if it does not read
-		// sensitivity=1.20 invertY=0 moveForward=K, the settings path did not work.
+		// ---- THE VERDICT, JUDGED HERE RATHER THAN BY A READER ------------------------------------
 		//
-		// invertY=0 after TWO presses is the assertion, not a typo. One press turns it on, the
-		// second must turn it off; invertY=1 here means Enter could not undo a toggle.
+		// *** THIS USED TO PRINT NUMBERS AND LEAVE THE COMPARING TO A HUMAN, AND THAT IS WHY IT
+		// STOPPED WORKING WITHOUT ANYBODY NOTICING. *** The old comment said "if it does not read
+		// sensitivity=1.20 invertY=0 moveForward=K, the settings path did not work" — and for a
+		// whole demo it read 1.50 / 1 / W and every run was still green, because a check whose
+		// result only exists in prose is a check nothing can fail. See the row count above for what
+		// had actually broken.
+		//
+		// THREE CLAIMS, EACH ABOUT A DIFFERENT ROW KIND, so one broken row kind cannot hide behind
+		// two working ones:
+		//
+		//   SLIDER  four RIGHTs must raise MOUSE SENSITIVITY above where the snapshot found it. It
+		//           is compared against the SNAPSHOT and not against a literal, because the default
+		//           is a number somebody is entitled to change.
+		//   TOGGLE  two ENTERs on INVERT MOUSE Y must leave it exactly where it started. One press
+		//           turns it on, the second must turn it off — this is the red arm for the one-way
+		//           toggle a player reported as "the button to uninvert the mouse didn't work", and
+		//           invertY != the snapshot means it is back.
+		//   CAPTURE the rebind must actually land: MOVE FORWARD on K.
 		const UTraceUserSettings& Settings = UTraceUserSettings::Get();
+
+		const bool bSliderMoved = Settings.MouseSensitivity > SavedMouseSensitivity + UE_KINDA_SMALL_NUMBER;
+		const bool bToggleRestored = (Settings.bInvertMouseY == bSavedInvertMouseY);
+		const bool bRebindLanded = (Settings.GetKey(ETraceInputAction::MoveForward) == EKeys::K);
+		const bool bPassed = bSliderMoved && bToggleRestored && bRebindLanded;
+
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[AutoSettings] DONE. sensitivity=%.2f yScale=%.2f invertY=%d moveForward=%s dash=%s"),
-			Settings.MouseSensitivity, Settings.MouseSensitivityYScale, Settings.bInvertMouseY ? 1 : 0,
+			TEXT("[AutoSettings] DONE. sensitivity=%.2f (was %.2f) yScale=%.2f invertY=%d (was %d) ")
+			TEXT("moveForward=%s dash=%s"),
+			Settings.MouseSensitivity, SavedMouseSensitivity, Settings.MouseSensitivityYScale,
+			Settings.bInvertMouseY ? 1 : 0, bSavedInvertMouseY ? 1 : 0,
 			*UTraceUserSettings::DescribeKey(Settings.GetKey(ETraceInputAction::MoveForward)),
 			*UTraceUserSettings::DescribeKey(Settings.GetKey(ETraceInputAction::Dash)));
+
+		if (bPassed)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[AutoSettings] VERDICT: THE KEYBOARD STILL DRIVES THE SETTINGS OVERLAY. slider "
+					"moved=1, toggle returned to its start=1, rebind landed on K=1."));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[AutoSettings] VERDICT: THE KEYBOARD PATH IS BROKEN. slider moved=%d, toggle "
+					"returned to its start=%d, rebind landed on K=%d."),
+				bSliderMoved ? 1 : 0, bToggleRestored ? 1 : 0, bRebindLanded ? 1 : 0);
+		}
 
 		if (UWorld* World = GetWorld())
 		{
@@ -1260,6 +1319,38 @@ static FAutoConsoleCommandWithWorldAndArgs CmdMenuCursorAt(
 			const int32 Y = FCString::Atoi(*Args[1]);
 			PC->SetMouseLocation(X, Y);
 			UE_LOG(LogTraceGame, Display, TEXT("[Menu] Trace.Menu.CursorAt: pointer -> (%d, %d)."), X, Y);
+		}));
+
+/**
+ * D32-PADMENU — Trace.Menu.Report.
+ *
+ * The title screen's state in one line, so a synthetic pad press can be shown to have moved exactly
+ * what it claims to have moved. `Trace.Pad.Menu down down` followed by this is a measurement;
+ * a screenshot of the same thing is a picture of a highlight nobody can count.
+ *
+ * READS ONLY. It is the only command this tranche adds that touches the title screen, and it cannot
+ * change it — which is what lets it be run before AND after a press without the "after" reading
+ * being something the report itself caused.
+ */
+static FAutoConsoleCommandWithWorldAndArgs CmdMenuReport(
+	TEXT("Trace.Menu.Report"),
+	TEXT("D32-PADMENU, dev only. Prints the highlighted title row, the difficulty, which modal is up "
+		"and whether a controller has been seen. Reads only."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+		[](const TArray<FString>& Args, UWorld* World)
+		{
+			APlayerController* const PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+			const ATraceMenuHUD* const MenuHUD = (PC != nullptr) ? Cast<ATraceMenuHUD>(PC->GetHUD()) : nullptr;
+			if (MenuHUD == nullptr)
+			{
+				// NOT silence, and not an error either: run inside a match this is simply the wrong
+				// screen, and saying so is what stops the next reader assuming the command is broken.
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Menu.Report] No title-screen HUD here — this command only means anything on "
+						"the menu map."));
+				return;
+			}
+			MenuHUD->LogMenuState((Args.Num() > 0) ? *Args[0] : TEXT("report"));
 		}));
 #endif
 
@@ -1527,6 +1618,253 @@ void ATraceMenuHUD::ClickTestStep()
 // =================================================================================================
 // Input entry points
 // =================================================================================================
+
+// =================================================================================================
+// D32-PADMENU — the controller on the title screen
+//
+// See the block above the members in TraceMenuHUD.h for WHY this is polled while the keyboard next
+// to it stays bound, and TracePadMenu in Settings/TraceGamepadInput.h for the button table.
+//
+// EVERY PATH BELOW ENDS IN A FUNCTION THE KEYBOARD ALREADY CALLS. MoveSelection, AdjustSelection,
+// ActivateSelection and CancelPressed are unchanged, and so are their guards — the travel latch, the
+// activation grace window, the "an overlay is open" early-outs. That is what makes this additive
+// rather than a second, parallel menu that has to be kept in step with the first.
+// =================================================================================================
+
+#if !UE_BUILD_SHIPPING
+void ATraceMenuHUD::LogMenuState(const TCHAR* Why) const
+{
+	// The label comes from BuildRowView rather than from a second switch, so a row renamed in one
+	// place cannot be reported under its old name here.
+	FTraceMenuRowView RowView;
+	BuildRowView(Selected, true, RowView);
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Menu.Report] %s | row=%s (%d/%d) difficulty=%s | options=%d join=%d travelling=%d | ")
+		TEXT("renderer=%s | pad: enabled=%d seenOnThisMachine=%d hints=%d | joinText='%s'"),
+		Why, *RowView.Label, static_cast<int32>(Selected) + 1, static_cast<int32>(ETraceMenuRow::Count),
+		*TraceDifficulty::ToDisplayName(Difficulty),
+		OptionsMenu.IsOpen() ? 1 : 0, IsJoinPromptOpen() ? 1 : 0, bTravelling ? 1 : 0,
+		bMenuUmgActive ? TEXT("UMG") : TEXT("Canvas"),
+		TracePadMenu::IsEnabled() ? 1 : 0,
+		TracePadMenu::HasSeenPad(this) ? 1 : 0,
+		ShouldShowPadHints() ? 1 : 0,
+		*JoinEntry.GetText());
+}
+#endif
+
+bool ATraceMenuHUD::ShouldShowPadHints() const
+{
+	return TracePadMenu::HasSeenPad(this);
+}
+
+void ATraceMenuHUD::PollPadInput()
+{
+	APlayerController* const PC = GetOwningPlayerController();
+	if (PC == nullptr)
+	{
+		return;
+	}
+
+	// ---- SAMPLE THE THREE BUTTONS EVERY FRAME, INCLUDING THE FRAMES NOTHING HERE ACTS ON THEM ----
+	//
+	// These are REMEMBERED edges (TracePadMenu::RisingEdge), so the memory has to be kept alive even
+	// while this screen is not listening — otherwise the frame the settings overlay closes is a frame
+	// where a still-held B looks like a brand new press and jumps the title highlight to QUIT. That
+	// was not hypothetical: it is exactly the shape of the bug the double-A on frame 94 turned out to
+	// be, seen from the other side.
+	//
+	// Sampled ONCE and passed down, never re-read: reading an edge consumes it.
+	const bool bConfirm = TracePadMenu::RisingEdge(PC, TracePadMenu::ConfirmKey(), bPadConfirmWasDown);
+	const bool bBack    = TracePadMenu::RisingEdge(PC, TracePadMenu::BackKey(),    bPadBackWasDown);
+	const bool bAlt     = TracePadMenu::RisingEdge(PC, TracePadMenu::AltKey(),     bPadAltWasDown);
+
+	// THE SETTINGS OVERLAY OWNS THE PAD WHILE IT IS UP. FTraceOptionsMenu::PollNavigation has read
+	// the D-pad, the left stick and A/B/Y since D31-PAD; a second reader here would walk the title
+	// selection underneath the panel, so that closing the overlay would drop the player on a row they
+	// never chose. Exactly the reason DrawHUD stops sampling the mouse for the same frames.
+	//
+	// The repeat clocks are reset rather than left alone: a direction still held when the overlay
+	// opened must not be read as "newly pressed" on the frame it closes.
+	if (OptionsMenu.IsOpen())
+	{
+		PadNavX = 0;
+		PadNavY = 0;
+		return;
+	}
+
+	if (IsJoinPromptOpen())
+	{
+		PadNavX = 0;
+		PadNavY = 0;
+		PollPadJoinPrompt(bConfirm, bBack, bAlt);
+		return;
+	}
+
+	PollPadTitle(PC, bConfirm, bBack);
+}
+
+void ATraceMenuHUD::PollPadTitle(APlayerController* PC, bool bConfirm, bool bBack)
+{
+	// ---- Move ------------------------------------------------------------------------------------
+	//
+	// The clock is TracePadMenu's, shared with the other pad-driven screens, because a menu that
+	// scrolls at one speed here and another on the character select is a menu that feels unfinished.
+	// The KEYBOARD is not on this clock and does not need to be: its repeat is the OS's, which is the
+	// player's own system-wide setting and has always driven this screen.
+	if (TracePadMenu::StepRepeat(TracePadMenu::NavY(PC), PadNavY, PadNextNavTime, Now))
+	{
+		const ETraceMenuRow Before = Selected;
+		MoveSelection(PadNavY);
+
+		// Logged only when the row actually changed. MoveSelection clamps, so a held direction at the
+		// end of the list calls it every repeat while nothing moves, and a line per repeat would bury
+		// the presses that did something.
+		if (Selected != Before)
+		{
+			FTraceMenuRowView RowView;
+			BuildRowView(Selected, true, RowView);
+			UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] Pad %s -> %s."),
+				(PadNavY > 0) ? TEXT("DOWN") : TEXT("UP"), *RowView.Label);
+		}
+	}
+
+	// ---- Adjust (only DIFFICULTY answers, exactly as left/right on the keyboard) -----------------
+	if (TracePadMenu::StepRepeat(TracePadMenu::NavX(PC), PadNavX, PadNextAdjustTime, Now))
+	{
+		AdjustSelection(PadNavX);
+	}
+
+	// ---- A: activate ------------------------------------------------------------------------------
+	if (bConfirm)
+	{
+		FTraceMenuRowView RowView;
+		BuildRowView(Selected, true, RowView);
+		UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] Pad A (confirm) on %s."), *RowView.Label);
+
+		ActivateSelection();
+		return;
+	}
+
+	// ---- B: back ----------------------------------------------------------------------------------
+	//
+	// CancelPressed, which is Escape's handler — so B does on this screen exactly what Escape does:
+	// move the highlight to QUIT, and quit only if it was already there. That two-step is deliberate
+	// (see CancelPressed) and a pad gets the same protection rather than a shortcut out of the game.
+	//
+	// MENU/START also arrives here, as an Escape, because UTraceGamepadInputSubsystem::TickMenuButton
+	// synthesises one and ATraceMenuPlayerController binds Escape to CancelPressed. So a pad has two
+	// ways back, which is the same arrangement the options overlay settled on in D31-PAD.
+	if (bBack)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] Pad B (back)."));
+		CancelPressed();
+	}
+}
+
+// -------------------------------------------------------------------------------------------------
+// The JOIN prompt, and the one honest limit of this tranche
+// -------------------------------------------------------------------------------------------------
+//
+// WHAT A PAD DOES AT A TEXT FIELD, DECIDED AND WRITTEN DOWN:
+//
+//   A   CONNECT to whatever is in the field. The field is pre-filled with the last address that was
+//       tried (see OpenJoinPrompt), so "the same four people playing again tomorrow" is JOIN, A —
+//       pad only, no keyboard, no clipboard.
+//   B   CANCEL, back to the title rows. *** THIS IS THE ANTI-DEAD-END, and it is the one behaviour
+//       here that is not optional. *** A pad player who opens this prompt and cannot leave it has a
+//       game they must force-quit. MENU/START gets out too, by the synthetic Escape the prompt's own
+//       FTraceTextEntry::Poll reads — two independent ways out, on purpose.
+//   X   PASTE the clipboard over the field. This is what makes a NEW host reachable pad-only: the
+//       address arrives in a chat window, the player copies it there and pastes it here.
+//
+// TYPING IS NOT SOLVED, AND IS NOT PRETENDED TO BE. An on-screen keyboard is out of scope for this
+// tranche (stated in the brief). A pad alone cannot enter an address that is neither remembered nor
+// on the clipboard; that needs a keyboard, and the panel now says so in as many words whenever a pad
+// has been seen. It is in the report as a known limitation rather than buried here.
+//
+// WHY THE PASTE IS REIMPLEMENTED RATHER THAN CALLED. FTraceTextEntry (UI/TraceNetworking.h) owns
+// Ctrl/Cmd+V and does the same job, but it is another tranche's file this pass and exposes no
+// "paste" entry point — only SetText. Synthesising a Ctrl+V chord was the alternative and was
+// refused: UTraceGamepadInputSubsystem's header argues at length that Escape is the ONE key in this
+// build that is provably safe to synthesise, and a two-key chord through a modifier is exactly the
+// kind of thing that argument rules out. So the clipboard is read here and filtered here, with the
+// filter kept deliberately identical to that file's IsLegalChar for the Address charset. If the two
+// ever disagree the field simply refuses a character this accepted — a paste that comes up short,
+// never a corrupt address.
+
+void ATraceMenuHUD::PollPadJoinPrompt(bool bConfirm, bool bBack, bool bAlt)
+{
+	// ---- B: cancel ---------------------------------------------------------------------------------
+	//
+	// FIRST, before anything that could act on the field. This is the escape hatch; if any line below
+	// it ever throws or early-returns, the way out must already have been taken.
+	if (bBack)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] Pad B -> JOIN prompt cancelled."));
+		JoinEntry.End();
+		JoinError.Reset();
+		JoinErrorText.Reset();
+		return;
+	}
+
+	// ---- X: paste ------------------------------------------------------------------------------------
+	if (bAlt)
+	{
+		FString Clipboard;
+		FPlatformApplicationMisc::ClipboardPaste(Clipboard);
+
+		// One line only, and only the characters an address may contain. People paste
+		// "  100.1.2.3:7777\n" out of a terminal constantly, and a trailing newline in a travel URL
+		// is a silent failure. Same rule, same order, as FTraceTextEntry::Poll's Ctrl+V branch.
+		FString Cleaned;
+		for (const TCHAR Char : Clipboard)
+		{
+			if (Char == TEXT('\n') || Char == TEXT('\r'))
+			{
+				break;
+			}
+			// The Address charset: alphanumeric plus '.', ':', '-', '_'. Mirrors IsLegalChar in
+			// UI/TraceNetworking.cpp — see the note above this function about which way a
+			// disagreement fails.
+			if (FChar::IsAlnum(Char) || Char == TEXT('.') || Char == TEXT(':')
+				|| Char == TEXT('-') || Char == TEXT('_'))
+			{
+				Cleaned.AppendChar(Char);
+			}
+		}
+
+		if (Cleaned.IsEmpty())
+		{
+			// Said out loud rather than swallowed: a paste button that does nothing on an empty
+			// clipboard is indistinguishable from a paste button that is broken.
+			JoinError = TEXT("NOTHING ADDRESS-LIKE ON THE CLIPBOARD");
+			JoinErrorText = JoinEntry.GetText();
+			UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] Pad X -> clipboard held nothing usable."));
+			return;
+		}
+
+		// SetText clamps the caret to the new length rather than moving it; setting empty first puts
+		// it at the start, which is where a field the player has not typed into should draw it.
+		JoinEntry.SetText(FString());
+		JoinEntry.SetText(Cleaned);
+		JoinError.Reset();
+		JoinErrorText.Reset();
+		UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] Pad X -> pasted '%s' into the JOIN field."), *Cleaned);
+		return;
+	}
+
+	// ---- A: connect ------------------------------------------------------------------------------------
+	//
+	// Straight into ConfirmJoin, the very function Enter reaches through FTraceTextEntry's submit
+	// edge — so an empty field produces the same "ENTER AN ADDRESS" complaint and the prompt stays
+	// open, rather than a pad getting a different answer from a keyboard.
+	if (bConfirm)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] Pad A -> JOIN connect ('%s')."), *JoinEntry.GetText());
+		ConfirmJoin();
+	}
+}
 
 void ATraceMenuHUD::MoveSelection(int32 Delta)
 {
@@ -2059,6 +2397,19 @@ void ATraceMenuHUD::DrawHUD()
 	// Sampled once per drawn frame so a mouse-down can ask "was the window already ours before this
 	// click?". See MousePressed.
 	UpdateWindowFocus();
+
+	// ---- D32-PADMENU — the controller, read once per drawn frame --------------------------------
+	//
+	// HERE, at the top, for the same reason the address field is serviced before anything is drawn:
+	// a press has to be able to change what this frame shows. A pad that moved the highlight one
+	// frame after the button went down would feel like the lag every other input on this screen does
+	// not have.
+	//
+	// ABOVE the mouse-hover block below on purpose. Hover only re-selects when the pointer has
+	// actually MOVED (see bCursorHasMoved), so on a machine whose mouse is sitting still the pad's
+	// choice survives; on a machine where the player is using both, the last device to move wins,
+	// which is the behaviour the keyboard has always had against the mouse here.
+	PollPadInput();
 
 	FontSmall  = GEngine->GetSmallFont();
 	FontMedium = GEngine->GetMediumFont();
@@ -2674,10 +3025,45 @@ void ATraceMenuHUD::DrawJoinPrompt()
 		DrawTextCentered(Keys, TraceMenuStyle::InkDim, CX, PanelY + PanelH - (66.f * UIScale), FontSmall, KeysScale);
 	}
 
+	// ---- D32-PADMENU — what a controller can and cannot do at a text field ------------------------
+	//
+	// Two lines, and the second one is the important one: it is the difference between a player
+	// concluding the pad is broken and a player knowing to reach for a keyboard. Only drawn once a
+	// controller has been seen (ShouldShowPadHints), so a keyboard-only player never reads either.
+	//
+	// It takes the "THIS MACHINE IS" line's slot rather than adding a third — see the else arm below.
+	if (ShouldShowPadHints())
+	{
+		const FString PadKeys = TEXT("A   CONNECT          B   CANCEL          X   PASTE");
+		float PadScale = 1.f * UIScale;
+		const float PadNatural = MeasureWidth(PadKeys, FontSmall, PadScale);
+		if (PadNatural > HintRoom && PadNatural > 1.f)
+		{
+			PadScale *= FMath::Max(0.72f, HintRoom / PadNatural);
+		}
+		DrawTextCentered(PadKeys, TraceMenuStyle::Cyan, CX, PanelY + PanelH - (46.f * UIScale), FontSmall, PadScale);
+
+		const FString PadNote = TEXT("TYPING A NEW ADDRESS NEEDS A KEYBOARD");
+		float NoteScale = 0.92f * UIScale;
+		const float NoteNatural = MeasureWidth(PadNote, FontSmall, NoteScale);
+		if (NoteNatural > HintRoom && NoteNatural > 1.f)
+		{
+			NoteScale *= FMath::Max(0.72f, HintRoom / NoteNatural);
+		}
+		DrawTextCentered(PadNote, TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.7f),
+			CX, PanelY + PanelH - (26.f * UIScale), FontSmall, NoteScale);
+	}
 	// Deliberately repeated here as well as on the title screen behind it. Somebody in this prompt is
 	// mid-conversation with the person they are trying to reach, and "what's yours?" is the very next
 	// question — having it on screen saves a round trip through Escape. Same fit guard: a long
 	// tailscale hostname is exactly the string that does not fit a 900 px panel.
+	//
+	// D32-PADMENU MADE THIS AN ELSE ARM rather than adding a third block. The panel has room for two
+	// lines under the key legend, and this is the one of the three that is a REPEAT — the title
+	// screen's own address chip is directly behind this scrim. A player holding a controller is not
+	// the player about to read their hostname down a call, so on a machine where a pad has been seen
+	// the captions win. Both arms draw exactly two lines, so nothing above them moves either way.
+	else
 	{
 		const FString Machine = FString::Printf(TEXT("THIS MACHINE IS %s"), *TraceNet::GetHostEndpoint());
 		float MachineScale = 1.f * UIScale;
@@ -2971,13 +3357,18 @@ void ATraceMenuHUD::DrawFooter()
 {
 	const float CX = ViewW * 0.5f;
 
-	// D30 — THIS FOOTER IS NOW ONE LINE, NOT TWO. The key legend that used to sit on the first
-	// baseline ("W / S OR ARROWS MOVE ... ESC QUIT") is gone at the owner's request; only the hint
-	// under it remains. The MATHS below is deliberately untouched — Y is still the vanished first
-	// line's position and the hint is still drawn one 24px line under it — because the UMG twin
+	// D30 — THE KEYBOARD KEY LEGEND IS GONE. The line that used to sit on the first baseline
+	// ("W / S OR ARROWS MOVE ... ESC QUIT") was removed at the owner's request; the hint under it
+	// remains. The MATHS below is deliberately untouched — Y is still that first line's position and
+	// the hint is still drawn one 24px line under it — because the UMG twin
 	// (UTraceTitleMenuWidget::PlaceFooterBelowBlurb) lays its hint out at exactly KeysY +
 	// FooterLineGap and the two renderers have to keep landing in the same place. Emptying the
 	// string on one side and moving the line on the other is how they would drift apart.
+	//
+	// D32-PADMENU — THE FOOTER IS THEREFORE ONE LINE OR TWO, AND THE SECOND ONE IS THE PAD'S. Y is no
+	// longer a vacant baseline: on a machine where a controller has been seen it carries D-PAD / A / B,
+	// and the dark band below grows up to meet it. See ShouldShowPadHints for why that is not the
+	// deleted legend coming back, and BuildMenuView for the identical decision on the UMG side.
 	//
 	// The line has to clear the bezel's bottom rail, which sits 3.8% of the height up from the edge;
 	// anchoring off the bottom in reference pixels alone puts it under the rail.
@@ -3018,9 +3409,25 @@ void ATraceMenuHUD::DrawFooter()
 	// remaining line by the same 22px it used to give the key legend, rather than keeping a band
 	// sized for two lines with a blank row at the top of it.
 	const float HintY = Y + (24.f * UIScale);
-	const float BandY = HintY - (22.f * UIScale);
+
+	// D32-PADMENU — the pad legend goes on the baseline the deleted keyboard legend used to hold (Y),
+	// which is exactly the slot the UMG twin keeps for it (BuildMenuView's FooterKeys). Drawn only
+	// once a controller has been seen; see ShouldShowPadHints.
+	//
+	// THE BAND HAS TO GROW WITH IT. It is sized to hug whatever the TOPMOST footer line is, and with
+	// the pad line present that is Y rather than HintY — without this the caption would sit two
+	// pixels above the dark strip, on the grid, where it is unreadable. Same 22px hug either way.
+	const bool bPadLegend = ShouldShowPadHints();
+	const float TopLineY = bPadLegend ? Y : HintY;
+	const float BandY = TopLineY - (22.f * UIScale);
 	DrawRect(FLinearColor(0.004f, 0.014f, 0.026f, 0.92f), 0.f, BandY, ViewW, ViewH - BandY);
 	DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.24f), 0.f, BandY, ViewW, FMath::Max(1.f, 1.f * UIScale));
+
+	if (bPadLegend)
+	{
+		DrawTextCentered(TEXT("D-PAD   MOVE          A   SELECT          B   BACK"),
+			TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.75f), CX, Y, FontSmall, 1.f * UIScale);
+	}
 
 	// WP8.1 — no address repetition here any more; the chip under the tagline is the one source.
 	DrawTextCentered(TEXT("PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE"),

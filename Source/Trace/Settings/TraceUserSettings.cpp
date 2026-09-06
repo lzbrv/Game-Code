@@ -2,14 +2,23 @@
 
 #include "Settings/TraceUserSettings.h"
 
+#include "Containers/Ticker.h"          // FTSTicker, for the D32-INVERT look-polarity probe
+#include "EnhancedActionKeyMapping.h"   // FEnhancedActionKeyMapping - finding IA_Look by its key
+#include "EnhancedPlayerInput.h"        // UEnhancedPlayerInput::GetActionValue
 #include "Engine/Engine.h"              // GEngine->GetCurrentPlayWorld, for the WP2 console hook
+#include "Engine/GameViewportClient.h"  // the route a real device's sample takes
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"  // ServerChangeName - the engine's own rename path
 #include "GameFramework/PlayerState.h"
 #include "HAL/IConsoleManager.h"
+#include "InputAction.h"
+#include "InputCoreTypes.h"
+#include "InputKeyEventArgs.h"
+#include "Misc/CoreMiscDefines.h"       // FInputDeviceId
 #include "Misc/ConfigCacheIni.h"
 #include "Trace.h"                      // LogTraceGame
 #include "UObject/UObjectGlobals.h"     // GetMutableDefault
+#include "UnrealClient.h"               // FViewport
 
 // =================================================================================================
 // The action table
@@ -664,6 +673,13 @@ float UTraceUserSettings::GetLookScaleY() const
 	// The sign IS the inversion. Folding it into the Scalar modifier rather than adding or removing
 	// a Negate modifier keeps the mapping's modifier list a fixed shape, so a live rebuild only ever
 	// changes numbers.
+	//
+	// Raw EKeys::MouseY is POSITIVE-UP before it reaches here — FSceneViewport negates the
+	// screen-space cursor delta — so a positive Scale is standard and needs no Negate anywhere in the
+	// chain. GetPadLookRateY carries the same convention for the stick and its comment sets out why
+	// that is correct rather than inherited; Trace.Look.VerifyPolarity measures both devices in one
+	// run, because "the mouse is unaffected" is a claim that has to be re-measured every time the
+	// pad's half is touched.
 	return bInvertMouseY ? -Scale : Scale;
 }
 
@@ -2044,6 +2060,41 @@ float UTraceUserSettings::GetPadLookRateY() const
 	// The SIGN is the inversion, exactly as it is for the mouse (GetLookScaleY). Folding it into the
 	// scalar rather than adding or removing a Negate keeps the pad context's modifier list a fixed
 	// shape, so a live rebuild only ever changes numbers.
+	//
+	// *** THE MOUSE'S CONVENTION IS SHARED HERE ON PURPOSE, AND IT IS NOT A COPY-PASTE BUG. ***
+	// The reading that says it is goes: "a mouse reports a DELTA and a stick reports an AXIS, so
+	// pushing them both forward cannot give the same sign, so the pad inherited a base sign that is
+	// wrong for it." That reading has been proposed as the cause of a real player report, and it is
+	// FALSE. Both devices are POSITIVE-FORWARD by the time Enhanced Input sees them, on every
+	// platform whose source could be read from this machine:
+	//   * mouse  — FSceneViewport::OnMouseMove accumulates `MouseDelta.Y -= CursorDelta.Y`
+	//     (Runtime/Engine/Private/Slate/SceneViewport.cpp), negating the screen-space down-positive
+	//     cursor delta. EKeys::MouseY is already positive-up. There is one such accumulation, so
+	//     there is no second path that could disagree.
+	//   * stick, Mac MFi/Xbox/DualSense — FAppleControllerInterface copies GCController's
+	//     `rightThumbstick.yAxis.value` straight through, and that axis is positive-up.
+	//   * stick, Mac generic HID — HIDInputInterface sends `-FloatValue` for the Ry/Rz element
+	//     precisely so that it agrees with the line above.
+	//   * stick, Windows XInput — NOT VERIFIED HERE. This engine install carries Mac source only
+	//     (Runtime/ApplicationCore/Private/Windows has no XInputInterface.cpp), and a Windows game
+	//     cannot be built or run from this machine, so the Windows sign is an inference and is
+	//     labelled as one. What does NOT depend on the platform is the argument below.
+	//
+	// THE PLATFORM-INDEPENDENT ARGUMENT, and the one to reach for on any machine where the above
+	// cannot be read: the MOVE stick shares this convention. TraceGamepadInput maps IA_Move to
+	// Gamepad_Left2D with no Negate at all, on the stated contract "Y = forward (+forward)". A
+	// platform layer that delivered stick Y positive-DOWN would therefore make WALKING FORWARD move
+	// the player backwards — a louder and more obvious bug than an inverted camera, on the same
+	// device, from the same interface. So on any machine where the move stick walks the right way,
+	// the look stick's base sign is right too, and an inverted camera there is not this line's doing.
+	//
+	// SO DO NOT "CORRECT" THE BASE SIGN HERE. Trace.Look.VerifyPolarity measures the whole chain in a
+	// running match and reports the SIGNED pitch the camera actually took. Shipped code, measured:
+	// stick forward with invert OFF -> camera UP (+58.32 deg), invert ON -> DOWN (-59.35), stick back
+	// with invert OFF -> DOWN (-55.91), and the mouse UP/DOWN alongside it in the same run. Flipping
+	// this line to `bPadInvertLookY ? Rate : -Rate` was measured too: the pad then looks DOWN when the
+	// stick is pushed forward and the toggle labelled "INVERT LOOK Y" has to be switched ON to look
+	// normally — i.e. that edit CREATES the bug it is meant to cure, and leaves the label lying.
 	return bPadInvertLookY ? -Rate : Rate;
 }
 
@@ -3074,6 +3125,552 @@ namespace
 		TEXT("RightMouseButton through a real binding and the ini's string form. Restores the bindings it ")
 		TEXT("touches."),
 		FConsoleCommandDelegate::CreateStatic(&VerifyBindableKeys));
+}
+
+// =================================================================================================
+// D32-INVERT — Trace.Look.VerifyPolarity
+//
+// *** THE ONE THING NO OTHER CHECK IN THIS PROJECT MEASURES: WHICH WAY THE CAMERA ACTUALLY GOES. ***
+// Trace.Pad.Drive drives the right stick on its X axis only and prints FMath::Abs of every number it
+// reports, so a pad whose PITCH is inverted — or whose pitch is dead — passes it unchanged. A sign
+// bug is invisible to a check built out of magnitudes, and a magnitude check was the only look check
+// this project had.
+//
+// SIX ARMS, AND FOUR OF THEM EXIST SO THE OPPOSITE CASE CAN BE FOUND:
+//   1. settle                    nothing injected. If the view drifts here, every number below is
+//                                noise and no verdict from this command means anything.
+//   2. pad forward, invert OFF   the shipped default, and the arm the owner's report is about.
+//   3. pad forward, invert ON    the toggle must REVERSE arm 2, not merely change it. An arm-2-only
+//                                run cannot tell a correct default from a flag that does nothing.
+//   4. pad BACKWARD, invert OFF  the stick's other direction must give the other sign. Without this,
+//                                a chain that answered "up" to every sample would pass arm 2.
+//   5. mouse forward             THE CONTROL THAT MUST NOT CHANGE, and the reason the whole command
+//   6. mouse backward            drives both devices in ONE run rather than trusting a memory of how
+//                                the mouse behaved before an edit.
+//
+// WHAT "FORWARD" MEANS, AND WHY ONE WORD CAN COVER BOTH DEVICES. A POSITIVE raw sample means the
+// device was pushed forward/up on EITHER device, and that is a fact about the engine, not a
+// convention chosen here:
+//   * mouse — FSceneViewport::OnMouseMove accumulates `MouseDelta.Y -= CursorDelta.Y`, negating the
+//     screen-space (down-positive) delta, so EKeys::MouseY is already positive-up by the time
+//     Enhanced Input sees it.
+//   * stick — FAppleControllerInterface copies GCController's rightThumbstick.yAxis straight through
+//     and that axis is positive-up; the Mac HID path (HIDInputInterface, non-MFi pads) sends
+//     `-FloatValue` for Ry/Rz precisely to agree with it; Windows XInput's sThumbRY is positive-up
+//     too. There is no platform in this game's list on which a forward stick is negative.
+// That shared convention is the only thing that makes arms 2 and 5 comparable, so it is stated here
+// rather than assumed.
+//
+// WHAT IS MEASURED, per arm: the SIGNED pitch of the control rotation — zeroed at the instant the arm
+// starts measuring, so the reading is a delta and cannot be contaminated by where the player happened
+// to be looking — and the SIGNED peak of IA_Look's Y value. Positive pitch is UP in UE, and
+// ATraceCharacter::DoLook feeds IA_Look.Y straight into AddControllerPitchInput with no sign of its
+// own, so the two must agree. Both are printed because "the value never reached the game" and "the
+// value reached the game with the wrong sign" are different failures that a single number confuses.
+//
+// It restores bPadInvertLookY and bPadEnabled before it returns and NEVER calls Save(), so it cannot
+// leave a test value in TraceUserSettings.ini.
+// =================================================================================================
+
+namespace TraceLookPolarityProbe
+{
+	/** Failures across the whole run, so the last line can be a verdict and not a shrug. */
+	int32 GFailures = 0;
+
+	/** Below this many degrees the arm is reported as having gone NOWHERE, which is its own failure. */
+	constexpr float PitchEpsilon = 1.0f;
+
+	void Check(bool bCondition, const TCHAR* What, const FString& Detail)
+	{
+		if (bCondition)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[LookY]   ok       %s — %s"), What, *Detail);
+		}
+		else
+		{
+			++GFailures;
+			UE_LOG(LogTraceGame, Error, TEXT("[LookY]   WRONG    %s — %s"), What, *Detail);
+		}
+	}
+
+	const TCHAR* DirectionName(float PitchDelta)
+	{
+		if (PitchDelta > PitchEpsilon)
+		{
+			return TEXT("UP");
+		}
+		if (PitchDelta < -PitchEpsilon)
+		{
+			return TEXT("DOWN");
+		}
+		return TEXT("NOWHERE");
+	}
+
+	APlayerController* FindLocalController()
+	{
+		UWorld* const World = (GEngine != nullptr) ? GEngine->GetCurrentPlayWorld() : nullptr;
+		return (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+	}
+
+	/**
+	 * Injects one analog sample for @p Key, by the same route Trace.Pad.Drive uses.
+	 *
+	 * THE VIEWPORT PATH FIRST because that is the one a real device takes — FSceneViewport hands the
+	 * sample to UGameViewportClient::InputAxis, which ends in PlayerController->InputKey. Falling back
+	 * to the controller skips the viewport's IgnoreInput gate, which is worth having on a -nullrhi run
+	 * where there is no viewport at all.
+	 */
+	bool InjectAxis(APlayerController* PC, const FKey& Key, float Value)
+	{
+		if (PC == nullptr)
+		{
+			return false;
+		}
+
+		FViewport* const Viewport =
+			(GEngine != nullptr && GEngine->GameViewport != nullptr) ? GEngine->GameViewport->Viewport : nullptr;
+
+		// NumSamples must be >= 1: UPlayerInput accumulates (Delta, NumSamples) pairs and a zero
+		// sample count makes the axis read as untouched.
+		const FInputKeyEventArgs Args(
+			Viewport, FInputDeviceId::CreateFromInternalId(0), Key, Value,
+			/*DeltaTime*/ 1.f / 60.f, /*NumSamples*/ 1, FPlatformTime::Cycles64());
+
+		if (GEngine != nullptr && GEngine->GameViewport != nullptr)
+		{
+			return GEngine->GameViewport->InputAxis(Args);
+		}
+		return PC->InputKey(Args);
+	}
+
+	/**
+	 * Explicit ZERO on all four stick axes.
+	 *
+	 * NOT TIDYING UP — it is what makes the two mouse arms able to fail. UPlayerInput copies an axis
+	 * accumulator into RawValue only when a sample arrived this frame, so an injected stick value is
+	 * not "the value this frame", it is "the value until something else is injected". Without this the
+	 * mouse arms would still be carrying the stick deflection from the arm three phases earlier and
+	 * would pass with the mouse completely dead.
+	 */
+	void ZeroSticks(APlayerController* PC)
+	{
+		InjectAxis(PC, EKeys::Gamepad_LeftX,  0.f);
+		InjectAxis(PC, EKeys::Gamepad_LeftY,  0.f);
+		InjectAxis(PC, EKeys::Gamepad_RightX, 0.f);
+		InjectAxis(PC, EKeys::Gamepad_RightY, 0.f);
+	}
+
+	/**
+	 * IA_Look, found by the KEY it is mapped to rather than by asset name.
+	 *
+	 * Looking it up through the live mapping list is the stronger form: it proves the pad's context is
+	 * actually applied to this player, which a name lookup on the asset registry would not, and it
+	 * costs nothing because the mapping is the thing being measured anyway.
+	 */
+	const UInputAction* FindActionMappedTo(const UEnhancedPlayerInput* PlayerInput, const FKey& Key)
+	{
+		if (PlayerInput == nullptr)
+		{
+			return nullptr;
+		}
+
+		// The VIEW accessor and not GetEnhancedActionMappings(): the latter is protected, and reaching
+		// it would mean subclassing UEnhancedPlayerInput for a read.
+		for (const FEnhancedActionKeyMapping& Mapping : PlayerInput->GetEnhancedActionMappingsView())
+		{
+			if (Mapping.Key == Key && Mapping.Action != nullptr)
+			{
+				return Mapping.Action.Get();
+			}
+		}
+		return nullptr;
+	}
+
+	struct FProbe : public TSharedFromThis<FProbe>
+	{
+		enum class EPhase : uint8
+		{
+			Settle,           // nothing injected — the baseline, and the first negative control
+			PadForwardStd,    // right stick forward, bPadInvertLookY OFF
+			PadForwardInv,    // right stick forward, bPadInvertLookY ON
+			PadBackStd,       // right stick BACK, bPadInvertLookY OFF
+			MouseForward,     // mouse forward — the control that must not change
+			MouseBack,        // mouse back
+			Done,
+		};
+
+		static constexpr int32 NumArms = 6;
+
+		static TSharedPtr<FProbe> Instance;
+
+		EPhase Phase = EPhase::Settle;
+		float PhaseSeconds = 0.f;
+		bool bPhaseStarted = false;
+
+		/**
+		 * *** WHY EVERY ARM THROWS AWAY ITS FIRST FEW FRAMES. ***
+		 * This ticker runs from FTSTicker::GetCoreTicker, which fires EARLY in the frame — before the
+		 * player controller ticks and therefore before UPlayerInput has consumed the sample injected
+		 * below. The first reading of an arm is still the PREVIOUS arm's, which for a command whose
+		 * whole subject is a SIGN would read as the toggle failing to take effect. Same margin, and
+		 * the same reason, as Trace.Pad.Drive's.
+		 */
+		static constexpr float SettleMargin = 0.15f;
+
+		bool bMeasuring = false;
+		float MeasuredSeconds = 0.f;
+		float PeakLookY = 0.f;
+
+		/** Per-arm results, kept so the summary can print the six side by side. */
+		float ArmPitch[NumArms] = {};
+		float ArmLookY[NumArms] = {};
+		bool  bArmRan[NumArms] = {};
+
+		/** Restored in Finish(). The probe must not leave a test value behind. */
+		bool bRestoreInvert = false;
+		bool bRestorePadEnabled = true;
+
+		/** Mouse counts per frame, sized in BeginPhase so the spike guard cannot silently eat them. */
+		float MouseCounts = 4.f;
+
+		FTSTicker::FDelegateHandle Handle;
+
+		static float DurationOf(EPhase InPhase)
+		{
+			switch (InPhase)
+			{
+			// A FULL SECOND OF SETTLE, and it is not padding: ATracePlayerController::OnLookInput
+			// refuses every look event until IgnoreLookUntilTime, the window it opens after a spawn or
+			// a mouse capture. Driving inside that window fails for a reason that is not this bug.
+			case EPhase::Settle: return 1.00f;
+			case EPhase::Done:   return 0.f;
+			// 0.35 s of measurement after the margin. At the pad's shipped 220 x 0.75 = 165 deg/s that
+			// is ~58 degrees — comfortably clear of the 1-degree noise floor and comfortably short of
+			// the camera manager's +/-89.9 pitch clamp, which would cap the magnitude. (A cap would not
+			// flip a sign, so it could not produce a wrong verdict; it would only make one less legible.)
+			default:             return 0.50f;
+			}
+		}
+
+		static int32 ArmIndex(EPhase InPhase)
+		{
+			return FMath::Clamp(static_cast<int32>(InPhase), 0, NumArms - 1);
+		}
+
+		static const TCHAR* ArmName(EPhase InPhase)
+		{
+			switch (InPhase)
+			{
+			case EPhase::Settle:        return TEXT("settle (nothing injected)");
+			case EPhase::PadForwardStd: return TEXT("PAD  stick FORWARD, invert OFF");
+			case EPhase::PadForwardInv: return TEXT("PAD  stick FORWARD, invert ON");
+			case EPhase::PadBackStd:    return TEXT("PAD  stick BACK,    invert OFF");
+			case EPhase::MouseForward:  return TEXT("MOUSE moved FORWARD");
+			case EPhase::MouseBack:     return TEXT("MOUSE moved BACK");
+			default:                    return TEXT("done");
+			}
+		}
+
+		static void Start()
+		{
+			Stop();
+
+			GFailures = 0;
+			Instance = MakeShared<FProbe>();
+
+			UTraceUserSettings& Settings = UTraceUserSettings::Get();
+			Instance->bRestoreInvert = Settings.bPadInvertLookY;
+			Instance->bRestorePadEnabled = Settings.bPadEnabled;
+
+			// Forced ON for the duration. Whether the pad can be switched off is Trace.Pad.Drive's
+			// question; this command would otherwise report "NOWHERE" on both pad arms and blame a
+			// sign for a disabled device.
+			Settings.bPadEnabled = true;
+			Settings.bPadInvertLookY = false;
+			// Broadcast and NOT Save(): the pad and mouse contexts are rebuilt from the new values,
+			// and nothing is written to disk.
+			UTraceUserSettings::OnChanged().Broadcast();
+
+			Instance->Handle = FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateSP(Instance.ToSharedRef(), &FProbe::Tick), 0.f);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[LookY] ===== D32-INVERT: which way does the camera go? ====="));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[LookY] Six arms. Positive raw sample = device pushed FORWARD, on both devices. ")
+				TEXT("Positive pitch = camera UP. Entering with invert=%d padEnabled=%d (restored at the end)."),
+				Instance->bRestoreInvert ? 1 : 0, Instance->bRestorePadEnabled ? 1 : 0);
+		}
+
+		static void Stop()
+		{
+			if (Instance.IsValid())
+			{
+				if (Instance->Handle.IsValid())
+				{
+					FTSTicker::GetCoreTicker().RemoveTicker(Instance->Handle);
+				}
+				Instance.Reset();
+			}
+		}
+
+		bool Tick(float DeltaSeconds)
+		{
+			APlayerController* const PC = FindLocalController();
+			UEnhancedPlayerInput* const PlayerInput =
+				(PC != nullptr) ? Cast<UEnhancedPlayerInput>(PC->PlayerInput) : nullptr;
+
+			if (PC == nullptr || PlayerInput == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[LookY] No local player controller with an enhanced player input yet — nothing to ")
+					TEXT("drive. Run this in a match."));
+				++GFailures;
+				Finish();
+				return false;
+			}
+
+			const UInputAction* const Look =
+				FindActionMappedTo(PlayerInput, EKeys::Gamepad_Right2D);
+			if (Look == nullptr)
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[LookY] Nothing is mapped to the right stick, so the pad's look context is not ")
+					TEXT("applied to this player. Trace.Pad.Status says why; there is no polarity to measure."));
+				++GFailures;
+				Finish();
+				return false;
+			}
+
+			if (!bPhaseStarted)
+			{
+				BeginPhase(PC);
+			}
+
+			// ---- The injection for this frame ----------------------------------------------------
+			switch (Phase)
+			{
+			case EPhase::PadForwardStd:
+			case EPhase::PadForwardInv:
+				InjectAxis(PC, EKeys::Gamepad_RightY, +1.0f);
+				break;
+
+			case EPhase::PadBackStd:
+				InjectAxis(PC, EKeys::Gamepad_RightY, -1.0f);
+				break;
+
+			case EPhase::MouseForward:
+				ZeroSticks(PC);
+				InjectAxis(PC, EKeys::MouseX, 0.f);
+				InjectAxis(PC, EKeys::MouseY, +MouseCounts);
+				break;
+
+			case EPhase::MouseBack:
+				ZeroSticks(PC);
+				InjectAxis(PC, EKeys::MouseX, 0.f);
+				InjectAxis(PC, EKeys::MouseY, -MouseCounts);
+				break;
+
+			default:
+				break;
+			}
+
+			PhaseSeconds += DeltaSeconds;
+
+			// The snapshot is taken when the margin expires, not when the arm started — see
+			// SettleMargin. The pitch is ZEROED at that instant so what is read at the end is a delta.
+			if (!bMeasuring && PhaseSeconds >= SettleMargin)
+			{
+				bMeasuring = true;
+				MeasuredSeconds = 0.f;
+				PeakLookY = 0.f;
+
+				const FRotator Current = PC->GetControlRotation();
+				PC->SetControlRotation(FRotator(0.f, Current.Yaw, Current.Roll));
+			}
+
+			if (bMeasuring)
+			{
+				MeasuredSeconds += DeltaSeconds;
+
+				// SIGNED peak, by magnitude. FMath::Max on the absolute value — which is what every
+				// existing check in this project does — is exactly the operation that would hide the
+				// bug being hunted.
+				const float LookY = PlayerInput->GetActionValue(Look).Get<FVector2D>().Y;
+				if (FMath::Abs(LookY) > FMath::Abs(PeakLookY))
+				{
+					PeakLookY = LookY;
+				}
+			}
+
+			if (PhaseSeconds >= DurationOf(Phase))
+			{
+				EndPhase(PC);
+			}
+
+			if (Phase == EPhase::Done)
+			{
+				Finish();
+				return false;
+			}
+			return true;
+		}
+
+		void BeginPhase(APlayerController* PC)
+		{
+			bPhaseStarted = true;
+			bMeasuring = false;
+			PhaseSeconds = 0.f;
+			MeasuredSeconds = 0.f;
+			PeakLookY = 0.f;
+
+			UTraceUserSettings& Settings = UTraceUserSettings::Get();
+
+			// The flag is set on the arm that needs it and put back on the next, so the two pad-forward
+			// arms differ in EXACTLY one thing.
+			if (Phase == EPhase::PadForwardInv && !Settings.bPadInvertLookY)
+			{
+				Settings.bPadInvertLookY = true;
+				UTraceUserSettings::OnChanged().Broadcast();
+			}
+			else if (Phase != EPhase::PadForwardInv && Settings.bPadInvertLookY)
+			{
+				Settings.bPadInvertLookY = false;
+				UTraceUserSettings::OnChanged().Broadcast();
+			}
+
+			if (Phase == EPhase::MouseForward || Phase == EPhase::MouseBack)
+			{
+				// SIZED, not a literal. OnLookInput drops any event over max(20 deg, 2500 deg/s x frame)
+				// as an implausible cursor warp, so a fixed count would be silently swallowed on any
+				// machine whose saved MouseSensitivity is high — and the arm would report NOWHERE for a
+				// reason that has nothing to do with polarity. Six degrees a frame is a third of the
+				// floor at any sensitivity.
+				MouseCounts = 6.0f / FMath::Max(0.05f, FMath::Abs(Settings.GetLookScaleY()));
+				ZeroSticks(PC);
+			}
+		}
+
+		void EndPhase(APlayerController* PC)
+		{
+			// The pitch was zeroed when measuring began, so the current pitch IS the delta. Through
+			// NormalizeAxis because FRotator stores 0..360 and a downward look reads as 330-something.
+			const float PitchDelta = FRotator::NormalizeAxis(PC->GetControlRotation().Pitch);
+			const int32 Arm = ArmIndex(Phase);
+
+			ArmPitch[Arm] = PitchDelta;
+			ArmLookY[Arm] = PeakLookY;
+			bArmRan[Arm] = true;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[LookY]   %-32s camera went %-7s (pitch %+7.2f deg in %.2fs; peak IA_Look.Y %+8.4f)"),
+				ArmName(Phase), DirectionName(PitchDelta), PitchDelta, MeasuredSeconds, PeakLookY);
+
+			Phase = static_cast<EPhase>(static_cast<uint8>(Phase) + 1);
+			bPhaseStarted = false;
+		}
+
+		void Finish()
+		{
+			UTraceUserSettings& Settings = UTraceUserSettings::Get();
+			Settings.bPadInvertLookY = bRestoreInvert;
+			Settings.bPadEnabled = bRestorePadEnabled;
+			UTraceUserSettings::OnChanged().Broadcast();
+
+			if (bArmRan[ArmIndex(EPhase::Settle)])
+			{
+				Report();
+			}
+
+			Check(Settings.bPadInvertLookY == bRestoreInvert && Settings.bPadEnabled == bRestorePadEnabled,
+				TEXT("the probe put the settings back as it found them"),
+				FString::Printf(TEXT("invert=%d padEnabled=%d, and nothing was written to disk"),
+					Settings.bPadInvertLookY ? 1 : 0, Settings.bPadEnabled ? 1 : 0));
+
+			if (GFailures == 0)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[LookY] ===== PASS: look polarity is correct on both devices, and the pad's ")
+					TEXT("invert toggle reverses it. ====="));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[LookY] ===== FAIL: %d problem(s). ====="), GFailures);
+			}
+
+			Stop();
+		}
+
+		void Report()
+		{
+			const float PadStd  = ArmPitch[ArmIndex(EPhase::PadForwardStd)];
+			const float PadInv  = ArmPitch[ArmIndex(EPhase::PadForwardInv)];
+			const float PadBack = ArmPitch[ArmIndex(EPhase::PadBackStd)];
+			const float MouseF  = ArmPitch[ArmIndex(EPhase::MouseForward)];
+			const float MouseB  = ArmPitch[ArmIndex(EPhase::MouseBack)];
+			const float Settle  = ArmPitch[ArmIndex(EPhase::Settle)];
+
+			Check(FMath::Abs(Settle) < PitchEpsilon
+					&& FMath::Abs(ArmLookY[ArmIndex(EPhase::Settle)]) < UE_KINDA_SMALL_NUMBER,
+				TEXT("[control] with nothing injected the view is still"),
+				FString::Printf(TEXT("pitch moved %+.2f deg, peak IA_Look.Y %+.4f"),
+					Settle, ArmLookY[ArmIndex(EPhase::Settle)]));
+
+			// THE ARM THE OWNER REPORTED. Standard is forward = UP, and that is what the header's own
+			// comment on bPadInvertLookY promises: "FALSE is standard: push the stick forward, look up."
+			Check(PadStd > PitchEpsilon,
+				TEXT("PAD default (invert OFF): stick FORWARD looks UP"),
+				FString::Printf(TEXT("camera went %s, pitch %+.2f deg"), DirectionName(PadStd), PadStd));
+
+			Check(PadInv < -PitchEpsilon,
+				TEXT("PAD with invert ON: stick FORWARD looks DOWN"),
+				FString::Printf(TEXT("camera went %s, pitch %+.2f deg"), DirectionName(PadInv), PadInv));
+
+			// THE TOGGLE MUST REVERSE, not merely differ. Two arms that both went UP by different
+			// amounts would satisfy "the flag changed something" and would still be a broken toggle.
+			Check((PadStd > PitchEpsilon) && (PadInv < -PitchEpsilon),
+				TEXT("the invert toggle REVERSES the pad's pitch rather than just changing it"),
+				FString::Printf(TEXT("OFF -> %s (%+.2f), ON -> %s (%+.2f)"),
+					DirectionName(PadStd), PadStd, DirectionName(PadInv), PadInv));
+
+			Check(PadBack < -PitchEpsilon,
+				TEXT("[opposite case] PAD default: stick BACK looks DOWN"),
+				FString::Printf(TEXT("camera went %s, pitch %+.2f deg — so the chain is not simply ")
+					TEXT("answering UP to everything"), DirectionName(PadBack), PadBack));
+
+			Check(MouseF > PitchEpsilon,
+				TEXT("[control] MOUSE forward still looks UP"),
+				FString::Printf(TEXT("camera went %s, pitch %+.2f deg"), DirectionName(MouseF), MouseF));
+
+			Check(MouseB < -PitchEpsilon,
+				TEXT("[control] MOUSE back still looks DOWN"),
+				FString::Printf(TEXT("camera went %s, pitch %+.2f deg"), DirectionName(MouseB), MouseB));
+
+			// THE COMPARISON THE OWNER'S REPORT IS ACTUALLY ABOUT: the same physical gesture — push the
+			// device away from you — must produce the same result on both devices.
+			Check(FMath::Sign(PadStd) == FMath::Sign(MouseF)
+					&& FMath::Abs(PadStd) > PitchEpsilon && FMath::Abs(MouseF) > PitchEpsilon,
+				TEXT("PAD and MOUSE agree: pushing either device forward looks the SAME way"),
+				FString::Printf(TEXT("pad %s (%+.2f), mouse %s (%+.2f)"),
+					DirectionName(PadStd), PadStd, DirectionName(MouseF), MouseF));
+		}
+	};
+
+	TSharedPtr<FProbe> FProbe::Instance;
+
+	void VerifyLookPolarity()
+	{
+		FProbe::Start();
+	}
+
+	FAutoConsoleCommand CmdVerifyLookPolarity(
+		TEXT("Trace.Look.VerifyPolarity"),
+		TEXT("D32-INVERT. Drives the right stick forward and back, and the mouse forward and back, ")
+		TEXT("through the real input pipeline, and reports the SIGNED pitch the camera actually took ")
+		TEXT("in each case — with the pad's invert toggle off and again with it on. Six arms; three ")
+		TEXT("are controls. Restores the settings it changes and writes nothing to disk."),
+		FConsoleCommandDelegate::CreateStatic(&VerifyLookPolarity));
 }
 
 #endif // !UE_BUILD_SHIPPING

@@ -1,4 +1,5 @@
-// Trace — D31-PAD: the gamepad's mapping context. See TraceGamepadInput.h for the whole argument.
+// Trace — D31-PAD: the gamepad's mapping context, and D32-PADMENU: the vocabulary every
+// pad-driven menu screen reads. See TraceGamepadInput.h for both arguments.
 
 #include "Settings/TraceGamepadInput.h"
 
@@ -120,6 +121,114 @@ namespace TraceGamepadInputImpl
 			}
 		}
 		return nullptr;
+	}
+}
+
+// =================================================================================================
+// D32-PADMENU — the pad's menu vocabulary, implemented once
+//
+// See the block at the bottom of TraceGamepadInput.h for why these live here rather than being
+// written out four times, and for the button table itself. Nothing below is compiled out of
+// Shipping: these ARE the feature, not a check on it.
+// =================================================================================================
+
+namespace TracePadMenu
+{
+	const FKey& ConfirmKey() { return EKeys::Gamepad_FaceButton_Bottom; }
+	const FKey& BackKey()    { return EKeys::Gamepad_FaceButton_Right; }
+	const FKey& AltKey()     { return EKeys::Gamepad_FaceButton_Left; }
+
+	bool IsEnabled()
+	{
+		return UTraceUserSettings::Get().bPadEnabled;
+	}
+
+	bool HasSeenPad(const UObject* WorldContext)
+	{
+		const UTraceGamepadInputSubsystem* const Pad = UTraceGamepadInputSubsystem::Get(WorldContext);
+		return (Pad != nullptr) && Pad->HasSeenGamepadInput();
+	}
+
+	/**
+	 * "Is this direction being asked for", over a D-pad key and its left-stick twin.
+	 *
+	 * Byte-for-byte the predicate FTraceOptionsMenu::PollNavigation's local `PadDown` lambda uses,
+	 * and Trace.Pad.MenuVerify asserts the two key LISTS still agree. See the header.
+	 */
+	static bool DirDown(const APlayerController* PC, const FKey& DPad, const FKey& Stick)
+	{
+		if (PC == nullptr || !IsEnabled())
+		{
+			return false;
+		}
+		return PC->IsInputKeyDown(DPad) || PC->IsInputKeyDown(Stick)
+			|| PC->WasInputKeyJustPressed(DPad) || PC->WasInputKeyJustPressed(Stick);
+	}
+
+	int32 NavX(const APlayerController* PC)
+	{
+		int32 Dir = 0;
+		if (DirDown(PC, EKeys::Gamepad_DPad_Right, EKeys::Gamepad_LeftStick_Right)) { Dir += 1; }
+		if (DirDown(PC, EKeys::Gamepad_DPad_Left,  EKeys::Gamepad_LeftStick_Left))  { Dir -= 1; }
+		return Dir;
+	}
+
+	int32 NavY(const APlayerController* PC)
+	{
+		int32 Dir = 0;
+		if (DirDown(PC, EKeys::Gamepad_DPad_Down, EKeys::Gamepad_LeftStick_Down)) { Dir += 1; }
+		if (DirDown(PC, EKeys::Gamepad_DPad_Up,   EKeys::Gamepad_LeftStick_Up))   { Dir -= 1; }
+		return Dir;
+	}
+
+	static bool ButtonPressed(const APlayerController* PC, const FKey& Key)
+	{
+		return PC != nullptr && IsEnabled() && PC->WasInputKeyJustPressed(Key);
+	}
+
+	bool ConfirmPressed(const APlayerController* PC) { return ButtonPressed(PC, ConfirmKey()); }
+	bool BackPressed(const APlayerController* PC)    { return ButtonPressed(PC, BackKey()); }
+	bool AltPressed(const APlayerController* PC)     { return ButtonPressed(PC, AltKey()); }
+
+	bool RisingEdge(const APlayerController* PC, const FKey& Key, bool& bWasDown)
+	{
+		const bool bDown = (PC != nullptr) && PC->IsInputKeyDown(Key);
+
+		// RECORDED BEFORE THE GATE IS APPLIED, deliberately. If the state were only tracked while
+		// controller input was on, a player who switched it on with a button already held would get an
+		// edge out of the switch itself.
+		const bool bEdge = bDown && !bWasDown;
+		bWasDown = bDown;
+
+		return bEdge && IsEnabled();
+	}
+
+	bool StepRepeat(int32 Dir, int32& LastDir, float& NextTime, float Now)
+	{
+		if (Dir == 0)
+		{
+			// RESET, not "leave it alone". Without this, releasing the D-pad and pressing the SAME
+			// direction again inside the repeat window would be read as a still-held direction and
+			// would silently swallow the second press.
+			LastDir = 0;
+			return false;
+		}
+
+		if (Dir != LastDir)
+		{
+			// Direction just became held: act immediately, then wait out the longer first delay.
+			LastDir = Dir;
+			NextTime = Now + RepeatDelay;
+			return true;
+		}
+
+		if (Now >= NextTime)
+		{
+			NextTime = Now + RepeatInterval;
+			return true;
+		}
+
+		return false;
 	}
 }
 
@@ -538,8 +647,18 @@ bool UTraceGamepadInputSubsystem::Tick(float /*DeltaSeconds*/)
 	// page cannot tell them apart.
 	//
 	// AnyKey is the cheap way to ask "did anything at all arrive", but it is a KEYBOARD-inclusive
-	// wildcard, so the two sticks and the four cardinal face buttons are polled instead: between them
-	// they cover every pad a player will pick up, and none of them can be produced by a keyboard.
+	// wildcard, so the pad's own keys are polled instead: none of them can be produced by a keyboard.
+	//
+	// *** THE LIST IS COMPLETE, AND IT WAS NOT. *** It used to stop after D-pad UP and DOWN, with a
+	// comment claiming the probes "cover every pad a player will pick up". D32-PADMENU disproved that
+	// with a screenshot: a run that pressed only D-pad LEFT — a perfectly ordinary thing to do on a
+	// two-plate screen whose choices are side by side — moved the highlight and still reported no
+	// controller, so the team screen drew no pad captions for a player who was visibly using one.
+	//
+	// LEFT and RIGHT are now here, and so are the eight DIGITAL STICK keys. The sticks were thought to
+	// be covered by the analog test below, and for a real pad they are; but the synthetic path — and
+	// any platform layer that reports a flick as its digital key without an analog sample — produced
+	// exactly the same silent miss.
 	if (!bSeenGamepadInput)
 	{
 		static const FKey Probes[] =
@@ -549,7 +668,13 @@ bool UTraceGamepadInputSubsystem::Tick(float /*DeltaSeconds*/)
 			EKeys::Gamepad_Special_Left,      EKeys::Gamepad_Special_Right,
 			EKeys::Gamepad_LeftShoulder,      EKeys::Gamepad_RightShoulder,
 			EKeys::Gamepad_LeftTrigger,       EKeys::Gamepad_RightTrigger,
+			EKeys::Gamepad_LeftThumbstick,    EKeys::Gamepad_RightThumbstick,
 			EKeys::Gamepad_DPad_Up,           EKeys::Gamepad_DPad_Down,
+			EKeys::Gamepad_DPad_Left,         EKeys::Gamepad_DPad_Right,
+			EKeys::Gamepad_LeftStick_Up,      EKeys::Gamepad_LeftStick_Down,
+			EKeys::Gamepad_LeftStick_Left,    EKeys::Gamepad_LeftStick_Right,
+			EKeys::Gamepad_RightStick_Up,     EKeys::Gamepad_RightStick_Down,
+			EKeys::Gamepad_RightStick_Left,   EKeys::Gamepad_RightStick_Right,
 		};
 
 		for (const FKey& Probe : Probes)
@@ -1527,6 +1652,639 @@ namespace TraceGamepadVerify
 	};
 
 	TSharedPtr<FDrive> FDrive::Instance;
+
+	// ---------------------------------------------------------------------------------------------
+	// D32-PADMENU — Trace.Pad.Menu, the synthetic THUMB
+	// ---------------------------------------------------------------------------------------------
+	//
+	// A scripted sequence of pad button presses, spaced over real frames.
+	//
+	// *** WHY A SEQUENCER AND NOT ONE COMMAND PER PRESS. ***
+	// A press is only observable on the NEXT UPlayerInput::ProcessInputStack: UPlayerInput::InputKey
+	// writes an EventAccumulator, and bDown / EventCounts — the two things WasInputKeyJustPressed and
+	// IsInputKeyDown actually read — are filled from it when the player controller ticks. So a press
+	// and its release inside one callback are a press no screen can see. And -TraceExec fires its
+	// whole command list in ONE callback (see UI/TraceAutoShot.h), so "down, down, a" as three
+	// console commands is three presses in one frame, i.e. zero presses.
+	//
+	// Each step therefore holds its button for HoldSeconds — long enough for several player-input
+	// ticks, and SHORTER than TracePadMenu::RepeatDelay so one step is one move and never two — then
+	// releases it and waits GapSeconds before the next.
+	//
+	// EVERY SCREEN THIS DRIVES IS DRIVEN THROUGH ITS OWN POLLING. Nothing here calls MoveSelection,
+	// ActivateSelection, Confirm or a Server RPC. The only thing injected is a BUTTON, at
+	// UGameViewportClient::InputKey — the very call FSceneViewport makes for a physical pad — so a
+	// run that passes with the screen's polling disconnected is not a run this can produce.
+
+	struct FPadMenuScript : TSharedFromThis<FPadMenuScript>
+	{
+		static TSharedPtr<FPadMenuScript> Instance;
+
+		/** Long enough for several player-input ticks; shorter than TracePadMenu::RepeatDelay. */
+		static constexpr float HoldSeconds = 0.20f;
+		static constexpr float GapSeconds = 0.24f;
+
+		/**
+		 * WHERE THE CURRENT STEP IS. AN EXPLICIT STATE MACHINE, and the first version was not.
+		 *
+		 * That version inferred the state from an elapsed-time comparison and a bPressed flag, and it
+		 * PRESSED THE SAME BUTTON FOREVER: after the release cleared the flag, the very next tick read
+		 * "not pressed" and pressed again, so the step only advanced on a frame long enough to skip
+		 * the whole hold-and-gap window in one go. Measured in the first title-screen run — the log
+		 * shows `1/4 press / 1/4 release` eighteen times, and the index only moved when a screenshot
+		 * flush stalled one frame for 1.1 s. Three named states cannot express that bug.
+		 */
+		enum class EStep : uint8
+		{
+			Press,     // inject the down edge on this tick
+			Hold,      // wait out HoldSeconds, then inject the up edge
+			Gap,       // wait out GapSeconds, then move to the next token
+		};
+
+		TArray<FKey> Keys;
+		TArray<FString> Names;
+
+		int32 Index = 0;
+		float StepSeconds = 0.f;
+		EStep Step = EStep::Press;
+		FTSTicker::FDelegateHandle Handle;
+
+		/** "down" -> Gamepad_DPad_Down. Returns an invalid key for a token that is not a button. */
+		static FKey KeyForToken(const FString& Token)
+		{
+			const FString T = Token.ToLower();
+			if (T == TEXT("up"))      { return EKeys::Gamepad_DPad_Up; }
+			if (T == TEXT("down"))    { return EKeys::Gamepad_DPad_Down; }
+			if (T == TEXT("left"))    { return EKeys::Gamepad_DPad_Left; }
+			if (T == TEXT("right"))   { return EKeys::Gamepad_DPad_Right; }
+			if (T == TEXT("lup"))     { return EKeys::Gamepad_LeftStick_Up; }
+			if (T == TEXT("ldown"))   { return EKeys::Gamepad_LeftStick_Down; }
+			if (T == TEXT("lleft"))   { return EKeys::Gamepad_LeftStick_Left; }
+			if (T == TEXT("lright"))  { return EKeys::Gamepad_LeftStick_Right; }
+			if (T == TEXT("a"))       { return TracePadMenu::ConfirmKey(); }
+			if (T == TEXT("b"))       { return TracePadMenu::BackKey(); }
+			if (T == TEXT("x"))       { return TracePadMenu::AltKey(); }
+			if (T == TEXT("y"))       { return EKeys::Gamepad_FaceButton_Top; }
+			if (T == TEXT("menu"))    { return EKeys::Gamepad_Special_Right; }
+			if (T == TEXT("view"))    { return EKeys::Gamepad_Special_Left; }
+			// "wait" is a deliberate no-key step: it is how a script gives a screen time to travel,
+			// replicate or close between two presses.
+			if (T == TEXT("wait"))    { return FKey(); }
+			return FKey(NAME_None);
+		}
+
+		static void Start(const TArray<FString>& Args)
+		{
+			Stop();
+
+			if (Args.Num() == 0)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[PadMenu] Trace.Pad.Menu needs at least one of: up down left right lup ldown ")
+					TEXT("lleft lright a b x y menu view wait."));
+				return;
+			}
+
+			TSharedRef<FPadMenuScript> Script = MakeShared<FPadMenuScript>();
+			for (const FString& Arg : Args)
+			{
+				const FKey Key = KeyForToken(Arg);
+				if (Key.GetFName() == NAME_None && !Arg.Equals(TEXT("wait"), ESearchCase::IgnoreCase))
+				{
+					UE_LOG(LogTraceGame, Warning, TEXT("[PadMenu] '%s' is not a token I know; skipped."), *Arg);
+					continue;
+				}
+				Script->Keys.Add(Key);
+				Script->Names.Add(Key.IsValid() ? UTraceUserSettings::DescribePadKey(Key) : FString(TEXT("(wait)")));
+			}
+
+			if (Script->Keys.Num() == 0)
+			{
+				return;
+			}
+
+			Instance = Script;
+			Script->Handle = FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateSP(Script, &FPadMenuScript::Tick), 0.f);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[PadMenu] Driving %d synthetic pad press(es), %.2fs held / %.2fs apart, through "
+					"UGameViewportClient::InputKey. Controller input is %s."),
+				Script->Keys.Num(), HoldSeconds, GapSeconds,
+				TracePadMenu::IsEnabled() ? TEXT("ON") : TEXT("OFF (nothing should respond)"));
+		}
+
+		static void Stop()
+		{
+			if (Instance.IsValid())
+			{
+				// A half-finished script must not leave a button latched down for the rest of the run.
+				if (Instance->Step == EStep::Hold && Instance->Keys.IsValidIndex(Instance->Index)
+					&& Instance->Keys[Instance->Index].IsValid())
+				{
+					InjectButton(CurrentController(), Instance->Keys[Instance->Index], /*bPressed=*/false);
+				}
+				if (Instance->Handle.IsValid())
+				{
+					FTSTicker::GetCoreTicker().RemoveTicker(Instance->Handle);
+				}
+				Instance.Reset();
+			}
+		}
+
+		static APlayerController* CurrentController()
+		{
+			UWorld* const World = (GEngine != nullptr) ? GEngine->GetCurrentPlayWorld() : nullptr;
+			return TraceGamepadInputImpl::FindLocalController((World != nullptr) ? World->GetGameInstance() : nullptr);
+		}
+
+		bool Tick(float DeltaSeconds)
+		{
+			APlayerController* const PC = CurrentController();
+			if (PC == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[PadMenu] No local player controller; sequence abandoned."));
+				Instance.Reset();
+				return false;
+			}
+
+			switch (Step)
+			{
+			case EStep::Press:
+				// The down edge goes in on its OWN tick and the clock starts at zero afterwards, so
+				// the button is guaranteed to be down across at least one whole engine frame — which
+				// is what UPlayerInput::ProcessInputStack needs before WasInputKeyJustPressed and
+				// IsInputKeyDown can report it at all.
+				if (Keys[Index].IsValid())
+				{
+					InjectButton(PC, Keys[Index], /*bPressed=*/true);
+				}
+				UE_LOG(LogTraceGame, Display, TEXT("[PadMenu] %d/%d  press    %s"),
+					Index + 1, Keys.Num(), *Names[Index]);
+				Step = EStep::Hold;
+				StepSeconds = 0.f;
+				return true;
+
+			case EStep::Hold:
+				StepSeconds += DeltaSeconds;
+				if (StepSeconds < HoldSeconds)
+				{
+					return true;
+				}
+				if (Keys[Index].IsValid())
+				{
+					InjectButton(PC, Keys[Index], /*bPressed=*/false);
+				}
+				UE_LOG(LogTraceGame, Display, TEXT("[PadMenu] %d/%d  release  %s"),
+					Index + 1, Keys.Num(), *Names[Index]);
+				Step = EStep::Gap;
+				StepSeconds = 0.f;
+				return true;
+
+			case EStep::Gap:
+			default:
+				StepSeconds += DeltaSeconds;
+				if (StepSeconds < GapSeconds)
+				{
+					return true;
+				}
+				break;
+			}
+
+			++Index;
+			StepSeconds = 0.f;
+			Step = EStep::Press;
+
+			if (!Keys.IsValidIndex(Index))
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[PadMenu] Sequence complete (%d press(es))."), Keys.Num());
+				if (Instance.IsValid())
+				{
+					Instance->Handle.Reset();
+					Instance.Reset();
+				}
+				return false;
+			}
+			return true;
+		}
+	};
+
+	TSharedPtr<FPadMenuScript> FPadMenuScript::Instance;
+
+	// ---------------------------------------------------------------------------------------------
+	// D32-PADMENU — Trace.Pad.MenuVerify
+	// ---------------------------------------------------------------------------------------------
+	//
+	// What the four menu screens actually depend on, asserted against the LIVE input pipeline.
+	//
+	// SEVEN OF ITS NINETEEN CHECKS ARE NEGATIVE CONTROLS, because a check that cannot fail proves
+	// nothing. THREE WHOLE ARMS are one — nothing pressed at all, a released button, and the whole
+	// thing with CONTROLLER INPUT switched off — and FOUR MORE sit INSIDE the positive arms, which is
+	// the half that is easy to skip: A must not also read as BACK or as the second verb, and a D-pad
+	// direction must move its own axis and NOT the other one. Without those four, a helper that
+	// answered "any button" or "any direction" for everything would pass every positive arm.
+	//
+	// The pure StepRepeat arm is bounded above as well as below: a repeat clock that fired every
+	// frame would pass a "did it move at all" check.
+
+	struct FPadMenuVerify : TSharedFromThis<FPadMenuVerify>
+	{
+		enum class EPhase : uint8
+		{
+			Idle,          // nothing injected — negative control
+			AHeld,         // A down
+			AReleased,     // A up — negative control
+			DownHeld,      // D-pad down
+			RightHeld,     // D-pad right
+			StickLeft,     // left stick's digital LEFT — the stick twin of the D-pad
+			PadOff,        // A down with CONTROLLER INPUT off — negative control
+			Done,
+		};
+
+		static TSharedPtr<FPadMenuVerify> Instance;
+		static constexpr float PhaseSeconds = 0.35f;
+
+		/**
+		 * The first tick of a phase still reads the PREVIOUS phase's key state, because this ticker
+		 * runs before the player controller does. Same margin, same reason, as FDrive::SettleMargin.
+		 */
+		static constexpr float SettleMargin = 0.12f;
+
+		EPhase Phase = EPhase::Idle;
+		float Seconds = 0.f;
+		bool bEntered = false;
+		bool bMeasuring = false;
+
+		bool bSawConfirm = false;
+		bool bSawBack = false;
+		bool bSawAlt = false;
+		int32 SawNavX = 0;
+		int32 SawNavY = 0;
+		bool bNavXWasNonZero = false;
+		bool bNavYWasNonZero = false;
+
+		bool bRestorePadEnabled = true;
+		FTSTicker::FDelegateHandle Handle;
+
+		static void Start()
+		{
+			if (Instance.IsValid())
+			{
+				return;
+			}
+			GFailures = 0;
+			Instance = MakeShared<FPadMenuVerify>();
+			Instance->Handle = FTSTicker::GetCoreTicker().AddTicker(
+				FTickerDelegate::CreateSP(Instance.ToSharedRef(), &FPadMenuVerify::Tick), 0.f);
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[PadMenu] VERIFY: the menu vocabulary every pad-driven screen reads. Seven arms, "
+					"nineteen checks; seven of the checks are negative controls (three whole arms, and "
+					"four more inside the positive ones)."));
+
+			// ---- The pure half, run immediately: it needs no frames -----------------------------
+			StaticChecks();
+		}
+
+		static void StaticChecks()
+		{
+			const FKey A = TracePadMenu::ConfirmKey();
+			const FKey B = TracePadMenu::BackKey();
+			const FKey X = TracePadMenu::AltKey();
+
+			Check(A != B && B != X && A != X, TEXT("CONFIRM, BACK and the second verb are three different buttons"),
+				FString::Printf(TEXT("%s / %s / %s"), *UTraceUserSettings::DescribePadKey(A),
+					*UTraceUserSettings::DescribePadKey(B), *UTraceUserSettings::DescribePadKey(X)));
+
+			Check(UTraceUserSettings::IsBindablePadKey(A) && UTraceUserSettings::IsBindablePadKey(B)
+				&& UTraceUserSettings::IsBindablePadKey(X),
+				TEXT("all three are real pad buttons"),
+				TEXT("IsBindablePadKey accepts each one, so none of them is a keyboard key that would "
+					"never arrive from a controller"));
+
+			// MENU/START is the pause key (TickMenuButton). A menu whose CONFIRM was also pause would
+			// activate a row and open the pause menu on one press.
+			Check(A != EKeys::Gamepad_Special_Right && B != EKeys::Gamepad_Special_Right
+				&& X != EKeys::Gamepad_Special_Right,
+				TEXT("none of the three is MENU/START, which is the pause key"), FString());
+
+			// A menu button that is also a NAV key would move the highlight and activate it at once.
+			const FKey NavKeys[] =
+			{
+				EKeys::Gamepad_DPad_Up,        EKeys::Gamepad_DPad_Down,
+				EKeys::Gamepad_DPad_Left,      EKeys::Gamepad_DPad_Right,
+				EKeys::Gamepad_LeftStick_Up,   EKeys::Gamepad_LeftStick_Down,
+				EKeys::Gamepad_LeftStick_Left, EKeys::Gamepad_LeftStick_Right,
+			};
+			bool bClash = false;
+			for (const FKey& Nav : NavKeys)
+			{
+				bClash = bClash || (Nav == A) || (Nav == B) || (Nav == X);
+			}
+			Check(!bClash, TEXT("no menu button is also one of the eight navigation keys"),
+				TEXT("4 D-pad keys + the left stick's 4 digital keys"));
+
+			// ---- The repeat clock, bounded at BOTH ends ------------------------------------------
+			{
+				int32 LastDir = 0;
+				float NextTime = 0.f;
+				int32 Steps = 0;
+
+				// One fresh press: exactly one step, however many frames it is held for.
+				for (float T = 0.f; T < TracePadMenu::RepeatDelay * 0.9f; T += 0.02f)
+				{
+					Steps += TracePadMenu::StepRepeat(1, LastDir, NextTime, T) ? 1 : 0;
+				}
+				Check(Steps == 1, TEXT("a held direction steps ONCE before the repeat delay"),
+					FString::Printf(TEXT("%d step(s) over %.2fs of holding, delay is %.2fs"),
+						Steps, TracePadMenu::RepeatDelay * 0.9f, TracePadMenu::RepeatDelay));
+
+				// Then it repeats — but at the stated interval, not every frame.
+				const int32 Before = Steps;
+				for (float T = TracePadMenu::RepeatDelay * 0.9f; T < TracePadMenu::RepeatDelay + 0.30f; T += 0.02f)
+				{
+					Steps += TracePadMenu::StepRepeat(1, LastDir, NextTime, T) ? 1 : 0;
+				}
+				const int32 Repeats = Steps - Before;
+				const int32 Expected = FMath::FloorToInt(0.30f / TracePadMenu::RepeatInterval) + 1;
+				Check(Repeats >= 1 && Repeats <= Expected + 1,
+					TEXT("and then repeats at the stated interval, not every frame"),
+					FString::Printf(TEXT("%d repeat(s) in the 0.30s after the delay; %.2fs interval "
+						"predicts about %d, a per-frame clock would give 15"),
+						Repeats, TracePadMenu::RepeatInterval, Expected));
+
+				// Release and press the same direction again: a NEW press, not a swallowed repeat.
+				int32 Again = 0;
+				TracePadMenu::StepRepeat(0, LastDir, NextTime, 1.0f);
+				Again += TracePadMenu::StepRepeat(1, LastDir, NextTime, 1.01f) ? 1 : 0;
+				Check(Again == 1, TEXT("releasing and re-pressing the same direction steps again"),
+					TEXT("without the LastDir reset this press lands inside the previous repeat window "
+						"and is silently swallowed"));
+			}
+		}
+
+		static float DurationOf(EPhase) { return PhaseSeconds; }
+
+		bool Tick(float DeltaSeconds)
+		{
+			APlayerController* const PC = FPadMenuScript::CurrentController();
+			if (PC == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[PadMenu] VERIFY: no local player controller."));
+				Finish();
+				return false;
+			}
+
+			if (!bEntered)
+			{
+				Enter(PC);
+			}
+
+			Seconds += DeltaSeconds;
+
+			if (!bMeasuring && Seconds >= SettleMargin)
+			{
+				bMeasuring = true;
+				bSawConfirm = false;
+				bSawBack = false;
+				bSawAlt = false;
+				SawNavX = 0;
+				SawNavY = 0;
+				bNavXWasNonZero = false;
+				bNavYWasNonZero = false;
+
+				// *** THE INJECTION HAPPENS HERE, NOT AT PHASE ENTRY. ***
+				// It used to happen at entry and the "A reaches CONFIRM" arm FAILED on the first
+				// honest run — a false negative, and a clean example of why an arm that has never
+				// been red is worth nothing. WasInputKeyJustPressed is true for exactly ONE
+				// player-input tick, and a press injected at entry has that tick inside the settle
+				// margin, which is the window this test throws away. Injecting at the moment
+				// measurement opens puts the one tick that carries the edge inside the window that
+				// looks for it. Phase ENTRY still does the tear-down of the previous phase (release
+				// its key, flip the setting), which is what the margin is genuinely for.
+				BeginMeasuring(PC);
+			}
+
+			if (bMeasuring)
+			{
+				bSawConfirm = bSawConfirm || TracePadMenu::ConfirmPressed(PC);
+				bSawBack    = bSawBack    || TracePadMenu::BackPressed(PC);
+				bSawAlt     = bSawAlt     || TracePadMenu::AltPressed(PC);
+
+				const int32 X = TracePadMenu::NavX(PC);
+				const int32 Y = TracePadMenu::NavY(PC);
+				if (X != 0) { SawNavX = X; bNavXWasNonZero = true; }
+				if (Y != 0) { SawNavY = Y; bNavYWasNonZero = true; }
+			}
+
+			if (Seconds >= DurationOf(Phase))
+			{
+				Leave(PC);
+			}
+
+			if (Phase == EPhase::Done)
+			{
+				Finish();
+				return false;
+			}
+			return true;
+		}
+
+		/** Phase entry: undo the PREVIOUS phase. Nothing this phase is testing is injected here. */
+		void Enter(APlayerController* PC)
+		{
+			bEntered = true;
+			bMeasuring = false;
+			Seconds = 0.f;
+
+			switch (Phase)
+			{
+			case EPhase::AReleased: InjectButton(PC, TracePadMenu::ConfirmKey(), false); break;
+			case EPhase::RightHeld: InjectButton(PC, EKeys::Gamepad_DPad_Down, false); break;
+			case EPhase::StickLeft: InjectButton(PC, EKeys::Gamepad_DPad_Right, false); break;
+			case EPhase::PadOff:
+			{
+				InjectButton(PC, EKeys::Gamepad_LeftStick_Left, false);
+				UTraceUserSettings& Settings = UTraceUserSettings::Get();
+				bRestorePadEnabled = Settings.bPadEnabled;
+				// The state the OFF toggle on the CONTROLLER page actually produces. The field is
+				// written directly rather than through Save(), because a Save here would rewrite the
+				// player's .ini for the duration of a check.
+				Settings.bPadEnabled = false;
+				break;
+			}
+			default:
+				break;
+			}
+		}
+
+		/** The moment measurement opens: inject what THIS phase is about. See the call site. */
+		void BeginMeasuring(APlayerController* PC)
+		{
+			switch (Phase)
+			{
+			case EPhase::AHeld:     InjectButton(PC, TracePadMenu::ConfirmKey(), true); break;
+			case EPhase::DownHeld:  InjectButton(PC, EKeys::Gamepad_DPad_Down, true); break;
+			case EPhase::RightHeld: InjectButton(PC, EKeys::Gamepad_DPad_Right, true); break;
+			case EPhase::StickLeft: InjectButton(PC, EKeys::Gamepad_LeftStick_Left, true); break;
+
+			// The negative control's positive half: A really is pressed, it is only the SETTING that
+			// is off. An arm that injected nothing here would pass with the gate deleted.
+			case EPhase::PadOff:    InjectButton(PC, TracePadMenu::ConfirmKey(), true); break;
+
+			// Idle and AReleased inject nothing, on purpose: they are the two arms whose whole claim
+			// is that nothing arrives.
+			default:
+				break;
+			}
+		}
+
+		void Leave(APlayerController* PC)
+		{
+			switch (Phase)
+			{
+			case EPhase::Idle:
+				Check(!bSawConfirm && !bSawBack && !bSawAlt && !bNavXWasNonZero && !bNavYWasNonZero,
+					TEXT("[control] nothing pressed, nothing reads as pressed"),
+					FString::Printf(TEXT("confirm=%d back=%d alt=%d navX=%d navY=%d"),
+						bSawConfirm ? 1 : 0, bSawBack ? 1 : 0, bSawAlt ? 1 : 0,
+						bNavXWasNonZero ? 1 : 0, bNavYWasNonZero ? 1 : 0));
+				break;
+
+			case EPhase::AHeld:
+				Check(bSawConfirm, TEXT("A reaches CONFIRM"), TEXT("injected at the viewport, read back "
+					"through the same TracePadMenu::ConfirmPressed every screen calls"));
+				// NEGATIVE CONTROL INSIDE THE POSITIVE ARM: without it, a helper that answered "any
+				// button" for all three would pass every arm above.
+				Check(!bSawBack && !bSawAlt, TEXT("[control] A is not also BACK or the second verb"),
+					FString::Printf(TEXT("back=%d alt=%d"), bSawBack ? 1 : 0, bSawAlt ? 1 : 0));
+				Check(!bNavXWasNonZero && !bNavYWasNonZero,
+					TEXT("[control] A moves no highlight"),
+					FString::Printf(TEXT("navX=%d navY=%d"), SawNavX, SawNavY));
+				break;
+
+			case EPhase::AReleased:
+				Check(!bSawConfirm, TEXT("[control] CONFIRM is false once A is released"), FString());
+				break;
+
+			case EPhase::DownHeld:
+				Check(bNavYWasNonZero && SawNavY == 1, TEXT("D-pad DOWN is +1 on the vertical axis"),
+					FString::Printf(TEXT("navY=%d"), SawNavY));
+				Check(!bNavXWasNonZero, TEXT("[control] and moves nothing horizontally"),
+					FString::Printf(TEXT("navX=%d"), SawNavX));
+				break;
+
+			case EPhase::RightHeld:
+				Check(bNavXWasNonZero && SawNavX == 1, TEXT("D-pad RIGHT is +1 on the horizontal axis"),
+					FString::Printf(TEXT("navX=%d"), SawNavX));
+				Check(!bNavYWasNonZero, TEXT("[control] and moves nothing vertically"),
+					FString::Printf(TEXT("navY=%d"), SawNavY));
+				break;
+
+			case EPhase::StickLeft:
+				Check(bNavXWasNonZero && SawNavX == -1,
+					TEXT("the LEFT STICK's digital keys drive the same axis as the D-pad"),
+					FString::Printf(TEXT("navX=%d — this is what lets a player who never finds the "
+						"D-pad still walk a menu"), SawNavX));
+				break;
+
+			case EPhase::PadOff:
+			{
+				Check(!bSawConfirm && !bNavXWasNonZero && !bNavYWasNonZero,
+					TEXT("[control] with CONTROLLER INPUT off, a held A does nothing at all"),
+					FString::Printf(TEXT("confirm=%d navX=%d navY=%d — the same gate TickMenuButton "
+						"puts on MENU/START"), bSawConfirm ? 1 : 0, SawNavX, SawNavY));
+
+				UTraceUserSettings& Settings = UTraceUserSettings::Get();
+				Settings.bPadEnabled = bRestorePadEnabled;
+				InjectButton(PC, TracePadMenu::ConfirmKey(), false);
+				Check(TracePadMenu::IsEnabled() == bRestorePadEnabled,
+					TEXT("CONTROLLER INPUT was put back the way it was found"),
+					FString::Printf(TEXT("now %s"), bRestorePadEnabled ? TEXT("ON") : TEXT("OFF")));
+				break;
+			}
+
+			default:
+				break;
+			}
+
+			Phase = static_cast<EPhase>(static_cast<uint8>(Phase) + 1);
+			bEntered = false;
+		}
+
+		void Finish()
+		{
+			if (GFailures == 0)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[PadMenu] VERIFY VERDICT: the menu vocabulary holds. 0 failure(s)."));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error, TEXT("[PadMenu] VERIFY VERDICT: %d failure(s)."), GFailures);
+			}
+
+			if (Instance.IsValid())
+			{
+				Instance->Handle.Reset();
+				Instance.Reset();
+			}
+		}
+	};
+
+	TSharedPtr<FPadMenuVerify> FPadMenuVerify::Instance;
+
+	/**
+	 * D32-PADMENU — Trace.Pad.Enable <0|1>.
+	 *
+	 * The CONTROLLER INPUT toggle, from the console, so the OFF case can be a NEGATIVE CONTROL on any
+	 * screen rather than only inside Trace.Pad.MenuVerify's own arm. The title screen is the one that
+	 * needs it: MenuVerify cannot be run there (its A arm would start a match), so without this there
+	 * was no way to show that the same synthetic presses that walk the menu do nothing when a player
+	 * has switched their pad off.
+	 *
+	 * IN MEMORY ONLY — it writes the field and re-applies the context, and deliberately does NOT
+	 * Save(). A dev command that left a player's TraceUserSettings.ini with their controller disabled
+	 * is a support ticket nobody would connect back to a verification run.
+	 */
+	FAutoConsoleCommand CmdPadEnable(
+		TEXT("Trace.Pad.Enable"),
+		TEXT("D32-PADMENU, dev only. Trace.Pad.Enable <0|1> - flips CONTROLLER INPUT for this session "
+			"without saving it, so the OFF case can be used as a negative control."),
+		FConsoleCommandWithArgsDelegate::CreateLambda(
+			[](const TArray<FString>& Args)
+			{
+				const bool bWant = (Args.Num() == 0) || (FCString::Atoi(*Args[0]) != 0);
+				UTraceUserSettings::Get().bPadEnabled = bWant;
+
+				UWorld* const World = (GEngine != nullptr) ? GEngine->GetCurrentPlayWorld() : nullptr;
+				if (UTraceGamepadInputSubsystem* const Pad = UTraceGamepadInputSubsystem::Get(World))
+				{
+					Pad->ApplyPadSettings();
+				}
+
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[Pad] CONTROLLER INPUT is now %s (this session only; nothing was saved)."),
+					bWant ? TEXT("ON") : TEXT("OFF"));
+			}));
+
+	FAutoConsoleCommand CmdPadMenu(
+		TEXT("Trace.Pad.Menu"),
+		TEXT("D32-PADMENU. Trace.Pad.Menu <token> [<token> ...] - drives the menus with synthetic pad "
+			"button presses, one at a time, spaced over real frames. Tokens: up down left right (D-pad), "
+			"lup ldown lleft lright (left stick), a b x y, menu, view, wait. Each is held 0.20s and "
+			"released, which is one navigation step and never two. Nothing is called directly: the "
+			"button goes in at UGameViewportClient::InputKey and every screen reads it through its own "
+			"polling."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&FPadMenuScript::Start));
+
+	FAutoConsoleCommand CmdPadMenuVerify(
+		TEXT("Trace.Pad.MenuVerify"),
+		TEXT("D32-PADMENU. Proves the pad's MENU vocabulary against the live input pipeline: A is "
+			"CONFIRM and only CONFIRM, B is BACK, the D-pad and the left stick drive the same two axes, "
+			"the shared repeat clock steps once per press, and CONTROLLER INPUT off silences all of it. "
+			"Seven of its nineteen checks are negative controls. Takes about 2.5s. Run it in a match, "
+			"not on the title screen, where a synthetic A would start one."),
+		FConsoleCommandDelegate::CreateStatic(&FPadMenuVerify::Start));
 
 	FAutoConsoleCommand CmdPadStatus(
 		TEXT("Trace.Pad.Status"),

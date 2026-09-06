@@ -31,6 +31,13 @@
 		{
 			"Name": "MultiUserClient",
 			"Enabled": true
+		},
+		{
+			"Name": "RawInput",
+			"Enabled": true,
+			"Optional": true,
+			"PlatformAllowList": [ "Win64" ],
+			"Description": "D32-DINPUT. Windows-only generic HID (\"DirectInput\") gamepads, wheels and sticks, which XInput does not see. Optional because the plugin carries DeprecatedEngineVersion 5.8 and will be removed from a future engine: without Optional, that removal turns into 'Unable to find plugin RawInput' and nobody can build. See Config/DefaultInput.ini for what it does and does not cover."
 		}
 	]
 }

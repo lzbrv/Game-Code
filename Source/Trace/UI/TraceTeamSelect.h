@@ -3,6 +3,13 @@
 // Verbatim: "Add an option to switch teams while in a hosted match. Players can hit H to pull up a
 // team select menu. Players should load into team select before character select."
 //
+// D32-PADMENU: A CONTROLLER DRIVES THIS SCREEN TOO. D-pad or left stick moves the highlight, A
+// confirms, B closes (the pad's H), X changes character (the pad's C). The buttons come from
+// TracePadMenu in Settings/TraceGamepadInput.h so that this screen, the character screen, the title
+// screen and the options overlay cannot disagree about what A means; the REPEAT CLOCK stays this
+// screen's own, shared with its arrow keys, so a thumb and a finger scroll at the same speed here.
+// The one thing a pad cannot do is OPEN this screen mid-match — see PollOpenHotkey.
+//
 // SHAPED EXACTLY LIKE FTraceCharacterSelect, and read that file's header first — every argument it
 // makes applies here unchanged. It is plain C++ rather than a UObject (it holds nothing that
 // outlives a frame and never replicates), it draws entirely through AHUD::DrawRect / DrawText, and
@@ -85,6 +92,13 @@ public:
 	 * edges of it: this opens the screen and PollInput's own H closes it again. Returns true when a
 	 * request was sent — the host ignores it today, and it is returned anyway because the caller that
 	 * eventually wants to swallow the key press should not have to re-derive whether one happened.
+	 *
+	 * *** KEYBOARD ONLY, AND D32-PADMENU LEFT IT THAT WAY DELIBERATELY. *** This poll runs during
+	 * GAMEPLAY, so any pad button it read would have to be one no gameplay verb is using — and the
+	 * shipped layout uses all sixteen a standard controller has, with MENU/START spent on pause. The
+	 * .cpp has the full argument and the two fixes that would remove the gap. Nothing a pad player
+	 * NEEDS is behind this key: the join flow opens the screen by itself, and once it is up a pad
+	 * drives all of it.
 	 */
 	static bool PollOpenHotkey(ATracePlayerController* PC);
 

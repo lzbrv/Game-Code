@@ -1,5 +1,11 @@
 // Trace — D31-PAD: the gamepad's own Enhanced Input mapping context.
 //
+// D32-PADMENU ALSO LIVES HERE, at the bottom of this file: `namespace TracePadMenu` is the one
+// place the pad's MENU vocabulary (A confirms, B goes back, the D-pad and the left stick move a
+// highlight) is written down, so the title screen, the character select, the team select and the
+// options overlay cannot drift into four different answers. Read that block before adding a fifth
+// pad-driven screen.
+//
 // THE OWNER'S ASK, VERBATIM: "Add a subpage within settings for controller keybinds. Create a
 // default mapping, so that if a player connects a controller with Bluetooth instead/in addition to a
 // mouse or trackpad they can use a controller."
@@ -111,6 +117,15 @@ public:
 	 * A READOUT AND NEVER A GATE — see the hot-plug note in this file's header. It exists so the
 	 * controller settings page can say "NO CONTROLLER SEEN YET" instead of leaving a player who has
 	 * paired nothing staring at a page of binds wondering why they do nothing.
+	 *
+	 * D32-PADMENU gave it a second reader, on the same terms: the four pad-driven screens print their
+	 * button captions only once this is true, so a keyboard-only player is never told about buttons
+	 * they do not have. STILL NEVER A GATE ON INPUT — the first button a player presses has to work,
+	 * and it cannot if a screen is waiting to have seen one.
+	 *
+	 * THE PROBE LIST IN Tick() IS WHAT MAKES THIS TRUE OR FALSE, and D32 had to widen it: it stopped
+	 * after D-pad UP and DOWN, so a player who pressed only D-pad LEFT — the obvious thing to do on a
+	 * screen with two choices side by side — moved the highlight and still reported no controller.
 	 */
 	bool HasSeenGamepadInput() const { return bSeenGamepadInput; }
 
@@ -186,3 +201,165 @@ private:
 	/** Latches the "no input assets, and the C++ fallback did not name what I needed" warning. */
 	bool bResolveFailureReported = false;
 };
+
+// =================================================================================================
+// D32-PADMENU — the ONE place the pad's menu vocabulary is written down
+// =================================================================================================
+//
+// THE OWNER'S ASK, VERBATIM: "Make a connected controller work on the main menu and character select
+// menus."
+//
+// -------------------------------------------------------------------------------------------------
+// WHY THIS IS A SHARED NAMESPACE AND NOT FOUR COPIES OF THE SAME `if`
+// -------------------------------------------------------------------------------------------------
+// D31-PAD made the OPTIONS OVERLAY pad-navigable by reading the D-pad, the left stick's digital keys
+// and three face buttons inline in FTraceOptionsMenu::PollNavigation. That was right for one screen.
+// D32 adds three more — the title screen, the character select and the team select — and four
+// independent copies of "which button means yes" is precisely how a player ends up with A confirming
+// on one screen and B confirming on the next.
+//
+// So the semantics live here, once, and every screen this tranche owns calls these functions:
+//
+//     A  (Gamepad_FaceButton_Bottom)  CONFIRM      the convention on every pad ever shipped
+//     B  (Gamepad_FaceButton_Right)   BACK         ditto, and it is what a thumb reaches for
+//     X  (Gamepad_FaceButton_Left)    the screen's SECOND verb, where it has one, and nothing
+//                                     otherwise. Today that is only the team screen's CHANGE
+//                                     CHARACTER (the C key's twin).
+//     D-pad / left stick              MOVE the highlight
+//     MENU/START                      already an Escape, synthesised by TickMenuButton above
+//
+// *** FTraceOptionsMenu IS NOT ROUTED THROUGH HERE, AND THAT IS A SCHEDULING FACT, NOT A DESIGN. ***
+// UI/TraceOptionsMenu.cpp is another tranche's file this pass. Its inline keys are the SAME keys —
+// A select, B back, D-pad+stick move — which is why the four screens agree today; the check
+// `Trace.Pad.MenuVerify` asserts the agreement rather than trusting this paragraph, so the day
+// somebody edits one of the two, a run says so. When that file next comes free it should call these.
+//
+// -------------------------------------------------------------------------------------------------
+// WHY IT IS POLLED AND NOT BOUND, ON A SCREEN WHOSE KEYBOARD *IS* BOUND
+// -------------------------------------------------------------------------------------------------
+// The title screen's keyboard arrives through ATraceMenuPlayerController::SetupInputComponent, six
+// BindKey calls. The obvious change is six more. Two reasons it is not what happened:
+//
+//   1. Source/Trace/UI/TraceMenuPlayerController.* is NOT in this tranche's ownership line. (Neither
+//      was it in D31-PAD's, which is why that pass's report lists "the title screen is not
+//      pad-navigable" as a known gap and proposes exactly those six lines.)
+//   2. A bound key cannot express a HELD direction. Every other menu in this project walks its
+//      selection on a repeat clock — press once to step, hold to scroll — and BindKey gives one
+//      IE_Pressed edge and nothing else. The keyboard gets away with it because the OS repeats keys;
+//      a D-pad has no OS repeat at all, so a bound pad D-pad would move the highlight exactly once
+//      per physical press. Polling is what the other three screens already do.
+//
+// Nothing here removes, replaces or re-prioritises anything the keyboard or the mouse uses: every
+// function below is a read.
+
+class APlayerController;
+
+namespace TracePadMenu
+{
+	/** A. CONFIRM / activate, on every screen. */
+	TRACE_API const FKey& ConfirmKey();
+
+	/** B. BACK / cancel / close, on every screen. */
+	TRACE_API const FKey& BackKey();
+
+	/** X. The screen's second verb, where it has one. Never "confirm" and never "back". */
+	TRACE_API const FKey& AltKey();
+
+	/**
+	 * Whether a pad may drive a menu at all — i.e. UTraceUserSettings::bPadEnabled.
+	 *
+	 * THE SAME GATE TickMenuButton USES for MENU/START, and it is deliberate that a menu obeys it:
+	 * `CONTROLLER INPUT → OFF` is the escape hatch a player reaches for when a pad with a worn stick
+	 * is jittering, and an OFF that silenced the game but still walked the pause menu would read as
+	 * the setting being broken.
+	 */
+	TRACE_API bool IsEnabled();
+
+	/**
+	 * True once any pad input has been seen on this machine — the gate for a screen's PAD HINTS only.
+	 *
+	 * NEVER A GATE ON INPUT (see UTraceGamepadInputSubsystem::HasSeenGamepadInput, which this
+	 * forwards to): the first button a player presses has to work, and it cannot work if the screen
+	 * is waiting to have seen one. Hints are the opposite case — a keyboard-only player should not be
+	 * told about buttons they do not have, and the moment they touch a pad the caption appears.
+	 *
+	 * Returns false when there is no game instance yet, which is the honest answer.
+	 */
+	TRACE_API bool HasSeenPad(const UObject* WorldContext);
+
+	/**
+	 * -1 / 0 / +1 from the D-pad and the left stick together. X is left/right, Y is up/down (down
+	 * positive, matching every MoveSelection in this project).
+	 *
+	 * THE STICK IS READ AS ITS FOUR DIGITAL KEYS (Gamepad_LeftStick_Left and friends) rather than as
+	 * an axis, exactly as FTraceOptionsMenu::PollNavigation does. The engine synthesises those from
+	 * the stick with its own threshold, so a caller's repeat clock — written for a key that is either
+	 * down or not — works unchanged, and a stick held at half deflection does not scroll a list at
+	 * half speed.
+	 *
+	 * IsInputKeyDown OR WasInputKeyJustPressed, not either alone. Down alone loses a press that began
+	 * and ended between two polls, which is exactly what synthetic injection produces and what a very
+	 * quick tap produces on a laggy frame; just-pressed alone cannot express a HELD direction, which
+	 * is what the repeat clock needs.
+	 */
+	TRACE_API int32 NavX(const APlayerController* PC);
+	TRACE_API int32 NavY(const APlayerController* PC);
+
+	/**
+	 * A / B / X, read as WasInputKeyJustPressed — the same edge the keyboard next to them is read as.
+	 * All three return false when IsEnabled() is false.
+	 *
+	 * *** THESE CAN REPORT ONE PHYSICAL PRESS ON TWO CONSECUTIVE FRAMES. *** Measured, not feared:
+	 * the title-screen run of 2026-09-06 logged `Pad A (confirm) on PLAY` on frame 93 and again on
+	 * frame 94, the frame the ClientTravel began — UPlayerInput only clears EventCounts when
+	 * ProcessInputStack runs, and a frame that is busy loading a map may not run one. Everything that
+	 * already had a latch of its own absorbed it (the character screen's PendingRequest, the team
+	 * screen's RequestCooldown, the title screen's bTravelling), which is why it was invisible until
+	 * a log was read line by line.
+	 *
+	 * A caller for whom "at most once per physical press" is load-bearing — the title screen, where a
+	 * second A would submit the JOIN prompt the first one opened — must use RisingEdge below instead.
+	 */
+	TRACE_API bool ConfirmPressed(const APlayerController* PC);
+	TRACE_API bool BackPressed(const APlayerController* PC);
+	TRACE_API bool AltPressed(const APlayerController* PC);
+
+	/**
+	 * A rising edge computed from the CALLER'S OWN previous sample, which cannot fire twice for one
+	 * press however the engine's frames fall.
+	 *
+	 * The same argument, and the same shape, as UTraceGamepadInputSubsystem::TickMenuButton's handling
+	 * of MENU/START: a remembered down-state is a promise about the physical button, where
+	 * WasInputKeyJustPressed is a promise about a per-frame event list that something else owns.
+	 *
+	 * @param bWasDown in/out, one bool per key per caller. Stale is harmless: a poll that is skipped
+	 *                 for a frame simply leaves the button "already down", which suppresses an edge
+	 *                 rather than inventing one.
+	 * @return true on the frame the button goes from up to down. Always false while IsEnabled() is
+	 *         false — and it still records the state, so switching CONTROLLER INPUT back on under a
+	 *         held button does not fire one.
+	 */
+	TRACE_API bool RisingEdge(const APlayerController* PC, const FKey& Key, bool& bWasDown);
+
+	/**
+	 * Held-key repeat, shared so four screens cannot drift into four scroll speeds.
+	 *
+	 * Matches FTraceOptionsMenu's numbers (0.38 s before the first repeat, then one step every
+	 * 0.14 s). The character select's own keyboard repeat is 0.35/0.12 and is NOT changed by this
+	 * tranche — the pad and the keyboard run separate clocks on that screen, because merging them
+	 * would have meant editing behaviour the owner did not ask about.
+	 */
+	inline constexpr float RepeatDelay = 0.38f;
+	inline constexpr float RepeatInterval = 0.14f;
+
+	/**
+	 * One step of the shared repeat clock.
+	 *
+	 * @param Dir        this frame's direction, -1 / 0 / +1
+	 * @param LastDir    in/out: the previous frame's direction
+	 * @param NextTime   in/out: local time the next repeat is due
+	 * @param Now        local time
+	 * @return true when the caller should move the highlight one step this frame.
+	 */
+	TRACE_API bool StepRepeat(int32 Dir, int32& LastDir, float& NextTime, float Now);
+}
