@@ -366,35 +366,33 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 		}
 	}
 
-	// The Tron materials, resolved the same way ATraceArenaBuilder resolves them: constructor-time
-	// finders so the reference lands on the CDO and the cooker follows it, COMMITTED pair first and
-	// the gitignored legacy pair only as a fallback, and a tolerated miss on both that
-	// MakeViewModelMaterials() turns into a BasicShapeMaterial fallback.
+	// The Tron materials: constructor-time finders so the reference lands on the CDO and the cooker
+	// follows it, and a tolerated miss that MakeViewModelMaterials() turns into a BasicShapeMaterial
+	// fallback. ATraceArenaBuilder still keeps a legacy fallback for these two, but it reaches for it
+	// with LoadObject(LOAD_NoWarn | LOAD_Quiet) AFTER the committed pair has actually failed, which is
+	// why that one stays silent and this one could not.
 	//
 	// Separate static finders per path rather than a loop: ConstructorHelpers::FObjectFinder must be
 	// static and is only legal during construction, so each candidate needs its own.
 	{
+		// ONLY THE COMMITTED PAIR. There used to be a second pair of finders aimed at
+		// /Game/Generated/Materials as a fallback. FObjectFinder is not lazy — it resolves during
+		// construction whether or not the branch that reads it is ever taken — so those two ran on
+		// every CDO and, since the overhaul deleted that gitignored directory, failed on every one,
+		// printing two Errors into every cook for a branch that could no longer fire on any machine.
+		// Error-level noise that is known-harmless is worse than none: it trains a reader to scroll
+		// past the cook log, which is exactly how the bee-swarm defect fixed alongside this survived.
 		static ConstructorHelpers::FObjectFinder<UMaterialInterface> SurfaceFinder(TraceCharacterAssets::SurfaceMaterialPath);
 		static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TraceCharacterAssets::NeonMaterialPath);
-		static ConstructorHelpers::FObjectFinder<UMaterialInterface> LegacySurfaceFinder(TraceCharacterAssets::LegacySurfaceMaterialPath);
-		static ConstructorHelpers::FObjectFinder<UMaterialInterface> LegacyNeonFinder(TraceCharacterAssets::LegacyNeonMaterialPath);
 
 		if (SurfaceFinder.Succeeded())
 		{
 			SurfaceMaterial = SurfaceFinder.Object;
 		}
-		else if (LegacySurfaceFinder.Succeeded())
-		{
-			SurfaceMaterial = LegacySurfaceFinder.Object;
-		}
 
 		if (NeonFinder.Succeeded())
 		{
 			NeonMaterial = NeonFinder.Object;
-		}
-		else if (LegacyNeonFinder.Succeeded())
-		{
-			NeonMaterial = LegacyNeonFinder.Object;
 		}
 	}
 

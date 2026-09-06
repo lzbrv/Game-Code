@@ -246,7 +246,16 @@ NET_VERSION="$(python3 "${TRACE_SCRIPT_DIR}/netversion.py" --quiet 2>/dev/null |
 APP_SIZE="$(du -sh "$APP" 2>/dev/null | cut -f1 | tr -d ' ')"
 
 STAGE="${OUTPUT}/${TRACE_PROJECT_NAME}-Mac"
-ZIP="${OUTPUT}/${APP_STEM}.zip"
+
+# DATE-STAMPED, because an undated build is indistinguishable from every other
+# undated build the moment it leaves this machine. Playtesters keep whatever they
+# downloaded, and "are you on the latest one?" has no answer when four files in
+# four Downloads folders share a name. The stamp is the BUILD's date, not the
+# commit's, because that is the question being asked. The NET code inside the
+# zip's README still decides who can actually play together; this only makes the
+# file identifiable at a glance.
+BUILD_DATE="$(date +%Y-%m-%d)"
+ZIP="${OUTPUT}/${APP_STEM}-${BUILD_DATE}.zip"
 README="${STAGE}/READ ME FIRST - Trace will not open until you do this.txt"
 
 rm -rf "$STAGE" "$ZIP"
@@ -344,8 +353,8 @@ Messages, AirDrop, Slack, Discord. It is not attached by the network and not by
 the file itself. So a copy that arrives any other way never has it and never
 needs any of the above:
 
-    curl -L -o ~/Downloads/${APP_STEM}.zip "<the link>"
-    scp  someone@100.x.x.x:${APP_STEM}.zip ~/Downloads/
+    curl -L -o ~/Downloads/${APP_STEM}-${BUILD_DATE}.zip "<the link>"
+    scp  someone@100.x.x.x:${APP_STEM}-${BUILD_DATE}.zip ~/Downloads/
 
 If you are already on the Tailscale network in order to play, scp over the
 tailnet is the easiest route and skips this whole page.
@@ -514,7 +523,7 @@ zip, and this is the short version:
 
 Want to skip all of that? Grab it with curl instead of a browser — the
 quarantine flag comes from the browser, not from the file:
-      curl -L -o ~/Downloads/${APP_STEM}.zip "<paste the link here>"
+      curl -L -o ~/Downloads/${APP_STEM}-${BUILD_DATE}.zip "<paste the link here>"
 
 Before we start: your title screen shows "${NET_VERSION}" in the bottom right
 corner. Mine has to say the same thing or we cannot connect. Windows players see

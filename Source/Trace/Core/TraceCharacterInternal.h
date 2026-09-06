@@ -1255,22 +1255,18 @@ namespace TraceCharacterAssets
 	/**
 	 * The two Tron materials, shared with ATraceArenaBuilder.
 	 *
-	 * COMMITTED FIRST, LEGACY SECOND — and getting this wrong is invisible on a machine that has run
-	 * the generator. Spec v17 §3 promoted these to /Game/Trace/Materials/Parents, which IS in the
-	 * repository; /Game/Generated is the pre-v17 generator output and is GITIGNORED. The arena
-	 * builder was migrated to prefer the committed pair, and this file was missed because it belongs
-	 * to no agent's slice — so on a fresh clone the ARENA rendered correctly while every CHARACTER
-	 * silently degraded to BasicShapeMaterial. That asymmetry is the giveaway if it ever regresses.
+	 * COMMITTED, AND NOTHING ELSE. Spec v17 §3 promoted these to /Game/Trace/Materials/Parents, which
+	 * IS in the repository; the pre-v17 generator wrote to /Game/Generated, which was gitignored and
+	 * is now deleted outright. A legacy fallback used to sit beside these constants and was retired
+	 * once its target could no longer exist on any machine. Anything that resolves a Tron material
+	 * belongs on this pair — the historical failure here was a load site quietly keeping the legacy
+	 * path, which does not fail loudly enough to notice: it degrades to flat BasicShapeMaterial grey.
 	 *
 	 * A miss on BOTH is still tolerated: MakeViewModelMaterials() falls back to BasicShapeMaterial,
 	 * because a flat-shaded gun beats no gun.
 	 */
 	const TCHAR* const SurfaceMaterialPath = TEXT("/Game/Trace/Materials/Parents/M_TraceSurface.M_TraceSurface");
 	const TCHAR* const NeonMaterialPath = TEXT("/Game/Trace/Materials/Parents/M_TraceNeon.M_TraceNeon");
-
-	/** Pre-v17 generator output. Gitignored, so present only on a machine that ran the generator. */
-	const TCHAR* const LegacySurfaceMaterialPath = TEXT("/Game/Generated/Materials/M_TraceSurface.M_TraceSurface");
-	const TCHAR* const LegacyNeonMaterialPath = TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon");
 
 	/**
 	 * The railgun. COMMITTED, unlike the Mannequin — this is our own art, not Epic's, so it lives in

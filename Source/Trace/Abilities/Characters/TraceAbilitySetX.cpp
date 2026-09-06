@@ -860,7 +860,15 @@ ATraceBeeSwarm::ATraceBeeSwarm()
 	// blend ladder — which the halo and the trail still use. The cores use these again while
 	// TraceXBeeFx::bBeePolish is false, because "the old model" is this material as much as it is
 	// this sphere.
-	static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TEXT("/Game/Generated/Materials/M_TraceNeon.M_TraceNeon"));
+	//
+	// THE PATH BELOW IS THE COMMITTED PARENT, not /Game/Generated/Materials. That legacy directory
+	// was generator output, gitignored, and DELETED during the overhaul. This finder still pointed at
+	// it, so it could not resolve on ANY machine and every bee silently took the BasicShapeMaterial
+	// branch below — flat engine grey instead of amber — in the shipped build, since bBeePolish is
+	// false and this is therefore the LIVE material, not a fallback. It logged one cook-time Error
+	// per package that read as harmless noise. M_TraceNeon exposes "Color", which is the first of the
+	// two names the MID sets below, so the amber lands. BasicShapeMaterial stays as last resort.
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> NeonFinder(TEXT("/Game/Trace/Materials/Parents/M_TraceNeon.M_TraceNeon"));
 	if (NeonFinder.Succeeded())
 	{
 		LegacyBeeMaterial = NeonFinder.Object;
