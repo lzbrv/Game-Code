@@ -76,7 +76,15 @@ import struct
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = os.path.join(REPO, "Art", "CentreTower", "tron-octagonal-tower.glb")
+# THE OWNER'S SOURCE, newest first. The remodel arrived as .obj; the .glb is the
+# first version and is kept only so the history reads. Whichever exists and is
+# listed first wins, so dropping a new export in replaces the tower without
+# editing this file.
+SRC_CANDIDATES = (
+    os.path.join(REPO, "Art", "CentreTower", "tron-octagonal-tower.obj"),
+    os.path.join(REPO, "Art", "CentreTower", "tron-octagonal-tower.glb"),
+)
+SRC = next((p for p in SRC_CANDIDATES if os.path.isfile(p)), SRC_CANDIDATES[0])
 
 # The owner's material names, and which half each belongs to. A material that
 # appears in neither list is a FAILURE, not a default: silently dropping part of
@@ -291,6 +299,81 @@ def collect(doc, binary):
     return groups
 
 
+def collect_obj(path):
+    """The same {(material, forced_trim): buffers} map that collect() builds, from an OBJ.
+
+    OBJ IS ALREADY FLAT - no node graph, so there is nothing to bake and none of
+    the transform risk collect() carries. The frame matches too: the owner exports
+    Y-up metres either way, which is glTF's own convention, so the vertices go
+    into the written GLB untouched and Unreal's importer does the one conversion.
+
+    Polygons are fanned into triangles. Normals are taken from the file when it
+    supplies them and computed per-face when it does not, because the shell's
+    walkability is read off normals downstream.
+    """
+    pos_list = []
+    nor_list = []
+    uv_list = []
+    groups = {}
+    group_name = None
+    material = None
+
+    def emit(tri_v, tri_t, tri_n):
+        key = (material or "(none)", (group_name or "") in TRIM_NODES)
+        bucket = groups.setdefault(key, {"pos": [], "nor": [], "uv": [], "idx": []})
+        base = len(bucket["pos"])
+        p = [pos_list[i] for i in tri_v]
+        if all(n is not None for n in tri_n):
+            normals = [nor_list[i] for i in tri_n]
+        else:
+            u = [p[1][i] - p[0][i] for i in range(3)]
+            v = [p[2][i] - p[0][i] for i in range(3)]
+            n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]
+            ln = math.sqrt(sum(c * c for c in n)) or 1.0
+            normals = [[n[0] / ln, n[1] / ln, n[2] / ln]] * 3
+        uvs = [uv_list[i] if i is not None and i < len(uv_list) else [0.0, 0.0] for i in tri_t]
+        bucket["pos"].extend(p)
+        bucket["nor"].extend(normals)
+        bucket["uv"].extend(uvs)
+        bucket["idx"].extend([base, base + 1, base + 2])
+
+    with open(path, "r", errors="replace") as handle:
+        for line in handle:
+            if line.startswith("v "):
+                f = line.split()
+                pos_list.append([float(f[1]), float(f[2]), float(f[3])])
+            elif line.startswith("vn "):
+                f = line.split()
+                nor_list.append([float(f[1]), float(f[2]), float(f[3])])
+            elif line.startswith("vt "):
+                f = line.split()
+                uv_list.append([float(f[1]), float(f[2]) if len(f) > 2 else 0.0])
+            elif line.startswith("o ") or line.startswith("g "):
+                group_name = line[2:].strip()
+            elif line.startswith("usemtl"):
+                material = line.split(None, 1)[1].strip()
+            elif line.startswith("f "):
+                verts = []
+                for tok in line.split()[1:]:
+                    bits = tok.split("/")
+                    vi = int(bits[0]) - 1
+                    ti = int(bits[1]) - 1 if len(bits) > 1 and bits[1] else None
+                    ni = int(bits[2]) - 1 if len(bits) > 2 and bits[2] else None
+                    verts.append((vi, ti, ni))
+                for k in range(1, len(verts) - 1):
+                    tri = (verts[0], verts[k], verts[k + 1])
+                    emit([t[0] for t in tri], [t[1] for t in tri], [t[2] for t in tri])
+    return groups
+
+
+def collect_any(path):
+    """collect() for a GLB, collect_obj() for an OBJ."""
+    if path.lower().endswith(".obj"):
+        return collect_obj(path)
+    doc, binary = read_glb(path)
+    return collect(doc, binary)
+
+
 def build_glb(doc, groups, wanted, label):
     """One node, one mesh, one primitive per surviving material."""
     names = [m.get("name", "") for m in doc.get("materials", [])]
@@ -422,8 +505,7 @@ def deck_height(groups, wanted):
 
 def measure(path):
     """Triangle count, bounding box and slope histogram, read back off a written file."""
-    doc, binary = read_glb(path)
-    groups = collect(doc, binary)
+    groups = collect_any(path)
     tris = 0
     lo = [1e18] * 3
     hi = [-1e18] * 3
@@ -449,7 +531,12 @@ def measure(path):
             ny = abs(n[1] / ln)
             if ny > 0.05:
                 up_area += area
-                if ny >= 0.7193:      # Trace's WalkableFloorZ, i.e. 44.00 degrees
+                # 0.7100 IS THE LIVE LIMIT, read off the game's own MOVECFG-P28 line
+                # ("band Nz (0.450..0.710) ... upper bound IS GetWalkableFloorZ()"),
+                # not the 0.7193 engine default this script used to assume. The two
+                # differ by 0.77 of a degree, which is small until a ramp is authored
+                # to sit just inside the band and the tool says it is just outside.
+                if ny >= 0.7100:
                     walk_area += area
     return tris, lo, hi, up_area, walk_area
 
@@ -468,8 +555,7 @@ def climb_check(path, scale, step_limit=45.0, pawn_height=176.0, capsule_radius=
     Defaults are the engine's and the project's: MaxStepHeight 45 (never
     overridden in Source/), capsule 34 x 88 (TraceCharacterInternal.h:39-40).
     """
-    doc, binary = read_glb(path)
-    groups = collect(doc, binary)
+    groups = collect_any(path)
     tris = []
     for g in groups.values():
         pos = g["pos"]
@@ -507,13 +593,20 @@ def climb_check(path, scale, step_limit=45.0, pawn_height=176.0, capsule_radius=
                 best = t
         return best
 
+    # THE SWEEP RANGE IS DERIVED, not typed. The first model reached 6.86 m and the
+    # remodel 5.36; a hard-coded 6.85 would have walked 1.5 m of empty air and then
+    # reported a clean bill of health on a ramp it never touched.
+    outer = max(p[0] for g in groups.values() for p in g["pos"])
+    inner = min(abs(p[0]) for g in groups.values() for p in g["pos"] if abs(p[2]) < half)
+    inner = max(inner, 0.05)
+
     worst_step = 0.0
     worst_x = None
     worst_head = None
     head_x = None
     prev = None
-    x = 6.85
-    while x > 2.20:
+    x = outer
+    while x > inner:
         heights = []
         for zz in (-half, 0.0, half):
             t = cast(x, 100.0, zz, -1.0)
@@ -555,8 +648,13 @@ def main():
     if not os.path.isfile(SRC):
         raise SystemExit("missing source art: {0}".format(SRC))
 
-    doc, binary = read_glb(SRC)
-    names = {m.get("name", "") for m in doc.get("materials", [])}
+    if SRC.lower().endswith(".obj"):
+        doc = {"materials": []}
+        groups = collect_obj(SRC)
+    else:
+        doc, binary = read_glb(SRC)
+        groups = collect(doc, binary)
+    names = {k[0] for k in groups}
     print("source: {0}".format(os.path.relpath(SRC, REPO)))
     print("  materials: {0}".format(", ".join(sorted(names))))
 
@@ -571,7 +669,6 @@ def main():
             "Add each to SHELL_MATERIALS (collides, walkable) or NEON_MATERIALS "
             "(drawn only) at the top of this script.".format(", ".join(sorted(unknown))))
 
-    groups = collect(doc, binary)
     src_tris = sum(len(g["idx"]) // 3 for g in groups.values())
     print("  flattened to {0} material group(s), {1:,} triangles".format(len(groups), src_tris))
 
@@ -645,7 +742,7 @@ def main():
         print("  FAIL walkable area {0:.2f}% != {1:.2f}%".format(out_frac, src_frac))
         ok = False
     else:
-        print("  ok   walkable area under 44.00 deg  {0:.1f}%  (source {1:.1f}%)".format(
+        print("  ok   walkable area under 44.77 deg  {0:.1f}%  (source {1:.1f}%)".format(
             out_frac, src_frac))
 
     # ---- can a pawn actually get up it? ----------------------------------------
@@ -665,9 +762,15 @@ def main():
     if deck_m is None:
         raise SystemExit("no shell surface directly over the centre - cannot find the deck")
     shell_top_m = max(p[1] for k in groups if is_shell(k) for p in groups[k]["pos"])
+    # The furthest any shell vertex reaches from the tower's axis. The importer needs
+    # it to answer "does anything overlap the ramps", and it cannot get it from the
+    # placed actor: at yaw 45 UE's actor bounds are the ROTATED BOX's AABB, inflated
+    # by root two, which reads 1847 uu for a tower that actually reaches 1069.
+    reach_m = max(math.hypot(p[0], p[2]) for k in groups if is_shell(k) for p in groups[k]["pos"])
     profile = {
         "deck_top_m": deck_m,
         "shell_top_m": shell_top_m,
+        "shell_reach_m": reach_m,
         "deck_fraction_of_shell_box": deck_m / shell_top_m,
         "source": os.path.basename(SRC),
         "note": ("deck_top_m is the surface a pawn rests on at the centre, found by ray-cast; "
@@ -679,6 +782,7 @@ def main():
         json.dump(profile, handle, indent=2, sort_keys=True)
     print("\n  deck (what a pawn stands on) {0:.4f} m   shell box top {1:.4f} m   ratio {2:.6f}"
           .format(deck_m, shell_top_m, deck_m / shell_top_m))
+    print("  shell reach {0:.4f} m from the axis".format(reach_m))
     print("  wrote {0}".format(os.path.relpath(prof_path, REPO)))
     print("\nBoth halves match the source. Each is ONE mesh with one slot per material,")
     print("so Unreal imports each as a single StaticMesh.")

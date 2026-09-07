@@ -446,6 +446,7 @@ def read_profile():
     with open(path, "r") as handle:
         prof = json.load(handle)
     ratio = float(prof["deck_fraction_of_shell_box"])
+    globals()["_SHELL_REACH_M"] = float(prof.get("shell_reach_m") or 0.0)
     # 1.0 IS THE EXPECTED VALUE, not an edge case. Once the four collars moved to
     # the trim asset the shell's highest point IS the walkable deck, so the ratio
     # is exactly 1 and arrives here as 1.0000000000000542. The epsilon is for that
@@ -456,6 +457,36 @@ def read_profile():
     log("[SCALE] profile: deck {0:.4f} m of a {1:.4f} m shell box, ratio {2:.6f}".format(
         float(prof["deck_top_m"]), float(prof["shell_top_m"]), ratio))
     return ratio
+
+
+def rerun_guess(actor):
+    return actor.get_actor_label().startswith("CentreTower_")
+
+
+def census_deck_top():
+    """Kit_Octagon_01's deck top Z as recorded before it was replaced, or None."""
+    import json
+    path = os.path.join(PROJECT_ROOT, "Saved", "rebake_census.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r") as handle:
+            data = json.load(handle)
+    except Exception as exc:  # noqa: BLE001
+        log("[SCALE] census unreadable ({0})".format(exc))
+        return None
+    for section in ("census_a", "census_c", "census_b"):
+        for entry in (data.get(section) or {}).get("hand", []) or []:
+            if entry.get("label") != "Kit_Octagon_01":
+                continue
+            o = entry.get("bounds_origin") or []
+            e = entry.get("bounds_extent") or []
+            if len(o) == 3 and len(e) == 3:
+                top = float(o[2]) + float(e[2])
+                log("[SCALE] original pillar from Saved/rebake_census.json ({0}): deck top "
+                    "{1:.6f}".format(section, top))
+                return top
+    return None
 
 
 def place():
@@ -473,12 +504,44 @@ def place():
                if a and (mesh_name_of(a) or "").lower().find("octagon") >= 0]
     if not octagon:
         fail("no actor with an 'octagon' mesh in {0}; nothing to replace".format(LEVEL_PATH))
+    # MORE THAN ONE IS ONLY LEGAL IF THEY ARE ALL OURS. Restoring actor packages
+    # from git can bring back a previous run's tower alongside the current one, and
+    # both carry an octagon mesh. Any of them answers the only question asked here
+    # - the deck height, which every run reproduces from the original pillar - and
+    # the "clear any previous run" sweep below removes all of them before the new
+    # one goes in. A second octagon that is NOT ours is a different situation and
+    # still stops the script, because then it is a real ambiguity about which one
+    # the Core should sit on.
+    ours = [a for a in octagon if a.get_actor_label().startswith("CentreTower_")]
+    if len(octagon) > 1 and len(ours) != len(octagon):
+        fail("{0} actors carry an octagon mesh and only {1} are this script's; refusing to guess "
+             "which one the Core should use".format(len(octagon), len(ours)))
     if len(octagon) > 1:
-        fail("{0} actors carry an octagon mesh; expected exactly 1".format(len(octagon)))
+        log("[KEEP] {0} of this script's own towers are present; all will be replaced".format(
+            len(octagon)))
     old = octagon[0]
     o, e = old.get_actor_bounds(False)
-    target_deck_z = float(o.z + e.z)
     old_centre = (float(o.x), float(o.y))
+
+    # THE DECK HEIGHT COMES FROM THE ORIGINAL PILLAR'S RECORD, NOT FROM WHATEVER IS
+    # STANDING HERE NOW. Reading it off the live actor works exactly once. On a
+    # re-run the mesh has already been re-imported under that actor, so its bounds
+    # describe the NEW geometry at the OLD scale - and when the owner's remodel
+    # changed the deck from 2.26 m to 2.86 m that read 700.66 instead of 553.67 and
+    # would have built a tower a quarter too tall, with no error anywhere.
+    #
+    # Saved/rebake_census.json holds Kit_Octagon_01 as it was before any of this:
+    # bounds_origin.z 26.832897 + bounds_extent.z 526.832989. That file is stale by
+    # design - it is a historical record - which is precisely what makes it the
+    # right source for a number that must never move.
+    target_deck_z = census_deck_top()
+    if target_deck_z is None:
+        if rerun_guess(old):
+            fail("Saved/rebake_census.json has no Kit_Octagon_01 entry, and the only octagon in "
+                 "the level is this script's own tower - there is nothing left that records the "
+                 "original deck height. Restore the census or pass the height explicitly.")
+        target_deck_z = float(o.z + e.z)
+        log("[SCALE] no census entry; falling back to the live pillar's bounds")
 
     # RE-RUNNING THIS SCRIPT IS SUPPORTED, and this is the line that makes it safe.
     # On a second run the only actor carrying an octagon mesh is the tower this
@@ -543,33 +606,18 @@ def place():
     doomed = [] if rerun else [old]
     doomed += find_by_label(("KitLip_Kit_Octagon_01",))
 
-    # ---- the four platforms, and why they only became a problem at yaw 45 ------
+    # ---- the four platforms STAY, and the remodel is why ----------------------
     #
-    # These were the middle of the OLD climb: Kit_Ramp -> Kit_Platform -> octagon.
-    # The ramps went with the pillar, which already left these as landings serving
-    # nothing. At yaw 0 that was all they were, so the first pass kept them - it is
-    # not this script's business to delete another author's geometry that merely
-    # looks redundant.
+    # These were removed when the tower was turned 45 degrees: the ramps ran under
+    # them with 60 uu of clear width against a 68 uu pawn, and bots went from 0 of
+    # 42 stranded to 5 of 40. The owner's remodel makes the ramps STEEPER, which
+    # makes them SHORTER - the model's reach drops from 6.86 m to 5.36 m and, at
+    # the scale that keeps the deck at 553.67, from 1670 uu to 1069 uu. The nearest
+    # platform edge is at radius 1590, so the conflict that forced their removal is
+    # gone with 521 uu to spare, and they are restored.
     #
-    # Turning the tower to face the corners moved the ramps underneath them, and
-    # they stopped being merely redundant. MEASURED across each ramp's width at
-    # 20 uu stations, taking the platforms' undersides as a ceiling and 176 uu as
-    # the pawn:
-    #
-    #     bearing  45   narrowest clear width  200 uu   passable
-    #     bearing 135   narrowest clear width  220 uu   passable
-    #     bearing 225   narrowest clear width   60 uu   BLOCKED (a pawn needs 68)
-    #     bearing 315   narrowest clear width   80 uu   marginal
-    #
-    # They are not symmetric about the centre - X -1600..-600 against 400..1400 -
-    # which is why two diagonals are pinched and two are not. Confirmed in game:
-    # Trace.Bots.StructureDrill went from 0 of 42 stranded at yaw 0 to 5 of 40
-    # (12.5%) at yaw 45, which is precisely the Demo 30 complaint about bots
-    # wedging on the hand-made centre.
-    #
-    # So they go. Their eight neon lips go with them, for the reason the octagon's
-    # rim cubes did: they are dressing on a thing that no longer exists.
-    doomed += find_by_label(("Kit_Platform_", "KitLip_Kit_Platform_"))
+    # Their clearance is re-measured after placement rather than assumed - see the
+    # platform check at the end of place().
     ramps = [a for a in subsys.get_all_level_actors()
              if a and a.get_actor_label().startswith("Kit_Ramp_")
              and KIT_TAG in [str(t) for t in a.tags]]
@@ -653,6 +701,36 @@ def place():
 
     for a in (shell_actor, neon_actor):
         log("[ACTOR] {0}".format(describe(a)))
+
+    # ---- do the restored platforms clear the ramps? ----------------------------
+    #
+    # ASKED, NOT ASSUMED. Turning the tower 45 degrees once put these directly over
+    # two of the four ramps and it took a bot drill to notice. The tower's reach is
+    # read off its own placed bounds and compared with each platform's nearest
+    # corner; a platform whose footprint reaches inside that radius is reported,
+    # because that is the condition that produced the blockage last time.
+    # REACH FROM THE MODEL, NOT THE ACTOR'S BOX. At yaw 45 get_actor_bounds returns
+    # the rotated box's AABB, inflated by root two - 1847 uu for a tower that reaches
+    # 1069 - and a check built on that condemns platforms that are 500 uu clear.
+    reach = _SHELL_REACH_M * 100.0 * scale
+    if reach <= 0.0:
+        fail("tower_profile.json has no shell_reach_m; re-run Scripts/split_centre_tower.py")
+    worst = None
+    for a in find_by_label(("Kit_Platform_", "KitLip_Kit_Platform_")):
+        po, pe = a.get_actor_bounds(False)
+        # nearest point of the platform's box to the tower's axis
+        nx = max(0.0, abs(float(po.x)) - float(pe.x))
+        ny = max(0.0, abs(float(po.y)) - float(pe.y))
+        near = (nx * nx + ny * ny) ** 0.5
+        gap = near - reach
+        if worst is None or gap < worst[0]:
+            worst = (gap, a.get_actor_label(), near)
+    if worst is not None:
+        log("[ACTOR] tower reach {0:.0f} uu; nearest platform '{1}' starts at {2:.0f} uu -> "
+            "{3:+.0f} uu of clearance".format(reach, worst[1], worst[2], worst[0]))
+        if worst[0] < 0.0:
+            fail("'{0}' overlaps the tower's footprint by {1:.0f} uu; at yaw 45 that is how two of "
+                 "the four ramps got sealed to 60 uu of clear width".format(worst[1], -worst[0]))
 
     if not unreal.get_editor_subsystem(unreal.LevelEditorSubsystem).save_current_level():
         fail("could not save {0}".format(LEVEL_PATH))

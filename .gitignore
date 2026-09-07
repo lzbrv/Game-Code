@@ -263,6 +263,14 @@ Art/Fonts/*.pdf
 # provenance check and the only copy of the original.
 !Art/SideRamp/tron-concave-ramp.obj
 
+# ── The owner's hand-authored centre tower ────────────────────────────────────
+# Same exception, same reason: hand-modelled source art that cannot be
+# regenerated from anything in the repo. This is the REMODEL - steeper ramps with
+# their tops flush to the deck - and it supersedes the .glb first version, which
+# is deleted rather than kept beside it so there is only one source of truth for
+# what the centre of the map is. The old one is in the history at 467e0b8.
+!Art/CentreTower/tron-octagonal-tower.obj
+
 # ── The centre tower's GENERATED halves ───────────────────────────────────────
 # tron-octagonal-tower.glb beside these is the owner's hand-modelled source and IS
 # committed. These three are output: Scripts/split_centre_tower.py rewrites them
