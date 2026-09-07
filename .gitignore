@@ -262,3 +262,16 @@ Art/Fonts/*.pdf
 # through the same endpoints rejected at 2.5e-01). Losing it would cost the
 # provenance check and the only copy of the original.
 !Art/SideRamp/tron-concave-ramp.obj
+
+# ── The centre tower's GENERATED halves ───────────────────────────────────────
+# tron-octagonal-tower.glb beside these is the owner's hand-modelled source and IS
+# committed. These three are output: Scripts/split_centre_tower.py rewrites them
+# from it on demand, flattening the 80-node scene into one mesh per half and
+# routing the four ramp collars out of collision. Committing them would be
+# committing a build product that is 1.6 MB per regeneration and can silently
+# disagree with the source it came from. The IMPORTED assets under
+# Content/Trace/Art/CentreTower ARE committed, so a fresh clone needs none of this
+# to play - only to re-import.
+/Art/CentreTower/CentreTower_Shell.glb
+/Art/CentreTower/CentreTower_Neon.glb
+/Art/CentreTower/tower_profile.json
