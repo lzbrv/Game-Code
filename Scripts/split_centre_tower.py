@@ -276,7 +276,7 @@ def collect(doc, binary):
                 # A node on the forced-trim list keeps its material but is filed
                 # under a distinct key, so the shell cannot pick it up.
                 key = (mat, True) if label in TRIM_NODES else (mat, False)
-                bucket = groups.setdefault(key, {"pos": [], "nor": [], "uv": [], "idx": []})
+                bucket = groups.setdefault(key, {"pos": [], "nor": [], "uv": [], "idx": [], "grp": []})
                 base = len(bucket["pos"])
                 for p in pos:
                     bucket["pos"].append(xform_point(world, p))
@@ -289,6 +289,7 @@ def collect(doc, binary):
                                          else [0.0, 1.0, 0.0])
                 for t in uv:
                     bucket["uv"].append([t[0], t[1]])
+                bucket["grp"].extend([label or ""] * len(pos))
                 bucket["idx"].extend(base + i for i in idx)
         for child in node.get("children", []):
             visit(child, world, label)
@@ -320,7 +321,7 @@ def collect_obj(path):
 
     def emit(tri_v, tri_t, tri_n):
         key = (material or "(none)", (group_name or "") in TRIM_NODES)
-        bucket = groups.setdefault(key, {"pos": [], "nor": [], "uv": [], "idx": []})
+        bucket = groups.setdefault(key, {"pos": [], "nor": [], "uv": [], "idx": [], "grp": []})
         base = len(bucket["pos"])
         p = [pos_list[i] for i in tri_v]
         if all(n is not None for n in tri_n):
@@ -335,6 +336,7 @@ def collect_obj(path):
         bucket["pos"].extend(p)
         bucket["nor"].extend(normals)
         bucket["uv"].extend(uvs)
+        bucket["grp"].extend([group_name or ""] * 3)
         bucket["idx"].extend([base, base + 1, base + 2])
 
     with open(path, "r", errors="replace") as handle:
@@ -372,6 +374,186 @@ def collect_any(path):
         return collect_obj(path)
     doc, binary = read_glb(path)
     return collect(doc, binary)
+
+
+# =============================================================================
+# RE-PROFILING THE FOUR RAMPS TO THE SIDE BUTTRESSES' STEEPNESS
+# =============================================================================
+#
+# The owner's ask: "make the octagon buttresses as steep as the side buttresses".
+# The side buttresses are not a look, they are two numbers, and they live in
+# Source/Trace/World/TraceSideRampProfile.h:
+#
+#     kToeTangent   1.0635923 = tan(acos(0.71) + 2 deg) = 46.7651 deg
+#     kCrestTangent 1.8232359 = tan(acos(0.45) - 2 deg) = 61.2563 deg
+#
+# which is the LIVE surf band with a 2 degree margin held off each end, so a float
+# rounding cannot drop the toe into walkable geometry or push the crest into wall.
+# The shape between them is a parabola, and because the tangent of z = H*u^2 is
+# linear in u, fixing the two tangents fixes where on that parabola the built face
+# starts: kProfileStartFrac = kToeTangent / kCrestTangent.
+#
+# The tower's RISE is not free - the ramp has to start on its plinth and finish
+# flush with the deck - so the DEPTH is what the two tangents imply:
+#
+#     H = D * kCrestTangent * (1 + startFrac) / 2   ->   D = 2H / (kCrest * (1+s))
+#
+# With H = 2.700 m that is D = 1.8706 m, against the 2.900 m the model ships. The
+# ramps therefore get SHORTER as well as steeper, which is the whole reason they
+# stop overhanging anything: the tip comes in from radius 1038 uu to 794 uu.
+#
+# WHAT THE TRANSFORM DOES, AND WHAT IT REFUSES TO DO
+#   * It moves vertices ALONG the arm and adjusts their height. It never touches
+#     the across-arm coordinate, so the ramps keep their width and their lane
+#     spacing.
+#   * Heights are preserved at both ends by construction: the plinth top stays at
+#     0.160 and the crest stays at 2.860, so the deck stays FLUSH - the property
+#     the owner asked for in the previous round is not quietly undone by this one.
+#   * Everything below the plinth top keeps its height exactly, so the base slab
+#     stays a slab on the floor instead of being dragged up the new curve.
+#   * Above it, each vertex keeps its FRACTIONAL depth under the ride surface, so
+#     side panels, edge lights and lane lights follow the new curve instead of
+#     sinking through it or floating off it.
+#
+# The arm's axis is MEASURED from its own geometry rather than read off the n/e/s/w
+# in the name: a model that renamed or reordered its arms would otherwise be
+# reprofiled along the wrong axis, and the failure would look like a mangled tower
+# rather than like a bad assumption.
+# =============================================================================
+
+TOE_TANGENT = 1.0635923
+CREST_TANGENT = 1.8232359
+PROFILE_START_FRAC = TOE_TANGENT / CREST_TANGENT
+
+
+def reprofile_ramps(groups):
+    """Re-cut the four ramps to the side buttresses' band. Returns a report dict."""
+    arms = {}
+    for key, g in groups.items():
+        for i, name in enumerate(g["grp"]):
+            if not name.startswith("ramp_"):
+                continue
+            arm = name.split("_")[1]
+            arms.setdefault(arm, []).append((key, i))
+    if not arms:
+        return None
+
+    # --- per-arm axis, from the geometry -------------------------------------
+    report = {"arms": {}, "depth_old_m": None, "depth_new_m": None}
+    for arm, refs in sorted(arms.items()):
+        pts = [groups[k]["pos"][i] for k, i in refs]
+        shell = [groups[k]["pos"][i] for k, i in refs
+                 if groups[k]["grp"][i] == "ramp_{0}_shell".format(arm)]
+        if not shell:
+            raise SystemExit("arm '{0}' has no ramp_{0}_shell to take the ride surface from"
+                             .format(arm))
+        # the axis is whichever horizontal coordinate the shell spans furthest from 0
+        cx = sum(abs(p[0]) for p in shell) / len(shell)
+        cz = sum(abs(p[2]) for p in shell) / len(shell)
+        axis = 0 if cx > cz else 2
+        sign = 1.0 if sum(p[axis] for p in shell) >= 0 else -1.0
+
+        def u_of(p):
+            return sign * p[axis]
+
+        u_crest = min(u_of(p) for p in shell)
+        u_toe = max(u_of(p) for p in shell)
+        plinth_top = min(p[1] for p in shell)
+        crest_y = max(p[1] for p in shell)
+        rise = crest_y - plinth_top
+        if not (u_toe > u_crest and rise > 0.01):
+            raise SystemExit("arm '{0}' has a degenerate shell".format(arm))
+
+        # --- the original ride surface, as a table in u ----------------------
+        table = {}
+        for p in shell:
+            u = round(u_of(p), 5)
+            table[u] = max(table.get(u, -1e18), p[1])
+        us = sorted(table)
+
+        def ride_orig(u):
+            if u <= us[0]:
+                return table[us[0]]
+            if u >= us[-1]:
+                return table[us[-1]]
+            lo, hi = us[0], us[-1]
+            for k in range(len(us) - 1):
+                if us[k] <= u <= us[k + 1]:
+                    lo, hi = us[k], us[k + 1]
+                    break
+            if hi - lo < 1e-9:
+                return table[lo]
+            f = (u - lo) / (hi - lo)
+            return table[lo] * (1.0 - f) + table[hi] * f
+
+        # --- the new profile -------------------------------------------------
+        s_frac = PROFILE_START_FRAC
+        depth_new = 2.0 * rise / (CREST_TANGENT * (1.0 + s_frac))
+        full_h = rise / (1.0 - s_frac * s_frac)
+        unbuilt = full_h * s_frac * s_frac
+
+        def ride_new(a):
+            u_par = s_frac + (1.0 - s_frac) * a
+            return plinth_top + full_h * u_par * u_par - unbuilt
+
+        depth_old = u_toe - u_crest
+        for key, i in refs:
+            p = groups[key]["pos"][i]
+            u = u_of(p)
+            a = (u_toe - u) / depth_old
+            a = min(1.0, max(0.0, a))
+            overhang = max(0.0, u - u_toe)
+            u_new = u_crest + (1.0 - a) * depth_new + overhang
+            y = p[1]
+            r_old = ride_orig(u)
+            r_new = ride_new(a)
+            # THREE BANDS, and each needs a different rule.
+            #
+            #   at or below the plinth top : keep the height. The base slab is floor
+            #       furniture; dragging it up the new curve would lift it off the floor.
+            #   between plinth and surface : keep the FRACTIONAL depth, so side panels
+            #       stay attached to the ride surface without changing thickness.
+            #   above the surface          : keep the ABSOLUTE proudness. The edge and
+            #       lane lights stand ~26 mm off the face; scaling that with the curve
+            #       pushed them to Y 2.9201 against a source maximum of 2.8860, and near
+            #       the toe - where the old surface is only millimetres above the plinth -
+            #       the same division sent the threshold strip to Y 1.2689. Both were
+            #       this branch being handled by the one above it.
+            if y > r_old:
+                y = r_new + (y - r_old)
+            elif y > plinth_top and (r_old - plinth_top) > 1e-4:
+                y = plinth_top + (y - plinth_top) * (r_new - plinth_top) / (r_old - plinth_top)
+            new = list(p)
+            new[axis] = sign * u_new
+            new[1] = y
+            groups[key]["pos"][i] = new
+
+        report["arms"][arm] = {"axis": "XYZ"[axis], "sign": sign, "rise_m": rise,
+                               "depth_old_m": depth_old, "depth_new_m": depth_new}
+        report["depth_old_m"] = depth_old
+        report["depth_new_m"] = depth_new
+
+    # Normals are now wrong - they were computed on the old curve. Recompute them
+    # per face from the moved vertices, because the walkable/surfable test
+    # downstream reads normals and a stale one would report the OLD steepness.
+    for g in groups.values():
+        idx = g["idx"]
+        pos = g["pos"]
+        for k in range(0, len(idx) - 2, 3):
+            a, b, c = pos[idx[k]], pos[idx[k + 1]], pos[idx[k + 2]]
+            u = [b[i] - a[i] for i in range(3)]
+            v = [c[i] - a[i] for i in range(3)]
+            n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]
+            ln = math.sqrt(sum(t * t for t in n))
+            if ln < 1e-12:
+                continue
+            n = [t / ln for t in n]
+            # keep the authored orientation: flip if it disagrees with the old normal
+            if sum(n[i] * g["nor"][idx[k]][i] for i in range(3)) < 0.0:
+                n = [-t for t in n]
+            for j in range(3):
+                g["nor"][idx[k + j]] = list(n)
+    return report
 
 
 def build_glb(doc, groups, wanted, label):
@@ -541,6 +723,61 @@ def measure(path):
     return tris, lo, hi, up_area, walk_area
 
 
+def ride_band(groups, walk_z=0.7100, surf_z=0.4500):
+    """Area shares of the RIDE SURFACE across the live surf band, plus its angle range.
+
+    Only the ramps' ride surface is measured, not the whole shell: the deck is flat
+    by design and the side panels are vertical by design, and averaging those in
+    would hide the one number this change exists to move.
+
+    walk_z / surf_z are the LIVE band off the game's MOVECFG-P28 line, not engine
+    defaults.
+    """
+    tot = walk = surf = wall = 0.0
+    lo_d = 180.0
+    hi_d = 0.0
+    for g in groups.values():
+        pos = g["pos"]
+        idx = g["idx"]
+        grp = g.get("grp") or [""] * len(pos)
+        for k in range(0, len(idx) - 2, 3):
+            names = {grp[idx[k + j]] for j in range(3)} if grp else set()
+            if not any(n.startswith("ramp_") and n.endswith("_shell") for n in names):
+                continue
+            a, b, c = pos[idx[k]], pos[idx[k + 1]], pos[idx[k + 2]]
+            u = [b[i] - a[i] for i in range(3)]
+            v = [c[i] - a[i] for i in range(3)]
+            n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]]
+            ln = math.sqrt(sum(t * t for t in n))
+            if ln < 1e-12:
+                continue
+            # ORIENT BY THE AUTHORED NORMAL, THEN TAKE UPWARD FACES ONLY. The shell is
+            # a solid strip, not a sheet: 16.5 m2 of it is underside. Taking abs() of
+            # the normal counted that underside as ride surface, and because it is
+            # dead flat it reported as 36% walkable at 0.00 degrees - a number that
+            # described the bottom of the ramp, not the top of it.
+            ref = g["nor"][idx[k]] if g.get("nor") else None
+            if ref and sum(n[i] * ref[i] for i in range(3)) < 0.0:
+                n = [-t for t in n]
+            ny = n[1] / ln
+            if ny <= 0.05:
+                continue
+            area = ln / 2.0
+            tot += area
+            if ny >= walk_z:
+                walk += area
+            elif ny >= surf_z:
+                surf += area
+            else:
+                wall += area
+            deg = math.degrees(math.acos(min(1.0, ny)))
+            lo_d = min(lo_d, deg)
+            hi_d = max(hi_d, deg)
+    if tot <= 0.0:
+        return None
+    return (walk / tot * 100.0, surf / tot * 100.0, wall / tot * 100.0, lo_d, hi_d)
+
+
 def climb_check(path, scale, step_limit=45.0, pawn_height=176.0, capsule_radius=34.0):
     """Walk the collision shell up one ramp and report the worst step and headroom.
 
@@ -672,6 +909,27 @@ def main():
     src_tris = sum(len(g["idx"]) // 3 for g in groups.values())
     print("  flattened to {0} material group(s), {1:,} triangles".format(len(groups), src_tris))
 
+    # --- the source's own Y range, kept so flushness can be asserted after ------
+    src_y = (min(p[1] for g in groups.values() for p in g["pos"]),
+             max(p[1] for g in groups.values() for p in g["pos"]))
+
+    def shell_y_of(gs):
+        ys = [p[1] for k, g in gs.items()
+              if (k[0] in SHELL_MATERIALS and not k[1]) for p in g["pos"]]
+        return (min(ys), max(ys))
+    src_r = max(math.hypot(p[0], p[2]) for g in groups.values() for p in g["pos"])
+
+    src_shell_y = shell_y_of(groups)
+    rep = reprofile_ramps(groups)
+    if rep:
+        print("  re-cut the ramps to the side buttresses' band "
+              "({0:.4f}..{1:.4f} deg):".format(math.degrees(math.atan(TOE_TANGENT)),
+                                               math.degrees(math.atan(CREST_TANGENT))))
+        for arm, a in sorted(rep["arms"].items()):
+            print("    ramp_{0}: axis {1}{2}  rise {3:.4f} m  depth {4:.4f} -> {5:.4f} m".format(
+                arm, "+" if a["sign"] > 0 else "-", a["axis"], a["rise_m"],
+                a["depth_old_m"], a["depth_new_m"]))
+
     out_dir = os.path.dirname(SRC)
     written = []
     total = 0
@@ -704,46 +962,69 @@ def main():
     # count, their union bounding box and their walkable-area fraction must match
     # the source. Baking node transforms is the one step here that can go wrong
     # without looking wrong, and all three of these would move if it had.
-    print("\nverifying the written files against the source:")
-    s_tris, s_lo, s_hi, s_up, s_walk = measure(SRC)
+    shell_y = shell_y_of(groups)
+    print("\nverifying the written files:")
     tris = 0
     lo = [1e18] * 3
     hi = [-1e18] * 3
-    up = 0.0
-    walk = 0.0
     for path, _ in written:
-        t, l, h, u, w = measure(path)
+        t, l, h, _u, _w = measure(path)
         tris += t
-        up += u
-        walk += w
         for i in range(3):
             lo[i] = min(lo[i], l[i])
             hi[i] = max(hi[i], h[i])
 
     ok = True
-    if tris != s_tris:
-        print("  FAIL triangles {0} != {1}".format(tris, s_tris))
+    if tris != src_tris:
+        print("  FAIL triangles {0} != {1}".format(tris, src_tris))
         ok = False
     else:
-        print("  ok   triangles              {0:,}".format(tris))
+        print("  ok   triangles                        {0:,}".format(tris))
 
-    for i, axis in enumerate("XYZ"):
-        d = max(abs(lo[i] - s_lo[i]), abs(hi[i] - s_hi[i]))
-        if d > 1e-4:
-            print("  FAIL {0} bounds drift {1:.6f}".format(axis, d))
+    # FLUSHNESS IS A PROPERTY OF THE SHELL, so it is asserted on the shell.
+    #
+    # The trim is allowed to move and does: the edge and lane lights sit ~26 mm
+    # proud of the ride surface and follow it, so where the new curve is higher than
+    # the old one they rise with it, by up to 33 mm. That is the strips staying
+    # stuck to the face, which is what should happen. Asserting on the model's
+    # overall Y bound would have failed on exactly that correct behaviour.
+    sh_lo, sh_hi = shell_y
+    dy = max(abs(sh_lo - src_shell_y[0]), abs(sh_hi - src_shell_y[1]))
+    if dy > 1e-4:
+        print("  FAIL shell Y moved by {0:.6f} - the ramps no longer meet the deck".format(dy))
+        ok = False
+    else:
+        print("  ok   shell Y {0:9.4f}..{1:9.4f}  unchanged (plinth on the floor, crest flush)"
+              .format(sh_lo, sh_hi))
+        print("       trim follows the face: {0:+.4f} m at its highest strip".format(
+            hi[1] - src_y[1]))
+
+    # X/Z SHRINK, and that is the point: steeper over a fixed rise is shorter.
+    out_r = max(abs(lo[0]), abs(hi[0]), abs(lo[2]), abs(hi[2]))
+    if out_r >= src_r - 1e-6:
+        print("  FAIL footprint did not shrink ({0:.4f} -> {1:.4f}); the re-cut did nothing"
+              .format(src_r, out_r))
+        ok = False
+    else:
+        print("  ok   footprint {0:.4f} -> {1:.4f} m  (steeper over a fixed rise is shorter)"
+              .format(src_r, out_r))
+
+    # THE ASK ITSELF: every ride-surface facet inside the live surf band.
+    # measured on the in-memory groups: build_glb writes ONE node per half, so the
+    # written file no longer knows which triangles were ramp_*_shell.
+    band = ride_band(groups)
+    if band is None:
+        print("  FAIL could not measure the ride surface")
+        ok = False
+    else:
+        walk, surf, wall, lo_d, hi_d = band
+        print("  {0} ride surface  walkable {1:.1f}%  SURF {2:.1f}%  wall {3:.1f}%   "
+              "facets {4:.2f}..{5:.2f} deg".format(
+                  "ok  " if (walk < 0.5 and wall < 0.5) else "FAIL",
+                  walk, surf, wall, lo_d, hi_d))
+        if walk >= 0.5 or wall >= 0.5:
+            print("       (the side buttresses ship 46.90..61.16 deg, 0 walkable, 0 wall)")
             ok = False
-        else:
-            print("  ok   {0} bounds {1:9.4f}..{2:9.4f}  (drift {3:.1e})".format(
-                axis, lo[i], hi[i], d))
-
-    src_frac = (s_walk / s_up * 100.0) if s_up > 0 else 0.0
-    out_frac = (walk / up * 100.0) if up > 0 else 0.0
-    if abs(src_frac - out_frac) > 0.05:
-        print("  FAIL walkable area {0:.2f}% != {1:.2f}%".format(out_frac, src_frac))
-        ok = False
-    else:
-        print("  ok   walkable area under 44.77 deg  {0:.1f}%  (source {1:.1f}%)".format(
-            out_frac, src_frac))
 
     # ---- can a pawn actually get up it? ----------------------------------------
     shell_path = os.path.join(out_dir, "CentreTower_Shell.glb")
