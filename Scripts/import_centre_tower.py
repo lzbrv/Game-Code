@@ -100,6 +100,24 @@ NEON_NAME = "SM_CentreTowerNeon"
 SHELL_SRC = os.path.join(SRC_DIR, "CentreTower_Shell.glb")
 NEON_SRC = os.path.join(SRC_DIR, "CentreTower_Neon.glb")
 
+# THE TOWER'S YAW. The model authors its four ramps on its own cardinal axes, so
+# this is what decides whether they face the goals and the sidelines (0) or the
+# four corners (45).
+#
+# 45, BY THE OWNER'S CALL, and it puts the ramps back where the centre's ramps
+# have always been: the four Kit_Ramp actors this replaced sat at (+/-480, +/-440),
+# i.e. on the diagonals. At yaw 0 the approaches moved onto the goal-to-goal line
+# for the first time; 45 restores the original reading, where a player crossing
+# the middle meets a flat deck face square-on and has to commit to a corner to get
+# up.
+#
+# Rotation about Z changes nothing this script verifies: not the deck height, not
+# any slope, not the climb gate in Scripts/split_centre_tower.py (which walks the
+# mesh in its own local frame). The Core's spawn XY is the bounding-box centre,
+# which stays on (0,0) because the tower is four-fold symmetric - that symmetry is
+# the reason a yaw is free here at all.
+TOWER_YAW = 45.0
+
 TOWER_TAG = "TraceCentreTower"
 KIT_TAG = "TraceCenterKit"
 
@@ -461,8 +479,20 @@ def place():
     o, e = old.get_actor_bounds(False)
     target_deck_z = float(o.z + e.z)
     old_centre = (float(o.x), float(o.y))
-    log("[KEEP] replacing: {0}".format(describe(old)))
-    log("[SCALE] target deck top Z = {0:.2f} (the octagon's, measured)".format(target_deck_z))
+
+    # RE-RUNNING THIS SCRIPT IS SUPPORTED, and this is the line that makes it safe.
+    # On a second run the only actor carrying an octagon mesh is the tower this
+    # script placed last time, so that is what the deck height is read from. That
+    # is correct rather than circular: the height it carries IS the original
+    # pillar's, measured on the first run and preserved by every run since. Said
+    # out loud because a reader seeing the tower measure itself would rightly
+    # wonder whether the number can drift - it cannot, the scale is recomputed
+    # from it to reproduce it exactly.
+    rerun = old.get_actor_label().startswith("CentreTower_")
+    log("[KEEP] {0}: {1}".format(
+        "re-placing (deck height carried forward from the original pillar)" if rerun
+        else "replacing", describe(old)))
+    log("[SCALE] target deck top Z = {0:.2f} (measured, not typed)".format(target_deck_z))
 
     # THE CORE'S PERCH IS THE ONE NUMBER THAT MAY NOT MOVE. Demo 29 section 3(a)
     # starts each half with the Core on top of this pillar; ATraceCore's
@@ -481,8 +511,11 @@ def place():
         # object/factory path returns None under -run=pythonscript, because a
         # commandlet has no placement-factory context. It fails as a None deref
         # three lines later, which reads like anything except the real cause.
+        # unreal.Rotator is (roll, pitch, yaw) positionally - the third argument is
+        # the yaw, same as Scripts/import_side_ramp.py uses to face each wall.
         act = subsys.spawn_actor_from_class(
-            unreal.StaticMeshActor, unreal.Vector(0.0, 0.0, 0.0), unreal.Rotator(0.0, 0.0, 0.0))
+            unreal.StaticMeshActor, unreal.Vector(0.0, 0.0, 0.0),
+            unreal.Rotator(0.0, 0.0, TOWER_YAW))
         if act is None:
             fail("could not spawn {0}".format(label))
         act.set_actor_label(label)
@@ -504,8 +537,39 @@ def place():
     # Decided by MEASURED overlap with the tower's real footprint, then reported.
     # The old pillar and its eight rim cubes are removed because the model brings
     # its own; the four Kit_Ramps because the new ramp surface passes through them.
-    doomed = [old]
+    # Our own previous actors were destroyed just above, so they must not appear
+    # here as well - destroying an actor twice is how a re-run turns into a crash
+    # inside describe().
+    doomed = [] if rerun else [old]
     doomed += find_by_label(("KitLip_Kit_Octagon_01",))
+
+    # ---- the four platforms, and why they only became a problem at yaw 45 ------
+    #
+    # These were the middle of the OLD climb: Kit_Ramp -> Kit_Platform -> octagon.
+    # The ramps went with the pillar, which already left these as landings serving
+    # nothing. At yaw 0 that was all they were, so the first pass kept them - it is
+    # not this script's business to delete another author's geometry that merely
+    # looks redundant.
+    #
+    # Turning the tower to face the corners moved the ramps underneath them, and
+    # they stopped being merely redundant. MEASURED across each ramp's width at
+    # 20 uu stations, taking the platforms' undersides as a ceiling and 176 uu as
+    # the pawn:
+    #
+    #     bearing  45   narrowest clear width  200 uu   passable
+    #     bearing 135   narrowest clear width  220 uu   passable
+    #     bearing 225   narrowest clear width   60 uu   BLOCKED (a pawn needs 68)
+    #     bearing 315   narrowest clear width   80 uu   marginal
+    #
+    # They are not symmetric about the centre - X -1600..-600 against 400..1400 -
+    # which is why two diagonals are pinched and two are not. Confirmed in game:
+    # Trace.Bots.StructureDrill went from 0 of 42 stranded at yaw 0 to 5 of 40
+    # (12.5%) at yaw 45, which is precisely the Demo 30 complaint about bots
+    # wedging on the hand-made centre.
+    #
+    # So they go. Their eight neon lips go with them, for the reason the octagon's
+    # rim cubes did: they are dressing on a thing that no longer exists.
+    doomed += find_by_label(("Kit_Platform_", "KitLip_Kit_Platform_"))
     ramps = [a for a in subsys.get_all_level_actors()
              if a and a.get_actor_label().startswith("Kit_Ramp_")
              and KIT_TAG in [str(t) for t in a.tags]]
@@ -546,6 +610,9 @@ def place():
         box_top, ratio, unit_deck))
     log("[SCALE] uniform scale = {0:.2f} / {1:.2f} = {2:.6f}  (DERIVED, not typed)".format(
         target_deck_z, unit_deck, scale))
+
+    log("[ACTOR] yaw {0:.0f} - the four ramps face the {1}".format(
+        TOWER_YAW, "corners (diagonals)" if abs(TOWER_YAW - 45.0) < 1e-6 else "cardinal axes"))
 
     shell_actor = spawn(shell, "CentreTower_Shell", scale, True)
     neon_actor = spawn(neon, "CentreTower_Neon", scale, False)
