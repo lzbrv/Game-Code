@@ -1198,8 +1198,56 @@ namespace
 	 * Sweeps longer than this are treated as teleports (respawn, post-score reposition) rather
 	 * than movement, and are not tested — otherwise the segment from a player's pre-respawn
 	 * position to their spawn point would scythe through the whole arena.
+	 *
+	 * THE ABSOLUTE FLOOR ONLY. Ask TeleportSweepGuardUU() for the number the trip test uses; see
+	 * TeleportSweepGuardMarginUU for why this constant on its own stopped being sufficient.
 	 */
 	constexpr double MinTeleportSweepDistance = 600.0;
+
+	/**
+	 * *** THE MARGIN THIS GUARD WAS WRITTEN WITH, RESTORED AND MADE DERIVED. ***
+	 *
+	 * 600uu was chosen when DashSpeed was 3000, i.e. a whole dash was 3000 x 0.18 = 540uu and the
+	 * guard cleared it by 60uu. Spec v16 raised DashSpeed to 3300 and left the constant alone, which
+	 * took the clearance to 6uu — 1.0% — and Trace.Trail.DashProof has been printing that number
+	 * every run. The trip test's own D31 comment calls the result "right in principle and very
+	 * nearly wrong in practice", because everything past the guard is discarded ENTIRE: a remote
+	 * client whose queued moves the server consumes in one frame can deliver a whole dash as a single
+	 * sweep, and 6uu of headroom is not a margin, it is a coincidence.
+	 *
+	 * So the floor is now max(600, oneWholeDash + 60) and the 60 is stated here rather than baked
+	 * into a total. At the shipped 3300 x 0.18 that is 654uu, restoring exactly the clearance the
+	 * original author picked, and any future retune of DashSpeed or DashDuration carries its own
+	 * headroom with it instead of silently eating this one.
+	 *
+	 * *** WHY WIDENING IT CANNOT SCYTHE THE ARENA. *** The teleport guard is not the only thing
+	 * standing between a respawn and a phantom kill, and it is not even the first: the dash gate runs
+	 * BEFORE it, and a pawn that has just respawned is not dashing. The positions this component
+	 * remembers are also refreshed for EVERY tracked character every frame, before any filter, so a
+	 * pawn that was dead while it was moved has its "previous" position already at the spawn by the
+	 * time it is alive again. And a goal reset runs ClearTrail() on every trace, which empties
+	 * PreviousLocations outright. 54uu of extra permissiveness reaches none of that; a map-scale
+	 * teleport is still thousands of uu and still rejected.
+	 */
+	constexpr double TeleportSweepGuardMarginUU = 60.0;
+
+	/**
+	 * The longest sweep the trip test will still treat as movement, for a frame of @p DeltaSeconds.
+	 *
+	 * ONE DEFINITION, TWO CALLERS — the live guard in ServerRunTripTest and the arithmetic
+	 * Trace.Trail.DashProof prints. They were two expressions sharing a constant, which is how the
+	 * harness came to report a margin the guard did not actually have.
+	 */
+	double TeleportSweepGuardUU(const UTraceSettings& Settings, double DeltaSeconds)
+	{
+		const double WholeDash =
+			static_cast<double>(Settings.DashSpeed) * static_cast<double>(Settings.DashDuration);
+
+		return FMath::Max3(
+			MinTeleportSweepDistance,
+			WholeDash + TeleportSweepGuardMarginUU,
+			static_cast<double>(Settings.DashSpeed) * DeltaSeconds * 2.0);
+	}
 
 	/**
 	 * The same idea applied to the holder: a gap this large between two consecutive trace points
@@ -3221,6 +3269,14 @@ void UTraceTrailComponent::RequestParry(ETraceParryRefusal& OutRefusal)
 	ServerRequestParry(TraceParry::GetPressStampSeconds(OwnerActor));
 }
 
+bool UTraceTrailComponent::ServerRequestParry_Validate(float ClientPressServerTime)
+{
+	// Validation failure DISCONNECTS the sender, so this rejects only what is outright impossible to
+	// reason about — the same line ServerRequestReload_Validate draws. A stale or optimistic stamp is
+	// an honest client with a drifting clock and is clamped downstream, not kicked.
+	return FMath::IsFinite(ClientPressServerTime);
+}
+
 void UTraceTrailComponent::ServerRequestParry_Implementation(float ClientPressServerTime)
 {
 	ETraceParryRefusal Refusal = ETraceParryRefusal::None;
@@ -4968,9 +5024,7 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 	TArray<ATraceCharacter*> Candidates;
 	GatherTrackedCharacters(Candidates);
 
-	const double MaxSweepDistance = FMath::Max(
-		MinTeleportSweepDistance,
-		static_cast<double>(Settings.DashSpeed) * static_cast<double>(DeltaTime) * 2.0);
+	const double MaxSweepDistance = TeleportSweepGuardUU(Settings, static_cast<double>(DeltaTime));
 
 	// SPEC v7 §3. THE SAME TWO FUNCTIONS THE RIBBON IS DRAWN FROM — this is the line that makes
 	// "the lethal volume matches the drawn volume" structural. 22.5uu to either side, 63uu tall,
@@ -5323,7 +5377,52 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 
 	// Applied outside every loop above: this kills, which re-enters the component and mutates
 	// TrailPoints.Items and PreviousLocations.
-	if (Tripper != nullptr)
+	// *** ONE HELD TRIP AT A TIME, AND THE ONE IN FLIGHT OWNS THE SLOT UNTIL IT RESOLVES. ***
+	//
+	// This is ServerAdvancePendingTrip's documented contract ("@return true if the trip is still
+	// pending — the caller must not start a different one"), and until this pass the caller did not
+	// honour it: the branch below read `if (PendingTripDasher.Get() != Tripper)` and OVERWROTE a live
+	// hold whenever a SECOND enemy's dash was the first lethal one found on a later frame. Two
+	// attackers crossing the carrier's trace inside one hold window is ordinary play in a 5v5, not an
+	// exotic race, and the clobber cost three separate things:
+	//
+	//   * the first dasher's EARNED kill was dropped silently — the exact failure v8 §3 exists to
+	//     prevent, arriving by a different route;
+	//   * their record in TraceParry's ledger (keyed by CARRIER and TRIP INSTANT, so a new trip files
+	//     a NEW record rather than replacing the old one) was orphaned. Nothing ever asked about it
+	//     again, so 0.1s later — AbandonedHoldSeconds — the DEAD-MAN SWITCH fired;
+	//   * which DISARMS HELD TRIPS FOR THE WHOLE SESSION and logs a Warning accusing this function of
+	//     a bug it is not committing at that moment. Every remote client in the match then reverts to
+	//     the pre-v8 parry, which is the "great for me as the host, not great for joiners" complaint
+	//     the feature was written to answer.
+	//
+	// FIRST TRIP WINS, and that is the right game answer as well as the safe one: the carrier can
+	// only die once, so the kill belongs to whoever crossed first. If that trip is PARRIED instead,
+	// the carrier and the trace both live and the second dasher — still inside the ribbon — earns
+	// their own verdict on the next frame, through the ordinary sweep.
+	//
+	// A hold whose dasher has been destroyed is NOT abandoned here either: ServerAdvancePendingTrip
+	// withdraws it through ServerCancelPendingTrip, which tells the parry ledger the kill became
+	// moot. Hence the PendingTripHeldSeconds term — it keeps a stale slot addressable so it is
+	// cancelled properly rather than silently replaced.
+	if (PendingTripDasher.IsValid() || PendingTripHeldSeconds > 0.f)
+	{
+		// v8 §3, THE OTHER HALF OF THE HOLD — and the single line that decides whether any of this
+		// works. A dash crosses a ribbon in one or two frames; a remote carrier's hold lasts three or
+		// four. Older code cleared PendingTripDasher the first frame the dasher was no longer
+		// intersecting, so the hold was DROPPED rather than resolved: the earned kill never landed,
+		// TraceParry's dead-man switch counted it abandoned, and the first lethal dash against a
+		// joined carrier disarmed held trips (and with them the 58ms press anchoring) for the whole
+		// session. Measured before that change: case B left the carrier ALIVE 3/3 instead of DEAD 4/4
+		// — remote carriers were effectively unkillable by trace dashes.
+		//
+		// Contact is NOT re-required, and neither is being THIS frame's Tripper. The trip already
+		// resolved, at PendingTripServerTime, against a segment that was lethal and drawn at that
+		// instant; the only open question is whether a press covering that instant shows up before
+		// the hold expires. Nothing here can invent a kill the sweep did not already earn.
+		ServerAdvancePendingTrip(Holder, DeltaTime, &HeldPathPunished);
+	}
+	else if (Tripper != nullptr)
 	{
 		// parry=0 passWindow=0 is printed on the KILL line too, and it is not noise: the claim under
 		// test is a conditional, so the log has to carry the negative case as explicitly as the
@@ -5332,38 +5431,13 @@ void UTraceTrailComponent::ServerRunTripTest(float DeltaTime)
 		// upstream lag and re-ask each frame. GetTripHoldSeconds() is 0 for the host and for bots,
 		// so single-machine play is untouched. The dasher pays a few tens of ms of feedback delay;
 		// they lose nothing else.
-		if (PendingTripDasher.Get() != Tripper)
-		{
-			PendingTripDasher = Tripper;
-			PendingTripServerTime = TripServerTime;
-			PendingTripHeldSeconds = 0.f;
+		PendingTripDasher = Tripper;
+		PendingTripServerTime = TripServerTime;
+		PendingTripHeldSeconds = 0.f;
 
-			// Resolve the brand-new trip on its own contact frame with zero elapsed hold, exactly as
-			// before: a host or a bot carrier holds for 0s and dies on this very line.
-			ServerAdvancePendingTrip(Holder, 0.f, &HeldPathPunished);
-		}
-		else
-		{
-			ServerAdvancePendingTrip(Holder, DeltaTime, &HeldPathPunished);
-		}
-	}
-	else if (PendingTripDasher.IsValid())
-	{
-		// v8 §3, THE OTHER HALF OF THE HOLD — and the single line that decides whether any of this
-		// works. A dash crosses a ribbon in one or two frames; a remote carrier's hold lasts three or
-		// four. The previous code cleared PendingTripDasher here, on the first frame the dasher was no
-		// longer intersecting, so the hold was DROPPED rather than resolved: the earned kill never
-		// landed, TraceParry's dead-man switch counted it abandoned, and the first lethal dash against
-		// a joined carrier disarmed held trips (and with them the 58ms press anchoring) for the whole
-		// session. Measured before this change: case B left the carrier ALIVE 3/3 instead of DEAD 4/4
-		// — remote carriers were effectively unkillable by trace dashes, a worse client-only bug than
-		// the one v8 §3 set out to fix.
-		//
-		// Contact is NOT re-required. The trip already resolved, at PendingTripServerTime, against a
-		// segment that was lethal and drawn at that instant; the only open question is whether a press
-		// covering that instant shows up before the hold expires. Nothing here can invent a kill the
-		// sweep did not already earn.
-		ServerAdvancePendingTrip(Holder, DeltaTime, &HeldPathPunished);
+		// Resolve the brand-new trip on its own contact frame with zero elapsed hold, exactly as
+		// before: a host or a bot carrier holds for 0s and dies on this very line.
+		ServerAdvancePendingTrip(Holder, 0.f, &HeldPathPunished);
 	}
 
 	// v6 §3, deferred for the same re-entrancy reason as ApplyTrailTrip above: this kills, and the
@@ -15022,16 +15096,16 @@ namespace
 			// ---- THE TELEPORT GUARD, AS ARITHMETIC ---------------------------------------------
 			const double DashReach =
 				static_cast<double>(Settings.DashSpeed) * static_cast<double>(Settings.DashDuration);
-			const double Guard60 = FMath::Max(MinTeleportSweepDistance,
-				static_cast<double>(Settings.DashSpeed) * (1.0 / 60.0) * 2.0);
+			const double Guard60 = TeleportSweepGuardUU(Settings, 1.0 / 60.0);
 
 			UE_LOG(LogTraceGame, Display,
-				TEXT("[DASHPROOF] TELEPORT GUARD: a sweep longer than max(%.0fuu, DashSpeed*dt*2) is "
-				     "DISCARDED before any geometry runs. At 60Hz that is %.0fuu. One whole dash is "
-				     "DashSpeed %.0f x DashDuration %.2f = %.0fuu, so the margin is %.0fuu (%.1f%%). "
-				     "The server can simulate more than one frame of a remote client's movement between "
-				     "two trip tests, and everything past the guard is discarded ENTIRE."),
-				MinTeleportSweepDistance, Guard60, Settings.DashSpeed, Settings.DashDuration,
+				TEXT("[DASHPROOF] TELEPORT GUARD: a sweep longer than max(%.0fuu, oneWholeDash+%.0f, "
+				     "DashSpeed*dt*2) is DISCARDED before any geometry runs. At 60Hz that is %.0fuu. One "
+				     "whole dash is DashSpeed %.0f x DashDuration %.2f = %.0fuu, so the margin is %.0fuu "
+				     "(%.1f%%). The server can simulate more than one frame of a remote client's movement "
+				     "between two trip tests, and everything past the guard is discarded ENTIRE."),
+				MinTeleportSweepDistance, TeleportSweepGuardMarginUU, Guard60,
+				Settings.DashSpeed, Settings.DashDuration,
 				DashReach, Guard60 - DashReach, 100.0 * (Guard60 - DashReach) / Guard60);
 
 			UE_LOG(LogTraceGame, Display,

@@ -388,8 +388,15 @@ public:
 	 * server clamps it exactly as a shot's timestamp is clamped and judges the parry against it, so
 	 * a joined player is not charged for their packet's flight time. 0 = "no stamp", which resolves
 	 * to arrival and reproduces the pre-v8 behaviour byte for byte.
+	 *
+	 * WithValidation, like every other client-stamped RPC in this build (ServerFire, ServerSwing,
+	 * ServerRequestReload, ServerRequestEquip). A non-finite stamp was already harmless — the clamp
+	 * in TraceParry::ServerResolvePress tests IsFinite and falls back to arrival — but this was the
+	 * one float the wire could carry that nothing on the boundary refused, and "the gate is where the
+	 * packet arrives" is the rule the rest of the netcode keeps. It rejects ONLY what is impossible
+	 * to reason about; a merely WRONG stamp is still clamped rather than kicked.
 	 */
-	UFUNCTION(Server, Reliable)
+	UFUNCTION(Server, Reliable, WithValidation)
 	void ServerRequestParry(float ClientPressServerTime);
 
 	/**
@@ -1086,7 +1093,12 @@ private:
 	 *                      not punish that same dasher again through the live-parry path in the same
 	 *                      frame — ServerPunishParriedDash carries the Demo 7 refunds (parry cooldown
 	 *                      to zero, one dash charge back), so a double call hands out two.
-	 * @return true if the trip is still pending (the caller must not start a different one).
+	 * @return true if the trip is still pending. THE CALLER MUST NOT START A DIFFERENT ONE — and
+	 *         since this pass ServerRunTripTest enforces that by checking the slot rather than by
+	 *         reading this value: it advances whatever is in flight and only files a new trip when
+	 *         PendingTripDasher is empty. Overwriting a live hold used to drop the first dasher's
+	 *         earned kill AND orphan its record in TraceParry's ledger, which tripped the dead-man
+	 *         switch 0.1s later and disarmed held trips for the rest of the session.
 	 */
 	bool ServerAdvancePendingTrip(ATraceCharacter* Holder, float DeltaTime, ATraceCharacter** OutPunished = nullptr);
 

@@ -2344,6 +2344,78 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 		return;
 	}
 
+	// ---- THE THREE CanFire() RULES THAT HAD NO SERVER COPY --------------------------------
+	//
+	// *** THIS BLOCK IS A FIX, NOT A NEW RULE. *** Spec v10 §1 ("the knife is out, so the gun is
+	// not"), §1's 0.2 s pullout and §6 ("don't let players shoot while in a dash animation") are all
+	// enforced by CanFire() on the shooting machine and, until this pass, BY NOTHING ELSE. Every
+	// other rule in this function carries the same sentence in its own comment — the client's gate is
+	// for feel, and a modified client simply would not run it — and ServerSwing_Implementation
+	// re-asks all three for the blade. The trigger was the one path that did not, so each of these
+	// was a client-side suggestion.
+	//
+	// THE KNIFE ONE WAS LIVE AND WORTH THE MOST. bDualWieldKnife is OFF in the shipped build (v31 §1
+	// reverted it), so the knife IS a reachable selector value on key 3 — and with it selected
+	// GetShootLockoutRemaining() returns 0 by construction, the clip still holds the last firearm's
+	// rounds (ApplyEquip's exchange is firearm-to-firearm), and TraceAmmo::GetZoneDamage falls
+	// through its `Weapon != Smg` branch to the PISTOL table. A client that sent ServerFire with the
+	// blade out therefore collected full 100/40/25 hitscan at pistol cadence while drawing the
+	// knife's +22% ground speed and higher momentum ceiling. ServerRequestEquip is Reliable and
+	// arrives on this same component's channel ahead of any shot that follows it, so the selector the
+	// server reads here is always the one the client is actually holding: no grace is needed or
+	// wanted.
+	//
+	// THE OTHER TWO CARRY A GRACE, and it is the reload gate's 50 ms for the reload gate's reason —
+	// the two ends agree on the RULE and can only disagree about the clock.
+	//
+	//   PULLOUT   both machines derive DeployEndServerTime from the same press stamp through the
+	//             same function, so they differ only by each end's error in estimating the shared
+	//             clock. Refusing inside that error would drop the first round after a swap for
+	//             honest players only.
+	//   DASH      DashTimeRemaining is saved-move state, so client and server replay the identical
+	//             number — but ServerMovePacked is UNRELIABLE and this RPC is RELIABLE, so the move
+	//             that ended the dash and the shot fired the instant it did are not ordered against
+	//             each other on the wire. See GetDashTimeRemaining(). A cheater firing at the start
+	//             of a dash still has ~0.13 s on the clock and is refused.
+	//
+	// All three are exact no-ops for a bot and for a listen host's own pawn: CanFire() already
+	// refused those shots in this same process, so nothing reaches here to be refused twice.
+	{
+		constexpr double WeaponStateGraceSeconds = 0.05;
+
+		if (!IsFirearmEquipped())
+		{
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("ServerFire: %s fired with no firearm selected (server holds %s; spec v10 s1)"),
+				*GetNameSafe(OwnerActor), LexToString(EquippedWeapon));
+			if (bCollectStats) { ++TraceShotStats::GStats.ServerRejectedState; }
+			return;
+		}
+
+		if (GetDeployRemaining() > WeaponStateGraceSeconds)
+		{
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("ServerFire: %s fired %.3fs into a %.3fs pullout (spec v10 s1)"),
+				*GetNameSafe(OwnerActor),
+				TraceMelee::GetSwapSecondsFor(EquippedWeapon) - GetDeployRemaining(),
+				TraceMelee::GetSwapSecondsFor(EquippedWeapon));
+			if (bCollectStats) { ++TraceShotStats::GStats.ServerRejectedState; }
+			return;
+		}
+
+		if (const UTraceCharacterMovementComponent* ShooterMovement = Character->GetTraceMovement())
+		{
+			if (ShooterMovement->GetDashTimeRemaining() > WeaponStateGraceSeconds)
+			{
+				UE_LOG(LogTraceGame, Verbose,
+					TEXT("ServerFire: %s fired mid-dash with %.3fs of the window left (spec v10 s6)"),
+					*GetNameSafe(OwnerActor), ShooterMovement->GetDashTimeRemaining());
+				if (bCollectStats) { ++TraceShotStats::GStats.ServerRejectedState; }
+				return;
+			}
+		}
+	}
+
 	// ---- SPEC v28 §10: the melee lockout, RE-ASKED HERE ------------------------------------
 	//
 	// [DUALWIELD] The client refused this shot for the length of its swing animation; that gate is
@@ -2460,7 +2532,7 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 	// ---- muzzle sanity, measured against where the shooter *was* --------------------------
 	FVector ShotOrigin(Origin);
 	FVector ReferencePoint = Character->GetMuzzleLocation();
-	if (const UTraceLagCompensationComponent* ShooterLagComp = Character->FindComponentByClass<UTraceLagCompensationComponent>())
+	if (const UTraceLagCompensationComponent* ShooterLagComp = Character->LagComp)
 	{
 		FTraceLagCompFrame ShooterFrame;
 		if (ShooterLagComp->GetPoseAtTime(static_cast<float>(RewindTime), ShooterFrame))
@@ -2504,7 +2576,7 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 	bool bShieldBlocked = false;
 	if (Victim != nullptr)
 	{
-		if (UTraceHealthComponent* VictimHealth = Victim->FindComponentByClass<UTraceHealthComponent>())
+		if (UTraceHealthComponent* VictimHealth = Victim->Health)
 		{
 			// Spec section 6: head 100 / body 40 / legs 25. No multiplier, no base damage - the zone
 			// IS the damage. UTraceSettings::HitscanDamage and HeadshotMultiplier are no longer read
@@ -3442,7 +3514,7 @@ void UTraceWeaponComponent::ServerSwing_Implementation(FVector_NetQuantize Origi
 
 	FVector SwingOrigin(Origin);
 	FVector ReferencePoint = Character->GetMuzzleLocation();
-	if (const UTraceLagCompensationComponent* AttackerLagComp = Character->FindComponentByClass<UTraceLagCompensationComponent>())
+	if (const UTraceLagCompensationComponent* AttackerLagComp = Character->LagComp)
 	{
 		FTraceLagCompFrame AttackerFrame;
 		if (AttackerLagComp->GetPoseAtTime(static_cast<float>(RewindTime), AttackerFrame))
@@ -3484,7 +3556,7 @@ void UTraceWeaponComponent::ServerSwing_Implementation(FVector_NetQuantize Origi
 	bool bKilled = false;
 	if (Hit.Victim != nullptr)
 	{
-		if (UTraceHealthComponent* VictimHealth = Hit.Victim->FindComponentByClass<UTraceHealthComponent>())
+		if (UTraceHealthComponent* VictimHealth = Hit.Victim->Health)
 		{
 			// TWO CAUSES, not one, for the same reason ServerFire passes "Headshot" instead of
 			// letting the kill feed infer it from the victim's previous health: the approach angle
@@ -3662,7 +3734,7 @@ bool UTraceWeaponComponent::GetFacingYawAtTime(const ATraceCharacter* Character,
 		return false;
 	}
 
-	const UTraceWeaponComponent* Weapon = Character->FindComponentByClass<UTraceWeaponComponent>();
+	const UTraceWeaponComponent* Weapon = Character->Weapon;
 	if (Weapon == nullptr || Weapon->FacingHistory.Num() == 0)
 	{
 		// No history: a client (which records none), a pawn that just spawned, or a build with lag
@@ -6024,6 +6096,30 @@ namespace TraceAmmoTest
 		int32 ClipBeforeDrain = 0;
 		int32 DrainCalls = 0;
 		double ReloadObservedAtRealTime = 0.0;
+
+		/**
+		 * *** WAIT FOR THE RELOAD, DO NOT PREDICT IT — AND THE CLOCKS ARE WHY. ***
+		 *
+		 * Steps 4 and 5 used to resume at `NowReal + GetReloadSeconds() + 0.25`, i.e. they measured a
+		 * SHARED-CLOCK deadline (ReloadEndServerTime, which UTraceWeaponComponent::IsReloading compares
+		 * against GetServerTimeSeconds) with a REAL-TIME stopwatch. Those two agree only while the
+		 * machine is keeping up, so the harness reported five failures against a reload that was
+		 * working perfectly:
+		 *
+		 *   at 5 fps in a full bot match  "clip 29/30, reloading=0, ~0.76s after it started"
+		 *   under -UseFixedTimeStep       "clip 0/30, reloading=1, ~0.79s after it started"
+		 *
+		 * The second is the plainest: reloading=1 means the gun was still mid-reload when the harness
+		 * declared it late. A test that goes red because the frame rate dropped teaches its reader to
+		 * ignore red, which is worse than not having it.
+		 *
+		 * So the step waits on the thing it is actually asserting about (IsReloading() going false) and
+		 * keeps a REAL-time backstop so a reload that genuinely never completes still fails loudly
+		 * rather than hanging the ticker. Generous, because it is a deadlock guard and not the
+		 * measurement: the reload's own duration is asserted at step 3 from GetReloadRemaining().
+		 */
+		double ReloadWaitDeadlineRealTime = 0.0;
+		bool bWaitingForReload = false;
 	};
 
 	void RunAmmoTest()
@@ -6058,6 +6154,24 @@ namespace TraceAmmoTest
 			if (NowReal < State->NextStepRealTime)
 			{
 				return true;
+			}
+
+			// ---- WAIT FOR THE RELOAD ITSELF, NOT FOR A STOPWATCH ------------------------------
+			//
+			// See FAmmoTestState::ReloadWaitDeadlineRealTime. Steps 3 and 4 arm this instead of
+			// guessing a real-time duration for a shared-clock deadline; the backstop is what keeps a
+			// reload that never finishes a loud FAIL rather than a hung ticker.
+			if (State->bWaitingForReload)
+			{
+				const ATraceCharacter* WaitSubject = State->Subject.Get();
+				const UTraceWeaponComponent* WaitWeapon = (WaitSubject != nullptr) ? WaitSubject->Weapon : nullptr;
+				const bool bStillReloading = (WaitWeapon != nullptr) && WaitWeapon->IsReloading();
+
+				if (bStillReloading && NowReal < State->ReloadWaitDeadlineRealTime)
+				{
+					return true;
+				}
+				State->bWaitingForReload = false;
 			}
 
 			// ---- staging -------------------------------------------------------------------
@@ -6170,16 +6284,39 @@ namespace TraceAmmoTest
 				// Elapsed wall time over FireInterval is an independent witness: the trigger was held
 				// for a measured duration and the gun's cadence is a published knob. +/-1 covers the
 				// ticker's granularity at each end of the burst.
-				const double FireInterval = FMath::Max(0.01, static_cast<double>(UTraceSettings::Get().FireInterval));
+				//
+				// *** AND THE FIRE MODE, WHICH THIS CHECK PREDATES. *** Spec v29 §2b made the pistol
+				// SEMI-AUTOMATIC — "it must fire once per trigger press" — and the shipped config says
+				// so (bPistolFullAuto=False). A held trigger therefore spends exactly ONE round, and
+				// this assertion went on predicting HeldSeconds/FireInterval of them, so it failed on
+				// correct behaviour: "clip fell by 1 in 1.45s ... so ~4 shot(s) were expected". Measured
+				// on an untouched build, so it is the harness that is stale, not the gun.
+				//
+				// The expectation now comes from IsFullAutoNow() — the same predicate the trigger loop
+				// in TickComponent asks — so this check follows the weapon in hand and any ability that
+				// forces full auto (Roxie's MODDED) instead of assuming the v28 pistol forever.
+				// GetFireInterval() rather than the raw pistol knob, for the same reason: the subject
+				// may be holding the SMG, and the base-times-scale answer is the one CanFire gates on.
+				const double FireInterval = FMath::Max(0.01, Weapon->GetFireInterval());
 				const double HeldSeconds = NowReal - State->LiveFireStartRealTime;
-				const int32 ExpectedShots = FMath::FloorToInt(HeldSeconds / FireInterval);
-				const bool bPlausibleCount = (ClipDrop >= ExpectedShots - 1) && (ClipDrop <= ExpectedShots + 1);
+				const bool bFullAuto = Weapon->IsFullAutoNow();
+				const int32 ExpectedShots = bFullAuto
+					? FMath::FloorToInt(HeldSeconds / FireInterval)
+					: 1;
+
+				// Semi-automatic is EXACT: one press, one round, no tolerance to hide behind. Full auto
+				// keeps the +/-1 for the ticker's granularity at each end of the burst.
+				const bool bPlausibleCount = bFullAuto
+					? (ClipDrop >= ExpectedShots - 1 && ClipDrop <= ExpectedShots + 1)
+					: (ClipDrop == 1);
 
 				State->List.Check(ClipDrop > 0 && bPlausibleCount,
 					TEXT("the REAL trigger actually spends rounds: StartFire -> FireOnce -> ServerFire -> the clip"),
-					FString::Printf(TEXT("clip fell by %d in %.2fs at FireInterval %.2f, so ~%d shot(s) were "
-					                     "expected (+/-1)"),
-						ClipDrop, HeldSeconds, FireInterval, ExpectedShots));
+					FString::Printf(TEXT("clip fell by %d in %.2fs at interval %.3f, %s, so %d shot(s) were "
+					                     "expected%s"),
+						ClipDrop, HeldSeconds, FireInterval,
+						bFullAuto ? TEXT("FULL AUTO") : TEXT("SEMI-AUTO (v29 s2b: one round per press)"),
+						ExpectedShots, bFullAuto ? TEXT(" (+/-1)") : TEXT(" exactly")));
 
 				State->List.Check(ClipDrop > 0 && RoundsSpent == ClipDrop,
 					TEXT("exactly ONE round leaves the clip per shot"),
@@ -6227,7 +6364,10 @@ namespace TraceAmmoTest
 
 				State->ReloadObservedAtRealTime = NowReal;
 				State->Step = 4;
-				State->NextStepRealTime = NowReal + static_cast<double>(TraceAmmo::GetReloadSeconds()) + 0.25;
+				State->NextStepRealTime = 0.0;
+				State->bWaitingForReload = true;
+				State->ReloadWaitDeadlineRealTime =
+					NowReal + static_cast<double>(TraceAmmo::GetReloadSeconds()) * 20.0 + 2.0;
 				return true;
 			}
 
@@ -6279,7 +6419,10 @@ namespace TraceAmmoTest
 						bCanFireBefore ? 1 : 0, bRefusedArmed ? 0 : 1, bAllowedDisarmed ? 1 : 0));
 
 				State->Step = 5;
-				State->NextStepRealTime = NowReal + static_cast<double>(TraceAmmo::GetReloadSeconds()) + 0.25;
+				State->NextStepRealTime = 0.0;
+				State->bWaitingForReload = true;
+				State->ReloadWaitDeadlineRealTime =
+					NowReal + static_cast<double>(TraceAmmo::GetReloadSeconds()) * 20.0 + 2.0;
 				return true;
 			}
 

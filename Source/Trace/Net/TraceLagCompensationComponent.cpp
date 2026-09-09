@@ -348,7 +348,11 @@ ATraceCharacter* UTraceLagCompensationComponent::ResolveHitscan(
 		bool bHavePose = false;
 		if (Settings.bEnableLagCompensation)
 		{
-			if (const UTraceLagCompensationComponent* TargetLagComp = Target->FindComponentByClass<UTraceLagCompensationComponent>())
+			// The typed subobject, not FindComponentByClass: this is the inner loop of the hitscan
+			// resolver (every candidate, every shot, on both the predicted and the authoritative
+			// pass), and the scan walks the whole component array of a pawn that has a dozen of them.
+			// ATraceCharacter::LagComp is the same object the scan would return.
+			if (const UTraceLagCompensationComponent* TargetLagComp = Target->LagComp)
 			{
 				bHavePose = TargetLagComp->GetPoseAtTime(RewindToServerTime, Frame);
 			}

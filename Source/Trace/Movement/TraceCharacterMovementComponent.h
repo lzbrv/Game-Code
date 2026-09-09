@@ -1251,6 +1251,26 @@ public:
 	 */
 	bool AreWeaponActionsBlocked() const { return IsDashing(); }
 
+	/**
+	 * Seconds left in the dash window; 0 when not dashing. The same clock AreWeaponActionsBlocked()
+	 * is a boolean view of, exposed as a NUMBER for the one caller that needs a tolerance.
+	 *
+	 * *** WHY A SERVER-SIDE FIRE GATE CANNOT USE THE BARE BOOL. *** AreWeaponActionsBlocked() is
+	 * documented above as valid on both ends of "the client predicts the shot, the server validates
+	 * it", and it is — but the two ends do not learn about the dash's END at the same instant.
+	 * ServerMovePacked is UNRELIABLE and ServerFire is RELIABLE, so the move that drove
+	 * DashTimeRemaining to 0 and the shot fired the moment it did are not ordered against each other
+	 * on the wire. A server that refused on the bare bool would eat the first round after some
+	 * honest dashes — the "the gun eats bullets" failure this project treats as strictly worse than
+	 * the rule not being enforced at all.
+	 *
+	 * So the server forgives the same 50 ms the reload and melee gates forgive, and reads this. A
+	 * cheater firing at the START of a dash still has ~0.13 s on the clock and is refused; an honest
+	 * client one or two frames of reordering late is not. Exact and free on a listen host and on
+	 * every bot, whose dash clock is this process's own.
+	 */
+	float GetDashTimeRemaining() const { return FMath::Max(0.f, DashTimeRemaining); }
+
 	// --- SPEC v10 §1: THE KNIFE'S MOVEMENT PROFILE -------------------------------------------------
 
 	/**
@@ -1708,8 +1728,8 @@ public:
 	/** Seconds of "the ability layer still counts this pawn as grounded" left. See the ledge grace. */
 	float GetGroundGraceRemainingForAudit() const { return GroundGraceRemaining; }
 
-	/** Seconds of dash window left. Zero when not dashing. */
-	float GetDashTimeRemainingForAudit() const { return DashTimeRemaining; }
+	/** Seconds of dash window left. Zero when not dashing. Forwards to the gameplay accessor. */
+	float GetDashTimeRemainingForAudit() const { return GetDashTimeRemaining(); }
 
 	/** Seconds of slide-jump coyote grace left. Zero when no slide has recently ended. */
 	float GetSlideJumpGraceRemainingForAudit() const { return SlideJumpGraceRemaining; }

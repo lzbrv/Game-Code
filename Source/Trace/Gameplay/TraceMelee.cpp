@@ -224,7 +224,7 @@ namespace
 		{
 			return nullptr;
 		}
-		return const_cast<ATraceCharacter*>(TraceChar)->FindComponentByClass<UTraceWeaponComponent>();
+		return TraceChar->Weapon;
 	}
 }
 
@@ -563,7 +563,7 @@ ATraceCharacter* TraceMelee::ResolveSwing(
 	// rotation — a bullet does not care which way you are looking, and this is the one thing that
 	// does). A stale yaw would flip the verdict in the direction the attacker cannot see.
 	FVector VictimLocation = OutHit.Victim->GetActorLocation();
-	if (const UTraceLagCompensationComponent* VictimLagComp = OutHit.Victim->FindComponentByClass<UTraceLagCompensationComponent>())
+	if (const UTraceLagCompensationComponent* VictimLagComp = OutHit.Victim->LagComp)
 	{
 		FTraceLagCompFrame Frame;
 		if (VictimLagComp->GetPoseAtTime(RewindToServerTime, Frame))
