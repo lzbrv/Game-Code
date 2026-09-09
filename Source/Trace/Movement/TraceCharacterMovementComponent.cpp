@@ -272,6 +272,38 @@ static bool IsSurfLegacyExit()
 #endif
 }
 
+/**
+ * THE A/B ARM FOR ABILITY VELOCITY OWNERSHIP.
+ *
+ * 1 restores the behaviour that shipped before the ownership block at the top of CalcVelocity(): the
+ * dash and the slide re-assert their velocity ONLY in OnMovementUpdated, i.e. after the physics step
+ * that moved the pawn, so each frame's displacement is whatever Super::CalcVelocity left behind.
+ *
+ * It exists because that defect is a DISTANCE and distances are only meaningful against each other.
+ * Trace.Dash.ReachTest measured, at a pinned 60 fps on the same pawn over the same floor:
+ *
+ *     arm            key held        no key held
+ *     legacy (1)     544.9 uu 91.7%  435.7 uu 73.4%
+ *     shipped (0)    605.3 uu 101.9% 605.0 uu 101.9%
+ *
+ * 605 uu is 11 frames x 3300 uu/s x 1/60, i.e. the whole 0.18 s window quantised to whole frames —
+ * the arithmetic ceiling, reached from both arms of the input condition.
+ *
+ * Same shape and same reasoning as the two legacy arms above, including the Shipping guard on the
+ * READER rather than only on the console registration.
+ */
+int32 GTraceLegacyAbilityVelocity = 0;
+
+static bool IsAbilityVelocityLegacy()
+{
+#if UE_BUILD_SHIPPING
+	return false;
+#else
+	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceLegacyAbilityVelocity"));
+	return GTraceLegacyAbilityVelocity != 0 || bFromCommandLine;
+#endif
+}
+
 static bool IsSurfLegacyAirLimit()
 {
 #if UE_BUILD_SHIPPING
@@ -573,6 +605,192 @@ static bool IsDashDebugEnabled()
 {
 	static const bool bFromCommandLine = FParse::Param(FCommandLine::Get(), TEXT("TraceDashDebug"));
 	return bFromCommandLine || GTraceDashDebug != 0;
+}
+
+// =================================================================================================
+// THE DASH REACH LEDGER — how far a dash ACTUALLY travels, against how far this file says it does.
+//
+// DashSpeed x DashDuration = 594 uu is asserted in four places (the header's climb arithmetic,
+// Trace.DashVectorTest's "reach=" line, Trace.Trail.DashProof's teleport-guard paragraph, and the
+// trail's own guard constant) and MEASURED in none of them. DashVectorTest says so itself: it
+// "measures the PURE function and nothing else".
+//
+// That gap matters because the dash does NOT own its velocity during the frame that moves the pawn.
+// ApplyDashVelocity() is called from BeginDash and again from OnMovementUpdated, which runs AFTER
+// the physics step — so the displacement each frame is whatever Super::CalcVelocity left behind, and
+// the re-assert only tidies up for the next frame. With a movement key held that is a small
+// direction drag; with NO key held, Super::CalcVelocity takes the bZeroAcceleration branch and
+// ApplyVelocityBraking removes GroundFriction x BrakingFrictionFactor (8 x 2 = 16) per second plus
+// BrakingDecelerationWalking (2600) BEFORE the pawn moves.
+//
+// So this counts real dashes in a real match and splits them by the one condition that predicts the
+// answer: whether the player was holding a direction. Two populations that disagree are the defect;
+// two that agree are the fix. Straight-line displacement rather than path length, because a dash IS
+// a straight line by construction — if those two ever differ, the dash is being deflected and the
+// ratio will say so.
+//
+// Dev-only, off by default, and never advanced on a replayed move.
+// =================================================================================================
+
+int32 GTraceDashReach = 0;
+static FAutoConsoleVariableRef CVarTraceDashReach(
+	TEXT("Trace.Dash.Reach"),
+	GTraceDashReach,
+	TEXT("Dev only. Non-zero measures the ACTUAL distance every dash covers against "
+	     "DashSpeed x DashDuration, split by whether a movement key was held. "
+	     "Trace.Dash.ReachReport prints it."),
+	ECVF_Cheat);
+
+/** One population: dashes that began with a live movement input, or dashes that began without one. */
+struct FTraceDashReachBucket
+{
+	int32 Count = 0;
+	double RatioTotal = 0.0;
+	double RatioMin = 0.0;
+	double RatioMax = 0.0;
+	double ReachTotal = 0.0;
+
+	void Add(double Ratio, double Reach)
+	{
+		RatioMin = (Count == 0) ? Ratio : FMath::Min(RatioMin, Ratio);
+		RatioMax = (Count == 0) ? Ratio : FMath::Max(RatioMax, Ratio);
+		++Count;
+		RatioTotal += Ratio;
+		ReachTotal += Reach;
+	}
+
+	double MeanRatio() const { return (Count > 0) ? (RatioTotal / Count) : 0.0; }
+	double MeanReach() const { return (Count > 0) ? (ReachTotal / Count) : 0.0; }
+};
+
+static FTraceDashReachBucket GDashReachWithInput;
+static FTraceDashReachBucket GDashReachNoInput;
+static FTraceDashReachBucket GDashReachAirborne;
+
+static void TraceDashReachReport()
+{
+	const auto Row = [](const TCHAR* Label, const FTraceDashReachBucket& Bucket)
+	{
+		if (Bucket.Count == 0)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[DASHREACH] %-28s no samples"), Label);
+			return;
+		}
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[DASHREACH] %-28s n=%4d  mean %6.1f uu = %5.1f%% of intended  (worst %5.1f%%, best %5.1f%%)"),
+			Label, Bucket.Count, Bucket.MeanReach(), Bucket.MeanRatio() * 100.0,
+			Bucket.RatioMin * 100.0, Bucket.RatioMax * 100.0);
+	};
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[DASHREACH] ===== actual dash displacement vs DashSpeed x DashDuration ====="));
+	Row(TEXT("GROUNDED, key held"), GDashReachWithInput);
+	Row(TEXT("GROUNDED, no key held"), GDashReachNoInput);
+	Row(TEXT("AIRBORNE"), GDashReachAirborne);
+
+	const int32 GroundSamples = GDashReachWithInput.Count + GDashReachNoInput.Count;
+	if (GDashReachWithInput.Count > 0 && GDashReachNoInput.Count > 0)
+	{
+		const double Gap = (GDashReachWithInput.MeanRatio() - GDashReachNoInput.MeanRatio()) * 100.0;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[DASHREACH] THE HEADLINE: holding a direction is worth %+.1f percentage points of dash "
+			     "distance over %d grounded sample(s). Same charge, same clock, same 594 uu on paper. "
+			     "Zero is the target."),
+			Gap, GroundSamples);
+	}
+}
+
+static FAutoConsoleCommand CmdTraceDashReachReport(
+	TEXT("Trace.Dash.ReachReport"),
+	TEXT("Dev only. Print the dash reach ledger gathered while Trace.Dash.Reach was on."),
+	FConsoleCommandDelegate::CreateStatic(&TraceDashReachReport));
+
+// =================================================================================================
+// Trace.Dash.ReachTest — THE ARM A BOT MATCH CANNOT PRODUCE.
+//
+// The ledger above, run over an eight-bot match, returns 84 grounded samples and every one of them
+// is "key held": a bot on its way somewhere is always holding a direction when it dashes. The
+// no-input dash is not unreachable, though — CanDash() asks for a charge, a live pawn and no dash in
+// flight, and nothing else — so a player standing still and pressing dash gets one, composed from
+// the capsule's facing by ComputeDashDirection()'s fallback.
+//
+// That is precisely the arm that separates the two branches of Super::CalcVelocity: with a key held
+// it takes the friction path (which preserves speed and only drags direction), with no key held it
+// takes bZeroAcceleration -> ApplyVelocityBraking, which removes 16/s of the velocity plus 2600
+// uu/s^2 BEFORE the frame moves the pawn. So the arm has to be driven deliberately.
+//
+// Six dashes, three per arm, on the local pawn, through StartDash() — the same entry point the input
+// layer calls. Everything else is held identical between the arms: same pawn, same facing, same
+// ground, same charge clock. The only difference is whether a movement key is down.
+// =================================================================================================
+
+int32 GTraceDashReachTest = 0;
+static FAutoConsoleVariableRef CVarTraceDashReachTest(
+	TEXT("Trace.Dash.ReachTest"),
+	GTraceDashReachTest,
+	TEXT("Dev only. Drive three dashes with a movement key held and three with none, and report the "
+	     "distance each arm actually covered against DashSpeed x DashDuration."),
+	ECVF_Cheat);
+
+namespace TraceDashReachTest
+{
+	/** Single local pawn, dev-only, game thread: file statics are the right amount of machinery. */
+	int32 GPhase = -1;            // -1 armed but not started, 0..5 running, 6 done
+	float GPhaseTime = 0.f;
+	bool  GFired = false;         // a dash has been OBSERVED running this phase
+	bool  GRequestSent = false;   // StartDash() has been called this phase (see the re-ask below)
+	int32 GBeganAtPhaseStart = 0; // the began-count when this phase opened; see the latch below
+	float GRunYaw = 0.f;
+
+	/**
+	 * THREE COUNTS, BECAUSE THERE ARE THREE THINGS THAT CAN GO WRONG AND ONLY ONE OF THEM IS THE
+	 * MEASUREMENT.
+	 *
+	 *   REQUESTED  StartDash() was called and CanDash() agreed.
+	 *   BEGAN      BeginDash() actually ran on a later move — the intent survived to be consumed.
+	 *   CLOSED     the window then expired with the pawn still on the ground, which is the only
+	 *              shape of dash this comparison can use.
+	 *
+	 * The first version of this harness printed only the first and the last, read "fired 3, closed 1"
+	 * and could not say which half had lost them. Requested-but-never-began and began-but-left-the-
+	 * ground are different facts about a run, and a mean over "whatever survived" is not a
+	 * measurement until you know which one happened.
+	 */
+	int32 GRequestedWithInput = 0;
+	int32 GRequestedNoInput = 0;
+	int32 GBeganWithInput = 0;
+	int32 GBeganNoInput = 0;
+
+	constexpr int32 DashesPerArm = 3;
+	constexpr int32 DashPhases = DashesPerArm * 2;
+
+	/**
+	 * TWO MORE PHASES, FOR THE SLIDE, AND FOR THE SAME REASON THE DASH NEEDED DRIVING.
+	 *
+	 * The slide re-asserts its velocity in the same place the dash did and was fixed by the same
+	 * block, so it has the same two branches — and a bot cannot produce the interesting one either.
+	 * A bot slides while holding a direction, which takes Super::CalcVelocity's friction path
+	 * (magnitude preserved, direction dragged); a PLAYER routinely slides and then lets go, which
+	 * takes bZeroAcceleration -> ApplyVelocityBraking. Measured over an eight-bot match the two arms
+	 * were 0.88 and 0.90 of the slide's own speed profile on five and one samples — i.e. nothing,
+	 * because every one of those samples was the branch the fix does not change.
+	 *
+	 * So: run up to entry speed, RELEASE the key, then press crouch. The slide's own debug line
+	 * (Trace.SlideDebug) carries duration, distance and entry/exit speed, which is everything needed
+	 * to normalise distance against the speed profile and compare arms.
+	 */
+	constexpr int32 SlidePhases = 2;
+	constexpr int32 NumPhases = DashPhases + SlidePhases;
+
+	bool PhaseIsSlide(int32 Phase) { return Phase >= DashPhases; }
+
+	/** A phase holds input (or not) for HoldFor, dashes, then waits out the recharge before the next. */
+	constexpr float HoldFor = 0.45f;
+
+	bool PhaseHoldsInput(int32 Phase) { return Phase < DashesPerArm; }
+
+	/** Seconds of run-up a slide phase spends building entry speed before it releases and crouches. */
+	constexpr float SlideRunUp = 1.6f;
 }
 
 /**
@@ -2668,11 +2886,70 @@ void UTraceCharacterMovementComponent::CalcVelocity(float DeltaTime, float Frict
 		// block (spec v5 §7). Removed in v12 §5. Nothing replaces it: with the mantle gone, a pawn at
 		// a ledge is either falling or walking, and the two branches below are the whole story again.
 
+		// =========================================================================================
+		// THE TWO ABILITIES THAT OWN THE VELOCITY VECTOR OUTRIGHT, ASSERTED BEFORE THE PAWN MOVES.
+		//
+		// *** THIS BLOCK IS A FIX, AND THE COMMENT IT REPLACES SAID THE OPPOSITE. *** The old note on
+		// the air branch below read "the dash owns the velocity vector outright for its whole window
+		// and re-asserts it in OnMovementUpdated, so letting air input add to it first would just be
+		// arithmetic nobody can observe". It was observable, because of WHEN the two run:
+		//
+		//     PerformMovement -> StartNewPhysics -> PhysWalking/PhysFalling -> CalcVelocity  (here)
+		//                                                                  -> MOVE THE PAWN
+		//                     -> OnMovementUpdated                                          (re-assert)
+		//
+		// The re-assert lands AFTER the displacement it was supposed to govern. So every frame of a
+		// dash or a slide moved the pawn at whatever Super::CalcVelocity had just left behind, and the
+		// re-assert only tidied up for the NEXT frame — which is why it looked correct in every log
+		// that printed Velocity and in none that measured distance.
+		//
+		// WHAT SUPER::CALCVELOCITY DOES TO A DASH, in the engine's own two branches:
+		//   key held   bZeroAcceleration is false, so it runs the direction-drag term
+		//              `Velocity -= (Velocity - AccelDir*VelSize) * min(dt*Friction,1)` — magnitude is
+		//              preserved but the vector is dragged 13% per frame toward the INPUT direction,
+		//              which on a pitched dash flattens it and on any dash bends it.
+		//   no key     bZeroAcceleration is true, so it runs ApplyVelocityBraking with
+		//              GroundFriction x BrakingFrictionFactor (8 x 2 = 16) plus
+		//              BrakingDecelerationWalking (2600) BEFORE the frame moves — roughly -925 uu/s at
+		//              dash speed, on every single frame of the window.
+		//
+		// MEASURED (Trace.Dash.ReachTest, 60 fps pinned, same pawn, same facing, same ground):
+		//     key held   544.9 uu   91.7% of the 594 uu this file asserts in four places
+		//     no key     435.7 uu   73.4%
+		// An 18.4 point spread on a mechanic whose entire contract is "a fixed-length burst on rails",
+		// decided by whether the player happened to be holding a movement key. Standing still and
+		// dashing is not an exotic input; it is what a player does when they are surprised.
+		//
+		// Asserting here makes the frame's displacement the dash's own vector, which is what every
+		// comment in this file already claims. The OnMovementUpdated re-assert STAYS: it is what puts
+		// Z back after PhysFalling's gravity step, and it is the writer BeginDash shares.
+		//
+		// Prediction-safe by construction: DashDirection, DashTimeRemaining, SlideDirection and
+		// SlideSpeed are all saved-move state, so a replayed frame asserts the identical vector. It is
+		// strictly BETTER than what it replaces, which made the displacement depend on engine friction
+		// applied to a velocity that was about to be overwritten.
+		// =========================================================================================
+		if (DashTimeRemaining > 0.f && !IsAbilityVelocityLegacy())
+		{
+			ApplyDashVelocity();
+			return;
+		}
+
+		// The slide's ground test is IsGroundedForAbilities(), not IsMovingOnGround(), because that is
+		// the test OnMovementUpdated maintains the slide under — a one-frame contact blip on a ledge
+		// lip must not hand one frame of the slide back to the air model on one machine and not the
+		// other. ApplySlideVelocity() leaves Z alone unless the pawn is genuinely walking.
+		if (SlideTimeRemaining > 0.f && IsGroundedForAbilities() && !IsAbilityVelocityLegacy())
+		{
+			ApplySlideVelocity();
+			return;
+		}
+
 		// --- AIR (spec §2.1) ---------------------------------------------------------------------
 		//
-		// Not while dashing: the dash owns the velocity vector outright for its whole window and
-		// re-asserts it in OnMovementUpdated, so letting air input add to it first would just be
-		// arithmetic nobody can observe.
+		// The dash is already gone above, so this branch is only ever reached by a pawn whose velocity
+		// no ability owns. The DashTimeRemaining term is kept as an explicit statement of that rather
+		// than left implicit in the ordering.
 		if (IsFalling() && IsSourceAirAccelerationEnabled() && DashTimeRemaining <= 0.f)
 		{
 			ApplySourceAirAcceleration(DeltaTime);
@@ -3315,6 +3592,34 @@ void UTraceCharacterMovementComponent::BeginDash()
 	}
 
 #if !UE_BUILD_SHIPPING
+	// THE REACH LEDGER'S OPENING EDGE. Latched on the record pass only — a correction replays this
+	// function for several moves and would re-open the same dash, which is how a ledger invents
+	// samples. "Had input" is asked HERE because Acceleration is what BeginDash composed the
+	// direction from, and it is the condition that predicts which branch Super::CalcVelocity takes on
+	// every frame of the window that follows.
+	if (GTraceDashReach != 0 && CharacterOwner != nullptr && !CharacterOwner->bClientUpdating
+		&& UpdatedComponent != nullptr)
+	{
+		DashReachStartLocation = UpdatedComponent->GetComponentLocation();
+		bDashReachHadInput = !FVector(Acceleration.X, Acceleration.Y, 0.f).IsNearlyZero();
+		bDashReachStartedAirborne = IsFalling();
+
+		// The ReachTest's middle count. Here rather than at StartDash() because THIS is the moment a
+		// dash exists; StartDash only raises an intent that a later move may or may not consume.
+		//
+		// SCOPED TO THE DRIVEN PAWN, exactly as the ledger's close is, and it was not on the first
+		// pass: the run printed "requested 3, began 5" — more dashes than the test had asked for —
+		// because both bots dash constantly and a bot always holds a direction, so their launches all
+		// landed in the key-held arm. An accounting line that can read higher than its own input is
+		// worse than no accounting line.
+		if (GTraceDashReachTest != 0 && !bDashReachStartedAirborne
+			&& CharacterOwner->IsLocallyControlled() && CharacterOwner->IsPlayerControlled())
+		{
+			if (bDashReachHadInput) { ++TraceDashReachTest::GBeganWithInput; }
+			else                    { ++TraceDashReachTest::GBeganNoInput; }
+		}
+	}
+
 	if (IsDashDebugEnabled())
 	{
 		const FRotator AimRotation = GetDashAimRotation();
@@ -3342,6 +3647,24 @@ void UTraceCharacterMovementComponent::ApplyDashVelocity()
 	// a vertical component it would only discard. This is also what stops a level dash across a slope
 	// from being read as an attempt to launch.
 	if (IsMovingOnGround() && DashDirection.Z <= UE_KINDA_SMALL_NUMBER)
+	{
+		Velocity.Z = 0.f;
+	}
+}
+
+void UTraceCharacterMovementComponent::ApplySlideVelocity()
+{
+	// ONE WRITER FOR THE SLIDE'S VELOCITY, exactly as ApplyDashVelocity() is the dash's, and for the
+	// same reason: it is now called from two places — CalcVelocity(), before the pawn moves, and
+	// OnMovementUpdated(), after — and two copies of these three lines would be two things to keep in
+	// step.
+	Velocity.X = SlideDirection.X * SlideSpeed;
+	Velocity.Y = SlideDirection.Y * SlideSpeed;
+
+	// Grounded: no vertical component to hand PhysWalking, which would only discard it. Airborne
+	// (a ledge blip inside the ground grace, where the slide is still maintained) Z is left alone —
+	// PhysFalling owns it, and it strips and restores Z around CalcVelocity anyway.
+	if (IsMovingOnGround())
 	{
 		Velocity.Z = 0.f;
 	}
@@ -4912,6 +5235,37 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	{
 #if !UE_BUILD_SHIPPING
 		const FVector PreExitVelocity = Velocity;
+
+		// THE REACH LEDGER'S CLOSING EDGE. Straight-line displacement over the whole window, against
+		// the DashSpeed x DashDuration this file asserts in four places and measures in none.
+		// While Trace.Dash.ReachTest is driving, only the pawn it drives counts: the ledger is
+		// otherwise match-wide by design (ten bots dashing is one sample of the mechanic), and a bot
+		// always holds a direction, so its dashes would all land in one arm of a two-arm comparison
+		// and quietly move the number the verdict is read from.
+		// BOTH TERMS, and neither is redundant — the same pair UTraceWeaponComponent uses for the
+		// predicted gunshot. IsLocallyControlled() alone is TRUE for every bot on the server (an
+		// AIController is local), which is exactly how the first run of this A/B collected five
+		// samples in the "key held" arm when the test only fires three: two bot dashes had walked in.
+		const bool bLedgerOwnsThisPawn = (GTraceDashReachTest == 0)
+			|| (CharacterOwner != nullptr
+				&& CharacterOwner->IsLocallyControlled() && CharacterOwner->IsPlayerControlled());
+
+		if (GTraceDashReach != 0 && bLedgerOwnsThisPawn
+			&& CharacterOwner != nullptr && !CharacterOwner->bClientUpdating
+			&& UpdatedComponent != nullptr && !DashReachStartLocation.IsZero())
+		{
+			const double Intended = FMath::Max(1.0,
+				static_cast<double>(GetDashSpeed()) * static_cast<double>(GetDashDuration()));
+			const double Actual = FVector::Dist(DashReachStartLocation,
+				UpdatedComponent->GetComponentLocation());
+
+			FTraceDashReachBucket& Bucket = bDashReachStartedAirborne
+				? GDashReachAirborne
+				: (bDashReachHadInput ? GDashReachWithInput : GDashReachNoInput);
+			Bucket.Add(Actual / Intended, Actual);
+
+			DashReachStartLocation = FVector::ZeroVector;
+		}
 #endif
 		ApplyDashExitSpeed();
 
@@ -5094,12 +5448,7 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 			}
 			else
 			{
-				Velocity.X = SlideDirection.X * SlideSpeed;
-				Velocity.Y = SlideDirection.Y * SlideSpeed;
-				if (IsMovingOnGround())
-				{
-					Velocity.Z = 0.f;
-				}
+				ApplySlideVelocity();
 			}
 		}
 	}
@@ -5269,6 +5618,7 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	TickMomentumMeasure(DeltaSeconds);
 	TickLedgeTest(DeltaSeconds);
 	TickDashPitchTest(DeltaSeconds);
+	TickDashReachTest(DeltaSeconds);
 
 	// SPEC v10 §5. Advanced on the RECORD pass only, for the reason BeginWallStickSample() gives: a
 	// replay re-runs the same frames and would close the same sample several times over. Always on
@@ -5587,6 +5937,21 @@ static FAutoConsoleVariableRef CVarTraceSurfLegacyAirLimit(
 	TEXT("Patch 28 sec 5 A/B. 1 puts UE's stock LimitAirControl back on surf planes, which deletes the "
 	     "up-slope half of the player's input and is the behaviour the override replaces. Run "
 	     "-TraceSurfTest with it on and off and diff the ideal-strafe column."),
+	ECVF_Cheat);
+
+/**
+ * See GTraceLegacyAbilityVelocity's definition for what the arm restores and the numbers it was
+ * measured with. The REGISTRATION lives down here with its siblings while the DEFINITION stays up
+ * beside the reader, which is the split this file settled on after W9-SHIPGUARD: the Shipping guard
+ * belongs on the reader, and a console registration inside the dev block is what keeps a cheat knob
+ * out of a retail binary.
+ */
+static FAutoConsoleVariableRef CVarTraceLegacyAbilityVelocity(
+	TEXT("Trace.Move.LegacyAbilityVelocity"),
+	GTraceLegacyAbilityVelocity,
+	TEXT("A/B arm. 1 restores the behaviour where the dash and the slide re-assert their velocity "
+	     "only AFTER the pawn has moved, so a frame's displacement is whatever engine friction left "
+	     "behind. Drives Trace.Dash.ReachTest's two arms from one binary."),
 	ECVF_Cheat);
 
 /**
@@ -7146,6 +7511,255 @@ void UTraceCharacterMovementComponent::TickLedgeTest(float DeltaSeconds)
 // -------------------------------------------------------------------------------------------
 // -TraceDashPitchTest — spec v7 §5 measured on a real pawn
 // -------------------------------------------------------------------------------------------
+
+void UTraceCharacterMovementComponent::TickDashReachTest(float DeltaSeconds)
+{
+	using namespace TraceDashReachTest;
+
+	if (GTraceDashReachTest == 0 || GPhase >= NumPhases)
+	{
+		return;
+	}
+	if (CharacterOwner == nullptr || UpdatedComponent == nullptr || !CharacterOwner->IsLocallyControlled())
+	{
+		return;
+	}
+
+	// NEVER ON A REPLAYED MOVE, for TickDashPitchTest's reason: a correction re-runs these frames and
+	// would fire phantom dashes the server never saw.
+	if (CharacterOwner->bClientUpdating)
+	{
+		return;
+	}
+
+	const UWorld* TestWorld = GetWorld();
+	if (TestWorld == nullptr)
+	{
+		return;
+	}
+
+	if (GPhase < 0)
+	{
+		// Wait for a settled pawn standing on something, exactly as the pitch test does.
+		if (TestWorld->GetTimeSeconds() < 4.f || !IsMovingOnGround())
+		{
+			return;
+		}
+
+		// The ledger is the instrument; arm it rather than making the caller remember to. The slide
+		// phases read Trace.SlideDebug's own line, so arm that too — a run that silently produced no
+		// slide output would look exactly like a run whose slides never happened.
+		GTraceDashReach = 1;
+		GTraceSlideDebug = 1;
+		GDashReachWithInput = FTraceDashReachBucket();
+		GDashReachNoInput = FTraceDashReachBucket();
+		GDashReachAirborne = FTraceDashReachBucket();
+
+		// Face the middle of the field so three dashes in a row have somewhere to go — a dash into a
+		// wall measures the wall, which is the one thing that would make the two arms incomparable.
+		FVector TowardCentre = -UpdatedComponent->GetComponentLocation();
+		TowardCentre.Z = 0.f;
+		GRunYaw = TowardCentre.Normalize() ? static_cast<float>(TowardCentre.Rotation().Yaw) : 0.f;
+
+		GPhase = 0;
+		GPhaseTime = 0.f;
+		GFired = false;
+		GRequestSent = false;
+		GBeganAtPhaseStart = 0;
+		GRequestedWithInput = 0;
+		GRequestedNoInput = 0;
+		GBeganWithInput = 0;
+		GBeganNoInput = 0;
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[DASHREACH] ---- ReachTest begin: %d dash(es) with a key held, then %d with none. "
+			     "speed=%.0f duration=%.3f intended reach=%.1fuu runYaw=%.1f arm=%s"),
+			DashesPerArm, DashesPerArm, GetDashSpeed(), GetDashDuration(),
+			GetDashSpeed() * GetDashDuration(), GRunYaw,
+			IsAbilityVelocityLegacy()
+				? TEXT("LEGACY (velocity re-asserted only after the move)")
+				: TEXT("SHIPPED (the ability owns velocity before the move)"));
+	}
+
+	GPhaseTime += DeltaSeconds;
+
+	// A PHASE IS LONG ENOUGH TO GET ITS CHARGE BACK, WITH REAL MARGIN.
+	//
+	// The first sizing was RechargeWindow + 1 s and it was not enough: three of six phases logged
+	// "charges=0" and produced no sample. The pool refills on its own clock inside OnMovementUpdated
+	// and the phase has to cover the hold, the whole window, the dash itself and the frame quantisation
+	// on top — so the length is stated as that sum rather than as a round number that happened to work
+	// once. The give-up timeout below is derived from the same sum, so the two cannot drift apart.
+	const float ChargeWait = GetDashRechargeWindow() + 2.0f;
+	const float PhaseLength = HoldFor + ChargeWait + GetDashDuration() + 1.0f;
+
+	if (APlayerController* TestController = Cast<APlayerController>(CharacterOwner->GetController()))
+	{
+		// Level, and pinned every frame: the whole comparison depends on the two arms dashing along
+		// the same vector, and a fallback dash reads the capsule's facing.
+		TestController->SetControlRotation(FRotator(0.f, GRunYaw, 0.f));
+	}
+
+	const FRotationMatrix YawBasis(FRotator(0.f, GRunYaw, 0.f));
+
+	if (PhaseIsSlide(GPhase))
+	{
+		// RUN UP, THEN LET GO. The release is the whole point: it is what puts Acceleration at zero
+		// for the frames the slide is running, which is the branch the fix changes.
+		if (GPhaseTime < SlideRunUp)
+		{
+			CharacterOwner->AddMovementInput(YawBasis.GetUnitAxis(EAxis::X), 1.f);
+		}
+		else if (!GFired)
+		{
+			// One press edge: bSlideHeldLastMove is what derives it, so raising the level for a frame
+			// and dropping it is exactly what a tap does. CanStartSlide() owns every refusal.
+			SetWantsToSlide(true);
+			if (!GRequestSent)
+			{
+				GRequestSent = true;
+			}
+			if (IsSliding())
+			{
+				GFired = true;
+				SetWantsToSlide(false);
+			}
+		}
+		else
+		{
+			SetWantsToSlide(false);
+		}
+
+		if (GPhaseTime >= PhaseLength)
+		{
+			++GPhase;
+			GPhaseTime = 0.f;
+			GFired = false;
+			GRequestSent = false;
+			if (GPhase >= NumPhases)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[DASHREACH] ---- slide arm done. Read the SLIDE lines above (Trace.SlideDebug) "
+					     "for duration, distance and entry/exit speed; distance over dur x mean speed is "
+					     "the number that compares across arms."));
+			}
+		}
+		return;
+	}
+
+	// THE ONLY DIFFERENCE BETWEEN THE DASH ARMS. Held right up to the dash and through it, because
+	// the branch under test is what Super::CalcVelocity does on EVERY frame of the window, not just
+	// the launch frame.
+	if (PhaseHoldsInput(GPhase) && GPhaseTime < HoldFor + GetDashDuration() + 0.2f)
+	{
+		CharacterOwner->AddMovementInput(YawBasis.GetUnitAxis(EAxis::X), 1.f);
+	}
+
+	if (!GFired && GPhaseTime >= HoldFor)
+	{
+		// *** THE PHASE IS NOT DONE UNTIL A DASH IS ACTUALLY RUNNING. *** The first version latched
+		// GFired on the StartDash() call, which is only an INTENT — bWantsToDash is raised here and
+		// consumed by step 2 of a LATER move — and a request that was never consumed then looked
+		// identical to a dash that happened. It read "requested 3, began 1" and the phase had already
+		// moved on. Re-asking every frame until IsDashing() is observed makes the two counts agree,
+		// which is the only state in which the arm has the samples it claims.
+		// *** LATCH ON A DASH HAVING BEGUN, NOT ON SEEING ONE RUN. *** Watching IsDashing() looks
+		// equivalent and is not: a dash is 0.18 s and the re-ask below runs every frame, so any frame
+		// on which the harness fails to observe the window leaves GFired false and the next frame
+		// requests ANOTHER dash. That is not a missed sample, it is a charge drain — the run before
+		// this fix reported "charges=0" on three of six phases and bled requests across the phase
+		// boundary into the other arm. The began-count is incremented at BeginDash for this pawn only,
+		// so it cannot be missed and cannot be moved by a bot.
+		if (GBeganWithInput + GBeganNoInput > GBeganAtPhaseStart)
+		{
+			GFired = true;
+		}
+		else if (IsMovingOnGround() && CanDash())
+		{
+			// Re-ask every frame until it takes, but COUNT the request once: bWantsToDash is cleared
+			// at the end of every move, so a single StartDash() that misses its window is simply lost,
+			// and counting each re-ask would inflate the very number that is supposed to catch that.
+			StartDash();
+			if (!GRequestSent)
+			{
+				GRequestSent = true;
+				if (PhaseHoldsInput(GPhase)) { ++GRequestedWithInput; } else { ++GRequestedNoInput; }
+			}
+		}
+		else if (GPhaseTime > HoldFor + ChargeWait)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[DASHREACH] phase %d never got a dash away (grounded=%d charges=%d dashLeft=%.2f) "
+				     "— this arm is one sample short."),
+				GPhase, IsMovingOnGround() ? 1 : 0, DashCharges, DashTimeRemaining);
+			GFired = true;
+		}
+	}
+
+	if (GPhaseTime >= PhaseLength)
+	{
+		++GPhase;
+		GPhaseTime = 0.f;
+		GFired = false;
+		GRequestSent = false;
+		GBeganAtPhaseStart = GBeganWithInput + GBeganNoInput;
+
+		// RE-AIM AT THE CENTRE FOR EVERY PHASE. Six dashes plus six run-ups is about 6 km in a
+		// straight line, which walks the pawn off the far end of the arena and starts measuring the
+		// geometry it runs into rather than the dash. Turning back to the middle each time keeps every
+		// phase in open floor, which is the one condition the two arms have to share.
+		if (UpdatedComponent != nullptr)
+		{
+			FVector TowardCentre = -UpdatedComponent->GetComponentLocation();
+			TowardCentre.Z = 0.f;
+			if (TowardCentre.Normalize())
+			{
+				GRunYaw = static_cast<float>(TowardCentre.Rotation().Yaw);
+			}
+		}
+
+		if (GPhase == DashPhases)
+		{
+			TraceDashReachReport();
+
+			// THE VERDICT, stated as the one number that matters: the two arms are the same dash.
+			// THE INSTRUMENT'S OWN ACCOUNTING, printed whether or not it is flattering. A dash that
+			// started and was never closed is one that ended some other way — the pawn left the ground
+			// mid-window, died, or the phase ran out — and the honest response is to say how many,
+			// not to average over whatever survived.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[DASHREACH] accounting  key held: requested %d, began %d, closed %d  |  no key: "
+				     "requested %d, began %d, closed %d. requested>began means the intent was raised and "
+				     "never consumed; began>closed means the window did not finish on the ground."),
+				GRequestedWithInput, GBeganWithInput, GDashReachWithInput.Count,
+				GRequestedNoInput, GBeganNoInput, GDashReachNoInput.Count);
+
+			if (GDashReachWithInput.Count > 0 && GDashReachNoInput.Count > 0)
+			{
+				const double Held = GDashReachWithInput.MeanRatio() * 100.0;
+				const double Idle = GDashReachNoInput.MeanRatio() * 100.0;
+				// UE_LOG needs a literal verbosity, so the two outcomes are two calls rather than a
+				// ternary. A FAIL is an Error so an unattended run's exit scan catches it.
+				if (FMath::Abs(Held - Idle) <= 2.0)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[DASHREACH] VERDICT: PASS — key held %.1f%% of intended, no key %.1f%%, gap "
+						     "%+.1f points (tolerance 2.0). The dash is a fixed-length burst; holding a "
+						     "movement key does not change how far it goes."),
+						Held, Idle, Held - Idle);
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[DASHREACH] VERDICT: *** FAIL *** — key held %.1f%% of intended, no key %.1f%%, "
+						     "gap %+.1f points (tolerance 2.0). The dash is meant to be a fixed-length "
+						     "burst; holding a movement key must not change how far it goes."),
+						Held, Idle, Held - Idle);
+				}
+			}
+		}
+	}
+}
 
 void UTraceCharacterMovementComponent::TickDashPitchTest(float DeltaSeconds)
 {

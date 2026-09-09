@@ -1900,6 +1900,16 @@ protected:
 	 */
 	void ApplyDashVelocity();
 
+	/**
+	 * The slide's single velocity writer, mirroring ApplyDashVelocity() above.
+	 *
+	 * Called from CalcVelocity() before the pawn moves and from OnMovementUpdated() after it, so the
+	 * frame's displacement is the slide's own vector rather than whatever Super::CalcVelocity left
+	 * behind. See the ownership block at the top of CalcVelocity() for the measurement that made
+	 * this necessary.
+	 */
+	void ApplySlideVelocity();
+
 	// --- The momentum model (both stateless; see the header note on prediction) -------------------
 
 	/**
@@ -2628,6 +2638,17 @@ protected:
 	float LastDashActiveWorldTime = -1000.f;
 
 #if !UE_BUILD_SHIPPING
+	/**
+	 * DEV ONLY, and deliberately NOT saved-move state, on exactly the footing LastDashActiveWorldTime
+	 * above is on: nothing in the simulation reads them, so a replay has nothing to restore and they
+	 * cannot desync anything. See "THE DASH REACH LEDGER" in the .cpp for what they measure.
+	 */
+	FVector DashReachStartLocation = FVector::ZeroVector;
+	bool bDashReachHadInput = false;
+	bool bDashReachStartedAirborne = false;
+#endif
+
+#if !UE_BUILD_SHIPPING
 	// --- SPEC v18 §1b: THE AIR DRIFT LEDGER -------------------------------------------------------
 	//
 	// "When mid jump with some forward momentum already, it feels like new movement vectors happen
@@ -2743,6 +2764,13 @@ protected:
 	 * on the command line, Display-level logging, compiled out of shipping.
 	 */
 	void TickDashPitchTest(float DeltaSeconds);
+
+	/**
+	 * DEV ONLY (Trace.Dash.ReachTest). Drives three dashes with a movement key held and three with
+	 * none, and reports the distance each arm actually covered. See the block comment on the command
+	 * for why a bot match cannot produce the second arm.
+	 */
+	void TickDashReachTest(float DeltaSeconds);
 
 	float DashPitchTestTime = -1.f;
 	int32 DashPitchTestPhase = 0;
