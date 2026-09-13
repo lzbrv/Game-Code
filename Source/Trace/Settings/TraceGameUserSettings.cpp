@@ -16,6 +16,7 @@
 #include "Misc/Parse.h"
 #include "Scalability.h"
 #include "Trace.h"                           // LogTraceGame
+#include "UI/Text/TraceGameText.h"           // the editable wording of every VIDEO page value
 
 // =================================================================================================
 // File-scope state
@@ -64,26 +65,21 @@ namespace
 
 		// Match against the ratios players recognise before falling back to arithmetic. 3440x1440 is
 		// 43:18 exactly, which is true and useless; "21:9" is what the panel is sold as.
-		struct FNamedAspect { float Ratio; const TCHAR* Label; };
-		static const FNamedAspect Named[] =
-		{
-			{ 16.f / 9.f,   TEXT("16:9")  },
-			{ 16.f / 10.f,  TEXT("16:10") },
-			{ 4.f / 3.f,    TEXT("4:3")   },
-			{ 21.f / 9.f,   TEXT("21:9")  },
-			{ 32.f / 9.f,   TEXT("32:9")  },
-			{ 3.f / 2.f,    TEXT("3:2")   },
-			{ 5.f / 4.f,    TEXT("5:4")   },
-		};
-
+		//
+		// A CHAIN RATHER THAN THE STATIC TABLE THIS USED TO BE, so each label sits at its own
+		// TRACE_TEXT call site. Trace.Text.Reload rewrites the stored strings, so a TCHAR* lifted out
+		// of one into a function-local static would outlive the characters it pointed at. Order and
+		// tolerance are unchanged: first match within 0.02 wins.
 		const float Ratio = static_cast<float>(InWidth) / static_cast<float>(InHeight);
-		for (const FNamedAspect& Candidate : Named)
-		{
-			if (FMath::Abs(Ratio - Candidate.Ratio) < 0.02f)
-			{
-				return Candidate.Label;
-			}
-		}
+		auto Matches = [Ratio](float Candidate) { return FMath::Abs(Ratio - Candidate) < 0.02f; };
+
+		if (Matches(16.f / 9.f))  { return TRACE_TEXT("OPTIONS.ASPECT_16_9",  "16:9");  }
+		if (Matches(16.f / 10.f)) { return TRACE_TEXT("OPTIONS.ASPECT_16_10", "16:10"); }
+		if (Matches(4.f / 3.f))   { return TRACE_TEXT("OPTIONS.ASPECT_4_3",   "4:3");   }
+		if (Matches(21.f / 9.f))  { return TRACE_TEXT("OPTIONS.ASPECT_21_9",  "21:9");  }
+		if (Matches(32.f / 9.f))  { return TRACE_TEXT("OPTIONS.ASPECT_32_9",  "32:9");  }
+		if (Matches(3.f / 2.f))   { return TRACE_TEXT("OPTIONS.ASPECT_3_2",   "3:2");   }
+		if (Matches(5.f / 4.f))   { return TRACE_TEXT("OPTIONS.ASPECT_5_4",   "5:4");   }
 
 		// Reduced form only when it is short enough to be read as a ratio. MEASURED: this Mac's
 		// desktop is 1728x1117 (the notch steals 32 points off 1728x1149), whose reduced ratio is
@@ -96,7 +92,7 @@ namespace
 		{
 			return FString();
 		}
-		return FString::Printf(TEXT("%d:%d"), ReducedW, ReducedH);
+		return TRACE_TEXTF("OPTIONS.ASPECT_GENERIC", "{0}:{1}", { ReducedW, ReducedH });
 	}
 }
 
@@ -201,12 +197,12 @@ FString UTraceGameUserSettings::DescribeWindowMode(EWindowMode::Type Mode)
 {
 	switch (Mode)
 	{
-	case EWindowMode::Fullscreen:         return TEXT("FULLSCREEN");
+	case EWindowMode::Fullscreen:         return TRACE_TEXT("OPTIONS.WINDOW_MODE_FULLSCREEN", "FULLSCREEN");
 	// "BORDERLESS", not "WINDOWED FULLSCREEN": it is what every other shooter calls it, and it does
 	// not read as a near-duplicate of the row above it in a list the player is scanning quickly.
-	case EWindowMode::WindowedFullscreen: return TEXT("BORDERLESS");
-	case EWindowMode::Windowed:           return TEXT("WINDOWED");
-	default:                              return TEXT("UNKNOWN");
+	case EWindowMode::WindowedFullscreen: return TRACE_TEXT("OPTIONS.WINDOW_MODE_BORDERLESS", "BORDERLESS");
+	case EWindowMode::Windowed:           return TRACE_TEXT("OPTIONS.WINDOW_MODE_WINDOWED", "WINDOWED");
+	default:                              return TRACE_TEXT("OPTIONS.WINDOW_MODE_UNKNOWN", "UNKNOWN");
 	}
 }
 
@@ -321,8 +317,9 @@ void UTraceGameUserSettings::BuildResolutionOptions() const
 
 		const FString Aspect = DescribeAspect(Entry.Key.X, Entry.Key.Y);
 		Option.Label = Aspect.IsEmpty()
-			? FString::Printf(TEXT("%d x %d"), Entry.Key.X, Entry.Key.Y)
-			: FString::Printf(TEXT("%d x %d  (%s)"), Entry.Key.X, Entry.Key.Y, *Aspect);
+			? TRACE_TEXTF("OPTIONS.RESOLUTION_LABEL", "{0} x {1}", { Entry.Key.X, Entry.Key.Y })
+			: TRACE_TEXTF("OPTIONS.RESOLUTION_LABEL_WITH_ASPECT", "{0} x {1}  ({2})",
+				{ Entry.Key.X, Entry.Key.Y, Aspect });
 
 		ResolutionOptions.Add(MoveTemp(Option));
 	}
@@ -525,17 +522,17 @@ FString UTraceGameUserSettings::DescribeQualityLevel(int32 Level)
 {
 	switch (FMath::Clamp(Level, MinQualityLevel, MaxQualityLevel))
 	{
-	case 0:  return TEXT("LOW");
-	case 1:  return TEXT("MEDIUM");
-	case 2:  return TEXT("HIGH");
-	default: return TEXT("EPIC");
+	case 0:  return TRACE_TEXT("OPTIONS.QUALITY_LEVEL_LOW", "LOW");
+	case 1:  return TRACE_TEXT("OPTIONS.QUALITY_LEVEL_MEDIUM", "MEDIUM");
+	case 2:  return TRACE_TEXT("OPTIONS.QUALITY_LEVEL_HIGH", "HIGH");
+	default: return TRACE_TEXT("OPTIONS.QUALITY_LEVEL_EPIC", "EPIC");
 	}
 }
 
 FString UTraceGameUserSettings::DescribeOverallQuality(ETraceVideoQuality Quality)
 {
 	return (Quality == ETraceVideoQuality::Custom)
-		? FString(TEXT("CUSTOM"))
+		? TRACE_TEXT("OPTIONS.QUALITY_CUSTOM", "CUSTOM")
 		: DescribeQualityLevel(static_cast<int32>(Quality));
 }
 
@@ -580,8 +577,8 @@ void UTraceGameUserSettings::SetFrameRateLimitByIndex(int32 OptionIndex)
 FString UTraceGameUserSettings::DescribeFrameRateLimit(float Limit)
 {
 	return (Limit <= 0.f)
-		? FString(TEXT("UNLIMITED"))
-		: FString::Printf(TEXT("%d FPS"), FMath::RoundToInt(Limit));
+		? TRACE_TEXT("OPTIONS.FRAMECAP_UNLIMITED", "UNLIMITED")
+		: TRACE_TEXTF("OPTIONS.FRAMECAP_FPS", "{0} FPS", { FMath::RoundToInt(Limit) });
 }
 
 void UTraceGameUserSettings::ApplyFrameRateLimitNow()

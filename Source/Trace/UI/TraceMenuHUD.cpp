@@ -30,6 +30,7 @@
 #include "TimerManager.h"
 #include "Trace.h"                    // LogTraceGame
 #include "UI/Text/TraceCanvasText.h"   // spec v22 §A1 — this renderer types from the atlas
+#include "UI/Text/TraceGameText.h"     // the editable wording, Config/TraceGameText.ini
 #include "UI/TraceAutoShot.h"
 #include "UI/TraceHardwareCursor.h"    // spec v24 §2 — one pointer on screen, not two
 #include "UI/TraceMatchOptions.h"
@@ -311,7 +312,7 @@ namespace TraceMenuHUDFile
 			const FString NetLabel = TraceNet::GetNetVersionLabel();
 			return Version.IsEmpty()
 				? NetLabel
-				: FString::Printf(TEXT("V %s   %s"), *Version, *NetLabel);
+				: TRACE_TEXTF("MENU.VERSION_LINE", "V {0}   {1}", { Version, NetLabel });
 		}();
 		return Label;
 	}
@@ -578,8 +579,8 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 	}
 
 	OutView.Blurb = BuildBlurb();
-	OutView.Tagline = TEXT("5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER");
-	OutView.AddressCaption = TEXT("YOUR ADDRESS");
+	OutView.Tagline = TRACE_TEXT("MENU.TAGLINE", "5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER");
+	OutView.AddressCaption = TRACE_TEXT("MENU.ADDRESS_CAPTION", "YOUR ADDRESS");
 	OutView.AddressValue = TraceNet::GetHostEndpoint();
 
 	// MEASURED CAVEAT, kept verbatim from the Canvas path. If something else already holds UDP 7777,
@@ -588,7 +589,7 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 	// nothing is listening on.
 	OutView.PortWarning = TraceNet::IsDefaultPortFreeCached()
 		? FString()
-		: FString(TEXT("PORT 7777 IS BUSY ON THIS MACHINE - THE HUD WILL SHOW THE REAL PORT IN-GAME"));
+		: FString(TRACE_TEXT("MENU.PORT_BUSY_WARNING", "PORT 7777 IS BUSY ON THIS MACHINE - THE HUD WILL SHOW THE REAL PORT IN-GAME"));
 
 	// D30 — THE KEY LEGEND IS GONE, at the owner's request ("remove the text at the bottom: close
 	// trace, w/s..."). It read
@@ -608,13 +609,13 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 	// it uses is the one the deletion deliberately left in the asset — see the paragraph above — so
 	// no layout moves and the Canvas twin (DrawFooter) prints the same string in the same place.
 	OutView.FooterKeys = ShouldShowPadHints()
-		? FString(TEXT("D-PAD   MOVE          A   SELECT          B   BACK"))
+		? FString(TRACE_TEXT("MENU.FOOTER_PAD_KEYS", "D-PAD   MOVE          A   SELECT          B   BACK"))
 		: FString();
 
 	// WP8.1 — the address prints in TWO places (the chip above, and the JOIN modal's "THIS MACHINE
 	// IS"), not five. This hint used to end "... AND TYPE YOUR ADDRESS ABOVE", which was repetition
 	// number four; the chip it pointed at is right there.
-	OutView.FooterHint = TEXT("PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE");
+	OutView.FooterHint = TRACE_TEXT("MENU.FOOTER_HINT", "PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE");
 
 	// WP8.2 — the version AND the network compatibility code, bottom-right. The widget draws it
 	// because this Canvas cannot reach a UMG frame (AHUD's canvas composites under Slate); the Canvas
@@ -645,9 +646,9 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 	OutView.bTravelVisible = bTravelling;
 	if (bTravelling)
 	{
-		OutView.TravelCaption = TravelCaption.IsEmpty() ? FString(TEXT("ENTERING THE ARENA")) : TravelCaption;
+		OutView.TravelCaption = TravelCaption.IsEmpty() ? FString(TRACE_TEXT("MENU.TRAVEL_ENTERING_ARENA", "ENTERING THE ARENA")) : TravelCaption;
 		OutView.TravelHint = TravelCaption.StartsWith(TEXT("CONNECTING"))
-			? FString(TEXT("THIS CAN TAKE A FEW SECONDS.  A FAILURE WILL BE REPORTED, NOT SWALLOWED."))
+			? FString(TRACE_TEXT("MENU.TRAVEL_CONNECT_HINT", "THIS CAN TAKE A FEW SECONDS.  A FAILURE WILL BE REPORTED, NOT SWALLOWED."))
 			: FString();
 	}
 
@@ -1838,7 +1839,7 @@ void ATraceMenuHUD::PollPadJoinPrompt(bool bConfirm, bool bBack, bool bAlt)
 		{
 			// Said out loud rather than swallowed: a paste button that does nothing on an empty
 			// clipboard is indistinguishable from a paste button that is broken.
-			JoinError = TEXT("NOTHING ADDRESS-LIKE ON THE CLIPBOARD");
+			JoinError = TRACE_TEXT("MENU.JOIN_ERROR_CLIPBOARD_EMPTY", "NOTHING ADDRESS-LIKE ON THE CLIPBOARD");
 			JoinErrorText = JoinEntry.GetText();
 			UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] Pad X -> clipboard held nothing usable."));
 			return;
@@ -2228,16 +2229,17 @@ void ATraceMenuHUD::StartMatch()
 	if (!bPortFree)
 	{
 		TraceNet::ReportFailure(
-			FString::Printf(TEXT("UDP %d IS BUSY - HOSTING ON A DIFFERENT PORT"), TraceNet::DefaultPort),
+			TRACE_TEXTF("MENU.NET_PORT_BUSY_HEADLINE", "UDP {0} IS BUSY - HOSTING ON A DIFFERENT PORT",
+				{ TraceNet::DefaultPort }),
 			// ASCII only. These strings are drawn with the engine's built-in BITMAP fonts, whose
 			// glyph pages do not cover an em dash — it comes out as a box or as nothing at all.
-			TEXT("ANOTHER COPY OF TRACE ALREADY HOLDS 7777. THE MATCH IS STILL JOINABLE, BUT THE "
-			     "ADDRESS TO SHARE IS THE ONE SHOWN TOP-RIGHT ON THE HUD - IT WILL NOT END IN 7777."));
+			TRACE_TEXT("MENU.NET_PORT_BUSY_DETAIL",
+				"ANOTHER COPY OF TRACE ALREADY HOLDS 7777. THE MATCH IS STILL JOINABLE, BUT THE ADDRESS TO SHARE IS THE ONE SHOWN TOP-RIGHT ON THE HUD - IT WILL NOT END IN 7777."));
 	}
 
 	TravelCaption = bPortFree
-		? FString::Printf(TEXT("HOSTING ON %s"), *TraceNet::GetHostEndpoint())
-		: FString(TEXT("PORT 7777 IS BUSY - CHECK THE HUD FOR THE REAL ADDRESS"));
+		? TRACE_TEXTF("MENU.TRAVEL_HOSTING_ON", "HOSTING ON {0}", { TraceNet::GetHostEndpoint() })
+		: FString(TRACE_TEXT("MENU.TRAVEL_PORT_BUSY", "PORT 7777 IS BUSY - CHECK THE HUD FOR THE REAL ADDRESS"));
 
 	UE_LOG(LogTraceGame, Display, TEXT("Title screen: PLAY -> %s?%s  hosting on %s, port %s"),
 		TraceMaps::Arena, *Options,
@@ -2277,7 +2279,7 @@ void ATraceMenuHUD::ConfirmJoin()
 	{
 		// Kept in the field rather than bounced back to the menu: an empty error that closes the
 		// prompt is how a player concludes the button does nothing.
-		JoinError = TEXT("ENTER AN ADDRESS, e.g.  100.101.102.103:7777");
+		JoinError = TRACE_TEXT("MENU.JOIN_ERROR_EMPTY_ADDRESS", "ENTER AN ADDRESS, e.g.  100.101.102.103:7777");
 		JoinErrorText = Typed;
 		return;
 	}
@@ -2285,7 +2287,7 @@ void ATraceMenuHUD::ConfirmJoin()
 	APlayerController* PC = GetOwningPlayerController();
 	if (PC == nullptr)
 	{
-		JoinError = TEXT("NO LOCAL PLAYER - CANNOT CONNECT");
+		JoinError = TRACE_TEXT("MENU.JOIN_ERROR_NO_LOCAL_PLAYER", "NO LOCAL PLAYER - CANNOT CONNECT");
 		JoinErrorText = Typed;
 		return;
 	}
@@ -2300,7 +2302,7 @@ void ATraceMenuHUD::ConfirmJoin()
 	JoinEntry.End();
 
 	bTravelling = true;
-	TravelCaption = FString::Printf(TEXT("CONNECTING TO %s"), *Address);
+	TravelCaption = TRACE_TEXTF("MENU.TRAVEL_CONNECTING_TO", "CONNECTING TO {0}", { Address });
 
 	UE_LOG(LogTraceGame, Display, TEXT("Title screen: JOIN -> ClientTravel('%s', TRAVEL_Absolute)."), *Address);
 
@@ -2357,7 +2359,7 @@ void ATraceMenuHUD::StartPracticeRange()
 	// =============================================================================================
 	const FString Options = TEXT("game=/Script/Trace.TracePracticeGameMode");
 
-	TravelCaption = TEXT("ENTERING THE PRACTICE RANGE");
+	TravelCaption = TRACE_TEXT("MENU.TRAVEL_ENTERING_PRACTICE", "ENTERING THE PRACTICE RANGE");
 
 	UE_LOG(LogTraceGame, Display, TEXT("Title screen: PRACTICE -> %s?%s"), TraceMaps::Arena, *Options);
 
@@ -2753,7 +2755,7 @@ void ATraceMenuHUD::DrawWordmark()
 				FLinearColor(1.f, 1.f, 1.f, SwooshOpacity), BLEND_Translucent);
 		}
 
-		DrawTextCentered(TEXT("5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER"),
+		DrawTextCentered(TRACE_TEXT("MENU.TAGLINE", "5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER"),
 			TraceMenuStyle::InkDim, CX, TaglineTop, FontSmall, 1.15f * UIScale);
 
 		// Remembered for DrawAddressChip, which has to sit exactly under the tagline and must not
@@ -2766,16 +2768,16 @@ void ATraceMenuHUD::DrawWordmark()
 	const float TitleY = ViewH * 0.135f;
 	const float Thickness = FMath::Max(2.f, CapHeight * 0.055f);
 
-	DrawStrokeTextCentered(TEXT("TRACE"), TraceMenuStyle::Cyan, CX, TitleY, CapHeight, Thickness);
+	DrawStrokeTextCentered(TRACE_TEXT("MENU.WORDMARK", "TRACE"), TraceMenuStyle::Cyan, CX, TitleY, CapHeight, Thickness);
 
 	// Rule + tagline. The rule is exactly as wide as the wordmark, which is the only reason the
 	// block below it looks deliberate rather than dropped in.
-	const float MarkW = MeasureStrokeText(TEXT("TRACE"), CapHeight);
+	const float MarkW = MeasureStrokeText(TRACE_TEXT("MENU.WORDMARK", "TRACE"), CapHeight);
 	const float RuleY = TitleY + CapHeight + (28.f * UIScale);
 	DrawGlowLine(CX - MarkW * 0.5f, RuleY, CX + MarkW * 0.5f, RuleY,
 		TraceMenuStyle::Cyan, FMath::Max(1.f, 2.f * UIScale));
 
-	DrawTextCentered(TEXT("5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER"),
+	DrawTextCentered(TRACE_TEXT("MENU.TAGLINE", "5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER"),
 		TraceMenuStyle::InkDim, CX, RuleY + (18.f * UIScale), FontSmall, 1.15f * UIScale);
 
 	// Remembered for DrawAddressChip, same as the sprite arm above.
@@ -2792,7 +2794,7 @@ void ATraceMenuHUD::DrawAddressChip()
 	// size somebody can read it off a screen and say it out loud — not buried in a doc, not behind
 	// `tailscale ip -4`, not in a log.
 	const FString Endpoint = TraceNet::GetHostEndpoint();
-	const FString Caption = TEXT("YOUR ADDRESS");
+	const FString Caption = TRACE_TEXT("MENU.ADDRESS_CAPTION", "YOUR ADDRESS");
 
 	const float CX = ViewW * 0.5f;
 	const float CaptionScale = 1.0f * UIScale;
@@ -2834,7 +2836,7 @@ void ATraceMenuHUD::DrawAddressChip()
 	// the ten minutes of confusion on the other end.
 	if (!TraceNet::IsDefaultPortFreeCached())
 	{
-		DrawTextCentered(TEXT("PORT 7777 IS BUSY ON THIS MACHINE - THE HUD WILL SHOW THE REAL PORT IN-GAME"),
+		DrawTextCentered(TRACE_TEXT("MENU.PORT_BUSY_WARNING", "PORT 7777 IS BUSY ON THIS MACHINE - THE HUD WILL SHOW THE REAL PORT IN-GAME"),
 			TraceMenuStyle::Amber, CX, ChipY + ChipH + (4.f * UIScale), FontSmall, 0.95f * UIScale);
 	}
 }
@@ -2935,8 +2937,8 @@ void ATraceMenuHUD::DrawJoinPrompt()
 	DrawRect(EdgeColor, PanelX, PanelY, Edge, PanelH);
 	DrawRect(EdgeColor, PanelX + PanelW - Edge, PanelY, Edge, PanelH);
 
-	DrawTextCentered(TEXT("JOIN A GAME"), TraceMenuStyle::Cyan, CX, PanelY + (22.f * UIScale), FontMedium, 1.5f * UIScale);
-	DrawTextCentered(TEXT("TYPE THE HOST'S ADDRESS"), TraceMenuStyle::InkDim,
+	DrawTextCentered(TRACE_TEXT("MENU.JOIN_TITLE", "JOIN A GAME"), TraceMenuStyle::Cyan, CX, PanelY + (22.f * UIScale), FontMedium, 1.5f * UIScale);
+	DrawTextCentered(TRACE_TEXT("MENU.JOIN_SUBTITLE", "TYPE THE HOST'S ADDRESS"), TraceMenuStyle::InkDim,
 		CX, PanelY + (58.f * UIScale), FontSmall, 1.f * UIScale);
 
 	// ---- The field -----------------------------------------------------------------------------
@@ -2960,7 +2962,7 @@ void ATraceMenuHUD::DrawJoinPrompt()
 	if (Typed.IsEmpty())
 	{
 		// Ghost text, dim enough that nobody mistakes it for a value they can press Enter on.
-		TraceMenuHUDType::Draw(this, FString::Printf(TEXT("100.101.102.103:%d"), TraceNet::DefaultPort),
+		TraceMenuHUDType::Draw(this, TRACE_TEXTF("MENU.JOIN_FIELD_PLACEHOLDER", "100.101.102.103:{0}", { TraceNet::DefaultPort }),
 			TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.35f), TextX, TextY, FontMedium, TextScale);
 	}
 	else
@@ -2987,11 +2989,12 @@ void ATraceMenuHUD::DrawJoinPrompt()
 	}
 	else if (JoinEntry.WasRecentlyPasted(Now))
 	{
-		DrawTextCentered(TEXT("PASTED FROM CLIPBOARD"), TraceMenuStyle::Cyan, CX, NoteY, FontSmall, 1.05f * UIScale);
+		DrawTextCentered(TRACE_TEXT("MENU.JOIN_PASTED_NOTE", "PASTED FROM CLIPBOARD"), TraceMenuStyle::Cyan, CX, NoteY, FontSmall, 1.05f * UIScale);
 	}
 	else
 	{
-		DrawTextCentered(FString::Printf(TEXT("PORT %d IS ADDED FOR YOU IF YOU LEAVE IT OFF"), TraceNet::DefaultPort),
+		DrawTextCentered(TRACE_TEXTF("MENU.JOIN_PORT_NOTE", "PORT {0} IS ADDED FOR YOU IF YOU LEAVE IT OFF",
+			{ TraceNet::DefaultPort }),
 			TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.75f), CX, NoteY, FontSmall, 1.05f * UIScale);
 	}
 
@@ -3007,14 +3010,14 @@ void ATraceMenuHUD::DrawJoinPrompt()
 	const float HintPad = 24.f * UIScale;
 	const float HintRoom = PanelW - HintPad * 2.f;
 	{
-		FString Keys = TEXT("ENTER   CONNECT          ESC   CANCEL          CTRL / CMD + V   PASTE          BACKSPACE   DELETE");
+		FString Keys = TRACE_TEXT("MENU.JOIN_KEYS_LONG", "ENTER   CONNECT          ESC   CANCEL          CTRL / CMD + V   PASTE          BACKSPACE   DELETE");
 		float KeysScale = 1.f * UIScale;
 		float Natural = MeasureWidth(Keys, FontSmall, KeysScale);
 		if (Natural > HintRoom && Natural > 1.f)
 		{
 			if (HintRoom / Natural < 0.72f)
 			{
-				Keys = TEXT("ENTER   CONNECT          ESC   CANCEL          BACKSPACE   DELETE");
+				Keys = TRACE_TEXT("MENU.JOIN_KEYS_SHORT", "ENTER   CONNECT          ESC   CANCEL          BACKSPACE   DELETE");
 				Natural = MeasureWidth(Keys, FontSmall, KeysScale);
 			}
 			if (Natural > HintRoom && Natural > 1.f)
@@ -3034,7 +3037,7 @@ void ATraceMenuHUD::DrawJoinPrompt()
 	// It takes the "THIS MACHINE IS" line's slot rather than adding a third — see the else arm below.
 	if (ShouldShowPadHints())
 	{
-		const FString PadKeys = TEXT("A   CONNECT          B   CANCEL          X   PASTE");
+		const FString PadKeys = TRACE_TEXT("MENU.JOIN_PAD_KEYS", "A   CONNECT          B   CANCEL          X   PASTE");
 		float PadScale = 1.f * UIScale;
 		const float PadNatural = MeasureWidth(PadKeys, FontSmall, PadScale);
 		if (PadNatural > HintRoom && PadNatural > 1.f)
@@ -3043,7 +3046,7 @@ void ATraceMenuHUD::DrawJoinPrompt()
 		}
 		DrawTextCentered(PadKeys, TraceMenuStyle::Cyan, CX, PanelY + PanelH - (46.f * UIScale), FontSmall, PadScale);
 
-		const FString PadNote = TEXT("TYPING A NEW ADDRESS NEEDS A KEYBOARD");
+		const FString PadNote = TRACE_TEXT("MENU.JOIN_PAD_TYPING_NOTE", "TYPING A NEW ADDRESS NEEDS A KEYBOARD");
 		float NoteScale = 0.92f * UIScale;
 		const float NoteNatural = MeasureWidth(PadNote, FontSmall, NoteScale);
 		if (NoteNatural > HintRoom && NoteNatural > 1.f)
@@ -3065,7 +3068,7 @@ void ATraceMenuHUD::DrawJoinPrompt()
 	// the captions win. Both arms draw exactly two lines, so nothing above them moves either way.
 	else
 	{
-		const FString Machine = FString::Printf(TEXT("THIS MACHINE IS %s"), *TraceNet::GetHostEndpoint());
+		const FString Machine = TRACE_TEXTF("MENU.JOIN_THIS_MACHINE", "THIS MACHINE IS {0}", { TraceNet::GetHostEndpoint() });
 		float MachineScale = 1.f * UIScale;
 		const float Natural = MeasureWidth(Machine, FontSmall, MachineScale);
 		if (Natural > HintRoom && Natural > 1.f)
@@ -3149,18 +3152,19 @@ FString ATraceMenuHUD::BuildBlurb() const
 	case ETraceMenuRow::Play:
 		// WP8.1 — points at the chip instead of repeating its number. The chip is the address's one
 		// authoritative appearance on this screen.
-		return TEXT("HOSTS A GAME ON YOUR ADDRESS ABOVE.  OTHERS PICK JOIN AND TYPE IT.");
+		return TRACE_TEXT("MENU.BLURB_PLAY", "HOSTS A GAME ON YOUR ADDRESS ABOVE.  OTHERS PICK JOIN AND TYPE IT.");
 
 	case ETraceMenuRow::Join:
 		return LastJoinAddress.IsEmpty()
-			? FString(TEXT("CONNECT TO SOMEBODY ELSE'S GAME.  YOU WILL NEED THEIR ADDRESS."))
-			: FString::Printf(TEXT("CONNECT TO SOMEBODY ELSE'S GAME.  ENTER RECONNECTS TO %s."), *LastJoinAddress);
+			? FString(TRACE_TEXT("MENU.BLURB_JOIN_NO_ADDRESS", "CONNECT TO SOMEBODY ELSE'S GAME.  YOU WILL NEED THEIR ADDRESS."))
+			: TRACE_TEXTF("MENU.BLURB_JOIN_REMEMBERED",
+				"CONNECT TO SOMEBODY ELSE'S GAME.  ENTER RECONNECTS TO {0}.", { LastJoinAddress });
 
 	case ETraceMenuRow::Practice:
-		return TEXT("ALONE IN THE ARENA WITH FIVE DUMMIES.  NO MATCH, NO CLOCK, NO SCORE.");
+		return TRACE_TEXT("MENU.BLURB_PRACTICE", "ALONE IN THE ARENA WITH FIVE DUMMIES.  NO MATCH, NO CLOCK, NO SCORE.");
 
 	case ETraceMenuRow::Settings:
-		return TEXT("MOUSE SENSITIVITY, INVERT Y AND EVERY KEY BINDING.");
+		return TRACE_TEXT("MENU.BLURB_SETTINGS", "MOUSE SENSITIVITY, INVERT Y AND EVERY KEY BINDING.");
 
 	case ETraceMenuRow::Quit:
 		// D30 — deliberately blank. "CLOSE TRACE." is the "close trace" in the owner's "remove the
@@ -3173,7 +3177,7 @@ FString ATraceMenuHUD::BuildBlurb() const
 		// ignores the text outright; TraceText::Measure splits "" into one empty line). Returning
 		// nothing therefore leaves the footer exactly where it is instead of letting it jump a line
 		// whenever QUIT happens to be the selected row.
-		return FString();
+		return TRACE_TEXT("MENU.BLURB_QUIT", "");
 
 	default:
 		return TraceMenuStyle::DifficultyBlurb(Difficulty);
@@ -3200,12 +3204,12 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 
 	switch (Row)
 	{
-	case ETraceMenuRow::Play:       OutView.Label = TEXT("PLAY");         break;
-	case ETraceMenuRow::Join:       OutView.Label = TEXT("JOIN");         break;
-	case ETraceMenuRow::Practice:   OutView.Label = TEXT("PRACTICE");     break;
-	case ETraceMenuRow::Difficulty: OutView.Label = TEXT("DIFFICULTY");   break;
-	case ETraceMenuRow::Settings:   OutView.Label = TEXT("SETTINGS");     break;
-	case ETraceMenuRow::Quit:       OutView.Label = TEXT("QUIT");         break;
+	case ETraceMenuRow::Play:       OutView.Label = TRACE_TEXT("MENU.ROW_PLAY", "PLAY");         break;
+	case ETraceMenuRow::Join:       OutView.Label = TRACE_TEXT("MENU.ROW_JOIN", "JOIN");         break;
+	case ETraceMenuRow::Practice:   OutView.Label = TRACE_TEXT("MENU.ROW_PRACTICE", "PRACTICE");     break;
+	case ETraceMenuRow::Difficulty: OutView.Label = TRACE_TEXT("MENU.ROW_DIFFICULTY", "DIFFICULTY");   break;
+	case ETraceMenuRow::Settings:   OutView.Label = TRACE_TEXT("MENU.ROW_SETTINGS", "SETTINGS");     break;
+	case ETraceMenuRow::Quit:       OutView.Label = TRACE_TEXT("MENU.ROW_QUIT", "QUIT");         break;
 	default:                        OutView.Label = TEXT("");             break;
 	}
 
@@ -3219,7 +3223,7 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 	// target stays — a reconnect affordance, not a repetition.
 	if (Row == ETraceMenuRow::Join)
 	{
-		OutView.Status = LastJoinAddress.IsEmpty() ? FString(TEXT("ENTER AN ADDRESS")) : LastJoinAddress;
+		OutView.Status = LastJoinAddress.IsEmpty() ? FString(TRACE_TEXT("MENU.ROW_JOIN_STATUS_EMPTY", "ENTER AN ADDRESS")) : LastJoinAddress;
 	}
 
 	// DIFFICULTY is the VALUE row: right-aligned value, arrows either side, dimmed at the ends of
@@ -3425,12 +3429,12 @@ void ATraceMenuHUD::DrawFooter()
 
 	if (bPadLegend)
 	{
-		DrawTextCentered(TEXT("D-PAD   MOVE          A   SELECT          B   BACK"),
+		DrawTextCentered(TRACE_TEXT("MENU.FOOTER_PAD_KEYS", "D-PAD   MOVE          A   SELECT          B   BACK"),
 			TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.75f), CX, Y, FontSmall, 1.f * UIScale);
 	}
 
 	// WP8.1 — no address repetition here any more; the chip under the tagline is the one source.
-	DrawTextCentered(TEXT("PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE"),
+	DrawTextCentered(TRACE_TEXT("MENU.FOOTER_HINT", "PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE"),
 		TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.6f),
 		CX, HintY, FontSmall, 1.f * UIScale);
 }
@@ -3538,13 +3542,13 @@ void ATraceMenuHUD::DrawTravelOverlay()
 	}
 
 	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.72f), 0.f, 0.f, ViewW, ViewH);
-	DrawStrokeTextCentered(TEXT("TRACE"), TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.55f),
+	DrawStrokeTextCentered(TRACE_TEXT("MENU.WORDMARK", "TRACE"), TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.55f),
 		ViewW * 0.5f, ViewH * 0.36f, ViewH * 0.10f, FMath::Max(2.f, ViewH * 0.10f * 0.055f));
 
 	// The caption names what is actually happening — "HOSTING ON 100.x.y.z:7777" or "CONNECTING TO
 	// <addr>" — rather than one generic line for two very different operations. A join that hangs
 	// for fifteen seconds and then fails needs the player to have seen the address it was dialling.
-	const FString Caption = TravelCaption.IsEmpty() ? FString(TEXT("ENTERING THE ARENA")) : TravelCaption;
+	const FString Caption = TravelCaption.IsEmpty() ? FString(TRACE_TEXT("MENU.TRAVEL_ENTERING_ARENA", "ENTERING THE ARENA")) : TravelCaption;
 	DrawTextCentered(Caption, TraceMenuStyle::Ink, ViewW * 0.5f, ViewH * 0.55f,
 		FontMedium, 1.4f * UIScale);
 
@@ -3552,7 +3556,7 @@ void ATraceMenuHUD::DrawTravelOverlay()
 	// three seconds of nothing does not read as a hang.
 	if (TravelCaption.StartsWith(TEXT("CONNECTING")))
 	{
-		DrawTextCentered(TEXT("THIS CAN TAKE A FEW SECONDS.  A FAILURE WILL BE REPORTED, NOT SWALLOWED."),
+		DrawTextCentered(TRACE_TEXT("MENU.TRAVEL_CONNECT_HINT", "THIS CAN TAKE A FEW SECONDS.  A FAILURE WILL BE REPORTED, NOT SWALLOWED."),
 			TraceMenuStyle::InkDim, ViewW * 0.5f, ViewH * 0.55f + (34.f * UIScale), FontSmall, 1.05f * UIScale);
 	}
 }

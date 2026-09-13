@@ -23,6 +23,7 @@
 #include "TraceTypes.h"                  // TraceTeamColor / TraceTeamName
 #include "UI/TraceHardwareCursor.h"      // spec v24 §2 — one pointer on screen, not two
 #include "UI/Text/TraceCanvasText.h"     // spec v22 §A1 — this screen types from the glyph atlas
+#include "UI/Text/TraceGameText.h"       // the editable wording, Config/TraceGameText.ini
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 
 #if !UE_BUILD_SHIPPING
@@ -116,10 +117,10 @@ namespace TraceTeamSelectFile
 	{
 		if (State == nullptr)
 		{
-			return TEXT("?");
+			return TRACE_TEXT("TEAMSELECT.ROSTER_UNKNOWN_NAME", "?");
 		}
 		const FString Name = State->GetPlayerName();
-		return Name.IsEmpty() ? TEXT("PLAYER") : Name.ToUpper();
+		return Name.IsEmpty() ? TRACE_TEXT("TEAMSELECT.ROSTER_DEFAULT_NAME", "PLAYER") : Name.ToUpper();
 	}
 
 	/**
@@ -653,12 +654,18 @@ FString FTraceTeamSelect::VerdictLine(const ATracePlayerController* PC) const
 
 	switch (PC->LastTeamResult)
 	{
-	case ETraceTeamChangeResult::Granted:       return FString::Printf(TEXT("MOVED TO %s"), *Team);
-	case ETraceTeamChangeResult::AlreadyOnTeam: return FString::Printf(TEXT("ALREADY ON %s"), *Team);
-	case ETraceTeamChangeResult::WouldUnbalance:return TEXT("REFUSED - THAT WOULD STACK THE TEAMS");
-	case ETraceTeamChangeResult::TeamFull:      return FString::Printf(TEXT("REFUSED - %s IS FULL"), *Team);
-	case ETraceTeamChangeResult::NotAllowed:    return TEXT("REFUSED");
-	default:                                    return FString();
+	case ETraceTeamChangeResult::Granted:
+		return TRACE_TEXTF("TEAMSELECT.VERDICT_MOVED_TO", "MOVED TO {0}", { Team });
+	case ETraceTeamChangeResult::AlreadyOnTeam:
+		return TRACE_TEXTF("TEAMSELECT.VERDICT_ALREADY_ON", "ALREADY ON {0}", { Team });
+	case ETraceTeamChangeResult::WouldUnbalance:
+		return TRACE_TEXT("TEAMSELECT.VERDICT_WOULD_UNBALANCE", "REFUSED - THAT WOULD STACK THE TEAMS");
+	case ETraceTeamChangeResult::TeamFull:
+		return TRACE_TEXTF("TEAMSELECT.VERDICT_TEAM_FULL", "REFUSED - {0} IS FULL", { Team });
+	case ETraceTeamChangeResult::NotAllowed:
+		return TRACE_TEXT("TEAMSELECT.VERDICT_REFUSED", "REFUSED");
+	default:
+		return FString();
 	}
 }
 
@@ -690,7 +697,7 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 	}
 
 	// ---- Header ---------------------------------------------------------------------------------
-	TraceTeamSelectFile::Text(HUD, TEXT("SELECT YOUR TEAM"), Ink, CenterX, HeaderTop * S,
+	TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.TITLE", "SELECT YOUR TEAM"), Ink, CenterX, HeaderTop * S,
 		TitleSize * S, TitleTrack * S, TraceText::EHAlign::Center);
 
 	// The close-out countdown, right-aligned against the margin. A timeout the player cannot see is
@@ -705,7 +712,8 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 			: InkSoft;
 
 		TraceTeamSelectFile::Text(HUD,
-			FString::Printf(TEXT("KEEPING YOUR TEAM IN %d"), FMath::Max(0, FMath::CeilToInt(Remaining))),
+			TRACE_TEXTF("TEAMSELECT.COUNTDOWN", "KEEPING YOUR TEAM IN {0}",
+				{ FMath::Max(0, FMath::CeilToInt(Remaining)) }),
 			CountColor, ViewW - (Margin * S), (HeaderTop + 16.f) * S,
 			SizeLabel * S, TrackLabel * S, TraceText::EHAlign::Right);
 	}
@@ -715,7 +723,8 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 	// The balance rule refuses things, and a refusal a player was never warned about reads as a bug.
 	// One line, always on screen, in the same words the refusal uses.
 	TraceTeamSelectFile::Text(HUD,
-		TEXT("A SWITCH IS REFUSED IF IT WOULD LEAVE ONE SIDE MORE THAN ONE PLAYER LARGER. A BOT WILL STAND DOWN FOR YOU."),
+		TRACE_TEXT("TEAMSELECT.RULE",
+			"A SWITCH IS REFUSED IF IT WOULD LEAVE ONE SIDE MORE THAN ONE PLAYER LARGER. A BOT WILL STAND DOWN FOR YOU."),
 		InkDim, CenterX, SubY * S, SizeLabel * S, TrackLabel * S, TraceText::EHAlign::Center);
 
 	// ---- The two plates -------------------------------------------------------------------------
@@ -732,7 +741,14 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 		const FString Verdict = VerdictLine(PC);
 		if (!Verdict.IsEmpty())
 		{
-			const bool bRefusal = Verdict.StartsWith(TEXT("REFUSED"));
+			// THE RED ASKS THE VERDICT, NOT THE WORDS. This read StartsWith("REFUSED") while the
+			// wording lived in this file and could not move; now that the wording is editable, an
+			// owner who rewrote a refusal would have had it quietly turn white. Same three results,
+			// same red, whatever the document says.
+			const bool bRefusal = (PC != nullptr)
+				&& (PC->LastTeamResult == ETraceTeamChangeResult::WouldUnbalance
+					|| PC->LastTeamResult == ETraceTeamChangeResult::TeamFull
+					|| PC->LastTeamResult == ETraceTeamChangeResult::NotAllowed);
 			TraceTeamSelectFile::Text(HUD, Verdict, bRefusal ? Danger : Ink, CenterX, VerdictY * S,
 				SizeLead * S, 1.4f * S, TraceText::EHAlign::Center);
 		}
@@ -747,9 +763,9 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 	// first button a player presses has to work, and it cannot if the screen is waiting to have seen
 	// one.
 	{
-		const FString KeyboardLine = FString::Printf(
-			TEXT("1 / 2 OR ARROWS + ENTER   SELECT TEAM        C   CHANGE CHARACTER        %s   CLOSE"),
-			OpenKeyName());
+		const FString KeyboardLine = TRACE_TEXTF("TEAMSELECT.FOOTER_KEYBOARD",
+			"1 / 2 OR ARROWS + ENTER   SELECT TEAM        C   CHANGE CHARACTER        {0}   CLOSE",
+			{ FString(OpenKeyName()) });
 
 		// A SECOND LINE, NOT A LONGER ONE. The keyboard line is already 95 characters and fills a
 		// 1280-wide window at this point size; appending the pad's three buttons to it would have run
@@ -757,7 +773,8 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 		// legend too small to read. The reference layout is 1080 high and this line sits at 900, so
 		// there is room under it — measured, not assumed: FooterY + PadFooterGap is 928 of 1080.
 		const bool bPadLine = TracePadMenu::HasSeenPad(PC);
-		const FString PadLine = TEXT("A   SELECT TEAM        X   CHANGE CHARACTER        B   CLOSE");
+		const FString PadLine = TRACE_TEXT("TEAMSELECT.FOOTER_GAMEPAD",
+			"A   SELECT TEAM        X   CHANGE CHARACTER        B   CLOSE");
 
 		// ---- FIT, and it turned out to be needed for a line that predates this tranche -----------
 		//
@@ -840,7 +857,9 @@ void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATra
 	TraceTeamSelectFile::Text(HUD, TraceTeamName(Team).ToString().ToUpper(),
 		bAllowed ? Ink : Dimmed(Ink, 0.6f), X + PadX, CursorY, SizeDisplay * S, 3.0f * S);
 
-	TraceTeamSelectFile::Text(HUD, (Row == RowBlue) ? TEXT("1") : TEXT("2"),
+	TraceTeamSelectFile::Text(HUD, (Row == RowBlue)
+			? TRACE_TEXT("TEAMSELECT.PLATE_KEY_BLUE", "1")
+			: TRACE_TEXT("TEAMSELECT.PLATE_KEY_ORANGE", "2"),
 		InkDim, X + W - PadX, CursorY + (10.f * S), SizeLead * S, 0.f, TraceText::EHAlign::Right);
 
 	CursorY += TraceText::LineHeight(SizeDisplay * S) + (14.f * S);
@@ -859,9 +878,16 @@ void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATra
 	}
 
 	const int32 TeamCap = FMath::Max(1, UTraceSettings::Get().PlayersPerTeam);
+
+	// The plural is its own slot rather than two spellings of the whole line: an owner who renames
+	// BOT has one place to do it, and the singular stays a deliberate empty string.
+	const FString BotSuffix = (BotCount == 1)
+		? FString()
+		: TRACE_TEXT("TEAMSELECT.PLATE_BOT_PLURAL_SUFFIX", "S");
+
 	TraceTeamSelectFile::Text(HUD,
-		FString::Printf(TEXT("%d / %d   (%d BOT%s)"), Members.Num(), TeamCap, BotCount,
-			(BotCount == 1) ? TEXT("") : TEXT("S")),
+		TRACE_TEXTF("TEAMSELECT.PLATE_COUNT", "{0} / {1}   ({2} BOT{3})",
+			{ Members.Num(), TeamCap, BotCount, BotSuffix }),
 		InkSoft, X + PadX, CursorY, SizeLead * S, 1.4f * S);
 
 	CursorY += TraceText::LineHeight(SizeLead * S) + (18.f * S);
@@ -881,7 +907,8 @@ void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATra
 	{
 		if (CursorY + RowH > Y + H - (PlatePad * S) - (46.f * S))
 		{
-			TraceTeamSelectFile::Text(HUD, TEXT("..."), InkDim, X + PadX, CursorY, SizeBody * S);
+			TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.ROSTER_MORE", "..."), InkDim,
+				X + PadX, CursorY, SizeBody * S);
 			break;
 		}
 
@@ -893,12 +920,14 @@ void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATra
 
 		if (bIsYou)
 		{
-			TraceTeamSelectFile::Text(HUD, TEXT("YOU"), Tint, X + W - PadX, CursorY,
+			TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.ROSTER_YOU", "YOU"), Tint,
+				X + W - PadX, CursorY,
 				SizeLabel * S, TrackLabel * S, TraceText::EHAlign::Right);
 		}
 		else if (Member->IsABot())
 		{
-			TraceTeamSelectFile::Text(HUD, TEXT("BOT"), InkDim, X + W - PadX, CursorY,
+			TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.ROSTER_BOT", "BOT"), InkDim,
+				X + W - PadX, CursorY,
 				SizeLabel * S, TrackLabel * S, TraceText::EHAlign::Right);
 		}
 
@@ -909,7 +938,8 @@ void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATra
 	const float StatusY = Y + H - (PlatePad * S) - TraceText::LineHeight(SizeLabel * S);
 	if (bCurrent)
 	{
-		TraceTeamSelectFile::Text(HUD, TEXT("YOUR TEAM"), Tint, X + PadX, StatusY,
+		TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.PLATE_STATUS_CURRENT", "YOUR TEAM"), Tint,
+			X + PadX, StatusY,
 			SizeLabel * S, TrackLabel * S);
 	}
 	else if (!bAllowed)
@@ -920,7 +950,8 @@ void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATra
 	}
 	else
 	{
-		TraceTeamSelectFile::Text(HUD, TEXT("PRESS TO JOIN"), Ink, X + PadX, StatusY,
+		TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.PLATE_STATUS_JOIN", "PRESS TO JOIN"), Ink,
+			X + PadX, StatusY,
 			SizeLabel * S, TrackLabel * S);
 	}
 }

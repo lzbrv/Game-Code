@@ -9,6 +9,7 @@
 #include "Core/TracePlayerState.h"
 #include "Gameplay/TraceCore.h"
 #include "Trace.h"
+#include "UI/Text/TraceGameText.h"     // the editable wording for the period labels
 #include "World/TraceArenaBuilder.h"   // repaint the endzones when the sides switch
 
 ATraceGameState::ATraceGameState()
@@ -178,17 +179,19 @@ FString ATraceGameState::GetHalfLabel() const
 {
 	if (bHalfTimeBreak)
 	{
-		return TEXT("HALF TIME");
+		return TRACE_TEXT("MATCH.HALF_LABEL_HALF_TIME", "HALF TIME");
 	}
 
 	// Ordinals only go as far as the number of halves anyone will ever configure; beyond that fall
 	// back to a plain count rather than inventing English.
 	switch (CurrentHalf)
 	{
-	case 1:  return (NumHalves <= 1) ? FString(TEXT("MATCH")) : FString(TEXT("1ST HALF"));
-	case 2:  return TEXT("2ND HALF");
-	case 3:  return TEXT("3RD HALF");
-	default: return FString::Printf(TEXT("PERIOD %d"), CurrentHalf);
+	case 1:  return (NumHalves <= 1)
+		? TRACE_TEXT("MATCH.HALF_LABEL_SINGLE_PERIOD", "MATCH")
+		: TRACE_TEXT("MATCH.HALF_LABEL_FIRST", "1ST HALF");
+	case 2:  return TRACE_TEXT("MATCH.HALF_LABEL_SECOND", "2ND HALF");
+	case 3:  return TRACE_TEXT("MATCH.HALF_LABEL_THIRD", "3RD HALF");
+	default: return TRACE_TEXTF("MATCH.HALF_LABEL_PERIOD_N", "PERIOD {0}", { CurrentHalf });
 	}
 }
 
@@ -215,8 +218,8 @@ FString ATraceGameState::GetPendingPeriodEndLabel() const
 	// ATraceGameMode::EndPeriodNow() makes, so the HUD can never promise a half time that is
 	// actually full time.
 	return (CurrentHalf < NumHalves)
-		? FString(TEXT("HALF ENDS AT NEXT DEAD BALL"))
-		: FString(TEXT("MATCH ENDS AT NEXT DEAD BALL"));
+		? TRACE_TEXT("MATCH.PENDING_HALF_END", "HALF ENDS AT NEXT DEAD BALL")
+		: TRACE_TEXT("MATCH.PENDING_MATCH_END", "MATCH ENDS AT NEXT DEAD BALL");
 }
 
 float ATraceGameState::GetPendingPeriodEndTimeRemaining() const

@@ -21,6 +21,7 @@
 #include "SocketSubsystem.h"
 #include "Sockets.h"
 #include "Trace.h"                       // LogTraceGame
+#include "UI/Text/TraceGameText.h"       // the editable wording, Config/TraceGameText.ini
 
 // CLIPBOARD PASTE — the one optional thing in this file.
 //
@@ -311,7 +312,7 @@ ERole DescribeConnection(const UWorld* World, FString& OutEndpoint, FString& Out
 		}
 		if (OutEndpoint.IsEmpty())
 		{
-			OutEndpoint = TEXT("SERVER");
+			OutEndpoint = TRACE_TEXT("NET.ENDPOINT_SERVER_FALLBACK", "SERVER");
 		}
 		return ERole::Client;
 	}
@@ -331,8 +332,8 @@ ERole DescribeConnection(const UWorld* World, FString& OutEndpoint, FString& Out
 
 		const int32 Connected = (NetDriver != nullptr) ? NetDriver->ClientConnections.Num() : 0;
 		OutDetail = (Connected == 1)
-			? FString(TEXT("1 PLAYER CONNECTED"))
-			: FString::Printf(TEXT("%d PLAYERS CONNECTED"), Connected);
+			? TRACE_TEXT("NET.STATUS_ONE_PLAYER_CONNECTED", "1 PLAYER CONNECTED")
+			: TRACE_TEXTF("NET.STATUS_PLAYERS_CONNECTED", "{0} PLAYERS CONNECTED", { Connected });
 
 		return ERole::Hosting;
 	}
@@ -348,7 +349,7 @@ ERole DescribeConnection(const UWorld* World, FString& OutEndpoint, FString& Out
 	OutEndpoint = TEXT("OFFLINE");
 	OutDetail = IsDefaultPortFreeCached()
 		? FString()
-		: FString::Printf(TEXT("UDP %d IS IN USE BY ANOTHER PROCESS"), DefaultPort);
+		: TRACE_TEXTF("NET.STATUS_PORT_IN_USE", "UDP {0} IS IN USE BY ANOTHER PROCESS", { DefaultPort });
 
 	return ERole::Offline;
 }
@@ -411,34 +412,37 @@ FString DescribeNetworkFailure(ENetworkFailure::Type FailureType)
 	switch (FailureType)
 	{
 	case ENetworkFailure::NetDriverAlreadyExists:
-		return TEXT("A NET DRIVER IS ALREADY RUNNING. RESTART THE GAME.");
+		return TRACE_TEXT("NET.FAIL_DRIVER_ALREADY_EXISTS", "A NET DRIVER IS ALREADY RUNNING. RESTART THE GAME.");
 	case ENetworkFailure::NetDriverCreateFailure:
-		return TEXT("COULD NOT CREATE A NET DRIVER.");
+		return TRACE_TEXT("NET.FAIL_DRIVER_CREATE", "COULD NOT CREATE A NET DRIVER.");
 	case ENetworkFailure::NetDriverListenFailure:
-		return FString::Printf(TEXT("COULD NOT LISTEN ON UDP %d. ANOTHER COPY MAY ALREADY BE HOSTING."), DefaultPort);
+		return TRACE_TEXTF("NET.FAIL_LISTEN", "COULD NOT LISTEN ON UDP {0}. ANOTHER COPY MAY ALREADY BE HOSTING.", { DefaultPort });
 	case ENetworkFailure::ConnectionLost:
-		return TEXT("CONNECTION LOST.");
+		return TRACE_TEXT("NET.FAIL_CONNECTION_LOST", "CONNECTION LOST.");
 	case ENetworkFailure::ConnectionTimeout:
-		return TEXT("CONNECTION TIMED OUT. CHECK THE ADDRESS, THE VPN, AND UDP 7777 ON THE HOST.");
+		return TRACE_TEXT("NET.FAIL_TIMEOUT", "CONNECTION TIMED OUT. CHECK THE ADDRESS, THE VPN, AND UDP 7777 ON THE HOST.");
 	case ENetworkFailure::FailureReceived:
-		return TEXT("THE SERVER REFUSED THE CONNECTION.");
+		return TRACE_TEXT("NET.FAIL_REFUSED", "THE SERVER REFUSED THE CONNECTION.");
 	// THE FOUR VERSION-MISMATCH CODES NAME THE CHECK, because "different builds" is true and useless:
 	// it does not say what to compare or where to look. The NET code is on the title screen of every
 	// build, bottom-right, so the instruction is one a player can actually carry out.
 	case ENetworkFailure::OutdatedClient:
-		return FString::Printf(TEXT("BUILD MISMATCH. YOURS IS %s — COMPARE IT WITH THE HOST'S (TITLE SCREEN, BOTTOM RIGHT)."),
-			*GetNetVersionLabel());
+		return TRACE_TEXTF("NET.FAIL_BUILD_MISMATCH_CLIENT",
+			"BUILD MISMATCH. YOURS IS {0} — COMPARE IT WITH THE HOST'S (TITLE SCREEN, BOTTOM RIGHT).",
+			{ GetNetVersionLabel() });
 	case ENetworkFailure::OutdatedServer:
-		return FString::Printf(TEXT("BUILD MISMATCH. YOURS IS %s — THE HOST'S TITLE SCREEN MUST SHOW THE SAME CODE."),
-			*GetNetVersionLabel());
+		return TRACE_TEXTF("NET.FAIL_BUILD_MISMATCH_SERVER",
+			"BUILD MISMATCH. YOURS IS {0} — THE HOST'S TITLE SCREEN MUST SHOW THE SAME CODE.",
+			{ GetNetVersionLabel() });
 	case ENetworkFailure::PendingConnectionFailure:
-		return TEXT("COULD NOT REACH THAT ADDRESS.");
+		return TRACE_TEXT("NET.FAIL_UNREACHABLE", "COULD NOT REACH THAT ADDRESS.");
 	case ENetworkFailure::NetGuidMismatch:
 	case ENetworkFailure::NetChecksumMismatch:
-		return FString::Printf(TEXT("CLIENT AND SERVER ARE RUNNING DIFFERENT BUILDS. YOURS IS %s."),
-			*GetNetVersionLabel());
+		return TRACE_TEXTF("NET.FAIL_DIFFERENT_BUILDS_CHECKSUM",
+			"CLIENT AND SERVER ARE RUNNING DIFFERENT BUILDS. YOURS IS {0}.",
+			{ GetNetVersionLabel() });
 	default:
-		return TEXT("THE CONNECTION FAILED.");
+		return TRACE_TEXT("NET.FAIL_GENERIC", "THE CONNECTION FAILED.");
 	}
 }
 
@@ -448,24 +452,24 @@ FString DescribeTravelFailure(ETravelFailure::Type FailureType)
 	{
 	case ETravelFailure::NoLevel:
 	case ETravelFailure::LoadMapFailure:
-		return TEXT("THE SERVER'S MAP COULD NOT BE LOADED.");
+		return TRACE_TEXT("NET.TRAVEL_FAIL_MAP_LOAD", "THE SERVER'S MAP COULD NOT BE LOADED.");
 	case ETravelFailure::InvalidURL:
-		return TEXT("THAT ADDRESS IS NOT VALID. USE  <ip>:7777.");
+		return TRACE_TEXT("NET.TRAVEL_FAIL_INVALID_URL", "THAT ADDRESS IS NOT VALID. USE  <ip>:7777.");
 	case ETravelFailure::PackageMissing:
 	case ETravelFailure::NoDownload:
-		return TEXT("THE SERVER IS RUNNING CONTENT THIS BUILD DOES NOT HAVE.");
+		return TRACE_TEXT("NET.TRAVEL_FAIL_MISSING_CONTENT", "THE SERVER IS RUNNING CONTENT THIS BUILD DOES NOT HAVE.");
 	case ETravelFailure::PackageVersion:
-		return TEXT("CLIENT AND SERVER ARE RUNNING DIFFERENT BUILDS.");
+		return TRACE_TEXT("NET.TRAVEL_FAIL_DIFFERENT_BUILDS", "CLIENT AND SERVER ARE RUNNING DIFFERENT BUILDS.");
 	case ETravelFailure::PendingNetGameCreateFailure:
-		return TEXT("COULD NOT START THE CONNECTION.");
+		return TRACE_TEXT("NET.TRAVEL_FAIL_START_CONNECTION", "COULD NOT START THE CONNECTION.");
 	case ETravelFailure::ServerTravelFailure:
-		return TEXT("THE SERVER FAILED TO CHANGE MAP.");
+		return TRACE_TEXT("NET.TRAVEL_FAIL_SERVER_MAP_CHANGE", "THE SERVER FAILED TO CHANGE MAP.");
 	case ETravelFailure::ClientTravelFailure:
-		return TEXT("THIS CLIENT FAILED TO FOLLOW THE SERVER.");
+		return TRACE_TEXT("NET.TRAVEL_FAIL_CLIENT_FOLLOW", "THIS CLIENT FAILED TO FOLLOW THE SERVER.");
 	case ETravelFailure::CheatCommands:
-		return TEXT("TRAVEL IS DISABLED BECAUSE CHEAT COMMANDS WERE USED.");
+		return TRACE_TEXT("NET.TRAVEL_FAIL_CHEATS", "TRAVEL IS DISABLED BECAUSE CHEAT COMMANDS WERE USED.");
 	default:
-		return TEXT("TRAVEL FAILED.");
+		return TRACE_TEXT("NET.TRAVEL_FAIL_GENERIC", "TRAVEL FAILED.");
 	}
 }
 
@@ -496,7 +500,7 @@ void BindFailureHandlers()
 				(FailureType == ENetworkFailure::ConnectionLost) || (FailureType == ENetworkFailure::ConnectionTimeout);
 
 			const FString Headline = (bWeAreTheServer && bPeerDropped)
-				? FString(TEXT("A PLAYER LEFT THE MATCH"))
+				? TRACE_TEXT("NET.FAIL_PEER_LEFT", "A PLAYER LEFT THE MATCH")
 				: DescribeNetworkFailure(FailureType);
 
 			// The engine's own ErrorString is often empty and, when it is not, is aimed at a

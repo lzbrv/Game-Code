@@ -60,7 +60,8 @@
 #include "Trace.h"                        // LogTraceGame
 #include "TraceSettings.h"
 #include "TraceTypes.h"
-#include "UI/Text/TraceCanvasText.h"   // spec v22 §A1 — the match HUD types from the atlas
+#include "UI/Text/TraceCanvasText.h"    // spec v22 §A1 — the match HUD types from the atlas
+#include "UI/Text/TraceGameText.h"      // the editable wording, Config/TraceGameText.ini
 #include "UI/TraceAutoShot.h"
 #include "UI/TraceMatchOptions.h"         // TraceMatchFlow::PostMatchDuration, TraceMaps
 #include "UI/TraceNetworking.h"           // TraceNet — host address, connection state, failures
@@ -757,7 +758,7 @@ namespace TraceHUDPullRing
 				TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.35f));
 			Style.HAlign = TraceText::EHAlign::Center;
 			Style.Weight = TraceHUDType::HudWeight();   // spec v25 §4 — the HUD's face, like every other row
-			TraceCanvasText::Draw(HUD, FString::Printf(TEXT("HOLD [%s]"), *KeyLabel),
+			TraceCanvasText::Draw(HUD, TRACE_TEXTF("HUD.ABILITY_HOLD_KEY", "HOLD [{0}]", { KeyLabel }),
 				CX, CY + Radius + (8.f * UIScale), Style);
 		}
 
@@ -1797,12 +1798,13 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 	// that does not aim at teammates — is the whole of it.
 	if (bOnCooldown)
 	{
-		Caption = FString::Printf(TEXT("THROW READY IN %.1f"), CooldownRemaining);
+		Caption = TRACE_TEXTF("HUD.CROSSHAIR_THROW_READY_IN", "THROW READY IN {0}",
+			{ FString::Printf(TEXT("%.1f"), CooldownRemaining) });
 		CaptionColor = TraceHUDStyle::Danger;
 	}
 	else if (bLocalCarrying)
 	{
-		Caption = TEXT("LMB  -  THROW");
+		Caption = TRACE_TEXT("HUD.CROSSHAIR_LMB_THROW", "LMB  -  THROW");
 		CaptionColor = TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.35f);
 	}
 
@@ -1831,7 +1833,7 @@ void ATraceHUD::DrawPassProgress()
 	// The filled arc is TEAM COLOURED, because a pass is the one action whose whole point is the
 	// teammate on the other end of it.
 	DrawCrosshairRing(Progress, TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.30f),
-		TEXT("PASSING"), TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.85f));
+		TRACE_TEXT("HUD.RING_PASSING", "PASSING"), TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.85f));
 }
 
 // =================================================================================================
@@ -2345,9 +2347,10 @@ void ATraceHUD::DrawThrowChargeRing()
 	// it already reads "POWER 15%", which is the same lesson stated correctly and read from the same
 	// published curve the throw itself releases at, so the readout cannot drift from the game.
 	const FString RingCaption = bFull
-		? FString(TEXT("FULL  -  POWER 100%"))
-		: FString::Printf(TEXT("%.0f%%  -  POWER %.0f%%"),
-			100.f * ChargeAlpha, 100.f * FMath::Max(0.f, Power));
+		? TRACE_TEXT("HUD.RING_THROW_FULL", "FULL  -  POWER 100%")
+		: TRACE_TEXTF("HUD.RING_THROW_CHARGING", "{0}%  -  POWER {1}%",
+			{ FString::Printf(TEXT("%.0f"), 100.f * ChargeAlpha),
+			  FString::Printf(TEXT("%.0f"), 100.f * FMath::Max(0.f, Power)) });
 
 	DrawCrosshairRing(ChargeAlpha, RingColor, RingCaption,
 		bFull ? TraceHUDStyle::Good : TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.85f));
@@ -2651,8 +2654,13 @@ void ATraceHUD::DrawHealthAndDash()
 	// in the stack.
 	float LabelW = 58.f * UIScale;
 	{
-		static const TCHAR* const GutterLabels[] = {
-			TEXT("WEAPON"), TEXT("THROW"), TEXT("PARRY"), TEXT("DASH"), TEXT("SLIDE")
+		// NOT static any more: the wording is the document's now, so the gutter has to be measured
+		// against whatever it says this session. "THROW" stays a literal — the only row that draws it
+		// is the superseded charge bar below, which lives behind the Trace.HUD.V16 red arm.
+		const TCHAR* const GutterLabels[] = {
+			*TRACE_TEXT("HUD.ROW_WEAPON", "WEAPON"), TEXT("THROW"),
+			*TRACE_TEXT("HUD.ROW_PARRY", "PARRY"), *TRACE_TEXT("HUD.ROW_DASH", "DASH"),
+			*TRACE_TEXT("HUD.ROW_SLIDE", "SLIDE")
 		};
 		for (const TCHAR* const GutterLabel : GutterLabels)
 		{
@@ -2783,11 +2791,14 @@ void ATraceHUD::DrawHealthAndDash()
 		// leaving the screen says it, and this row is the second, unambiguous confirmation.
 		const bool bSmgOut = TraceMelee::IsWeaponEquipped(LocalChar, ETraceEquippedWeapon::Smg);
 		const FString WeaponText = bLocalCarrying
-			? FString(TEXT("STOWED"))
-			: (bKnife ? FString(TEXT("KNIFE")) : (bSmgOut ? FString(TEXT("SMG")) : FString(TEXT("PISTOL"))));
+			? TRACE_TEXT("HUD.WEAPON_STOWED", "STOWED")
+			: (bKnife ? TRACE_TEXT("HUD.WEAPON_KNIFE", "KNIFE")
+			          : (bSmgOut ? TRACE_TEXT("HUD.WEAPON_SMG", "SMG")
+			                     : TRACE_TEXT("HUD.WEAPON_PISTOL", "PISTOL")));
 
-		DrawTextLeft(TEXT("WEAPON"), bLocalCarrying ? TraceHUDStyle::InkDim : TraceHUDStyle::Ink,
-			Margin, VCenterTextY(FString(TEXT("WEAPON")), FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+		const FString& WeaponLabel = TRACE_TEXT("HUD.ROW_WEAPON", "WEAPON");
+		DrawTextLeft(WeaponLabel, bLocalCarrying ? TraceHUDStyle::InkDim : TraceHUDStyle::Ink,
+			Margin, VCenterTextY(WeaponLabel, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 
 		// One meter, three meanings, in priority order — pullout beats cooldown beats ready, which is
 		// exactly the order in which they gate the trigger.
@@ -2817,14 +2828,15 @@ void ATraceHUD::DrawHealthAndDash()
 				                                                : ETraceEquippedWeapon::Gun)));
 			Fraction = FMath::Clamp(1.f - (Deploy / SwapTotal), 0.f, 1.f);
 			WeaponColor = TraceHUDStyle::Shade(TeamTint, 0.45f, 0.0f);
-			StatusText = FString::Printf(TEXT("%s  DRAWING"), *WeaponText);
+			StatusText = TRACE_TEXTF("HUD.WEAPON_DRAWING", "{0}  DRAWING", { WeaponText });
 		}
 		else if (bKnife && !bLocalCarrying && Cooling > TraceHUDStyle::TimeEpsilon)
 		{
 			const float CooldownTotal = FMath::Max(TraceHUDStyle::TimeEpsilon, TraceMelee::GetSwingCooldownSeconds());
 			Fraction = FMath::Clamp(1.f - (Cooling / CooldownTotal), 0.f, 1.f);
 			WeaponColor = FLinearColor(0.45f, 0.45f, 0.50f, 1.f);
-			StatusText = FString::Printf(TEXT("%s  %.1f"), *WeaponText, Cooling);
+			StatusText = TRACE_TEXTF("HUD.WEAPON_COOLDOWN", "{0}  {1}",
+				{ WeaponText, FString::Printf(TEXT("%.1f"), Cooling) });
 		}
 		else if (bLocalCarrying)
 		{
@@ -2924,7 +2936,7 @@ void ATraceHUD::DrawHealthAndDash()
 			const float Charge = FMath::Clamp(1.f - (ParryRemaining / FMath::Max(TraceHUDStyle::TimeEpsilon, ParryTotal)), 0.f, 1.f);
 			const bool bReady = (ParryRemaining <= TraceHUDStyle::TimeEpsilon);
 
-			const FString Label(TEXT("PARRY"));
+			const FString& Label = TRACE_TEXT("HUD.ROW_PARRY", "PARRY");
 			DrawTextLeft(Label, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
 				Margin, VCenterTextY(Label, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 
@@ -2961,7 +2973,7 @@ void ATraceHUD::DrawHealthAndDash()
 		{
 			const bool bReady = (Dash.Charges > 0);
 
-			const FString DashLabel(TEXT("DASH"));
+			const FString& DashLabel = TRACE_TEXT("HUD.ROW_DASH", "DASH");
 			DrawTextLeft(DashLabel, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
 				Margin, VCenterTextY(DashLabel, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 
@@ -3008,7 +3020,7 @@ void ATraceHUD::DrawHealthAndDash()
 		{
 			const bool bWellTimed = TraceMove->IsSlideJumpWellTimed();
 
-			const FString SlideLabel(TEXT("SLIDE"));
+			const FString& SlideLabel = TRACE_TEXT("HUD.ROW_SLIDE", "SLIDE");
 			DrawTextLeft(SlideLabel, bWellTimed ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
 				Margin, VCenterTextY(SlideLabel, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 
@@ -3021,7 +3033,9 @@ void ATraceHUD::DrawHealthAndDash()
 
 			DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, bWellTimed ? 1.f : 0.35f, WindowColor);
 
-			const FString WindowText = bWellTimed ? TEXT("JUMP NOW") : TEXT("SLIDING");
+			const FString WindowText = bWellTimed
+				? TRACE_TEXT("HUD.SLIDE_JUMP_NOW", "JUMP NOW")
+				: TRACE_TEXT("HUD.SLIDE_SLIDING", "SLIDING");
 			DrawTextLeft(WindowText, TraceHUDStyle::InkDim,
 				Margin + BarW + (10.f * UIScale),
 				VCenterTextY(WindowText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
@@ -3065,7 +3079,9 @@ void ATraceHUD::DrawHealthAndDash()
 		if (bLocalCarrying)
 		{
 			const bool bPassing = (TracePC->GetPassProgress() >= 0.f);
-			const FString InvulnText = bPassing ? TEXT("SHIELD DOWN") : TEXT("INVULNERABLE");
+			const FString InvulnText = bPassing
+				? TRACE_TEXT("HUD.CARRIER_SHIELD_DOWN", "SHIELD DOWN")
+				: TRACE_TEXT("HUD.CARRIER_INVULNERABLE", "INVULNERABLE");
 			const FLinearColor InvulnColor = bPassing
 				? TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, 0.7f + 0.3f * FMath::Sin(Now * 12.f))
 				: TraceHUDStyle::Ink;
@@ -3127,7 +3143,8 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 	// that hardcodes a key is a HUD that lies to the first player who rebinds it.
 	// EXTRACTED to ATraceHUD::ActionKeyLabel — the identical loop existed three times once the
 	// refusal toast needed to print the same key this row prints. Same lookup, same fallback.
-	const FString Label = FString::Printf(TEXT("[%s]"), *ActionKeyLabel(TEXT("Ability"), TEXT("E")));
+	const FString Label = TRACE_TEXTF("HUD.ABILITY_KEY", "[{0}]",
+		{ ActionKeyLabel(TEXT("Ability"), TEXT("E")) });
 	DrawTextLeft(Label, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
 		Margin, VCenterTextY(Label, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 
@@ -3158,11 +3175,15 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 
 	if (!bReady)
 	{
-		StatusText = FString::Printf(TEXT("%s  %.1f"), *AbilityName, Remaining);
+		StatusText = TRACE_TEXTF("HUD.ABILITY_COOLING", "{0}  {1}",
+			{ AbilityName, FString::Printf(TEXT("%.1f"), Remaining) });
 
 		if (bLocalDead)
 		{
-			StatusText += TEXT("  RUNNING");
+			// The two spaces stay in the code: the document trims what it reads, so a leading gap
+			// could not survive a round trip through it.
+			StatusText += TEXT("  ");
+			StatusText += TRACE_TEXT("HUD.ABILITY_RUNNING_SUFFIX", "RUNNING");
 			StatusColor = TraceHUDStyle::Warning;
 		}
 	}
@@ -3257,7 +3278,8 @@ float ATraceHUD::DrawSecondaryCooldownRow(float RowY, float Margin, float BarW, 
 	// The key, from the player's OWN binding. V is the documented default (spec §5: "Mace's suspend
 	// needs its own bind (V)"), and it is a fallback here rather than a literal for the same reason
 	// the E row's is.
-	const FString KeyText = FString::Printf(TEXT("[%s]"), *ActionKeyLabel(TEXT("AbilitySecondary"), TEXT("V")));
+	const FString KeyText = TRACE_TEXTF("HUD.ABILITY_SECONDARY_KEY", "[{0}]",
+		{ ActionKeyLabel(TEXT("AbilitySecondary"), TEXT("V")) });
 
 	DrawTextLeft(KeyText, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
 		Margin, VCenterTextY(KeyText, FontSmall, UIScale, RowY, VRowH), FontSmall, UIScale);
@@ -3277,7 +3299,8 @@ float ATraceHUD::DrawSecondaryCooldownRow(float RowY, float Margin, float BarW, 
 	// does, and a row that only named it while it was unavailable would teach the key backwards.
 	const FString Caption = bReady
 		? RowLabel
-		: FString::Printf(TEXT("%s  %.1f"), *RowLabel, Remaining);
+		: TRACE_TEXTF("HUD.ABILITY_SECONDARY_COOLING", "{0}  {1}",
+			{ RowLabel, FString::Printf(TEXT("%.1f"), Remaining) });
 
 	DrawTextLeft(Caption, bFlashing ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
 		Margin + BarW + (10.f * UIScale),
@@ -3399,8 +3422,10 @@ void ATraceHUD::DrawHealthBar(const UTraceHealthComponent* HealthComp, float X, 
 	// RULE the player has to be taught once, and a green shimmer teaches nobody anything. The rate
 	// is printed with it so the player can judge whether waiting is worth it against pushing.
 	const FString RegenText = bRegenerating
-		? FString::Printf(TEXT("REGEN  +%.0f/s"), TraceHealthRegen::GetRatePerSecond())
-		: FString::Printf(TEXT("REGEN IN  %.1f"), SecondsUntil);
+		? TRACE_TEXTF("HUD.REGEN_ACTIVE", "REGEN  +{0}/s",
+			{ FString::Printf(TEXT("%.0f"), TraceHealthRegen::GetRatePerSecond()) })
+		: TRACE_TEXTF("HUD.REGEN_IN", "REGEN IN  {0}",
+			{ FString::Printf(TEXT("%.1f"), SecondsUntil) });
 
 	const FLinearColor RegenColor = bRegenerating
 		? TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, 0.7f + 0.3f * Pulse)
@@ -3735,8 +3760,10 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 			? TraceHUDStatusStyle::BeeRounds
 			: TraceHUDStatusStyle::NormalRounds;
 
-		OutState.CapacityText = FString::Printf(TEXT("/%d"), OutState.ClipCapacity);
-		OutState.CountText = OutState.bReloading ? FString(TEXT("--")) : FString::FromInt(OutState.InClip);
+		OutState.CapacityText = TRACE_TEXTF("HUD.AMMO_CAPACITY", "/{0}", { OutState.ClipCapacity });
+		OutState.CountText = OutState.bReloading
+			? TRACE_TEXT("HUD.AMMO_COUNT_RELOADING", "--")
+			: FString::FromInt(OutState.InClip);
 
 		OutState.bLowAmmo = !OutState.bBeeClip && !OutState.bReloading
 			&& (static_cast<float>(OutState.InClip)
@@ -3769,7 +3796,9 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 		// The WORDS are the third independent bee-round signal, and the right-hand half is the reload
 		// key — read from the player's own bindings rather than hardcoded to R, exactly as the ability
 		// row does. A HUD that hardcodes a key is a HUD that lies to the first player who rebinds it.
-		OutState.AmmoLabel = OutState.bBeeClip ? FString(TEXT("BEE ROUNDS")) : FString(TEXT("AMMO"));
+		OutState.AmmoLabel = OutState.bBeeClip
+			? TRACE_TEXT("HUD.AMMO_LABEL_BEE", "BEE ROUNDS")
+			: TRACE_TEXT("HUD.AMMO_LABEL", "AMMO");
 		OutState.AmmoLabelColor = OutState.bBeeClip
 			? TraceHUDStatusStyle::BeeRounds
 			: TraceHUDStyle::InkDim;
@@ -3779,8 +3808,9 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 		const FString ReloadKeyLabel = ActionKeyLabel(TEXT("Reload"), TEXT("R"));
 
 		OutState.RightLabel = OutState.bReloading
-			? FString::Printf(TEXT("RELOADING  %.1f"), OutState.ReloadRemaining)
-			: FString::Printf(TEXT("[%s]  RELOAD"), *ReloadKeyLabel);
+			? TRACE_TEXTF("HUD.AMMO_RELOADING", "RELOADING  {0}",
+				{ FString::Printf(TEXT("%.1f"), OutState.ReloadRemaining) })
+			: TRACE_TEXTF("HUD.AMMO_RELOAD_PROMPT", "[{0}]  RELOAD", { ReloadKeyLabel });
 
 		OutState.RightLabelColor = OutState.bReloading
 			? TraceHUDStatusStyle::Reloading
@@ -3815,8 +3845,10 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 			const float Bonus = 100.f * (TraceVulnerable::GetMultiplierForStacks(Stacks) - 1.f);
 
 			OutState.Chips.Add({
-				FString::Printf(TEXT("VULNERABLE  x%d  +%.0f%%"), Stacks, Bonus),
-				FString::Printf(TEXT("%.1fs"), Remaining),
+				TRACE_TEXTF("HUD.STATUS_VULNERABLE", "VULNERABLE  x{0}  +{1}%",
+					{ Stacks, FString::Printf(TEXT("%.0f"), Bonus) }),
+				TRACE_TEXTF("HUD.STATUS_READOUT_SECONDS_1DP", "{0}s",
+					{ FString::Printf(TEXT("%.1f"), Remaining) }),
 				Remaining / Total, TraceHUDStatusStyle::Vulnerable });
 		}
 	}
@@ -3849,7 +3881,9 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 		if (Remaining > 0.f)
 		{
 			OutState.Chips.Add({
-				TEXT("POISONED"), FString::Printf(TEXT("%.1fs"), Remaining),
+				TRACE_TEXT("HUD.STATUS_POISONED", "POISONED"),
+				TRACE_TEXTF("HUD.STATUS_READOUT_SECONDS_1DP", "{0}s",
+					{ FString::Printf(TEXT("%.1f"), Remaining) }),
 				Remaining / Total, TraceHUDStatusStyle::Poisoned });
 
 			if (PoisonComp->IsSlowActive())
@@ -3904,8 +3938,10 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 	if (SlowMultiplier < 1.f && SlowRemaining > 0.f)
 	{
 		OutState.Chips.Add({
-			FString::Printf(TEXT("SLOWED  -%.0f%% SPEED"), 100.f * (1.f - SlowMultiplier)),
-			FString::Printf(TEXT("%.1fs"), SlowRemaining),
+			TRACE_TEXTF("HUD.STATUS_SLOWED", "SLOWED  -{0}% SPEED",
+				{ FString::Printf(TEXT("%.0f"), 100.f * (1.f - SlowMultiplier)) }),
+			TRACE_TEXTF("HUD.STATUS_READOUT_SECONDS_1DP", "{0}s",
+				{ FString::Printf(TEXT("%.1f"), SlowRemaining) }),
 			FMath::Clamp(SlowRemaining / SlowTotal, 0.f, 1.f), TraceHUDStatusStyle::Slowed });
 	}
 
@@ -3933,7 +3969,9 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 					UTraceSettings::Get().MaceSuspendMaxSeconds);
 
 				OutState.Chips.Add({
-					TEXT("SUSPENDED"), FString::Printf(TEXT("%.2fs"), Remaining),
+					TRACE_TEXT("HUD.STATUS_SUSPENDED", "SUSPENDED"),
+					TRACE_TEXTF("HUD.STATUS_READOUT_SECONDS_2DP", "{0}s",
+						{ FString::Printf(TEXT("%.2f"), Remaining) }),
 					Remaining / Total, TraceHUDStatusStyle::Suspend });
 			}
 
@@ -3948,7 +3986,9 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 				const float Range = FMath::Max(1.f, UTraceSettings::Get().MaceSpikeRangeUU);
 
 				OutState.Chips.Add({
-					TEXT("SPIKE PULL"), FString::Printf(TEXT("%.0fm"), ToAnchor / 100.f),
+					TRACE_TEXT("HUD.STATUS_SPIKE_PULL", "SPIKE PULL"),
+					TRACE_TEXTF("HUD.STATUS_READOUT_METRES", "{0}m",
+						{ FString::Printf(TEXT("%.0f"), ToAnchor / 100.f) }),
 					FMath::Clamp(ToAnchor / Range, 0.f, 1.f), TraceHUDStatusStyle::Pull });
 			}
 		}
@@ -3962,8 +4002,10 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 				const float Reduction = 100.f * UTraceSettings::Get().ChudDamageReduction;
 
 				OutState.Chips.Add({
-					FString::Printf(TEXT("CHUD  -%.0f%% DAMAGE"), Reduction),
-					FString::Printf(TEXT("%.1fs"), Remaining),
+					TRACE_TEXTF("HUD.STATUS_CHUD", "CHUD  -{0}% DAMAGE",
+						{ FString::Printf(TEXT("%.0f"), Reduction) }),
+					TRACE_TEXTF("HUD.STATUS_READOUT_SECONDS_1DP", "{0}s",
+						{ FString::Printf(TEXT("%.1f"), Remaining) }),
 					Remaining / Total, TraceHUDStatusStyle::Chud });
 			}
 		}
@@ -3985,8 +4027,10 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 				const float BoostPercent = 100.f * (RoccoSet->GetMoveSpeedMultiplier() - 1.f);
 
 				OutState.Chips.Add({
-					FString::Printf(TEXT("SPEED BOOST  x%d  +%.0f%%"), Stacks, BoostPercent),
-					FString::Printf(TEXT("%.1fs"), Remaining),
+					TRACE_TEXTF("HUD.STATUS_SPEED_BOOST", "SPEED BOOST  x{0}  +{1}%",
+						{ Stacks, FString::Printf(TEXT("%.0f"), BoostPercent) }),
+					TRACE_TEXTF("HUD.STATUS_READOUT_SECONDS_1DP", "{0}s",
+						{ FString::Printf(TEXT("%.1f"), Remaining) }),
 					Remaining / Total, TraceHUDStatusStyle::SpeedBoost });
 			}
 		}
@@ -4005,8 +4049,10 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 				const float RateBonus = 100.f * ((1.f / FMath::Max(0.01f, RoxieSet->GetFireIntervalScale())) - 1.f);
 
 				OutState.Chips.Add({
-					FString::Printf(TEXT("MODDED  +%.0f%% FIRE RATE"), RateBonus),
-					FString::Printf(TEXT("%.1fs"), Remaining),
+					TRACE_TEXTF("HUD.STATUS_MODDED", "MODDED  +{0}% FIRE RATE",
+						{ FString::Printf(TEXT("%.0f"), RateBonus) }),
+					TRACE_TEXTF("HUD.STATUS_READOUT_SECONDS_1DP", "{0}s",
+						{ FString::Printf(TEXT("%.1f"), Remaining) }),
 					Remaining / Total, TraceHUDStatusStyle::Modded });
 			}
 		}
@@ -4025,7 +4071,9 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 				if (Remaining > 0.f)
 				{
 					OutState.Chips.Add({
-						TEXT("CLOAKED"), FString::Printf(TEXT("%.1fs"), Remaining),
+						TRACE_TEXT("HUD.STATUS_CLOAKED", "CLOAKED"),
+						TRACE_TEXTF("HUD.STATUS_READOUT_SECONDS_1DP", "{0}s",
+							{ FString::Printf(TEXT("%.1f"), Remaining) }),
 						FMath::Clamp(Remaining / Total, 0.f, 1.f), TraceHUDStatusStyle::Cloaked });
 				}
 			}
@@ -4043,7 +4091,9 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 				const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon, LilySet->GetZipDurationForNow());
 
 				OutState.Chips.Add({
-					TEXT("ZIP"), FString::Printf(TEXT("%.1fs"), Remaining),
+					TRACE_TEXT("HUD.STATUS_ZIP", "ZIP"),
+					TRACE_TEXTF("HUD.STATUS_READOUT_SECONDS_1DP", "{0}s",
+						{ FString::Printf(TEXT("%.1f"), Remaining) }),
 					FMath::Clamp(Remaining / Total, 0.f, 1.f), TraceHUDStatusStyle::Zip });
 			}
 		}
@@ -4066,8 +4116,11 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 				const bool  bCapped = (Remaining > 0.f && Cap > 0.f);
 
 				OutState.Chips.Add({
-					TEXT("STUCK"),
-					bCapped ? FString::Printf(TEXT("%.1fs"), Remaining) : FString(TEXT("HELD")),
+					TRACE_TEXT("HUD.STATUS_STUCK", "STUCK"),
+					bCapped
+						? TRACE_TEXTF("HUD.STATUS_READOUT_SECONDS_1DP", "{0}s",
+							{ FString::Printf(TEXT("%.1f"), Remaining) })
+						: TRACE_TEXT("HUD.STATUS_STUCK_HELD", "HELD"),
 					bCapped ? FMath::Clamp(Remaining / Cap, 0.f, 1.f) : 1.f,
 					TraceHUDStatusStyle::Stuck });
 			}
@@ -4571,7 +4624,7 @@ void ATraceHUD::DrawScoresAndClock()
 
 	// Clock / phase in the middle. GetMatchTimeRemaining() is driven by the replicated
 	// GetServerWorldTimeSeconds() clock, so every client counts down together.
-	FString ClockText(TEXT("--:--"));
+	FString ClockText = TRACE_TEXT("HUD.CLOCK_PLACEHOLDER", "--:--");
 	FLinearColor ClockColor = TraceHUDStyle::Ink;
 
 	if (TraceGS != nullptr)
@@ -4584,7 +4637,9 @@ void ATraceHUD::DrawScoresAndClock()
 			// and is zero when no countdown is running. Showing the real number rather than the word
 			// "WARMUP" is the difference between "the game is about to start" and "the game is stuck".
 			const float Remaining = TraceGS->GetMatchTimeRemaining();
-			ClockText = (TraceGS->MatchEndServerTime > 0.f) ? FormatClock(Remaining) : FString(TEXT("--:--"));
+			ClockText = (TraceGS->MatchEndServerTime > 0.f)
+				? FormatClock(Remaining)
+				: TRACE_TEXT("HUD.CLOCK_PLACEHOLDER", "--:--");
 			ClockColor = TraceHUDStyle::InkDim;
 			break;
 		}
@@ -4595,7 +4650,7 @@ void ATraceHUD::DrawScoresAndClock()
 			{
 				// The word, not the fortnight. A practice clock is also never urgent, so the
 				// ClockUrgentSeconds red check is deliberately skipped with the number.
-				ClockText = TEXT("PRACTICE");
+				ClockText = TRACE_TEXT("HUD.CLOCK_PRACTICE", "PRACTICE");
 				ClockColor = TraceHUDStyle::InkDim;
 				break;
 			}
@@ -4606,7 +4661,7 @@ void ATraceHUD::DrawScoresAndClock()
 		}
 
 		case ETraceMatchState::PostMatch:
-			ClockText = TEXT("FINAL");
+			ClockText = TRACE_TEXT("HUD.CLOCK_FINAL", "FINAL");
 			ClockColor = TraceHUDStyle::InkDim;
 			break;
 
@@ -4622,14 +4677,16 @@ void ATraceHUD::DrawScoresAndClock()
 	// "FIRST TO N" was never the rule and the score cap is now deleted outright (spec v4 §6): the
 	// clock decides the match, so the phase is the useful thing to show.
 	// ATraceGameState::GetHalfLabel() already reads "1ST HALF" / "HALF TIME" / "2ND HALF".
-	FString FooterText = (TraceGS != nullptr) ? TraceGS->GetHalfLabel() : FString(TEXT("MATCH"));
+	FString FooterText = (TraceGS != nullptr)
+		? TraceGS->GetHalfLabel()
+		: TRACE_TEXT("HUD.FOOTER_MATCH_FALLBACK", "MATCH");
 	if (TraceGS != nullptr && TraceGS->TraceMatchState == ETraceMatchState::WaitingForPlayers)
 	{
-		FooterText = TEXT("WARM UP");
+		FooterText = TRACE_TEXT("HUD.FOOTER_WARM_UP", "WARM UP");
 	}
 	else if (TraceGS != nullptr && TraceGS->TraceMatchState == ETraceMatchState::PostMatch)
 	{
-		FooterText = TEXT("FULL TIME");
+		FooterText = TRACE_TEXT("HUD.FOOTER_FULL_TIME", "FULL TIME");
 	}
 
 	// WP1 — the range names itself instead of a half ("1ST HALF" of a fortnight is the exact line
@@ -4639,7 +4696,7 @@ void ATraceHUD::DrawScoresAndClock()
 	// wipe bonus 0) and are deliberately NOT special-cased here.
 	if (bPractice)
 	{
-		FooterText = TEXT("PRACTICE RANGE");
+		FooterText = TRACE_TEXT("HUD.FOOTER_PRACTICE_RANGE", "PRACTICE RANGE");
 	}
 
 	// ---- Deferred half time / full time (spec v9 §11) --------------------------------------------
@@ -4697,7 +4754,8 @@ void ATraceHUD::DrawScoresAndClock()
 		const float CapRemaining = TraceGS->GetPendingPeriodEndTimeRemaining();
 		if (CapRemaining > 0.f)
 		{
-			DrawTextRight(FString::Printf(TEXT("%ds"), FMath::CeilToInt(CapRemaining)),
+			DrawTextRight(TRACE_TEXTF("HUD.PENDING_WHISTLE_CAP_SECONDS", "{0}s",
+					{ FMath::CeilToInt(CapRemaining) }),
 				TraceHUDStyle::InkDim, PanelX + PanelW - (12.f * UIScale), FooterY, FontSmall, UIScale);
 		}
 	}
@@ -4729,8 +4787,10 @@ void ATraceHUD::DrawScoresAndClock()
 		{
 			const ETraceTeam LeadingTeam = (BlueScore > OrangeScore) ? ETraceTeam::Blue : ETraceTeam::Orange;
 			const FString MercyText = (Remaining == 1)
-				? FString::Printf(TEXT("MERCY RULE: %s WINS ON THE NEXT POINT"), *TraceTeamName(LeadingTeam).ToString().ToUpper())
-				: FString::Printf(TEXT("MERCY RULE: %s IS %d POINTS FROM THE WIN"), *TraceTeamName(LeadingTeam).ToString().ToUpper(), Remaining);
+				? TRACE_TEXTF("HUD.MERCY_ONE_POINT", "MERCY RULE: {0} WINS ON THE NEXT POINT",
+					{ TraceTeamName(LeadingTeam).ToString().ToUpper() })
+				: TRACE_TEXTF("HUD.MERCY_N_POINTS", "MERCY RULE: {0} IS {1} POINTS FROM THE WIN",
+					{ TraceTeamName(LeadingTeam).ToString().ToUpper(), Remaining });
 
 			// Pulsed and team coloured, one line UNDER the Core banner.
 			//
@@ -4792,12 +4852,14 @@ void ATraceHUD::DrawCoreBanner()
 		// happens.
 		if (Core->IsLoose())
 		{
-			BannerText = TEXT("CORE LOOSE - FIRST TOUCH TAKES IT");
+			BannerText = TRACE_TEXT("HUD.BANNER_CORE_LOOSE", "CORE LOOSE - FIRST TOUCH TAKES IT");
 			BannerColor = TraceHUDStyle::Danger;
 		}
 		else
 		{
-			BannerText = Core->IsOutOfPlay() ? TEXT("CORE OUT OF PLAY") : TEXT("CORE KICKOFF");
+			BannerText = Core->IsOutOfPlay()
+				? TRACE_TEXT("HUD.BANNER_CORE_OUT_OF_PLAY", "CORE OUT OF PLAY")
+				: TRACE_TEXT("HUD.BANNER_CORE_KICKOFF", "CORE KICKOFF");
 			BannerColor = TraceHUDStyle::InkDim;
 		}
 	}
@@ -4807,13 +4869,14 @@ void ATraceHUD::DrawCoreBanner()
 		// verb. Spec v4 §7 made LMB mean two different things while carrying — a 0.5 s hover-hold
 		// pass, or an outright throw — and this line picked between them. The hover-pass went with
 		// the endzone ruleset.
-		BannerText = FString(TEXT("YOU HAVE THE CORE - LMB THROWS"));
+		BannerText = TRACE_TEXT("HUD.BANNER_YOU_HAVE_CORE", "YOU HAVE THE CORE - LMB THROWS");
 		BannerColor = TraceTeamColor(LocalTeam);
 	}
 	else
 	{
 		const ETraceTeam CarrierTeam = Carrier->GetTeam();
-		BannerText = FString::Printf(TEXT("%s HAS THE CORE"), *TraceTeamName(CarrierTeam).ToString().ToUpper());
+		BannerText = TRACE_TEXTF("HUD.BANNER_TEAM_HAS_CORE", "{0} HAS THE CORE",
+			{ TraceTeamName(CarrierTeam).ToString().ToUpper() });
 		BannerColor = TraceTeamColor(CarrierTeam);
 	}
 
@@ -4864,12 +4927,12 @@ void ATraceHUD::DrawNetworkStatus()
 	switch (ConnectionRole)
 	{
 	case TraceNet::ERole::Hosting:
-		Headline = FString::Printf(TEXT("HOSTING  %s"), *Endpoint);
+		Headline = TRACE_TEXTF("HUD.NET_HOSTING", "HOSTING  {0}", { Endpoint });
 		Accent = TraceHUDStyle::Good;
 		break;
 
 	case TraceNet::ERole::Client:
-		Headline = FString::Printf(TEXT("CONNECTED  %s"), *Endpoint);
+		Headline = TRACE_TEXTF("HUD.NET_CONNECTED", "CONNECTED  {0}", { Endpoint });
 		Accent = TraceHUDStyle::Good;
 		// Bots fill the empty slots and yield them as humans arrive, so the useful second line for a
 		// client is simply how many humans are in the match with them.
@@ -4877,7 +4940,7 @@ void ATraceHUD::DrawNetworkStatus()
 		break;
 
 	default:
-		Headline = TEXT("OFFLINE - NOBODY CAN JOIN");
+		Headline = TRACE_TEXT("HUD.NET_OFFLINE", "OFFLINE - NOBODY CAN JOIN");
 		Accent = TraceHUDStyle::Warning;
 		break;
 	}
@@ -4896,10 +4959,12 @@ void ATraceHUD::DrawNetworkStatus()
 		}
 
 		const FString HumanText = (Humans == 1)
-			? FString(TEXT("1 HUMAN PLAYER"))
-			: FString::Printf(TEXT("%d HUMAN PLAYERS"), Humans);
+			? TRACE_TEXT("HUD.NET_ONE_HUMAN", "1 HUMAN PLAYER")
+			: TRACE_TEXTF("HUD.NET_N_HUMANS", "{0} HUMAN PLAYERS", { Humans });
 
-		Detail = Detail.IsEmpty() ? HumanText : FString::Printf(TEXT("%s  -  %s"), *Detail, *HumanText);
+		Detail = Detail.IsEmpty()
+			? HumanText
+			: TRACE_TEXTF("HUD.NET_DETAIL_JOIN", "{0}  -  {1}", { Detail, HumanText });
 
 		// Logged on CHANGE, never per frame. "A second human arrived" is the single fact the Demo 5
 		// report needed and could not get, and putting it in the log at Display means the next person
@@ -5455,15 +5520,16 @@ void ATraceHUD::DrawPhaseBanner()
 			const float Frac = Remaining - FMath::FloorToFloat(Remaining);
 			const float Pop = 1.f + 0.18f * FMath::Clamp(Frac, 0.f, 1.f);
 
-			DrawTextCentered(TEXT("MATCH STARTS IN"), TraceHUDStyle::InkDim,
+			DrawTextCentered(TRACE_TEXT("HUD.BANNER_MATCH_STARTS_IN", "MATCH STARTS IN"), TraceHUDStyle::InkDim,
 				CX, BannerY, FontSmall, 1.2f * UIScale);
 			DrawTextCentered(FString::FromInt(Seconds), TraceHUDStyle::Ink,
 				CX, BannerY + (26.f * UIScale), FontLarge, 3.4f * UIScale * Pop);
 		}
 		else
 		{
-			DrawTextCentered(TEXT("WARM UP"), TraceHUDStyle::InkDim, CX, BannerY, FontSmall, 1.2f * UIScale);
-			DrawTextCentered(TEXT("WAITING FOR PLAYERS"), TraceHUDStyle::Ink,
+			DrawTextCentered(TRACE_TEXT("HUD.BANNER_WARM_UP", "WARM UP"), TraceHUDStyle::InkDim,
+				CX, BannerY, FontSmall, 1.2f * UIScale);
+			DrawTextCentered(TRACE_TEXT("HUD.BANNER_WAITING_FOR_PLAYERS", "WAITING FOR PLAYERS"), TraceHUDStyle::Ink,
 				CX, BannerY + (26.f * UIScale), FontMedium, 1.4f * UIScale);
 		}
 		return;
@@ -5482,11 +5548,14 @@ void ATraceHUD::DrawPhaseBanner()
 		// offset drew "SIDES SWITCHED" straight through the middle of "HALF TIME" — confirmed in a
 		// captured frame. Measuring makes it correct at every UIScale instead of at one of them.
 		const float HalfTimeScale = 3.0f * UIScale;
-		DrawTextCentered(TEXT("HALF TIME"), TraceHUDStyle::Ink, CX, BannerY, FontLarge, HalfTimeScale);
+		DrawTextCentered(TRACE_TEXT("HUD.BANNER_HALF_TIME", "HALF TIME"), TraceHUDStyle::Ink,
+			CX, BannerY, FontLarge, HalfTimeScale);
 		DrawTextCentered(
-			FString::Printf(TEXT("SIDES SWITCHED  -  RESUMING IN %.0f"), TraceGS->GetMatchTimeRemaining()),
+			TRACE_TEXTF("HUD.BANNER_SIDES_SWITCHED", "SIDES SWITCHED  -  RESUMING IN {0}",
+				{ FString::Printf(TEXT("%.0f"), TraceGS->GetMatchTimeRemaining()) }),
 			TraceHUDStyle::InkDim, CX,
-			BannerY + MeasureHeight(TEXT("HALF TIME"), FontLarge, HalfTimeScale) + (10.f * UIScale),
+			BannerY + MeasureHeight(TRACE_TEXT("HUD.BANNER_HALF_TIME", "HALF TIME"), FontLarge, HalfTimeScale)
+				+ (10.f * UIScale),
 			FontSmall, 1.2f * UIScale);
 		return;
 	}
@@ -5500,7 +5569,7 @@ void ATraceHUD::DrawPhaseBanner()
 		{
 			const float Alpha = 1.f - (WipeAge / TraceHUDStyle::WipeBonusDuration);
 			const FLinearColor Tint = TraceTeamColor(TraceGS->LastWipeBonusTeam);
-			DrawTextCentered(TEXT("TEAM WIPE  +2"), TraceHUDStyle::WithAlpha(Tint, Alpha),
+			DrawTextCentered(TRACE_TEXT("HUD.BANNER_TEAM_WIPE", "TEAM WIPE  +2"), TraceHUDStyle::WithAlpha(Tint, Alpha),
 				CX, BannerY - (34.f * UIScale), FontMedium, 1.7f * UIScale);
 		}
 	}
@@ -5510,7 +5579,7 @@ void ATraceHUD::DrawPhaseBanner()
 	if (Age >= 0.f && Age < TraceHUDStyle::GoBannerDuration)
 	{
 		const float Alpha = 1.f - (Age / TraceHUDStyle::GoBannerDuration);
-		DrawTextCentered(TEXT("GO"), TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, Alpha),
+		DrawTextCentered(TRACE_TEXT("HUD.BANNER_GO", "GO"), TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, Alpha),
 			CX, BannerY + (40.f * UIScale), FontLarge, 3.0f * UIScale);
 	}
 }
@@ -5545,11 +5614,12 @@ void ATraceHUD::DrawScoreFlash()
 	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.75f * Alpha), 0.f, BandY, ViewW, Rule);
 	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.75f * Alpha), 0.f, BandY + BandH, ViewW, Rule);
 
-	const FString Headline = FString::Printf(TEXT("%s SCORES"), *TraceTeamName(ScoreFlashTeam).ToString().ToUpper());
+	const FString Headline = TRACE_TEXTF("HUD.SCOREFLASH_TEAM_SCORES", "{0} SCORES",
+		{ TraceTeamName(ScoreFlashTeam).ToString().ToUpper() });
 	DrawTextCentered(Headline, TraceHUDStyle::WithAlpha(TeamColor, Alpha), CX, Y, FontLarge, 2.3f * UIScale);
 
 	// The reset is the thing that felt like a crash, so it is named out loud.
-	DrawTextCentered(TEXT("CORE RESET  -  BACK TO SPAWNS"),
+	DrawTextCentered(TRACE_TEXT("HUD.SCOREFLASH_CORE_RESET", "CORE RESET  -  BACK TO SPAWNS"),
 		TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, Alpha * 0.9f),
 		CX, Y + (62.f * UIScale), FontSmall, 1.15f * UIScale);
 }
@@ -5593,7 +5663,8 @@ void ATraceHUD::DrawParryKillBanner()
 	const float Alpha = FMath::Clamp(1.f - (SecondsAgo / FadeSeconds), 0.f, 1.f);
 	const FLinearColor Tint = TraceHUDStyle::WithAlpha(TraceParry::GetTintColor(), Alpha);
 
-	const FString Line = FString::Printf(TEXT("PARRIED - %s DASHED YOUR TRACE"), *VictimName.ToUpper());
+	const FString Line = TRACE_TEXTF("HUD.BANNER_PARRIED", "PARRIED - {0} DASHED YOUR TRACE",
+		{ VictimName.ToUpper() });
 
 	// Below the Core banner, above the crosshair: the carrier is looking at one or the other, and
 	// this must never sit on top of either.
@@ -5626,15 +5697,21 @@ void ATraceHUD::DrawDeathPanel()
 
 	DrawPanel(PanelX, PanelY, PanelW, PanelH, TraceHUDStyle::PanelFill, TraceHUDStyle::PanelBorder);
 
-	DrawTextCentered(TEXT("ELIMINATED"), TraceHUDStyle::Danger, CX, PanelY + (16.f * UIScale), FontLarge, 1.2f * UIScale);
+	DrawTextCentered(TRACE_TEXT("HUD.DEATH_ELIMINATED", "ELIMINATED"), TraceHUDStyle::Danger,
+		CX, PanelY + (16.f * UIScale), FontLarge, 1.2f * UIScale);
 
 	// Killer line, if the server told us who did it. "Trail" deaths in particular are worth
 	// naming — they are the rule nobody believes until they see it attributed.
 	if (TracePC != nullptr && !TracePC->GetLastKillerName().IsEmpty())
 	{
 		const FName Cause = TracePC->GetLastDeathCause();
-		const FString CauseText = Cause.IsNone() ? FString() : FString::Printf(TEXT("  (%s)"), *Cause.ToString());
-		const FString KillerLine = FString::Printf(TEXT("by %s%s"), *TracePC->GetLastKillerName(), *CauseText);
+		// The two spaces in front of the bracket stay in the code, not in the document: it trims
+		// what it reads, so a leading gap could not survive a round trip through it.
+		const FString CauseText = Cause.IsNone()
+			? FString()
+			: (FString(TEXT("  ")) + TRACE_TEXTF("HUD.DEATH_CAUSE_SUFFIX", "({0})", { Cause.ToString() }));
+		const FString KillerLine = TRACE_TEXTF("HUD.DEATH_KILLER_LINE", "by {0}{1}",
+			{ TracePC->GetLastKillerName(), CauseText });
 		DrawTextCentered(KillerLine, TraceHUDStyle::InkDim, CX, PanelY + (62.f * UIScale), FontMedium, 0.95f * UIScale);
 
 		// SPEC v6 §3 asks for feedback that leaves the dasher in no doubt. "by <carrier> (Parried)"
@@ -5644,7 +5721,8 @@ void ATraceHUD::DrawDeathPanel()
 		// it says RED because red is the tell they had 0.2 s to notice and did not.
 		if (Cause == TraceParry::GetParryKillCause())
 		{
-			DrawTextCentered(TEXT("YOU DASHED A PARRIED (RED) TRACE"), TraceParry::GetTintColor(),
+			DrawTextCentered(TRACE_TEXT("HUD.DEATH_PARRY_EXPLAINER", "YOU DASHED A PARRIED (RED) TRACE"),
+				TraceParry::GetTintColor(),
 				CX, PanelY + (82.f * UIScale), FontSmall, 0.85f * UIScale);
 		}
 	}
@@ -5667,8 +5745,8 @@ void ATraceHUD::DrawDeathPanel()
 		? TracePS->GetRespawnTimeRemaining()
 		: (UTraceSettings::Get().RespawnDelay - (Now - LocalDeathTime));
 	const FString RespawnText = (Remaining > 0.f)
-		? FString::Printf(TEXT("RESPAWN IN %d"), FMath::CeilToInt(Remaining))
-		: FString(TEXT("RESPAWNING..."));
+		? TRACE_TEXTF("HUD.RESPAWN_IN", "RESPAWN IN {0}", { FMath::CeilToInt(Remaining) })
+		: TRACE_TEXT("HUD.RESPAWNING", "RESPAWNING...");
 
 	DrawTextCentered(RespawnText, TraceHUDStyle::Ink, CX, PanelY + (100.f * UIScale), FontMedium, 1.05f * UIScale);
 }
@@ -5936,12 +6014,13 @@ void ATraceHUD::DrawMatchResult()
 	FLinearColor ResultColor;
 	if (Winner == ETraceTeam::None)
 	{
-		ResultText = TEXT("DRAW");
+		ResultText = TRACE_TEXT("HUD.RESULT_DRAW", "DRAW");
 		ResultColor = TraceHUDStyle::Ink;
 	}
 	else
 	{
-		ResultText = FString::Printf(TEXT("%s WINS"), *TraceTeamName(Winner).ToString().ToUpper());
+		ResultText = TRACE_TEXTF("HUD.RESULT_TEAM_WINS", "{0} WINS",
+			{ TraceTeamName(Winner).ToString().ToUpper() });
 		ResultColor = TraceTeamColor(Winner);
 	}
 
@@ -5959,10 +6038,11 @@ void ATraceHUD::DrawMatchResult()
 	// to name the scoring mode as well, which was the fact an A/B playtest's notes needed and the one
 	// a screenshot otherwise lost; there is one ruleset now and naming it says nothing.
 	const FString SubText = bMercy
-		? FString::Printf(TEXT("%s LED BY %d - THE MATCH ENDED EARLY"),
-			*TraceTeamName(Winner).ToString().ToUpper(), FMath::Abs(Blue - Orange))
-		: FString::Printf(TEXT("%s HALVES ON THE CLOCK"),
-			(TraceGS->NumHalves == 2) ? TEXT("TWO") : TEXT("ALL"));
+		? TRACE_TEXTF("HUD.RESULT_MERCY_SUB", "{0} LED BY {1} - THE MATCH ENDED EARLY",
+			{ TraceTeamName(Winner).ToString().ToUpper(), FMath::Abs(Blue - Orange) })
+		: TRACE_TEXTF("HUD.RESULT_CLOCK_SUB", "{0} HALVES ON THE CLOCK",
+			{ (TraceGS->NumHalves == 2) ? TRACE_TEXT("HUD.RESULT_HALVES_TWO", "TWO")
+			                            : TRACE_TEXT("HUD.RESULT_HALVES_ALL", "ALL") });
 
 	DrawTextCentered(SubText, TraceHUDStyle::InkDim, CX, ViewH * 0.205f, FontSmall, 1.05f * UIScale);
 
@@ -5971,7 +6051,8 @@ void ATraceHUD::DrawMatchResult()
 	const float ScoreY = ViewH * 0.255f;
 	const float ScoreInset = 60.f * UIScale;
 	DrawTextRight(FString::FromInt(Blue), TraceTeamColor(ETraceTeam::Blue), CX - ScoreInset, ScoreY, FontLarge, 2.4f * UIScale);
-	DrawTextCentered(TEXT("-"), TraceHUDStyle::InkDim, CX, ScoreY, FontLarge, 2.4f * UIScale);
+	DrawTextCentered(TRACE_TEXT("HUD.RESULT_SCORE_SEPARATOR", "-"), TraceHUDStyle::InkDim,
+		CX, ScoreY, FontLarge, 2.4f * UIScale);
 	DrawTextLeft(FString::FromInt(Orange), TraceTeamColor(ETraceTeam::Orange), CX + ScoreInset, ScoreY, FontLarge, 2.4f * UIScale);
 
 	// ---- Roster card --------------------------------------------------------------------------
@@ -6014,8 +6095,9 @@ void ATraceHUD::DrawMatchResult()
 	const float Remaining = FMath::Max(0.f, TraceMatchFlow::PostMatchDuration - Elapsed);
 
 	const FString ReturnText = (Remaining > 0.5f)
-		? FString::Printf(TEXT("RETURNING TO THE TITLE SCREEN IN %d"), FMath::CeilToInt(Remaining))
-		: FString(TEXT("RETURNING TO THE TITLE SCREEN..."));
+		? TRACE_TEXTF("HUD.RESULT_RETURNING_IN", "RETURNING TO THE TITLE SCREEN IN {0}",
+			{ FMath::CeilToInt(Remaining) })
+		: TRACE_TEXT("HUD.RESULT_RETURNING", "RETURNING TO THE TITLE SCREEN...");
 
 	// Framed, so it reads as the one live thing left on a frozen screen rather than a stray caption.
 	const float StripH = 46.f * UIScale;
@@ -6058,7 +6140,8 @@ void ATraceHUD::DrawScoreboard()
 	const int32 Orange = (TraceGS != nullptr) ? TraceGS->GetScore(ETraceTeam::Orange) : 0;
 	const float CX = PanelX + PanelW * 0.5f;
 
-	DrawTextCentered(FString::Printf(TEXT("%d  -  %d"), Blue, Orange), TraceHUDStyle::Ink,
+	DrawTextCentered(TRACE_TEXTF("HUD.SCOREBOARD_SCORELINE", "{0}  -  {1}", { Blue, Orange }),
+		TraceHUDStyle::Ink,
 		CX, PanelY + (14.f * UIScale), FontLarge, 1.2f * UIScale);
 
 	const float Gutter = 22.f * UIScale;
@@ -6068,7 +6151,7 @@ void ATraceHUD::DrawScoreboard()
 	DrawScoreboardTeam(ETraceTeam::Blue,   PanelX + Gutter, ColumnY, ColumnW);
 	DrawScoreboardTeam(ETraceTeam::Orange, PanelX + Gutter * 2.f + ColumnW, ColumnY, ColumnW);
 
-	DrawTextCentered(TEXT("HOLD TAB"), TraceHUDStyle::InkDim, CX,
+	DrawTextCentered(TRACE_TEXT("HUD.SCOREBOARD_HOLD_TAB", "HOLD TAB"), TraceHUDStyle::InkDim, CX,
 		PanelY + PanelH - (24.f * UIScale), FontSmall, UIScale);
 }
 
@@ -6133,14 +6216,16 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 	const FString TeamLabel = TraceTeamName(Team).ToString().ToUpper();
 	DrawTextLeft(TeamLabel, TeamColor, NameX, VCenterTextY(TeamLabel, FontMedium, UIScale, Y, HeaderH), FontMedium, UIScale);
 
-	const float HeaderTextY = VCenterTextY(TEXT("K"), FontSmall, UIScale, Y, HeaderH);
+	const float HeaderTextY = VCenterTextY(TRACE_TEXT("HUD.SCOREBOARD_COL_KILLS", "K"),
+		FontSmall, UIScale, Y, HeaderH);
 	if (bShowCharacters)
 	{
-		DrawTextRight(TEXT("CHAR"), TraceHUDStyle::InkDim, CharX, HeaderTextY, FontSmall, UIScale);
+		DrawTextRight(TRACE_TEXT("HUD.SCOREBOARD_COL_CHAR", "CHAR"), TraceHUDStyle::InkDim,
+			CharX, HeaderTextY, FontSmall, UIScale);
 	}
-	DrawTextRight(TEXT("K"),    TraceHUDStyle::InkDim, KillsX,  HeaderTextY, FontSmall, UIScale);
-	DrawTextRight(TEXT("D"),    TraceHUDStyle::InkDim, DeathsX, HeaderTextY, FontSmall, UIScale);
-	DrawTextRight(TEXT("PING"), TraceHUDStyle::InkDim, PingX,   HeaderTextY, FontSmall, UIScale);
+	DrawTextRight(TRACE_TEXT("HUD.SCOREBOARD_COL_KILLS",  "K"),    TraceHUDStyle::InkDim, KillsX,  HeaderTextY, FontSmall, UIScale);
+	DrawTextRight(TRACE_TEXT("HUD.SCOREBOARD_COL_DEATHS", "D"),    TraceHUDStyle::InkDim, DeathsX, HeaderTextY, FontSmall, UIScale);
+	DrawTextRight(TRACE_TEXT("HUD.SCOREBOARD_COL_PING",   "PING"), TraceHUDStyle::InkDim, PingX,   HeaderTextY, FontSmall, UIScale);
 
 	// Best first. TArray's pointer overload of Sort wraps the predicate in TDereferenceWrapper,
 	// which is why the lambda takes references rather than pointers.
@@ -6170,7 +6255,10 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 		if (Member->bIsCarrier)
 		{
 			// ASCII only: the engine's built-in fonts carry no glyph for anything fancier.
-			Name += TEXT("  [CORE]");
+			// The gap stays in the code: the document trims what it reads, so two leading spaces
+			// could not survive a round trip through it.
+			Name += TEXT("  ");
+			Name += TRACE_TEXT("HUD.SCOREBOARD_CARRIER_TAG", "[CORE]");
 		}
 
 		// ---- THE NAME IS CLIPPED TO ITS COLUMN ----------------------------------------------
@@ -6566,7 +6654,10 @@ void ATraceHUD::DrawMeter(float X, float Y, float W, float H, float Fraction, co
 FString ATraceHUD::FormatClock(float Seconds)
 {
 	const int32 Total = FMath::Max(0, FMath::CeilToInt(Seconds));
-	return FString::Printf(TEXT("%02d:%02d"), Total / 60, Total % 60);
+	// The zero padding stays in the code, where it is a compile-time literal; the document owns
+	// only the separator between the two numbers.
+	return TRACE_TEXTF("HUD.CLOCK_FORMAT", "{0}:{1}",
+		{ FString::Printf(TEXT("%02d"), Total / 60), FString::Printf(TEXT("%02d"), Total % 60) });
 }
 
 // ===================================================================================================

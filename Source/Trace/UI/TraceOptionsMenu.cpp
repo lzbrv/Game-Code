@@ -26,6 +26,7 @@
 #include "Trace.h"                       // LogTraceGame
 #include "UI/TraceMatchOptions.h"        // TraceCharacters - the spec v14 §3 toggle's storage
 #include "UI/Text/TraceCanvasText.h" // spec v22 §A1 - this page types in the artist's face
+#include "UI/Text/TraceGameText.h"   // TRACE_TEXT / TRACE_TEXTF - the owner's editable wording
 #include "Audio/TraceAudio.h"           // spec v26 §9 - ButtonPress on the submenu rows too
 #include "Audio/TraceMusicPlayer.h"     // UI plan WP3 - RefreshVolume, so a MUSIC drag is heard live
 #include "GameFramework/PlayerState.h"  // UI plan WP2.4 - the name the submit path is replacing
@@ -1785,17 +1786,17 @@ void FTraceOptionsMenu::RebuildRows()
 	if (Page == EPage::Root)
 	{
 		// Only offered when the host supplied somewhere to go. The title screen has no RESUME.
-		if (OnResume)         { AddAction(TEXT("RESUME"), EAction::Resume); }
-		AddAction(TEXT("SETTINGS"), EAction::OpenSettings);
+		if (OnResume)         { AddAction(*TRACE_TEXT("OPTIONS.PAUSE.RESUME", "RESUME"), EAction::Resume); }
+		AddAction(*TRACE_TEXT("OPTIONS.PAUSE.SETTINGS", "SETTINGS"), EAction::OpenSettings);
 
 		// Its own row on the pause root rather than only inside SETTINGS. Spec v11 §0: the player
 		// this feature exists for is one whose frame rate has collapsed, and making them walk past
 		// mouse sensitivity and eleven key bindings to reach the resolution scale is exactly the kind
 		// of burial that left the collaborator with no way to improve anything.
-		AddAction(TEXT("VIDEO"), EAction::OpenVideo);
+		AddAction(*TRACE_TEXT("OPTIONS.PAUSE.VIDEO", "VIDEO"), EAction::OpenVideo);
 
-		if (OnReturnToTitle)  { AddAction(TEXT("RETURN TO TITLE"), EAction::ReturnToTitle); }
-		if (OnQuit)           { AddAction(TEXT("QUIT"), EAction::Quit); }
+		if (OnReturnToTitle)  { AddAction(*TRACE_TEXT("OPTIONS.PAUSE.RETURN_TO_TITLE", "RETURN TO TITLE"), EAction::ReturnToTitle); }
+		if (OnQuit)           { AddAction(*TRACE_TEXT("OPTIONS.PAUSE.QUIT", "QUIT"), EAction::Quit); }
 	}
 	else if (Page == EPage::Video)
 	{
@@ -1805,35 +1806,36 @@ void FTraceOptionsMenu::RebuildRows()
 		// GPU-bound PER PIXEL — instancing the arena removed 893 draw calls and bought 1.4% — so the
 		// number of pixels is the dominant term and the two controls that change it come first,
 		// above the mode, the resolution and all nine quality groups.
-		AddHeader(TEXT("PERFORMANCE"));
-		AddValue(ERowKind::Slider, TEXT("RESOLUTION SCALE"), ESetting::ResolutionScale);
-		AddNote(TEXT("THE BIGGEST WIN IF THE GAME RUNS SLOW. THIS FRAME IS LIMITED BY PIXELS."));
-		AddAction(TEXT("AUTO-DETECT QUALITY"), EAction::AutoDetectQuality);
-		AddValue(ERowKind::Choice, TEXT("OVERALL QUALITY"), ESetting::OverallQuality);
+		AddHeader(*TRACE_TEXT("OPTIONS.VIDEO.HDR_PERFORMANCE", "PERFORMANCE"));
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.VIDEO.ROW_RESOLUTION_SCALE", "RESOLUTION SCALE"), ESetting::ResolutionScale);
+		AddNote(*TRACE_TEXT("OPTIONS.VIDEO.NOTE_RESOLUTION_SCALE",
+			"THE BIGGEST WIN IF THE GAME RUNS SLOW. THIS FRAME IS LIMITED BY PIXELS."));
+		AddAction(*TRACE_TEXT("OPTIONS.VIDEO.ROW_AUTO_DETECT_QUALITY", "AUTO-DETECT QUALITY"), EAction::AutoDetectQuality);
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_OVERALL_QUALITY", "OVERALL QUALITY"), ESetting::OverallQuality);
 
 		// ---- Display ----------------------------------------------------------------------------
-		AddHeader(TEXT("DISPLAY"));
-		AddValue(ERowKind::Choice, TEXT("WINDOW MODE"), ESetting::WindowMode);
-		AddValue(ERowKind::Choice, TEXT("RESOLUTION"), ESetting::Resolution);
-		AddValue(ERowKind::Toggle, TEXT("VSYNC"), ESetting::VSync);
-		AddValue(ERowKind::Choice, TEXT("FRAME RATE LIMIT"), ESetting::FrameRateLimit);
-		AddValue(ERowKind::Slider, TEXT("FIELD OF VIEW"), ESetting::FieldOfView);
+		AddHeader(*TRACE_TEXT("OPTIONS.VIDEO.HDR_DISPLAY", "DISPLAY"));
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_WINDOW_MODE", "WINDOW MODE"), ESetting::WindowMode);
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_RESOLUTION", "RESOLUTION"), ESetting::Resolution);
+		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.VIDEO.ROW_VSYNC", "VSYNC"), ESetting::VSync);
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_FRAME_RATE_LIMIT", "FRAME RATE LIMIT"), ESetting::FrameRateLimit);
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.VIDEO.ROW_FIELD_OF_VIEW", "FIELD OF VIEW"), ESetting::FieldOfView);
 
 		// ---- The nine groups --------------------------------------------------------------------
-		AddHeader(TEXT("QUALITY"));
-		AddValue(ERowKind::Choice, TEXT("VIEW DISTANCE"), ESetting::QualityViewDistance);
-		AddValue(ERowKind::Choice, TEXT("ANTI-ALIASING"), ESetting::QualityAntiAliasing);
-		AddValue(ERowKind::Choice, TEXT("POST PROCESSING"), ESetting::QualityPostProcess);
-		AddValue(ERowKind::Choice, TEXT("SHADOWS"), ESetting::QualityShadows);
-		AddValue(ERowKind::Choice, TEXT("GLOBAL ILLUMINATION"), ESetting::QualityGlobalIllumination);
-		AddValue(ERowKind::Choice, TEXT("REFLECTIONS"), ESetting::QualityReflections);
-		AddValue(ERowKind::Choice, TEXT("TEXTURES"), ESetting::QualityTextures);
-		AddValue(ERowKind::Choice, TEXT("EFFECTS"), ESetting::QualityEffects);
-		AddValue(ERowKind::Choice, TEXT("SHADING"), ESetting::QualityShading);
+		AddHeader(*TRACE_TEXT("OPTIONS.VIDEO.HDR_QUALITY", "QUALITY"));
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_VIEW_DISTANCE", "VIEW DISTANCE"), ESetting::QualityViewDistance);
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_ANTI_ALIASING", "ANTI-ALIASING"), ESetting::QualityAntiAliasing);
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_POST_PROCESSING", "POST PROCESSING"), ESetting::QualityPostProcess);
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_SHADOWS", "SHADOWS"), ESetting::QualityShadows);
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_GLOBAL_ILLUMINATION", "GLOBAL ILLUMINATION"), ESetting::QualityGlobalIllumination);
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_REFLECTIONS", "REFLECTIONS"), ESetting::QualityReflections);
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_TEXTURES", "TEXTURES"), ESetting::QualityTextures);
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_EFFECTS", "EFFECTS"), ESetting::QualityEffects);
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_SHADING", "SHADING"), ESetting::QualityShading);
 
 		AddHeader(TEXT(""));
-		AddAction(TEXT("RESET TO DEFAULTS"), EAction::ResetVideoDefaults);
-		AddAction(TEXT("BACK"), EAction::Back);
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetVideoDefaults);
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
 	else if (Page == EPage::Crosshair)
 	{
@@ -1848,25 +1850,26 @@ void FTraceOptionsMenu::RebuildRows()
 		//
 		// The two toggles go LAST and together, because they are the two rows that answer "is there
 		// LESS of it" rather than "how much".
-		AddHeader(TEXT("SHAPE"));
-		AddValue(ERowKind::Slider, TEXT("SIZE"), ESetting::CrosshairSize);
-		AddValue(ERowKind::Slider, TEXT("THICKNESS"), ESetting::CrosshairThickness);
-		AddValue(ERowKind::Slider, TEXT("GAP"), ESetting::CrosshairGap);
+		AddHeader(*TRACE_TEXT("OPTIONS.CROSSHAIR.HDR_SHAPE", "SHAPE"));
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CROSSHAIR.ROW_SIZE", "SIZE"), ESetting::CrosshairSize);
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CROSSHAIR.ROW_THICKNESS", "THICKNESS"), ESetting::CrosshairThickness);
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CROSSHAIR.ROW_GAP", "GAP"), ESetting::CrosshairGap);
 
-		AddHeader(TEXT("APPEARANCE"));
-		AddValue(ERowKind::Choice, TEXT("COLOUR"), ESetting::CrosshairColor);
-		AddValue(ERowKind::Slider, TEXT("OPACITY"), ESetting::CrosshairOpacity);
-		AddValue(ERowKind::Toggle, TEXT("CENTRE DOT"), ESetting::CrosshairDot);
-		AddValue(ERowKind::Toggle, TEXT("OUTLINE"), ESetting::CrosshairOutline);
+		AddHeader(*TRACE_TEXT("OPTIONS.CROSSHAIR.HDR_APPEARANCE", "APPEARANCE"));
+		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.CROSSHAIR.ROW_COLOUR", "COLOUR"), ESetting::CrosshairColor);
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CROSSHAIR.ROW_OPACITY", "OPACITY"), ESetting::CrosshairOpacity);
+		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.CROSSHAIR.ROW_CENTRE_DOT", "CENTRE DOT"), ESetting::CrosshairDot);
+		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.CROSSHAIR.ROW_OUTLINE", "OUTLINE"), ESetting::CrosshairOutline);
 
 		// Not decoration. The preview beside this list draws at ACTUAL SIZE, which at 1080p is a cross
 		// about twenty pixels across sitting in a box ten times that — and a player who does not know
 		// it is 1:1 reads that as the preview being broken. The note is how they are told.
-		AddNote(TEXT("PREVIEW IS ACTUAL SIZE, OVER THE TWO SURFACES THE ARENA IS MADE OF."));
+		AddNote(*TRACE_TEXT("OPTIONS.CROSSHAIR.NOTE_PREVIEW_ACTUAL_SIZE",
+			"PREVIEW IS ACTUAL SIZE, OVER THE TWO SURFACES THE ARENA IS MADE OF."));
 
 		AddHeader(TEXT(""));
-		AddAction(TEXT("RESET TO DEFAULTS"), EAction::ResetCrosshairDefaults);
-		AddAction(TEXT("BACK"), EAction::Back);
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetCrosshairDefaults);
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
 	else if (Page == EPage::Audio)
 	{
@@ -1876,10 +1879,10 @@ void FTraceOptionsMenu::RebuildRows()
 		// multiplies both of the two under it, so it reads as the parent it is. EFFECTS before MUSIC
 		// because effects are the game — a player who cannot hear the shot that killed them has a
 		// problem, a player who finds the bed loud has a preference.
-		AddHeader(TEXT("VOLUME"));
-		AddValue(ERowKind::Slider, TEXT("MASTER VOLUME"), ESetting::MasterVolume);
-		AddValue(ERowKind::Slider, TEXT("SOUND EFFECTS"), ESetting::SfxVolume);
-		AddValue(ERowKind::Slider, TEXT("MUSIC"), ESetting::MusicVolume);
+		AddHeader(*TRACE_TEXT("OPTIONS.AUDIO.HDR_VOLUME", "VOLUME"));
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.AUDIO.ROW_MASTER_VOLUME", "MASTER VOLUME"), ESetting::MasterVolume);
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.AUDIO.ROW_SOUND_EFFECTS", "SOUND EFFECTS"), ESetting::SfxVolume);
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.AUDIO.ROW_MUSIC", "MUSIC"), ESetting::MusicVolume);
 
 		// NO "NO MUSIC YET" NOTE. The UI plan's draft carried one — deliberate honesty about a silent
 		// slider — and the integration pass struck it, because music DOES ship this release: the
@@ -1888,8 +1891,8 @@ void FTraceOptionsMenu::RebuildRows()
 		// mistake the original note was written to avoid, one release later.
 
 		AddHeader(TEXT(""));
-		AddAction(TEXT("RESET TO DEFAULTS"), EAction::ResetAudioDefaults);
-		AddAction(TEXT("BACK"), EAction::Back);
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetAudioDefaults);
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
 	else if (Page == EPage::Controller)
 	{
@@ -1903,21 +1906,23 @@ void FTraceOptionsMenu::RebuildRows()
 		// MOVE AND LOOK HAVE NO BIND ROWS AT ALL, and the note says so rather than leaving a reader
 		// to wonder where they went. They are the two sticks, they are not per-action buttons, and
 		// there is nothing to rebind about them but the numbers immediately below.
-		AddHeader(TEXT("CONTROLLER"));
-		AddValue(ERowKind::Toggle, TEXT("CONTROLLER INPUT"), ESetting::PadEnabled);
-		AddNote(TEXT("LEFT STICK MOVES, RIGHT STICK LOOKS. THE KEYBOARD AND MOUSE KEEP WORKING."));
+		AddHeader(*TRACE_TEXT("OPTIONS.CONTROLLER.HDR_CONTROLLER", "CONTROLLER"));
+		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_CONTROLLER_INPUT", "CONTROLLER INPUT"), ESetting::PadEnabled);
+		AddNote(*TRACE_TEXT("OPTIONS.CONTROLLER.NOTE_STICKS",
+			"LEFT STICK MOVES, RIGHT STICK LOOKS. THE KEYBOARD AND MOUSE KEEP WORKING."));
 
-		AddHeader(TEXT("LOOK STICK"));
-		AddValue(ERowKind::Slider, TEXT("LOOK SPEED"),          ESetting::PadLookRate);
-		AddValue(ERowKind::Slider, TEXT("VERTICAL SPEED"),      ESetting::PadLookYScale);
-		AddValue(ERowKind::Toggle, TEXT("INVERT LOOK Y"),       ESetting::PadInvertY);
-		AddValue(ERowKind::Slider, TEXT("LOOK DEAD ZONE"),      ESetting::PadLookDeadzone);
-		AddNote(TEXT("RAISE THIS IF THE VIEW DRIFTS WHEN YOU ARE NOT TOUCHING THE STICK."));
+		AddHeader(*TRACE_TEXT("OPTIONS.CONTROLLER.HDR_LOOK_STICK", "LOOK STICK"));
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_LOOK_SPEED", "LOOK SPEED"),          ESetting::PadLookRate);
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_VERTICAL_SPEED", "VERTICAL SPEED"),      ESetting::PadLookYScale);
+		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_INVERT_LOOK_Y", "INVERT LOOK Y"),       ESetting::PadInvertY);
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_LOOK_DEAD_ZONE", "LOOK DEAD ZONE"),      ESetting::PadLookDeadzone);
+		AddNote(*TRACE_TEXT("OPTIONS.CONTROLLER.NOTE_DEAD_ZONE",
+			"RAISE THIS IF THE VIEW DRIFTS WHEN YOU ARE NOT TOUCHING THE STICK."));
 
-		AddHeader(TEXT("MOVE STICK"));
-		AddValue(ERowKind::Slider, TEXT("MOVE DEAD ZONE"),      ESetting::PadMoveDeadzone);
+		AddHeader(*TRACE_TEXT("OPTIONS.CONTROLLER.HDR_MOVE_STICK", "MOVE STICK"));
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_MOVE_DEAD_ZONE", "MOVE DEAD ZONE"),      ESetting::PadMoveDeadzone);
 
-		AddHeader(TEXT("BUTTONS"));
+		AddHeader(*TRACE_TEXT("OPTIONS.CONTROLLER.HDR_BUTTONS", "BUTTONS"));
 
 		// EVERY ACTION EXCEPT THE FOUR KEYBOARD MOVE ROWS. Walking the shared table rather than a
 		// hand-written list, so an action added to ETraceInputAction gets a row on this page for
@@ -1938,8 +1943,8 @@ void FTraceOptionsMenu::RebuildRows()
 		}
 
 		AddHeader(TEXT(""));
-		AddAction(TEXT("RESET TO DEFAULTS"), EAction::ResetControllerDefaults);
-		AddAction(TEXT("BACK"), EAction::Back);
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetControllerDefaults);
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
 	else if (Page == EPage::Settings)
 	{
@@ -1950,30 +1955,31 @@ void FTraceOptionsMenu::RebuildRows()
 		// a SetPlayerName. The first thing a player opening SETTINGS for the first time should be
 		// able to fix is the thing with their name on it, and a row buried under two display doors and
 		// a match toggle is a row nobody finds before their first match.
-		AddHeader(TEXT("PLAYER"));
-		AddValue(ERowKind::TextEntry, TEXT("CALL SIGN"), ESetting::CallSign);
+		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_PLAYER", "PLAYER"));
+		AddValue(ERowKind::TextEntry, *TRACE_TEXT("OPTIONS.SETTINGS.ROW_CALL_SIGN", "CALL SIGN"), ESetting::CallSign);
 
 		// The note is not decoration: this row is the only control on any of these pages that takes
 		// free text, so it is the only one where a player can be refused a character and not know why.
 		// It names the alphabet AND the cap, which are the two refusals the field can make.
-		AddNote(TEXT("SHOWN ON THE SCOREBOARD AND IN THE KILL FEED. A-Z, 0-9, SPACE, - _ . MAX 16."));
+		AddNote(*TRACE_TEXT("OPTIONS.SETTINGS.NOTE_CALL_SIGN",
+			"SHOWN ON THE SCOREBOARD AND IN THE KILL FEED. A-Z, 0-9, SPACE, - _ . MAX 16."));
 
 		// First row on the page, above the mouse. Same reasoning as the pause root's VIDEO entry —
 		// and this is the ONLY route to the video page from the title screen, where there is no
 		// pause root at all, so it cannot be buried at the bottom next to RESET.
-		AddHeader(TEXT("DISPLAY"));
-		AddAction(TEXT("VIDEO SETTINGS"), EAction::OpenVideo);
+		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_DISPLAY", "DISPLAY"));
+		AddAction(*TRACE_TEXT("OPTIONS.SETTINGS.ROW_VIDEO_SETTINGS", "VIDEO SETTINGS"), EAction::OpenVideo);
 
 		// SPEC v29 §3. Beside VIDEO SETTINGS rather than in a section of its own: both rows are doors
 		// to a page about how the game LOOKS, and this is the only route the title screen has to
 		// either of them — there is no pause root there to hang a shortcut on.
-		AddAction(TEXT("CROSSHAIR"), EAction::OpenCrosshair);
+		AddAction(*TRACE_TEXT("OPTIONS.SETTINGS.ROW_CROSSHAIR", "CROSSHAIR"), EAction::OpenCrosshair);
 
 		// UI PLAN WP3. Its own header rather than a third door under DISPLAY, because it is not one:
 		// DISPLAY is how the game LOOKS and this is how it SOUNDS, and a page about the crosshair and
 		// a page about the master volume have nothing to say to each other.
-		AddHeader(TEXT("SOUND"));
-		AddAction(TEXT("AUDIO"), EAction::OpenAudio);
+		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_SOUND", "SOUND"));
+		AddAction(*TRACE_TEXT("OPTIONS.SETTINGS.ROW_AUDIO", "AUDIO"), EAction::OpenAudio);
 
 		// D31-PAD. Its own header for the same reason SOUND has one — a page about a controller is
 		// neither how the game looks nor how it sounds — and ABOVE the MOUSE and CONTROLS blocks
@@ -1981,8 +1987,8 @@ void FTraceOptionsMenu::RebuildRows()
 		// paired a pad and opened SETTINGS is looking for the word CONTROLLER, and twenty-one keybind
 		// rows between them and it is the burial spec v11 §0 already argued against once. It is also
 		// the only route the title screen has to the page.
-		AddHeader(TEXT("CONTROLLER"));
-		AddAction(TEXT("CONTROLLER SETTINGS"), EAction::OpenController);
+		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_CONTROLLER", "CONTROLLER"));
+		AddAction(*TRACE_TEXT("OPTIONS.SETTINGS.ROW_CONTROLLER_SETTINGS", "CONTROLLER SETTINGS"), EAction::OpenController);
 
 		// ---- Match rules (spec v14 §3) ----------------------------------------------------------
 		//
@@ -1993,31 +1999,33 @@ void FTraceOptionsMenu::RebuildRows()
 		// The note is not optional. This row cannot retro-apply to a match already being served by
 		// somebody else's machine, and a toggle that appears to do nothing is worse than no toggle —
 		// the player needs to be told it is a HOST setting and that it lands on the next match.
-		AddHeader(TEXT("MATCH"));
-		AddValue(ERowKind::Toggle, TEXT("CHARACTERS"), ESetting::CharactersEnabled);
-		AddNote(TEXT("OFF: EVERYONE PLAYS THE DEFAULT MANNEQUIN, NO ABILITIES, NO SELECT SCREEN."));
-		AddNote(TEXT("APPLIES TO MATCHES YOU HOST, FROM THE NEXT MATCH. GOALS MODE ONLY."));
+		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_MATCH", "MATCH"));
+		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.SETTINGS.ROW_CHARACTERS", "CHARACTERS"), ESetting::CharactersEnabled);
+		AddNote(*TRACE_TEXT("OPTIONS.SETTINGS.NOTE_CHARACTERS_OFF",
+			"OFF: EVERYONE PLAYS THE DEFAULT MANNEQUIN, NO ABILITIES, NO SELECT SCREEN."));
+		AddNote(*TRACE_TEXT("OPTIONS.SETTINGS.NOTE_CHARACTERS_HOST",
+			"APPLIES TO MATCHES YOU HOST, FROM THE NEXT MATCH. GOALS MODE ONLY."));
 
-		AddHeader(TEXT("MOUSE"));
+		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_MOUSE", "MOUSE"));
 
 		{
 			FRow Row;
 			Row.Kind = ERowKind::Slider;
-			Row.Label = TEXT("SENSITIVITY");
+			Row.Label = TRACE_TEXT("OPTIONS.SETTINGS.ROW_SENSITIVITY", "SENSITIVITY");
 			Row.Setting = ESetting::Sensitivity;
 			Rows.Add(MoveTemp(Row));
 		}
 		{
 			FRow Row;
 			Row.Kind = ERowKind::Slider;
-			Row.Label = TEXT("VERTICAL SENSITIVITY");
+			Row.Label = TRACE_TEXT("OPTIONS.SETTINGS.ROW_VERTICAL_SENSITIVITY", "VERTICAL SENSITIVITY");
 			Row.Setting = ESetting::SensitivityY;
 			Rows.Add(MoveTemp(Row));
 		}
 		{
 			FRow Row;
 			Row.Kind = ERowKind::Toggle;
-			Row.Label = TEXT("INVERT MOUSE Y");
+			Row.Label = TRACE_TEXT("OPTIONS.SETTINGS.ROW_INVERT_MOUSE_Y", "INVERT MOUSE Y");
 			Row.Setting = ESetting::InvertY;
 			Rows.Add(MoveTemp(Row));
 		}
@@ -2034,8 +2042,8 @@ void FTraceOptionsMenu::RebuildRows()
 		}
 
 		AddHeader(TEXT(""));
-		AddAction(TEXT("RESET TO DEFAULTS"), EAction::ResetDefaults);
-		AddAction(TEXT("BACK"), EAction::Back);
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetDefaults);
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
 
 	// Before picking a selection, not after: a row that is greyed out right now is not somewhere the
@@ -3059,12 +3067,12 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 	switch (Setting)
 	{
 	case ESetting::ResolutionScale:
-		return FString::Printf(TEXT("%d%%"), FMath::RoundToInt(Value));
+		return TRACE_TEXTF("OPTIONS.VALUE.PERCENT", "{0}%", { FMath::RoundToInt(Value) });
 
 	case ESetting::FieldOfView:
 		// No degree sign: AHUD::DrawText goes through the engine's bitmap fonts, whose glyph pages
 		// are ASCII, and a missing glyph draws as a blank box that reads as a rendering fault.
-		return FString::Printf(TEXT("%d DEG"), FMath::RoundToInt(Value));
+		return TRACE_TEXTF("OPTIONS.VALUE.DEGREES", "{0} DEG", { FMath::RoundToInt(Value) });
 
 	case ESetting::OverallQuality:
 		return UTraceGameUserSettings::DescribeOverallQuality(ETraceVideoQuality(FMath::RoundToInt(Value)));
@@ -3075,7 +3083,7 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 		const int32 Index = FMath::RoundToInt(Value);
 		return Modes.IsValidIndex(Index)
 			? UTraceGameUserSettings::DescribeWindowMode(Modes[Index])
-			: FString(TEXT("N/A"));
+			: FString(TRACE_TEXT("OPTIONS.VALUE.NOT_AVAILABLE", "N/A"));
 	}
 
 	case ESetting::Resolution:
@@ -3083,7 +3091,7 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 		const UTraceGameUserSettings* GUS = Video();
 		if (GUS == nullptr)
 		{
-			return TEXT("N/A");
+			return TRACE_TEXT("OPTIONS.VALUE.NOT_AVAILABLE", "N/A");
 		}
 
 		if (!GUS->IsResolutionSelectable())
@@ -3091,7 +3099,7 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 			// Not the stored size greyed out — that would still be a claim, and a false one. In
 			// windowed fullscreen the window takes the desktop's size whatever this is set to, so
 			// the row says what is actually true.
-			return TEXT("DESKTOP");
+			return TRACE_TEXT("OPTIONS.VIDEO.VALUE_RESOLUTION_DESKTOP", "DESKTOP");
 		}
 
 		const TArray<FTraceResolutionOption>& Options = GUS->GetResolutionOptions();
@@ -3102,10 +3110,12 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 		if (GUS->GetResolutionOptionIndex() == INDEX_NONE)
 		{
 			const FIntPoint Current = GUS->GetScreenResolution();
-			return FString::Printf(TEXT("%d x %d  (CUSTOM)"), Current.X, Current.Y);
+			return TRACE_TEXTF("OPTIONS.VIDEO.VALUE_RESOLUTION_CUSTOM", "{0} x {1}  (CUSTOM)",
+				{ Current.X, Current.Y });
 		}
 
-		return Options.IsValidIndex(Index) ? Options[Index].Label : FString(TEXT("N/A"));
+		return Options.IsValidIndex(Index) ? Options[Index].Label
+			: FString(TRACE_TEXT("OPTIONS.VALUE.NOT_AVAILABLE", "N/A"));
 	}
 
 	case ESetting::VSync:
@@ -3122,7 +3132,8 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 	// broken control, not as an off switch.
 	case ESetting::PadEnabled:
 	case ESetting::PadInvertY:
-		return (Value >= 0.5f) ? TEXT("ON") : TEXT("OFF");
+		return (Value >= 0.5f) ? TRACE_TEXT("OPTIONS.VALUE.ON", "ON")
+			: TRACE_TEXT("OPTIONS.VALUE.OFF", "OFF");
 
 	// ---- SPEC v29 §3 --------------------------------------------------------------------------
 	//
@@ -3132,12 +3143,13 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 	// version lives in the header of Settings/TraceUserSettings.h.
 	case ESetting::CrosshairSize:
 	case ESetting::CrosshairGap:
-		return FString::Printf(TEXT("%d PX"), FMath::RoundToInt(Value));
+		return TRACE_TEXTF("OPTIONS.VALUE.PIXELS", "{0} PX", { FMath::RoundToInt(Value) });
 
 	case ESetting::CrosshairThickness:
 		// One decimal, because the shipped default is 2.5 and rounding it to "2" or "3" on the row
 		// would make the RESET row's result look like it had missed.
-		return FString::Printf(TEXT("%.1f PX"), Value);
+		return TRACE_TEXTF("OPTIONS.VALUE.PIXELS_DECIMAL", "{0} PX",
+			{ FString::Printf(TEXT("%.1f"), Value) });
 
 	case ESetting::CrosshairColor:
 		// The palette's own names, from the settings class, for the same reason the video rows take
@@ -3152,7 +3164,7 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 	case ESetting::SfxVolume:
 	case ESetting::MusicVolume:
 		// Already in percent — see GetSettingValue, which is the only place the conversion happens.
-		return FString::Printf(TEXT("%d%%"), FMath::RoundToInt(Value));
+		return TRACE_TEXTF("OPTIONS.VALUE.PERCENT", "{0}%", { FMath::RoundToInt(Value) });
 
 	// ---- D31-PAD ------------------------------------------------------------------------------
 	//
@@ -3161,15 +3173,15 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 	// two dead zones read as a percentage of the stick's travel, which is the only form in which a
 	// player can compare them to what their thumb is doing.
 	case ESetting::PadLookRate:
-		return FString::Printf(TEXT("%d DEG/S"), FMath::RoundToInt(Value));
+		return TRACE_TEXTF("OPTIONS.VALUE.DEGREES_PER_SECOND", "{0} DEG/S", { FMath::RoundToInt(Value) });
 
 	case ESetting::PadLookYScale:
-		return FString::Printf(TEXT("%.2fx"), Value);
+		return TRACE_TEXTF("OPTIONS.VALUE.MULTIPLIER", "{0}x", { FString::Printf(TEXT("%.2f"), Value) });
 
 	case ESetting::PadLookDeadzone:
 	case ESetting::PadMoveDeadzone:
 		// Already in percent — see GetSettingValue, which is the only place the conversion happens.
-		return FString::Printf(TEXT("%d%%"), FMath::RoundToInt(Value));
+		return TRACE_TEXTF("OPTIONS.VALUE.PERCENT", "{0}%", { FMath::RoundToInt(Value) });
 
 	case ESetting::CallSign:
 		// UI PLAN WP2.2 — the row draws the name through the clamped accessor, so an empty stored
@@ -3184,7 +3196,7 @@ FString FTraceOptionsMenu::FormatSettingValue(ESetting Setting, float Value) con
 		const int32 Index = FMath::RoundToInt(Value);
 		return Limits.IsValidIndex(Index)
 			? UTraceGameUserSettings::DescribeFrameRateLimit(Limits[Index])
-			: FString(TEXT("N/A"));
+			: FString(TRACE_TEXT("OPTIONS.VALUE.NOT_AVAILABLE", "N/A"));
 	}
 
 	default:
@@ -4041,8 +4053,11 @@ void FTraceOptionsMenu::DrawPerfReadout(AHUD* HUD, float RightX, float Y)
 	const FLinearColor Color = (PerfFps < 45.f) ? TraceOptionsStyle::Amber : TraceOptionsStyle::Cyan;
 
 	const FString Line = (PerfGpuMs > 0.01f)
-		? FString::Printf(TEXT("%.0f FPS    %.2f MS    GPU %.2f MS"), PerfFps, PerfFrameMs, PerfGpuMs)
-		: FString::Printf(TEXT("%.0f FPS    %.2f MS"), PerfFps, PerfFrameMs);
+		? TRACE_TEXTF("OPTIONS.VIDEO.PERF_READOUT_GPU", "{0} FPS    {1} MS    GPU {2} MS",
+			{ FString::Printf(TEXT("%.0f"), PerfFps), FString::Printf(TEXT("%.2f"), PerfFrameMs),
+			  FString::Printf(TEXT("%.2f"), PerfGpuMs) })
+		: TRACE_TEXTF("OPTIONS.VIDEO.PERF_READOUT", "{0} FPS    {1} MS",
+			{ FString::Printf(TEXT("%.0f"), PerfFps), FString::Printf(TEXT("%.2f"), PerfFrameMs) });
 
 	// BODY, not a header (spec v26 §2): this is a live READOUT of the page's own effect — the same
 	// class of thing as a row's value, and it is set in the same face the in-match HUD reports numbers
@@ -4174,12 +4189,12 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	}
 
 	// ---- Title ---------------------------------------------------------------------------------
-	FString Title = TEXT("SETTINGS");
-	if (Page == EPage::Root)            { Title = TEXT("PAUSED"); }
-	else if (Page == EPage::Video)      { Title = TEXT("VIDEO"); }
-	else if (Page == EPage::Crosshair)  { Title = TEXT("CROSSHAIR"); }
-	else if (Page == EPage::Audio)      { Title = TEXT("AUDIO"); }
-	else if (Page == EPage::Controller) { Title = TEXT("CONTROLLER"); }
+	FString Title = TRACE_TEXT("OPTIONS.TITLE.SETTINGS", "SETTINGS");
+	if (Page == EPage::Root)            { Title = TRACE_TEXT("OPTIONS.TITLE.PAUSED", "PAUSED"); }
+	else if (Page == EPage::Video)      { Title = TRACE_TEXT("OPTIONS.TITLE.VIDEO", "VIDEO"); }
+	else if (Page == EPage::Crosshair)  { Title = TRACE_TEXT("OPTIONS.TITLE.CROSSHAIR", "CROSSHAIR"); }
+	else if (Page == EPage::Audio)      { Title = TRACE_TEXT("OPTIONS.TITLE.AUDIO", "AUDIO"); }
+	else if (Page == EPage::Controller) { Title = TRACE_TEXT("OPTIONS.TITLE.CONTROLLER", "CONTROLLER"); }
 
 	// SOFACHROME, and the spec names this string: "the word SETTINGS at the top of the settings page
 	// stays Sofachrome while the rows beneath it become Erbaum" (v26 §2). PAUSED and VIDEO are the
@@ -4219,11 +4234,12 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 		// D31-PAD — a different sentence, because a different thing is being asked for and a
 		// different key cancels. A player at this prompt may have no keyboard in reach at all, so the
 		// legend has to name the pad's own cancel.
-		Hint = TEXT("PRESS A CONTROLLER BUTTON          MENU / ESC   CANCEL");
+		Hint = TRACE_TEXT("OPTIONS.HINT.CAPTURE_PAD_BUTTON",
+			"PRESS A CONTROLLER BUTTON          MENU / ESC   CANCEL");
 	}
 	else if (bCapturingKey)
 	{
-		Hint = TEXT("PRESS ANY KEY TO BIND          ESC   CANCEL");
+		Hint = TRACE_TEXT("OPTIONS.HINT.CAPTURE_KEY", "PRESS ANY KEY TO BIND          ESC   CANCEL");
 	}
 	else if (Page == EPage::Root)
 	{
@@ -4244,24 +4260,28 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 		// cancel-the-edit rather than back-a-page, and the arrows move a caret rather than a
 		// selection. The footer says what the keys do RIGHT NOW, exactly as the rebind capture's does
 		// three branches up.
-		Hint = TEXT("TYPE YOUR CALL SIGN          ENTER   SAVE          ESC   CANCEL");
+		Hint = TRACE_TEXT("OPTIONS.HINT.CALL_SIGN_ENTRY",
+			"TYPE YOUR CALL SIGN          ENTER   SAVE          ESC   CANCEL");
 	}
 	else if (Page == EPage::Controller)
 	{
 		// D31-PAD — the pad's own legend, in the pad's own vocabulary. A player who reached this page
 		// with a controller cannot use a legend that names ARROWS, ENTER and BKSP; a player who
 		// reached it with a keyboard still has all three, and PollNavigation accepts both sets.
-		Hint = TEXT("D-PAD  MOVE / ADJUST      A  SELECT      Y  UNBIND      B  BACK");
+		Hint = TRACE_TEXT("OPTIONS.HINT.CONTROLLER_PAGE",
+			"D-PAD  MOVE / ADJUST      A  SELECT      Y  UNBIND      B  BACK");
 	}
 	else if (Page == EPage::Video || Page == EPage::Crosshair || Page == EPage::Audio)
 	{
 		// No BKSP/UNBIND on any of these three — there is nothing to unbind — and the hint says so
 		// rather than offering a key that does nothing.
-		Hint = TEXT("ARROWS  MOVE / ADJUST          ENTER  SELECT          ESC  BACK");
+		Hint = TRACE_TEXT("OPTIONS.HINT.NO_UNBIND_PAGES",
+			"ARROWS  MOVE / ADJUST          ENTER  SELECT          ESC  BACK");
 	}
 	else
 	{
-		Hint = TEXT("ARROWS  MOVE / ADJUST      ENTER  SELECT      BKSP  UNBIND      ESC  BACK");
+		Hint = TRACE_TEXT("OPTIONS.HINT.SETTINGS_PAGE",
+			"ARROWS  MOVE / ADJUST      ENTER  SELECT      BKSP  UNBIND      ESC  BACK");
 	}
 
 	// BODY (spec v26 §2). The footer is a key legend — "BKSP UNBIND" is the same kind of string as the
@@ -4326,17 +4346,17 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 			// page: they are drawn instead of the word CONTROLS, and they name the two COLUMNS that
 			// every Binding row below them is laid out in. The key names under KEY are Erbaum; the
 			// word KEY is not.
-			TraceOptionsMenuType::Draw(HUD, TEXT("KEYBIND"), WordTint, X, TextY, FontSmall, 1.0f * UIScale,
+			TraceOptionsMenuType::Draw(HUD, TRACE_TEXT("OPTIONS.SETTINGS.COL_KEYBIND", "KEYBIND"), WordTint, X, TextY, FontSmall, 1.0f * UIScale,
 				TraceOptionsMenuType::HeaderFace);
-			TraceOptionsMenuType::Draw(HUD, TEXT("KEY"), WordTint, ValueRightHdr, TextY, FontSmall,
+			TraceOptionsMenuType::Draw(HUD, TRACE_TEXT("OPTIONS.SETTINGS.COL_KEY", "KEY"), WordTint, ValueRightHdr, TextY, FontSmall,
 				1.0f * UIScale, TraceOptionsMenuType::HeaderFace, TraceText::EHAlign::Right);
 
 			// The rule has to stop short at BOTH ends, or it strikes straight through KEY. Measured in
 			// the face the words were just DRAWN in — Erbaum is a third narrower than Sofachrome, so
 			// measuring in the wrong one is exactly the strike-through this line exists to avoid.
-			RuleLeft = X + MeasureWidth(HUD, TEXT("KEYBIND"), FontSmall, 1.0f * UIScale,
+			RuleLeft = X + MeasureWidth(HUD, TRACE_TEXT("OPTIONS.SETTINGS.COL_KEYBIND", "KEYBIND"), FontSmall, 1.0f * UIScale,
 				TraceOptionsMenuType::HeaderFace) + Gap;
-			RuleRight = ValueRightHdr - MeasureWidth(HUD, TEXT("KEY"), FontSmall, 1.0f * UIScale,
+			RuleRight = ValueRightHdr - MeasureWidth(HUD, TRACE_TEXT("OPTIONS.SETTINGS.COL_KEY", "KEY"), FontSmall, 1.0f * UIScale,
 				TraceOptionsMenuType::HeaderFace) - Gap;
 			bWordsDrawn = true;
 		}
@@ -4457,7 +4477,9 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 			const bool bMeasuring = bAutoDetectPending;
 			HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, bSelected ? 0.30f : 0.16f), X, Y, W, H);
 
-			const FString Text = bMeasuring ? TEXT("MEASURING THIS MACHINE...") : Row.Label;
+			const FString Text = bMeasuring
+				? TRACE_TEXT("OPTIONS.VIDEO.AUTO_DETECT_MEASURING", "MEASURING THIS MACHINE...")
+				: Row.Label;
 			DrawTextCentered(HUD, Text, bMeasuring ? FLinearColor::White : TraceOptionsStyle::Amber,
 				X + W * 0.5f, TextY, FontMedium, LabelScale, ActionFace);
 			return;
@@ -4524,7 +4546,7 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 
 			if (bWaiting)
 			{
-				ValueText = TEXT("PRESS A KEY");
+				ValueText = TRACE_TEXT("OPTIONS.KEYBIND.PRESS_A_KEY", "PRESS A KEY");
 				ValueColor = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, 0.6f + 0.4f * FMath::Sin(Now * 9.f));
 			}
 			else if (Key.IsValid())
@@ -4554,7 +4576,7 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 				// would eat the row's label at 720p — and would also make the sentence look like a
 				// bindable thing, which is the opposite of what it says. It is set as right-aligned
 				// prose, in the same column, at the same baseline.
-				ValueText = TEXT("LMB  (WHILE CARRYING)");
+				ValueText = TRACE_TEXT("OPTIONS.KEYBIND.PASS_ALREADY_BOUND", "LMB  (WHILE CARRYING)");
 				ValueColor = TraceOptionsStyle::InkDim;
 				bPassNote = true;
 			}
@@ -4568,7 +4590,7 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 			{
 				// An empty SECOND slot on the selected row. "+" and not "UNBOUND": the first chip already
 				// says whether the action works at all, and this one is an invitation rather than a state.
-				ValueText = TEXT("+");
+				ValueText = TRACE_TEXT("OPTIONS.KEYBIND.ADD_SECOND", "+");
 				ValueColor = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::InkDim, 0.55f);
 			}
 
@@ -4652,7 +4674,7 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 
 		if (bWaiting)
 		{
-			ValueText = TEXT("PRESS A BUTTON");
+			ValueText = TRACE_TEXT("OPTIONS.PADBIND.PRESS_A_BUTTON", "PRESS A BUTTON");
 			ValueColor = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, 0.6f + 0.4f * FMath::Sin(Now * 9.f));
 		}
 		else if (Key.IsValid())
@@ -4662,14 +4684,14 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		}
 		else if (Row.Binding == ETraceInputAction::Pass)
 		{
-			ValueText = FString::Printf(TEXT("%s  (WHILE CARRYING)"),
-				*UTraceUserSettings::DescribePadKey(UserSettings.GetPadKey(ETraceInputAction::Fire)));
+			ValueText = TRACE_TEXTF("OPTIONS.PADBIND.PASS_ALREADY_BOUND", "{0}  (WHILE CARRYING)",
+				{ UTraceUserSettings::DescribePadKey(UserSettings.GetPadKey(ETraceInputAction::Fire)) });
 			ValueColor = TraceOptionsStyle::InkDim;
 			bPassNote = true;
 		}
 		else
 		{
-			ValueText = TEXT("UNBOUND");
+			ValueText = TRACE_TEXT("OPTIONS.PADBIND.UNBOUND", "UNBOUND");
 			ValueColor = TraceOptionsStyle::Amber;
 		}
 
@@ -5013,7 +5035,7 @@ void FTraceOptionsMenu::DrawCrosshairPreview(AHUD* HUD, float X, float Y, float 
 	// Drawn on the DARK half so it is legible whatever the preview's own colours are doing, and
 	// pinned to the bottom of the box rather than under it, because it belongs to the box.
 	const float CaptionScale = 0.95f * UIScale;
-	TraceOptionsMenuType::Draw(HUD, TEXT("PREVIEW"),
+	TraceOptionsMenuType::Draw(HUD, TRACE_TEXT("OPTIONS.CROSSHAIR.PREVIEW_CAPTION", "PREVIEW"),
 		TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.85f),
 		BoxX + (10.f * UIScale), BoxY + (8.f * UIScale), FontSmall, CaptionScale,
 		TraceOptionsMenuType::BodyFace);
@@ -5025,12 +5047,12 @@ void FTraceOptionsMenu::DrawCrosshairPreview(AHUD* HUD, float X, float Y, float 
 	// box, so without the strip its tail would be near-white ink on the lit cyan surface — invisible,
 	// which is the exact defect the cyan half is here to demonstrate. A caption that fell into it
 	// would be an unintentional demonstration.
-	const FString Readout = FString::Printf(TEXT("%d / %.1f / %d  %s  %d%%"),
-		FMath::RoundToInt(Settings.GetCrosshairSize()),
-		Settings.GetCrosshairThickness(),
-		FMath::RoundToInt(Settings.GetCrosshairGap()),
-		*UTraceUserSettings::DescribeCrosshairColor(Settings.CrosshairColorIndex),
-		FMath::RoundToInt(Settings.GetCrosshairOpacity() * 100.f));
+	const FString Readout = TRACE_TEXTF("OPTIONS.CROSSHAIR.PREVIEW_READOUT", "{0} / {1} / {2}  {3}  {4}%",
+		{ FMath::RoundToInt(Settings.GetCrosshairSize()),
+		  FString::Printf(TEXT("%.1f"), Settings.GetCrosshairThickness()),
+		  FMath::RoundToInt(Settings.GetCrosshairGap()),
+		  UTraceUserSettings::DescribeCrosshairColor(Settings.CrosshairColorIndex),
+		  FMath::RoundToInt(Settings.GetCrosshairOpacity() * 100.f) });
 
 	const float ReadoutH = TraceOptionsMenuType::Height(HUD, FontSmall, CaptionScale);
 	const float StripH = ReadoutH + (10.f * UIScale);

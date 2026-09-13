@@ -692,6 +692,29 @@ const TCHAR* TraceText::FallbackFaceSourceFile()
 	return TraceFontAtlasMetrics::FallbackFace.Source;
 }
 
+bool TraceText::DrawsInOwnFace(TCHAR Char, ETraceTextWeight Weight)
+{
+	// Atlas down: everything is Slate's and the face question is meaningless here.
+	if (!IsAtlasActive())
+	{
+		return true;
+	}
+
+	const int32 Code = static_cast<int32>(Char);
+	if (Char == TEXT(' ') || Char == TEXT('\t') || Char == TEXT('\n') || Code == 0x00A0
+		|| FChar::IsWhitespace(Char) || Code < 0x20
+		|| TraceTextFile::IsDeliberatelyInvisible(Code))
+	{
+		return true;   // drawing nothing is face-independent — same reasoning as CanDraw
+	}
+
+	TraceTextFile::Resolve();
+
+	// THE ONE DIFFERENCE FROM CanDraw: the fallback sheet is not consulted. A cell in the weight's
+	// own sheet is the whole question.
+	return TraceTextFile::FindCell(TraceTextFile::EffectiveFace(Weight), Char) != nullptr;
+}
+
 bool TraceText::CanDraw(TCHAR Char, ETraceTextWeight Weight)
 {
 	// With the atlas down every glyph goes through Slate and the question is Lato's to answer, not

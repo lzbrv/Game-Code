@@ -295,6 +295,25 @@ namespace TraceText
 	 */
 	TRACE_API bool CanDraw(TCHAR Char, ETraceTextWeight Weight = ETraceTextWeight::Light);
 
+	/**
+	 * True when @p Char has a cell in @p Weight's OWN sheet — i.e. it draws in the typeface the
+	 * screen was designed in, rather than in the Latin-1 fallback.
+	 *
+	 * The narrower half of CanDraw(), and it exists for the game text document: a curly quote or an
+	 * em dash pasted out of a word processor is drawable (CanDraw says true, and it is legible) but
+	 * it arrives in a different face and sits visibly wrong in the middle of a Sofachrome line. That
+	 * is worth telling an author about and is not worth a runtime warning, which is why the two
+	 * questions are separate functions rather than one with a flag.
+	 *
+	 * Whitespace and the deliberately invisible codes answer TRUE, on the same reasoning CanDraw
+	 * uses: drawing nothing is their correct rendering, in any face.
+	 *
+	 * Asked here rather than from a range in the caller, because this module is still the only thing
+	 * that includes TraceFontAtlasMetrics.h and that is the property that keeps the charset in one
+	 * place.
+	 */
+	TRACE_API bool DrawsInOwnFace(TCHAR Char, ETraceTextWeight Weight = ETraceTextWeight::Light);
+
 	// =============================================================================================
 	// METRICS — all in screen pixels at @p Size, and all correct in the fallback too
 	// =============================================================================================

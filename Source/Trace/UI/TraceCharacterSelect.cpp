@@ -27,6 +27,7 @@
 #include "TraceTypes.h"                 // TraceTeamColor / TraceTeamName
 #include "UI/TraceHardwareCursor.h"     // spec v24 §2 — one pointer on screen, not two
 #include "UI/Text/TraceCanvasText.h"       // spec v22 §A1 — the cards type from the glyph atlas
+#include "UI/Text/TraceGameText.h"
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"   // the artist's sprites, colours and 9-slice numbers
 
 #if !UE_BUILD_SHIPPING
@@ -1235,7 +1236,7 @@ namespace TraceCharacterSelectFile
 	{
 		if (State == nullptr)
 		{
-			return FString(TEXT("A TEAM-MATE"));
+			return TRACE_TEXT("CHARSELECT.HOLDER_UNKNOWN", "A TEAM-MATE");
 		}
 
 		// The BOT suffix is not decoration. Since spec v15 §2 a card can be greyed out by a computer
@@ -1245,7 +1246,7 @@ namespace TraceCharacterSelectFile
 		const FString Name = State->GetPlayerName();
 		if (State->IsABot() && !Name.StartsWith(TEXT("BOT"), ESearchCase::IgnoreCase))
 		{
-			return Name + TEXT(" (BOT)");
+			return Name + TRACE_TEXT("CHARSELECT.HOLDER_BOT_SUFFIX", " (BOT)");
 		}
 
 		return Name;
@@ -2577,10 +2578,10 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 	const bool bUrgent = bHasDeadline && (SelectRemaining <= 5.f);
 
 	const float ChipH = 40.f * S;
-	const FString TeamLine = FString::Printf(TEXT("%s TEAM"),
-		*TraceTeamName(LocalState->Team).ToString().ToUpper());
+	const FString TeamLine = TRACE_TEXTF("CHARSELECT.HEADER_TEAM_CHIP", "{0} TEAM",
+		{ TraceTeamName(LocalState->Team).ToString().ToUpper() });
 	const FString CountText = FString::Printf(TEXT("%d"), FMath::Max(0, FMath::CeilToInt(SelectRemaining)));
-	const FString CountLabel(TEXT("AUTO-PICK IN"));
+	const FString CountLabel(TRACE_TEXT("CHARSELECT.HEADER_AUTOPICK_LABEL", "AUTO-PICK IN"));
 
 	const float TeamChipW = TraceCharacterSelectFile::ChipWidth(HUD, TeamLine, ChipH, 0.f,
 		TraceSelectLayout::SizeLabel * S, TraceSelectLayout::TrackLabel * S);
@@ -2596,7 +2597,7 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 	float TitleSize = TraceSelectLayout::TitleSize * S;
 	float TitleTrack = TraceSelectLayout::TitleTrack * S;
 	{
-		const FString Title(TEXT("SELECT YOUR CHARACTER"));
+		const FString Title(TRACE_TEXT("CHARSELECT.TITLE", "SELECT YOUR CHARACTER"));
 
 		// The title is centred, so the space it may occupy is symmetrical about the centre and bounded
 		// by whichever flank is wider.
@@ -2672,7 +2673,8 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 	// The rule of the screen, in sentence case and at micro-copy size. It is guidance, not a heading,
 	// and setting it as one was part of what made the old screen read as an undifferentiated wall.
 	TraceCharacterSelectType::DrawCentered(HUD,
-		TEXT("Nobody on your team may take the same character. The enemy may mirror your pick."),
+		TRACE_TEXT("CHARSELECT.RULE",
+			"Nobody on your team may take the same character. The enemy may mirror your pick."),
 		TraceSelectStyle::InkDim, CenterX, TraceSelectLayout::SubY * S, nullptr,
 		TraceSelectLayout::SizeBody * 0.88f * S, 0.f);
 
@@ -2870,7 +2872,7 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 			{
 				const float KeyX = (Side >= 60.f * S) ? (IdentityX + Side + (16.f * S)) : IdentityX;
 
-				TraceCharacterSelectType::Draw(HUD, TEXT("PRESS"), TraceSelectStyle::InkDim,
+				TraceCharacterSelectType::Draw(HUD, TRACE_TEXT("CHARSELECT.DETAIL_PRESS_LABEL", "PRESS"), TraceSelectStyle::InkDim,
 					KeyX,
 					IdentityY + (DetailCapH - TraceCharacterSelectType::LineHeight(HUD, nullptr, TraceSelectLayout::SizeLabel * S)) * 0.5f,
 					nullptr, TraceSelectLayout::SizeLabel * S, TraceSelectLayout::TrackLabel * S);
@@ -2931,12 +2933,12 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 			}
 			else if (LocalState->GetSelectedCharacter() == Entry.Id)
 			{
-				Status = TEXT("LOCKED IN");
+				Status = TRACE_TEXT("CHARSELECT.DETAIL_STATUS_LOCKED_IN", "LOCKED IN");
 				StatusColor = TraceSelectStyle::Good;
 			}
 			else
 			{
-				Status = TEXT("PRESS ENTER TO LOCK IN");
+				Status = TRACE_TEXT("CHARSELECT.DETAIL_STATUS_PRESS_ENTER", "PRESS ENTER TO LOCK IN");
 			}
 
 			IdentityY = DrawWrapped(HUD, Status, StatusColor, IdentityX, IdentityY, IdentityW,
@@ -3028,14 +3030,14 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 		}
 
 		{
-			float Y = DrawHeading(TEXT("MOVEMENT"), TraceSelectStyle::Cyan, ColumnsX, ColumnsY);
+			float Y = DrawHeading(*TRACE_TEXT("CHARSELECT.HEADING_MOVEMENT", "MOVEMENT"), TraceSelectStyle::Cyan, ColumnsX, ColumnsY);
 			TraceCharacterSelectType::WrapDraw(HUD, MovementText, BodyColor, ColumnsX, Y, ColumnW,
 				nullptr, BodySize, BodyGap, BodyWeight);
 		}
 
 		{
 			const float X = ColumnsX + ColumnW + ColumnGap;
-			float Y = DrawHeading(TEXT("PASSIVE"), TraceSelectStyle::Cyan, X, ColumnsY);
+			float Y = DrawHeading(*TRACE_TEXT("CHARSELECT.HEADING_PASSIVE", "PASSIVE"), TraceSelectStyle::Cyan, X, ColumnsY);
 			TraceCharacterSelectType::WrapDraw(HUD, PassiveText, BodyColor, X, Y, ColumnW,
 				nullptr, BodySize, BodyGap, BodyWeight);
 		}
@@ -3056,7 +3058,7 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 #endif
 
 			const float X = ColumnsX + (ColumnW + ColumnGap) * 2.f;
-			float Y = DrawHeading(TEXT("ACTIVATED"), Entry.Accent, X, ColumnsY);
+			float Y = DrawHeading(*TRACE_TEXT("CHARSELECT.HEADING_ACTIVATED", "ACTIVATED"), Entry.Accent, X, ColumnsY);
 
 			// ---- THE ROW IS FITTED TO ITS COLUMN, FOR THE SAME REASON THE CARD'S MICRO ROW IS ------
 			//
@@ -3172,14 +3174,14 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 		if (TraceCharacterRoster::Count >= 10)
 		{
 			Controls.Add({ TEXT("1-9"), FString() });
-			Controls.Add({ TEXT("0"), TEXT("CHOOSE") });
+			Controls.Add({ TEXT("0"), TRACE_TEXT("CHARSELECT.FOOTER_CHOOSE", "CHOOSE") });
 		}
 		else
 		{
 			Controls.Add({ FString::Printf(TEXT("1-%d"), TraceCharacterRoster::Count), TEXT("CHOOSE") });
 		}
-		Controls.Add({ TEXT("ARROWS"), TEXT("MOVE") });
-		Controls.Add({ TEXT("ENTER"), TEXT("LOCK IN") });
+		Controls.Add({ TEXT("ARROWS"), TRACE_TEXT("CHARSELECT.FOOTER_MOVE", "MOVE") });
+		Controls.Add({ TEXT("ENTER"), TRACE_TEXT("CHARSELECT.FOOTER_LOCK_IN", "LOCK IN") });
 
 		// D32-PADMENU — the pad's two chips, and ONLY once a controller has been seen on this machine
 		// (UTraceGamepadInputSubsystem::HasSeenGamepadInput). A keyboard-only player reads exactly the
@@ -3193,11 +3195,11 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 		const bool bPadHints = TracePadMenu::HasSeenPad(HUD);
 		if (bPadHints)
 		{
-			Controls.Add({ TEXT("D-PAD"), TEXT("MOVE") });
-			Controls.Add({ TEXT("A"), TEXT("LOCK IN") });
+			Controls.Add({ TEXT("D-PAD"), TRACE_TEXT("CHARSELECT.FOOTER_MOVE", "MOVE") });
+			Controls.Add({ TEXT("A"), TRACE_TEXT("CHARSELECT.FOOTER_LOCK_IN", "LOCK IN") });
 		}
 
-		Controls.Add({ TEXT("CLICK"), TEXT("A CARD") });
+		Controls.Add({ TEXT("CLICK"), TRACE_TEXT("CHARSELECT.FOOTER_A_CARD", "A CARD") });
 
 		const float CapH = 30.f * S;
 		const float CapGap = 9.f * S;

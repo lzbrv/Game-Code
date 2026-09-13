@@ -47,6 +47,7 @@
 #include "Core/TracePlayerState.h"
 #include "Gameplay/TraceCore.h"               // IsCarrier(): the carrier wears white
 #include "Gameplay/TraceWeaponComponent.h"     // the knife the third-person body has to hold
+#include "UI/Text/TraceGameText.h"            // the editable wording of the on-screen art warning
 #include "Trace.h"
 #include "TraceSettings.h"
 
@@ -266,29 +267,31 @@ bool ATraceCharacter::GetCharacterArtWarning(FString& OutHeadline, FString& OutD
 	switch (GetCharacterArtStatus())
 	{
 	case ETraceCharacterArtStatus::MeshMissing:
-		OutHeadline = TEXT("CHARACTER ART NOT INSTALLED");
-		OutDetail = FString::Printf(TEXT("Players are placeholder shapes. Run  %s  from the project root, then relaunch."),
-			TraceCharacterAssets::ImportCommand);
+		OutHeadline = TRACE_TEXT("BODY.WARN_ART_MESH_MISSING_HEADLINE", "CHARACTER ART NOT INSTALLED");
+		OutDetail = TRACE_TEXTF("BODY.WARN_ART_MESH_MISSING_DETAIL",
+			"Players are placeholder shapes. Run  {0}  from the project root, then relaunch.",
+			{ FString(TraceCharacterAssets::ImportCommand) });
 		return true;
 
 	case ETraceCharacterArtStatus::CharacterBodyMeshMissing:
-		OutHeadline = TEXT("CHARACTER BODY MESH NOT IMPORTED");
-		OutDetail = FString::Printf(
-			TEXT("%s is drawn as the Mannequin. Run  ./Scripts/import-rocco.sh  from the project root, then relaunch."),
-			*GMissingBodyMeshDetail);
+		OutHeadline = TRACE_TEXT("BODY.WARN_BODY_MESH_MISSING_HEADLINE", "CHARACTER BODY MESH NOT IMPORTED");
+		OutDetail = TRACE_TEXTF("BODY.WARN_BODY_MESH_MISSING_DETAIL",
+			"{0} is drawn as the Mannequin. Run  ./Scripts/import-rocco.sh  from the project root, then relaunch.",
+			{ GMissingBodyMeshDetail });
 		return true;
 
 	case ETraceCharacterArtStatus::CharacterBodyAnimMissing:
-		OutHeadline = TEXT("CHARACTER BODY NOT RETARGETED");
-		OutDetail = FString::Printf(
-			TEXT("%s is frozen in its bind pose. Run  ./Scripts/retarget-rocco.sh  from the project root, then relaunch."),
-			*GMissingBodyAnimDetail);
+		OutHeadline = TRACE_TEXT("BODY.WARN_BODY_ANIM_MISSING_HEADLINE", "CHARACTER BODY NOT RETARGETED");
+		OutDetail = TRACE_TEXTF("BODY.WARN_BODY_ANIM_MISSING_DETAIL",
+			"{0} is frozen in its bind pose. Run  ./Scripts/retarget-rocco.sh  from the project root, then relaunch.",
+			{ GMissingBodyAnimDetail });
 		return true;
 
 	case ETraceCharacterArtStatus::AnimMissing:
-		OutHeadline = TEXT("CHARACTER ANIMATIONS NOT INSTALLED");
-		OutDetail = FString::Printf(TEXT("Players are posed but never move. Run  %s --force, then relaunch."),
-			TraceCharacterAssets::ImportCommand);
+		OutHeadline = TRACE_TEXT("BODY.WARN_ANIM_MISSING_HEADLINE", "CHARACTER ANIMATIONS NOT INSTALLED");
+		OutDetail = TRACE_TEXTF("BODY.WARN_ANIM_MISSING_DETAIL",
+			"Players are posed but never move. Run  {0} --force, then relaunch.",
+			{ FString(TraceCharacterAssets::ImportCommand) });
 		return true;
 
 	case ETraceCharacterArtStatus::DisabledByCommandLine:
@@ -297,8 +300,9 @@ bool ATraceCharacter::GetCharacterArtWarning(FString& OutHeadline, FString& OutD
 		// exercised everything about the fallback EXCEPT the warning, the warning would be the one
 		// part of this fix that no automated run could ever photograph. Different wording, so nobody
 		// mistakes a deliberate test for a broken install.
-		OutHeadline = TEXT("CHARACTER ART DISABLED (-TraceNoCharacterArt)");
-		OutDetail = TEXT("This is the simulated missing-import state. Relaunch without the switch for the Mannequin.");
+		OutHeadline = TRACE_TEXT("BODY.WARN_ART_DISABLED_HEADLINE", "CHARACTER ART DISABLED (-TraceNoCharacterArt)");
+		OutDetail = TRACE_TEXT("BODY.WARN_ART_DISABLED_DETAIL",
+			"This is the simulated missing-import state. Relaunch without the switch for the Mannequin.");
 		return true;
 
 	default:
@@ -557,16 +561,16 @@ namespace TraceCharacterBody
 	/** Fills the banner's payload and reports, so a missing body says WHICH body. Once per process. */
 	void ReportMissingBodyMesh(uint8 CharacterId, const FString& MeshPath)
 	{
-		GMissingBodyMeshDetail = FString::Printf(TEXT("%s: %s did not load."),
-			*TraceCharacterRoster::NameFor(CharacterId), *MeshPath);
+		GMissingBodyMeshDetail = TRACE_TEXTF("BODY.WARN_BODY_MESH_SUBJECT_FORMAT", "{0}: {1} did not load.",
+			{ TraceCharacterRoster::NameFor(CharacterId), MeshPath });
 		ReportCharacterArtStatus(ETraceCharacterArtStatus::CharacterBodyMeshMissing);
 	}
 
 	/** The same, for the anim class that was supposed to drive that body. */
 	void ReportMissingBodyAnim(uint8 CharacterId, const FString& Detail)
 	{
-		GMissingBodyAnimDetail = FString::Printf(TEXT("%s: %s"),
-			*TraceCharacterRoster::NameFor(CharacterId), *Detail);
+		GMissingBodyAnimDetail = TRACE_TEXTF("BODY.WARN_BODY_ANIM_SUBJECT_FORMAT", "{0}: {1}",
+			{ TraceCharacterRoster::NameFor(CharacterId), Detail });
 		ReportCharacterArtStatus(ETraceCharacterArtStatus::CharacterBodyAnimMissing);
 	}
 
@@ -895,7 +899,7 @@ void ATraceCharacter::ApplyBodyAnimInstance(USkeletalMeshComponent* MeshComp, US
 		if (LoadedAnimClass == nullptr)
 		{
 			TraceCharacterBody::ReportMissingBodyAnim(CharacterId,
-				FString::Printf(TEXT("%s did not load."), *AnimClassPath));
+				TRACE_TEXTF("BODY.WARN_BODY_ANIM_LOAD_FAILED", "{0} did not load.", { AnimClassPath }));
 		}
 	}
 	else
@@ -943,8 +947,9 @@ void ATraceCharacter::ApplyBodyAnimInstance(USkeletalMeshComponent* MeshComp, US
 		// at somebody else's rig. Different failure from "not retargeted yet", same visible result,
 		// so it goes through the same banner with its own sentence.
 		TraceCharacterBody::ReportMissingBodyAnim(CharacterId,
-			FString::Printf(TEXT("%s drives skeleton '%s', but that body is skinned to '%s'."),
-				*AnimClassPath, *GetNameSafe(AnimSkeleton), *GetNameSafe(MeshSkeleton)));
+			TRACE_TEXTF("BODY.WARN_BODY_ANIM_SKELETON_MISMATCH",
+				"{0} drives skeleton '{1}', but that body is skinned to '{2}'.",
+				{ AnimClassPath, GetNameSafe(AnimSkeleton), GetNameSafe(MeshSkeleton) }));
 	}
 
 	static bool bWarnedIncompatibleAnim = false;

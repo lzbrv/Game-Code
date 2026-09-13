@@ -15,6 +15,7 @@
 #include "HAL/IConsoleManager.h"
 #include "Misc/PackageName.h"
 #include "Trace.h"
+#include "UI/Text/TraceGameText.h"          // the editable wording for every card
 #include "UObject/UObjectGlobals.h"
 
 // ---------------------------------------------------------------------------------------------
@@ -641,6 +642,78 @@ namespace TraceCharacterRosterFile
 		return (GSource == TraceCharacterRoster::ESource::Assets) ? AssetStorage().Entries : GetCppTable();
 	}
 
+	// =============================================================================================
+	// THE EDITABLE WORDING, LAID OVER WHICHEVER SOURCE WON.
+	//
+	// The five strings on a character card — the name, the three ability lines and the activated
+	// ability's own name — are the prose the owner most wants to rewrite, and the one they named
+	// first ("character descriptions"). This is where Config/TraceGameText.ini reaches them.
+	//
+	// A LAYER RATHER THAN A THIRD SOURCE, and the distinction is the whole reason this is five lines
+	// and not a migration. The roster's two sources (the C++ table and the generated assets) still
+	// decide everything: who exists, in what order, with what cooldown, colour, body and anim class.
+	// All this does is replace five TEXT POINTERS with pointers to the document's wording, leaving
+	// every other field and the whole source-resolution story exactly as it was. Trace.VerifyCharacterData
+	// compares the loaded roster against the C++ table field by field and is deliberately run against
+	// All(), so it would go red the moment this overlay touched a field that is not prose.
+	//
+	// THE POINTERS ARE STILL PROCESS-LIFETIME, which is the contract FTraceCharacterEntry has always
+	// had. TraceGameText::Get() returns a reference into storage that is only ever added to and whose
+	// addresses never move (see the "STABLE ADDRESSES" note in TraceGameText.cpp), so taking a TCHAR*
+	// out of it is as durable as the string literal it replaces.
+	//
+	// THE KEY IS BUILT FROM THE C++ TABLE'S NAME, NOT THE LIVE ONE. If it used the live name, renaming
+	// ROCCO in the document would rename his own keys, and the next Trace.Text.Dump would write a
+	// second set of lines under the new name while the old ones became orphans. The C++ name is the
+	// character's identity; the document holds what is DISPLAYED.
+	TArray<TraceCharacterRoster::FTraceCharacterEntry> GTextOverlay;
+	bool GTextOverlayBuilt = false;
+
+	const TArray<TraceCharacterRoster::FTraceCharacterEntry>& ApplyEditableText()
+	{
+		const TArray<TraceCharacterRoster::FTraceCharacterEntry>& Resolved = Resolve();
+
+		// Before the engine exists Resolve() short-circuits to the C++ table without latching, and
+		// the text document has no business being loaded that early either. Hand back the raw table.
+		if (GEngine == nullptr)
+		{
+			return Resolved;
+		}
+
+		if (GTextOverlayBuilt && GTextOverlay.Num() == Resolved.Num())
+		{
+			return GTextOverlay;
+		}
+
+		const TArray<TraceCharacterRoster::FTraceCharacterEntry>& Identity = GetCppTable();
+
+		GTextOverlay = Resolved;
+		for (int32 Index = 0; Index < GTextOverlay.Num(); ++Index)
+		{
+			TraceCharacterRoster::FTraceCharacterEntry& Entry = GTextOverlay[Index];
+
+			// The stable slug for this row. Falls back to the resolved name only if the C++ table is
+			// somehow shorter, which TryBuildFromAssets already refuses to allow.
+			const TCHAR* Slug = Identity.IsValidIndex(Index) ? Identity[Index].Name : Entry.Name;
+			const FString Prefix = FString::Printf(TEXT("CHARACTER.%s"), Slug);
+
+			const auto Overlay = [&Prefix](const TCHAR* Suffix, const TCHAR* Current) -> const TCHAR*
+			{
+				const FString Key = Prefix + Suffix;
+				return *TraceGameText::Get(*Key, Current);
+			};
+
+			Entry.Name          = Overlay(TEXT(".NAME"),           Entry.Name);
+			Entry.Movement      = Overlay(TEXT(".MOVEMENT"),       Entry.Movement);
+			Entry.Passive       = Overlay(TEXT(".PASSIVE"),        Entry.Passive);
+			Entry.ActivatedName = Overlay(TEXT(".ACTIVATED_NAME"), Entry.ActivatedName);
+			Entry.Activated     = Overlay(TEXT(".ACTIVATED_DESC"), Entry.Activated);
+		}
+
+		GTextOverlayBuilt = true;
+		return GTextOverlay;
+	}
+
 	void OnUseAssetsCVarChanged(IConsoleVariable* /*Variable*/)
 	{
 		TraceCharacterRoster::ForceReload();
@@ -649,7 +722,7 @@ namespace TraceCharacterRosterFile
 
 const TArray<TraceCharacterRoster::FTraceCharacterEntry>& TraceCharacterRoster::All()
 {
-	return TraceCharacterRosterFile::Resolve();
+	return TraceCharacterRosterFile::ApplyEditableText();
 }
 
 const TArray<TraceCharacterRoster::FTraceCharacterEntry>& TraceCharacterRoster::CppFallbackTable()
@@ -678,6 +751,11 @@ void TraceCharacterRoster::ForceReload()
 	TraceCharacterRosterFile::GResolved = false;
 	TraceCharacterRosterFile::GSource = ESource::CppTable;
 	TraceCharacterRosterFile::AssetStorage().Reset();
+
+	// The wording layer is rebuilt with the rest. Trace.Text.Reload calls this so that re-reading the
+	// document updates the character cards, not only the screens that ask for their strings directly.
+	TraceCharacterRosterFile::GTextOverlayBuilt = false;
+	TraceCharacterRosterFile::GTextOverlay.Reset();
 }
 
 const TraceCharacterRoster::FTraceCharacterEntry* TraceCharacterRoster::Find(uint8 Id)

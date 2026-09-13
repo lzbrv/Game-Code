@@ -17,6 +17,7 @@
 #include "Misc/CoreMiscDefines.h"       // FInputDeviceId
 #include "Misc/ConfigCacheIni.h"
 #include "Trace.h"                      // LogTraceGame
+#include "UI/Text/TraceGameText.h"      // the editable wording, Config/TraceGameText.ini
 #include "UObject/UObjectGlobals.h"     // GetMutableDefault
 #include "UnrealClient.h"               // FViewport
 
@@ -378,6 +379,20 @@ namespace
 
 const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 {
+	// *** THE DisplayName COLUMN IS NOT IN Config/TraceGameText.ini, AND THE REASON IS THIS COMMENT'S
+	// OWN NEXT SENTENCE. *** These twenty strings are the keybind and controller pages' row labels, so
+	// they belong in the document — but the column is `const TCHAR*` in a table that is built ONCE and
+	// never rebuilt, and TraceGameText::Get's reference is only good for the buffer it points at until
+	// the next Trace.Text.Reload (see UI/Text/TraceGameText.h). Resolving them here would cache twenty
+	// pointers into storage that a reload may move: stale labels at best, a read of freed characters at
+	// worst. Re-resolving on every call is no better — this function is walked from HUD draw code.
+	//
+	// THE PLACE THAT WORKS is where the label is COPIED, once per rebuild, into a row:
+	// FTraceOptionsMenu::RebuildRows in UI/TraceOptionsMenu.cpp does `Row.Label = Info.DisplayName;`
+	// twice (keyboard page and pad page). A TraceGameText::Get(<key>, Info.DisplayName) there is
+	// re-read on every rebuild, holds no pointer, and costs nothing per frame. The same shape the
+	// character roster uses for its cards (Core/TraceCharacterRoster.cpp, ApplyEditableText).
+	//
 	// Function-local static: built on first use, after EKeys is up, and never rebuilt.
 	static const TArray<FTraceInputActionInfo> Table =
 	{
@@ -695,6 +710,12 @@ namespace TraceCrosshairPalette
 {
 	struct FEntry
 	{
+		/**
+		 * The document key for Name, spelled out rather than built from Name itself. The two are
+		 * INDEPENDENT on purpose: the owner is allowed to reword a stop ("AMBER" -> "GOLD") and a key
+		 * derived from the wording would detach from their edit the moment the shipped name changed.
+		 */
+		const TCHAR* TextKey;
 		const TCHAR* Name;
 		FLinearColor Color;
 	};
@@ -742,14 +763,14 @@ namespace TraceCrosshairPalette
 		static const FEntry Entries[] =
 		{
 			// Release art bible §2.4 — the interface's Ink, not paper white. See the block above.
-			{ TEXT("WHITE"),   FLinearColor(0.90f, 0.97f, 1.00f) },
-			{ TEXT("CYAN"),    FLinearColor(0.16f, 0.88f, 1.00f) },
-			{ TEXT("LIME"),    FLinearColor(0.55f, 1.00f, 0.15f) },
-			{ TEXT("GREEN"),   FLinearColor(0.10f, 1.00f, 0.35f) },
-			{ TEXT("AMBER"),   FLinearColor(1.00f, 0.72f, 0.10f) },
-			{ TEXT("ORANGE"),  FLinearColor(1.00f, 0.46f, 0.08f) },
-			{ TEXT("RED"),     FLinearColor(1.00f, 0.16f, 0.16f) },
-			{ TEXT("MAGENTA"), FLinearColor(1.00f, 0.20f, 0.90f) },
+			{ TEXT("OPTIONS.CROSSHAIR_COLOR_WHITE"),   TEXT("WHITE"),   FLinearColor(0.90f, 0.97f, 1.00f) },
+			{ TEXT("OPTIONS.CROSSHAIR_COLOR_CYAN"),    TEXT("CYAN"),    FLinearColor(0.16f, 0.88f, 1.00f) },
+			{ TEXT("OPTIONS.CROSSHAIR_COLOR_LIME"),    TEXT("LIME"),    FLinearColor(0.55f, 1.00f, 0.15f) },
+			{ TEXT("OPTIONS.CROSSHAIR_COLOR_GREEN"),   TEXT("GREEN"),   FLinearColor(0.10f, 1.00f, 0.35f) },
+			{ TEXT("OPTIONS.CROSSHAIR_COLOR_AMBER"),   TEXT("AMBER"),   FLinearColor(1.00f, 0.72f, 0.10f) },
+			{ TEXT("OPTIONS.CROSSHAIR_COLOR_ORANGE"),  TEXT("ORANGE"),  FLinearColor(1.00f, 0.46f, 0.08f) },
+			{ TEXT("OPTIONS.CROSSHAIR_COLOR_RED"),     TEXT("RED"),     FLinearColor(1.00f, 0.16f, 0.16f) },
+			{ TEXT("OPTIONS.CROSSHAIR_COLOR_MAGENTA"), TEXT("MAGENTA"), FLinearColor(1.00f, 0.20f, 0.90f) },
 		};
 
 		OutCount = UE_ARRAY_COUNT(Entries);
@@ -803,7 +824,13 @@ FLinearColor UTraceUserSettings::CrosshairPaletteColor(int32 Index)
 
 FString UTraceUserSettings::DescribeCrosshairColor(int32 Index)
 {
-	return FString(TraceCrosshairPalette::Entry(Index).Name);
+	const TraceCrosshairPalette::FEntry& Stop = TraceCrosshairPalette::Entry(Index);
+
+	// ASKED FOR PER CALL, not resolved once into the palette table. TraceGameText::Get hands back a
+	// reference whose CHARACTER BUFFER is only good until the next Trace.Text.Reload (see the header's
+	// note on Get), so a `const TCHAR*` cached in a static table would both go stale after a re-read
+	// and stop answering one. One hash lookup, on a row that draws only while the crosshair page is up.
+	return TraceGameText::Get(Stop.TextKey, Stop.Name);
 }
 
 float UTraceUserSettings::GetCrosshairSize() const
@@ -963,7 +990,19 @@ FString UTraceUserSettings::SanitizeCallSign(const FString& Raw)
 FString UTraceUserSettings::GetCallSignOrDefault() const
 {
 	const FString Clean = SanitizeCallSign(CallSign);
-	return Clean.IsEmpty() ? FString(DefaultCallSign) : Clean;
+	if (!Clean.IsEmpty())
+	{
+		return Clean;
+	}
+
+	// THE ONE PLACE THE FALLBACK NAME BECOMES WORDS, so it is the place the document gets to change
+	// it — this is what the scoreboard, the kill feed and the pass reticle draw for a player who has
+	// never typed a name. DefaultCallSign (a constexpr in the header, so not itself convertible) is
+	// handed in as the default, which keeps the shipped wording in exactly one place.
+	//
+	// UI/TraceOptionsMenu.cpp draws the SAME constant as the call-sign row's ghost text; that site
+	// should use THIS key rather than a second one, or a reworded default would disagree with itself.
+	return TraceGameText::Get(TEXT("OPTIONS.DEFAULT_CALL_SIGN"), DefaultCallSign);
 }
 
 // =================================================================================================
@@ -1296,7 +1335,10 @@ FString UTraceUserSettings::DescribeKey(const FKey& Key)
 {
 	if (!Key.IsValid())
 	{
-		return TEXT("UNBOUND");
+		// ONE KEY FOR ALL THREE COPIES of this word — DescribeBinding's "no keys at all" case and
+		// DescribePadKey's use the same one, because a player who renames the empty chip means all of
+		// them and would not thank us for three lines that have to be kept in step by hand.
+		return TRACE_TEXT("OPTIONS.KEY_UNBOUND", "UNBOUND");
 	}
 
 	// GetDisplayName gives "Space Bar" / "Left Shift" / "Left Mouse Button", which is what a player
@@ -1383,7 +1425,7 @@ FString UTraceUserSettings::DescribeBinding(ETraceInputAction Action) const
 	GetKeys(Action, Keys);
 	if (Keys.Num() == 0)
 	{
-		return TEXT("UNBOUND");
+		return TRACE_TEXT("OPTIONS.KEY_UNBOUND", "UNBOUND");   // shared with DescribeKey/DescribePadKey
 	}
 
 	FString Out;
@@ -1391,6 +1433,12 @@ FString UTraceUserSettings::DescribeBinding(ETraceInputAction Action) const
 	{
 		if (!Out.IsEmpty())
 		{
+			// DELIBERATELY NOT IN THE TEXT DOCUMENT, and this is the reason rather than an oversight:
+			// the document's parser trims every value at BOTH ENDS (ParseDocument in
+			// UI/Text/TraceGameText.cpp — "trailing spaces are invisible in an editor and never
+			// intentional"), so this separator's outer double spaces could not survive one
+			// Trace.Text.Dump + Reload and two chips would join as "Q/THUMBMOUSE 1". Internal spacing
+			// is safe in the document; leading and trailing is not, and this string is mostly that.
 			Out += TEXT("  /  ");
 		}
 		Out += DescribeKey(Key);
@@ -1805,7 +1853,7 @@ FString UTraceUserSettings::DescribePadKey(const FKey& Key)
 {
 	if (!Key.IsValid())
 	{
-		return TEXT("UNBOUND");
+		return TRACE_TEXT("OPTIONS.KEY_UNBOUND", "UNBOUND");   // shared with DescribeKey, deliberately
 	}
 
 	// *** THE SHORT NAMES, AND THEY ARE NOT COSMETIC. *** Key.GetDisplayName() returns
@@ -1818,37 +1866,51 @@ FString UTraceUserSettings::DescribePadKey(const FKey& Key)
 	// way to draw the PlayStation glyphs — and half-right glyphs are worse than a consistent
 	// convention. The POSITION suffix disambiguates for a player holding a DualSense: "A (DOWN)"
 	// names the button by where the thumb goes, which is true on every pad ever made.
-	static const TMap<FKey, const TCHAR*> ShortNames =
+	//
+	// EACH ROW CARRIES ITS DOCUMENT KEY BESIDE THE SHIPPED WORDING (see UI/Text/TraceGameText.h). The
+	// key is written out rather than derived from the name, so rewording a chip — "VIEW / BACK" ->
+	// "SELECT", say — is an edit to the document and nothing else.
+	struct FPadName
 	{
-		{ EKeys::Gamepad_FaceButton_Bottom,  TEXT("A  (DOWN)")      },
-		{ EKeys::Gamepad_FaceButton_Right,   TEXT("B  (RIGHT)")     },
-		{ EKeys::Gamepad_FaceButton_Left,    TEXT("X  (LEFT)")      },
-		{ EKeys::Gamepad_FaceButton_Top,     TEXT("Y  (UP)")        },
-		{ EKeys::Gamepad_LeftShoulder,       TEXT("LB")             },
-		{ EKeys::Gamepad_RightShoulder,      TEXT("RB")             },
-		{ EKeys::Gamepad_LeftTrigger,        TEXT("LT")             },
-		{ EKeys::Gamepad_RightTrigger,       TEXT("RT")             },
-		{ EKeys::Gamepad_LeftThumbstick,     TEXT("L3")             },
-		{ EKeys::Gamepad_RightThumbstick,    TEXT("R3")             },
-		{ EKeys::Gamepad_DPad_Up,            TEXT("D-PAD UP")       },
-		{ EKeys::Gamepad_DPad_Down,          TEXT("D-PAD DOWN")     },
-		{ EKeys::Gamepad_DPad_Left,          TEXT("D-PAD LEFT")     },
-		{ EKeys::Gamepad_DPad_Right,         TEXT("D-PAD RIGHT")    },
-		{ EKeys::Gamepad_Special_Left,       TEXT("VIEW / BACK")    },
-		{ EKeys::Gamepad_Special_Right,      TEXT("MENU / START")   },
-		{ EKeys::Gamepad_LeftStick_Up,       TEXT("L-STICK UP")     },
-		{ EKeys::Gamepad_LeftStick_Down,     TEXT("L-STICK DOWN")   },
-		{ EKeys::Gamepad_LeftStick_Left,     TEXT("L-STICK LEFT")   },
-		{ EKeys::Gamepad_LeftStick_Right,    TEXT("L-STICK RIGHT")  },
-		{ EKeys::Gamepad_RightStick_Up,      TEXT("R-STICK UP")     },
-		{ EKeys::Gamepad_RightStick_Down,    TEXT("R-STICK DOWN")   },
-		{ EKeys::Gamepad_RightStick_Left,    TEXT("R-STICK LEFT")   },
-		{ EKeys::Gamepad_RightStick_Right,   TEXT("R-STICK RIGHT")  },
+		const TCHAR* TextKey;
+		const TCHAR* Shipped;
 	};
 
-	if (const TCHAR* const* Found = ShortNames.Find(Key))
+	static const TMap<FKey, FPadName> ShortNames =
 	{
-		return FString(*Found);
+		{ EKeys::Gamepad_FaceButton_Bottom,  { TEXT("OPTIONS.PAD_FACE_BOTTOM"),       TEXT("A  (DOWN)")     } },
+		{ EKeys::Gamepad_FaceButton_Right,   { TEXT("OPTIONS.PAD_FACE_RIGHT"),        TEXT("B  (RIGHT)")    } },
+		{ EKeys::Gamepad_FaceButton_Left,    { TEXT("OPTIONS.PAD_FACE_LEFT"),         TEXT("X  (LEFT)")     } },
+		{ EKeys::Gamepad_FaceButton_Top,     { TEXT("OPTIONS.PAD_FACE_TOP"),          TEXT("Y  (UP)")       } },
+		{ EKeys::Gamepad_LeftShoulder,       { TEXT("OPTIONS.PAD_LEFT_SHOULDER"),     TEXT("LB")            } },
+		{ EKeys::Gamepad_RightShoulder,      { TEXT("OPTIONS.PAD_RIGHT_SHOULDER"),    TEXT("RB")            } },
+		{ EKeys::Gamepad_LeftTrigger,        { TEXT("OPTIONS.PAD_LEFT_TRIGGER"),      TEXT("LT")            } },
+		{ EKeys::Gamepad_RightTrigger,       { TEXT("OPTIONS.PAD_RIGHT_TRIGGER"),     TEXT("RT")            } },
+		{ EKeys::Gamepad_LeftThumbstick,     { TEXT("OPTIONS.PAD_LEFT_THUMBSTICK"),   TEXT("L3")            } },
+		{ EKeys::Gamepad_RightThumbstick,    { TEXT("OPTIONS.PAD_RIGHT_THUMBSTICK"),  TEXT("R3")            } },
+		{ EKeys::Gamepad_DPad_Up,            { TEXT("OPTIONS.PAD_DPAD_UP"),           TEXT("D-PAD UP")      } },
+		{ EKeys::Gamepad_DPad_Down,          { TEXT("OPTIONS.PAD_DPAD_DOWN"),         TEXT("D-PAD DOWN")    } },
+		{ EKeys::Gamepad_DPad_Left,          { TEXT("OPTIONS.PAD_DPAD_LEFT"),         TEXT("D-PAD LEFT")    } },
+		{ EKeys::Gamepad_DPad_Right,         { TEXT("OPTIONS.PAD_DPAD_RIGHT"),        TEXT("D-PAD RIGHT")   } },
+		{ EKeys::Gamepad_Special_Left,       { TEXT("OPTIONS.PAD_SPECIAL_LEFT"),      TEXT("VIEW / BACK")   } },
+		{ EKeys::Gamepad_Special_Right,      { TEXT("OPTIONS.PAD_SPECIAL_RIGHT"),     TEXT("MENU / START")  } },
+		{ EKeys::Gamepad_LeftStick_Up,       { TEXT("OPTIONS.PAD_LSTICK_UP"),         TEXT("L-STICK UP")    } },
+		{ EKeys::Gamepad_LeftStick_Down,     { TEXT("OPTIONS.PAD_LSTICK_DOWN"),       TEXT("L-STICK DOWN")  } },
+		{ EKeys::Gamepad_LeftStick_Left,     { TEXT("OPTIONS.PAD_LSTICK_LEFT"),       TEXT("L-STICK LEFT")  } },
+		{ EKeys::Gamepad_LeftStick_Right,    { TEXT("OPTIONS.PAD_LSTICK_RIGHT"),      TEXT("L-STICK RIGHT") } },
+		{ EKeys::Gamepad_RightStick_Up,      { TEXT("OPTIONS.PAD_RSTICK_UP"),         TEXT("R-STICK UP")    } },
+		{ EKeys::Gamepad_RightStick_Down,    { TEXT("OPTIONS.PAD_RSTICK_DOWN"),       TEXT("R-STICK DOWN")  } },
+		{ EKeys::Gamepad_RightStick_Left,    { TEXT("OPTIONS.PAD_RSTICK_LEFT"),       TEXT("R-STICK LEFT")  } },
+		{ EKeys::Gamepad_RightStick_Right,   { TEXT("OPTIONS.PAD_RSTICK_RIGHT"),      TEXT("R-STICK RIGHT") } },
+	};
+
+	if (const FPadName* Found = ShortNames.Find(Key))
+	{
+		// The DOCUMENT is asked per call and the table holds only literals. Resolving the wording once
+		// into this static map would cache a pointer into TraceGameText's storage, which the header
+		// says is good only until the next Trace.Text.Reload — and a chip that could not be re-read
+		// would make Reload a half-truth on this page.
+		return TraceGameText::Get(Found->TextKey, Found->Shipped);
 	}
 
 	// A pad button this table has never heard of — a vendor extra, a touchpad click. It is still
