@@ -644,6 +644,29 @@ void UTraceAbilityComponent::ServerRequestSetCharacter_Implementation(ETraceChar
 	ServerSetCharacter(NewCharacter);
 }
 
+bool UTraceAbilityComponent::ServerRequestSetLoadout_Validate(FTraceLoadout NewLoadout)
+{
+	// IN-RANGE OR NOTHING. This is the only thing validation should judge: a value outside the enum
+	// could index the slot arrays and the roster table, so it is a malformed packet and the
+	// connection deserves to be dropped. A pick that is merely REFUSED — locked, or a kit that has no
+	// ability for that slot — is a legitimate client racing the whistle, and dropping them for it
+	// would turn a lost race into a disconnect.
+	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+	{
+		const ETraceCharacterId Id = NewLoadout.Get(static_cast<ETraceLoadoutSlot>(Index));
+		if (static_cast<uint8>(Id) >= static_cast<uint8>(ETraceCharacterId::Count))
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+void UTraceAbilityComponent::ServerRequestSetLoadout_Implementation(FTraceLoadout NewLoadout)
+{
+	ServerSetLoadout(NewLoadout);
+}
+
 void UTraceAbilityComponent::OnRep_CharacterId()
 {
 	// The previous character's presentation is not a baseline for this one's: the same Flags bits mean

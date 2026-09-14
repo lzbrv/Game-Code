@@ -1107,6 +1107,15 @@ void ATraceHUD::DrawHUD()
 	CharacterSelect.Tick(this, TracePC.Get(), LocalPS.Get(), ViewW, ViewH, UIScale, Now,
 		/*bInputAllowed=*/!PauseMenu.IsOpen());
 
+	// IMMEDIATELY AFTER, AND ONLY ONE OF THEM DRAWS. CharacterSelect still runs first because it
+	// hosts the TEAM screen and the overlay open/close callbacks the rest of the HUD reads; with the
+	// loadout arm on it returns before its own ten cards, and this draws the three columns in their
+	// place. Input is gated on the team screen as well as the pause menu: while you are still
+	// choosing a side, the loadout page behind it must not eat your arrow keys.
+	LoadoutSelect.Tick(this, TracePC.Get(), LocalPS.Get(), ViewW, ViewH, UIScale, Now,
+		/*bInputAllowed=*/!PauseMenu.IsOpen() && !CharacterSelect.IsTeamSelectOpen()
+			&& TraceLoadoutSelect::IsArmed());
+
 	// Last, over everything including the full-time takeover. A no-op while closed.
 	PauseMenu.Tick(this, TracePC.Get(), ViewW, ViewH, UIScale, Now);
 
@@ -3690,6 +3699,9 @@ void ATraceHUD::DrawAmmoAndStatuses()
 	// the HUD canvas, scrim included. Hiding it while either overlay owns the screen is what makes
 	// the two paths look the same; leaving it up would be a change in what the player sees, which
 	// spec v17 §0 calls a bug rather than a feature.
+	// LoadoutSelect deliberately NOT added here: it is open on exactly the same condition
+	// CharacterSelect is (the replicated select window), so CharacterSelect::IsOpen() already answers
+	// for both and adding a second term would be a way for them to disagree.
 	const bool bOverlayOwnsScreen = PauseMenu.IsOpen() || CharacterSelect.IsOpen();
 
 	if (PresentCornerUmg(bCornerLive && !bOverlayOwnsScreen, CornerState))

@@ -845,6 +845,19 @@ public:
 	UFUNCTION(Server, Reliable)
 	void ServerRequestSetCharacter(ETraceCharacterId NewCharacter);
 
+	/**
+	 * Client -> server. The loadout screen's request path; ServerSetLoadout is the authoritative half
+	 * and is what enforces the lock and the legality of every (kit, slot) pair.
+	 *
+	 * VALIDATED, unlike its character-pick sibling, because this one carries THREE bytes of
+	 * attacker-controlled enum rather than one. Validation refuses a value outside the enum outright
+	 * — that is a malformed packet, not a rejected pick — and everything else (locked, illegal pair)
+	 * is a refusal the implementation makes and logs, so a legitimate client that raced the whistle
+	 * gets a "no" rather than a disconnect.
+	 */
+	UFUNCTION(Server, Reliable, WithValidation)
+	void ServerRequestSetLoadout(FTraceLoadout NewLoadout);
+
 	/** Client -> server. The validated half of TryActivate(). */
 	UFUNCTION(Server, Reliable)
 	void ServerTryActivate();

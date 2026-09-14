@@ -2,6 +2,8 @@
 
 #include "UI/TraceCharacterSelect.h"
 
+#include "UI/TraceLoadoutSelect.h"   // IsArmed() — the page that replaced this one
+
 #include "CanvasItem.h"                 // FCanvasTextItem — the only way to typeset with a real face
 #include "Engine/Canvas.h"              // UCanvas::Canvas (the FCanvas) for the DPI scale
 #include "Engine/Engine.h"
@@ -1978,6 +1980,19 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 	}
 
 	if (!bOpen)
+	{
+		return;
+	}
+
+	// *** THE LOADOUT SCREEN REPLACED THIS PAGE. *** Everything above still runs — the team screen
+	// this class hosts, its open/close callbacks, the overlay bookkeeping the HUD reads — and only
+	// the ten-card character page below is skipped. That is the whole point of returning HERE rather
+	// than at the top: team select is not being replaced, the page after it is.
+	//
+	// The server still auto-assigns a character on timeout and that is still correct: the character
+	// id is the identity byte now — which face, which scoreboard column — and picking it was never
+	// what this page was really for once abilities became the choice.
+	if (TraceLoadoutSelect::IsArmed())
 	{
 		return;
 	}

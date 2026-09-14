@@ -34,6 +34,7 @@
 
 #include "TraceTypes.h"          // ETraceTeam, TraceTeamColor
 #include "UI/TraceCharacterSelect.h" // FTraceCharacterSelect — spec v14 §3
+#include "UI/TraceLoadoutSelect.h"   // FTraceLoadoutSelect — the page that replaced it
 #include "UI/TraceKillFeed.h"     // ETraceKillIcon, ATraceKillFeedRelay — spec v8 §6
 #include "UI/TraceOptionsMenu.h"  // FTraceOptionsMenu
 #include "UI/Widgets/HUD/TraceHudCornerData.h" // FTraceHudCornerState — spec v17 §4 (step 4b)
@@ -695,6 +696,13 @@ private:
 	 * HUD having to notice them arriving. See TraceCharacterSelect.h.
 	 */
 	FTraceCharacterSelect CharacterSelect;
+
+	/**
+	 * THE PAGE THAT REPLACED THE CHARACTER GRID. Same open condition, same host, same frame slot —
+	 * CharacterSelect still owns the TEAM screen and its overlay callbacks and simply stops drawing
+	 * its own ten cards while `Trace.UI.LoadoutScreen` is on. See TraceLoadoutSelect.h.
+	 */
+	FTraceLoadoutSelect LoadoutSelect;
 
 	/** Binds the select screen's input-suppression callbacks. Idempotent; called from BeginPlay. */
 	void WireCharacterSelect();

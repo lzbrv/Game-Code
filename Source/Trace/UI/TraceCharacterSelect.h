@@ -103,6 +103,15 @@ public:
 	bool IsOpen() const { return bOpen || TeamSelect.IsOpen(); }
 
 	/**
+	 * Is the TEAM screen specifically up?
+	 *
+	 * Exists because the loadout page sits behind this one in the same frame and must not eat arrow
+	 * keys while the player is still choosing a side. IsOpen() cannot answer that — it is true for
+	 * both screens, which is exactly right for the overlay test and exactly wrong for this one.
+	 */
+	bool IsTeamSelectOpen() const { return TeamSelect.IsOpen(); }
+
+	/**
 	 * Poll input and draw. Call exactly once per frame from the owning AHUD::DrawHUD.
 	 *
 	 * @param HUD           the drawing surface
