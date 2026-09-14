@@ -2335,11 +2335,26 @@ float UTraceAbilityComponent::GetDashHitSweepRadiusFor(const AActor* Actor)
 	// frame for every dashing pawn in the world, most of which are Mannequins and bots with no
 	// component at all. 0 is "run no sweep", and it is the answer in every one of those cases.
 	const UTraceAbilityComponent* Comp = Get(Actor);
-	if (Comp == nullptr || Comp->AbilitySet == nullptr)
+	if (Comp == nullptr)
 	{
 		return 0.f;
 	}
-	return FMath::Max(0.f, Comp->AbilitySet->GetDashHitSweepRadius());
+
+	// COMBINE RULE: MAX, and this is the one hook where a product would be actively wrong. The
+	// contract's default is 0 meaning "run no sweep", so 0 is the identity for max but an annihilator
+	// for multiplication — one kit not wanting a sweep would cancel another kit that does. There is
+	// also only ever ONE sweep per dash, so the question is not "how much" but "how wide does the
+	// widest asker need it", and the rule for what to do with a hit stays in each kit's
+	// OnDashHitCharacter, which every kit still gets offered.
+	float Radius = 0.f;
+	for (const TObjectPtr<UTraceCharacterAbilitySet>& Set : Comp->EquippedSets)
+	{
+		if (Set != nullptr)
+		{
+			Radius = FMath::Max(Radius, Set->GetDashHitSweepRadius());
+		}
+	}
+	return FMath::Max(0.f, Radius);
 }
 
 void UTraceAbilityComponent::NotifyPawnSpawned()
@@ -2530,22 +2545,79 @@ void UTraceAbilityComponent::NotifyKill(ATraceCharacter* Victim, FName Cause, bo
 
 float UTraceAbilityComponent::GetMoveSpeedMultiplierFor(const AActor* Actor)
 {
-	const UTraceCharacterAbilitySet* Set = GetAbilitySetFor(Actor);
-	return (Set != nullptr) ? FMath::Max(0.01f, Set->GetMoveSpeedMultiplier()) : 1.f;
+	// COMBINE RULE: PRODUCT. The contract on GetMoveSpeedMultiplier is "1.0 = unchanged", which makes
+	// 1 the identity and multiplication the only combine that cannot change the answer for a kit that
+	// does not care. Rocco's headshot boost and X's vulnerable-enemy bonus are independent effects
+	// that both happen to be speed, so a player carrying both gets both — 1.03 * 1.10, not whichever
+	// one the loop happened to reach first.
+	//
+	// A kit covering several slots appears ONCE in EquippedSets, so its multiplier is counted once.
+	// That is what keeps a uniform loadout returning exactly the single number it returned before.
+	const UTraceAbilityComponent* Comp = Get(Actor);
+	if (Comp == nullptr)
+	{
+		return 1.f;
+	}
+
+	float Product = 1.f;
+	for (const TObjectPtr<UTraceCharacterAbilitySet>& Set : Comp->EquippedSets)
+	{
+		if (Set != nullptr)
+		{
+			Product *= Set->GetMoveSpeedMultiplier();
+		}
+	}
+
+	// Floored for the same reason the single-set version was: this scales max ground speed, and a
+	// kit (or a mistyped ini) answering 0 would freeze the player solid rather than slow them.
+	return FMath::Max(0.01f, Product);
 }
 
 float UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(const AActor* Actor)
 {
-	const UTraceCharacterAbilitySet* Set = GetAbilitySetFor(Actor);
-	return (Set != nullptr) ? FMath::Max(0.01f, Set->GetMagnetRadiusMultiplier()) : 1.f;
+	// COMBINE RULE: PRODUCT, for the same reason as move speed — the contract's "1.0 = unchanged"
+	// makes 1 the identity. Mace's 1.30 stays 1.30 alone and composes if a future kit also scales it.
+	const UTraceAbilityComponent* Comp = Get(Actor);
+	if (Comp == nullptr)
+	{
+		return 1.f;
+	}
+
+	float Product = 1.f;
+	for (const TObjectPtr<UTraceCharacterAbilitySet>& Set : Comp->EquippedSets)
+	{
+		if (Set != nullptr)
+		{
+			Product *= Set->GetMagnetRadiusMultiplier();
+		}
+	}
+	return FMath::Max(0.01f, Product);
 }
 
 float UTraceAbilityComponent::GetFireIntervalScaleFor(const AActor* Actor)
 {
-	const UTraceCharacterAbilitySet* Set = GetAbilitySetFor(Actor);
-	if (Set == nullptr)
+	// COMBINE RULE: PRODUCT. Identity is 1 again, and the two live users pull in opposite directions
+	// — Roxie's MODDED shortens the interval, Slimeball's stick lengthens it — so a player carrying
+	// both should get the net effect rather than whichever the loop saw first. Multiplying is also
+	// what makes the pair commutative: the answer cannot depend on slot order.
+	//
+	// *** OWNER DECISION STILL OPEN. *** MODDED and stuck together multiply out to 0.466 — a 2.14x
+	// fire rate. That is what "keep the downsides welded on" produces and it is deliberate, but it is
+	// the strongest number in the game and it comes from two abilities neither of which was balanced
+	// against the other. Flagged, not silently capped: the clamp below is a safety rail, not balance.
+	const UTraceAbilityComponent* Comp = Get(Actor);
+	if (Comp == nullptr)
 	{
 		return 1.f;
+	}
+
+	float Product = 1.f;
+	for (const TObjectPtr<UTraceCharacterAbilitySet>& Set : Comp->EquippedSets)
+	{
+		if (Set != nullptr)
+		{
+			Product *= Set->GetFireIntervalScale();
+		}
 	}
 
 	// Floored well above zero, and that floor is the safety rail rather than a tuning value: this
@@ -2553,21 +2625,38 @@ float UTraceAbilityComponent::GetFireIntervalScaleFor(const AActor* Actor)
 	// hand that player an unbounded fire rate. 0.05 is a 20x rate cap — twenty times anything spec §2
 	// asks for, so it can never bind on a legitimate value. Ceilinged at 10 for the same reason in the
 	// other direction: a gun that will not fire for four seconds reads as broken, not as a nerf.
-	return FMath::Clamp(Set->GetFireIntervalScale(), 0.05f, 10.f);
+	//
+	// NOTE the clamp is applied to the PRODUCT, not per kit. Clamping each factor first would let two
+	// legal-but-extreme kits multiply past the rail the rail exists to hold.
+	return FMath::Clamp(Product, 0.05f, 10.f);
 }
 
 float UTraceAbilityComponent::GetSlideJumpWindowSpeedBonusFor(const AActor* Actor, float InWellTimedBonus)
 {
-	const UTraceCharacterAbilitySet* Set = GetAbilitySetFor(Actor);
-	if (Set == nullptr)
+	// COMBINE RULE: CHAIN. This one is not a multiplier, it is a TRANSFORM — each kit is handed the
+	// bonus so far and returns the bonus it wants — so the kits compose by feeding one into the next
+	// rather than by multiplying. Two kits that each add a little add both; one that ignores it
+	// returns its input unchanged, which is the identity.
+	const UTraceAbilityComponent* Comp = Get(Actor);
+	if (Comp == nullptr)
 	{
 		return InWellTimedBonus;
 	}
 
+	float Bonus = InWellTimedBonus;
+	for (const TObjectPtr<UTraceCharacterAbilitySet>& Set : Comp->EquippedSets)
+	{
+		if (Set != nullptr)
+		{
+			Bonus = Set->ModifySlideJumpWindowSpeedBonus(Bonus);
+		}
+	}
+
 	// Never below the global number the movement component just computed. The rule there is that a
 	// well-timed hop must never be worth LESS than a mistimed one; a character passive is not allowed
-	// to smuggle in an exception to it, however its own knob is tuned.
-	return FMath::Max(InWellTimedBonus, Set->ModifySlideJumpWindowSpeedBonus(InWellTimedBonus));
+	// to smuggle in an exception to it, however its own knob is tuned — and with a chain, neither is
+	// a kit further down the chain allowed to undo one further up.
+	return FMath::Max(InWellTimedBonus, Bonus);
 }
 
 #if !UE_BUILD_SHIPPING

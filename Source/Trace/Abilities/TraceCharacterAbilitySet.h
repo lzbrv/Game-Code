@@ -544,6 +544,26 @@ private:
 	 */
 	ETraceLoadoutSlot Slot = ETraceLoadoutSlot::Activated;
 
-	/** Bit per ETraceLoadoutSlot. See IsSlot(). Written once by Initialize(). */
-	uint8 SlotMask = 1u << static_cast<uint8>(ETraceLoadoutSlot::Activated);
+	/**
+	 * Bit per ETraceLoadoutSlot. See IsSlot(). Written once by Initialize() on a live instance — but
+	 * the value HERE is what the CDO answers, and the CDO is what UTraceAbilityComponent's loadout
+	 * legality check asks "can this kit serve that slot?".
+	 *
+	 * ALL THREE BY DEFAULT, because that is the roster as it actually ships: every one of the ten
+	 * characters has a movement ability, a passive and an activated one — checked against
+	 * Config/TraceGameText.ini, which carries a MOVEMENT, a PASSIVE and an ACTIVATED_NAME line for
+	 * each of the ten. So "this kit can fill any slot" is the true answer for every kit in the build,
+	 * not a permissive shrug.
+	 *
+	 * It was Activated-only before loadouts existed, which was equally true then — a single-character
+	 * pick only ever asked about the E. Left that way it would have refused every mixed loadout in
+	 * the game, silently, as an illegal pick.
+	 *
+	 * A FUTURE KIT THAT GENUINELY LACKS ONE must narrow this in its own constructor. That is the
+	 * whole point of the check: an ability that is equipped and answers no hook reads to a player as
+	 * a broken ability, not as an empty slot.
+	 */
+	uint8 SlotMask = (1u << static_cast<uint8>(ETraceLoadoutSlot::Movement))
+		| (1u << static_cast<uint8>(ETraceLoadoutSlot::Passive))
+		| (1u << static_cast<uint8>(ETraceLoadoutSlot::Activated));
 };

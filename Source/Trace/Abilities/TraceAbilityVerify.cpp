@@ -1024,3 +1024,174 @@ namespace TraceLoadoutVerify
 		FConsoleCommandDelegate::CreateStatic(&Run));
 }
 #endif   // !UE_BUILD_SHIPPING
+
+#if !UE_BUILD_SHIPPING
+// =================================================================================================
+// Trace.Loadout.Combine — S3a. Do the numeric hooks actually COMBINE across a mixed loadout?
+//
+// Every one of these used to read the single AbilitySet pointer, which after S2 means "whichever kit
+// owns Activated". With a mixed loadout that silently drops two of your three abilities' effects —
+// and drops them QUIETLY: the number is a legal number, just the wrong one.
+//
+// So the test does not check the combine arithmetic against itself (which would be a tautology). It
+// puts a kit whose contribution is NON-DEFAULT into a NON-ACTIVATED slot and asks whether its
+// contribution survives. Under the old code it could not: the pointer pointed elsewhere.
+//
+//   MACE's magnet multiplier in the MOVEMENT slot     -> must still reach GetMagnetRadiusMultiplierFor
+//   CHUT's dash sweep radius in the MOVEMENT slot     -> must still reach GetDashHitSweepRadiusFor
+//
+// And the identity cases, which are what protect a uniform loadout from this change:
+//
+//   a kit with no opinion contributes exactly 1 (or 0 for the sweep, where 0 means "no sweep" and a
+//   PRODUCT would have been actively wrong — one kit declining would cancel a kit that wanted one).
+// =================================================================================================
+namespace TraceLoadoutCombine
+{
+	void Run()
+	{
+		UWorld* World = nullptr;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (Context.World() != nullptr && Context.World()->GetAuthGameMode() != nullptr)
+				{
+					World = Context.World();
+					break;
+				}
+			}
+		}
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[LoadoutCombine] no authoritative world — run this in a match."));
+			return;
+		}
+
+		ATraceCharacter* Pawn = nullptr;
+		UTraceAbilityComponent* Comp = nullptr;
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			if (ATraceCharacter* Candidate = *It)
+			{
+				if (UTraceAbilityComponent* Found = UTraceAbilityComponent::Get(Candidate))
+				{
+					Pawn = Candidate;
+					Comp = Found;
+					break;
+				}
+			}
+		}
+		if (Comp == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[LoadoutCombine] no pawn with an ability component."));
+			return;
+		}
+
+		const FTraceLoadout Restore = Comp->GetLoadout();
+		int32 Failures = 0;
+
+		auto Check = [&Failures](const TCHAR* Label, float Actual, float Expected, const TCHAR* Why)
+		{
+			const bool bPass = FMath::IsNearlyEqual(Actual, Expected, 0.001f);
+			Failures += bPass ? 0 : 1;
+			UE_LOG(LogTraceGame, Display, TEXT("[LoadoutCombine]   %-4s %-46s got %.4f, expected %.4f  |  %s"),
+				bPass ? TEXT("ok") : TEXT("FAIL"), Label, Actual, Expected, Why);
+		};
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[LoadoutCombine] ===== S3a: does a non-Activated kit's number still reach the game? ====="));
+
+		// ---- the reference values, read from the kits themselves so a tuning change cannot stale them
+		FTraceLoadout AllMace = FTraceLoadout::Uniform(ETraceCharacterId::Mace);
+		Comp->ApplyLoadout(AllMace);
+		const float MaceMagnet = UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(Pawn);
+
+		FTraceLoadout AllChut = FTraceLoadout::Uniform(ETraceCharacterId::Chut);
+		Comp->ApplyLoadout(AllChut);
+		const float ChutSweep = UTraceAbilityComponent::GetDashHitSweepRadiusFor(Pawn);
+
+		// ---- a kit with no opinion: the identity cases ----------------------------------------
+		FTraceLoadout AllElle = FTraceLoadout::Uniform(ETraceCharacterId::Elle);
+		Comp->ApplyLoadout(AllElle);
+		Check(TEXT("a kit with no magnet opinion contributes 1"),
+			UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(Pawn), 1.f,
+			TEXT("1 is the identity for a product"));
+		Check(TEXT("a kit wanting no dash sweep contributes 0"),
+			UTraceAbilityComponent::GetDashHitSweepRadiusFor(Pawn), 0.f,
+			TEXT("0 means 'run no sweep'"));
+
+		// ---- THE REAL QUESTION: the contribution is in a slot the legacy pointer never looked at
+		FTraceLoadout MaceMoves;
+		MaceMoves.Movement  = ETraceCharacterId::Mace;    // the magnet lives here now
+		MaceMoves.Passive   = ETraceCharacterId::Elle;
+		MaceMoves.Activated = ETraceCharacterId::Elle;    // ...and the legacy pointer looks HERE
+		Comp->ApplyLoadout(MaceMoves);
+		Check(TEXT("Mace's magnet survives being in MOVEMENT"),
+			UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(Pawn), MaceMagnet,
+			TEXT("pre-S3a this read Elle's 1.0 and Mace's +30% vanished"));
+
+		FTraceLoadout ChutMoves;
+		ChutMoves.Movement  = ETraceCharacterId::Chut;    // the bash sweep lives here now
+		ChutMoves.Passive   = ETraceCharacterId::Elle;
+		ChutMoves.Activated = ETraceCharacterId::Elle;
+		Comp->ApplyLoadout(ChutMoves);
+		Check(TEXT("Chut's dash sweep survives being in MOVEMENT"),
+			UTraceAbilityComponent::GetDashHitSweepRadiusFor(Pawn), ChutSweep,
+			TEXT("pre-S3a this read 0 and the bash simply never swept"));
+
+		// ---- and the uniform case is unchanged, which is the promise S2 made -------------------
+		Comp->ApplyLoadout(AllMace);
+		Check(TEXT("uniform Mace is exactly what it always was"),
+			UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(Pawn), MaceMagnet,
+			TEXT("one kit, counted once, not squared"));
+
+		// ---- every (kit, slot) pair is a legal pick --------------------------------------------
+		int32 IllegalPairs = 0;
+		for (int32 IdIndex = 1; IdIndex < static_cast<int32>(ETraceCharacterId::Count); ++IdIndex)
+		{
+			const ETraceCharacterId Id = static_cast<ETraceCharacterId>(IdIndex);
+			if (UTraceCharacterAbilitySet::FindClassFor(Id) == nullptr)
+			{
+				continue;   // an id nothing implements yet is not an illegal pick, it is an absent one
+			}
+			for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
+			{
+				FTraceLoadout One;
+				One.Set(static_cast<ETraceLoadoutSlot>(SlotIndex), Id);
+				FString Reason;
+				if (!UTraceAbilityComponent::IsLoadoutLegal(One, &Reason))
+				{
+					++IllegalPairs;
+					UE_LOG(LogTraceGame, Error, TEXT("[LoadoutCombine]   FAIL  %s cannot go in %s — %s"),
+						TraceCharacterIdToString(Id),
+						TraceLoadoutSlotToString(static_cast<ETraceLoadoutSlot>(SlotIndex)), *Reason);
+				}
+			}
+		}
+		Failures += IllegalPairs;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[LoadoutCombine]   %-4s every shipped kit is a legal pick for every slot   %d illegal pair(s)"),
+			(IllegalPairs == 0) ? TEXT("ok") : TEXT("FAIL"), IllegalPairs);
+
+		Comp->ApplyLoadout(Restore);
+
+		if (Failures == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[LoadoutCombine] ===== PASS — a kit's number reaches the game from whichever slot "
+				     "it is in. ====="));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[LoadoutCombine] ===== *** FAIL *** %d check(s) — see above ====="), Failures);
+		}
+	}
+
+	FAutoConsoleCommand Cmd(
+		TEXT("Trace.Loadout.Combine"),
+		TEXT("S3a. Prove the numeric hooks combine across a mixed loadout instead of reading only the "
+		     "Activated kit."),
+		FConsoleCommandDelegate::CreateStatic(&Run));
+}
+#endif   // !UE_BUILD_SHIPPING
