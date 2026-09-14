@@ -634,9 +634,35 @@ namespace TraceAbilityVerify
 				const bool bSurvivedDeath = State->RemainingAfterRespawn > 1.f;
 				const bool bClearedAtHalfTime = State->RemainingAfterHalfTime <= 0.01f;
 
+				// *** A REAL HALF TIME DURING THE TEST INVALIDATES IT, AND MUST SAY SO. ***
+				//
+				// The whole measurement is "the cooldown survived a death" — and spec §5 gives half
+				// time the explicit right to clear it. If a genuine interval began between the kill
+				// and this check, the cooldown reads 0 for a correct reason and the test reports a
+				// FAILURE THAT IS NOT ONE.
+				//
+				// That is not hypothetical: it happened three times while the loadout rework was being
+				// built, once for each schedule that happened to put this fixture near the whistle,
+				// and each one cost a round of stashing and rebuilding to disprove. The interval also
+				// got LONGER during that work (12s -> 45s), so the window this lands in is nearly four
+				// times what it was. A test that cries wolf gets ignored, which is worse than a test
+				// that admits it could not measure.
+				const ATraceGameState* HalfTimeState =
+					(TickWorld != nullptr) ? TickWorld->GetGameState<ATraceGameState>() : nullptr;
+				const bool bRealHalfTimeIntervened =
+					(HalfTimeState != nullptr) && HalfTimeState->IsHalfTimeBreak();
+
 				if (!State->bPawnActuallyReplaced)
 				{
 					UE_LOG(LogTraceGame, Error, TEXT("[ABILITYCD] VERDICT: INVALID — the pawn was never replaced."));
+				}
+				else if (bRealHalfTimeIntervened && !bSurvivedDeath)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[ABILITYCD] VERDICT: INCONCLUSIVE — a REAL half time break began during the "
+						     "test, and spec §5 gives half time the right to clear the cooldown. The 0.0s "
+						     "reading is correct behaviour, not a failure, and nothing was measured. "
+						     "Re-run this fixture during play — schedule it well clear of the whistle."));
 				}
 				else if (bSurvivedDeath && bClearedAtHalfTime)
 				{
