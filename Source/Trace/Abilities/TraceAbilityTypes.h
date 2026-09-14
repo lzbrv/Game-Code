@@ -150,6 +150,34 @@ enum class ETraceAbilityBlockReason : uint8
 TRACE_API const TCHAR* TraceAbilityBlockReasonToString(ETraceAbilityBlockReason Reason);
 
 /**
+ * THE THREE LOADOUT SLOTS.
+ *
+ * The rework replaces "you are Rocco" with "you have one movement ability, one passive and one
+ * activated", each of which may come from a different kit. An ability is therefore the PAIR
+ * (source kit, slot): UTraceAbilitySetRoxie in Movement IS the rocket; the same class in Activated
+ * IS Modded.
+ *
+ * THE ORDER IS LOAD-BEARING AND THIS ENUM IS APPEND-ONLY. The values index the per-slot net state
+ * array on UTraceAbilityComponent, so they reach the wire; renumbering them would silently re-point
+ * every client's idea of which ability owns which state. Same contract as ETraceCharacterId's.
+ *
+ * Count is not a slot. It is the array bound, and it is deliberately the last enumerator so that
+ * adding a fourth slot later is one line here plus a wider array rather than a hunt for 3s.
+ */
+UENUM()
+enum class ETraceLoadoutSlot : uint8
+{
+	Movement  = 0,
+	Passive   = 1,
+	Activated = 2,
+
+	Count     UMETA(Hidden)
+};
+
+/** "MOVEMENT" / "PASSIVE" / "ACTIVATED", for logs and for the harnesses. Never player-facing. */
+TRACE_API const TCHAR* TraceLoadoutSlotToString(ETraceLoadoutSlot Slot);
+
+/**
  * The per-character replicated scratch pad.
  *
  * WHY ONE FIXED STRUCT AND NOT A REPLICATED SUBOBJECT PER CHARACTER.

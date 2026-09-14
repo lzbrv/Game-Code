@@ -396,11 +396,39 @@ public:
 	template <typename T>
 	T* GetAbilitySetAs() const { return Cast<T>(AbilitySet); }
 
-	/** The replicated per-character scratch pad. See FTraceAbilityNetState. */
-	const FTraceAbilityNetState& GetNetState() const { return AbilityState; }
+	/**
+	 * The replicated scratch pad for ONE slot. See FTraceAbilityNetState.
+	 *
+	 * PER SLOT SINCE THE LOADOUT REWORK, and that is what makes three abilities on one pawn safe.
+	 * Several kits publish their whole state in one atomic write that begins `Flags = 0` — Mace's
+	 * PublishState is the clearest, wiping the byte and then OR-ing bits that belong to two
+	 * different slots. With one shared struct, two live kits doing that would erase each other every
+	 * frame. With one struct each, the wipe is confined to the slot that owns it and the existing
+	 * bodies are correct unchanged.
+	 */
+	const FTraceAbilityNetState& GetNetState(ETraceLoadoutSlot Slot) const;
+
+	/**
+	 * The pre-rework accessor, kept because ~20 call sites outside the ability layer read it and
+	 * none of them knows what a slot is yet.
+	 *
+	 * *** IT ANSWERS FOR THE ACTIVATED SLOT, NOT FOR "THE STATE". *** While exactly one kit is
+	 * instantiated that kit is in Activated (see UTraceCharacterAbilitySet::Slot's default), so this
+	 * is the same struct it has always returned and every existing reader is unaffected. Once
+	 * loadouts are live, a caller that means a specific ability must say which — the HUD's V row
+	 * wants Movement, the E ring wants Activated. Each of those is a one-word edit at the call site,
+	 * made deliberately rather than by a silent change of meaning here.
+	 */
+	const FTraceAbilityNetState& GetNetState() const { return GetNetState(ETraceLoadoutSlot::Activated); }
 
 	/** SERVER ONLY. Write, then MarkNetStateDirty(). Asserts nothing — returns a scratch on clients. */
-	FTraceAbilityNetState& GetMutableNetState();
+	FTraceAbilityNetState& GetMutableNetState(ETraceLoadoutSlot Slot);
+
+	/** The pre-rework accessor. Answers for the Activated slot — see GetNetState() above. */
+	FTraceAbilityNetState& GetMutableNetState() { return GetMutableNetState(ETraceLoadoutSlot::Activated); }
+
+	/** SERVER. Clears EVERY slot's state. See the note on its definition for why all three. */
+	void ResetAllSlotStates();
 
 	/** SERVER ONLY. Runs OnRep locally so a listen server behaves exactly like a remote client. */
 	void MarkNetStateDirty();
@@ -798,9 +826,18 @@ protected:
 	UPROPERTY(Replicated)
 	float ActivatedCooldownEndMatchTime = 0.f;
 
-	/** REPLICATED. The per-character transient state. See FTraceAbilityNetState. */
+	/**
+	 * REPLICATED. The transient state, ONE STRUCT PER LOADOUT SLOT. See FTraceAbilityNetState.
+	 *
+	 * A fixed C array rather than a TArray: the size is a compile-time property of the slot enum,
+	 * UE replicates static arrays element by element, and a fixed extent means no allocation and no
+	 * way for the two ends to disagree about how many slots exist.
+	 *
+	 * Costs two extra structs on the wire per pawn while only one kit is instantiated. That is the
+	 * price of landing the plumbing before the feature, and it buys a stage that is revertible.
+	 */
 	UPROPERTY(ReplicatedUsing = OnRep_AbilityState)
-	FTraceAbilityNetState AbilityState;
+	FTraceAbilityNetState AbilityState[static_cast<int32>(ETraceLoadoutSlot::Count)];
 
 	/** The live ability set. Constructed on every machine from CharacterId; never replicated. */
 	UPROPERTY(Transient)

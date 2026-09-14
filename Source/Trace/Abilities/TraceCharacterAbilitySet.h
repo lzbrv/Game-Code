@@ -86,6 +86,26 @@ public:
 	// IDENTITY — the one thing every subclass must override
 	// =============================================================================================
 
+	/**
+	 * WHICH SLOT THIS INSTANCE IS FILLING.
+	 *
+	 * The rework instantiates a kit once per slot it was picked for, so the SAME class can be live
+	 * three times on one pawn meaning three different abilities. This is how a body tells which of
+	 * its own abilities it is currently being asked about.
+	 *
+	 * Everything a kit owns that reaches the wire is already funnelled through State() /
+	 * MutableState() / MarkStateDirty() below, and those now route by THIS value — so two instances
+	 * of the same class cannot stomp each other's replicated state, which was the single worst risk
+	 * in the plan and is solved here rather than managed in ten files.
+	 *
+	 * Set once by Initialize() and never again. Defaults to Activated so that the pre-rework path,
+	 * which builds exactly one instance, keeps the slot it has always effectively had.
+	 */
+	ETraceLoadoutSlot GetSlot() const { return Slot; }
+
+	/** Sugar for the guards that go inside a lifecycle body serving more than one slot. */
+	bool IsSlot(ETraceLoadoutSlot InSlot) const { return Slot == InSlot; }
+
 	virtual ETraceCharacterId GetCharacterId() const
 		PURE_VIRTUAL(UTraceCharacterAbilitySet::GetCharacterId, return ETraceCharacterId::None;);
 
@@ -473,7 +493,13 @@ public:
 	// =============================================================================================
 
 	/** Called once by the component immediately after NewObject. */
-	void Initialize(UTraceAbilityComponent* InComponent);
+	/**
+	 * @param InSlot  which of the three loadout slots this instance is filling. See GetSlot().
+	 *                Defaulted so the pre-rework call site, which builds exactly one kit, keeps
+	 *                compiling and keeps the slot it has always effectively had.
+	 */
+	void Initialize(UTraceAbilityComponent* InComponent,
+		ETraceLoadoutSlot InSlot = ETraceLoadoutSlot::Activated);
 
 	virtual UWorld* GetWorld() const override;
 
@@ -489,4 +515,7 @@ public:
 private:
 	UPROPERTY(Transient)
 	TObjectPtr<UTraceAbilityComponent> AbilityComponent = nullptr;
+
+	/** See GetSlot(). Written once by Initialize(); immutable for the life of the instance. */
+	ETraceLoadoutSlot Slot = ETraceLoadoutSlot::Activated;
 };

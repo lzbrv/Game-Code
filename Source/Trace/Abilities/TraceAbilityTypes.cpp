@@ -269,3 +269,14 @@ float TraceAbilityTraits::GetThrowChargePastFullScale(const AActor* Actor)
 	}
 	return 1.f;
 }
+
+const TCHAR* TraceLoadoutSlotToString(ETraceLoadoutSlot Slot)
+{
+	switch (Slot)
+	{
+	case ETraceLoadoutSlot::Movement:  return TEXT("MOVEMENT");
+	case ETraceLoadoutSlot::Passive:   return TEXT("PASSIVE");
+	case ETraceLoadoutSlot::Activated: return TEXT("ACTIVATED");
+	default:                           return TEXT("?");
+	}
+}

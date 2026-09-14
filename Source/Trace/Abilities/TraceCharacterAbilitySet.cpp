@@ -24,9 +24,13 @@ static FTraceAbilityNetState GAbilitySetScratchState;
 // Context
 // =================================================================================================
 
-void UTraceCharacterAbilitySet::Initialize(UTraceAbilityComponent* InComponent)
+void UTraceCharacterAbilitySet::Initialize(UTraceAbilityComponent* InComponent, ETraceLoadoutSlot InSlot)
 {
 	AbilityComponent = InComponent;
+
+	// WRITTEN ONCE, HERE, AND NEVER AGAIN. A kit that could change slot mid-life would be a kit
+	// whose replicated state moves between structs while clients are reading it.
+	Slot = InSlot;
 }
 
 UWorld* UTraceCharacterAbilitySet::GetWorld() const
@@ -74,9 +78,13 @@ float UTraceCharacterAbilitySet::MatchTimeNow() const
 
 const FTraceAbilityNetState& UTraceCharacterAbilitySet::State() const
 {
+	// BY SLOT. This one line, and its two siblings below, are what let the same class be live in two
+	// slots at once without the two instances stamping on each other — see GetSlot(). Every kit in
+	// the build reaches replicated state through these three functions, so routing here is routing
+	// everywhere, and no kit body had to change to get it.
 	if (AbilityComponent != nullptr)
 	{
-		return AbilityComponent->GetNetState();
+		return AbilityComponent->GetNetState(Slot);
 	}
 	GAbilitySetScratchState.Reset();
 	return GAbilitySetScratchState;
@@ -86,7 +94,7 @@ FTraceAbilityNetState& UTraceCharacterAbilitySet::MutableState()
 {
 	if (AbilityComponent != nullptr)
 	{
-		return AbilityComponent->GetMutableNetState();
+		return AbilityComponent->GetMutableNetState(Slot);
 	}
 	GAbilitySetScratchState.Reset();
 	return GAbilitySetScratchState;

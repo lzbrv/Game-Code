@@ -1809,6 +1809,10 @@ void UTraceSlimeStickFxComponent::PollStuckState()
 	// scratch pad, and it is therefore already correct on every machine. Reading it here rather than
 	// being told about it costs one frame of latency and nothing else.
 	const UTraceAbilityComponent* Comp = UTraceAbilityComponent::Get(Pawn);
+	// [SLOT-S3] This reads Slimeball's STICK, which is his MOVEMENT ability, but it reads the
+	// component's default slot because that is where the one pre-rework kit instance lives. When S3
+	// instantiates per slot, this becomes GetNetState(ETraceLoadoutSlot::Movement). Marked rather
+	// than changed now: re-pointing it today would read an empty struct.
 	bStuckNow = (Comp != nullptr)
 		&& Comp->GetCharacterId() == ETraceCharacterId::Slimeball
 		&& (Comp->GetNetState().Flags & TraceAbilityFlags::MovementActive) != 0;
@@ -2030,6 +2034,10 @@ void UTraceSlimeStickSubsystem::Tick(float DeltaTime)
 		//
 		// The forced arm wins when something has taken the goo over through SetStuck(), so the sound
 		// has ONE producer whether the stick came from the kit or from Trace.Slimeball.StickGoo.
+		// [SLOT-S3] This reads Slimeball's STICK, which is his MOVEMENT ability, but it reads the
+		// component's default slot because that is where the one pre-rework kit instance lives. When S3
+		// instantiates per slot, this becomes GetNetState(ETraceLoadoutSlot::Movement). Marked rather
+		// than changed now: re-pointing it today would read an empty struct.
 		const bool bStuck = (Goo != nullptr && Goo->IsForcedStuck())
 			|| ((Comp->GetNetState().Flags & TraceAbilityFlags::MovementActive) != 0);
 

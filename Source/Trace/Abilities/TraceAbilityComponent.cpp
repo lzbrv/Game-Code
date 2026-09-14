@@ -44,6 +44,23 @@
 #include "UI/TraceHUD.h"
 #include "Abilities/Characters/TraceAbilitySetRoxie.h"   // the §7.2 capture fixture only — see the arm
 
+namespace
+{
+	/**
+	 * THE SLOT THE ONE PRE-REWORK INSTANCE LIVES IN.
+	 *
+	 * Named rather than written as a bare 0 or 2 at a dozen sites, because every one of them is a
+	 * place S3 has to revisit when three instances exist: grep this and you have the list. It is
+	 * Activated because that is UTraceCharacterAbilitySet::Slot's default, which is in turn Activated
+	 * because the E ability is the one every kit has.
+	 */
+	constexpr int32 LegacySlotIndex()
+	{
+		return static_cast<int32>(ETraceLoadoutSlot::Activated);
+	}
+}
+
+
 // =================================================================================================
 // THE RED ARM.
 //
@@ -339,7 +356,7 @@ void UTraceAbilityComponent::ServerSetCharacter(ETraceCharacterId NewCharacter)
 				*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(CharacterId));
 		}
 		CharacterId = ETraceCharacterId::None;
-		AbilityState.Reset();
+		ResetAllSlotStates();
 		MarkNetStateDirty();
 		OnRep_CharacterId();
 		return;
@@ -496,7 +513,7 @@ void UTraceAbilityComponent::ServerSetCharacter(ETraceCharacterId NewCharacter)
 	// The transient state belonged to the character that just left, so it goes. THE COOLDOWN DOES
 	// NOT: swapping character mid-match must not be a way to buy a free E, and spec §5 gives exactly
 	// one automatic reset — half time.
-	AbilityState.Reset();
+	ResetAllSlotStates();
 	MarkNetStateDirty();
 
 	// Server-side OnRep, so a listen server's own machine takes the identical path a remote client
@@ -579,8 +596,12 @@ void UTraceAbilityComponent::RouteNetStateEdges()
 
 	if (!bPresentedStateValid)
 	{
-		AbilitySet->SyncClientFx(AbilityState);
-		PresentedState = AbilityState;
+		// THE ACTIVATED SLOT, NAMED RATHER THAN IMPLIED. While exactly one kit is instantiated it
+		// lives in Activated, so this is the struct this code has always read. S3 widens both of
+		// these to route each live slot to its own instance; doing it here, before three instances
+		// exist, would be a loop with one iteration and a comment explaining why.
+		AbilitySet->SyncClientFx(AbilityState[LegacySlotIndex()]);
+		PresentedState = AbilityState[LegacySlotIndex()];
 		bPresentedStateValid = true;
 #if !UE_BUILD_SHIPPING
 		TraceAbilityFxRouterStats::Syncs++;
@@ -588,14 +609,14 @@ void UTraceAbilityComponent::RouteNetStateEdges()
 		return;
 	}
 
-	if (!(PresentedState == AbilityState))
+	if (!(PresentedState == AbilityState[LegacySlotIndex()]))
 	{
 		// PresentedState is updated BEFORE the callback would be a bug in the other direction: a kit
 		// that reads State() inside its own edge handler must see the NEW state, and it does, because
 		// AbilityState is already the new one. Old is the copy this machine last drew.
 		const FTraceAbilityNetState Old = PresentedState;
-		PresentedState = AbilityState;
-		AbilitySet->OnClientStateEdge(Old, AbilityState);
+		PresentedState = AbilityState[LegacySlotIndex()];
+		AbilitySet->OnClientStateEdge(Old, AbilityState[LegacySlotIndex()]);
 #if !UE_BUILD_SHIPPING
 		TraceAbilityFxRouterStats::Edges++;
 #endif
@@ -975,7 +996,7 @@ void UTraceAbilityComponent::OnHalfTime()
 	// nothing else in the framework touches them.
 	ActivatedCooldownEndMatchTime = 0.f;
 	PredictedCooldownEndMatchTime = 0.f;
-	AbilityState.Reset();
+	ResetAllSlotStates();
 	MarkNetStateDirty();
 
 	if (AbilitySet != nullptr)
@@ -1601,14 +1622,40 @@ bool UTraceAbilityComponent::IsBot() const
 	return (MyState != nullptr) && MyState->IsABot();
 }
 
-FTraceAbilityNetState& UTraceAbilityComponent::GetMutableNetState()
+const FTraceAbilityNetState& UTraceAbilityComponent::GetNetState(ETraceLoadoutSlot Slot) const
+{
+	const int32 Index = static_cast<int32>(Slot);
+	if (Index < 0 || Index >= static_cast<int32>(ETraceLoadoutSlot::Count))
+	{
+		// Not reachable from any caller in the build — the enum is the only way in — but this is a
+		// public accessor and an out-of-range read here would be a wire-visible garbage state rather
+		// than a crash, which is the worse of the two failures.
+		GNonAuthorityScratchState.Reset();
+		return GNonAuthorityScratchState;
+	}
+	return AbilityState[Index];
+}
+
+void UTraceAbilityComponent::ResetAllSlotStates()
+{
+	// EVERY SLOT, and that is the point of the helper. The single-struct version of this file said
+	// "the transient state belonged to the character that just left, so it goes"; with three structs
+	// the same sentence has to mean all three, and a Reset() that quietly cleared only one would
+	// leave a dead ability's flags replicating forever.
+	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+	{
+		AbilityState[Index].Reset();
+	}
+}
+
+FTraceAbilityNetState& UTraceAbilityComponent::GetMutableNetState(ETraceLoadoutSlot Slot)
 {
 	if (!HasAuthorityOwner())
 	{
 		GNonAuthorityScratchState.Reset();
 		return GNonAuthorityScratchState;
 	}
-	return AbilityState;
+	return AbilityState[static_cast<int32>(Slot)];
 }
 
 void UTraceAbilityComponent::MarkNetStateDirty()
@@ -2119,19 +2166,30 @@ void UTraceAbilityComponent::ApplyDeathStateWipe()
 	constexpr uint8 RunningBits = static_cast<uint8>(
 		TraceAbilityFlags::EffectActive | TraceAbilityFlags::MovementActive);
 
-	const bool bHadSomethingRunning =
-		((AbilityState.Flags & RunningBits) != 0) || (AbilityState.EffectEndMatchTime != 0.f);
+	// EVERY SLOT. With three abilities live, "was something running" is a question about the pawn,
+	// not about one struct, and a half-time clear that only looked at one would leave the other two
+	// replicating a running effect into the second half.
+	bool bHadSomethingRunning = false;
+	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+	{
+		bHadSomethingRunning = bHadSomethingRunning
+			|| ((AbilityState[Index].Flags & RunningBits) != 0)
+			|| (AbilityState[Index].EffectEndMatchTime != 0.f);
+	}
 
 	if (!bHadSomethingRunning)
 	{
 		return;   // The overwhelmingly common case: nothing was up. No replication, no log.
 	}
 
-	const uint8 FlagsBefore = AbilityState.Flags;
-	const float EffectEndBefore = AbilityState.EffectEndMatchTime;
+	const uint8 FlagsBefore = AbilityState[LegacySlotIndex()].Flags;
+	const float EffectEndBefore = AbilityState[LegacySlotIndex()].EffectEndMatchTime;
 
-	AbilityState.Flags &= static_cast<uint8>(~RunningBits);
-	AbilityState.EffectEndMatchTime = 0.f;
+	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+	{
+		AbilityState[Index].Flags &= static_cast<uint8>(~RunningBits);
+		AbilityState[Index].EffectEndMatchTime = 0.f;
+	}
 	MarkNetStateDirty();
 
 	++GAbilityDeathWipes;
@@ -2142,8 +2200,8 @@ void UTraceAbilityComponent::ApplyDeathStateWipe()
 		TEXT("ready; the second timer (AuxEndMatchTime %.2f) is a cooldown for some characters and is ")
 		TEXT("untouched too."),
 		*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(CharacterId),
-		FlagsBefore, AbilityState.Flags, FMath::Max(0.f, EffectEndBefore - MatchTimeNow()),
-		GetActivatedCooldownRemaining(), AbilityState.AuxEndMatchTime);
+		FlagsBefore, AbilityState[LegacySlotIndex()].Flags, FMath::Max(0.f, EffectEndBefore - MatchTimeNow()),
+		GetActivatedCooldownRemaining(), AbilityState[LegacySlotIndex()].AuxEndMatchTime);
 }
 
 void UTraceAbilityComponent::NotifyKill(ATraceCharacter* Victim, FName Cause, bool bHeadshot)
