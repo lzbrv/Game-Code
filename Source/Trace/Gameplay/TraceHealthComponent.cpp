@@ -773,6 +773,11 @@ void UTraceHealthComponent::ApplyDamage(float Amount, AController* Instigator, F
 	//
 	// Like the carrier branch, this returns BEFORE the regen clock is stamped: damage that never
 	// landed must not postpone anyone's healing.
+	// NOTE FOR TEST FIXTURES: a harness that kills a pawn by calling ApplyDamage will find it does
+	// nothing during the break, which looks exactly like the ability under test having broken. It was
+	// confusing once already — Trace.Ability.CooldownPersistenceTest scheduled at t=45s landed inside
+	// a real interval and reported a cooldown failure that was actually this gate refusing its kill.
+	// Schedule such a fixture during play, or end the pawn by a route that is not damage.
 	if (const ATraceGameState* TraceGS = GetWorld() ? GetWorld()->GetGameState<ATraceGameState>() : nullptr)
 	{
 		if (TraceGS->IsHalfTimeBreak())
