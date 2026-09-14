@@ -130,3 +130,35 @@ argument renders as a visible `{1}` rather than dereferencing whatever was on th
 precision or width in the code, in its own `Printf` with a literal format, as above.
 
 Then run `Trace.Text.Dump` to add it to the document.
+
+---
+
+## The ability names
+
+The loadout rework gave all thirty abilities names of their own, and they live in the same file as
+every other word in the game:
+
+```ini
+[ABILITY.MOVEMENT]
+ROCCO                              = HOP
+OYSTER                             = POP
+
+[ABILITY.PASSIVE]
+SLIMEBALL                          = PERCH
+
+[ABILITY.ACTIVATED]
+ROCCO                              = RIPPLE
+```
+
+The key on the left is `<SLOT>.<WHOSE ABILITY IT IS>`. That second half is a leftover from when the
+game had characters, and it is deliberately still there: it is how the code identifies which ability
+is which, so renaming it would break the link the same way renaming any other key does. The player
+never sees it — only the name on the right.
+
+Three activated abilities were renamed away from character names when the characters went away:
+CHUD became BRACE, PICKLER became LOB, and SLIMEWALL became SCREEN. The other seven were already
+neutral and were left alone.
+
+**The descriptions are not here.** An ability's one-line explanation still comes from the character
+roster (`CHARACTER.<NAME>.MOVEMENT`, `.PASSIVE`, `.ACTIVATED_DESC`), which is the same prose the old
+character screen showed. Both screens read it, so retuning an ability is still one line to edit.
