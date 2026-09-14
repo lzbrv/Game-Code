@@ -551,11 +551,41 @@ void UTraceAbilitySetSlimeball::ApplyStick(float DeltaSeconds)
 
 bool UTraceAbilitySetSlimeball::IsStuck() const
 {
-	if (ShouldDriveMovement())
+	// *** STUCK BY ANY MEANS, NOT ONLY BY MY OWN HALF. *** [S3f — the PERCH rewrite]
+	//
+	// The stick is the MOVEMENT ability and the fire-rate bonus is the PASSIVE one. Before loadouts
+	// those were always the same instance, so "am I stuck" and "did I stick myself" were the same
+	// question. They are not any more: a player who takes the passive without the stick was asking a
+	// question only the other half could answer, and the passive was dead — no error, no feedback,
+	// just an ability that never once fired.
+	//
+	// So this now asks the PAWN's state rather than this object's. Own state first, because when this
+	// instance is driving the movement it is the freshest source and costs nothing; then the player's
+	// movement-slot kit, which is where a separate Slimeball instance publishes its stick.
+	if (ShouldDriveMovement() && bStuck)
 	{
-		return bStuck;
+		return true;
 	}
-	return (State().Flags & TraceSlimeballFlags::Stuck) != 0;
+	if ((State().Flags & TraceSlimeballFlags::Stuck) != 0)
+	{
+		return true;
+	}
+
+	// THE OTHER HALF, if the player equipped it in a different slot from this one.
+	if (const UTraceAbilityComponent* Comp = GetAbilityComponent())
+	{
+		if (Comp->IsKitIn(ETraceCharacterId::Slimeball, ETraceLoadoutSlot::Movement)
+			&& (Comp->GetNetStateOfKitIn(ETraceLoadoutSlot::Movement).Flags & TraceSlimeballFlags::Stuck) != 0)
+		{
+			return true;
+		}
+	}
+
+	// RESIDUAL, STATED PLAINLY: a player who equips this passive with NO stick source at all still
+	// cannot trigger it. Every source of "stuck" in the build today is Slimeball's own movement
+	// ability. Widening further means inventing a new way to be stuck — a design addition, not a
+	// plumbing fix — so it is named here rather than quietly approximated.
+	return false;
 }
 
 float UTraceAbilitySetSlimeball::GetStickSecondsRemaining() const

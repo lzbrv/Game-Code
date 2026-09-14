@@ -649,7 +649,7 @@ void UTraceAbilityComponent::OnRep_CharacterId()
 	// The previous character's presentation is not a baseline for this one's: the same Flags bits mean
 	// different things to different kits, so a diff across a swap would hand the new set an edge that
 	// never happened. Forget what was drawn; RebuildAbilitySet's SYNC re-establishes it.
-	bPresentedStateValid = false;
+	ForgetPresentedState();
 
 	RebuildAbilitySet();
 }
@@ -677,42 +677,64 @@ void UTraceAbilityComponent::OnRep_AbilityState()
 
 void UTraceAbilityComponent::RouteNetStateEdges()
 {
-	if (AbilitySet == nullptr)
+	if (EquippedSets.Num() == 0)
 	{
-		// The set is built by OnRep_CharacterId, and the two OnReps arrive in whatever order the
-		// property order and the packet decide. Losing the race is normal, not an error: the state is
-		// already stored, and the next sight of it — the tick, or RebuildAbilitySet's own call — is a
-		// SYNC that hands the new set the whole world at once. Flag it so, and drop this one.
-		bPresentedStateValid = false;
+		// The sets are built by OnRep_CharacterId / OnRep_Loadout, and the OnReps arrive in whatever
+		// order the property order and the packet decide. Losing the race is normal, not an error: the
+		// state is already stored, and the next sight of it — the tick, or RebuildAbilitySet's own call
+		// — is a SYNC that hands the new sets the whole world at once. Flag it so, and drop this one.
+		ForgetPresentedState();
 		return;
 	}
 
-	if (!bPresentedStateValid)
+	// ONE DIFF PER KIT, against that kit's own slot. A kit filed under Activated must not be handed an
+	// edge because the Movement kit's flags moved: the same bit means different things to different
+	// kits, so a shared mirror would fire every kit's Fx whenever any kit changed.
+	for (const TObjectPtr<UTraceCharacterAbilitySet>& Equipped : EquippedSets)
 	{
+		if (Equipped == nullptr)
+		{
+			continue;
+		}
+
+		UTraceCharacterAbilitySet* Set = Equipped.Get();
+		const int32 SlotIndex = static_cast<int32>(Set->GetSlot());
+
+		if (!bPresentedStateValid[SlotIndex])
+		{
 		// THE ACTIVATED SLOT, NAMED RATHER THAN IMPLIED. While exactly one kit is instantiated it
 		// lives in Activated, so this is the struct this code has always read. S3 widens both of
 		// these to route each live slot to its own instance; doing it here, before three instances
 		// exist, would be a loop with one iteration and a comment explaining why.
-		AbilitySet->SyncClientFx(AbilityState[LegacySlotIndex()]);
-		PresentedState = AbilityState[LegacySlotIndex()];
-		bPresentedStateValid = true;
+			Set->SyncClientFx(AbilityState[SlotIndex]);
+			PresentedState[SlotIndex] = AbilityState[SlotIndex];
+			bPresentedStateValid[SlotIndex] = true;
 #if !UE_BUILD_SHIPPING
-		TraceAbilityFxRouterStats::Syncs++;
+			TraceAbilityFxRouterStats::Syncs++;
 #endif
-		return;
-	}
+			continue;   // CONTINUE, not return: the other kits have their own first sight to serve.
+		}
 
-	if (!(PresentedState == AbilityState[LegacySlotIndex()]))
-	{
-		// PresentedState is updated BEFORE the callback would be a bug in the other direction: a kit
-		// that reads State() inside its own edge handler must see the NEW state, and it does, because
-		// AbilityState is already the new one. Old is the copy this machine last drew.
-		const FTraceAbilityNetState Old = PresentedState;
-		PresentedState = AbilityState[LegacySlotIndex()];
-		AbilitySet->OnClientStateEdge(Old, AbilityState[LegacySlotIndex()]);
+		if (!(PresentedState[SlotIndex] == AbilityState[SlotIndex]))
+		{
+			// PresentedState is updated BEFORE the callback would be a bug in the other direction: a
+			// kit that reads State() inside its own edge handler must see the NEW state, and it does,
+			// because AbilityState is already the new one. Old is the copy this machine last drew.
+			const FTraceAbilityNetState Old = PresentedState[SlotIndex];
+			PresentedState[SlotIndex] = AbilityState[SlotIndex];
+			Set->OnClientStateEdge(Old, AbilityState[SlotIndex]);
 #if !UE_BUILD_SHIPPING
-		TraceAbilityFxRouterStats::Edges++;
+			TraceAbilityFxRouterStats::Edges++;
 #endif
+		}
+	}
+}
+
+void UTraceAbilityComponent::ForgetPresentedState()
+{
+	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+	{
+		bPresentedStateValid[Index] = false;
 	}
 }
 
@@ -816,9 +838,11 @@ float UTraceAbilityComponent::GetActivatedCooldownRemaining() const
 	// Elle's fluffed Snap cast leaves the framework at zero while she refuses for up to 31 s, and a
 	// ring that reads READY on a button that does nothing is the worst of the available lies. Max, so
 	// a character can only ever be more conservative than the framework, never less.
-	if (AbilitySet != nullptr)
+	// THE ACTIVATED KIT, NAMED. This widens the E ring, so the kit that owns E is the only one that
+	// may widen it — asking a movement kit would let Roxie's 35 s rocket grey out somebody else's E.
+	if (const UTraceCharacterAbilitySet* Activated = GetAbilitySetForSlot(ETraceLoadoutSlot::Activated))
 	{
-		return FMath::Max(FrameworkRemaining, FMath::Max(0.f, AbilitySet->GetCharacterOwnedCooldownRemaining()));
+		return FMath::Max(FrameworkRemaining, FMath::Max(0.f, Activated->GetCharacterOwnedCooldownRemaining()));
 	}
 
 	return FrameworkRemaining;
@@ -856,12 +880,18 @@ static TAutoConsoleVariable<int32> CVarVRowRoxieFixture(
 bool UTraceAbilityComponent::GetSecondaryCooldownDisplay(float& OutRemaining, float& OutDuration,
                                                          FString& OutLabel) const
 {
-	if (AbilitySet == nullptr)
-	{
-		return false;
-	}
+	// OFFERED IN THE SAME ORDER V ITSELF IS. Whoever would consume the press is who should describe
+	// its cooldown, so the label and the key agree; asking one fixed kit would caption the V meter
+	// with an ability that is not on V for this player.
+	bool bAnswered = false;
+	OfferUntilConsumed(*this,
+		[&](UTraceCharacterAbilitySet* Set)
+		{
+			bAnswered = Set->GetSecondaryCooldownDisplay(OutRemaining, OutDuration, OutLabel);
+			return bAnswered;
+		});
 
-	if (AbilitySet->GetSecondaryCooldownDisplay(OutRemaining, OutDuration, OutLabel))
+	if (bAnswered)
 	{
 		// The character answered. Clamp rather than trust: a negative remaining would draw a meter
 		// running backwards, and a zero duration is a divide in the HUD's fraction.
@@ -992,8 +1022,17 @@ bool UTraceAbilityComponent::TryActivate()
 		return false;
 	}
 
+	// *** THE E KEY IS THE ACTIVATED SLOT'S, AND ONLY ITS. *** AbilitySet falls back to the first
+	// equipped kit when no kit fills Activated, which is right for the ~20 legacy identity readers it
+	// exists for and WRONG here: it would fire a movement kit's E off a slot the player left empty.
+	UTraceCharacterAbilitySet* const ActivatedSet = GetAbilitySetForSlot(ETraceLoadoutSlot::Activated);
+	if (ActivatedSet == nullptr)
+	{
+		return false;   // no activated ability equipped. E does nothing, silently, as an empty slot should.
+	}
+
 	FText Reason;
-	if (!AbilitySet->CanActivate(Reason))
+	if (!ActivatedSet->CanActivate(Reason))
 	{
 		// FX plan §7.1, producer 2 — AND THE ONE THAT CLOSES F3. The FText was already being
 		// produced here and dropped; Mortimer's posture refusals (TraceAbilitySetMortimer.h
@@ -1009,14 +1048,14 @@ bool UTraceAbilityComponent::TryActivate()
 	}
 
 	// ---- fire ------------------------------------------------------------------------------------
-	const bool bFired = AbilitySet->ActivateAbility();
+	const bool bFired = ActivatedSet->ActivateAbility();
 	if (!bFired)
 	{
 		// A deliberate fizzle. The character chose not to be charged for it.
 		return false;
 	}
 
-	const float Cooldown = FMath::Max(0.f, AbilitySet->GetActivatedCooldownSeconds());
+	const float Cooldown = FMath::Max(0.f, ActivatedSet->GetActivatedCooldownSeconds());
 	const float Deadline = MatchTimeNow() + Cooldown;
 
 	if (HasAuthorityOwner())
@@ -1748,6 +1787,47 @@ ETraceLoadoutSlot UTraceAbilityComponent::GetStateSlotFor(ETraceLoadoutSlot Slot
 	return (Set != nullptr) ? Set->GetSlot() : Slot;
 }
 
+bool UTraceAbilityComponent::IsLoadoutChangeOpen() const
+{
+	// THE SELECT WINDOW. The game mode owns it — it opens it before a half and for a mid-warm-up
+	// joiner, and closes it at the whistle — so this asks rather than re-deriving the rule and
+	// getting a different answer from the screen the player is looking at.
+	if (const ATracePlayerState* OwningState = Cast<ATracePlayerState>(GetOwningPlayerState()))
+	{
+		if (OwningState->IsCharacterSelectOpen())
+		{
+			return true;
+		}
+	}
+
+	if (const UWorld* MyWorld = GetWorld())
+	{
+		if (const ATraceGameState* TraceGS = MyWorld->GetGameState<ATraceGameState>())
+		{
+			// HALF TIME, the one window spec §5 names.
+			if (TraceGS->IsHalfTimeBreak())
+			{
+				return true;
+			}
+
+			// BEFORE THE WHISTLE. Warm-up and the pre-match lobby are not "play", and a build with no
+			// select screen wired yet (or a bot set up by a fixture) must still be able to be given a
+			// loadout. Locking here would make the rework unreachable rather than safe.
+			if (TraceGS->TraceMatchState != ETraceMatchState::InProgress)
+			{
+				return true;
+			}
+		}
+		else
+		{
+			// No Trace game state at all — a fixture world or a unit test. Nothing to lock against.
+			return true;
+		}
+	}
+
+	return false;
+}
+
 bool UTraceAbilityComponent::IsLoadoutLegal(const FTraceLoadout& InLoadout, FString* OutReason)
 {
 	// EMPTY IS LEGAL. That is the Mannequin — no kit, no abilities — and it is a real state the game
@@ -1796,6 +1876,27 @@ bool UTraceAbilityComponent::ServerSetLoadout(const FTraceLoadout& InLoadout)
 		UE_LOG(LogTraceGame, Warning,
 			TEXT("[Loadout] ServerSetLoadout called without authority — ignored. A client changes its "
 			     "loadout by asking the server, never by building one locally."));
+		return false;
+	}
+
+	// *** THE LOCK. *** [S4] Spec: "after selecting the abilities you want to equip, loadout is locked
+	// until halftime." A loadout you can rewrite mid-fight is not a loadout, it is a menu — every
+	// engagement becomes a question of who paused to counter-pick, and no ability's cooldown means
+	// anything because the answer is always to swap off it.
+	//
+	// TWO WINDOWS, AND THEY ARE THE TWO THE PLAYER IS ALREADY LOOKING AT A SCREEN IN: the select
+	// window before a half (bCharacterSelectOpen, which the game mode opens and closes and which also
+	// covers warm-up and a mid-warm-up joiner), and the half time break. Outside them the server says
+	// no and says why, rather than accepting a change the player would then watch not happen.
+	//
+	// SERVER-SIDE, and it has to be: a client that skipped its own UI gate is exactly the client this
+	// rule exists to stop.
+	if (!IsLoadoutChangeOpen())
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Loadout] %s refused %s — locked. Loadouts change at the select screen or at half "
+			     "time, not during play."),
+			*GetNameSafe(GetOwningPlayerState()), *TraceLoadoutToString(InLoadout));
 		return false;
 	}
 

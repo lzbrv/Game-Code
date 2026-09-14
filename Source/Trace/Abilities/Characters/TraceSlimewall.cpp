@@ -1809,13 +1809,13 @@ void UTraceSlimeStickFxComponent::PollStuckState()
 	// scratch pad, and it is therefore already correct on every machine. Reading it here rather than
 	// being told about it costs one frame of latency and nothing else.
 	const UTraceAbilityComponent* Comp = UTraceAbilityComponent::Get(Pawn);
-	// [SLOT-S3] This reads Slimeball's STICK, which is his MOVEMENT ability, but it reads the
-	// component's default slot because that is where the one pre-rework kit instance lives. When S3
-	// instantiates per slot, this becomes GetNetState(ETraceLoadoutSlot::Movement). Marked rather
-	// than changed now: re-pointing it today would read an empty struct.
+	// THE MOVEMENT SLOT, because the stick is Slimeball's MOVEMENT ability — not "is this player
+	// Slimeball", which after the loadout rework is a question about their face, not their abilities.
+	// GetNetStateOfKitIn does the extra hop a multi-slot kit needs: its one struct is filed under the
+	// highest slot it holds, which is not necessarily the slot being asked about.
 	bStuckNow = (Comp != nullptr)
-		&& Comp->GetCharacterId() == ETraceCharacterId::Slimeball
-		&& (Comp->GetNetState().Flags & TraceAbilityFlags::MovementActive) != 0;
+		&& Comp->IsKitIn(ETraceCharacterId::Slimeball, ETraceLoadoutSlot::Movement)
+		&& (Comp->GetNetStateOfKitIn(ETraceLoadoutSlot::Movement).Flags & TraceAbilityFlags::MovementActive) != 0;
 }
 
 void UTraceSlimeStickFxComponent::TickComponent(float DeltaTime, ELevelTick TickType,
@@ -2034,12 +2034,11 @@ void UTraceSlimeStickSubsystem::Tick(float DeltaTime)
 		//
 		// The forced arm wins when something has taken the goo over through SetStuck(), so the sound
 		// has ONE producer whether the stick came from the kit or from Trace.Slimeball.StickGoo.
-		// [SLOT-S3] This reads Slimeball's STICK, which is his MOVEMENT ability, but it reads the
-		// component's default slot because that is where the one pre-rework kit instance lives. When S3
-		// instantiates per slot, this becomes GetNetState(ETraceLoadoutSlot::Movement). Marked rather
-		// than changed now: re-pointing it today would read an empty struct.
+		// THE MOVEMENT SLOT — the stick is Slimeball's MOVEMENT ability. Same read the goo makes one
+		// level down, so there is still exactly one source of truth for "stuck".
 		const bool bStuck = (Goo != nullptr && Goo->IsForcedStuck())
-			|| ((Comp->GetNetState().Flags & TraceAbilityFlags::MovementActive) != 0);
+			|| (Comp->IsKitIn(ETraceCharacterId::Slimeball, ETraceLoadoutSlot::Movement)
+				&& (Comp->GetNetStateOfKitIn(ETraceLoadoutSlot::Movement).Flags & TraceAbilityFlags::MovementActive) != 0);
 
 		const TWeakObjectPtr<UTraceAbilityComponent> Key(Comp);
 		const bool bWas = WereStuck.Contains(Key);

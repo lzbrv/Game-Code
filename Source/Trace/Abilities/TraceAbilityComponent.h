@@ -410,6 +410,33 @@ public:
 	const FTraceLoadout& GetLoadout() const { return Loadout; }
 
 	/**
+	 * True when @p Slot is filled by kit @p Id.
+	 *
+	 * *** THE REPLACEMENT FOR `GetCharacterId() == Someone`. *** That test used to mean "this player
+	 * has that character's abilities", and it stopped meaning it the moment a loadout could mix: the
+	 * character id is now the identity byte — which face, which scoreboard column — and says nothing
+	 * about what is equipped. Code outside the ability files asking "is this a stuck Slimeball?" wants
+	 * this, and asking the old way silently answers about somebody's cosmetic choice.
+	 */
+	bool IsKitIn(ETraceCharacterId Id, ETraceLoadoutSlot Slot) const
+	{
+		return Loadout.Get(Slot) == Id && Id != ETraceCharacterId::None;
+	}
+
+	/**
+	 * The replicated struct belonging to whichever kit fills @p Slot.
+	 *
+	 * A kit covering several slots keeps ONE struct, filed under the highest slot it holds, so the
+	 * slot you ask about is not always the slot the state lives in. This does that hop for you.
+	 * Reading GetNetState(TheSlotIWant) directly is the bug this exists to prevent: it compiles, it
+	 * returns a real struct, and for a multi-slot kit it is the wrong one — all zeroes.
+	 */
+	const FTraceAbilityNetState& GetNetStateOfKitIn(ETraceLoadoutSlot Slot) const
+	{
+		return GetNetState(GetStateSlotFor(Slot));
+	}
+
+	/**
 	 * SERVER. Tear down whatever is equipped and build the kits @p InLoadout names.
 	 *
 	 * Rebuilds unconditionally, because a partial swap would leave one kit's OnUnequipped unrun.
@@ -430,6 +457,16 @@ public:
 	 * than showing a player a selection the server never accepted.
 	 */
 	bool ServerSetLoadout(const FTraceLoadout& InLoadout);
+
+	/**
+	 * Is the loadout open to change right now?
+	 *
+	 * True at the select screen, during the half time break, and any time the match is not running.
+	 * False during play — that is the lock. UI asks this to decide whether to offer the screen at
+	 * all; ServerSetLoadout asks it again because a client that skipped its own gate is the client
+	 * the rule exists for.
+	 */
+	bool IsLoadoutChangeOpen() const;
 
 	/** Would ServerSetLoadout accept this? Pure — safe to ask from UI to grey out an illegal pick. */
 	static bool IsLoadoutLegal(const FTraceLoadout& InLoadout, FString* OutReason = nullptr);
@@ -927,7 +964,12 @@ protected:
 	 * what the server's own FX have been told, each client's copy tracks its own. A replicated
 	 * "presented" state would be one machine's presentation imposed on all of them.
 	 */
-	FTraceAbilityNetState PresentedState;
+	// ONE PER SLOT, because there is now one kit per slot and each publishes its own struct. A single
+	// mirror would diff three kits' states against one memory of what was drawn: the first kit to
+	// change would make the other two look changed too, and every kit would get an edge callback for
+	// somebody else's bit flipping. Fx is exactly where that is most visible — auras and sounds firing
+	// on abilities that did nothing.
+	FTraceAbilityNetState PresentedState[static_cast<int32>(ETraceLoadoutSlot::Count)];
 
 	/**
 	 * False until this machine has seen a valid state at least once. The FIRST sight is a SYNC (attach
@@ -937,7 +979,7 @@ protected:
 	 * meaningless as a diff baseline: the new set must be told "here is the world", not "here is what
 	 * changed since somebody else's ability".
 	 */
-	bool bPresentedStateValid = false;
+	bool bPresentedStateValid[static_cast<int32>(ETraceLoadoutSlot::Count)] = { false, false, false };
 
 public:
 	/**
@@ -959,12 +1001,26 @@ public:
 	 */
 	void RouteNetStateEdges();
 
+	/**
+	 * Forgets what every slot last drew, so the next route is a SYNC rather than a diff.
+	 *
+	 * ALL SLOTS, ALWAYS. The reason is the same one that made this an array: a loadout change or a
+	 * character swap can replace any subset of the kits, and the same Flags bits mean different
+	 * things to different kits. Clearing only the slot that changed would diff a NEW kit's state
+	 * against the OLD kit's memory and hand it an edge that never happened.
+	 */
+	void ForgetPresentedState();
+
 #if !UE_BUILD_SHIPPING
 	/** DEV ONLY. Forces the next RouteNetStateEdges() to be a first sight — Trace.Fx.SyncTest's seam. */
-	void DebugForgetPresentedState() { bPresentedStateValid = false; }
+	void DebugForgetPresentedState() { ForgetPresentedState(); }
 
 	/** DEV ONLY. What this machine has been shown, for the router harness's before/after compare. */
-	const FTraceAbilityNetState& DebugGetPresentedState() const { return PresentedState; }
+	/** The Activated slot's mirror — the one a single-kit test means when it says "what was drawn". */
+	const FTraceAbilityNetState& DebugGetPresentedState() const
+	{
+		return PresentedState[static_cast<int32>(ETraceLoadoutSlot::Activated)];
+	}
 #endif
 
 private:

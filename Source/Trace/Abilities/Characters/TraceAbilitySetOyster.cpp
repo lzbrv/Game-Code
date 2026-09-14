@@ -4,6 +4,7 @@
 
 #include "Components/CapsuleComponent.h"
 #include "Engine/World.h"
+#include "EngineUtils.h"                  // TActorIterator — FindOwnJarNear walks the world's jars
 #include "GameFramework/PlayerState.h"
 #include "HAL/IConsoleManager.h"
 
@@ -232,10 +233,33 @@ ATraceOysterJar* UTraceAbilitySetOyster::FindOwnJarNear(const FVector& Location)
 	ATraceOysterJar* Best = nullptr;
 	float BestDistance = MAX_flt;
 
-	for (const TWeakObjectPtr<ATraceOysterJar>& Entry : LiveJars)
+	// *** ANY JAR YOU OWN, NOT JUST ONE THIS INSTANCE SPAWNED. *** [S3f — the POP rewrite]
+	//
+	// This used to walk LiveJars, which is THIS kit instance's private list. Before loadouts that was
+	// the same thing: one Oyster instance made every jar and jumped off every jar. It is no longer.
+	// The jar jump is the MOVEMENT ability and the jars come from the PASSIVE and the ACTIVATED, so
+	// an instance holding only the movement slot has an empty LiveJars and POP was simply dead —
+	// a pick that does nothing, with no error to explain it.
+	//
+	// So the question becomes the one the ability actually asks: is there a jar of MINE under my
+	// feet. Ownership is the jar's source component, which is the PLAYER's component, not the kit
+	// instance's — so a jar from any of your own Oyster slots counts, however you got it.
+	//
+	// RESIDUAL, STATED PLAINLY: POP is still inert for a player who equips it with NO jar source at
+	// all. Making it fully standalone means dropping the ownership test so you can vault off an
+	// ENEMY's jar — a one-line change here, deliberately not made, because it hands POP a use against
+	// the character it is stolen from and that is a balance call, not a plumbing one.
+	const UTraceAbilityComponent* MyComp = GetAbilityComponent();
+	const UWorld* CurrentWorld = GetWorld();
+	if (MyComp == nullptr || CurrentWorld == nullptr)
 	{
-		ATraceOysterJar* JarActor = Entry.Get();
-		if (JarActor == nullptr || !JarActor->IsGrounded())
+		return nullptr;
+	}
+
+	for (TActorIterator<ATraceOysterJar> It(const_cast<UWorld*>(CurrentWorld)); It; ++It)
+	{
+		ATraceOysterJar* JarActor = *It;
+		if (JarActor == nullptr || !JarActor->IsGrounded() || JarActor->GetSourceComponent() != MyComp)
 		{
 			continue;
 		}
