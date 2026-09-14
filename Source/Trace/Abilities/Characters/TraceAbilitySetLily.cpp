@@ -35,6 +35,7 @@
 #include "Settings/TraceUserSettings.h"                   // the player's Jump / Crouch binds
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "Abilities/Characters/TraceVerifyLock.h"   // one character fixture at a time
 
 #define LOCTEXT_NAMESPACE "TraceLily"
 
@@ -3014,6 +3015,18 @@ namespace TraceLilyVerifyFile
 	/** The numbers §3 states, checked against the knobs, plus an honest note about what is not wired. */
 	void RunLilyVerify()
 	{
+
+		// ONE CHARACTER FIXTURE AT A TIME. These run on tickers across many frames and all steer
+		// the SAME pawn, so two from one -TraceExec list interleave and each reports the other's
+		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Lily.Verify")))
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[LILY] QUEUED behind %s — it will start automatically when that finishes. "
+				     "(If it never starts, the holder died without releasing — see TraceVerifyLock.h.)"),
+				*TraceVerifyLock::CurrentHolder());
+			return;
+		}
 		const TCHAR* const Tag = TEXT("LILY");
 		const UTraceSettings& Settings = UTraceSettings::Get();
 

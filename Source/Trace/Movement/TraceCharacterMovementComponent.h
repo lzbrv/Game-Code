@@ -1271,6 +1271,24 @@ public:
 	 */
 	float GetDashTimeRemaining() const { return FMath::Max(0.f, DashTimeRemaining); }
 
+#if !UE_BUILD_SHIPPING
+	/**
+	 * TEST SEAM — supply the wish direction a headless fixture cannot get through the input path.
+	 *
+	 * UCharacterMovementComponent turns AddMovementInput into `Acceleration` inside
+	 * ControlledCharacterMove, which a harness driving a pawn with no live controller never reaches:
+	 * Trace.Rocco.Verify pumped AddMovementInput(bForce=true) for sixty frames and read zero every
+	 * time, with the input demonstrably NOT ignored. That left Rocco's headline ability — "the point
+	 * is the instant midair direction change" — reported as NOT EXERCISED and covered by nothing.
+	 *
+	 * WHAT THIS DOES AND DOES NOT BUY. Acceleration is the INPUT to that redirect, so writing it here
+	 * and then asserting the velocity turns is a test of Rocco's code. It is NOT a test of the engine
+	 * pipeline that normally produces Acceleration — that half stays uncovered, and the harness says
+	 * so in its own output rather than letting a green line imply otherwise.
+	 */
+	void DebugSetAcceleration(const FVector& InAcceleration) { Acceleration = InAcceleration; }
+#endif
+
 	// --- SPEC v10 §1: THE KNIFE'S MOVEMENT PROFILE -------------------------------------------------
 
 	/**

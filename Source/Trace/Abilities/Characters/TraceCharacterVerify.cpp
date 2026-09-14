@@ -54,6 +54,8 @@
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "Misc/ScopeExit.h"
+#include "Abilities/Characters/TraceVerifyLock.h"   // one character fixture at a time
 
 namespace TraceCharacterVerify
 {
@@ -338,6 +340,11 @@ namespace TraceCharacterVerify
 
 	void ReportRoccoVerdict(TSharedPtr<FRoccoRun> Run)
 	{
+
+		// THE SUBJECT IS FREE AGAIN. Released at the VERDICT rather than at the end of the last
+		// arm, because the verdict is the last thing that reads the pawn — and released here rather
+		// than nowhere so a batch runs these in sequence instead of refusing the second one.
+		ON_SCOPE_EXIT{ TraceVerifyLock::Release(TEXT("Trace.Rocco.Verify")); };
 		const UTraceSettings& Settings = UTraceSettings::Get();
 
 		UE_LOG(LogTraceGame, Display,
@@ -774,6 +781,26 @@ namespace TraceCharacterVerify
 				return false;
 			}
 
+			// *** THE INPUT PATH NEVER ARRIVES HEADLESSLY, SO SUPPLY THE WISH DIRECTLY. ***
+			//
+			// Sixty pumped frames of AddMovementInput(bForce = true) produce nothing here and the
+			// input is demonstrably NOT ignored: UCharacterMovementComponent only turns the input
+			// vector into `Acceleration` inside ControlledCharacterMove, which a harness driving a
+			// pawn with no live controller does not reach. That left §6's ACTUAL point — "the point is
+			// the instant midair direction change, not the height" — asserted by nothing at all,
+			// while the two smaller halves of the ability were covered.
+			//
+			// Acceleration is the INPUT to Rocco's redirect, so writing it and then asserting the
+			// velocity turns is a test of ROCCO. It is not a test of the engine pipeline that normally
+			// fills Acceleration in — and the note below says so, because a green line that quietly
+			// widened its own claim is the failure this file exists to avoid.
+			bool bWishFromSeam = false;
+			if (Move->GetCurrentAcceleration().IsNearlyZero())
+			{
+				Move->DebugSetAcceleration(FVector(0.f, Move->GetMaxSpeed(), 0.f));
+				bWishFromSeam = true;
+			}
+
 			const FVector Before = Move->Velocity;
 			const FVector Wish = Move->GetCurrentAcceleration();
 
@@ -805,6 +832,8 @@ namespace TraceCharacterVerify
 			// answers and this project has been bitten by conflating them.
 			if (Wish.IsNearlyZero())
 			{
+				// Now genuinely unreachable — the seam above cannot fail — but kept so that a future
+				// change which removes the seam reports the gap instead of silently skipping it.
 				++Run->Current.NotExercised;
 				Run->Current.NotExercisedNotes.Add(FString::Printf(
 					TEXT("the midair REDIRECT (§6's 'change direction instantly'): Acceleration stayed zero after "
@@ -813,11 +842,22 @@ namespace TraceCharacterVerify
 			}
 			else
 			{
+				// THE TURN, AND IT MUST BE A REAL ONE. Rocco went in at (600, 0) — all X, no Y — and
+				// the wish points along +Y, so a redirect that happened leaves more Y than X. The
+				// planar SPEED is preserved rather than granted (his code lerps toward wish * speed),
+				// so this also checks the momentum survived the turn: a redirect that zeroed his speed
+				// would pass a direction test and still be the wrong ability.
+				const float SpeedBefore = Before.Size2D();
+				const float SpeedAfter = After.Size2D();
 				const bool bRedirected = FMath::Abs(After.Y) > FMath::Abs(After.X);
+				const bool bSpeedKept = SpeedAfter >= SpeedBefore * 0.9f;
+
 				Run->Current.Add(TEXT("second jump changes direction midair, INSTANTLY (§6's point)"),
-					bConsumed && bRedirected,
-					FString::Printf(TEXT("wish=(%s) planar (%.0f,%.0f) -> (%.0f,%.0f)"),
-						*Wish.GetSafeNormal().ToCompactString(), Before.X, Before.Y, After.X, After.Y));
+					bConsumed && bRedirected && bSpeedKept,
+					FString::Printf(TEXT("wish=(%s)%s planar (%.0f,%.0f) -> (%.0f,%.0f), speed %.0f -> %.0f"),
+						*Wish.GetSafeNormal().ToCompactString(),
+						bWishFromSeam ? TEXT(" [wish supplied by the test seam: the ENGINE's input->acceleration path is NOT covered]") : TEXT(""),
+						Before.X, Before.Y, After.X, After.Y, SpeedBefore, SpeedAfter));
 			}
 
 			// Restore what this arm changed, then move on.
@@ -845,6 +885,18 @@ namespace TraceCharacterVerify
 
 	void RunRoccoVerify(const TArray<FString>& Args)
 	{
+
+		// ONE CHARACTER FIXTURE AT A TIME. These run on tickers across many frames and all steer
+		// the SAME pawn, so two from one -TraceExec list interleave and each reports the other's
+		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Rocco.Verify")))
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ROCCO] QUEUED behind %s — it will start automatically when that finishes. "
+				     "(If it never starts, the holder died without releasing — see TraceVerifyLock.h.)"),
+				*TraceVerifyLock::CurrentHolder());
+			return;
+		}
 		TSharedPtr<FRoccoRun> Run = MakeShared<FRoccoRun>();
 		if (Args.Num() >= 1)
 		{
@@ -945,6 +997,11 @@ namespace TraceCharacterVerify
 
 	void ReportChutVerdict(TSharedPtr<FChutRun> Run)
 	{
+
+		// THE SUBJECT IS FREE AGAIN. Released at the VERDICT rather than at the end of the last
+		// arm, because the verdict is the last thing that reads the pawn — and released here rather
+		// than nowhere so a batch runs these in sequence instead of refusing the second one.
+		ON_SCOPE_EXIT{ TraceVerifyLock::Release(TEXT("Trace.Chut.Verify")); };
 		const UTraceSettings& Settings = UTraceSettings::Get();
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[CHUT] ===== spec v14 §6 CHUT — knife %0.f front / %0.f back (standard %0.f / %0.f), bash %.0f uu/s "
@@ -1337,6 +1394,18 @@ namespace TraceCharacterVerify
 
 	void RunChutVerify(const TArray<FString>& Args)
 	{
+
+		// ONE CHARACTER FIXTURE AT A TIME. These run on tickers across many frames and all steer
+		// the SAME pawn, so two from one -TraceExec list interleave and each reports the other's
+		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Chut.Verify")))
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[CHUT] QUEUED behind %s — it will start automatically when that finishes. "
+				     "(If it never starts, the holder died without releasing — see TraceVerifyLock.h.)"),
+				*TraceVerifyLock::CurrentHolder());
+			return;
+		}
 		TSharedPtr<FChutRun> Run = MakeShared<FChutRun>();
 		if (Args.Num() >= 1)
 		{

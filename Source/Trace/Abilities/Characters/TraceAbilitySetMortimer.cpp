@@ -32,6 +32,7 @@
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "Abilities/Characters/TraceVerifyLock.h"   // one character fixture at a time
 
 #define LOCTEXT_NAMESPACE "TraceMortimer"
 
@@ -2053,6 +2054,18 @@ namespace TraceMortimerVerifyFile
 	 */
 	void RunMortimerVerify()
 	{
+
+		// ONE CHARACTER FIXTURE AT A TIME. These run on tickers across many frames and all steer
+		// the SAME pawn, so two from one -TraceExec list interleave and each reports the other's
+		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Mortimer.Verify")))
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[MORTIMER] QUEUED behind %s — it will start automatically when that finishes. "
+				     "(If it never starts, the holder died without releasing — see TraceVerifyLock.h.)"),
+				*TraceVerifyLock::CurrentHolder());
+			return;
+		}
 		const TCHAR* const Tag = TEXT("MORTIMER");
 		const UTraceSettings& Settings = UTraceSettings::Get();
 

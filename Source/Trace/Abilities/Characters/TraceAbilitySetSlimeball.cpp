@@ -25,6 +25,7 @@
 #include "Net/TraceLagCompensationComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "Abilities/Characters/TraceVerifyLock.h"   // one character fixture at a time
 
 // =================================================================================================
 // THE RED ARMS. One per ability, each removing that ability and nothing else, so the verification
@@ -2092,6 +2093,18 @@ namespace TraceSlimeballVerify
 
 	void RunVerify()
 	{
+
+		// ONE CHARACTER FIXTURE AT A TIME. These run on tickers across many frames and all steer
+		// the SAME pawn, so two from one -TraceExec list interleave and each reports the other's
+		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Slimeball.Verify")))
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[SLIME] QUEUED behind %s — it will start automatically when that finishes. "
+				     "(If it never starts, the holder died without releasing — see TraceVerifyLock.h.)"),
+				*TraceVerifyLock::CurrentHolder());
+			return;
+		}
 		UWorld* WorldPtr = FindAuthoritativeWorld();
 		if (WorldPtr == nullptr)
 		{
