@@ -707,6 +707,24 @@ bool UTraceWeaponComponent::CanFire() const
 		return false;
 	}
 
+	// --- THE HALF TIME BREAK: NOBODY SHOOTS ---------------------------------------------------- [S4]
+	//
+	// Forty-five seconds in which players stand in the open editing a loadout. The ability layer and
+	// the Core already stop for the break; the gun never asked. UTraceHealthComponent::ApplyDamage
+	// refuses the damage too, and the pair is deliberately independent — this one stops the shooting
+	// so the break does not sound like a firefight, that one guarantees no future damage source can
+	// slip through. Exactly the shape of the carrier's gun lock and shield.
+	if (const UWorld* MyWorld = GetWorld())
+	{
+		if (const ATraceGameState* TraceGS = MyWorld->GetGameState<ATraceGameState>())
+		{
+			if (TraceGS->IsHalfTimeBreak())
+			{
+				return false;
+			}
+		}
+	}
+
 	// --- SPEC v10 §1: the knife is out, so the gun is not ---------------------------------------
 	//
 	// [DUALWIELD] IsFirearmEquipped() rather than !IsKnifeEquipped(), and the change is not cosmetic:

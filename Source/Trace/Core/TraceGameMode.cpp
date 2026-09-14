@@ -3674,6 +3674,26 @@ void ATraceGameMode::BeginHalfTimeBreak()
 		BreakDuration, *TraceTeamName(GetNegativeSideTeamForHalf(NextHalf)).ToString(),
 		TraceGameState->BlueScore, TraceGameState->OrangeScore);
 
+	// *** THE LOADOUT WINDOW OPENS. *** [S4] Spec: "allow players to change ability loadouts during
+	// halftime", and the break was lengthened to forty-five seconds specifically to make room for it.
+	//
+	// The deadline is the end of the break itself, so the screen's own countdown and the interval
+	// clock are the same number — a screen that closed at a different moment from the whistle would
+	// either steal play time or strand a player mid-edit.
+	//
+	// HUMANS ONLY. Bots keep the uniform loadouts they were given; nothing opens a bot's screen and
+	// PollCharacterSelect already treats an open one on a bot as the defensive case it is.
+	const float SelectDeadline =
+		static_cast<float>(TraceGameState->GetServerWorldTimeSeconds() + BreakDuration);
+	for (APlayerState* Each : TraceGameState->PlayerArray)
+	{
+		ATracePlayerState* Candidate = Cast<ATracePlayerState>(Each);
+		if (Candidate != nullptr && !Candidate->IsABot())
+		{
+			Candidate->ServerSetCharacterSelectOpen(/*bOpen=*/true, SelectDeadline);
+		}
+	}
+
 	GetWorldTimerManager().SetTimer(HalfTimeTimerHandle, this, &ATraceGameMode::EndHalfTimeBreak, BreakDuration, false);
 }
 
@@ -3683,6 +3703,21 @@ void ATraceGameMode::EndHalfTimeBreak()
 	if (TraceGameState == nullptr || !TraceGameState->IsHalfTimeBreak())
 	{
 		return;
+	}
+
+	// *** THE WINDOW SHUTS WITH THE WHISTLE. *** [S4] A screen left open into live play is the lock
+	// with a hole in it: ServerSetLoadout would keep saying yes because the select window is one of
+	// the two states it accepts. Closed HERE rather than trusting the deadline to have expired,
+	// because a deadline is a number a client watches and this is the rule the server enforces.
+	//
+	// Closing it also auto-assigns anyone who never locked in, which is the behaviour the select
+	// screen already has at the start of a half — see PollCharacterSelect.
+	for (APlayerState* Each : TraceGameState->PlayerArray)
+	{
+		if (ATracePlayerState* Candidate = Cast<ATracePlayerState>(Each))
+		{
+			Candidate->ServerSetCharacterSelectOpen(/*bOpen=*/false, 0.f);
+		}
 	}
 
 	BeginHalf(TraceGameState->CurrentHalf + 1);

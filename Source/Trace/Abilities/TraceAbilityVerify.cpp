@@ -73,6 +73,7 @@
 #include "Gameplay/TraceHealthComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "Gameplay/TraceWeaponComponent.h"   // CanFire() — the S4 half-time gate
 
 namespace TraceAbilityVerify
 {
@@ -1216,6 +1217,194 @@ namespace TraceLoadoutCombine
 		TEXT("Trace.Loadout.Combine"),
 		TEXT("S3a. Prove the numeric hooks combine across a mixed loadout instead of reading only the "
 		     "Activated kit."),
+		FConsoleCommandDelegate::CreateStatic(&Run));
+}
+#endif   // !UE_BUILD_SHIPPING
+
+#if !UE_BUILD_SHIPPING
+// =================================================================================================
+// Trace.Loadout.Lock — S4. The three rules that make the break a break.
+//
+// The half time interval went from twelve seconds to forty-five so players could edit a loadout in
+// it. That made two things true that were not true before: players stand still, in the open, reading
+// a menu, for the better part of a minute — and the loadout is writable at a moment when the match
+// is not over.
+//
+// So this asserts what the break is:
+//
+//   LOCKED DURING PLAY     a loadout change is refused while the match is running. The change is
+//                          refused SERVER-SIDE, so a client that skipped its own UI gate is refused
+//                          too, which is the only version of the rule that is actually a rule.
+//   OPEN AT HALF TIME      and at the select screen, and before the whistle.
+//   NOBODY SHOOTS          CanFire() is false during the break, and ApplyDamage drops damage from
+//                          ANY source. Two independent gates on purpose: one stops the shooting,
+//                          the other guarantees nothing new can slip through later.
+//
+// The break is driven directly rather than waited for — a test that needs a real half to elapse is a
+// test nobody runs.
+// =================================================================================================
+namespace TraceLoadoutLock
+{
+	void Run()
+	{
+		UWorld* World = nullptr;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (Context.World() != nullptr && Context.World()->GetAuthGameMode() != nullptr)
+				{
+					World = Context.World();
+					break;
+				}
+			}
+		}
+		ATraceGameState* TraceGS = (World != nullptr) ? World->GetGameState<ATraceGameState>() : nullptr;
+		if (TraceGS == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[LoadoutLock] no Trace game state — run this in a match."));
+			return;
+		}
+
+		ATraceCharacter* Pawn = nullptr;
+		UTraceAbilityComponent* Comp = nullptr;
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			if (ATraceCharacter* Candidate = *It)
+			{
+				if (UTraceAbilityComponent* Found = UTraceAbilityComponent::Get(Candidate))
+				{
+					Pawn = Candidate;
+					Comp = Found;
+					break;
+				}
+			}
+		}
+		if (Comp == nullptr || Pawn == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[LoadoutLock] no pawn with an ability component."));
+			return;
+		}
+
+		int32 Failures = 0;
+		auto Check = [&Failures](const TCHAR* Label, bool bActual, bool bExpected, const TCHAR* Why)
+		{
+			const bool bPass = (bActual == bExpected);
+			Failures += bPass ? 0 : 1;
+			UE_LOG(LogTraceGame, Display, TEXT("[LoadoutLock]   %-4s %-52s got %s, expected %s  |  %s"),
+				bPass ? TEXT("ok") : TEXT("FAIL"), Label,
+				bActual ? TEXT("true ") : TEXT("false"), bExpected ? TEXT("true ") : TEXT("false"), Why);
+		};
+
+		// ---- save everything this test disturbs -----------------------------------------------
+		const FTraceLoadout RestoreLoadout = Comp->GetLoadout();
+		const ETraceMatchState RestoreMatch = TraceGS->TraceMatchState;
+		const bool bRestoreBreak = TraceGS->IsHalfTimeBreak();
+		const int32 RestoreHalf = TraceGS->CurrentHalf;
+		const int32 RestoreHalves = TraceGS->NumHalves;
+		bool bRestoreSelect = false;
+		if (const ATracePlayerState* PS = Cast<ATracePlayerState>(Comp->GetOwningPlayerState()))
+		{
+			bRestoreSelect = PS->IsCharacterSelectOpen();
+		}
+
+		auto SetWorldState = [&](ETraceMatchState Match, bool bBreak, bool bSelect)
+		{
+			TraceGS->TraceMatchState = Match;
+			TraceGS->SetHalfState(RestoreHalf, FMath::Max(1, RestoreHalves), bBreak);
+			if (ATracePlayerState* PS = Cast<ATracePlayerState>(Comp->GetOwningPlayerState()))
+			{
+				PS->ServerSetCharacterSelectOpen(bSelect, 0.f);
+			}
+		};
+
+		// A loadout that is legal but DIFFERENT, so "accepted" and "refused" are distinguishable.
+		FTraceLoadout Wanted;
+		Wanted.Movement  = ETraceCharacterId::Chut;
+		Wanted.Passive   = ETraceCharacterId::Mace;
+		Wanted.Activated = ETraceCharacterId::Elle;
+
+		UE_LOG(LogTraceGame, Display, TEXT("[LoadoutLock] ===== S4: when may a loadout change, and who may shoot? ====="));
+
+		// ---- 1. LOCKED DURING PLAY -------------------------------------------------------------
+		SetWorldState(ETraceMatchState::InProgress, /*bBreak=*/false, /*bSelect=*/false);
+		Comp->ApplyLoadout(RestoreLoadout);
+		Check(TEXT("mid-play: the window is shut"), Comp->IsLoadoutChangeOpen(), false,
+			TEXT("a loadout you can rewrite mid-fight is a menu, not a loadout"));
+		Check(TEXT("mid-play: the server REFUSES the change"),
+			Comp->ServerSetLoadout(Wanted), false,
+			TEXT("refused server-side, so skipping the UI gate does not help"));
+		Check(TEXT("mid-play: and nothing changed"), Comp->GetLoadout() == RestoreLoadout, true,
+			TEXT("a refusal that still edited would be the worst of both"));
+
+		// ---- 2. OPEN AT THE SELECT SCREEN ------------------------------------------------------
+		SetWorldState(ETraceMatchState::InProgress, /*bBreak=*/false, /*bSelect=*/true);
+		Check(TEXT("select screen open: the window is open"), Comp->IsLoadoutChangeOpen(), true,
+			TEXT("the player is looking at the screen that does this"));
+		Check(TEXT("select screen open: the change is ACCEPTED"),
+			Comp->ServerSetLoadout(Wanted), true, TEXT("and lands"));
+		Check(TEXT("select screen open: and it actually applied"), Comp->GetLoadout() == Wanted, true,
+			TEXT("accepted must mean equipped"));
+
+		// ---- 3. OPEN AT HALF TIME --------------------------------------------------------------
+		Comp->ApplyLoadout(RestoreLoadout);
+		SetWorldState(ETraceMatchState::InProgress, /*bBreak=*/true, /*bSelect=*/false);
+		Check(TEXT("half time: the window is open"), Comp->IsLoadoutChangeOpen(), true,
+			TEXT("spec: 'allow players to change ability loadouts during halftime'"));
+		Check(TEXT("half time: the change is ACCEPTED"),
+			Comp->ServerSetLoadout(Wanted), true, TEXT("this is what the 45 seconds are for"));
+
+		// ---- 4. NOBODY SHOOTS DURING THE BREAK -------------------------------------------------
+		if (UTraceWeaponComponent* Weapon = Pawn->FindComponentByClass<UTraceWeaponComponent>())
+		{
+			Check(TEXT("half time: the gun refuses to fire"), Weapon->CanFire(), false,
+				TEXT("45s of standing in the open reading a menu"));
+		}
+
+		if (UTraceHealthComponent* Health = Pawn->FindComponentByClass<UTraceHealthComponent>())
+		{
+			const float Before = Health->Health;
+			Health->ApplyDamage(25.f, nullptr, TEXT("LoadoutLockTest"));
+			Check(TEXT("half time: damage from ANY source is dropped"),
+				FMath::IsNearlyEqual(Health->Health, Before, 0.01f), true,
+				TEXT("gated at ApplyDamage, so every future source inherits it"));
+
+			// ...and the gate is the BREAK, not a blanket invulnerability.
+			SetWorldState(ETraceMatchState::InProgress, /*bBreak=*/false, /*bSelect=*/false);
+			const float BeforeLive = Health->Health;
+			Health->ApplyDamage(25.f, nullptr, TEXT("LoadoutLockTest"));
+			const bool bTookIt = !FMath::IsNearlyEqual(Health->Health, BeforeLive, 0.01f);
+			Check(TEXT("in play: damage lands again"), bTookIt, true,
+				TEXT("or the 'gate' is just invulnerability and proves nothing"));
+			Health->Health = BeforeLive;
+		}
+
+		// ---- put the world back ----------------------------------------------------------------
+		TraceGS->TraceMatchState = RestoreMatch;
+		TraceGS->SetHalfState(RestoreHalf, FMath::Max(1, RestoreHalves), bRestoreBreak);
+		if (ATracePlayerState* PS = Cast<ATracePlayerState>(Comp->GetOwningPlayerState()))
+		{
+			PS->ServerSetCharacterSelectOpen(bRestoreSelect, 0.f);
+		}
+		Comp->ApplyLoadout(RestoreLoadout);
+
+		if (Failures == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[LoadoutLock] ===== PASS — locked in play, open at the screen and at half time, "
+				     "and the break is not a firefight. ====="));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[LoadoutLock] ===== *** FAIL *** %d check(s) — see above ====="), Failures);
+		}
+	}
+
+	FAutoConsoleCommand Cmd(
+		TEXT("Trace.Loadout.Lock"),
+		TEXT("S4. Prove the loadout lock, the half time window, and that nobody shoots or takes damage "
+		     "during the break."),
 		FConsoleCommandDelegate::CreateStatic(&Run));
 }
 #endif   // !UE_BUILD_SHIPPING

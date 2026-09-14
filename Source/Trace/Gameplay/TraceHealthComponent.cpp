@@ -35,6 +35,7 @@
 #include "Math/UnrealMathUtility.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "Core/TraceGameState.h"    // IsHalfTimeBreak — the S4 damage gate
 
 // =================================================================================================
 // Console overrides for regeneration (spec v13 §1).
@@ -754,6 +755,32 @@ void UTraceHealthComponent::ApplyDamage(float Amount, AController* Instigator, F
 	if (!FMath::IsFinite(Amount) || Amount <= 0.f)
 	{
 		return;
+	}
+
+	// *** NOBODY TAKES DAMAGE DURING THE HALF TIME BREAK. *** [S4]
+	//
+	// The break was twelve seconds and is now forty-five, and players spend it standing still in the
+	// open editing their loadout. Nothing stopped a gun during it: the ability layer already refuses
+	// (UTraceAbilityComponent's break gate) and the Core is frozen, but the weapon path had no
+	// half-time question in it anywhere, so the break was simply a period in which one team could
+	// shoot the other while they read a menu.
+	//
+	// HERE RATHER THAN AT THE GUN, for exactly the reason the carrier rule is here: this is the one
+	// funnel every damage source ends at — bullets, the knife, Quake, Pickler, poison, a fall — so
+	// every future source inherits the rule for free. The gun ALSO refuses (UTraceWeaponComponent::
+	// CanFire), which stops the shooting rather than merely making it pointless; the two are
+	// deliberately independent, the same way the carrier's gun lock and shield are.
+	//
+	// Like the carrier branch, this returns BEFORE the regen clock is stamped: damage that never
+	// landed must not postpone anyone's healing.
+	if (const ATraceGameState* TraceGS = GetWorld() ? GetWorld()->GetGameState<ATraceGameState>() : nullptr)
+	{
+		if (TraceGS->IsHalfTimeBreak())
+		{
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("[%s] Damage %.1f ignored: half time break"), *GetNameSafe(GetOwner()), Amount);
+			return;
+		}
 	}
 
 	// *** THE RED ARM FOR THE ORDERING CLAIM, AND THE ONLY THING ABOVE THE CARRIER CHECK. ***
