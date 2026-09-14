@@ -280,3 +280,11 @@ const TCHAR* TraceLoadoutSlotToString(ETraceLoadoutSlot Slot)
 	default:                           return TEXT("?");
 	}
 }
+
+FString TraceLoadoutToString(const FTraceLoadout& Loadout)
+{
+	return FString::Printf(TEXT("%s/%s/%s"),
+		TraceCharacterIdToString(Loadout.Movement),
+		TraceCharacterIdToString(Loadout.Passive),
+		TraceCharacterIdToString(Loadout.Activated));
+}

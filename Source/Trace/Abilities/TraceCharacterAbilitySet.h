@@ -103,8 +103,25 @@ public:
 	 */
 	ETraceLoadoutSlot GetSlot() const { return Slot; }
 
-	/** Sugar for the guards that go inside a lifecycle body serving more than one slot. */
-	bool IsSlot(ETraceLoadoutSlot InSlot) const { return Slot == InSlot; }
+	/**
+	 * Sugar for the guards that go inside a lifecycle body serving more than one slot.
+	 *
+	 * *** ASKS THE MASK, NOT THE PRIMARY SLOT, AND THAT IS THE DEDUP RULE IN ONE LINE. *** A player
+	 * who takes two abilities from the same kit gets ONE instance owning both slots, not two half-
+	 * initialised copies — because several kits keep one pool of state that both their abilities
+	 * read (Oyster's LiveJars is written by his passive and his activated and read by his movement;
+	 * Mace publishes both slots in one atomic write). Two instances would each see half of it.
+	 *
+	 * So a kit picked for two slots answers TRUE to both, and its guarded bodies all run — which is
+	 * precisely the pre-rework behaviour for that pair, and exactly what the player asked for.
+	 */
+	bool IsSlot(ETraceLoadoutSlot InSlot) const
+	{
+		return (SlotMask & (1u << static_cast<uint8>(InSlot))) != 0;
+	}
+
+	/** Every slot this instance fills. A uniform pick sets all three. */
+	uint8 GetSlotMask() const { return SlotMask; }
 
 	virtual ETraceCharacterId GetCharacterId() const
 		PURE_VIRTUAL(UTraceCharacterAbilitySet::GetCharacterId, return ETraceCharacterId::None;);
@@ -499,7 +516,8 @@ public:
 	 *                compiling and keeps the slot it has always effectively had.
 	 */
 	void Initialize(UTraceAbilityComponent* InComponent,
-		ETraceLoadoutSlot InSlot = ETraceLoadoutSlot::Activated);
+		ETraceLoadoutSlot InSlot = ETraceLoadoutSlot::Activated,
+		uint8 InSlotMask = 0);
 
 	virtual UWorld* GetWorld() const override;
 
@@ -516,6 +534,16 @@ private:
 	UPROPERTY(Transient)
 	TObjectPtr<UTraceAbilityComponent> AbilityComponent = nullptr;
 
-	/** See GetSlot(). Written once by Initialize(); immutable for the life of the instance. */
+	/**
+	 * THE PRIMARY SLOT — the one whose replicated struct this instance writes.
+	 *
+	 * When a kit fills more than one slot it still gets ONE struct, and this says which. That is not
+	 * a compromise: those kits publish both slots' bits in a single atomic write, so one struct is
+	 * the shape their existing bodies already assume, and readers of the other slot are told to look
+	 * here by GetStateSlotFor() on the component.
+	 */
 	ETraceLoadoutSlot Slot = ETraceLoadoutSlot::Activated;
+
+	/** Bit per ETraceLoadoutSlot. See IsSlot(). Written once by Initialize(). */
+	uint8 SlotMask = 1u << static_cast<uint8>(ETraceLoadoutSlot::Activated);
 };

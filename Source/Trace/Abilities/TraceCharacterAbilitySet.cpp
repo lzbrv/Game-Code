@@ -24,13 +24,18 @@ static FTraceAbilityNetState GAbilitySetScratchState;
 // Context
 // =================================================================================================
 
-void UTraceCharacterAbilitySet::Initialize(UTraceAbilityComponent* InComponent, ETraceLoadoutSlot InSlot)
+void UTraceCharacterAbilitySet::Initialize(UTraceAbilityComponent* InComponent,
+	ETraceLoadoutSlot InSlot, uint8 InSlotMask)
 {
 	AbilityComponent = InComponent;
 
 	// WRITTEN ONCE, HERE, AND NEVER AGAIN. A kit that could change slot mid-life would be a kit
 	// whose replicated state moves between structs while clients are reading it.
 	Slot = InSlot;
+
+	// A mask of 0 means "just the primary", which is what every pre-rework caller wants and what the
+	// default argument produces. Callers that dedup a kit across several slots pass the real mask.
+	SlotMask = (InSlotMask != 0) ? InSlotMask : static_cast<uint8>(1u << static_cast<uint8>(InSlot));
 }
 
 UWorld* UTraceCharacterAbilitySet::GetWorld() const

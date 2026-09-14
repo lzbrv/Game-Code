@@ -392,6 +392,48 @@ public:
 	/** The live ability set, or null at ETraceCharacterId::None. Valid on every machine. */
 	UTraceCharacterAbilitySet* GetAbilitySet() const { return AbilitySet; }
 
+	/** The kit filling @p Slot, or null. With a uniform loadout all three answer the same object. */
+	UTraceCharacterAbilitySet* GetAbilitySetForSlot(ETraceLoadoutSlot Slot) const;
+
+	/**
+	 * WHICH SLOT'S STRUCT HOLDS @p Slot's REPLICATED STATE.
+	 *
+	 * Usually itself. It differs only when one kit was picked for several slots: that kit is
+	 * instantiated ONCE and writes ONE struct (its primary slot's), so a reader asking about the
+	 * other slot it covers has to be pointed at the primary. Without this, Slimeball picked for
+	 * movement AND activated would publish both bits into the movement struct while the activated
+	 * reader watched an empty one.
+	 */
+	ETraceLoadoutSlot GetStateSlotFor(ETraceLoadoutSlot Slot) const;
+
+	/** What this player has equipped. Server-authoritative; mirrors the player state's copy. */
+	const FTraceLoadout& GetLoadout() const { return Loadout; }
+
+	/**
+	 * SERVER. Tear down whatever is equipped and build the kits @p InLoadout names.
+	 *
+	 * Rebuilds unconditionally, because a partial swap would leave one kit's OnUnequipped unrun.
+	 * Safe to call with the same loadout; the caller decides whether that is wasteful.
+	 */
+	void ApplyLoadout(const FTraceLoadout& InLoadout);
+
+	/**
+	 * SERVER ONLY. The one door a loadout screen comes through.
+	 *
+	 * ApplyLoadout is the builder and will build whatever it is handed, including on a client, where
+	 * the result would be a local lie that the next replication silently corrects — the kind of
+	 * desync that looks like "my ability didn't fire" and is miserable to trace back. So the door is
+	 * separate from the builder: this one checks authority, rejects a loadout that names a kit for a
+	 * slot that kit does not serve, and only then builds and publishes.
+	 *
+	 * Returns false and changes nothing if the loadout is refused, so a caller can say so rather
+	 * than showing a player a selection the server never accepted.
+	 */
+	bool ServerSetLoadout(const FTraceLoadout& InLoadout);
+
+	/** Would ServerSetLoadout accept this? Pure — safe to ask from UI to grey out an illegal pick. */
+	static bool IsLoadoutLegal(const FTraceLoadout& InLoadout, FString* OutReason = nullptr);
+
 	/** Typed sugar: `if (UTraceAbilitySetMace* M = Comp->GetAbilitySetAs<UTraceAbilitySetMace>())`. */
 	template <typename T>
 	T* GetAbilitySetAs() const { return Cast<T>(AbilitySet); }
@@ -754,6 +796,9 @@ public:
 	void OnRep_CharacterId();
 
 	UFUNCTION()
+	void OnRep_Loadout();
+
+	UFUNCTION()
 	void OnRep_AbilityState();
 
 	/**
@@ -842,6 +887,34 @@ protected:
 	/** The live ability set. Constructed on every machine from CharacterId; never replicated. */
 	UPROPERTY(Transient)
 	TObjectPtr<UTraceCharacterAbilitySet> AbilitySet = nullptr;
+
+	/**
+	 * One entry per DISTINCT kit in the loadout, so at most three and often one.
+	 *
+	 * Deduped by class rather than by slot on purpose — see UTraceCharacterAbilitySet::IsSlot for
+	 * why two instances of one kit would each see half of the state that kit keeps.
+	 */
+	UPROPERTY(Transient)
+	TArray<TObjectPtr<UTraceCharacterAbilitySet>> EquippedSets;
+
+	/** Index into EquippedSets per slot, or INDEX_NONE. */
+	int32 SetIndexBySlot[static_cast<int32>(ETraceLoadoutSlot::Count)] = { INDEX_NONE, INDEX_NONE, INDEX_NONE };
+
+	/**
+	 * REPLICATED. What is equipped.
+	 *
+	 * *** ONE WRITER, AND IT IS THE SAME ONE THAT WRITES CharacterId. *** Two replicated facts that
+	 * can disagree is the bug shape this codebase has been bitten by before (the four-writer
+	 * bIsCarrier). So the server sets both in the same statement, in the one place a character is
+	 * assigned, and a uniform loadout is exactly what a character pick means. Until a screen can send
+	 * a mixed one, they cannot drift because nothing else writes either.
+	 *
+	 * CharacterId stays the identity byte — which face you wear, what the scoreboard column says —
+	 * and this stays the answer to what you can DO. Splitting them is what keeps the ~107 identity
+	 * readers out of this rework's blast radius.
+	 */
+	UPROPERTY(ReplicatedUsing = OnRep_Loadout)
+	FTraceLoadout Loadout;
 
 	// =============================================================================================
 	// THE CLIENT FX ROUTER — FX_AUDIO_PLAN §1.1. Local presentation state, NOT replicated.

@@ -851,3 +851,176 @@ namespace TraceAbilityVerify
 }   // namespace TraceAbilityVerify
 
 #endif // !UE_BUILD_SHIPPING
+
+#if !UE_BUILD_SHIPPING
+// =================================================================================================
+// Trace.Loadout.Verify — S2's proof, and the one number it exists to defend.
+//
+// S2 is the point of no return: loadouts are in replicated data from here. The claim that makes it
+// safe to land before any UI is that A UNIFORM LOADOUT IS THE PRE-REWORK CHARACTER, EXACTLY — same
+// one instance, same slots, same replicated struct. If that is true, every match played between S2
+// and S5 behaves as it always did, because every loadout in them is uniform.
+//
+// So this asserts the instantiation rule directly on a live pawn rather than describing it:
+//
+//   UNIFORM      one kit instance, owning all three slots, writing one struct.
+//   TWO OF ONE   a kit picked for two slots is still ONE instance (dedup by class), because those
+//                kits keep one pool of state their several abilities share — two copies would each
+//                see half of it. This is the rule most likely to be broken by a later refactor.
+//   THREE KITS   three instances, three structs, no aliasing.
+//   EMPTY        no instances and no crash — the characterless Mannequin mode A ships.
+// =================================================================================================
+namespace TraceLoadoutVerify
+{
+	struct FCase
+	{
+		const TCHAR* Label;
+		ETraceCharacterId Movement;
+		ETraceCharacterId Passive;
+		ETraceCharacterId Activated;
+		int32 ExpectedInstances;
+	};
+
+	void Run()
+	{
+		UWorld* World = nullptr;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				if (Context.World() != nullptr && Context.World()->GetAuthGameMode() != nullptr)
+				{
+					World = Context.World();
+					break;
+				}
+			}
+		}
+		if (World == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[LoadoutVerify] no authoritative world — run this in a match."));
+			return;
+		}
+
+		UTraceAbilityComponent* Comp = nullptr;
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+		{
+			if (ATraceCharacter* Pawn = *It)
+			{
+				if (UTraceAbilityComponent* Found = UTraceAbilityComponent::Get(Pawn))
+				{
+					Comp = Found;
+					break;
+				}
+			}
+		}
+		if (Comp == nullptr)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[LoadoutVerify] no pawn with an ability component."));
+			return;
+		}
+
+		const FTraceLoadout Restore = Comp->GetLoadout();
+
+		static const FCase Cases[] =
+		{
+			{ TEXT("uniform (a pre-rework character)"), ETraceCharacterId::Rocco, ETraceCharacterId::Rocco, ETraceCharacterId::Rocco, 1 },
+			{ TEXT("two slots from one kit"),           ETraceCharacterId::Mace,  ETraceCharacterId::Rocco, ETraceCharacterId::Mace,  2 },
+			{ TEXT("three different kits"),             ETraceCharacterId::Mace,  ETraceCharacterId::Rocco, ETraceCharacterId::Elle,  3 },
+			{ TEXT("empty (the Mannequin)"),            ETraceCharacterId::None,  ETraceCharacterId::None,  ETraceCharacterId::None,  0 },
+		};
+
+		int32 Failures = 0;
+		UE_LOG(LogTraceGame, Display, TEXT("[LoadoutVerify] ===== S2: how many kit instances does a loadout build? ====="));
+
+		for (const FCase& Case : Cases)
+		{
+			FTraceLoadout Loadout;
+			Loadout.Movement = Case.Movement;
+			Loadout.Passive = Case.Passive;
+			Loadout.Activated = Case.Activated;
+			Comp->ApplyLoadout(Loadout);
+
+			// Count DISTINCT instances across the three slots — the observable form of the dedup rule.
+			TSet<const UTraceCharacterAbilitySet*> Distinct;
+			for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+			{
+				if (const UTraceCharacterAbilitySet* Set =
+					Comp->GetAbilitySetForSlot(static_cast<ETraceLoadoutSlot>(Index)))
+				{
+					Distinct.Add(Set);
+				}
+			}
+
+			const bool bCountOk = (Distinct.Num() == Case.ExpectedInstances);
+
+			// And every filled slot must be answered by a kit that agrees it owns that slot.
+			bool bMaskOk = true;
+			for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+			{
+				const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(Index);
+				const UTraceCharacterAbilitySet* Set = Comp->GetAbilitySetForSlot(Slot);
+				if (Loadout.Get(Slot) == ETraceCharacterId::None)
+				{
+					bMaskOk = bMaskOk && (Set == nullptr);
+				}
+				else if (Set != nullptr)
+				{
+					bMaskOk = bMaskOk && Set->IsSlot(Slot);
+				}
+			}
+
+			// *** THE SLOT A KIT FILES ITS STATE UNDER. *** One kit keeps one replicated struct however
+			// many slots it covers, and it must be the HIGHEST slot it owns — Activated wherever the
+			// kit has an E. That is LegacySlotIndex(), which is where every not-yet-converted framework
+			// read still looks. Get this wrong and a uniform loadout writes its cooldown to one struct
+			// while the HUD reads another: no error, no crash, the cooldown just stops being real.
+			// This assertion is here because that is exactly what happened, and it passed every other
+			// check in this file.
+			bool bPrimaryOk = true;
+			for (const UTraceCharacterAbilitySet* Set : TSet<const UTraceCharacterAbilitySet*>(Distinct))
+			{
+				int32 Highest = INDEX_NONE;
+				for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+				{
+					if (Set->IsSlot(static_cast<ETraceLoadoutSlot>(Index)))
+					{
+						Highest = Index;   // slots ascend Movement < Passive < Activated
+					}
+				}
+				bPrimaryOk = bPrimaryOk && (Highest != INDEX_NONE)
+					&& (static_cast<int32>(Set->GetSlot()) == Highest);
+			}
+
+			const bool bPass = bCountOk && bMaskOk && bPrimaryOk;
+			Failures += bPass ? 0 : 1;
+
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[LoadoutVerify]   %-4s %-34s %-22s -> %d instance(s), expected %d%s%s"),
+				bPass ? TEXT("ok") : TEXT("FAIL"), Case.Label, *TraceLoadoutToString(Loadout),
+				Distinct.Num(), Case.ExpectedInstances,
+				bMaskOk ? TEXT("") : TEXT("  [SLOT MASK WRONG]"),
+				bPrimaryOk ? TEXT("") : TEXT("  [*** STATE FILED UNDER THE WRONG SLOT ***]"));
+		}
+
+		Comp->ApplyLoadout(Restore);
+
+		if (Failures == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[LoadoutVerify] ===== PASS — a uniform loadout is one instance owning all three "
+				     "slots, which is the pre-rework character exactly. ====="));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[LoadoutVerify] ===== *** FAIL *** %d case(s) — see above ====="), Failures);
+		}
+	}
+
+	FAutoConsoleCommand Cmd(
+		TEXT("Trace.Loadout.Verify"),
+		TEXT("S2. Prove the loadout instantiation rule: uniform = one kit, dedup by class, three kits "
+		     "= three instances, empty = none."),
+		FConsoleCommandDelegate::CreateStatic(&Run));
+}
+#endif   // !UE_BUILD_SHIPPING

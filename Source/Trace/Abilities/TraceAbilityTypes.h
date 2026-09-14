@@ -178,6 +178,91 @@ enum class ETraceLoadoutSlot : uint8
 TRACE_API const TCHAR* TraceLoadoutSlotToString(ETraceLoadoutSlot Slot);
 
 /**
+ * WHAT A PLAYER HAS EQUIPPED: one ability per slot, each named by the kit it came from.
+ *
+ * THE KIT ID IS THE ABILITY'S ADDRESS, NOT A CHARACTER ANY MORE. ETraceCharacterId survives this
+ * rework unchanged, with all ten enumerators and its DO-NOT-REORDER contract, because it is still
+ * the perfect name for "which of the ten bodies of code this ability lives in". Keeping it is worth
+ * stating plainly: it means no enum migration, no data-asset regeneration, no core redirects, and
+ * the roster table and its generated assets keep working verbatim as the SOURCE of ability prose.
+ *
+ * *** A UNIFORM LOADOUT IS EXACTLY THE OLD BEHAVIOUR, AND THAT IS THE WHOLE SAFETY ARGUMENT FOR
+ * LANDING THIS BEFORE ANY UI. *** {Rocco, Rocco, Rocco} dedups to ONE Rocco instance owning all
+ * three slots, which is byte-for-byte the single kit the pre-rework component built. So this struct
+ * can exist, replicate and drive the component while every player in every match is still uniform,
+ * and nothing observable changes until somebody deliberately picks a mixed one.
+ *
+ * None in a slot means "no ability there" and is legal — a player who has not picked yet, and the
+ * characterless Mannequin that mode A ships.
+ */
+USTRUCT()
+struct TRACE_API FTraceLoadout
+{
+	GENERATED_BODY()
+
+	UPROPERTY()
+	ETraceCharacterId Movement = ETraceCharacterId::None;
+
+	UPROPERTY()
+	ETraceCharacterId Passive = ETraceCharacterId::None;
+
+	UPROPERTY()
+	ETraceCharacterId Activated = ETraceCharacterId::None;
+
+	ETraceCharacterId Get(ETraceLoadoutSlot Slot) const
+	{
+		switch (Slot)
+		{
+		case ETraceLoadoutSlot::Movement:  return Movement;
+		case ETraceLoadoutSlot::Passive:   return Passive;
+		case ETraceLoadoutSlot::Activated: return Activated;
+		default:                           return ETraceCharacterId::None;
+		}
+	}
+
+	void Set(ETraceLoadoutSlot Slot, ETraceCharacterId Id)
+	{
+		switch (Slot)
+		{
+		case ETraceLoadoutSlot::Movement:  Movement  = Id; break;
+		case ETraceLoadoutSlot::Passive:   Passive   = Id; break;
+		case ETraceLoadoutSlot::Activated: Activated = Id; break;
+		default: break;
+		}
+	}
+
+	/** True when every slot names the same kit — i.e. this is one of the ten pre-rework characters. */
+	bool IsUniform() const
+	{
+		return Movement == Passive && Passive == Activated;
+	}
+
+	bool IsEmpty() const
+	{
+		return Movement == ETraceCharacterId::None
+			&& Passive == ETraceCharacterId::None
+			&& Activated == ETraceCharacterId::None;
+	}
+
+	/** Every slot set to @p Id. The shape that reproduces a pre-rework character exactly. */
+	static FTraceLoadout Uniform(ETraceCharacterId Id)
+	{
+		FTraceLoadout Out;
+		Out.Movement = Out.Passive = Out.Activated = Id;
+		return Out;
+	}
+
+	bool operator==(const FTraceLoadout& Other) const
+	{
+		return Movement == Other.Movement && Passive == Other.Passive && Activated == Other.Activated;
+	}
+	bool operator!=(const FTraceLoadout& Other) const { return !(*this == Other); }
+};
+
+/** "ROCCO/MACE/ELLE" — movement, passive, activated. For logs and harnesses. */
+TRACE_API FString TraceLoadoutToString(const FTraceLoadout& Loadout);
+
+/**
  * The per-character replicated scratch pad.
  *
  * WHY ONE FIXED STRUCT AND NOT A REPLICATED SUBOBJECT PER CHARACTER.

@@ -60,6 +60,32 @@ namespace
 	}
 }
 
+namespace
+{
+	/**
+	 * Runs @p Fn on every equipped kit, in slot order, tolerating a null.
+	 *
+	 * FOR LIFECYCLE HOOKS ONLY — the ones whose answer is "all of them": tick, equip/unequip, pawn
+	 * spawned/died, half time, kill. The SLOT hooks (activate, jump, secondary, dash) are NOT this
+	 * shape: several of them return a consume-or-not bool and must be offered in a defined order to
+	 * a defined slot, which S3 does deliberately rather than by fanning out here.
+	 *
+	 * One kit filling two slots appears ONCE, because the list is deduped by class. That is what
+	 * stops a uniform loadout ticking the same object three times a frame.
+	 */
+	template <typename FuncType>
+	void ForEachEquipped(const TArray<TObjectPtr<UTraceCharacterAbilitySet>>& Sets, FuncType&& Fn)
+	{
+		for (const TObjectPtr<UTraceCharacterAbilitySet>& Set : Sets)
+		{
+			if (Set != nullptr)
+			{
+				Fn(Set.Get());
+			}
+		}
+	}
+}
+
 
 // =================================================================================================
 // THE RED ARM.
@@ -281,7 +307,7 @@ void UTraceAbilityComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	if (AbilitySet != nullptr)
 	{
-		AbilitySet->OnUnequipped();
+		ForEachEquipped(EquippedSets, [](UTraceCharacterAbilitySet* Set) { Set->OnUnequipped(); });
 		AbilitySet = nullptr;
 		BuiltForCharacter = ETraceCharacterId::None;
 	}
@@ -299,6 +325,7 @@ void UTraceAbilityComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty
 	DOREPLIFETIME(UTraceAbilityComponent, CharacterId);
 	DOREPLIFETIME(UTraceAbilityComponent, ActivatedCooldownEndMatchTime);
 	DOREPLIFETIME(UTraceAbilityComponent, AbilityState);
+	DOREPLIFETIME(UTraceAbilityComponent, Loadout);
 }
 
 void UTraceAbilityComponent::TickComponent(float DeltaTime, ELevelTick TickType,
@@ -308,7 +335,7 @@ void UTraceAbilityComponent::TickComponent(float DeltaTime, ELevelTick TickType,
 
 	if (AbilitySet != nullptr)
 	{
-		AbilitySet->TickAbilities(DeltaTime);
+		ForEachEquipped(EquippedSets, [DeltaTime](UTraceCharacterAbilitySet* Set) { Set->TickAbilities(DeltaTime); });
 	}
 
 	// FX_AUDIO_PLAN §1.1 — AUTHORITY PARITY. The host is the machine every one of these matches is
@@ -632,7 +659,7 @@ void UTraceAbilityComponent::RebuildAbilitySet()
 
 	if (AbilitySet != nullptr)
 	{
-		AbilitySet->OnUnequipped();
+		ForEachEquipped(EquippedSets, [](UTraceCharacterAbilitySet* Set) { Set->OnUnequipped(); });
 		AbilitySet = nullptr;
 	}
 
@@ -657,10 +684,26 @@ void UTraceAbilityComponent::RebuildAbilitySet()
 		return;
 	}
 
-	AbilitySet = NewObject<UTraceCharacterAbilitySet>(this, SetClass);
-	AbilitySet->Initialize(this);
-	AbilitySet->OnInitialized();
-	AbilitySet->OnEquipped();
+	// THE UNIFORM LOADOUT IS THE OLD BEHAVIOUR, EXACTLY. A character pick means "all three slots
+	// from this kit", which dedups to one instance owning all three — the same single object this
+	// line used to build, initialised the same way, in the same order.
+	//
+	// *** BUT IT MUST NOT STOMP A MIXED ONE. *** This function is "the character changed", and it is
+	// reached from OnRep_CharacterId as well as from the server's assign path. Once a screen can send
+	// a mixed loadout, an unguarded uniform write here would silently undo it on the next identity
+	// update — the player picks three abilities, someone re-publishes their face, and they are back
+	// to being one character with no error anywhere. A mixed loadout therefore wins, and the identity
+	// byte keeps meaning what it means.
+	if (Loadout.IsUniform() || Loadout.IsEmpty())
+	{
+		ApplyLoadout(FTraceLoadout::Uniform(CharacterId));
+	}
+	else
+	{
+		// Mixed and already built. Re-apply it rather than returning, so this path still produces a
+		// freshly equipped set the way every caller expects.
+		ApplyLoadout(Loadout);
+	}
 
 	// FX_AUDIO_PLAN §1.1 — THE JOIN-IN-PROGRESS CASE, and it is the one that cannot be fixed later.
 	//
@@ -1001,7 +1044,7 @@ void UTraceAbilityComponent::OnHalfTime()
 
 	if (AbilitySet != nullptr)
 	{
-		AbilitySet->OnHalfTime();
+		ForEachEquipped(EquippedSets, [](UTraceCharacterAbilitySet* Set) { Set->OnHalfTime(); });
 	}
 
 	// D30-RESETS (b). *** THE OWNING CLIENT'S PREDICTION, WHICH THE REPLICATED ZERO CANNOT REACH. ***
@@ -1622,6 +1665,246 @@ bool UTraceAbilityComponent::IsBot() const
 	return (MyState != nullptr) && MyState->IsABot();
 }
 
+UTraceCharacterAbilitySet* UTraceAbilityComponent::GetAbilitySetForSlot(ETraceLoadoutSlot Slot) const
+{
+	const int32 SlotIndex = static_cast<int32>(Slot);
+	if (SlotIndex < 0 || SlotIndex >= static_cast<int32>(ETraceLoadoutSlot::Count))
+	{
+		return nullptr;
+	}
+	const int32 SetIndex = SetIndexBySlot[SlotIndex];
+	return EquippedSets.IsValidIndex(SetIndex) ? EquippedSets[SetIndex].Get() : nullptr;
+}
+
+ETraceLoadoutSlot UTraceAbilityComponent::GetStateSlotFor(ETraceLoadoutSlot Slot) const
+{
+	const UTraceCharacterAbilitySet* Set = GetAbilitySetForSlot(Slot);
+	return (Set != nullptr) ? Set->GetSlot() : Slot;
+}
+
+bool UTraceAbilityComponent::IsLoadoutLegal(const FTraceLoadout& InLoadout, FString* OutReason)
+{
+	// EMPTY IS LEGAL. That is the Mannequin — no kit, no abilities — and it is a real state the game
+	// already ships, not a malformed pick.
+	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+	{
+		const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(Index);
+		const ETraceCharacterId Id = InLoadout.Get(Slot);
+		if (Id == ETraceCharacterId::None)
+		{
+			continue;
+		}
+
+		UClass* SetClass = UTraceCharacterAbilitySet::FindClassFor(Id);
+		const UTraceCharacterAbilitySet* CDO =
+			(SetClass != nullptr) ? SetClass->GetDefaultObject<UTraceCharacterAbilitySet>() : nullptr;
+		if (CDO == nullptr)
+		{
+			if (OutReason != nullptr)
+			{
+				*OutReason = FString::Printf(TEXT("no ability set for %s"), TraceCharacterIdToString(Id));
+			}
+			return false;
+		}
+
+		// THE REAL CHECK. A kit serves the slots its abilities are written for. Asking Rocco's kit for
+		// a passive when it has no passive would build an instance that answers no hook — an ability
+		// that is equipped and does nothing, which reads to a player as a bug in the ability.
+		if (!CDO->IsSlot(Slot))
+		{
+			if (OutReason != nullptr)
+			{
+				*OutReason = FString::Printf(TEXT("%s has no %s ability"),
+					TraceCharacterIdToString(Id), TraceLoadoutSlotToString(Slot));
+			}
+			return false;
+		}
+	}
+	return true;
+}
+
+bool UTraceAbilityComponent::ServerSetLoadout(const FTraceLoadout& InLoadout)
+{
+	if (GetOwnerRole() != ROLE_Authority)
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Loadout] ServerSetLoadout called without authority — ignored. A client changes its "
+			     "loadout by asking the server, never by building one locally."));
+		return false;
+	}
+
+	FString Reason;
+	if (!IsLoadoutLegal(InLoadout, &Reason))
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[Loadout] refused %s — %s"),
+			*TraceLoadoutToString(InLoadout), *Reason);
+		return false;
+	}
+
+	if (Loadout == InLoadout)
+	{
+		return true;   // Already this. Not a failure, and not worth a rebuild.
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[Loadout] %s -> %s"),
+		*TraceLoadoutToString(Loadout), *TraceLoadoutToString(InLoadout));
+
+	// THE SAME RULE A CHARACTER SWAP ALREADY FOLLOWS, and it has to be the same or the two doors into
+	// "your abilities changed" disagree. The transient state belonged to the kit that just left, so
+	// it goes. THE COOLDOWN DOES NOT — changing loadout must not be a way to buy a free E, and spec
+	// §5 still gives exactly one automatic reset, at half time.
+	ResetAllSlotStates();
+	MarkNetStateDirty();
+
+	ApplyLoadout(InLoadout);   // Writes Loadout, which replicates and lands in OnRep_Loadout on clients.
+	return true;
+}
+
+void UTraceAbilityComponent::OnRep_Loadout()
+{
+	// A CLIENT REBUILDS FROM THE WIRE. ApplyLoadout copies its argument into Loadout, which the
+	// replication has already written — so it is handed its own value, deliberately: that keeps the
+	// one build path for both ends rather than a second, client-only one that could drift from it.
+	ApplyLoadout(Loadout);
+}
+
+void UTraceAbilityComponent::ApplyLoadout(const FTraceLoadout& InLoadout)
+{
+	// ---- tear down whatever is equipped -----------------------------------------------------
+	//
+	// UNEQUIP EVERYTHING FIRST, THEN BUILD. A kit that survived the swap because it happens to be in
+	// the new loadout too would keep state from before the change, and a kit being replaced must get
+	// its OnUnequipped before its successor's OnEquipped touches the same movement component or
+	// spawns into the same world. One clean edge, in the order the kits already expect.
+	for (const TObjectPtr<UTraceCharacterAbilitySet>& Existing : EquippedSets)
+	{
+		if (Existing != nullptr)
+		{
+			Existing->OnUnequipped();
+		}
+	}
+	EquippedSets.Reset();
+	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+	{
+		SetIndexBySlot[Index] = INDEX_NONE;
+	}
+
+	Loadout = InLoadout;
+	AbilitySet = nullptr;
+
+	// ---- work out which distinct kits are wanted, and which slots each covers ----------------
+	//
+	// DEDUP BY CLASS. Two slots from one kit is ONE instance with both bits in its mask, because
+	// those kits keep one pool of state their several abilities share.
+	struct FPending
+	{
+		UClass* Class = nullptr;
+		ETraceLoadoutSlot PrimarySlot = ETraceLoadoutSlot::Movement;
+		uint8 Mask = 0;
+	};
+	TArray<FPending, TInlineAllocator<3>> Pending;
+
+	for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
+	{
+		const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(SlotIndex);
+		const ETraceCharacterId Id = Loadout.Get(Slot);
+		if (Id == ETraceCharacterId::None)
+		{
+			continue;   // an empty slot is legal: the characterless Mannequin, and a player mid-pick
+		}
+
+		UClass* SetClass = UTraceCharacterAbilitySet::FindClassFor(Id);
+		if (SetClass == nullptr)
+		{
+			// Same non-error the single-kit path logged: the id is real, nothing implements it yet.
+			UE_LOG(LogTraceGame, Log,
+				TEXT("[Ability] %s wants %s in the %s slot, but no UTraceCharacterAbilitySet subclass "
+				     "claims that id — that slot is empty."),
+				*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(Id),
+				TraceLoadoutSlotToString(Slot));
+			continue;
+		}
+
+		FPending* Found = Pending.FindByPredicate(
+			[SetClass](const FPending& Entry) { return Entry.Class == SetClass; });
+
+		if (Found == nullptr)
+		{
+			FPending& Added = Pending.AddDefaulted_GetRef();
+			Added.Class = SetClass;
+			Added.PrimarySlot = Slot;
+			Added.Mask = static_cast<uint8>(1u << SlotIndex);
+		}
+		else
+		{
+			Found->Mask |= static_cast<uint8>(1u << SlotIndex);
+
+			// *** THE HIGHEST SLOT A KIT OWNS IS THE SLOT ITS STATE LIVES IN, AND IT MUST BE. ***
+			//
+			// A kit covering several slots still keeps ONE replicated struct, so which slot indexes it
+			// decides which struct that is. The enum is ordered Movement < Passive < Activated
+			// precisely so "highest wins" lands on Activated — and Activated is LegacySlotIndex(), the
+			// struct every not-yet-converted framework read still goes to.
+			//
+			// Taking the FIRST slot instead is not a style difference, it is a silent desync: a uniform
+			// loadout would file its kit under Movement while GetActivatedCooldownRemaining() and the
+			// client-Fx mirror kept reading Activated. Both structs exist, both replicate, neither
+			// errors — the cooldown simply stops being the one the game shows. It cost a respawn test
+			// reading 45s -> 0s to find, and nothing about it looks wrong at the call site.
+			if (static_cast<uint8>(Slot) > static_cast<uint8>(Found->PrimarySlot))
+			{
+				Found->PrimarySlot = Slot;
+			}
+		}
+	}
+
+	// ---- build ------------------------------------------------------------------------------
+	for (const FPending& Entry : Pending)
+	{
+		UTraceCharacterAbilitySet* Set = NewObject<UTraceCharacterAbilitySet>(this, Entry.Class);
+		Set->Initialize(this, Entry.PrimarySlot, Entry.Mask);
+
+		const int32 SetIndex = EquippedSets.Add(Set);
+		for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
+		{
+			if ((Entry.Mask & (1u << SlotIndex)) != 0)
+			{
+				SetIndexBySlot[SlotIndex] = SetIndex;
+			}
+		}
+	}
+
+	// AbilitySet stays meaningful for the ~20 callers that still ask for "the" kit: it is whatever
+	// fills Activated, or the first kit if nothing does. Those callers are retired slot by slot in
+	// S3; until then this keeps every one of them reading what it read before.
+	AbilitySet = GetAbilitySetForSlot(ETraceLoadoutSlot::Activated);
+	if (AbilitySet == nullptr && EquippedSets.Num() > 0)
+	{
+		AbilitySet = EquippedSets[0].Get();
+	}
+
+	// INITIALISE THEN EQUIP, ACROSS ALL KITS, in two passes rather than one. A kit's OnEquipped may
+	// look at the pawn and at the other kits; doing every OnInitialized first means it cannot
+	// observe a half-built loadout.
+	for (const TObjectPtr<UTraceCharacterAbilitySet>& Set : EquippedSets)
+	{
+		Set->OnInitialized();
+	}
+	for (const TObjectPtr<UTraceCharacterAbilitySet>& Set : EquippedSets)
+	{
+		Set->OnEquipped();
+	}
+
+	if (!Loadout.IsEmpty())
+	{
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[Ability] %s loadout %s -> %d kit instance(s)%s"),
+			*GetNameSafe(GetOwningPlayerState()), *TraceLoadoutToString(Loadout),
+			EquippedSets.Num(),
+			Loadout.IsUniform() ? TEXT(" (uniform - identical to the pre-rework character)") : TEXT(""));
+	}
+}
+
 const FTraceAbilityNetState& UTraceAbilityComponent::GetNetState(ETraceLoadoutSlot Slot) const
 {
 	const int32 Index = static_cast<int32>(Slot);
@@ -2065,7 +2348,7 @@ void UTraceAbilityComponent::NotifyPawnSpawned()
 	{
 		// Deliberately does NOT touch the cooldown. Spec §5: "a player can spawn with an ability
 		// timer still counting down."
-		AbilitySet->OnPawnSpawned();
+		ForEachEquipped(EquippedSets, [](UTraceCharacterAbilitySet* Set) { Set->OnPawnSpawned(); });
 	}
 }
 
@@ -2077,7 +2360,7 @@ void UTraceAbilityComponent::NotifyPawnDied()
 	// framework wipe that ran first would be overwritten one frame later by a stale mirror.
 	if (AbilitySet != nullptr)
 	{
-		AbilitySet->OnPawnDied();
+		ForEachEquipped(EquippedSets, [](UTraceCharacterAbilitySet* Set) { Set->OnPawnDied(); });
 	}
 
 	// ...THEN THE FRAMEWORK. See ApplyDeathStateWipe: this is spec v19 §4.2's ONE central place.
@@ -2208,7 +2491,7 @@ void UTraceAbilityComponent::NotifyKill(ATraceCharacter* Victim, FName Cause, bo
 {
 	if (AbilitySet != nullptr && HasAuthorityOwner())
 	{
-		AbilitySet->OnKill(Victim, Cause, bHeadshot);
+		ForEachEquipped(EquippedSets, [Victim, Cause, bHeadshot](UTraceCharacterAbilitySet* Set) { Set->OnKill(Victim, Cause, bHeadshot); });
 	}
 
 	// =============================================================================================
