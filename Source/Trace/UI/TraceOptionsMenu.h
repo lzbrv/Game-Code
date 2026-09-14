@@ -26,6 +26,7 @@
 
 #pragma once
 
+
 #include "CoreMinimal.h"
 #include "InputCoreTypes.h"
 #include "Math/Box2D.h"
@@ -35,6 +36,7 @@
 #include "Settings/TraceUserSettings.h"   // ETraceInputAction
 #include "UI/TraceNetworking.h"           // FTraceTextEntry - the CALL SIGN row types in it (WP2.2)
 #include "UI/Text/TraceTextWeight.h"      // ETraceTextWeight - which FACE a string is set in (v26 §2)
+#include "UI/TraceLoadoutSelect.h"   // the loadout library editor this menu hosts
 
 class AHUD;
 class APawn;
@@ -143,6 +145,21 @@ public:
 		 * has to anything.
 		 */
 		Crosshair,
+
+		/**
+		 * THE LOADOUT LIBRARY — spec: "create a loadout page in the main menu where players can set
+		 * their default loadouts (allow for five separate loadouts to be saved)".
+		 *
+		 * ITS OWN PAGE, and on the SETTINGS page rather than the pause root, for the reason the
+		 * crosshair page gives: the root earns its rows by emergency, and a loadout has none. Settings
+		 * is also the only route the TITLE SCREEN has to anything, and "in the main menu" is precisely
+		 * where the spec asks for this — so it has to be reachable from there or it does not exist.
+		 *
+		 * FIVE ROWS AND A BACK. Choosing one opens the three-column editor (FTraceLoadoutSelect in
+		 * library mode), which is the SAME screen the match uses — one place that knows what an
+		 * ability is called, rather than two that must be kept in agreement.
+		 */
+		Loadouts,
 
 		/**
 		 * UI PLAN WP3 — master / effects / music.
@@ -406,6 +423,11 @@ private:
 		OpenVideo,
 		/** SPEC v29 §3 — the CROSSHAIR row on the settings page. */
 		OpenCrosshair,
+		OpenLoadouts,
+		/** Edit saved loadout slot N. The slot index rides in the row's Index field. */
+		EditLoadoutSlot,
+		/** Forget saved loadout slot N, so a player can undo a mistake without rebuilding it. */
+		ClearLoadoutSlot,
 		/** UI PLAN WP3 — the AUDIO row on the settings page. */
 		OpenAudio,
 		/** D31-PAD — the CONTROLLER row on the settings page. */
@@ -597,6 +619,15 @@ private:
 		EAction Action = EAction::None;
 		ESetting Setting = ESetting::None;
 		ETraceInputAction Binding = ETraceInputAction::Count;
+
+		/**
+		 * Which of a repeated row this is — today, which of the five saved loadout slots.
+		 *
+		 * The loadout page is the first page here whose rows are five of the SAME row rather than
+		 * five different ones, so the action alone cannot say which slot was pressed. INDEX_NONE on
+		 * every other row, and nothing outside the loadout page reads it.
+		 */
+		int32 SlotIndex = INDEX_NONE;
 
 		/**
 		 * False when the row is meaningless right now — currently only RESOLUTION in windowed
@@ -875,6 +906,18 @@ private:
 	 * the overlay instead of dropping the player onto a page they never opened.
 	 */
 	EPage CrosshairReturnPage = EPage::Settings;
+
+	/** Where BACK goes from the loadout library, same contract as the pages above. */
+	EPage LoadoutsReturnPage = EPage::Settings;
+
+	/**
+	 * The three-column editor, open only while a slot is being edited.
+	 *
+	 * The SAME class the in-match screen is, in library mode — see TraceLoadoutSelect.h for why that
+	 * is a mode and not a subclass. While it is open this menu draws nothing of its own and forwards
+	 * its frame to it, so the two never read the same keys.
+	 */
+	FTraceLoadoutSelect LoadoutEditor;
 
 	/** UI PLAN WP3 — where BACK goes from the AUDIO page. Same contract as CrosshairReturnPage. */
 	EPage AudioReturnPage = EPage::Settings;

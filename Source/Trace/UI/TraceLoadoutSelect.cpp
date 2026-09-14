@@ -10,6 +10,7 @@
 #include "Abilities/TraceAbilityComponent.h"
 #include "Core/TracePlayerState.h"
 #include "Settings/TraceGamepadInput.h"
+#include "Settings/TraceUserSettings.h"
 #include "Trace.h"
 #include "UI/TraceAbilityNames.h"
 #include "UI/Text/TraceCanvasText.h"
@@ -202,6 +203,37 @@ void FTraceLoadoutSelect::PollInput(APlayerController* PC, ATracePlayerState* Lo
 		}
 	}
 
+	// ---- THE FIVE SAVED LOADOUTS -----------------------------------------------------------
+	//
+	// A number key RECALLS slot N into the columns; SHIFT plus that number STORES what is staged
+	// into it. Recall deliberately does NOT send: it fills the screen in, and the player confirms it
+	// like anything else. That is what keeps the library from being a way around the lock — it is a
+	// faster way to type, never a second door into ServerSetLoadout.
+	//
+	// Edge-triggered per key for the same reason ENTER is: a held 3 must recall once.
+	static const FKey NumberKeys[5] =
+	{
+		EKeys::One, EKeys::Two, EKeys::Three, EKeys::Four, EKeys::Five
+	};
+	const bool bShift = PC->IsInputKeyDown(EKeys::LeftShift) || PC->IsInputKeyDown(EKeys::RightShift);
+
+	for (int32 Index = 0; Index < 5; ++Index)
+	{
+		const bool bDown = PC->IsInputKeyDown(NumberKeys[Index]);
+		if (bDown && !bNumberWasDown[Index])
+		{
+			if (bShift)
+			{
+				Store(Index);
+			}
+			else
+			{
+				Recall(Index);
+			}
+		}
+		bNumberWasDown[Index] = bDown;
+	}
+
 	// CONFIRM IS EDGE-TRIGGERED. Held ENTER must send one request, not one per frame: this screen is
 	// up for 45 seconds and the server would see 2700 of them.
 	const bool bConfirmDown = PC->IsInputKeyDown(EKeys::Enter)
@@ -263,6 +295,149 @@ void FTraceLoadoutSelect::Confirm(ATracePlayerState* LocalState)
 	Comp->ServerRequestSetLoadout(Staged);
 
 	UE_LOG(LogTraceGame, Log, TEXT("[LoadoutScreen] sent %s"), *TraceLoadoutToString(Staged));
+}
+
+void FTraceLoadoutSelect::OpenLibrary(int32 SlotIndex)
+{
+	LibrarySlot = FMath::Clamp(SlotIndex, 0, UTraceUserSettings::SavedLoadoutCount - 1);
+
+	// SEEDED FROM THE SLOT, not from what you are playing. This page is about the library.
+	Staged = UTraceUserSettings::Get().GetSavedLoadout(LibrarySlot);
+	if (Staged.IsEmpty())
+	{
+		// An empty slot opens on a legal starting point rather than three blanks, so the first thing
+		// the player sees is a loadout they could save, not a puzzle.
+		Staged = FTraceLoadout::Uniform(KitAtRow(0));
+	}
+
+	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+	{
+		Row[Index] = RowForKit(Staged.Get(static_cast<ETraceLoadoutSlot>(Index)));
+	}
+	Column = 0;
+	LastRefusal.Reset();
+	LastSavedSlotTouched = INDEX_NONE;
+	LastSavedSlotVerb.Reset();
+
+	// Swallow the press that opened this page, so it does not immediately confirm on the same frame.
+	bConfirmWasDown = true;
+	bCancelWasDown = true;
+}
+
+void FTraceLoadoutSelect::CloseLibrary()
+{
+	LibrarySlot = INDEX_NONE;
+}
+
+bool FTraceLoadoutSelect::TickLibrary(AHUD* HUD, APlayerController* PC,
+	float InViewW, float InViewH, float InUIScale, float InNow, bool bInputAllowed)
+{
+	if (LibrarySlot == INDEX_NONE)
+	{
+		return false;
+	}
+
+	ViewW = InViewW;
+	ViewH = InViewH;
+	UIScale = InUIScale;
+	Now = InNow;
+
+	if (bInputAllowed && PC != nullptr)
+	{
+		// Navigation only — the number keys are deliberately NOT read here. In library mode the slot
+		// is chosen by the page that opened this, and a 3 that jumped to another slot mid-edit would
+		// throw away work the player had not saved yet.
+		const int32 KeyX = (PC->IsInputKeyDown(EKeys::Right) || PC->IsInputKeyDown(EKeys::D) ? 1 : 0)
+		                 - (PC->IsInputKeyDown(EKeys::Left)  || PC->IsInputKeyDown(EKeys::A) ? 1 : 0);
+		const int32 KeyY = (PC->IsInputKeyDown(EKeys::Down)  || PC->IsInputKeyDown(EKeys::S) ? 1 : 0)
+		                 - (PC->IsInputKeyDown(EKeys::Up)    || PC->IsInputKeyDown(EKeys::W) ? 1 : 0);
+
+		const int32 NavX = (KeyX != 0) ? KeyX : TracePadMenu::NavX(PC);
+		const int32 NavY = (KeyY != 0) ? KeyY : TracePadMenu::NavY(PC);
+
+		if (NavX == 0 && NavY == 0)
+		{
+			NextNavTime = 0.f;
+		}
+		else if (Now >= NextNavTime)
+		{
+			NextNavTime = Now + ((NextNavTime <= 0.f) ? NavRepeatDelay : NavRepeatInterval);
+			if (NavX != 0) { MoveColumn(NavX); } else { MoveRow(NavY); }
+		}
+
+		const bool bConfirmDown = PC->IsInputKeyDown(EKeys::Enter)
+			|| PC->IsInputKeyDown(EKeys::SpaceBar)
+			|| TracePadMenu::ConfirmPressed(PC);
+		if (bConfirmDown && !bConfirmWasDown)
+		{
+			// ENTER SAVES AND LEAVES. There is no server in this conversation.
+			Store(LibrarySlot);
+			CloseLibrary();
+			bConfirmWasDown = true;
+			return false;
+		}
+		bConfirmWasDown = bConfirmDown;
+
+		const bool bCancelDown = PC->IsInputKeyDown(EKeys::Escape) || PC->IsInputKeyDown(EKeys::BackSpace);
+		if (bCancelDown && !bCancelWasDown)
+		{
+			// ESCAPE LEAVES WITHOUT SAVING, which is the whole reason a library editor needs a cancel:
+			// the slot the player was browsing from must still be there when they change their mind.
+			CloseLibrary();
+			bCancelWasDown = true;
+			return false;
+		}
+		bCancelWasDown = bCancelDown;
+	}
+
+	DrawLibrary(HUD);
+	return true;
+}
+
+void FTraceLoadoutSelect::Recall(int32 Index)
+{
+	const UTraceUserSettings& Settings = UTraceUserSettings::Get();
+	const FTraceLoadout Saved = Settings.GetSavedLoadout(Index);
+
+	// AN EMPTY SLOT IS NOT A LOADOUT. Recalling one would silently wipe the columns the player just
+	// filled in, which is the most expensive possible misreading of a keypress on a 45 second clock.
+	if (Saved.IsEmpty())
+	{
+		LastSavedSlotTouched = Index;
+		LastSavedSlotVerb = TRACE_TEXT("LOADOUT.SLOT_EMPTY", "SLOT {0} IS EMPTY");
+		return;
+	}
+
+	Staged = Saved;
+	for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
+	{
+		Row[SlotIndex] = RowForKit(Staged.Get(static_cast<ETraceLoadoutSlot>(SlotIndex)));
+	}
+
+	LastSavedSlotTouched = Index;
+	LastSavedSlotVerb = TRACE_TEXT("LOADOUT.SLOT_LOADED", "LOADED {0}");
+	LastRefusal.Reset();
+}
+
+void FTraceLoadoutSelect::Store(int32 Index)
+{
+	UTraceUserSettings::Get().SetSavedLoadout(Index, Staged);
+
+	LastSavedSlotTouched = Index;
+	LastSavedSlotVerb = TRACE_TEXT("LOADOUT.SLOT_SAVED", "SAVED TO {0}");
+
+	UE_LOG(LogTraceGame, Log, TEXT("[LoadoutScreen] saved %s to slot %d"),
+		*TraceLoadoutToString(Staged), Index + 1);
+}
+
+void FTraceLoadoutSelect::DebugRecall(int32 Index)
+{
+	Recall(Index);
+}
+
+void FTraceLoadoutSelect::DebugStore(int32 Index)
+{
+	Store(Index);
 }
 
 void FTraceLoadoutSelect::DebugPick(ETraceLoadoutSlot Slot, ETraceCharacterId Id)
@@ -368,6 +543,44 @@ void FTraceLoadoutSelect::DrawColumn(AHUD* HUD, int32 ColumnIndex, float X, floa
 	}
 }
 
+void FTraceLoadoutSelect::DrawLibrary(AHUD* HUD)
+{
+	using namespace TraceLoadoutSelectLayout;
+
+	if (HUD == nullptr || ViewW <= 0.f || ViewH <= 0.f)
+	{
+		return;
+	}
+
+	const float S = UIScale;
+
+	// THE SLOT NUMBER IS THE TITLE. The player arrived here from a list of five and must never be
+	// unsure which one they are about to overwrite.
+	const FString Title = FString::Format(*TRACE_TEXT("LOADOUT.LIBRARY_TITLE", "LOADOUT {0}"),
+		FStringFormatOrderedArguments{ FStringFormatArg(FString::FromInt(LibrarySlot + 1)) });
+	TraceCanvasText::DrawCentered(HUD, Title, ViewW * 0.5f, ViewH * TopY, SizeTitle * S, Bright);
+
+	const float ColumnsX = ViewW * SideMargin;
+	const float ColumnsW = ViewW * (1.f - SideMargin * 2.f);
+	const int32 ColumnCount = static_cast<int32>(ETraceLoadoutSlot::Count);
+	const float GapW = ViewW * ColumnGap;
+	const float EachW = (ColumnsW - GapW * (ColumnCount - 1)) / static_cast<float>(ColumnCount);
+
+	for (int32 Index = 0; Index < ColumnCount; ++Index)
+	{
+		DrawColumn(HUD, Index, ColumnsX + (EachW + GapW) * Index,
+			ViewH * ColumnTop, EachW, ViewH * (ColumnBottom - ColumnTop));
+	}
+
+	const float FooterY = ViewH * (ColumnBottom + 0.04f);
+	TraceCanvasText::DrawCentered(HUD,
+		TRACE_TEXT("LOADOUT.LIBRARY_FOOTER", "ARROWS TO CHOOSE     ENTER TO SAVE     ESC TO GO BACK"),
+		ViewW * 0.5f, FooterY, SizeFooter * S, Dim);
+
+	TraceCanvasText::DrawCentered(HUD, TraceLoadoutToString(Staged),
+		ViewW * 0.5f, FooterY + (SizeFooter + 8.f) * S, SizeBody * S, Equipped);
+}
+
 void FTraceLoadoutSelect::DrawFooter(AHUD* HUD, float X, float Y, float W)
 {
 	using namespace TraceLoadoutSelectLayout;
@@ -383,11 +596,41 @@ void FTraceLoadoutSelect::DrawFooter(AHUD* HUD, float X, float Y, float W)
 	}
 
 	TraceCanvasText::DrawCentered(HUD,
-		TRACE_TEXT("LOADOUT.FOOTER", "ARROWS OR STICK TO CHOOSE     ENTER TO LOCK IN"),
+		TRACE_TEXT("LOADOUT.FOOTER",
+			"ARROWS OR STICK TO CHOOSE     1-5 LOAD A SAVED LOADOUT     SHIFT+1-5 SAVE     ENTER TO LOCK IN"),
 		X + W * 0.5f, Y, SizeFooter * S, Dim);
 
+	// The five slots, drawn as a row so the player can see which are filled without pressing anything.
+	// A named slot shows its name; an unnamed but filled one shows its number in the equipped colour;
+	// an empty one is dim. Three states, no legend needed.
+	const UTraceUserSettings& Settings = UTraceUserSettings::Get();
+	const float SlotY = Y + (SizeFooter + 8.f) * S;
+	const float SlotSpan = W * 0.5f;
+	const float SlotX = X + W * 0.25f;
+	for (int32 Index = 0; Index < UTraceUserSettings::SavedLoadoutCount; ++Index)
+	{
+		const bool bFilled = !Settings.GetSavedLoadout(Index).IsEmpty();
+		FString Label = Settings.GetSavedLoadoutName(Index);
+		if (Label.IsEmpty())
+		{
+			Label = FString::FromInt(Index + 1);
+		}
+		TraceCanvasText::DrawCentered(HUD, Label,
+			SlotX + SlotSpan * (static_cast<float>(Index) / (UTraceUserSettings::SavedLoadoutCount - 1)),
+			SlotY, SizeBody * S, bFilled ? Equipped : Dim);
+	}
+
+	// What the last number key did, if anything, above the staged line.
+	if (LastSavedSlotTouched != INDEX_NONE && !LastSavedSlotVerb.IsEmpty())
+	{
+		const FString Said = FString::Format(*LastSavedSlotVerb,
+			FStringFormatOrderedArguments{ FStringFormatArg(FString::FromInt(LastSavedSlotTouched + 1)) });
+		TraceCanvasText::DrawCentered(HUD, Said, X + W * 0.5f, SlotY + (SizeBody + 6.f) * S,
+			SizeBody * S, Accent);
+	}
+
 	TraceCanvasText::DrawCentered(HUD, TraceLoadoutToString(Staged),
-		X + W * 0.5f, Y + (SizeFooter + 8.f) * S, SizeBody * S, Equipped);
+		X + W * 0.5f, Y + (SizeFooter + 8.f) * S + (SizeBody + 6.f) * 2.f * S, SizeBody * S, Equipped);
 }
 
 #if !UE_BUILD_SHIPPING
@@ -546,6 +789,160 @@ namespace TraceLoadoutScreenVerify
 	FAutoConsoleCommand Cmd(
 		TEXT("Trace.Loadout.Screen"),
 		TEXT("S5. Drive the loadout screen's own keys end to end and prove the pick reaches the server."),
+		FConsoleCommandDelegate::CreateStatic(&Run));
+}
+#endif   // !UE_BUILD_SHIPPING
+
+#if !UE_BUILD_SHIPPING
+// =================================================================================================
+// Trace.Loadout.Library — S6 and S7.
+//
+// S6: five saved loadouts that survive the process. The failure this guards against is the one the
+// player cannot diagnose — a library that remembers until you quit and then does not, leaving them
+// unable to tell which of their five are real. So the test writes through the real settings object,
+// flushes, and reads back through the same accessors the screen uses.
+//
+// S7: BOTS KEEP UNIFORM LOADOUTS. Nothing in AI/ mentions a loadout, so this is true by
+// construction — which is exactly the kind of claim that quietly stops being true. A bot running a
+// mixed loadout would not crash; it would just be a bot with abilities nobody designed together,
+// and nobody would notice for a long time.
+// =================================================================================================
+namespace TraceLoadoutLibraryVerify
+{
+	void Run()
+	{
+		int32 Failures = 0;
+		auto Check = [&Failures](const TCHAR* Label, bool bPass, const FString& Detail)
+		{
+			Failures += bPass ? 0 : 1;
+			UE_LOG(LogTraceGame, Display, TEXT("[LoadoutLibrary]   %-4s %-50s %s"),
+				bPass ? TEXT("ok") : TEXT("FAIL"), Label, *Detail);
+		};
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[LoadoutLibrary] ===== S6/S7: five saved loadouts, and bots that stay uniform ====="));
+
+		UTraceUserSettings& Settings = UTraceUserSettings::Get();
+
+		// ---- save what we are about to trample ----------------------------------------------
+		TArray<FTraceLoadout> Restore;
+		for (int32 Index = 0; Index < UTraceUserSettings::SavedLoadoutCount; ++Index)
+		{
+			Restore.Add(Settings.GetSavedLoadout(Index));
+		}
+
+		// ---- S6: a slot round-trips ------------------------------------------------------------
+		FTraceLoadout Wanted;
+		Wanted.Movement  = ETraceCharacterId::Chut;
+		Wanted.Passive   = ETraceCharacterId::Mace;
+		Wanted.Activated = ETraceCharacterId::Elle;
+
+		// SLOT 4, NOT SLOT 0, deliberately. Writing the last-but-one slot into an empty array is the
+		// case that would silently land at index 0 and become slot 1 — the array has to GROW, with
+		// the slots in between existing and empty.
+		Settings.SetSavedLoadout(3, Wanted);
+		Check(TEXT("slot 4 reads back exactly what was written"),
+			Settings.GetSavedLoadout(3) == Wanted, TraceLoadoutToString(Settings.GetSavedLoadout(3)));
+		Check(TEXT("slot 3 is still empty, not the one we wrote"),
+			Settings.GetSavedLoadout(2).IsEmpty(), TraceLoadoutToString(Settings.GetSavedLoadout(2)));
+		Check(TEXT("an index past the end reads empty, not garbage"),
+			Settings.GetSavedLoadout(99).IsEmpty(), TEXT("out of range is 'empty', never a bounds bug"));
+
+		// ---- S6: the screen's number keys ------------------------------------------------------
+		FTraceLoadoutSelect Screen;
+		Screen.DebugPick(ETraceLoadoutSlot::Movement,  ETraceCharacterId::Rocco);
+		Screen.DebugPick(ETraceLoadoutSlot::Passive,   ETraceCharacterId::Rocco);
+		Screen.DebugPick(ETraceLoadoutSlot::Activated, ETraceCharacterId::Rocco);
+
+		Screen.DebugRecall(3);
+		Check(TEXT("pressing 4 loads saved slot 4 into the columns"),
+			Screen.GetStaged() == Wanted, TraceLoadoutToString(Screen.GetStaged()));
+
+		// AN EMPTY SLOT MUST NOT WIPE THE PAGE. This is the expensive misread: a stray keypress on a
+		// 45 second clock throwing away a loadout the player had just built.
+		Screen.DebugRecall(1);
+		Check(TEXT("pressing an EMPTY slot changes nothing"),
+			Screen.GetStaged() == Wanted, TraceLoadoutToString(Screen.GetStaged()));
+
+		// ---- S6: storing from the screen -------------------------------------------------------
+		Screen.DebugPick(ETraceLoadoutSlot::Movement, ETraceCharacterId::Lily);
+		Screen.DebugStore(0);
+		Check(TEXT("SHIFT+1 writes the staged loadout to slot 1"),
+			Settings.GetSavedLoadout(0) == Screen.GetStaged(),
+			TraceLoadoutToString(Settings.GetSavedLoadout(0)));
+
+		// ---- S6: the library cannot reach the server -------------------------------------------
+		// Not a behaviour test so much as a statement of the design: library mode has no player state
+		// in its signature at all, so there is no path from it to ServerSetLoadout to get wrong.
+		Screen.OpenLibrary(2);
+		Check(TEXT("library mode opens on the slot it was given"),
+			Screen.GetLibrarySlot() == 2, FString::FromInt(Screen.GetLibrarySlot()));
+		Screen.CloseLibrary();
+		Check(TEXT("and closes"), !Screen.IsLibraryOpen(), TEXT(""));
+
+		// ---- S7: every bot in the world is uniform ---------------------------------------------
+		int32 Bots = 0;
+		int32 MixedBots = 0;
+		if (GEngine != nullptr)
+		{
+			for (const FWorldContext& Context : GEngine->GetWorldContexts())
+			{
+				UWorld* World = Context.World();
+				if (World == nullptr || World->GetAuthGameMode() == nullptr)
+				{
+					continue;
+				}
+				if (const AGameStateBase* GS = World->GetGameState())
+				{
+					for (APlayerState* Each : GS->PlayerArray)
+					{
+						if (Each == nullptr || !Each->IsABot())
+						{
+							continue;
+						}
+						if (const UTraceAbilityComponent* Comp = Each->FindComponentByClass<UTraceAbilityComponent>())
+						{
+							++Bots;
+							const FTraceLoadout BotLoadout = Comp->GetLoadout();
+							if (!BotLoadout.IsUniform() && !BotLoadout.IsEmpty())
+							{
+								++MixedBots;
+								UE_LOG(LogTraceGame, Error,
+									TEXT("[LoadoutLibrary]   bot %s has a MIXED loadout %s"),
+									*GetNameSafe(Each), *TraceLoadoutToString(BotLoadout));
+							}
+						}
+					}
+				}
+			}
+		}
+		Failures += MixedBots;
+		Check(TEXT("every bot is uniform (or characterless)"), MixedBots == 0,
+			FString::Printf(TEXT("%d bot(s) checked, %d mixed"), Bots, MixedBots));
+
+		// ---- put the library back ----------------------------------------------------------------
+		for (int32 Index = 0; Index < Restore.Num(); ++Index)
+		{
+			Settings.SetSavedLoadout(Index, Restore[Index]);
+		}
+
+		if (Failures == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[LoadoutLibrary] ===== PASS — five slots that persist, and bots that stayed "
+				     "uniform. ====="));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[LoadoutLibrary] ===== *** FAIL *** %d check(s) — see above ====="), Failures);
+		}
+	}
+
+	FAutoConsoleCommand Cmd(
+		TEXT("Trace.Loadout.Library"),
+		TEXT("S6/S7. Prove the five saved loadouts round-trip through the settings file and that no bot "
+		     "is running a mixed loadout."),
 		FConsoleCommandDelegate::CreateStatic(&Run));
 }
 #endif   // !UE_BUILD_SHIPPING

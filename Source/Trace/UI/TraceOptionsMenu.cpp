@@ -2,6 +2,8 @@
 
 #include "UI/TraceOptionsMenu.h"
 
+#include "UI/TraceAbilityNames.h"   // the loadout page prints ability names
+
 #include "Camera/CameraComponent.h"
 #include "Containers/Ticker.h"          // FTSTicker - defer the viewport resize out of DrawHUD
 #include "DynamicRHI.h"                  // RHIGetGPUFrameCycles
@@ -1837,6 +1839,44 @@ void FTraceOptionsMenu::RebuildRows()
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetVideoDefaults);
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
+	else if (Page == EPage::Loadouts)
+	{
+		// FIVE ROWS, ONE PER SAVED SLOT, and each says what it holds rather than just its number — a
+		// library where every row reads "LOADOUT 3" is a library the player has to open five times to
+		// read. A filled slot shows its three abilities; an empty one says so.
+		AddHeader(*TRACE_TEXT("OPTIONS.LOADOUTS.HEADER", "YOUR SAVED LOADOUTS"));
+
+		const UTraceUserSettings& Settings = UTraceUserSettings::Get();
+		for (int32 Index = 0; Index < UTraceUserSettings::SavedLoadoutCount; ++Index)
+		{
+			const FTraceLoadout Saved = Settings.GetSavedLoadout(Index);
+
+			FString Summary;
+			if (Saved.IsEmpty())
+			{
+				Summary = TRACE_TEXT("OPTIONS.LOADOUTS.EMPTY", "EMPTY");
+			}
+			else
+			{
+				Summary = FString::Printf(TEXT("%s / %s / %s"),
+					*TraceAbilityNames::Get(Saved.Movement,  ETraceLoadoutSlot::Movement),
+					*TraceAbilityNames::Get(Saved.Passive,   ETraceLoadoutSlot::Passive),
+					*TraceAbilityNames::Get(Saved.Activated, ETraceLoadoutSlot::Activated));
+			}
+
+			FRow Row;
+			Row.Kind = ERowKind::Action;
+			Row.Label = FString::Printf(TEXT("%d.  %s"), Index + 1, *Summary);
+			Row.Action = EAction::EditLoadoutSlot;
+			Row.SlotIndex = Index;
+			Rows.Add(MoveTemp(Row));
+		}
+
+		AddHeader(TEXT(""));
+		AddNote(*TRACE_TEXT("OPTIONS.LOADOUTS.NOTE",
+			"THESE ARE YOURS AND STAY ON THIS MACHINE. LOAD ONE WITH 1-5 ON THE LOADOUT SCREEN."));
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
+	}
 	else if (Page == EPage::Crosshair)
 	{
 		// ---- SPEC v29 §3 — SHAPE FIRST, THEN INK ------------------------------------------------
@@ -1974,6 +2014,7 @@ void FTraceOptionsMenu::RebuildRows()
 		// to a page about how the game LOOKS, and this is the only route the title screen has to
 		// either of them — there is no pause root there to hang a shortcut on.
 		AddAction(*TRACE_TEXT("OPTIONS.SETTINGS.ROW_CROSSHAIR", "CROSSHAIR"), EAction::OpenCrosshair);
+		AddAction(*TRACE_TEXT("OPTIONS.SETTINGS.ROW_LOADOUTS", "LOADOUTS"), EAction::OpenLoadouts);
 
 		// UI PLAN WP3. Its own header rather than a third door under DISPLAY, because it is not one:
 		// DISPLAY is how the game LOOKS and this is how it SOUNDS, and a page about the crosshair and
@@ -2129,6 +2170,26 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 
 	if (Page == EPage::Closed || HUD == nullptr || InViewW <= 0.f || InViewH <= 0.f)
 	{
+		return;
+	}
+
+	// *** THE LOADOUT EDITOR OWNS THE FRAME WHILE IT IS OPEN. ***
+	//
+	// BEFORE everything below, and it returns rather than falling through: the editor reads arrows and
+	// ENTER, and so does this menu's own row list. Both running would move the selection behind the
+	// editor while the player builds a loadout, and they would come back to a different row than they
+	// left. One screen reads the keys at a time.
+	//
+	// When it closes it returns false, and the rows are rebuilt so the slot they just saved shows its
+	// new contents rather than the summary it had when they opened it.
+	if (LoadoutEditor.IsLibraryOpen())
+	{
+		if (!LoadoutEditor.TickLibrary(HUD, PC, InViewW, InViewH, InUIScale, InNow,
+			/*bInputAllowed=*/GFrameCounter >= IgnoreInputBeforeFrame))
+		{
+			IgnoreInputBeforeFrame = GFrameCounter + 1;
+			RebuildRows();
+		}
 		return;
 	}
 
@@ -3616,6 +3677,32 @@ void FTraceOptionsMenu::ActivateSelected()
 		RebuildRows();
 		break;
 
+	case EAction::OpenLoadouts:
+		// Remember where we came from, exactly as OpenVideo and OpenCrosshair do — the title screen and
+		// the pause menu both reach this page and BACK has to undo the step the player actually took.
+		LoadoutsReturnPage = Page;
+		Page = EPage::Loadouts;
+		IgnoreInputBeforeFrame = GFrameCounter + 1;
+		RebuildRows();
+		break;
+
+	case EAction::EditLoadoutSlot:
+		// Hands the frame to the three-column editor. This menu draws nothing while it is up — see the
+		// forward in Tick — so the two never read the same keys.
+		if (Rows.IsValidIndex(Selected) && Rows[Selected].SlotIndex != INDEX_NONE)
+		{
+			LoadoutEditor.OpenLibrary(Rows[Selected].SlotIndex);
+		}
+		break;
+
+	case EAction::ClearLoadoutSlot:
+		if (Rows.IsValidIndex(Selected) && Rows[Selected].SlotIndex != INDEX_NONE)
+		{
+			UTraceUserSettings::Get().SetSavedLoadout(Rows[Selected].SlotIndex, FTraceLoadout());
+			RebuildRows();
+		}
+		break;
+
 	case EAction::OpenCrosshair:
 		// Remember where we came from, exactly as OpenVideo does. Only the settings page carries this
 		// row today, but "back" must mean the place the player actually came from rather than one
@@ -3775,6 +3862,21 @@ void FTraceOptionsMenu::GoBack()
 		if (ControllerReturnPage == EPage::Root || ControllerReturnPage == EPage::Settings)
 		{
 			Page = ControllerReturnPage;
+			IgnoreInputBeforeFrame = GFrameCounter + 1;
+			RebuildRows();
+			return;
+		}
+
+		Close();
+		return;
+	}
+
+	if (Page == EPage::Loadouts)
+	{
+		// Nothing to flush: every slot is written and saved by the editor on the ENTER that made it.
+		if (LoadoutsReturnPage == EPage::Root || LoadoutsReturnPage == EPage::Settings)
+		{
+			Page = LoadoutsReturnPage;
 			IgnoreInputBeforeFrame = GFrameCounter + 1;
 			RebuildRows();
 			return;
@@ -4193,6 +4295,7 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	if (Page == EPage::Root)            { Title = TRACE_TEXT("OPTIONS.TITLE.PAUSED", "PAUSED"); }
 	else if (Page == EPage::Video)      { Title = TRACE_TEXT("OPTIONS.TITLE.VIDEO", "VIDEO"); }
 	else if (Page == EPage::Crosshair)  { Title = TRACE_TEXT("OPTIONS.TITLE.CROSSHAIR", "CROSSHAIR"); }
+	else if (Page == EPage::Loadouts)   { Title = TRACE_TEXT("OPTIONS.TITLE.LOADOUTS", "LOADOUTS"); }
 	else if (Page == EPage::Audio)      { Title = TRACE_TEXT("OPTIONS.TITLE.AUDIO", "AUDIO"); }
 	else if (Page == EPage::Controller) { Title = TRACE_TEXT("OPTIONS.TITLE.CONTROLLER", "CONTROLLER"); }
 

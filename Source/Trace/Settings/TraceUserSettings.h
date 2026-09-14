@@ -27,6 +27,8 @@
 #pragma once
 
 #include "CoreMinimal.h"
+
+#include "Abilities/TraceAbilityTypes.h"   // FTraceLoadout — the five saved loadouts below
 #include "Delegates/DelegateCombinations.h"
 #include "InputCoreTypes.h"             // FKey / EKeys
 #include "Misc/EnumClassFlags.h"        // ENUM_CLASS_FLAGS, for ETraceInputStates
@@ -514,6 +516,34 @@ public:
 	/** The one accessor. Mutable because the options screen writes through it. */
 	static UTraceUserSettings& Get();
 
+	// =============================================================================================
+	// SAVED LOADOUTS — spec: "allow for five separate loadouts to be saved"
+	// =============================================================================================
+	//
+	// HERE rather than in a class of their own, because this is already the per-machine settings file
+	// with a Save() that flushes GConfig, and a loadout library is exactly that: a preference, local
+	// to the player, that must survive a hard kill of the process.
+	//
+	// *** NOT REPLICATED, AND THAT IS THE POINT. *** These are what you have SAVED, not what you are
+	// PLAYING. What you are playing is FTraceLoadout on your ability component, which the server owns
+	// and the lock governs. A player loads a saved one INTO the screen and then confirms it like any
+	// other pick, so the library can never be a way around the lock: it is a faster way to type.
+
+	/** Five, per the spec. A constant because the screen draws one row per slot and must agree. */
+	static constexpr int32 SavedLoadoutCount = 5;
+
+	/** Slot @p Index, or an empty loadout if the index is out of range or was never filled. */
+	FTraceLoadout GetSavedLoadout(int32 Index) const;
+
+	/** Writes slot @p Index and persists immediately — a saved loadout the game forgets is a bug. */
+	void SetSavedLoadout(int32 Index, const FTraceLoadout& InLoadout);
+
+	/** The player's own label for slot @p Index, or "" if they never named it. */
+	FString GetSavedLoadoutName(int32 Index) const;
+
+	/** Names slot @p Index and persists. */
+	void SetSavedLoadoutName(int32 Index, const FString& InName);
+
 	/**
 	 * The change broadcast.
 	 *
@@ -549,6 +579,20 @@ public:
 	 */
 	UPROPERTY(config)
 	float MouseSensitivity = DefaultSensitivity;
+
+	/**
+	 * The five saved loadouts, and the five labels the player gave them.
+	 *
+	 * Kept as flat arrays that MAY be short: a fresh install has none, and a player who only ever
+	 * saves slot 3 leaves 1, 2, 4 and 5 empty forever. Everything reading them goes through
+	 * GetSavedLoadout/GetSavedLoadoutName, which answer "empty" for any index the arrays do not
+	 * reach — so a short array is the normal case and never a bounds bug.
+	 */
+	UPROPERTY(config)
+	TArray<FTraceLoadout> SavedLoadouts;
+
+	UPROPERTY(config)
+	TArray<FString> SavedLoadoutNames;
 
 	/**
 	 * Extra multiplier applied to the VERTICAL axis only, on top of MouseSensitivity.

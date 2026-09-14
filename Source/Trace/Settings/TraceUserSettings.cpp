@@ -1768,6 +1768,57 @@ bool UTraceUserSettings::IsAtDefaults() const
 	return true;
 }
 
+// =================================================================================================
+// Saved loadouts
+// =================================================================================================
+
+FTraceLoadout UTraceUserSettings::GetSavedLoadout(int32 Index) const
+{
+	// OUT OF RANGE IS "EMPTY", NOT AN ERROR. The arrays are allowed to be short — a fresh install has
+	// no loadouts at all and a player who only fills slot 3 leaves the rest empty forever — so every
+	// reader would otherwise need the same bounds check, and one of them would eventually forget it.
+	return SavedLoadouts.IsValidIndex(Index) ? SavedLoadouts[Index] : FTraceLoadout();
+}
+
+FString UTraceUserSettings::GetSavedLoadoutName(int32 Index) const
+{
+	return SavedLoadoutNames.IsValidIndex(Index) ? SavedLoadoutNames[Index] : FString();
+}
+
+void UTraceUserSettings::SetSavedLoadout(int32 Index, const FTraceLoadout& InLoadout)
+{
+	if (Index < 0 || Index >= SavedLoadoutCount)
+	{
+		return;
+	}
+
+	// Grow to reach the index. SetNum rather than reserve: the intermediate slots must EXIST and be
+	// empty, or writing slot 5 into an empty array would put it at index 0 and silently become slot 1.
+	if (SavedLoadouts.Num() <= Index)
+	{
+		SavedLoadouts.SetNum(Index + 1);
+	}
+	SavedLoadouts[Index] = InLoadout;
+
+	// SAVED IMMEDIATELY. A library that survives until you quit and then does not is worse than no
+	// library: the player has no way to tell which of their five are real.
+	Save();
+}
+
+void UTraceUserSettings::SetSavedLoadoutName(int32 Index, const FString& InName)
+{
+	if (Index < 0 || Index >= SavedLoadoutCount)
+	{
+		return;
+	}
+	if (SavedLoadoutNames.Num() <= Index)
+	{
+		SavedLoadoutNames.SetNum(Index + 1);
+	}
+	SavedLoadoutNames[Index] = InName;
+	Save();
+}
+
 void UTraceUserSettings::Save()
 {
 	FlattenToConfig();

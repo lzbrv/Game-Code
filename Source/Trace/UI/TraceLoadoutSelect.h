@@ -80,11 +80,52 @@ struct TRACE_API FTraceLoadoutSelect
 	void Tick(AHUD* HUD, APlayerController* PC, ATracePlayerState* LocalState,
 		float InViewW, float InViewH, float InUIScale, float InNow, bool bInputAllowed);
 
+	// =============================================================================================
+	// LIBRARY MODE — the same three columns, editing a SAVED slot instead of what you are playing
+	// =============================================================================================
+	//
+	// The main menu needs a page to build the five saved loadouts on, and it needs exactly this
+	// screen: three columns, ten abilities each, the same names and the same descriptions. Writing a
+	// second one would be two screens to keep in agreement about what an ability is called.
+	//
+	// THE ONE DIFFERENCE IS WHERE ENTER GOES. In match mode it asks the server. In library mode there
+	// is no server in the conversation at all — ENTER writes the slot to disk and closes. That is why
+	// this is a mode rather than a subclass: everything except the destination of one keypress is the
+	// same code, and a subclass would have duplicated the other ninety per cent to change it.
+	//
+	// It also means the library can never be a way around the loadout lock: nothing in this mode can
+	// reach ServerSetLoadout, by construction rather than by a check somebody has to remember.
+
+	/** Opens the editor on saved slot @p SlotIndex, seeded with whatever that slot holds. */
+	void OpenLibrary(int32 SlotIndex);
+
+	void CloseLibrary();
+
+	bool IsLibraryOpen() const { return LibrarySlot != INDEX_NONE; }
+
+	/** Which saved slot is being edited, or INDEX_NONE. */
+	int32 GetLibrarySlot() const { return LibrarySlot; }
+
+	/**
+	 * Draws and drives the editor. Call instead of Tick() — a host that called both would have two
+	 * screens reading the same keys.
+	 *
+	 * Returns false once the editor has closed, so the host knows to go back to its own page.
+	 */
+	bool TickLibrary(AHUD* HUD, APlayerController* PC,
+		float InViewW, float InViewH, float InUIScale, float InNow, bool bInputAllowed);
+
 	/** Test seam: set one slot's pick without a keypress. */
 	void DebugPick(ETraceLoadoutSlot Slot, ETraceCharacterId Id);
 
 	/** Test seam: send whatever is currently staged, as if ENTER had been pressed. */
 	void DebugConfirm(ATracePlayerState* LocalState);
+
+	/** Test seam: recall saved slot @p Index (0-based), as if its number key had been pressed. */
+	void DebugRecall(int32 Index);
+
+	/** Test seam: save what is staged into slot @p Index, as if SHIFT+number had been pressed. */
+	void DebugStore(int32 Index);
 
 	/** What the screen currently has staged — not necessarily what the server has accepted. */
 	FTraceLoadout GetStaged() const { return Staged; }
@@ -98,9 +139,18 @@ private:
 	void MoveRow(int32 Delta);
 	void Confirm(ATracePlayerState* LocalState);
 
+	/** Loads saved slot @p Index into Staged. Does NOT send — the player still confirms. */
+	void Recall(int32 Index);
+
+	/** Writes Staged into saved slot @p Index and persists it. */
+	void Store(int32 Index);
+
 	void Draw(AHUD* HUD, ATracePlayerState* LocalState);
 	void DrawColumn(AHUD* HUD, int32 ColumnIndex, float X, float Y, float W, float H);
 	void DrawFooter(AHUD* HUD, float X, float Y, float W);
+
+	/** The library editor's own frame: same three columns, a slot title, and a different footer. */
+	void DrawLibrary(AHUD* HUD);
 
 	/** Seeds Staged from whatever the player already has, so opening mid-match is not a blank page. */
 	void SyncStagedFromServer(ATracePlayerState* LocalState);
@@ -131,4 +181,16 @@ private:
 	static constexpr float NavRepeatInterval = 0.12f;
 
 	bool bConfirmWasDown = false;
+
+	/** Edge state for the five number keys, so a held 3 recalls once rather than every frame. */
+	bool bNumberWasDown[5] = { false, false, false, false, false };
+
+	/** Which saved slot was last recalled or stored, purely so the footer can say so. */
+	int32 LastSavedSlotTouched = INDEX_NONE;
+	FString LastSavedSlotVerb;
+
+	/** The saved slot being edited in library mode, or INDEX_NONE when this is the in-match screen. */
+	int32 LibrarySlot = INDEX_NONE;
+
+	bool bCancelWasDown = false;
 };
