@@ -101,7 +101,7 @@ public:
 	 * Set once by Initialize() and never again. Defaults to Activated so that the pre-rework path,
 	 * which builds exactly one instance, keeps the slot it has always effectively had.
 	 */
-	ETraceLoadoutSlot GetSlot() const { return Slot; }
+	ETraceLoadoutSlot GetSlot() const { return OwnedSlot; }
 
 	/**
 	 * Sugar for the guards that go inside a lifecycle body serving more than one slot.
@@ -542,7 +542,22 @@ private:
 	 * the shape their existing bodies already assume, and readers of the other slot are told to look
 	 * here by GetStateSlotFor() on the component.
 	 */
-	ETraceLoadoutSlot Slot = ETraceLoadoutSlot::Activated;
+	/**
+	 * NAMED OwnedSlot RATHER THAN Slot, and the rename is load-bearing on MSVC.
+	 *
+	 * `Slot` is one of the most common local variable names there is — material slots, weapon slots,
+	 * array slots — and several ability kits already had `for (int32 Slot = ...)` loops long before
+	 * this member existed. Adding a member called `Slot` to their base class turned every one of
+	 * those into C4458 "declaration hides class member", which MSVC raises as an ERROR under UE's
+	 * warnings-as-errors while clang on macOS says nothing. The Windows build broke on a file the Mac
+	 * build had compiled cleanly all week.
+	 *
+	 * Renaming the LOCALS would have been whack-a-mole: it fixes the files that exist today and
+	 * silently waits for the next kit that writes the obvious loop. Renaming the member once removes
+	 * the collision permanently, and this is the only member of this class whose name is common
+	 * enough to collide (the other two are AbilityComponent and SlotMask).
+	 */
+	ETraceLoadoutSlot OwnedSlot = ETraceLoadoutSlot::Activated;
 
 	/**
 	 * Bit per ETraceLoadoutSlot. See IsSlot(). Written once by Initialize() on a live instance — but
