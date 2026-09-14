@@ -1121,14 +1121,28 @@ namespace TraceLoadoutCombine
 			TEXT("0 means 'run no sweep'"));
 
 		// ---- THE REAL QUESTION: the contribution is in a slot the legacy pointer never looked at
-		FTraceLoadout MaceMoves;
-		MaceMoves.Movement  = ETraceCharacterId::Mace;    // the magnet lives here now
-		MaceMoves.Passive   = ETraceCharacterId::Elle;
-		MaceMoves.Activated = ETraceCharacterId::Elle;    // ...and the legacy pointer looks HERE
-		Comp->ApplyLoadout(MaceMoves);
-		Check(TEXT("Mace's magnet survives being in MOVEMENT"),
+		// Mace's magnet is his PASSIVE line ("+30% Core magnet radius"), so THAT is the slot it must
+		// survive in — with a different kit holding Activated, which is where the legacy pointer looks.
+		FTraceLoadout MacePassive;
+		MacePassive.Movement  = ETraceCharacterId::Elle;
+		MacePassive.Passive   = ETraceCharacterId::Mace;   // the magnet lives here
+		MacePassive.Activated = ETraceCharacterId::Elle;   // ...and the legacy pointer looks HERE
+		Comp->ApplyLoadout(MacePassive);
+		Check(TEXT("Mace's magnet survives being in PASSIVE"),
 			UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(Pawn), MaceMagnet,
 			TEXT("pre-S3a this read Elle's 1.0 and Mace's +30% vanished"));
+
+		// ...and the mirror image, which is what the S3b slot guards buy: taking Mace for his SUSPEND
+		// must not also hand you his magnet. An ability you did not pick firing anyway is free power
+		// nobody chose, and it is indistinguishable from a bug.
+		FTraceLoadout MaceMoves;
+		MaceMoves.Movement  = ETraceCharacterId::Mace;     // suspend only — NOT the magnet
+		MaceMoves.Passive   = ETraceCharacterId::Elle;
+		MaceMoves.Activated = ETraceCharacterId::Elle;
+		Comp->ApplyLoadout(MaceMoves);
+		Check(TEXT("Mace in MOVEMENT does NOT bring his passive magnet"),
+			UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(Pawn), 1.f,
+			TEXT("the magnet is his PASSIVE line; picking his suspend must not smuggle it in"));
 
 		FTraceLoadout ChutMoves;
 		ChutMoves.Movement  = ETraceCharacterId::Chut;    // the bash sweep lives here now
@@ -1137,7 +1151,17 @@ namespace TraceLoadoutCombine
 		Comp->ApplyLoadout(ChutMoves);
 		Check(TEXT("Chut's dash sweep survives being in MOVEMENT"),
 			UTraceAbilityComponent::GetDashHitSweepRadiusFor(Pawn), ChutSweep,
-			TEXT("pre-S3a this read 0 and the bash simply never swept"));
+			TEXT("the bash IS his movement line; pre-S3a this read 0 and never swept"));
+
+		// And the guard in the other direction for the same kit.
+		FTraceLoadout ChutPassive;
+		ChutPassive.Movement  = ETraceCharacterId::Elle;
+		ChutPassive.Passive   = ETraceCharacterId::Chut;   // his knife passive, not the bash
+		ChutPassive.Activated = ETraceCharacterId::Elle;
+		Comp->ApplyLoadout(ChutPassive);
+		Check(TEXT("Chut in PASSIVE does NOT bring his bash sweep"),
+			UTraceAbilityComponent::GetDashHitSweepRadiusFor(Pawn), 0.f,
+			TEXT("the sweep exists only to find a bash target, and the bash is MOVEMENT"));
 
 		// ---- and the uniform case is unchanged, which is the promise S2 made -------------------
 		Comp->ApplyLoadout(AllMace);

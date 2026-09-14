@@ -814,6 +814,14 @@ float UTraceAbilitySetElle::GetSlideJumpWindowSpeedBonusForElle(const AActor* Ac
 
 float UTraceAbilitySetElle::ModifySlideJumpWindowSpeedBonus(float InWellTimedBonus) const
 {
+
+	// SLOT GUARD — "well-timed slide jumps give her 30% more of the momentum boost" is Elle's MOVEMENT line.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return InWellTimedBonus;
+	}
 	// THE SEAM THE MOVEMENT COMPONENT ACTUALLY CALLS (v18 §2 integration pass). It reaches this
 	// through UTraceAbilityComponent::GetSlideJumpWindowSpeedBonusFor(), so Movement/ never learns
 	// Elle's name — the same shape as GetDashHitSweepRadius() and Chut.

@@ -751,6 +751,14 @@ void UTraceAbilitySetLily::ApplyZip(float DeltaSeconds)
 
 bool UTraceAbilitySetLily::OnJumpPressed()
 {
+
+	// SLOT GUARD — Zip's climb control. The flight is the ACTIVATED ability, so jump belongs to it only while Zip is the ability you equipped.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Activated))
+	{
+		return false;
+	}
 	if (!IsZipping())
 	{
 		return false;   // Not flying: an ordinary jump, an ordinary wall jump, an ordinary slide-jump.
@@ -774,6 +782,14 @@ bool UTraceAbilitySetLily::OnJumpPressed()
 
 void UTraceAbilitySetLily::OnJumpReleased()
 {
+
+	// SLOT GUARD — the other half of Zip's climb. Same slot as the press, or the climb could start and never stop.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Activated))
+	{
+		return;
+	}
 	// *** THIS FUNCTION IS DEAD CODE IN A REAL MATCH AND THAT IS THE BUG, NOT AN OVERSIGHT HERE. ***
 	// UTraceAbilityComponent::HandleJumpReleased() — its only possible caller — is itself called by
 	// nothing; ATracePlayerController::OnJumpCompleted() stops at ACharacter::StopJumping(). It is

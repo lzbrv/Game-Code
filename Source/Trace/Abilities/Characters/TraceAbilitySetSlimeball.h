@@ -185,7 +185,18 @@ public:
 	 * so that this character's answer has exactly one definition and the harness and the gun cannot
 	 * disagree about it.
 	 */
-	virtual float GetFireIntervalScale() const override { return GetFireIntervalMultiplier(); }
+	// SLOT GUARD — "while stuck: fires 30% faster" is Slimeball's PASSIVE line. Equipped as anything
+	// else, this kit must not speed the gun up: an ability you did not pick firing anyway is
+	// indistinguishable from a bug, and it is free power nobody chose.
+	//
+	// [SLOT-S3f] NOTE the passive asks a question the MOVEMENT ability answers — "am I stuck?" — so a
+	// player who takes this passive WITHOUT Slimeball's stick can never trigger it. That is the dead
+	// pick the owner asked to be rewritten (PERCH: works stuck by any means). Guarded correctly here
+	// first; made reachable in S3f.
+	virtual float GetFireIntervalScale() const override
+	{
+		return IsSlot(ETraceLoadoutSlot::Passive) ? GetFireIntervalMultiplier() : 1.f;
+	}
 
 	/**
 	 * Is he stuck to a wall right now?

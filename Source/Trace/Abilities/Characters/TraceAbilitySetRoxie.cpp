@@ -276,6 +276,14 @@ bool UTraceAbilitySetRoxie::ShouldDriveMovement() const
 
 bool UTraceAbilitySetRoxie::OnSecondaryPressed()
 {
+
+	// SLOT GUARD — "V fires a wobbling rocket that throws her backwards" is Roxie's MOVEMENT line.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return false;
+	}
 	ATraceCharacter* MyPawn = GetCharacter();
 	if (MyPawn == nullptr || !MyPawn->IsAlive())
 	{
@@ -584,6 +592,14 @@ float UTraceAbilitySetRoxie::GetModdedRemainingSeconds() const
 
 float UTraceAbilitySetRoxie::GetFireIntervalScale() const
 {
+
+	// SLOT GUARD — MODDED is Roxie's ACTIVATED ability; the faster fire is that ability, not a passive.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Activated))
+	{
+		return 1.f;
+	}
 	if (!IsModdedActive())
 	{
 		return 1.f;

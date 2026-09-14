@@ -1163,6 +1163,14 @@ bool UTraceAbilitySetMortimer::TryMantle()
 
 bool UTraceAbilitySetMortimer::OnJumpPressed()
 {
+
+	// SLOT GUARD — the mantle, which is Mortimer's MOVEMENT line word for word.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return false;
+	}
 	// TRUE CONSUMES THE JUMP (ATracePlayerController::OnJumpStarted), so this returns true only when a
 	// mantle actually started. A press that finds no ledge has to fall through to ACharacter::Jump or
 	// Mortimer would stop being able to jump anywhere near a wall — which is a much worse bug than a

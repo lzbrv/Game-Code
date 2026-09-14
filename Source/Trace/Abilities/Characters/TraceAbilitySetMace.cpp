@@ -227,6 +227,14 @@ bool UTraceAbilitySetMace::ShouldDriveMovement() const
 
 float UTraceAbilitySetMace::GetMagnetRadiusMultiplier() const
 {
+
+	// SLOT GUARD — "+30% Core magnet radius" is Mace's PASSIVE line.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Passive))
+	{
+		return 1.f;
+	}
 	// DERIVED, per §6's own instruction. The 450 lives in UTraceSettings::CoreCatchRadius and the
 	// 0.30 lives in MaceMagnetRadiusBonus; 585 is written down nowhere.
 	return 1.f + FMath::Max(0.f, UTraceSettings::Get().MaceMagnetRadiusBonus);
@@ -238,6 +246,14 @@ float UTraceAbilitySetMace::GetMagnetRadiusMultiplier() const
 
 bool UTraceAbilitySetMace::OnSecondaryPressed()
 {
+
+	// SLOT GUARD — "hold V in the air to suspend" is Mace's MOVEMENT line.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return false;
+	}
 	bSuspendHeld = true;
 
 	const ATraceCharacter* MyPawn = GetCharacter();
@@ -269,6 +285,14 @@ bool UTraceAbilitySetMace::OnSecondaryPressed()
 
 void UTraceAbilitySetMace::OnSecondaryReleased()
 {
+
+	// SLOT GUARD — releasing V cancels the suspend — the same MOVEMENT ability.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return;
+	}
 	bSuspendHeld = false;
 
 	// "Releasing V cancels IMMEDIATELY and gravity resumes." Not at the end of the frame, not on the

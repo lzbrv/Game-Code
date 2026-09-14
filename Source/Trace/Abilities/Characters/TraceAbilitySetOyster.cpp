@@ -255,12 +255,28 @@ ATraceOysterJar* UTraceAbilitySetOyster::FindOwnJarNear(const FVector& Location)
 
 bool UTraceAbilitySetOyster::OnDashStarted(const FVector& DashDirection)
 {
+
+	// SLOT GUARD — "every dash leaves a poison jar" is Oyster's PASSIVE line — a different slot from his jar-jump, and both can be equipped at once.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Passive))
+	{
+		return false;
+	}
 	NoteDashBegan();
 	return false;   // never cancels the dash
 }
 
 void UTraceAbilitySetOyster::OnDashEnded(bool bReachedFullDistance)
 {
+
+	// SLOT GUARD — same PASSIVE jar trail as OnDashStarted.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Passive))
+	{
+		return;
+	}
 	DropOwedDashJar();
 	bDashTracked = false;
 }
@@ -325,6 +341,14 @@ ATraceOysterJar* UTraceAbilitySetOyster::DebugDropDashJar()
 
 bool UTraceAbilitySetOyster::OnJumpPressed()
 {
+
+	// SLOT GUARD — "jumping while stood on one of your own jars breaks it and boosts you upward" is Oyster's MOVEMENT line.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return false;
+	}
 	ATraceCharacter* MyPawn = GetCharacter();
 	const UTraceCharacterMovementComponent* MoveComp = GetMovement();
 	if (MyPawn == nullptr || MoveComp == nullptr || !MoveComp->IsMovingOnGround())

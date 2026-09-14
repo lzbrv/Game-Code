@@ -459,6 +459,14 @@ bool UTraceAbilitySetRocco::ActivateAbility()
 
 bool UTraceAbilitySetRocco::OnJumpPressed()
 {
+
+	// SLOT GUARD — "a very small second jump" is Rocco's MOVEMENT line. Take Rocco for his headshot passive and you do NOT get the second jump.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return false;
+	}
 	if (CVarRoccoSecondJumpEnabled.GetValueOnAnyThread() == 0)
 	{
 		return false;   // RED ARM: decline, and the normal jump runs as if Rocco were a Mannequin.
@@ -639,6 +647,14 @@ float UTraceAbilitySetRocco::GetStackSecondsRemaining() const
 
 float UTraceAbilitySetRocco::GetMoveSpeedMultiplier() const
 {
+
+	// SLOT GUARD — "headshot kills give +3% speed" is Rocco's PASSIVE line.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Passive))
+	{
+		return 1.f;
+	}
 	// Read from the REPLICATED state, so a client's own movement prediction and the server compute
 	// the same multiplier from the same numbers. Cheap and pure — this is called every movement tick.
 	const int32 Stacks = GetLiveStackCount();

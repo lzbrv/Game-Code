@@ -489,6 +489,14 @@ void UTraceAbilitySetChut::OnKill(ATraceCharacter* Victim, FName Cause, bool bHe
 
 bool UTraceAbilitySetChut::OnDashStarted(const FVector& DashDirection)
 {
+
+	// SLOT GUARD — the bash, which is Chut's MOVEMENT line.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return false;
+	}
 	// A new dash is a new set of victims. Never cancel the dash: returning true here would break
 	// "dashing through a trace still kills the carrier normally", which is the one thing §6 says
 	// about Chut's dash that is NOT the bash.
@@ -499,11 +507,27 @@ bool UTraceAbilitySetChut::OnDashStarted(const FVector& DashDirection)
 
 void UTraceAbilitySetChut::OnDashEnded(bool bReachedFullDistance)
 {
+
+	// SLOT GUARD — the bash lands at the END of the dash, so this is the same MOVEMENT ability as the start.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return;
+	}
 	BashedThisDash.Reset();
 }
 
 void UTraceAbilitySetChut::OnDashHitCharacter(ATraceCharacter* Other, float DashProgress)
 {
+
+	// SLOT GUARD — the bash's actual effect on the player it hit.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return;
+	}
 	// The framework's seam. Nothing calls it yet (see the header); it funnels into the same apply
 	// path the poll uses, and BashedThisDash makes the two idempotent with respect to each other.
 	const UTraceCharacterMovementComponent* Move = GetMovement();
@@ -513,6 +537,14 @@ void UTraceAbilitySetChut::OnDashHitCharacter(ATraceCharacter* Other, float Dash
 
 float UTraceAbilitySetChut::GetDashHitSweepRadius() const
 {
+
+	// SLOT GUARD — the sweep exists only to find a bash target, and the bash is MOVEMENT.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return 0.f;
+	}
 	// The ONE knob, read from the ONE place. TryBash re-tests the gap against this same value from
 	// the pawn's location at the instant of the hit, so a sweep that is slightly generous cannot
 	// widen the bash — it can only offer TryBash a candidate it then refuses.

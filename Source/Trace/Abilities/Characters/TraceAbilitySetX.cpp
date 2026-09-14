@@ -645,6 +645,14 @@ bool UTraceAbilitySetX::IsAnyEnemyVulnerable() const
 
 float UTraceAbilitySetX::GetMoveSpeedMultiplier() const
 {
+
+	// SLOT GUARD — "+15% speed while any enemy is vulnerable" is X's MOVEMENT line, not his bees.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return 1.f;
+	}
 	// Called from the movement tick on every machine, so it is cached for the frame. The underlying
 	// query walks the pawn list; at ten pawns that is nothing, but "cheap and pure" is what the
 	// framework's contract for this hook asks for and a frame cache is how it stays true if the

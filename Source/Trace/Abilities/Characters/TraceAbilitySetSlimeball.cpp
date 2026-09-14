@@ -254,6 +254,14 @@ void UTraceAbilitySetSlimeball::TickAbilities(float DeltaSeconds)
 
 bool UTraceAbilitySetSlimeball::OnSecondaryPressed()
 {
+
+	// SLOT GUARD — "hold V to stick to a wall" is Slimeball's MOVEMENT line.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return false;
+	}
 	bSecondaryHeld = true;
 
 	if (CVarSlimeballWallStick.GetValueOnAnyThread() == 0)
@@ -311,6 +319,14 @@ bool UTraceAbilitySetSlimeball::OnSecondaryPressed()
 
 void UTraceAbilitySetSlimeball::OnSecondaryReleased()
 {
+
+	// SLOT GUARD — letting V go unsticks you — the same MOVEMENT ability.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return;
+	}
 	bSecondaryHeld = false;
 
 	// "while held". Letting go drops him on the same tick — the flag is cleared here and ApplyStick
@@ -323,6 +339,14 @@ void UTraceAbilitySetSlimeball::OnSecondaryReleased()
 
 bool UTraceAbilitySetSlimeball::OnJumpPressed()
 {
+
+	// SLOT GUARD — kicking off a wall you are stuck to. The stick is the MOVEMENT ability, so leaving it is too.
+	// Equipped in another slot, this kit must not run this body: an ability you did not pick
+	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	{
+		return false;
+	}
 	// DEMO 17 item 2: "Slimeball should be able to cancel the wall stick with jump, and perform a wall
 	// jump off the wall." Off the wall this hook has no opinion and the ordinary jump runs.
 	if (!bStuck)

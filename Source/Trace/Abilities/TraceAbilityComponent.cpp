@@ -63,6 +63,72 @@ namespace
 namespace
 {
 	/**
+	 * THE OFFER ORDER for hooks a kit can CONSUME, and the reason it is not simply slot order.
+	 *
+	 * A jump press is the case that sets it. Four kits answer OnJumpPressed from their MOVEMENT
+	 * ability — Rocco's second jump, Oyster's jar boost, Slimeball's wall kick, Mortimer's mantle —
+	 * but Lily answers it from her ACTIVATED one: while Zip is flying, jump is the climb control. A
+	 * player carrying Zip and any of those four has both wanting the same key in the same frame.
+	 *
+	 * ACTIVATED WINS, because the activated slot is the ability the player deliberately turned on and
+	 * that is running right now; a movement trick is ambient and available all match. Taking the jump
+	 * away from a five-second flight to give someone a small second hop is the one outcome a player
+	 * would call a bug. When Zip is NOT flying its hook returns false in a line and the movement kit
+	 * gets the press, which is the common case and costs one virtual call.
+	 *
+	 * Passive last: no shipped passive consumes an input, so its position is a tie-break that never
+	 * fires today. It is written down anyway so the order is a decision rather than an accident.
+	 *
+	 * A kit covering several slots is offered ONCE, at the highest slot it holds — offering it twice
+	 * would let one kit answer its own ability's press two ways in a frame.
+	 */
+	constexpr ETraceLoadoutSlot GOfferOrder[] =
+	{
+		ETraceLoadoutSlot::Activated,
+		ETraceLoadoutSlot::Movement,
+		ETraceLoadoutSlot::Passive,
+	};
+	static_assert(UE_ARRAY_COUNT(GOfferOrder) == static_cast<int32>(ETraceLoadoutSlot::Count),
+		"Every slot must appear in the offer order, or a kit in the missing slot is never asked.");
+
+	/**
+	 * Offers @p Fn each distinct equipped kit in GOfferOrder until one returns true.
+	 * Returns true if some kit consumed. A kit is offered at most once.
+	 */
+	template <typename FuncType>
+	bool OfferUntilConsumed(const UTraceAbilityComponent& Comp, FuncType&& Fn)
+	{
+		UTraceCharacterAbilitySet* Offered[static_cast<int32>(ETraceLoadoutSlot::Count)] = {};
+		int32 OfferedNum = 0;
+
+		for (const ETraceLoadoutSlot Slot : GOfferOrder)
+		{
+			UTraceCharacterAbilitySet* Set = Comp.GetAbilitySetForSlot(Slot);
+			if (Set == nullptr)
+			{
+				continue;
+			}
+
+			bool bAlready = false;
+			for (int32 Index = 0; Index < OfferedNum; ++Index)
+			{
+				bAlready = bAlready || (Offered[Index] == Set);
+			}
+			if (bAlready)
+			{
+				continue;
+			}
+			Offered[OfferedNum++] = Set;
+
+			if (Fn(Set))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	/**
 	 * Runs @p Fn on every equipped kit, in slot order, tolerating a null.
 	 *
 	 * FOR LIFECYCLE HOOKS ONLY — the ones whose answer is "all of them": tick, equip/unequip, pawn
@@ -2238,12 +2304,15 @@ void UTraceAbilityComponent::SetRosterEnforcementOn(bool bEnforced)
 
 bool UTraceAbilityComponent::HandleSecondaryPressed()
 {
-	if (AbilitySet == nullptr)
+	if (EquippedSets.Num() == 0)
 	{
 		return false;
 	}
 
-	if (AbilitySet->OnSecondaryPressed())
+	// Same offer order as the jump. V is the movement key for Mace (suspend), Slimeball (stick) and
+	// Roxie (rocket) — all MOVEMENT abilities — so in practice the movement kit takes it; the order
+	// only matters the day an activated ability wants V mid-effect.
+	if (OfferUntilConsumed(*this, [](UTraceCharacterAbilitySet* Set) { return Set->OnSecondaryPressed(); }))
 	{
 		return true;
 	}
@@ -2278,23 +2347,32 @@ bool UTraceAbilityComponent::HandleSecondaryPressed()
 
 void UTraceAbilityComponent::HandleSecondaryReleased()
 {
-	if (AbilitySet != nullptr)
-	{
-		AbilitySet->OnSecondaryReleased();
-	}
+	// EVERY KIT. Mace's suspend and Slimeball's stick both END on this release, and a release that
+	// reached only one of them would leave the other running with its key already let go — a player
+	// stuck to a wall they have stopped asking to be stuck to.
+	ForEachEquipped(EquippedSets, [](UTraceCharacterAbilitySet* Set) { Set->OnSecondaryReleased(); });
 }
 
 bool UTraceAbilityComponent::HandleJumpPressed()
 {
-	return (AbilitySet != nullptr) && AbilitySet->OnJumpPressed();
+	// OFFERED TO EVERY EQUIPPED KIT, highest slot first, first consumer wins — see GOfferOrder for
+	// why Activated outranks Movement here. Before this, only the Activated kit was asked, so a
+	// player who picked Rocco for his second jump and anyone else for their E simply could not
+	// double jump: the press went to a kit that had no opinion and stopped there.
+	return OfferUntilConsumed(*this, [](UTraceCharacterAbilitySet* Set) { return Set->OnJumpPressed(); });
 }
 
 void UTraceAbilityComponent::HandleJumpReleased()
 {
-	if (AbilitySet != nullptr)
-	{
-		AbilitySet->OnJumpReleased();
-	}
+	// EVERY KIT, not just one: a release is a notification, not a claim, and the kit that consumed
+	// the PRESS is not necessarily the only one that needs to know the key came back up. Lily is the
+	// sole implementer today and her Zip climb stops on it.
+	//
+	// *** THIS FUNCTION STILL HAS NO CALLER. *** Nothing in the input layer routes jump-release here,
+	// which is a pre-existing gap this rework did not introduce and does not fix: fanning it out
+	// correctly is cheap, wiring it up is an input-layer change with its own behaviour to verify.
+	// Left correct and unreachable rather than quietly dropped, so the day it is wired it is right.
+	ForEachEquipped(EquippedSets, [](UTraceCharacterAbilitySet* Set) { Set->OnJumpReleased(); });
 }
 
 void UTraceAbilityComponent::NotifyDashStarted(const FVector& DashDirection)
@@ -2307,25 +2385,30 @@ void UTraceAbilityComponent::NotifyDashStarted(const FVector& DashDirection)
 	// TraceAbilityIntegration::IsEnabled() must be true. Both of those are questions about the
 	// ability layer, and "a dash started" is not. Leaving a second call here would double every
 	// dash for the pawns that do reach it, so there is exactly one, and it is at the event.
-	if (AbilitySet != nullptr)
-	{
-		AbilitySet->OnDashStarted(DashDirection);
-	}
+	// EVERY KIT. Two shipped abilities key off a dash from different slots — Chut's bash is MOVEMENT,
+	// Oyster's jar trail is PASSIVE — and a player carrying both should get both. Reaching only the
+	// Activated kit meant Oyster-as-a-passive left no jars at all.
+	ForEachEquipped(EquippedSets,
+		[&DashDirection](UTraceCharacterAbilitySet* Set) { Set->OnDashStarted(DashDirection); });
 }
 
 void UTraceAbilityComponent::NotifyDashEnded(bool bReachedFullDistance)
 {
-	if (AbilitySet != nullptr)
-	{
-		AbilitySet->OnDashEnded(bReachedFullDistance);
-	}
+	// EVERY KIT, and it must be the same set that got OnDashStarted: a kit told a dash began and not
+	// told it ended is a kit holding a flag forever.
+	ForEachEquipped(EquippedSets,
+		[bReachedFullDistance](UTraceCharacterAbilitySet* Set) { Set->OnDashEnded(bReachedFullDistance); });
 }
 
 void UTraceAbilityComponent::NotifyDashHitCharacter(ATraceCharacter* Other, float DashProgress)
 {
-	if (AbilitySet != nullptr && HasAuthorityOwner())
+	// EVERY KIT, server only. The sweep that produced this hit is now a MAX across kits (S3a), so the
+	// kit that asked for the radius and the kit that wants the hit need not be the same one — each
+	// decides for itself what a hit means, which is exactly what the base class documents.
+	if (HasAuthorityOwner())
 	{
-		AbilitySet->OnDashHitCharacter(Other, DashProgress);
+		ForEachEquipped(EquippedSets,
+			[Other, DashProgress](UTraceCharacterAbilitySet* Set) { Set->OnDashHitCharacter(Other, DashProgress); });
 	}
 }
 
