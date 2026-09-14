@@ -1858,10 +1858,13 @@ void FTraceOptionsMenu::RebuildRows()
 			}
 			else
 			{
+				// ShortLabel, not Get: only the ACTIVATED ability has a name, so Get returns empty for
+				// the other two and this row printed " /  / RIPPLE" — three abilities described by
+				// one. ShortLabel falls back to the opening words of what an ability does.
 				Summary = FString::Printf(TEXT("%s / %s / %s"),
-					*TraceAbilityNames::Get(Saved.Movement,  ETraceLoadoutSlot::Movement),
-					*TraceAbilityNames::Get(Saved.Passive,   ETraceLoadoutSlot::Passive),
-					*TraceAbilityNames::Get(Saved.Activated, ETraceLoadoutSlot::Activated));
+					*TraceAbilityNames::ShortLabel(Saved.Movement,  ETraceLoadoutSlot::Movement, 22),
+					*TraceAbilityNames::ShortLabel(Saved.Passive,   ETraceLoadoutSlot::Passive, 22),
+					*TraceAbilityNames::ShortLabel(Saved.Activated, ETraceLoadoutSlot::Activated, 22));
 			}
 
 			FRow Row;
@@ -2041,9 +2044,12 @@ void FTraceOptionsMenu::RebuildRows()
 		// somebody else's machine, and a toggle that appears to do nothing is worse than no toggle —
 		// the player needs to be told it is a HOST setting and that it lands on the next match.
 		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_MATCH", "MATCH"));
-		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.SETTINGS.ROW_CHARACTERS", "CHARACTERS"), ESetting::CharactersEnabled);
+		// LABELLED "ABILITIES" NOW. The setting is unchanged and its key is unchanged — it is still the
+		// mode A switch — but what it turns off is abilities, and there are no characters left to name.
+		// A row called CHARACTERS would be asking about something the game no longer has.
+		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.SETTINGS.ROW_CHARACTERS", "ABILITIES"), ESetting::CharactersEnabled);
 		AddNote(*TRACE_TEXT("OPTIONS.SETTINGS.NOTE_CHARACTERS_OFF",
-			"OFF: EVERYONE PLAYS THE DEFAULT MANNEQUIN, NO ABILITIES, NO SELECT SCREEN."));
+			"OFF: EVERYONE PLAYS THE DEFAULT MANNEQUIN, NO ABILITIES, NO LOADOUT SCREEN."));
 		AddNote(*TRACE_TEXT("OPTIONS.SETTINGS.NOTE_CHARACTERS_HOST",
 			"APPLIES TO MATCHES YOU HOST, FROM THE NEXT MATCH. GOALS MODE ONLY."));
 

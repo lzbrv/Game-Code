@@ -1060,7 +1060,25 @@ void ATraceHUD::DrawHUD()
 			TracePC.Get(), LocalTeam, UIScale, Now);
 
 		DrawHitMarker();
-		DrawHealthAndDash();
+
+		// *** NOT WHILE A FULL-SCREEN MENU OWNS THE SCREEN. ***
+		//
+		// Health, dash charges and the weapon row are readouts about a pawn you are not driving while
+		// you are reading a menu, and they were drawn straight over the top of one: photographed on
+		// the loadout page as two meters and an ammo count sitting on the scrim the page had just
+		// painted over the match.
+		//
+		// The match CLOCK deliberately keeps drawing — during the half time break it is the countdown
+		// telling you how long you have to pick, which is the one piece of match state a player on
+		// this screen actually needs.
+		//
+		// Pre-existing and shared with the character select, which has done this for as long as it has
+		// existed. Fixed at the draw rather than inside the new page, because the page is not what is
+		// wrong and a fix inside it would leave the other screens still bleeding.
+		if (!PauseMenu.IsOpen() && !CharacterSelect.IsOpen() && !LoadoutSelect.IsOpen())
+		{
+			DrawHealthAndDash();
+		}
 
 		// Spec v16 §2 — the bottom-right corner. After the bottom-left stack purely so the two
 		// corners are read in the same order in this function as they are on screen.
@@ -3117,8 +3135,29 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 		return RowY;
 	}
 
+	// *** THE ABILITY THAT IS EQUIPPED, NOT THE FACE THAT IS WORN. ***
+	//
+	// This used to read GetSelectedCharacter() — the identity byte — and look the ability up from
+	// that. Since loadouts, those are two different questions: your character id says which face and
+	// which scoreboard column, and your ACTIVATED SLOT says what E actually does. A player running
+	// somebody else's E therefore had a HUD naming an ability they did not have, with a cooldown ring
+	// that belonged to the one they did. The row was lying about the key under the player's finger.
+	//
+	// The slot is the authority; the identity byte is only the fallback for a build with no loadout
+	// yet (and for the accent colour below, which IS a question about the face).
 	const uint8 CharacterId = LocalPS->GetSelectedCharacter();
-	const TraceCharacterRoster::FTraceCharacterEntry* const Entry = TraceCharacterRoster::Find(CharacterId);
+
+	uint8 ActivatedKitId = CharacterId;
+	if (const UTraceAbilityComponent* Abilities = LocalPS->FindComponentByClass<UTraceAbilityComponent>())
+	{
+		const ETraceCharacterId Equipped = Abilities->GetLoadout().Get(ETraceLoadoutSlot::Activated);
+		if (Equipped != ETraceCharacterId::None)
+		{
+			ActivatedKitId = static_cast<uint8>(Equipped);
+		}
+	}
+
+	const TraceCharacterRoster::FTraceCharacterEntry* const Entry = TraceCharacterRoster::Find(ActivatedKitId);
 
 	// Hoisted from its old home halfway down this function: the V row below wears the same accent,
 	// and the two rows sharing one definition of "this character's colour" is the point — they are
@@ -3177,7 +3216,10 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 	// Without the third caption, a dead player watching a number tick down has no way to know whether
 	// that is intended or whether the game has forgotten to reset it — and the spec's own note says
 	// that reads as a bug. So the HUD says out loud that it is deliberate.
-	const FString AbilityName = (Entry != nullptr) ? FString(Entry->ActivatedName) : TraceCharacterRoster::NameFor(CharacterId);
+	// NAME OF THE EQUIPPED ABILITY. NameFor() is the fallback and it returns a CHARACTER name, which
+	// no longer belongs on screen — so it is only reached when the roster has no entry at all, which
+	// is the same "nothing is equipped" case the early-out above already mostly covers.
+	const FString AbilityName = (Entry != nullptr) ? FString(Entry->ActivatedName) : FString();
 
 	FString StatusText = AbilityName;
 	FLinearColor StatusColor = bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim;
@@ -3702,7 +3744,12 @@ void ATraceHUD::DrawAmmoAndStatuses()
 	// LoadoutSelect deliberately NOT added here: it is open on exactly the same condition
 	// CharacterSelect is (the replicated select window), so CharacterSelect::IsOpen() already answers
 	// for both and adding a second term would be a way for them to disagree.
-	const bool bOverlayOwnsScreen = PauseMenu.IsOpen() || CharacterSelect.IsOpen();
+	// LoadoutSelect IS named here, even though it opens on the same replicated flag CharacterSelect
+	// reads. Inferring one screen's state from another's is how the corner meters ended up drawn over
+	// a full-screen menu: the inference was right in principle and the photograph disagreed, and a
+	// page that owns the screen should say so itself rather than be deduced from its neighbour.
+	const bool bOverlayOwnsScreen =
+		PauseMenu.IsOpen() || CharacterSelect.IsOpen() || LoadoutSelect.IsOpen();
 
 	if (PresentCornerUmg(bCornerLive && !bOverlayOwnsScreen, CornerState))
 	{
@@ -3710,8 +3757,19 @@ void ATraceHUD::DrawAmmoAndStatuses()
 	}
 
 	// Canvas: the shipped path, and the live fallback whenever the widget is unavailable.
+	//
+	// *** THE OVERLAY TEST BELONGS ON BOTH PATHS, AND WAS ONLY ON ONE. *** PresentCornerUmg above is
+	// handed `bCornerLive && !bOverlayOwnsScreen`; this branch asked only `bCornerLive`, so with the
+	// widget unavailable — which is the SHIPPED path — the dash and weapon meters drew straight
+	// through the select screen, the loadout screen and the pause menu. Photographed on the loadout
+	// page: two meters and an ammo count sitting on top of a full-screen menu that had just painted
+	// its own scrim over the match.
+	//
+	// Not a loadout bug: the character screen has been doing this for as long as the canvas corner
+	// has existed. Fixed here rather than in the new screen because the corner is what is wrong, and
+	// a fix inside one page would leave the other two still bleeding.
 	HideCornerWidget();
-	if (bCornerLive)
+	if (bCornerLive && !bOverlayOwnsScreen)
 	{
 		PresentCornerCanvas(CornerState);
 	}
@@ -6212,15 +6270,18 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 	// column reading MANNEQUIN ten times is noise that says nothing — worse, it invites the reader to
 	// think something failed. No character on the team means the scoreboard is pixel-identical to the
 	// one that shipped before this pass.
-	bool bShowCharacters = false;
-	for (const ATracePlayerState* Member : Members)
-	{
-		if (Member != nullptr && Member->HasCharacter())
-		{
-			bShowCharacters = true;
-			break;
-		}
-	}
+	// *** THE CHARACTER COLUMN IS GONE, BECAUSE CHARACTERS ARE. ***
+	//
+	// The abilities are freestanding now: a player picks one movement, one passive and one activated
+	// ability from three different kits, so there is no single character to name. A column reading
+	// ROCCO next to somebody running Rocco's passive, Mace's suspend and Elle's Snap does not
+	// describe them — it names a character they are not playing, which is worse than no column.
+	//
+	// FALSE RATHER THAN DELETING THE BRANCH, and that is not timidity: this exact value is the state
+	// the scoreboard shipped in before characters existed, the layout below is written for it, and
+	// its own comment calls that case "pixel-identical to the one that shipped". Reusing a supported
+	// path beats carving a new one out of a column-width calculation.
+	const bool bShowCharacters = false;
 
 	// ---- Header -------------------------------------------------------------------------------
 	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.25f), X, Y, Width, HeaderH);

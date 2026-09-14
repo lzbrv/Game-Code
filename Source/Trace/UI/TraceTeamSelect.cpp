@@ -764,7 +764,7 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 	// one.
 	{
 		const FString KeyboardLine = TRACE_TEXTF("TEAMSELECT.FOOTER_KEYBOARD",
-			"1 / 2 OR ARROWS + ENTER   SELECT TEAM        C   CHANGE CHARACTER        {0}   CLOSE",
+			"1 / 2 OR ARROWS + ENTER   SELECT TEAM        C   CHANGE LOADOUT        {0}   CLOSE",
 			{ FString(OpenKeyName()) });
 
 		// A SECOND LINE, NOT A LONGER ONE. The keyboard line is already 95 characters and fills a
@@ -774,7 +774,7 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 		// there is room under it — measured, not assumed: FooterY + PadFooterGap is 928 of 1080.
 		const bool bPadLine = TracePadMenu::HasSeenPad(PC);
 		const FString PadLine = TRACE_TEXT("TEAMSELECT.FOOTER_GAMEPAD",
-			"A   SELECT TEAM        X   CHANGE CHARACTER        B   CLOSE");
+			"A   SELECT TEAM        X   CHANGE LOADOUT        B   CLOSE");
 
 		// ---- FIT, and it turned out to be needed for a line that predates this tranche -----------
 		//
