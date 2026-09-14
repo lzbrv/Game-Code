@@ -664,7 +664,29 @@ bool UTraceAbilityComponent::ServerRequestSetLoadout_Validate(FTraceLoadout NewL
 
 void UTraceAbilityComponent::ServerRequestSetLoadout_Implementation(FTraceLoadout NewLoadout)
 {
-	ServerSetLoadout(NewLoadout);
+	if (!ServerSetLoadout(NewLoadout))
+	{
+		return;   // refused: locked, or an illegal pair. The screen stays up and says why.
+	}
+
+	// *** LOCKING IN CLOSES THE SCREEN. WITHOUT THIS THE GAME IS UNPLAYABLE. ***
+	//
+	// The select window is the ONLY condition that keeps the loadout page open, and nothing was ever
+	// closing it: LOCK IN sent the loadout, the server applied it, and the page stayed up forever
+	// with the match running behind it. A player could not reach the game at all.
+	//
+	// The character path has always done exactly this — ATraceGameMode::RequestCharacter marks the
+	// pick resolved and shuts the window in the same breath on a granted pick. The loadout path
+	// replaced that screen and did not replace this, which is the whole bug.
+	//
+	// HERE, IN THE RPC, RATHER THAN IN ServerSetLoadout: this is the "a player pressed LOCK IN" path.
+	// ServerSetLoadout is also reached by half-time setup, fixtures and the uniform-loadout build, and
+	// none of those is a player saying they are done choosing.
+	if (ATracePlayerState* OwningState = Cast<ATracePlayerState>(GetOwningPlayerState()))
+	{
+		OwningState->ServerMarkCharacterResolved(/*bLocked=*/true, /*bWasChosen=*/true);
+		OwningState->ServerSetCharacterSelectOpen(/*bOpen=*/false, /*DeadlineServerTime=*/0.f);
+	}
 }
 
 void UTraceAbilityComponent::OnRep_CharacterId()

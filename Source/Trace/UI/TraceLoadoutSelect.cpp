@@ -991,6 +991,15 @@ namespace TraceLoadoutScreenVerify
 		Check(TEXT("all three slots hold a live kit afterwards"), bAllSlotsBuilt,
 			TEXT("a loadout that applied but built nothing would be worse than a refusal"));
 
+		// *** AND THE SCREEN CLOSES. *** The select window is the only thing holding this page up, so
+		// a LOCK IN that applies the loadout and leaves the window open is a page that never goes
+		// away — the match running behind a menu the player cannot dismiss. That shipped, and it made
+		// the build unplayable. The assertion is one line and it is the difference between "the
+		// loadout was applied" and "the player can now play".
+		Check(TEXT("LOCK IN closes the screen"),
+			!Subject->IsCharacterSelectOpen(),
+			TEXT("the select window is the ONLY condition that keeps this page up"));
+
 		// ---- THE NAMES ARE THE ORIGINALS, AND NOTHING INVENTS ONE ------------------------------
 		//
 		// The reverted state, asserted rather than eyeballed: exactly the ten roster ActivatedNames
