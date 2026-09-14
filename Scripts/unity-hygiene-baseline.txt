@@ -1,0 +1,14 @@
+# Trace - unity-hygiene baseline.
+#
+# File-scope `using namespace` directives that predate this check. Each one
+# leaks its namespace into every file compiled after it in the same unity
+# blob; none of them collides TODAY, which is the only reason Windows builds.
+# Regenerate with: python3 Scripts/unity-hygiene.py --write-baseline
+#
+Source/Trace/Abilities/Characters/TraceOysterPoison.cpp: using namespace TraceOysterCloudVerify;
+Source/Trace/Core/TraceCharacter.cpp: using namespace TraceCharacterBounds;
+Source/Trace/Core/TraceCharacterDebugCommands.cpp: using namespace TraceCharacterBounds;
+Source/Trace/Gameplay/TraceCore.cpp: using namespace TraceCoreLocal;
+Source/Trace/Gameplay/TraceCoreArt.cpp: using namespace TraceCoreLocal;
+Source/Trace/Gameplay/TraceCoreHarness.cpp: using namespace TraceCoreLocal;
+Source/Trace/Gameplay/TraceCoreTurnover.cpp: using namespace TraceCoreLocal;

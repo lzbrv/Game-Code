@@ -86,10 +86,28 @@ namespace TraceLoadoutLayout
 	static const FLinearColor PlateHi(0.16f, 0.24f, 0.46f, 0.96f);
 }
 
-namespace
+// A NAMED NAMESPACE, LIKE TraceCharacterSelectFile AND TraceTeamSelectFile NEXT DOOR.
+//
+// An anonymous namespace would have been the obvious choice and is the wrong one here: its names are
+// visible unqualified for the rest of the TRANSLATION UNIT, and Unreal's unity builds put many .cpp
+// files in one. StrokeRect and DrawWrapped would then be loose in every file compiled after this
+// one — which is exactly how the sibling screens' own file-locals are kept out of each other's way,
+// and why both of them are named. Following the convention that already exists beats discovering
+// why it exists a second time.
+namespace TraceLoadoutSelectFile
 {
-	using namespace TraceLoadoutLayout;
-
+	// *** NO `using namespace TraceLoadoutLayout;` AT THIS SCOPE EITHER, AND THAT IS DELIBERATE. ***
+	//
+	// There was one here, and under Unreal's UNITY BUILDS it broke the Windows compile. A
+	// using-directive at namespace scope applies to the rest of the TRANSLATION UNIT, and a unity
+	// build concatenates many .cpp files into one: every name this namespace exports — Margin, Cyan,
+	// Ink, Good, Columns, Rows, Plate, RuleY, twenty-nine of them, most far too common to be safe —
+	// became visible unqualified in every file compiled after this one. TraceMenuHUD.cpp then
+	// declared its own local `RuleY` and `Plate` and MSVC raised C4459 "hides global declaration",
+	// which is an error under Unreal's warnings-as-errors. Clang on macOS does not enable it.
+	//
+	// The directives now live INSIDE the functions that need them, where they cannot escape the
+	// function, let alone the file.
 	void StrokeRect(AHUD* HUD, float X, float Y, float W, float H, float Thick, const FLinearColor& C)
 	{
 		if (HUD == nullptr || W <= 0.f || H <= 0.f)
@@ -272,12 +290,12 @@ void FTraceLoadoutSelect::SyncStagedFromServer(ATracePlayerState* LocalState)
 	// is legal but it is nobody's intent, and the half-time clock can run out while they read.
 	if (Staged.IsEmpty())
 	{
-		Staged = FTraceLoadout::Uniform(KitAtCard(0));
+		Staged = FTraceLoadout::Uniform(TraceLoadoutSelectFile::KitAtCard(0));
 	}
 
 	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
 	{
-		Highlighted[Index] = CardForKit(Staged.Get(static_cast<ETraceLoadoutSlot>(Index)));
+		Highlighted[Index] = TraceLoadoutSelectFile::CardForKit(Staged.Get(static_cast<ETraceLoadoutSlot>(Index)));
 	}
 	Tab = 0;
 	LastMessage.Reset();
@@ -317,7 +335,7 @@ void FTraceLoadoutSelect::PollKeys(APlayerController* PC, ATracePlayerState* Loc
 
 		// One axis per step. A diagonal on a stick would otherwise move a column AND a row in one
 		// frame, which reads as the highlight jumping rather than walking.
-		MoveCard((NavX != 0) ? NavX : NavY * Columns);
+		MoveCard((NavX != 0) ? NavX : NavY * TraceLoadoutLayout::Columns);
 	}
 
 	// THE FIVE SAVED LOADOUTS. A number recalls, SHIFT+number stores. Edge-triggered per key: this
@@ -362,7 +380,7 @@ void FTraceLoadoutSelect::MoveTab(int32 Delta)
 
 void FTraceLoadoutSelect::MoveCard(int32 Delta)
 {
-	const int32 Count = KitCount();
+	const int32 Count = TraceLoadoutSelectFile::KitCount();
 	if (Count <= 0)
 	{
 		return;
@@ -377,7 +395,7 @@ void FTraceLoadoutSelect::MoveCard(int32 Delta)
 void FTraceLoadoutSelect::EquipHighlighted()
 {
 	const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(Tab);
-	Staged.Set(Slot, KitAtCard(Highlighted[Tab]));
+	Staged.Set(Slot, TraceLoadoutSelectFile::KitAtCard(Highlighted[Tab]));
 	LastMessage.Reset();
 }
 
@@ -415,7 +433,7 @@ void FTraceLoadoutSelect::PollPointer(APlayerController* PC, ATracePlayerState* 
 	}
 
 	HoveredCard = INDEX_NONE;
-	for (int32 Index = 0; Index < KitCount(); ++Index)
+	for (int32 Index = 0; Index < TraceLoadoutSelectFile::KitCount(); ++Index)
 	{
 		if (CardRects[Index].bIsValid && CardRects[Index].IsInside(CursorPos))
 		{
@@ -548,7 +566,7 @@ void FTraceLoadoutSelect::Recall(int32 Index)
 	Staged = Saved;
 	for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
 	{
-		Highlighted[SlotIndex] = CardForKit(Staged.Get(static_cast<ETraceLoadoutSlot>(SlotIndex)));
+		Highlighted[SlotIndex] = TraceLoadoutSelectFile::CardForKit(Staged.Get(static_cast<ETraceLoadoutSlot>(SlotIndex)));
 	}
 
 	LastMessage = FString::Format(*TRACE_TEXT("LOADOUT.SLOT_LOADED", "LOADED {0}"),
@@ -578,11 +596,11 @@ void FTraceLoadoutSelect::OpenLibrary(int32 SlotIndex)
 	Staged = UTraceUserSettings::Get().GetSavedLoadout(LibrarySlot);
 	if (Staged.IsEmpty())
 	{
-		Staged = FTraceLoadout::Uniform(KitAtCard(0));
+		Staged = FTraceLoadout::Uniform(TraceLoadoutSelectFile::KitAtCard(0));
 	}
 	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
 	{
-		Highlighted[Index] = CardForKit(Staged.Get(static_cast<ETraceLoadoutSlot>(Index)));
+		Highlighted[Index] = TraceLoadoutSelectFile::CardForKit(Staged.Get(static_cast<ETraceLoadoutSlot>(Index)));
 	}
 	Tab = 0;
 	LastMessage.Reset();
@@ -644,6 +662,8 @@ bool FTraceLoadoutSelect::TickLibrary(AHUD* HUD, APlayerController* PC,
 
 void FTraceLoadoutSelect::Draw(AHUD* HUD, const TCHAR* Title, const TCHAR* FooterHint)
 {
+	using namespace TraceLoadoutLayout;
+
 	if (HUD == nullptr || ViewW <= 0.f || ViewH <= 0.f)
 	{
 		return;
@@ -672,7 +692,7 @@ void FTraceLoadoutSelect::Draw(AHUD* HUD, const TCHAR* Title, const TCHAR* Foote
 		CardRects[Index] = FBox2D(ForceInit);
 	}
 
-	const int32 Count = FMath::Min(KitCount(), Columns * Rows);
+	const int32 Count = FMath::Min(TraceLoadoutSelectFile::KitCount(), Columns * Rows);
 	for (int32 Index = 0; Index < Count; ++Index)
 	{
 		const int32 Col = Index % Columns;
@@ -696,6 +716,8 @@ void FTraceLoadoutSelect::Draw(AHUD* HUD, const TCHAR* Title, const TCHAR* Foote
 
 void FTraceLoadoutSelect::DrawTabs(AHUD* HUD, float X, float Y, float W)
 {
+	using namespace TraceLoadoutLayout;
+
 	const float S = UIScale;
 	const int32 Count = static_cast<int32>(ETraceLoadoutSlot::Count);
 	const float TabW = (W - TabGap * S * (Count - 1)) / static_cast<float>(Count);
@@ -710,25 +732,27 @@ void FTraceLoadoutSelect::DrawTabs(AHUD* HUD, float X, float Y, float W)
 		TabRects[Index] = FBox2D(FVector2D(TabX, Y), FVector2D(TabX + TabW, Y + TabH * S));
 
 		HUD->DrawRect(bActive ? PlateHi : Plate, TabX, Y, TabW, TabH * S);
-		StrokeRect(HUD, TabX, Y, TabW, TabH * S, (bActive ? 2.f : 1.f) * S,
+		TraceLoadoutSelectFile::StrokeRect(HUD, TabX, Y, TabW, TabH * S, (bActive ? 2.f : 1.f) * S,
 			bActive ? Cyan : (bHovered ? InkSoft : InkDim));
 
-		TraceCanvasText::DrawBold(HUD, SlotHeading(Slot), TabX + CardPad * S, Y + 10.f * S,
+		TraceCanvasText::DrawBold(HUD, TraceLoadoutSelectFile::SlotHeading(Slot), TabX + CardPad * S, Y + 10.f * S,
 			SizeTab * S, bActive ? Cyan : InkSoft);
 
 		// WHAT IS IN THE SLOT, on the tab itself. The point of three tabs is that you can see your
 		// whole loadout without visiting all three, so a tab that only said its own name would make
 		// the player click through to check what they had already chosen.
-		TraceCanvasText::Draw(HUD, TabSummary(Staged, Slot), TabX + CardPad * S, Y + 36.f * S,
+		TraceCanvasText::Draw(HUD, TraceLoadoutSelectFile::TabSummary(Staged, Slot), TabX + CardPad * S, Y + 36.f * S,
 			SizeTabSub * S, bActive ? Ink : InkDim);
 	}
 }
 
 void FTraceLoadoutSelect::DrawCard(AHUD* HUD, int32 Index, float X, float Y, float W, float H)
 {
+	using namespace TraceLoadoutLayout;
+
 	const float S = UIScale;
 	const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(Tab);
-	const ETraceCharacterId Id = KitAtCard(Index);
+	const ETraceCharacterId Id = TraceLoadoutSelectFile::KitAtCard(Index);
 
 	const bool bHighlighted = (Index == Highlighted[Tab]);
 	const bool bEquipped = (Staged.Get(Slot) == Id);
@@ -736,7 +760,7 @@ void FTraceLoadoutSelect::DrawCard(AHUD* HUD, int32 Index, float X, float Y, flo
 	CardRects[Index] = FBox2D(FVector2D(X, Y), FVector2D(X + W, Y + H));
 
 	HUD->DrawRect(bHighlighted ? PlateHi : Plate, X, Y, W, H);
-	StrokeRect(HUD, X, Y, W, H, (bEquipped ? 3.f : (bHighlighted ? 2.f : 1.f)) * S,
+	TraceLoadoutSelectFile::StrokeRect(HUD, X, Y, W, H, (bEquipped ? 3.f : (bHighlighted ? 2.f : 1.f)) * S,
 		bEquipped ? Good : (bHighlighted ? Cyan : InkDim));
 
 	float TextY = Y + CardPad * S;
@@ -755,7 +779,7 @@ void FTraceLoadoutSelect::DrawCard(AHUD* HUD, int32 Index, float X, float Y, flo
 	}
 
 	const FString Body = TraceAbilityNames::Describe(Id, Slot);
-	DrawWrapped(HUD, Body, TextX, TextY, TextW, SizeBody * S,
+	TraceLoadoutSelectFile::DrawWrapped(HUD, Body, TextX, TextY, TextW, SizeBody * S,
 		bHighlighted ? InkSoft : InkDim, 4.f * S);
 
 	// The equipped marker is a word, not only a colour: a green border alone is a legend the player
@@ -772,6 +796,8 @@ void FTraceLoadoutSelect::DrawCard(AHUD* HUD, int32 Index, float X, float Y, flo
 
 void FTraceLoadoutSelect::DrawSavedRow(AHUD* HUD, float X, float Y, float W)
 {
+	using namespace TraceLoadoutLayout;
+
 	const float S = UIScale;
 	const UTraceUserSettings& Settings = UTraceUserSettings::Get();
 
@@ -791,7 +817,7 @@ void FTraceLoadoutSelect::DrawSavedRow(AHUD* HUD, float X, float Y, float W)
 		SavedRects[Index] = FBox2D(FVector2D(SlotX, Y), FVector2D(SlotX + SlotW, Y + SavedH * S));
 
 		HUD->DrawRect(Plate, SlotX, Y, SlotW, SavedH * S);
-		StrokeRect(HUD, SlotX, Y, SlotW, SavedH * S, 1.f * S,
+		TraceLoadoutSelectFile::StrokeRect(HUD, SlotX, Y, SlotW, SavedH * S, 1.f * S,
 			bHovered ? Cyan : (bFilled ? InkSoft : InkDim));
 
 		FString Label = Settings.GetSavedLoadoutName(Index);
@@ -809,7 +835,7 @@ void FTraceLoadoutSelect::DrawSavedRow(AHUD* HUD, float X, float Y, float W)
 	ConfirmRect = FBox2D(FVector2D(ConfirmX, Y), FVector2D(ConfirmX + ConfirmW, Y + SavedH * S));
 
 	HUD->DrawRect(bHoveredConfirm ? PlateHi : Plate, ConfirmX, Y, ConfirmW, SavedH * S);
-	StrokeRect(HUD, ConfirmX, Y, ConfirmW, SavedH * S, 2.f * S, bHoveredConfirm ? Cyan : Good);
+	TraceLoadoutSelectFile::StrokeRect(HUD, ConfirmX, Y, ConfirmW, SavedH * S, 2.f * S, bHoveredConfirm ? Cyan : Good);
 	TraceCanvasText::DrawBold(HUD,
 		(LibrarySlot != INDEX_NONE) ? TRACE_TEXT("LOADOUT.SAVE_SLOT", "SAVE")
 		                            : TRACE_TEXT("LOADOUT.LOCK_IN", "LOCK IN"),
@@ -818,6 +844,8 @@ void FTraceLoadoutSelect::DrawSavedRow(AHUD* HUD, float X, float Y, float W)
 
 void FTraceLoadoutSelect::DrawPointer(AHUD* HUD)
 {
+	using namespace TraceLoadoutLayout;
+
 	// The OS cursor does not appear in captured frames and is hidden during a match, so the overlay
 	// draws its own — the same reason and the same shape as the character screen's.
 	if (!bHasCursor)
@@ -838,7 +866,7 @@ void FTraceLoadoutSelect::DrawPointer(AHUD* HUD)
 void FTraceLoadoutSelect::DebugPick(ETraceLoadoutSlot Slot, ETraceCharacterId Id)
 {
 	Staged.Set(Slot, Id);
-	Highlighted[static_cast<int32>(Slot)] = CardForKit(Id);
+	Highlighted[static_cast<int32>(Slot)] = TraceLoadoutSelectFile::CardForKit(Id);
 }
 
 void FTraceLoadoutSelect::DebugConfirm(ATracePlayerState* LocalState)

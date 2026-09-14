@@ -39,4 +39,19 @@ if ! "$PY" "$ROOT/Scripts/config-hygiene.py" --check; then
     echo "  Or bypass:   git commit --no-verify"
     exit 1
 fi
+
+# ---- unity hygiene: the Windows-only break a Mac build cannot see -----------
+#
+# A `using namespace` at file scope leaks into every file compiled after it in
+# the same unity blob, and MSVC raises C4459 as an ERROR where clang on macOS is
+# silent. That has broken the Windows build twice. This check is mechanical and
+# runs on both machines, which is the part of the gap a Mac CAN close.
+if ! "$PY" "$ROOT/Scripts/unity-hygiene.py"; then
+    echo
+    echo "pre-commit: refusing the commit - a new file-scope \`using namespace\` would"
+    echo "            break the Windows build in a file nobody touched."
+    echo "  Or bypass:   git commit --no-verify"
+    exit 1
+fi
+
 exit 0
