@@ -197,6 +197,23 @@ float ATracePlayerState::GetActivatedCooldownRemaining() const
 	return 0.f;
 }
 
+bool ATracePlayerState::HasAnyAbility() const
+{
+	// A character id is still an answer: the pre-loadout path, bots, and anyone auto-assigned all
+	// hold one, and a character means a full uniform loadout.
+	if (HasCharacter())
+	{
+		return true;
+	}
+
+	// ...and a loadout is the other answer, for the player who picked three abilities and no face.
+	if (const UTraceAbilityComponent* Abilities = FindComponentByClass<UTraceAbilityComponent>())
+	{
+		return !Abilities->GetLoadout().IsEmpty();
+	}
+	return false;
+}
+
 void ATracePlayerState::ServerMarkCharacterResolved(bool bLocked, bool bWasChosen)
 {
 	if (!HasAuthority())

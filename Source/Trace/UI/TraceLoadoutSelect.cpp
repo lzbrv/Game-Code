@@ -9,6 +9,7 @@
 #include "HAL/IConsoleManager.h"
 
 #include "Abilities/TraceAbilityComponent.h"
+#include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
 #include "Core/TraceGameState.h"
 #include "Core/TracePlayerState.h"
@@ -1042,6 +1043,63 @@ namespace TraceLoadoutScreenVerify
 				TEXT("the break owns the window; the poll must stand off"));
 
 			TraceGS->SetHalfState(HalfNow, HalvesNow, bWasBreak);
+		}
+
+		// ---- *** E MUST ACTUALLY FIRE. *** ------------------------------------------------------
+		//
+		// The gap every earlier harness left. They proved the loadout was ACCEPTED and that the kits
+		// were BUILT, and then stopped — so a build shipped in which locking in an activated ability
+		// did nothing when you pressed E. TryActivate refused on its FIRST LINE because the player's
+		// CHARACTER id was None, which is true of every loadout-only player; movement and passive
+		// abilities kept working because their hooks already asked the slots.
+		//
+		// SO THIS PRESSES E, rather than checking that the kit exists. Checking the kit exists is what
+		// the previous version of this block did and it is worth nothing: the kit DID exist, and the
+		// press was refused anyway by a gate above it. The bug lived in the gap between "equipped"
+		// and "works", which is exactly the gap a test has to cross.
+		//
+		// Driven on a subject with a LIVE PAWN and a cleared cooldown, with the character id left
+		// EMPTY, because that combination is precisely the state that was broken.
+		{
+			UTraceAbilityComponent* FireComp = nullptr;
+			if (const AGameStateBase* GS = World->GetGameState())
+			{
+				for (APlayerState* Each : GS->PlayerArray)
+				{
+					ATracePlayerState* Candidate = Cast<ATracePlayerState>(Each);
+					UTraceAbilityComponent* Found = (Candidate != nullptr)
+						? Candidate->FindComponentByClass<UTraceAbilityComponent>() : nullptr;
+					const ATraceCharacter* Pawn = (Found != nullptr) ? Found->GetOwningCharacter() : nullptr;
+					if (Pawn != nullptr && Pawn->IsAlive() && !Pawn->IsCarrier())
+					{
+						FireComp = Found;
+						break;
+					}
+				}
+			}
+
+			if (FireComp == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[LoadoutScreen]   (no live non-carrier pawn; the E-fires check did not run)"));
+			}
+			else
+			{
+				const FTraceLoadout FireRestore = FireComp->GetLoadout();
+
+				FireComp->ApplyLoadout(Wanted);            // Elle's SNAP in the activated slot
+				FireComp->DebugSetActivatedCooldown(0.f);  // so a running timer cannot be the refusal
+
+				Check(TEXT("the firing subject really has no character id"),
+					FireComp->GetCharacterId() == ETraceCharacterId::None,
+					TEXT("this is the state that broke; a character id would hide the bug"));
+
+				const bool bFired = FireComp->TryActivate();
+				Check(TEXT("*** E FIRES on a loadout with no character id ***"), bFired,
+					TEXT("TryActivate returned false on its first line for every loadout player"));
+
+				FireComp->ApplyLoadout(FireRestore);
+			}
 		}
 
 		// ---- THE NAMES ARE THE ORIGINALS, AND NOTHING INVENTS ONE ------------------------------

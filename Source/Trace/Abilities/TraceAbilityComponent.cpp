@@ -798,7 +798,11 @@ void UTraceAbilityComponent::RebuildAbilitySet()
 
 	BuiltForCharacter = CharacterId;
 
-	if (CharacterId == ETraceCharacterId::None)
+	// NO CHARACTER *AND* NO LOADOUT. The second half is the point: a player who built a loadout has
+	// no character id at all, and returning here would tear down the three kits they just equipped
+	// and leave them with nothing. The characterless Mannequin is a player with NOTHING equipped,
+	// which is now two conditions rather than one.
+	if (CharacterId == ETraceCharacterId::None && Loadout.IsEmpty())
 	{
 		return;   // the default characterless Mannequin. Every hook must be a no-op here.
 	}
@@ -1032,9 +1036,21 @@ namespace TraceAbilityToast
 bool UTraceAbilityComponent::TryActivate()
 {
 	// ---- every refusal, centralised, so no character has to remember any of them ----------------
-	if (CharacterId == ETraceCharacterId::None || AbilitySet == nullptr)
+	//
+	// *** THE ACTIVATED SLOT, NOT THE IDENTITY BYTE. ***
+	//
+	// This used to read `CharacterId == None || AbilitySet == nullptr`, and that was the same question
+	// before loadouts: no character meant no abilities. It is the opposite of the same question now.
+	// A player who built a loadout has a perfectly good activated ability and a character id of None
+	// — nothing sets the id when you pick abilities — so E returned false on its FIRST LINE, every
+	// press, for every loadout in the game.
+	//
+	// It is exactly why movement and passive abilities kept working while E did not: those are driven
+	// through hooks (OnJumpPressed, GetMoveSpeedMultiplier, the dash notifications) that were already
+	// converted to ask the slots. This one entry point was still asking who you are.
+	if (GetAbilitySetForSlot(ETraceLoadoutSlot::Activated) == nullptr)
 	{
-		return false;
+		return false;   // nothing equipped in the E slot. Not a refusal, an empty slot.
 	}
 
 	if (!AreCharactersEnabled(this))

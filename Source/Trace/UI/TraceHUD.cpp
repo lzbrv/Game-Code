@@ -2751,7 +2751,7 @@ void ATraceHUD::DrawHealthAndDash()
 				++PlannedRows;   // slide-jump window
 			}
 		}
-		if (LocalPS != nullptr && LocalPS->HasCharacter())
+		if (LocalPS != nullptr && LocalPS->HasAnyAbility())
 		{
 			++PlannedRows;   // ability row — the one row that draws through death by design
 		}
@@ -3127,9 +3127,11 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 	// If this ever starts reading ATraceCharacter or a component on it, the feature is broken again
 	// and the symptom will be "the meter disappears when I die", which reads as a HUD bug rather than
 	// as the rule violation it is.
-	if (LocalPS == nullptr || !LocalPS->HasCharacter())
+	// HasAnyAbility, not HasCharacter: a loadout player holds three abilities and no character id,
+	// and this row is about the ability under their finger.
+	if (LocalPS == nullptr || !LocalPS->HasAnyAbility())
 	{
-		// No character means mode A, the settings toggle, a bot, or a player who has not picked yet.
+		// Nothing equipped means mode A, the settings toggle, a bot, or a player who has not picked.
 		// In every one of those there is no ability, and a row saying "ABILITY  READY" would be a
 		// promise about a key that does nothing.
 		return RowY;
@@ -3270,7 +3272,7 @@ bool ATraceHUD::IsSecondaryRowUp(float& OutRowH, float& OutAdvance, float RowH)
 	OutAdvance = FMath::Max(OutRowH + (6.f * UIScale),
 		MeasureHeight(FString(TEXT("ROCKET  00.0")), FontSmall, UIScale) + (4.f * UIScale));
 
-	if (LocalPS == nullptr || !LocalPS->HasCharacter())
+	if (LocalPS == nullptr || !LocalPS->HasAnyAbility())
 	{
 		return false;
 	}

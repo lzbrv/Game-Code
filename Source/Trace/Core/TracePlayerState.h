@@ -198,6 +198,19 @@ public:
 	 */
 	bool  IsCharacterLocked() const { return bCharacterLocked; }
 
+	/**
+	 * Does this player have ANY ability equipped?
+	 *
+	 * *** THE OTHER QUESTION HasCharacter() USED TO ANSWER. *** It meant "has abilities" because a
+	 * character WAS the abilities. Since loadouts it means only "wears a face": a player can hold
+	 * three abilities and no character id, and every `if (HasCharacter())` guarding an ability —
+	 * the HUD's E row, the V row — silently drew nothing for them.
+	 *
+	 * Defined in the .cpp because it has to reach the ability component, which this header does not
+	 * include.
+	 */
+	bool  HasAnyAbility() const;
+
 	// ---- Last verdict, for the select screen's message line -----------------------------------
 	//
 	// CLIENT-LOCAL AND NOT REPLICATED, on purpose. This is the answer to one RPC this player sent;
