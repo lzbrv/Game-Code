@@ -9,6 +9,8 @@
 #include "HAL/IConsoleManager.h"
 
 #include "Abilities/TraceAbilityComponent.h"
+#include "Core/TraceGameMode.h"
+#include "Core/TraceGameState.h"
 #include "Core/TracePlayerState.h"
 #include "Settings/TraceGamepadInput.h"
 #include "Settings/TraceUserSettings.h"
@@ -999,6 +1001,48 @@ namespace TraceLoadoutScreenVerify
 		Check(TEXT("LOCK IN closes the screen"),
 			!Subject->IsCharacterSelectOpen(),
 			TEXT("the select window is the ONLY condition that keeps this page up"));
+
+		// *** AND IT STAYS CLOSED. *** This is the assertion the previous version was missing, and its
+		// absence shipped a build where the menu vanished on LOCK IN and came straight back: the
+		// select poll runs at 4 Hz for the whole match, decided the player had not picked (their
+		// CHARACTER id is still None — they picked a LOADOUT), and reopened it. Closing was never the
+		// problem. Staying closed was.
+		ATraceGameMode* const Mode = World->GetAuthGameMode<ATraceGameMode>();
+		ATraceGameState* const TraceGS = World->GetGameState<ATraceGameState>();
+		if (Mode != nullptr && TraceGS != nullptr)
+		{
+			for (int32 Pass = 0; Pass < 4; ++Pass)
+			{
+				Mode->DebugPollCharacterSelect();
+			}
+			Check(TEXT("...and four select polls do NOT reopen it"),
+				!Subject->IsCharacterSelectOpen(),
+				TEXT("the poll ran at 4Hz all match and undid the close"));
+
+			// ---- THE MIRROR OF THE SAME BUG ---------------------------------------------------
+			//
+			// The branch that reopens a screen for somebody unsorted also CLOSES one for somebody
+			// sorted — so at half time, when almost everyone is sorted, the poll would have shut the
+			// loadout window within 250 ms of the break opening it. Nobody could have changed a
+			// loadout at half time at all, and the S4 harness would not have noticed: it asked
+			// whether the server ACCEPTED a change, never whether the screen survived long enough to
+			// ask for one.
+			const bool bWasBreak = TraceGS->IsHalfTimeBreak();
+			const int32 HalfNow = TraceGS->CurrentHalf;
+			const int32 HalvesNow = FMath::Max(1, TraceGS->NumHalves);
+
+			TraceGS->SetHalfState(HalfNow, HalvesNow, /*bInHalfTimeBreak=*/true);
+			Subject->ServerSetCharacterSelectOpen(/*bOpen=*/true, 0.f);
+			for (int32 Pass = 0; Pass < 4; ++Pass)
+			{
+				Mode->DebugPollCharacterSelect();
+			}
+			Check(TEXT("the half time window SURVIVES the poll"),
+				Subject->IsCharacterSelectOpen(),
+				TEXT("the break owns the window; the poll must stand off"));
+
+			TraceGS->SetHalfState(HalfNow, HalvesNow, bWasBreak);
+		}
 
 		// ---- THE NAMES ARE THE ORIGINALS, AND NOTHING INVENTS ONE ------------------------------
 		//

@@ -188,6 +188,16 @@ public:
 	bool  IsCharacterSelectOpen() const { return bCharacterSelectOpen; }
 	bool  WasCharacterChosen() const { return bCharacterWasChosen; }
 
+	/**
+	 * Has the server accepted this player's pick?
+	 *
+	 * *** THE QUESTION "HasCharacter()" USED TO ANSWER, AND NO LONGER DOES. *** Since loadouts, a
+	 * player can be completely settled while holding NO character id at all: they picked three
+	 * abilities, which is the whole game now, and the id stayed None. Anything asking "is this player
+	 * still choosing?" wants this bit, not the id.
+	 */
+	bool  IsCharacterLocked() const { return bCharacterLocked; }
+
 	// ---- Last verdict, for the select screen's message line -----------------------------------
 	//
 	// CLIENT-LOCAL AND NOT REPLICATED, on purpose. This is the answer to one RPC this player sent;

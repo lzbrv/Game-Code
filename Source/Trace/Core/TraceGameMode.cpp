@@ -4204,6 +4204,26 @@ void ATraceGameMode::PollCharacterSelect()
 	const bool bEnabled = AreCharactersEnabled();
 	const double NowServer = BaseGameState->GetServerWorldTimeSeconds();
 
+	// *** THE HALF TIME BREAK OWNS THE WINDOW, NOT THIS POLL. ***
+	//
+	// BeginHalfTimeBreak opens the loadout window for every human and EndHalfTimeBreak shuts it at
+	// the whistle, deliberately, so the screen's countdown and the interval clock are the same
+	// number. This poll would have fought it: almost every player IS sorted by then, and the branch
+	// below closes an open window for anyone who is — so the half-time screen would have been shut
+	// within 250 ms of opening, every time, and nobody could have changed a loadout at half time at
+	// all.
+	//
+	// Standing off entirely for the duration is right rather than merely convenient: everything this
+	// poll exists to do — offer a screen to somebody who has not picked, auto-assign a player who ran
+	// out of clock, fill bots — is about getting a match STARTED, and the interval is not that.
+	if (const ATraceGameState* const TraceState = GetTraceGameState())
+	{
+		if (TraceState->IsHalfTimeBreak())
+		{
+			return;
+		}
+	}
+
 	for (APlayerState* const EachState : BaseGameState->PlayerArray)
 	{
 		ATracePlayerState* Candidate = Cast<ATracePlayerState>(EachState);
@@ -4406,7 +4426,21 @@ void ATraceGameMode::PollCharacterSelect()
 		}
 
 		// ---- Already sorted --------------------------------------------------------------------
-		if (Candidate->HasCharacter())
+		//
+		// *** OR LOCKED IN, WHICH IS NOT THE SAME THING ANY MORE. ***
+		//
+		// This used to ask HasCharacter() alone, and that was the same question before loadouts: you
+		// were finished choosing exactly when you held a character id. It is not the same question
+		// now. A player who locks in a LOADOUT has settled everything the game asks of them while
+		// their character id is still None — so this poll, running at 4 Hz for the whole match, saw
+		// somebody who had not picked and REOPENED the screen on the very next tick.
+		//
+		// The symptom was the screen vanishing on LOCK IN and coming straight back, with the player
+		// trapped in it. The close was working; this was undoing it a quarter of a second later.
+		//
+		// bCharacterLocked is precisely "the server has accepted a pick" and both paths set it — the
+		// character flow in RequestCharacter, the loadout flow in ServerRequestSetLoadout.
+		if (Candidate->HasCharacter() || Candidate->IsCharacterLocked())
 		{
 			if (Candidate->IsCharacterSelectOpen())
 			{

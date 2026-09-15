@@ -906,6 +906,21 @@ protected:
 	 */
 	void PollCharacterSelect();
 
+public:
+#if !UE_BUILD_SHIPPING
+	/**
+	 * Test seam: run one select poll now, instead of waiting up to a quarter second for the timer.
+	 *
+	 * Exists because the poll is what UNDID a fix. LOCK IN closed the loadout screen correctly and
+	 * this poll reopened it on the next tick, and no harness caught that — they all asserted the
+	 * close and then stopped looking. A test for "the screen stays shut" has to be able to run the
+	 * thing that would reopen it.
+	 */
+	void DebugPollCharacterSelect() { PollCharacterSelect(); }
+#endif
+
+protected:
+
 	/** Spawns one bot on @p Team, names it, and gives it a pawn. Null on failure. */
 	ATraceBotController* SpawnBotForTeam(ETraceTeam Team);
 
