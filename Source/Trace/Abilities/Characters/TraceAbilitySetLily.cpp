@@ -379,6 +379,13 @@ bool UTraceAbilitySetLily::ShouldDriveMovement() const
 
 int32 UTraceAbilitySetLily::GetExtraDashCharges() const
 {
+	// OVERLOAD ONLY. This kit now offers TWO movement abilities and a player picks one of them,
+	// so the extra dash must not arrive with the wall jumps. [Demo 35]
+	if (!IsAbility(ETraceAbilityId::Overload))
+	{
+		return 0;
+	}
+
 	// DEMO 19 ITEM 8: "only ... when she is not carrying the core".
 	//
 	// THE CONDITION IS ON THE ADDEND, NOT ON THE TOTAL, and that distinction is the whole item.
@@ -404,6 +411,19 @@ int32 UTraceAbilitySetLily::GetExtraDashCharges() const
 
 float UTraceAbilitySetLily::GetMaxHealthOverride() const
 {
+	// *** THE 60 HEALTH NOW BELONGS TO ZIP, NOT TO THE WALL JUMPS. *** [Demo 35]
+	//
+	// It used to ride on the passive, so a player who wanted stronger wall jumps was quietly buying
+	// the frailest body in the game with them. Demo 35 moves the debuff onto ZIP, where it is the
+	// price of a five second flight rather than a tax on a movement perk - and ACROBATICS ships
+	// without it.
+	//
+	// 0 is the framework's sentinel for "no override", which is what every other kit returns.
+	if (!IsAbility(ETraceAbilityId::Zip))
+	{
+		return 0.f;
+	}
+
 	// Floored at 1 rather than at 0: 0 is the sentinel for "this character has no opinion", and a
 	// mistyped 0 in the settings must not be read as "use the default" — it must be read as the
 	// smallest survivable number, so the mistake is visible instead of invisible.
@@ -412,6 +432,11 @@ float UTraceAbilitySetLily::GetMaxHealthOverride() const
 
 float UTraceAbilitySetLily::GetWallJumpMomentumScale() const
 {
+	// ACROBATICS ONLY — the other half of the split above. [Demo 35]
+	if (!IsAbility(ETraceAbilityId::Acrobatics))
+	{
+		return 1.f;
+	}
 	return 1.f + FMath::Clamp(UTraceSettings::Get().LilyWallJumpMomentumBonus, 0.f, 4.f);
 }
 

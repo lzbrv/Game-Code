@@ -195,32 +195,136 @@ TRACE_API const TCHAR* TraceLoadoutSlotToString(ETraceLoadoutSlot Slot);
  * None in a slot means "no ability there" and is legal — a player who has not picked yet, and the
  * characterless Mannequin that mode A ships.
  */
+/**
+ * EVERY ABILITY IN THE GAME, AS A FIRST-CLASS ID.
+ *
+ * *** WHY THIS EXISTS, AND WHY (kit, slot) STOPPED BEING ENOUGH. ***
+ *
+ * A loadout used to name one KIT per slot, and the kit decided what ran there. That worked while
+ * every kit had exactly one ability per slot — which was true from the rework until Demo 35, and is
+ * not true now. Demo 35 moves Chut's BASH from movement to passive, where his knife passive already
+ * lives, and moves Lily's ACROBATICS from passive to movement, where her extra dash already lives.
+ * One kit, two abilities, one slot. A loadout that can only say "Chut, in the passive slot" cannot
+ * say WHICH of Chut's two passives you meant.
+ *
+ * So the loadout names ABILITIES now. The kit is still where the code lives — that is unchanged, and
+ * it is why this is an id beside ETraceCharacterId rather than a replacement for it — but it is a
+ * fact ABOUT an ability rather than the way an ability is identified.
+ *
+ * DO NOT REORDER AND DO NOT INSERT, for the reason ETraceCharacterId gives: the value is replicated
+ * as a uint8 and a renumber would silently swap two players' abilities mid-match. New abilities
+ * APPEND, in front of Count.
+ *
+ * None is a real, supported state: an empty slot. Mode A gives everybody three of them.
+ */
+UENUM()
+enum class ETraceAbilityId : uint8
+{
+	None = 0,
+
+	// ---- movement ----------------------------------------------------------------------------
+	JetBoots,           // Rocco:    a small second jump
+	Suspend,            // Mace:     hold V in the air to hang
+	Leech,              // X:        +15% speed while any enemy is vulnerable
+	RockJump,           // Roxie:    V fires a rocket that throws you backwards
+	CarbonSliders,      // Elle:     well-timed slide jumps carry more momentum
+	StickyGloves,       // Slimeball: hold V to stick to a wall
+	Blink,              // Mortimer: hold V to teleport straight up          [Demo 35: replaced MANTLE]
+	Overload,           // Lily:     one extra dash charge                    [Demo 35: retuned]
+	Acrobatics,         // Lily:     wall jumps carry more momentum           [Demo 35: was a PASSIVE]
+
+	// ---- passive -----------------------------------------------------------------------------
+	Blasters,           // Rocco:    headshot kills give speed
+	CustomSteel,        // Chut:     knife does more from the front
+	Magnet,             // Mace:     +30% Core magnet radius                  (unnamed by Demo 35)
+	PickleJar,          // Oyster:   every dash leaves a poison jar
+	XMechs,             // X:        five bees orbit you
+	Shimmer,            // Elle:     passing or throwing the Core cloaks you
+	VistechPadding,     // Slimeball: while stuck, fire faster and take less
+	MortimerLoad,       // Mortimer: shorter dash, longer Core throw charge    (named TBD by Demo 35)
+	Bash,               // Chut:     the end of your dash knocks players       [Demo 35: was MOVEMENT]
+	DashCloak,          // Oyster:   jumping straight after a dash cloaks you  [Demo 35: new, replaced JAR JUMP]
+
+	// ---- activated ---------------------------------------------------------------------------
+	Ripple,             // Rocco
+	Chud,               // Chut
+	Spike,              // Mace
+	Pickler,            // Oyster
+	Sting,              // X
+	Modded,             // Roxie                                              [Demo 35: pistol only]
+	Snap,               // Elle
+	Slimewall,          // Slimeball
+	Quake,              // Mortimer
+	Zip,                // Lily                                               [Demo 35: carries the health debuff]
+
+	Count               UMETA(Hidden)
+};
+
+/** Human-readable, for logs and console commands. Never "<invalid>" for a value in the enum. */
+TRACE_API const TCHAR* TraceAbilityIdToString(ETraceAbilityId Id);
+
+/**
+ * Everything the game needs to know about one ability that is not its behaviour.
+ *
+ * ONE TABLE, AND IT IS THE ONLY PLACE AN ABILITY'S SLOT IS DECIDED. Demo 35 moved two abilities
+ * between slots; doing that had to be a one-line edit here rather than a hunt through ten kit files,
+ * or the next balance pass costs what this one did.
+ */
+struct TRACE_API FTraceAbilityDef
+{
+	ETraceAbilityId    Id       = ETraceAbilityId::None;
+
+	/** Which slot it occupies. THE definition of active/passive/movement. */
+	ETraceLoadoutSlot  Slot     = ETraceLoadoutSlot::Activated;
+
+	/** Whose kit implements it. Internal — no screen shows this to a player. */
+	ETraceCharacterId  Kit      = ETraceCharacterId::None;
+
+	/** Display name, or empty for an ability that has none. Most movement and passive ones do not. */
+	const TCHAR*       Name     = TEXT("");
+};
+
+/** The table. Indexed by walking, not by id — see TraceAbilityTable::Find. */
+namespace TraceAbilityTable
+{
+	TRACE_API const FTraceAbilityDef* Find(ETraceAbilityId Id);
+
+	/** Every ability that fills @p Slot, in table order. What a loadout column lists. */
+	TRACE_API void AllForSlot(ETraceLoadoutSlot Slot, TArray<ETraceAbilityId>& Out);
+
+	/** The slot @p Id fills, or Count if the id is None/unknown. */
+	TRACE_API ETraceLoadoutSlot SlotOf(ETraceAbilityId Id);
+
+	/** The kit that implements @p Id. */
+	TRACE_API ETraceCharacterId KitOf(ETraceAbilityId Id);
+}
+
 USTRUCT()
 struct TRACE_API FTraceLoadout
 {
 	GENERATED_BODY()
 
 	UPROPERTY()
-	ETraceCharacterId Movement = ETraceCharacterId::None;
+	ETraceAbilityId Movement = ETraceAbilityId::None;
 
 	UPROPERTY()
-	ETraceCharacterId Passive = ETraceCharacterId::None;
+	ETraceAbilityId Passive = ETraceAbilityId::None;
 
 	UPROPERTY()
-	ETraceCharacterId Activated = ETraceCharacterId::None;
+	ETraceAbilityId Activated = ETraceAbilityId::None;
 
-	ETraceCharacterId Get(ETraceLoadoutSlot Slot) const
+	ETraceAbilityId Get(ETraceLoadoutSlot Slot) const
 	{
 		switch (Slot)
 		{
 		case ETraceLoadoutSlot::Movement:  return Movement;
 		case ETraceLoadoutSlot::Passive:   return Passive;
 		case ETraceLoadoutSlot::Activated: return Activated;
-		default:                           return ETraceCharacterId::None;
+		default:                           return ETraceAbilityId::None;
 		}
 	}
 
-	void Set(ETraceLoadoutSlot Slot, ETraceCharacterId Id)
+	void Set(ETraceLoadoutSlot Slot, ETraceAbilityId Id)
 	{
 		switch (Slot)
 		{
@@ -232,25 +336,64 @@ struct TRACE_API FTraceLoadout
 	}
 
 	/** True when every slot names the same kit — i.e. this is one of the ten pre-rework characters. */
+	/**
+	 * Do all three slots come from ONE kit?
+	 *
+	 * It used to read `Movement == Passive && Passive == Activated`, because a slot held a kit and a
+	 * uniform loadout was the pre-rework character. A slot holds an ABILITY now and three abilities
+	 * are never equal, so the same sentence would answer false forever — including for the one case
+	 * it exists to detect. It asks about the kits behind the abilities instead, which is what it
+	 * always meant.
+	 */
 	bool IsUniform() const
 	{
-		return Movement == Passive && Passive == Activated;
+		if (IsEmpty())
+		{
+			return false;
+		}
+		// EVERY FILLED SLOT FROM ONE KIT, and empty slots do not count against it. After Demo 35 a
+		// kit cannot always fill all three — Chut has no movement ability, Lily no passive — so
+		// requiring three non-empty slots would report every Chut bot as "mixed", which is what it
+		// did until this line was written properly.
+		ETraceCharacterId Seen = ETraceCharacterId::None;
+		for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+		{
+			const ETraceAbilityId Id = Get(static_cast<ETraceLoadoutSlot>(Index));
+			if (Id == ETraceAbilityId::None)
+			{
+				continue;
+			}
+			const ETraceCharacterId Kit = TraceAbilityTable::KitOf(Id);
+			if (Seen == ETraceCharacterId::None)
+			{
+				Seen = Kit;
+			}
+			else if (Kit != Seen)
+			{
+				return false;
+			}
+		}
+		return Seen != ETraceCharacterId::None;
 	}
 
 	bool IsEmpty() const
 	{
-		return Movement == ETraceCharacterId::None
-			&& Passive == ETraceCharacterId::None
-			&& Activated == ETraceCharacterId::None;
+		return Movement == ETraceAbilityId::None
+			&& Passive == ETraceAbilityId::None
+			&& Activated == ETraceAbilityId::None;
 	}
 
 	/** Every slot set to @p Id. The shape that reproduces a pre-rework character exactly. */
-	static FTraceLoadout Uniform(ETraceCharacterId Id)
-	{
-		FTraceLoadout Out;
-		Out.Movement = Out.Passive = Out.Activated = Id;
-		return Out;
-	}
+	/**
+	 * The three abilities of one kit — the pre-rework character, as a loadout.
+	 *
+	 * Kept because it is what a character PICK still means (bots, the auto-assign, mode A's fallback)
+	 * and it is how every uniform loadout in the game is built. It looks the kit's abilities up in
+	 * the table rather than assuming one per slot, because after Demo 35 that assumption is false:
+	 * Chut has two passives and no movement, Lily two movement abilities and no passive. A kit that
+	 * cannot fill a slot leaves it EMPTY, which is a legal loadout.
+	 */
+	static FTraceLoadout Uniform(ETraceCharacterId Kit);
 
 	bool operator==(const FTraceLoadout& Other) const
 	{

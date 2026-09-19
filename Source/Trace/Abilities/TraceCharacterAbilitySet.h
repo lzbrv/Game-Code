@@ -115,13 +115,42 @@ public:
 	 * So a kit picked for two slots answers TRUE to both, and its guarded bodies all run — which is
 	 * precisely the pre-rework behaviour for that pair, and exactly what the player asked for.
 	 */
+	/**
+	 * Is @p InAbility one of the abilities this instance was equipped for?
+	 *
+	 * *** THE GUARD THAT REPLACED IsSlot FOR ANY KIT WITH TWO ABILITIES IN ONE SLOT. *** Demo 35
+	 * made that real: Chut's BASH joined CUSTOM STEEL in the passive slot and Lily's ACROBATICS
+	 * joined OVERLOAD in movement. For those kits "am I the passive?" is ambiguous — both are — and
+	 * only the ability id can say which body should run.
+	 */
+	bool IsAbility(ETraceAbilityId InAbility) const
+	{
+		return (AbilityMask & (1u << static_cast<uint32>(InAbility))) != 0;
+	}
+
+	/**
+	 * Does this instance fill @p InSlot?
+	 *
+	 * DERIVED FROM THE EQUIPPED ABILITIES rather than stored, which is what let Demo 35's category
+	 * moves land without rewriting twenty-three guards: a kit whose one ability for a slot moved to
+	 * another slot answers this correctly with no edit at all. Only the two kits that ended up with
+	 * TWO abilities in one slot needed their guards sharpened to IsAbility.
+	 */
 	bool IsSlot(ETraceLoadoutSlot InSlot) const
 	{
-		return (SlotMask & (1u << static_cast<uint8>(InSlot))) != 0;
+		for (int32 Index = 1; Index < static_cast<int32>(ETraceAbilityId::Count); ++Index)
+		{
+			const ETraceAbilityId Ability = static_cast<ETraceAbilityId>(Index);
+			if (IsAbility(Ability) && TraceAbilityTable::SlotOf(Ability) == InSlot)
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 
 	/** Every slot this instance fills. A uniform pick sets all three. */
-	uint8 GetSlotMask() const { return SlotMask; }
+	uint32 GetAbilityMask() const { return AbilityMask; }
 
 	virtual ETraceCharacterId GetCharacterId() const
 		PURE_VIRTUAL(UTraceCharacterAbilitySet::GetCharacterId, return ETraceCharacterId::None;);
@@ -517,7 +546,7 @@ public:
 	 */
 	void Initialize(UTraceAbilityComponent* InComponent,
 		ETraceLoadoutSlot InSlot = ETraceLoadoutSlot::Activated,
-		uint8 InSlotMask = 0);
+		uint32 InAbilityMask = 0);
 
 	virtual UWorld* GetWorld() const override;
 
@@ -560,25 +589,15 @@ private:
 	ETraceLoadoutSlot OwnedSlot = ETraceLoadoutSlot::Activated;
 
 	/**
-	 * Bit per ETraceLoadoutSlot. See IsSlot(). Written once by Initialize() on a live instance — but
-	 * the value HERE is what the CDO answers, and the CDO is what UTraceAbilityComponent's loadout
-	 * legality check asks "can this kit serve that slot?".
+	 * Bit per ETraceAbilityId: which of this kit's abilities the player actually equipped.
 	 *
-	 * ALL THREE BY DEFAULT, because that is the roster as it actually ships: every one of the ten
-	 * characters has a movement ability, a passive and an activated one — checked against
-	 * Config/TraceGameText.ini, which carries a MOVEMENT, a PASSIVE and an ACTIVATED_NAME line for
-	 * each of the ten. So "this kit can fill any slot" is the true answer for every kit in the build,
-	 * not a permissive shrug.
+	 * Replaced a slot mask, because a slot stopped identifying an ability — Demo 35 gave Chut two
+	 * passives and Lily two movement abilities. Written once by Initialize(); a kit that could change
+	 * what it is mid-life would be a kit whose replicated state moves between structs while clients
+	 * are reading it.
 	 *
-	 * It was Activated-only before loadouts existed, which was equally true then — a single-character
-	 * pick only ever asked about the E. Left that way it would have refused every mixed loadout in
-	 * the game, silently, as an illegal pick.
-	 *
-	 * A FUTURE KIT THAT GENUINELY LACKS ONE must narrow this in its own constructor. That is the
-	 * whole point of the check: an ability that is equipped and answers no hook reads to a player as
-	 * a broken ability, not as an empty slot.
+	 * Zero means "nothing equipped" and every guarded body is a no-op — the characterless Mannequin,
+	 * which is still a supported state.
 	 */
-	uint8 SlotMask = (1u << static_cast<uint8>(ETraceLoadoutSlot::Movement))
-		| (1u << static_cast<uint8>(ETraceLoadoutSlot::Passive))
-		| (1u << static_cast<uint8>(ETraceLoadoutSlot::Activated));
+	uint32 AbilityMask = 0;
 };

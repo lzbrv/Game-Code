@@ -902,9 +902,9 @@ namespace TraceLoadoutVerify
 	struct FCase
 	{
 		const TCHAR* Label;
-		ETraceCharacterId Movement;
-		ETraceCharacterId Passive;
-		ETraceCharacterId Activated;
+		ETraceAbilityId Movement;
+		ETraceAbilityId Passive;
+		ETraceAbilityId Activated;
 		int32 ExpectedInstances;
 	};
 
@@ -950,10 +950,17 @@ namespace TraceLoadoutVerify
 
 		static const FCase Cases[] =
 		{
-			{ TEXT("uniform (a pre-rework character)"), ETraceCharacterId::Rocco, ETraceCharacterId::Rocco, ETraceCharacterId::Rocco, 1 },
-			{ TEXT("two slots from one kit"),           ETraceCharacterId::Mace,  ETraceCharacterId::Rocco, ETraceCharacterId::Mace,  2 },
-			{ TEXT("three different kits"),             ETraceCharacterId::Mace,  ETraceCharacterId::Rocco, ETraceCharacterId::Elle,  3 },
-			{ TEXT("empty (the Mannequin)"),            ETraceCharacterId::None,  ETraceCharacterId::None,  ETraceCharacterId::None,  0 },
+			// Written as ABILITIES now, because that is what a slot holds. The cases still mean what
+			// they meant — one kit, a kit used twice, three kits, nothing — because the dedup rule
+			// they test is still about the KIT behind an ability, not the ability itself.
+			{ TEXT("one kit across all three slots"),
+			  ETraceAbilityId::JetBoots,      ETraceAbilityId::Blasters, ETraceAbilityId::Ripple, 1 },
+			{ TEXT("two slots from one kit"),
+			  ETraceAbilityId::Suspend,       ETraceAbilityId::Blasters, ETraceAbilityId::Spike,  2 },
+			{ TEXT("three different kits"),
+			  ETraceAbilityId::Suspend,       ETraceAbilityId::Blasters, ETraceAbilityId::Snap,   3 },
+			{ TEXT("empty (the Mannequin)"),
+			  ETraceAbilityId::None,          ETraceAbilityId::None,     ETraceAbilityId::None,   0 },
 		};
 
 		int32 Failures = 0;
@@ -986,7 +993,7 @@ namespace TraceLoadoutVerify
 			{
 				const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(Index);
 				const UTraceCharacterAbilitySet* Set = Comp->GetAbilitySetForSlot(Slot);
-				if (Loadout.Get(Slot) == ETraceCharacterId::None)
+				if (Loadout.Get(Slot) == ETraceAbilityId::None)
 				{
 					bMaskOk = bMaskOk && (Set == nullptr);
 				}
@@ -1133,8 +1140,12 @@ namespace TraceLoadoutCombine
 		Comp->ApplyLoadout(AllMace);
 		const float MaceMagnet = UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(Pawn);
 
-		FTraceLoadout AllChut = FTraceLoadout::Uniform(ETraceCharacterId::Chut);
-		Comp->ApplyLoadout(AllChut);
+		// EQUIPPED EXPLICITLY, NOT VIA Uniform(). Chut now has TWO passives and Uniform picks the first
+		// the table offers, which is his knife — so a reference measured that way would read 0 and the
+		// test would compare the bash against nothing.
+		FTraceLoadout BashOnly;
+		BashOnly.Passive = ETraceAbilityId::Bash;
+		Comp->ApplyLoadout(BashOnly);
 		const float ChutSweep = UTraceAbilityComponent::GetDashHitSweepRadiusFor(Pawn);
 
 		// ---- a kit with no opinion: the identity cases ----------------------------------------
@@ -1151,9 +1162,9 @@ namespace TraceLoadoutCombine
 		// Mace's magnet is his PASSIVE line ("+30% Core magnet radius"), so THAT is the slot it must
 		// survive in — with a different kit holding Activated, which is where the legacy pointer looks.
 		FTraceLoadout MacePassive;
-		MacePassive.Movement  = ETraceCharacterId::Elle;
-		MacePassive.Passive   = ETraceCharacterId::Mace;   // the magnet lives here
-		MacePassive.Activated = ETraceCharacterId::Elle;   // ...and the legacy pointer looks HERE
+		MacePassive.Movement  = ETraceAbilityId::CarbonSliders;
+		MacePassive.Passive   = ETraceAbilityId::Magnet;   // the magnet lives here
+		MacePassive.Activated = ETraceAbilityId::Snap;   // ...and the legacy pointer looks HERE
 		Comp->ApplyLoadout(MacePassive);
 		Check(TEXT("Mace's magnet survives being in PASSIVE"),
 			UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(Pawn), MaceMagnet,
@@ -1163,32 +1174,36 @@ namespace TraceLoadoutCombine
 		// must not also hand you his magnet. An ability you did not pick firing anyway is free power
 		// nobody chose, and it is indistinguishable from a bug.
 		FTraceLoadout MaceMoves;
-		MaceMoves.Movement  = ETraceCharacterId::Mace;     // suspend only — NOT the magnet
-		MaceMoves.Passive   = ETraceCharacterId::Elle;
-		MaceMoves.Activated = ETraceCharacterId::Elle;
+		MaceMoves.Movement  = ETraceAbilityId::Suspend;     // suspend only — NOT the magnet
+		MaceMoves.Passive   = ETraceAbilityId::Shimmer;
+		MaceMoves.Activated = ETraceAbilityId::Snap;
 		Comp->ApplyLoadout(MaceMoves);
 		Check(TEXT("Mace in MOVEMENT does NOT bring his passive magnet"),
 			UTraceAbilityComponent::GetMagnetRadiusMultiplierFor(Pawn), 1.f,
 			TEXT("the magnet is his PASSIVE line; picking his suspend must not smuggle it in"));
 
+		// DEMO 35 MOVED THE BASH FROM MOVEMENT TO PASSIVE, so these two cases swap over. The rule
+		// under test is unchanged — an ability's number reaches the game from whatever slot it is in —
+		// and that it had to be rewritten is the point: the slot is data now, and the test reads it.
 		FTraceLoadout ChutMoves;
-		ChutMoves.Movement  = ETraceCharacterId::Chut;    // the bash sweep lives here now
-		ChutMoves.Passive   = ETraceCharacterId::Elle;
-		ChutMoves.Activated = ETraceCharacterId::Elle;
+		ChutMoves.Movement  = ETraceAbilityId::CarbonSliders;
+		ChutMoves.Passive   = ETraceAbilityId::Bash;            // the bash sweep lives HERE now
+		ChutMoves.Activated = ETraceAbilityId::Snap;
 		Comp->ApplyLoadout(ChutMoves);
-		Check(TEXT("Chut's dash sweep survives being in MOVEMENT"),
+		Check(TEXT("the bash's dash sweep survives being in PASSIVE"),
 			UTraceAbilityComponent::GetDashHitSweepRadiusFor(Pawn), ChutSweep,
-			TEXT("the bash IS his movement line; pre-S3a this read 0 and never swept"));
+			TEXT("Demo 35 made the bash a passive; its sweep has to follow it"));
 
 		// And the guard in the other direction for the same kit.
+		// The mirror: Chut's OTHER passive, which must bring no sweep with it.
 		FTraceLoadout ChutPassive;
-		ChutPassive.Movement  = ETraceCharacterId::Elle;
-		ChutPassive.Passive   = ETraceCharacterId::Chut;   // his knife passive, not the bash
-		ChutPassive.Activated = ETraceCharacterId::Elle;
+		ChutPassive.Movement  = ETraceAbilityId::CarbonSliders;
+		ChutPassive.Passive   = ETraceAbilityId::CustomSteel;   // his knife passive, not the bash
+		ChutPassive.Activated = ETraceAbilityId::Snap;
 		Comp->ApplyLoadout(ChutPassive);
-		Check(TEXT("Chut in PASSIVE does NOT bring his bash sweep"),
+		Check(TEXT("his OTHER passive does NOT bring the bash sweep"),
 			UTraceAbilityComponent::GetDashHitSweepRadiusFor(Pawn), 0.f,
-			TEXT("the sweep exists only to find a bash target, and the bash is MOVEMENT"));
+			TEXT("one kit, two passives: picking the knife must not hand you the bash"));
 
 		// ---- and the uniform case is unchanged, which is the promise S2 made -------------------
 		Comp->ApplyLoadout(AllMace);
@@ -1197,25 +1212,35 @@ namespace TraceLoadoutCombine
 			TEXT("one kit, counted once, not squared"));
 
 		// ---- every (kit, slot) pair is a legal pick --------------------------------------------
+		// EVERY ABILITY IS A LEGAL PICK FOR ITS OWN SLOT, and for no other. The second half is new and
+		// it is what the ability table bought: before Demo 35 a slot held a kit and every kit served
+		// every slot, so there was nothing to get wrong. Now BASH is a passive and ACROBATICS is a
+		// movement ability, and a loadout that put either in its old slot has to be refused.
 		int32 IllegalPairs = 0;
-		for (int32 IdIndex = 1; IdIndex < static_cast<int32>(ETraceCharacterId::Count); ++IdIndex)
+		for (int32 IdIndex = 1; IdIndex < static_cast<int32>(ETraceAbilityId::Count); ++IdIndex)
 		{
-			const ETraceCharacterId Id = static_cast<ETraceCharacterId>(IdIndex);
-			if (UTraceCharacterAbilitySet::FindClassFor(Id) == nullptr)
-			{
-				continue;   // an id nothing implements yet is not an illegal pick, it is an absent one
-			}
+			const ETraceAbilityId Ability = static_cast<ETraceAbilityId>(IdIndex);
+			const ETraceLoadoutSlot Home = TraceAbilityTable::SlotOf(Ability);
+
 			for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
 			{
+				const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(SlotIndex);
 				FTraceLoadout One;
-				One.Set(static_cast<ETraceLoadoutSlot>(SlotIndex), Id);
+				One.Set(Slot, Ability);
+
 				FString Reason;
-				if (!UTraceAbilityComponent::IsLoadoutLegal(One, &Reason))
+				const bool bLegal = UTraceAbilityComponent::IsLoadoutLegal(One, &Reason);
+				const bool bWanted = (Slot == Home);
+
+				if (bLegal != bWanted)
 				{
 					++IllegalPairs;
-					UE_LOG(LogTraceGame, Error, TEXT("[LoadoutCombine]   FAIL  %s cannot go in %s — %s"),
-						TraceCharacterIdToString(Id),
-						TraceLoadoutSlotToString(static_cast<ETraceLoadoutSlot>(SlotIndex)), *Reason);
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[LoadoutCombine]   FAIL  %s in the %s slot: %s, expected %s%s%s"),
+						TraceAbilityIdToString(Ability), TraceLoadoutSlotToString(Slot),
+						bLegal ? TEXT("allowed") : TEXT("refused"),
+						bWanted ? TEXT("allowed") : TEXT("refused"),
+						Reason.IsEmpty() ? TEXT("") : TEXT(" — "), *Reason);
 				}
 			}
 		}
@@ -1346,9 +1371,9 @@ namespace TraceLoadoutLock
 
 		// A loadout that is legal but DIFFERENT, so "accepted" and "refused" are distinguishable.
 		FTraceLoadout Wanted;
-		Wanted.Movement  = ETraceCharacterId::Chut;
-		Wanted.Passive   = ETraceCharacterId::Mace;
-		Wanted.Activated = ETraceCharacterId::Elle;
+		Wanted.Movement  = ETraceAbilityId::StickyGloves;
+		Wanted.Passive   = ETraceAbilityId::Magnet;
+		Wanted.Activated = ETraceAbilityId::Snap;
 
 		UE_LOG(LogTraceGame, Display, TEXT("[LoadoutLock] ===== S4: when may a loadout change, and who may shoot? ====="));
 

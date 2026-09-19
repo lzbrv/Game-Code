@@ -1862,9 +1862,9 @@ void FTraceOptionsMenu::RebuildRows()
 				// the other two and this row printed " /  / RIPPLE" — three abilities described by
 				// one. ShortLabel falls back to the opening words of what an ability does.
 				Summary = FString::Printf(TEXT("%s / %s / %s"),
-					*TraceAbilityNames::ShortLabel(Saved.Movement,  ETraceLoadoutSlot::Movement, 22),
-					*TraceAbilityNames::ShortLabel(Saved.Passive,   ETraceLoadoutSlot::Passive, 22),
-					*TraceAbilityNames::ShortLabel(Saved.Activated, ETraceLoadoutSlot::Activated, 22));
+					*TraceAbilityNames::ShortLabel(Saved.Movement, 22),
+					*TraceAbilityNames::ShortLabel(Saved.Passive, 22),
+					*TraceAbilityNames::ShortLabel(Saved.Activated, 22));
 			}
 
 			FRow Row;

@@ -420,7 +420,12 @@ public:
 	 */
 	bool IsKitIn(ETraceCharacterId Id, ETraceLoadoutSlot Slot) const
 	{
-		return Loadout.Get(Slot) == Id && Id != ETraceCharacterId::None;
+		// The ability in that slot, resolved back to the kit that implements it. Asking whether the
+		// slot "is" a kit stopped being a direct comparison when the slot started holding an ability.
+		const ETraceAbilityId Equipped = Loadout.Get(Slot);
+		return Id != ETraceCharacterId::None
+			&& Equipped != ETraceAbilityId::None
+			&& TraceAbilityTable::KitOf(Equipped) == Id;
 	}
 
 	/**

@@ -284,7 +284,160 @@ const TCHAR* TraceLoadoutSlotToString(ETraceLoadoutSlot Slot)
 FString TraceLoadoutToString(const FTraceLoadout& Loadout)
 {
 	return FString::Printf(TEXT("%s/%s/%s"),
-		TraceCharacterIdToString(Loadout.Movement),
-		TraceCharacterIdToString(Loadout.Passive),
-		TraceCharacterIdToString(Loadout.Activated));
+		TraceAbilityIdToString(Loadout.Movement),
+		TraceAbilityIdToString(Loadout.Passive),
+		TraceAbilityIdToString(Loadout.Activated));
+}
+
+// =================================================================================================
+// THE ABILITY TABLE — Demo 35
+//
+// One row per ability. The SLOT column is the definition of what kind of ability it is, so moving
+// one between categories is a one-line edit here and nothing else. Demo 35 moved two (Bash into
+// passive, Acrobatics into movement) and this is where both moves live.
+//
+// The Name column is empty wherever the owner has not named an ability. Two are deliberately blank:
+// Mace's magnet, and Mortimer's dash/throw passive which Demo 35 marks TBD. A third — Oyster's new
+// dash cloak — is blank because the note left its name column empty. Blank is a supported state:
+// the loadout card shows the ability's description instead, which is what every unnamed ability did
+// before anything had names at all.
+// =================================================================================================
+namespace
+{
+	const FTraceAbilityDef GAbilityTable[] =
+	{
+		// ---- movement -------------------------------------------------------------------------
+		{ ETraceAbilityId::JetBoots,       ETraceLoadoutSlot::Movement,  ETraceCharacterId::Rocco,     TEXT("JET BOOTS")       },
+		{ ETraceAbilityId::Suspend,        ETraceLoadoutSlot::Movement,  ETraceCharacterId::Mace,      TEXT("SUSPEND")         },
+		{ ETraceAbilityId::Leech,          ETraceLoadoutSlot::Movement,  ETraceCharacterId::X,         TEXT("LEECH")           },
+		{ ETraceAbilityId::RockJump,       ETraceLoadoutSlot::Movement,  ETraceCharacterId::Roxie,     TEXT("ROCKJUMP")        },
+		{ ETraceAbilityId::CarbonSliders,  ETraceLoadoutSlot::Movement,  ETraceCharacterId::Elle,      TEXT("CARBON SLIDERS")  },
+		{ ETraceAbilityId::StickyGloves,   ETraceLoadoutSlot::Movement,  ETraceCharacterId::Slimeball, TEXT("STICKY GLOVES")   },
+		{ ETraceAbilityId::Blink,          ETraceLoadoutSlot::Movement,  ETraceCharacterId::Mortimer,  TEXT("BLINK")           },
+		{ ETraceAbilityId::Overload,       ETraceLoadoutSlot::Movement,  ETraceCharacterId::Lily,      TEXT("OVERLOAD")        },
+		{ ETraceAbilityId::Acrobatics,     ETraceLoadoutSlot::Movement,  ETraceCharacterId::Lily,      TEXT("ACROBATICS")      },
+
+		// ---- passive --------------------------------------------------------------------------
+		{ ETraceAbilityId::Blasters,       ETraceLoadoutSlot::Passive,   ETraceCharacterId::Rocco,     TEXT("BLASTERS")        },
+		{ ETraceAbilityId::CustomSteel,    ETraceLoadoutSlot::Passive,   ETraceCharacterId::Chut,      TEXT("CUSTOM STEEL")    },
+		{ ETraceAbilityId::Magnet,         ETraceLoadoutSlot::Passive,   ETraceCharacterId::Mace,      TEXT("")                },
+		{ ETraceAbilityId::PickleJar,      ETraceLoadoutSlot::Passive,   ETraceCharacterId::Oyster,    TEXT("PICKLE JAR")      },
+		{ ETraceAbilityId::XMechs,         ETraceLoadoutSlot::Passive,   ETraceCharacterId::X,         TEXT("X-MECHS")         },
+		{ ETraceAbilityId::Shimmer,        ETraceLoadoutSlot::Passive,   ETraceCharacterId::Elle,      TEXT("SHIMMER")         },
+		{ ETraceAbilityId::VistechPadding, ETraceLoadoutSlot::Passive,   ETraceCharacterId::Slimeball, TEXT("VISTECH PADDING") },
+		{ ETraceAbilityId::MortimerLoad,   ETraceLoadoutSlot::Passive,   ETraceCharacterId::Mortimer,  TEXT("")                },
+		{ ETraceAbilityId::Bash,           ETraceLoadoutSlot::Passive,   ETraceCharacterId::Chut,      TEXT("BASH")            },
+		{ ETraceAbilityId::DashCloak,      ETraceLoadoutSlot::Passive,   ETraceCharacterId::Oyster,    TEXT("")                },
+
+		// ---- activated ------------------------------------------------------------------------
+		{ ETraceAbilityId::Ripple,         ETraceLoadoutSlot::Activated, ETraceCharacterId::Rocco,     TEXT("RIPPLE")          },
+		{ ETraceAbilityId::Chud,           ETraceLoadoutSlot::Activated, ETraceCharacterId::Chut,      TEXT("CHUD")            },
+		{ ETraceAbilityId::Spike,          ETraceLoadoutSlot::Activated, ETraceCharacterId::Mace,      TEXT("SPIKE")           },
+		{ ETraceAbilityId::Pickler,        ETraceLoadoutSlot::Activated, ETraceCharacterId::Oyster,    TEXT("PICKLER")         },
+		{ ETraceAbilityId::Sting,          ETraceLoadoutSlot::Activated, ETraceCharacterId::X,         TEXT("STING")           },
+		{ ETraceAbilityId::Modded,         ETraceLoadoutSlot::Activated, ETraceCharacterId::Roxie,     TEXT("MODDED")          },
+		{ ETraceAbilityId::Snap,           ETraceLoadoutSlot::Activated, ETraceCharacterId::Elle,      TEXT("SNAP")            },
+		{ ETraceAbilityId::Slimewall,      ETraceLoadoutSlot::Activated, ETraceCharacterId::Slimeball, TEXT("SLIMEWALL")       },
+		{ ETraceAbilityId::Quake,          ETraceLoadoutSlot::Activated, ETraceCharacterId::Mortimer,  TEXT("QUAKE")           },
+		{ ETraceAbilityId::Zip,            ETraceLoadoutSlot::Activated, ETraceCharacterId::Lily,      TEXT("ZIP")             },
+	};
+
+	// THE GUARD THAT SHOUTS. Demo 35 removed three abilities and added two; the next pass will move
+	// more. A row missing from this table is an ability nobody can pick, with no error anywhere — so
+	// the count is asserted against the enum instead of trusted.
+	static_assert(UE_ARRAY_COUNT(GAbilityTable) == static_cast<int32>(ETraceAbilityId::Count) - 1,
+		"Every ETraceAbilityId except None needs a row in GAbilityTable.");
+}
+
+const TCHAR* TraceAbilityIdToString(ETraceAbilityId Id)
+{
+	if (Id == ETraceAbilityId::None)
+	{
+		return TEXT("None");
+	}
+	if (const FTraceAbilityDef* Def = TraceAbilityTable::Find(Id))
+	{
+		// The display name where there is one; otherwise the enum's own name, so a log line about an
+		// unnamed ability still says which ability rather than "<invalid>".
+		if (Def->Name != nullptr && Def->Name[0] != TEXT('\0'))
+		{
+			return Def->Name;
+		}
+	}
+
+	switch (Id)
+	{
+	case ETraceAbilityId::Magnet:       return TEXT("Magnet");
+	case ETraceAbilityId::MortimerLoad: return TEXT("MortimerLoad");
+	case ETraceAbilityId::DashCloak:    return TEXT("DashCloak");
+	default:                            return TEXT("<invalid>");
+	}
+}
+
+namespace TraceAbilityTable
+{
+	const FTraceAbilityDef* Find(ETraceAbilityId Id)
+	{
+		for (const FTraceAbilityDef& Def : GAbilityTable)
+		{
+			if (Def.Id == Id)
+			{
+				return &Def;
+			}
+		}
+		return nullptr;
+	}
+
+	void AllForSlot(ETraceLoadoutSlot Slot, TArray<ETraceAbilityId>& Out)
+	{
+		Out.Reset();
+		for (const FTraceAbilityDef& Def : GAbilityTable)
+		{
+			if (Def.Slot == Slot)
+			{
+				Out.Add(Def.Id);
+			}
+		}
+	}
+
+	ETraceLoadoutSlot SlotOf(ETraceAbilityId Id)
+	{
+		const FTraceAbilityDef* Def = Find(Id);
+		return (Def != nullptr) ? Def->Slot : ETraceLoadoutSlot::Count;
+	}
+
+	ETraceCharacterId KitOf(ETraceAbilityId Id)
+	{
+		const FTraceAbilityDef* Def = Find(Id);
+		return (Def != nullptr) ? Def->Kit : ETraceCharacterId::None;
+	}
+}
+
+FTraceLoadout FTraceLoadout::Uniform(ETraceCharacterId Kit)
+{
+	// WALKS THE TABLE RATHER THAN ASSUMING ONE ABILITY PER SLOT. Before Demo 35 every kit had exactly
+	// one of each and this could have been three lookups; now Chut has two passives and no movement,
+	// and Lily two movement abilities and no passive. The FIRST ability a kit offers for a slot wins,
+	// which is arbitrary only where a kit has two — and in both of those cases either is a legitimate
+	// "this character, as they were", which is all this function promises.
+	FTraceLoadout Out;
+	if (Kit == ETraceCharacterId::None)
+	{
+		return Out;
+	}
+
+	for (int32 Index = 0; Index < static_cast<int32>(ETraceAbilityId::Count); ++Index)
+	{
+		const ETraceAbilityId Id = static_cast<ETraceAbilityId>(Index);
+		const FTraceAbilityDef* Def = TraceAbilityTable::Find(Id);
+		if (Def == nullptr || Def->Kit != Kit)
+		{
+			continue;
+		}
+		if (Out.Get(Def->Slot) == ETraceAbilityId::None)
+		{
+			Out.Set(Def->Slot, Id);
+		}
+	}
+	return Out;
 }

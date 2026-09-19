@@ -104,7 +104,7 @@ struct TRACE_API FTraceLoadoutSelect
 		float InViewW, float InViewH, float InUIScale, float InNow, bool bInputAllowed);
 
 	// ---- test seams -----------------------------------------------------------------------------
-	void DebugPick(ETraceLoadoutSlot Slot, ETraceCharacterId Id);
+	void DebugPick(ETraceLoadoutSlot Slot, ETraceAbilityId Id);
 	void DebugConfirm(ATracePlayerState* LocalState);
 	void DebugRecall(int32 Index);
 	void DebugStore(int32 Index);

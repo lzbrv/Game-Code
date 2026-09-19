@@ -1594,6 +1594,10 @@ void UTraceUserSettings::ClearKey(ETraceInputAction Action, int32 Slot)
 
 void UTraceUserSettings::RefreshFromConfig()
 {
+	// BEFORE ANYTHING READS THEM. A saved loadout written in an older vocabulary is three in-range,
+	// wrong ability ids; discarding is the only safe reading. See DiscardSavedLoadoutsIfStale.
+	DiscardSavedLoadoutsIfStale();
+
 	const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
 
 	Bindings.Reset();
@@ -1771,6 +1775,30 @@ bool UTraceUserSettings::IsAtDefaults() const
 // =================================================================================================
 // Saved loadouts
 // =================================================================================================
+
+void UTraceUserSettings::DiscardSavedLoadoutsIfStale()
+{
+	if (SavedLoadoutVersion == CurrentSavedLoadoutVersion)
+	{
+		return;
+	}
+
+	// A file written in an older vocabulary. The values are all in range and all wrong, which is the
+	// dangerous shape — so they go, once, loudly enough to explain the empty slots.
+	const int32 Had = SavedLoadouts.Num();
+	SavedLoadouts.Reset();
+	SavedLoadoutNames.Reset();
+	SavedLoadoutVersion = CurrentSavedLoadoutVersion;
+
+	if (Had > 0)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Loadout] Discarded %d saved loadout(s) written before Demo 35. A saved slot used to "
+			     "hold a character and now holds an ability, so the old numbers name different "
+			     "abilities entirely. Rebuild them on the loadout page."), Had);
+	}
+	Save();
+}
 
 FTraceLoadout UTraceUserSettings::GetSavedLoadout(int32 Index) const
 {

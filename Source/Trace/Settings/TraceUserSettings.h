@@ -533,6 +533,12 @@ public:
 	static constexpr int32 SavedLoadoutCount = 5;
 
 	/** Slot @p Index, or an empty loadout if the index is out of range or was never filled. */
+	/**
+	 * Throws away saved loadouts written before the current vocabulary. Safe to call repeatedly.
+	 * Called once from Get() on first use, beside the other load-time repairs.
+	 */
+	void DiscardSavedLoadoutsIfStale();
+
 	FTraceLoadout GetSavedLoadout(int32 Index) const;
 
 	/** Writes slot @p Index and persists immediately — a saved loadout the game forgets is a bug. */
@@ -593,6 +599,25 @@ public:
 
 	UPROPERTY(config)
 	TArray<FString> SavedLoadoutNames;
+
+	/**
+	 * What the numbers in SavedLoadouts MEAN.
+	 *
+	 * *** A SAVED LOADOUT IS A LIST OF ENUM VALUES ON DISK, SO ITS MEANING CAN CHANGE UNDER IT. ***
+	 * Demo 35 did exactly that: a slot used to hold an ETraceCharacterId and now holds an
+	 * ETraceAbilityId, so a file written before the change reads back as three unrelated abilities —
+	 * silently, because every byte is still in range. A player's saved "Mace build" would quietly
+	 * become something nobody designed.
+	 *
+	 * So the file says which vocabulary it was written in, and a mismatch discards the slots rather
+	 * than reinterpreting them. Losing five saved loadouts once is a small, visible cost; loading a
+	 * loadout that is not the one you saved is neither.
+	 */
+	UPROPERTY(config)
+	int32 SavedLoadoutVersion = 0;
+
+	/** Bumped whenever the meaning of a saved slot changes. 1 = ability ids (Demo 35). */
+	static constexpr int32 CurrentSavedLoadoutVersion = 1;
 
 	/**
 	 * Extra multiplier applied to the VERTICAL axis only, on top of MouseSensitivity.

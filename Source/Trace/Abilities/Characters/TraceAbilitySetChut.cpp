@@ -493,7 +493,7 @@ bool UTraceAbilitySetChut::OnDashStarted(const FVector& DashDirection)
 	// SLOT GUARD — the bash, which is Chut's MOVEMENT line.
 	// Equipped in another slot, this kit must not run this body: an ability you did not pick
 	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
-	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	if (!IsAbility(ETraceAbilityId::Bash))
 	{
 		return false;
 	}
@@ -511,7 +511,7 @@ void UTraceAbilitySetChut::OnDashEnded(bool bReachedFullDistance)
 	// SLOT GUARD — the bash lands at the END of the dash, so this is the same MOVEMENT ability as the start.
 	// Equipped in another slot, this kit must not run this body: an ability you did not pick
 	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
-	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	if (!IsAbility(ETraceAbilityId::Bash))
 	{
 		return;
 	}
@@ -524,7 +524,7 @@ void UTraceAbilitySetChut::OnDashHitCharacter(ATraceCharacter* Other, float Dash
 	// SLOT GUARD — the bash's actual effect on the player it hit.
 	// Equipped in another slot, this kit must not run this body: an ability you did not pick
 	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
-	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	if (!IsAbility(ETraceAbilityId::Bash))
 	{
 		return;
 	}
@@ -541,7 +541,7 @@ float UTraceAbilitySetChut::GetDashHitSweepRadius() const
 	// SLOT GUARD — the sweep exists only to find a bash target, and the bash is MOVEMENT.
 	// Equipped in another slot, this kit must not run this body: an ability you did not pick
 	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
-	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	if (!IsAbility(ETraceAbilityId::Bash))
 	{
 		return 0.f;
 	}
