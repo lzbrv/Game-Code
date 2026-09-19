@@ -496,6 +496,22 @@ public:
 	 */
 	virtual void TickAbilities(float DeltaSeconds) override;
 
+	// ---- BLINK — Mortimer's movement ability since Demo 35, replacing the mantle ----------------
+	//
+	// "Hold V for .25s to teleport directly upwards, twice the height of a jump."
+	//
+	// A HOLD, NOT A PRESS, which is why it needs three hooks rather than one: V going down starts a
+	// clock, V coming up before it expires cancels, and the tick is what fires it. Cancelling on
+	// release is the whole feel of it — a tap does nothing and costs nothing.
+	virtual bool OnSecondaryPressed() override;
+	virtual void OnSecondaryReleased() override;
+
+	/** True while V is held and the charge has not yet fired. */
+	bool IsBlinkCharging() const { return BlinkHeldSeconds >= 0.f; }
+
+	/** Advances the hold and fires the teleport. Driven from TickAbilities. */
+	void TickBlink(float DeltaSeconds);
+
 	/** Cancels a mantle in flight. */
 	virtual void OnPawnDied() override;
 	virtual void OnUnequipped() override;
@@ -670,4 +686,11 @@ private:
 
 	/** Clears the five members above. One place, so an abandon and a completion cannot diverge. */
 	void ClearMantle();
+
+	/**
+	 * Seconds V has been held, or -1 when it is not. -1 rather than 0 because 0 is a legitimate
+	 * "held for no time yet" on the frame of the press, and the two must not be confused.
+	 */
+	float BlinkHeldSeconds = -1.f;
+
 };

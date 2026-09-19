@@ -6389,6 +6389,43 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Lily", meta = (DisplayName = "Extra Dash Charges (ON TOP of everyone's pool) [v19 §3]", ClampMin = "0", ClampMax = "5", UIMin = "0", UIMax = "2"))
 	int32 LilyExtraDashCharges = 1;
 
+	/** Seconds V must be held before BLINK fires. [Demo 35: "Hold V for .25s"] */
+	UPROPERTY(config)
+	float MortimerBlinkHoldSeconds = 0.25f;
+
+	/** How many jump-apexes BLINK rises. [Demo 35: "twice the height of a jump"] */
+	UPROPERTY(config)
+	float MortimerBlinkJumpHeights = 2.f;
+
+	/**
+	 * How soon after a dash a jump still counts as "directly following" it. [Demo 35]
+	 *
+	 * A WINDOW, NOT A FLAG. "Directly following a dash" has to be measured from the end of the dash,
+	 * because a flag would need clearing and every path that forgot would hand out a free cloak on
+	 * the next jump of the match.
+	 */
+	UPROPERTY(config)
+	float OysterDashCloakWindowSeconds = 0.35f;
+
+	/** How long the dash cloak lasts. [Demo 35: "CLOAKS YOU FOR 1s"] */
+	UPROPERTY(config)
+	float OysterDashCloakDurationSeconds = 1.f;
+
+
+	/**
+	 * How much longer the EXTRA dash charge takes to refill than a normal one. [Demo 35]
+	 *
+	 * "THE SECOND DASH RECHARGES AT 50% OF THE RECHARGE RATE" — half the RATE is twice the TIME, so
+	 * the shipped value is 2.0 and the knob is a multiplier on the window rather than on the rate.
+	 * Writing it the other way round is the +25%-distance/+65.8%-actual mistake this project already
+	 * shipped once on Chut's bash, and once on Roxie's jump.
+	 *
+	 * Floored at 1 in the component: a value below 1 would make the bonus charge refill FASTER than
+	 * a normal one, which is the opposite of what the note asks for.
+	 */
+	UPROPERTY(config)
+	float LilyExtraDashRechargeScale = 2.f;
+
 	/**
 	 * HER MAX HEALTH. §3: "she has only 60 health", against UTraceSettings::MaxHealth's 100.
 	 *

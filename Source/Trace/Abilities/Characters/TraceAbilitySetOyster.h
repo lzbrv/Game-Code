@@ -210,4 +210,29 @@ private:
 
 	/** Server. Mirrors the jar count into the replicated scratch pad for the HUD. */
 	void PublishState();
+
+	// ---- THE DASH CLOAK — Oyster's passive since Demo 35, replacing the jar jump ----------------
+	//
+	// "JUMPING DIRECTLY FOLLOWING A DASH CLOAKS YOU FOR 1S."
+	//
+	// Two facts and a deadline. DashEndedMatchTime is when the last dash finished, so "directly
+	// following" is a window measured from it rather than a flag that something else has to clear;
+	// CloakEndMatchTime is when the cloak stops. Both on the match clock, like every other ability
+	// timer in this project, so they survive a respawn the same way.
+
+	/** When the last dash ended, or 0. The window "directly following a dash" is measured from it. */
+	float DashEndedMatchTime = 0.f;
+
+	/** When the current dash cloak expires, or 0 for "not cloaked". */
+	float CloakEndMatchTime = 0.f;
+
+	/** What the cloak look was last set to, so the material work happens on edges only. */
+	bool bCloakVisualApplied = false;
+
+	/** Starts the cloak if this jump followed a dash closely enough. Called from OnJumpPressed. */
+	void TryDashCloak();
+
+	/** Expires the cloak and keeps the visual in step. Called from TickAbilities. */
+	void TickDashCloak();
+
 };
