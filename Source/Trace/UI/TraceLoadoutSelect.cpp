@@ -19,6 +19,7 @@
 #include "UI/TraceAbilityNames.h"
 #include "UI/Text/TraceCanvasText.h"
 #include "UI/Text/TraceText.h"
+#include "UI/Text/TraceTextWeight.h"
 #include "UI/Text/TraceGameText.h"
 
 namespace
@@ -819,8 +820,28 @@ void FTraceLoadoutSelect::DrawCard(AHUD* HUD, int32 Index, float X, float Y, flo
 	const FString Name = TraceAbilityNames::Get(Id);
 	if (!Name.IsEmpty())
 	{
-		TraceCanvasText::DrawBold(HUD, Name, TextX, TextY, SizeName * S,
+		// SHRINK A LONG NAME TO FIT RATHER THAN LET IT RUN OFF THE CARD. Demo 35 named the abilities
+		// and two of them — CARBON SLIDERS, STICKY GLOVES — are wider than a fifth of the screen at
+		// the display size, so they were drawn clipped mid-word. Scaling is the right answer over
+		// wrapping here: a name is one thing and reads as one line, and the sizes stay close enough
+		// that the grid still looks like a grid.
+		// MEASURED IN THE CUT IT IS DRAWN IN. TraceText's own note is blunt about this and it caught
+		// me anyway: the bold sheet is wider than the light one at the same size, so measuring with
+		// the default weight under-reads and a name that "fits" still runs off the card. STICKY
+		// GLOVES was clipped by exactly that.
+		const float NameSize = SizeName * S;
+		TraceText::FStyle NameStyle(NameSize, FLinearColor::White);
+		NameStyle.Weight = ETraceTextWeight::Bold;
+		const float Measured = TraceText::MeasureWidth(Name, NameStyle);
+		const float Fitted = (Measured > TextW && Measured > 0.f)
+			? NameSize * (TextW / Measured)
+			: NameSize;
+
+		TraceCanvasText::DrawBold(HUD, Name, TextX, TextY, Fitted,
 			bEquipped ? Good : (bHighlighted ? Ink : InkSoft));
+
+		// The row advances by the FULL size even when the name was shrunk, so every card's
+		// description starts on the same line and the grid stays aligned.
 		TextY += (SizeName + 8.f) * S;
 	}
 
