@@ -3152,10 +3152,13 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 	uint8 ActivatedKitId = CharacterId;
 	if (const UTraceAbilityComponent* Abilities = LocalPS->FindComponentByClass<UTraceAbilityComponent>())
 	{
-		const ETraceCharacterId Equipped = Abilities->GetLoadout().Get(ETraceLoadoutSlot::Activated);
-		if (Equipped != ETraceCharacterId::None)
+		// The equipped ABILITY, then the kit behind it — the roster row (and so the accent colour and
+		// the E name) is still keyed by kit.
+		const ETraceAbilityId Equipped = Abilities->GetLoadout().Get(ETraceLoadoutSlot::Activated);
+		const ETraceCharacterId EquippedKit = TraceAbilityTable::KitOf(Equipped);
+		if (EquippedKit != ETraceCharacterId::None)
 		{
-			ActivatedKitId = static_cast<uint8>(Equipped);
+			ActivatedKitId = static_cast<uint8>(EquippedKit);
 		}
 	}
 

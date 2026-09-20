@@ -653,8 +653,8 @@ bool UTraceAbilityComponent::ServerRequestSetLoadout_Validate(FTraceLoadout NewL
 	// would turn a lost race into a disconnect.
 	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
 	{
-		const ETraceCharacterId Id = NewLoadout.Get(static_cast<ETraceLoadoutSlot>(Index));
-		if (static_cast<uint8>(Id) >= static_cast<uint8>(ETraceCharacterId::Count))
+		const ETraceAbilityId Id = NewLoadout.Get(static_cast<ETraceLoadoutSlot>(Index));
+		if (static_cast<uint8>(Id) >= static_cast<uint8>(ETraceAbilityId::Count))
 		{
 			return false;
 		}
@@ -1891,44 +1891,59 @@ bool UTraceAbilityComponent::IsLoadoutChangeOpen() const
 
 bool UTraceAbilityComponent::IsLoadoutLegal(const FTraceLoadout& InLoadout, FString* OutReason)
 {
-	// EMPTY IS LEGAL. That is the Mannequin — no kit, no abilities — and it is a real state the game
-	// already ships, not a malformed pick.
+	// EMPTY IS LEGAL. That is the Mannequin — no abilities at all — and it is a real state the game
+	// ships, not a malformed pick.
 	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
 	{
 		const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(Index);
-		const ETraceCharacterId Id = InLoadout.Get(Slot);
-		if (Id == ETraceCharacterId::None)
+		const ETraceAbilityId Id = InLoadout.Get(Slot);
+		if (Id == ETraceAbilityId::None)
 		{
 			continue;
 		}
 
-		UClass* SetClass = UTraceCharacterAbilitySet::FindClassFor(Id);
-		const UTraceCharacterAbilitySet* CDO =
-			(SetClass != nullptr) ? SetClass->GetDefaultObject<UTraceCharacterAbilitySet>() : nullptr;
-		if (CDO == nullptr)
+		// *** THE TABLE DECIDES, NOT THE KIT. ***
+		//
+		// This used to ask the kit's class-default whether it served the slot, which worked while a
+		// slot held a KIT. An ability belongs to exactly one slot now and the table says which, so
+		// the only question left is whether the player put it in that slot. Asking the kit here after
+		// Demo 35 answered "no" for all twenty-nine abilities, because the CDO has no abilities
+		// equipped and therefore fills no slots — every loadout in the game was refused.
+		const FTraceAbilityDef* Def = TraceAbilityTable::Find(Id);
+		if (Def == nullptr)
 		{
 			if (OutReason != nullptr)
 			{
-				*OutReason = FString::Printf(TEXT("no ability set for %s"), TraceCharacterIdToString(Id));
+				*OutReason = FString::Printf(TEXT("%s is not in the ability table"), TraceAbilityIdToString(Id));
 			}
 			return false;
 		}
 
-		// THE REAL CHECK. A kit serves the slots its abilities are written for. Asking Rocco's kit for
-		// a passive when it has no passive would build an instance that answers no hook — an ability
-		// that is equipped and does nothing, which reads to a player as a bug in the ability.
-		if (!CDO->IsSlot(Slot))
+		if (Def->Slot != Slot)
 		{
 			if (OutReason != nullptr)
 			{
-				*OutReason = FString::Printf(TEXT("%s has no %s ability"),
-					TraceCharacterIdToString(Id), TraceLoadoutSlotToString(Slot));
+				*OutReason = FString::Printf(TEXT("%s is a %s ability, not a %s one"),
+					TraceAbilityIdToString(Id), TraceLoadoutSlotToString(Def->Slot),
+					TraceLoadoutSlotToString(Slot));
+			}
+			return false;
+		}
+
+		// ...and something has to implement it. An id with no kit class is an ability that is
+		// designed but not built, which must not be pickable.
+		if (UTraceCharacterAbilitySet::FindClassFor(Def->Kit) == nullptr)
+		{
+			if (OutReason != nullptr)
+			{
+				*OutReason = FString::Printf(TEXT("nothing implements %s"), TraceAbilityIdToString(Id));
 			}
 			return false;
 		}
 	}
 	return true;
 }
+
 
 bool UTraceAbilityComponent::ServerSetLoadout(const FTraceLoadout& InLoadout)
 {
@@ -2028,27 +2043,29 @@ void UTraceAbilityComponent::ApplyLoadout(const FTraceLoadout& InLoadout)
 	{
 		UClass* Class = nullptr;
 		ETraceLoadoutSlot PrimarySlot = ETraceLoadoutSlot::Movement;
-		uint8 Mask = 0;
+
+		/** Bit per ETraceAbilityId — WHICH of this kit's abilities were picked, not just which slots. */
+		uint32 AbilityMask = 0;
 	};
 	TArray<FPending, TInlineAllocator<3>> Pending;
 
 	for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
 	{
 		const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(SlotIndex);
-		const ETraceCharacterId Id = Loadout.Get(Slot);
-		if (Id == ETraceCharacterId::None)
+		const ETraceAbilityId Id = Loadout.Get(Slot);
+		if (Id == ETraceAbilityId::None)
 		{
 			continue;   // an empty slot is legal: the characterless Mannequin, and a player mid-pick
 		}
 
-		UClass* SetClass = UTraceCharacterAbilitySet::FindClassFor(Id);
+		UClass* SetClass = UTraceCharacterAbilitySet::FindClassFor(TraceAbilityTable::KitOf(Id));
 		if (SetClass == nullptr)
 		{
 			// Same non-error the single-kit path logged: the id is real, nothing implements it yet.
 			UE_LOG(LogTraceGame, Log,
 				TEXT("[Ability] %s wants %s in the %s slot, but no UTraceCharacterAbilitySet subclass "
 				     "claims that id — that slot is empty."),
-				*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(Id),
+				*GetNameSafe(GetOwningPlayerState()), TraceAbilityIdToString(Id),
 				TraceLoadoutSlotToString(Slot));
 			continue;
 		}
@@ -2061,11 +2078,13 @@ void UTraceAbilityComponent::ApplyLoadout(const FTraceLoadout& InLoadout)
 			FPending& Added = Pending.AddDefaulted_GetRef();
 			Added.Class = SetClass;
 			Added.PrimarySlot = Slot;
-			Added.Mask = static_cast<uint8>(1u << SlotIndex);
+			Added.AbilityMask = (1u << static_cast<uint32>(Id));
 		}
 		else
 		{
-			Found->Mask |= static_cast<uint8>(1u << SlotIndex);
+			// TWO ABILITIES FROM ONE KIT, which Demo 35 made real: picking Chut's knife AND his bash
+			// is one instance with two bits, not two instances. The bits say which bodies may run.
+			Found->AbilityMask |= (1u << static_cast<uint32>(Id));
 
 			// *** THE HIGHEST SLOT A KIT OWNS IS THE SLOT ITS STATE LIVES IN, AND IT MUST BE. ***
 			//
@@ -2090,12 +2109,16 @@ void UTraceAbilityComponent::ApplyLoadout(const FTraceLoadout& InLoadout)
 	for (const FPending& Entry : Pending)
 	{
 		UTraceCharacterAbilitySet* Set = NewObject<UTraceCharacterAbilitySet>(this, Entry.Class);
-		Set->Initialize(this, Entry.PrimarySlot, Entry.Mask);
+		Set->Initialize(this, Entry.PrimarySlot, Entry.AbilityMask);
 
 		const int32 SetIndex = EquippedSets.Add(Set);
 		for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
 		{
-			if ((Entry.Mask & (1u << SlotIndex)) != 0)
+			// Which SLOTS this instance answers for, derived from the abilities it was given.
+			const ETraceLoadoutSlot ThisSlot = static_cast<ETraceLoadoutSlot>(SlotIndex);
+			const ETraceAbilityId Equipped = Loadout.Get(ThisSlot);
+			if (Equipped != ETraceAbilityId::None
+				&& (Entry.AbilityMask & (1u << static_cast<uint32>(Equipped))) != 0)
 			{
 				SetIndexBySlot[SlotIndex] = SetIndex;
 			}

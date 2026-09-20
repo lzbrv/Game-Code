@@ -123,7 +123,7 @@ namespace TraceCharacterRosterFile
 		{
 			{
 				1, TEXT("ROCCO"),
-				TEXT("A VERY SMALL SECOND JUMP. THE POINT IS THE INSTANT MIDAIR DIRECTION CHANGE, NOT THE HEIGHT."),
+				TEXT("A SMALL SECOND JUMP."),
 				// SPEC v24 §11 MADE "1S" UNTRUE — RoccoHeadshotSpeedDurationSeconds is 3 now
 				// (TraceSettings.h + Config/DefaultGame.ini). Only the number moved: the stacking and
 				// the "each kill extends the whole boost" rule are the same sentence they were.
@@ -162,8 +162,7 @@ namespace TraceCharacterRosterFile
 			// ---------------------------------------------------------------------------------
 			{
 				2, TEXT("CHUT"),
-				TEXT("BASH. HITTING A PLAYER WITH THE END OF A STANDARD DASH KNOCKS THEM ALONG YOUR TRAVEL. "
-				     "NO EFFECT ON THE CORE CARRIER."),
+				TEXT("BASH PLAYERS WITH THE END OF YOUR DASH. NO EFFECT ON THE CORE CARRIER."),
 				TEXT("KNIFE DEALS 50 FROM THE FRONT INSTEAD OF 30. THE 60 DEGREE BACK ZONE STAYS AT 100."),
 				TEXT("CHUD"),
 				TEXT("TAKE 30% LESS DAMAGE FROM BODY SHOTS AND MELEES FOR 10S. A KNIFE KILL REFRESHES THE "
@@ -182,7 +181,7 @@ namespace TraceCharacterRosterFile
 				3, TEXT("MACE"),
 				TEXT("HOLD V IN THE AIR TO SUSPEND FOR UP TO 1.25S. NO GRAVITY, LATERAL MOVE CAPPED AT 550. "
 				     "RELEASING V CANCELS INSTANTLY."),
-				TEXT("+30% CORE MAGNET RADIUS. THE BASE IS 450, SO YOURS IS 585."),
+				TEXT("+30% CORE MAGNET RADIUS."),
 				TEXT("SPIKE"),
 				TEXT("THROW A ROPED SPIKE. IT EMBEDS IN A WALL FOR 2S; PRESS AGAIN TO BE PULLED TO IT AT THE "
 				     "MOMENTUM CEILING. ANY MOVEMENT INPUT CANCELS. YOU CAN SHOOT AND BE SHOT WHILE PULLED."),
@@ -198,7 +197,7 @@ namespace TraceCharacterRosterFile
 			},
 			{
 				4, TEXT("OYSTER"),
-				TEXT("JUMPING WHILE STOOD ON ONE OF YOUR OWN JARS BREAKS IT AND BOOSTS YOU UPWARD."),
+				TEXT("JUMPING DIRECTLY FOLLOWING A DASH CLOAKS YOU FOR 1S."),
 				// SPEC v26 §6a. The refund is a POISON rule, not a Pickler rule — a dash jar an enemy
 				// walks into pays it too — so it is stated on the line that describes the poison and
 				// only cross-referenced from the Pickler line below. A card that hid it under PICKLER
@@ -274,7 +273,12 @@ namespace TraceCharacterRosterFile
 				6, TEXT("ROXIE"),
 				TEXT("V FIRES A WOBBLING ROCKET THAT THROWS YOU BACKWARDS, FAST AND FAR. IT IS HARD TO "
 				     "AIM AND DEALS 100 ANYWHERE IT HITS. 35S COOLDOWN."),
-				TEXT("JUMPS 15% HIGHER THAN EVERYONE ELSE."),
+				// DEMO 35 REMOVED ROXIE'S JUMP PASSIVE. The row keeps a non-empty line because an empty
+				// description makes the ASSET unusable, and the roster is all-or-none: one bad asset
+				// drops every character back to this table. Nothing displays this string — the loadout
+				// screen reads by ABILITY and there is no ability row for a Roxie passive — so it says
+				// what is true rather than describing an ability that is gone.
+				TEXT("NO PASSIVE."),
 				TEXT("MODDED"),
 				TEXT("LOAD A MODDED CLIP: THE GUN GOES FULL AUTO AND FIRES 1.65X FASTER. ENDS AFTER ONE "
 				     "CLIP OR 5S, WHICHEVER COMES FIRST."),
@@ -364,8 +368,7 @@ namespace TraceCharacterRosterFile
 			// ---------------------------------------------------------------------------------
 			{
 				9, TEXT("MORTIMER"),
-				TEXT("MANTLE. THE ONLY WAY TO PULL YOURSELF UP ONTO A LEDGE OR THE TOP OF AN OBJECT, AND "
-				     "THE REACH AND HEIGHT WINDOW ARE 30% MORE GENEROUS THAN THE OLD IN-GAME MANTLE."),
+				TEXT("HOLD V FOR 0.25S TO TELEPORT DIRECTLY UPWARDS, TWICE THE HEIGHT OF A JUMP."),
 				// DEMO 20 ITEM 2 MADE THIS STRING UNTRUE AND THEN INCREASED THE COOLDOWN TOO, so both
 				// halves are stated here. MortimerDashDistanceScale is 0.40 and MortimerDashCooldownScale
 				// is 1.25 (TraceSettings.h + Config/DefaultGame.ini); measured live by
@@ -401,11 +404,12 @@ namespace TraceCharacterRosterFile
 				// than no card, and these are the only two edits: the layout, the colour and every other
 				// character's rows are untouched.
 				10, TEXT("LILY"),
-				TEXT("ONE EXTRA DASH CHARGE, BUT ONLY WHILE NOT CARRYING THE CORE: TWO EITHER WAY."),
-				TEXT("WALL JUMPS CARRY 30% MORE MOMENTUM THAN ANYONE ELSE'S. ALSO THE FRAILEST LOADOUT "
-				     "IN THE GAME AT 60 HEALTH INSTEAD OF 100."),
+				TEXT("ONE EXTRA DASH CHARGE, BUT NOT WHILE CARRYING THE CORE. THE SECOND DASH RECHARGES "
+				     "AT 50% OF THE RECHARGE RATE."),
+				TEXT("WALL JUMPS CARRY 30% MORE MOMENTUM THAN ANYONE ELSE'S."),
 				TEXT("ZIP"),
-				TEXT("FLY FOR 5S. JUMP CLIMBS AND CROUCH DESCENDS, BOTH AT HALF WALKING SPEED, AND "
+				TEXT("WHILE EQUIPPED YOU HAVE 60 HEALTH INSTEAD OF 100. FLY FOR 5S. JUMP CLIMBS AND "
+				     "CROUCH DESCENDS, BOTH AT HALF WALKING SPEED, AND "
 				     "EVERYTHING ELSE PLAYS AS NORMAL. CARRYING THE CORE HALVES IT - AND PICKING THE "
 				     "CORE UP MID-FLIGHT HALVES WHATEVER IS LEFT."),
 				30.f,

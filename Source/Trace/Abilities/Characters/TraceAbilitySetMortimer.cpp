@@ -762,6 +762,18 @@ float UTraceAbilitySetMortimer::GetThrowChargePastFullScale() const
 	return FMath::Clamp(UTraceSettings::Get().MortimerThrowChargePastFullScale, 0.f, 1.f);
 }
 
+// DEMO 35 RETIRED THE MANTLE, and this is the switch that says so rather than a deleted function.
+//
+// BLINK replaced it as Mortimer's movement ability. With this at 0 (shipped) OnJumpPressed never
+// reaches TryMantle, so the mantle cannot run under Blink's name; with it at 1 the old ability comes
+// back, which is how the two get compared in a playtest without a build.
+static TAutoConsoleVariable<int32> CVarMortimerLegacyMantle(
+	TEXT("Trace.Demo35.LegacyMantle"),
+	0,
+	TEXT("0 (shipped, Demo 35): the mantle is retired and BLINK is Mortimer's movement ability.\n")
+	TEXT("1: restore the mantle. For comparing the two; it is not pickable either way."),
+	ECVF_Default);
+
 bool UTraceAbilitySetMortimer::AllowsMantle() const
 {
 	return UTraceSettings::Get().bMortimerCanMantle;
@@ -1168,7 +1180,18 @@ bool UTraceAbilitySetMortimer::OnJumpPressed()
 	// SLOT GUARD — the mantle, which is Mortimer's MOVEMENT line word for word.
 	// Equipped in another slot, this kit must not run this body: an ability you did not pick
 	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
-	if (!IsSlot(ETraceLoadoutSlot::Movement))
+	// *** MANTLE WAS REPLACED BY BLINK IN DEMO 35, so this body never runs. ***
+	//
+	// The guard used to read IsSlot(Movement), which was correct while Mortimer's one movement
+	// ability WAS the mantle. His movement ability is BLINK now, so that guard would be TRUE whenever
+	// Blink is equipped and the mantle would run in its place — a second movement ability nobody
+	// picked, with nothing on screen to explain it.
+	//
+	// Returned false outright rather than guarded on a retired id: there is no ETraceAbilityId for
+	// the mantle, because an ability that cannot be picked has no row in the table. The body is left
+	// standing because the note says "replaced", not "deleted", and the reach/height maths here is
+	// the part a future mantle would want back.
+	if (CVarMortimerLegacyMantle.GetValueOnAnyThread() == 0)
 	{
 		return false;
 	}
@@ -1179,8 +1202,100 @@ bool UTraceAbilitySetMortimer::OnJumpPressed()
 	return TryMantle();
 }
 
-void UTraceAbilitySetMortimer::TickAbilities(float /*DeltaSeconds*/)
+// =================================================================================================
+// BLINK — Demo 35's replacement for the mantle
+//
+// "Hold V for .25s to teleport directly upwards, twice the height of a jump."
+//
+// A TELEPORT, NOT A LAUNCH. The note says teleport, and the difference is the whole ability: a
+// launch leaves you rising with velocity to spend and can be aimed by strafing, while a teleport
+// puts you exactly one height up with whatever velocity you already had. It is the reason this is
+// worth having over a second jump.
+//
+// TWICE THE HEIGHT OF A JUMP, DERIVED rather than typed. Apex is v^2/2g, so the distance is computed
+// from the pawn's own jump velocity and gravity — which means retuning the jump moves Blink with it,
+// and Demo 21's rule about derived values holds without anybody remembering it.
+// =================================================================================================
+
+bool UTraceAbilitySetMortimer::OnSecondaryPressed()
 {
+	if (!IsAbility(ETraceAbilityId::Blink))
+	{
+		return false;
+	}
+
+	const ATraceCharacter* MyPawn = GetCharacter();
+	if (MyPawn == nullptr || !MyPawn->IsAlive())
+	{
+		return false;
+	}
+
+	// Start the clock. TRUE CONSUMES V, which is correct: the hold is the ability, and a V that did
+	// nothing while charging would let another ability claim the same key mid-charge.
+	BlinkHeldSeconds = 0.f;
+	return true;
+}
+
+void UTraceAbilitySetMortimer::OnSecondaryReleased()
+{
+	// RELEASED EARLY IS A CANCEL, AND COSTS NOTHING. A tap must not spend anything — the player has
+	// not used the ability, they have changed their mind, and the charge is short enough that
+	// charging it by accident is easy.
+	BlinkHeldSeconds = -1.f;
+}
+
+void UTraceAbilitySetMortimer::TickBlink(float DeltaSeconds)
+{
+	if (!IsAbility(ETraceAbilityId::Blink) || BlinkHeldSeconds < 0.f)
+	{
+		return;
+	}
+
+	ATraceCharacter* MyPawn = GetCharacter();
+	UTraceCharacterMovementComponent* Move = (MyPawn != nullptr) ? MyPawn->GetTraceMovement() : nullptr;
+	if (MyPawn == nullptr || Move == nullptr || !MyPawn->IsAlive())
+	{
+		BlinkHeldSeconds = -1.f;
+		return;
+	}
+
+	BlinkHeldSeconds += DeltaSeconds;
+
+	const float HoldNeeded = FMath::Max(0.f, UTraceSettings::Get().MortimerBlinkHoldSeconds);
+	if (BlinkHeldSeconds < HoldNeeded)
+	{
+		return;
+	}
+
+	// ---- fire ------------------------------------------------------------------------------
+	//
+	// SERVER ONLY moves the body. A client that teleported itself would be corrected a round trip
+	// later, which on a vertical move reads as being yanked back down through the ceiling.
+	BlinkHeldSeconds = -1.f;
+	if (!HasAuthority())
+	{
+		return;
+	}
+
+	// Apex of a normal jump, from the pawn's own numbers: v^2 / 2g.
+	const float JumpZ = FMath::Max(1.f, Move->JumpZVelocity);
+	const float Gravity = FMath::Max(1.f, FMath::Abs(Move->GetGravityZ()));
+	const float JumpApex = (JumpZ * JumpZ) / (2.f * Gravity);
+	const float Rise = JumpApex * FMath::Max(0.f, UTraceSettings::Get().MortimerBlinkJumpHeights);
+
+	// SWEPT, so a Blink under a low ceiling stops at the ceiling instead of putting the pawn inside
+	// it. Teleporting into geometry is the one outcome that cannot be recovered from in a shooter.
+	const FVector Target = MyPawn->GetActorLocation() + FVector(0.f, 0.f, Rise);
+	MyPawn->SetActorLocation(Target, /*bSweep=*/true, nullptr, ETeleportType::TeleportPhysics);
+
+	UE_LOG(LogTraceGame, Log, TEXT("[Mortimer] BLINK: rose %.0f uu (%.1f x a %.0f uu jump apex)."),
+		Rise, UTraceSettings::Get().MortimerBlinkJumpHeights, JumpApex);
+}
+
+void UTraceAbilitySetMortimer::TickAbilities(float DeltaSeconds)
+{
+	TickBlink(DeltaSeconds);
+
 	if (!IsMantling())
 	{
 		return;   // Every machine, every tick, for every Mortimer who is not mid-mantle. One compare.

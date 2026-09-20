@@ -8,6 +8,7 @@
 #include "GameFramework/PlayerState.h"
 #include "HAL/IConsoleManager.h"
 
+#include "Abilities/TraceAbilityCloak.h"
 #include "Abilities/TraceAbilityComponent.h"
 #include "Abilities/Characters/TraceAbilityInputRelay.h"
 #include "Abilities/Characters/TraceOysterJar.h"
@@ -293,6 +294,11 @@ bool UTraceAbilitySetOyster::OnDashStarted(const FVector& DashDirection)
 
 void UTraceAbilitySetOyster::OnDashEnded(bool bReachedFullDistance)
 {
+	// The dash cloak measures "directly following a dash" from HERE. Recorded even when the
+	// passive is not equipped: it is one float, and a flag that is only maintained sometimes is
+	// the kind that is stale the first time somebody starts reading it.
+	DashEndedMatchTime = MatchTimeNow();
+
 
 	// SLOT GUARD — same PASSIVE jar trail as OnDashStarted.
 	// Equipped in another slot, this kit must not run this body: an ability you did not pick
@@ -365,6 +371,11 @@ ATraceOysterJar* UTraceAbilitySetOyster::DebugDropDashJar()
 
 bool UTraceAbilitySetOyster::OnJumpPressed()
 {
+	// THE DASH CLOAK IS A PASSIVE, so it runs BEFORE the movement guard below and never consumes
+	// the press: cloaking is not "using your jump", it is something that happens because you
+	// jumped. Returning true here would eat the jump itself.
+	TryDashCloak();
+
 
 	// SLOT GUARD — "jumping while stood on one of your own jars breaks it and boosts you upward" is Oyster's MOVEMENT line.
 	// Equipped in another slot, this kit must not run this body: an ability you did not pick
@@ -541,8 +552,90 @@ ATraceOysterJar* UTraceAbilitySetOyster::DebugSpawnJarAt(const FVector& Location
 // Tick — the two polls that BACK UP the hooks. Both hooks are wired; these catch what they cannot.
 // =================================================================================================
 
+
+// =================================================================================================
+// THE DASH CLOAK — Demo 35's replacement for the jar jump
+//
+// "JUMPING DIRECTLY FOLLOWING A DASH CLOAKS YOU FOR 1S."
+//
+// A PASSIVE, and the note moves it into that column deliberately: it costs nothing to hold, has no
+// key of its own, and fires off movement the player was doing anyway. The jar jump it replaces was a
+// movement ability that needed one of Oyster's OTHER abilities to produce a jar first — the dead
+// pick this rework has been unpicking. This one needs nothing but a dash.
+// =================================================================================================
+
+void UTraceAbilitySetOyster::TryDashCloak()
+{
+	if (!IsAbility(ETraceAbilityId::DashCloak))
+	{
+		return;
+	}
+
+	const ATraceCharacter* MyPawn = GetCharacter();
+	if (MyPawn == nullptr || !MyPawn->IsAlive() || !HasAuthority())
+	{
+		return;
+	}
+
+	// "DIRECTLY FOLLOWING" IS A WINDOW, measured from the end of the dash. A flag would have to be
+	// cleared by something, and every path that forgot to clear it would hand out a free cloak on
+	// the next jump of the match.
+	const float Now = MatchTimeNow();
+	const float Window = FMath::Max(0.f, UTraceSettings::Get().OysterDashCloakWindowSeconds);
+	if (DashEndedMatchTime <= 0.f || (Now - DashEndedMatchTime) > Window)
+	{
+		return;
+	}
+
+	CloakEndMatchTime = Now + FMath::Max(0.f, UTraceSettings::Get().OysterDashCloakDurationSeconds);
+
+	// Published so every machine can draw it — the cloak is a thing OTHER players need to see (or
+	// rather, not see), so it cannot live only on the server.
+	FTraceAbilityNetState& Writable = MutableState();
+	Writable.Flags |= TraceAbilityFlags::EffectActive;
+	Writable.EffectEndMatchTime = CloakEndMatchTime;
+	MarkStateDirty();
+
+	// ONE DASH, ONE CLOAK. Without this a player could jump repeatedly inside the window and keep
+	// re-arming it, which turns a one second cloak into a permanent one at no cost.
+	DashEndedMatchTime = 0.f;
+}
+
+void UTraceAbilitySetOyster::TickDashCloak()
+{
+	const ATraceCharacter* MyPawn = GetCharacter();
+
+	// READ FROM THE REPLICATED STATE, not from the local deadline: this runs on every machine and
+	// only the server wrote CloakEndMatchTime. The state is what a remote client has.
+	const FTraceAbilityNetState& Current = State();
+	const bool bWantCloak = IsAbility(ETraceAbilityId::DashCloak)
+		&& MyPawn != nullptr
+		&& MyPawn->IsAlive()
+		&& (Current.Flags & TraceAbilityFlags::EffectActive) != 0
+		&& MatchTimeNow() < Current.EffectEndMatchTime;
+
+	if (bWantCloak != bCloakVisualApplied)
+	{
+		TraceAbilityCloak::Apply(GetCharacter(), bWantCloak);
+		bCloakVisualApplied = bWantCloak;
+	}
+
+	// The server retires the flag once the deadline passes, so the struct does not sit dirty with a
+	// stale EffectActive for the rest of the match.
+	if (HasAuthority() && CloakEndMatchTime > 0.f && MatchTimeNow() >= CloakEndMatchTime)
+	{
+		CloakEndMatchTime = 0.f;
+		FTraceAbilityNetState& Writable = MutableState();
+		Writable.Flags &= static_cast<uint8>(~TraceAbilityFlags::EffectActive);
+		Writable.EffectEndMatchTime = 0.f;
+		MarkStateDirty();
+	}
+}
+
 void UTraceAbilitySetOyster::TickAbilities(float DeltaSeconds)
 {
+	TickDashCloak();
+
 	if (!UTraceAbilityComponent::AreCharactersEnabled(this))
 	{
 		if (HasAuthority() && LiveJars.Num() > 0)

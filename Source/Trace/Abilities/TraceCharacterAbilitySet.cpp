@@ -25,7 +25,7 @@ static FTraceAbilityNetState GAbilitySetScratchState;
 // =================================================================================================
 
 void UTraceCharacterAbilitySet::Initialize(UTraceAbilityComponent* InComponent,
-	ETraceLoadoutSlot InSlot, uint8 InSlotMask)
+	ETraceLoadoutSlot InSlot, uint32 InAbilityMask)
 {
 	AbilityComponent = InComponent;
 
@@ -35,7 +35,26 @@ void UTraceCharacterAbilitySet::Initialize(UTraceAbilityComponent* InComponent,
 
 	// A mask of 0 means "just the primary", which is what every pre-rework caller wants and what the
 	// default argument produces. Callers that dedup a kit across several slots pass the real mask.
-	SlotMask = (InSlotMask != 0) ? InSlotMask : static_cast<uint8>(1u << static_cast<uint8>(InSlot));
+	// A mask of 0 means "just this kit's ability for the primary slot", which is what the default
+	// argument produces and what every pre-loadout caller wants. Callers that equip a kit for several
+	// abilities pass the real mask.
+	if (InAbilityMask != 0)
+	{
+		AbilityMask = InAbilityMask;
+	}
+	else
+	{
+		AbilityMask = 0;
+		for (int32 Index = 1; Index < static_cast<int32>(ETraceAbilityId::Count); ++Index)
+		{
+			const ETraceAbilityId Ability = static_cast<ETraceAbilityId>(Index);
+			const FTraceAbilityDef* Def = TraceAbilityTable::Find(Ability);
+			if (Def != nullptr && Def->Kit == GetCharacterId() && Def->Slot == InSlot)
+			{
+				AbilityMask |= (1u << static_cast<uint32>(Ability));
+			}
+		}
+	}
 }
 
 UWorld* UTraceCharacterAbilitySet::GetWorld() const

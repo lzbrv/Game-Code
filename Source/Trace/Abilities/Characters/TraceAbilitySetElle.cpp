@@ -4,6 +4,8 @@
 
 #include "Abilities/Characters/TraceAbilitySetElle.h"
 
+#include "Abilities/TraceAbilityCloak.h"
+
 #include "Camera/CameraActor.h"          // the FX parade's observer — a bare AActor has no root
 #include "Camera/PlayerCameraManager.h"   // Trace.Elle.PortalShot frames the two mouths against the FOV
 #include "Components/MeshComponent.h"
@@ -528,6 +530,32 @@ bool UTraceAbilitySetElle::IsCloaked() const
 float UTraceAbilitySetElle::GetCloakEndMatchTime() const
 {
 	return IsCloaked() ? State().EffectEndMatchTime : 0.f;
+}
+
+// =================================================================================================
+// THE SHARED CLOAK LOOK — see Abilities/TraceAbilityCloak.h
+//
+// Defined HERE, in the translation unit that owns the material work, rather than moved out of it.
+// Demo 35 gave Oyster a dash cloak and it needs exactly this and nothing else of Elle's: not her
+// timer, not her Core-pass trigger, not the two FX sweeps, which stay hers.
+// =================================================================================================
+namespace TraceAbilityCloak
+{
+	void Apply(ATraceCharacter* Pawn, bool bCloakOn)
+	{
+		if (Pawn == nullptr)
+		{
+			return;
+		}
+		if (bCloakOn)
+		{
+			TraceAbilitySetElleFile::DimForCloak(Pawn, UTraceSettings::Get().ElleCloakOpacity);
+		}
+		else
+		{
+			TraceAbilitySetElleFile::RestoreFromCloak(Pawn);
+		}
+	}
 }
 
 void UTraceAbilitySetElle::ApplyCloakVisual(bool bCloakOn)

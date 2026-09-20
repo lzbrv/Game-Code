@@ -1194,9 +1194,27 @@ float UTraceCharacterMovementComponent::GetDashCooldown() const
 float UTraceCharacterMovementComponent::GetDashRechargeWindow() const
 {
 	// The cooldown has always been measured from dash START (UTraceSettings::DashCooldown), and the
-	// HUD's meter divides by exactly this quantity. Keeping every refill on the same window means a
-	// second charge refills on the same rhythm as the first.
-	return GetDashDuration() + GetDashCooldown();
+	// HUD's meter divides by exactly this quantity.
+	const float Base = GetDashDuration() + GetDashCooldown();
+
+	// *** DEMO 35: THE EXTRA CHARGE REFILLS AT HALF RATE. ***
+	//
+	// "ONE EXTRA DASH CHARGE... THE SECOND DASH RECHARGES AT 50% OF THE RECHARGE RATE." The charge
+	// being filled is the one ABOVE the base maximum, so the test is which charge this window is
+	// for, not who the player is: filling back to the base two is the normal rhythm, and only the
+	// bonus charge on top costs double.
+	//
+	// HERE RATHER THAN AT THE THREE REFILL SITES. Every one of them sets its next window from this
+	// function, and the HUD's meter divides by it, so putting the rule anywhere else would give a
+	// meter that disagrees with the charge it is drawing.
+	const int32 BaseCharges = FMath::Max(1, UTraceSettings::Get().BaseDashCharges);
+	if (DashCharges >= BaseCharges)
+	{
+		const float Scale = FMath::Max(1.f, UTraceSettings::Get().LilyExtraDashRechargeScale);
+		return Base * Scale;
+	}
+
+	return Base;
 }
 
 float UTraceCharacterMovementComponent::GetDashExitSpeedMultiplier() const

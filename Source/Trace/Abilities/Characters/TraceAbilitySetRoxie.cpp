@@ -170,8 +170,29 @@ namespace TraceRoxie
 // PASSIVE — "jumps 15% higher"
 // =================================================================================================
 
+// DEMO 35 REMOVED ROXIE'S JUMP PASSIVE ("+15% higher than everyone else"). The ability has no row in
+// the ability table, so nobody can pick it; this switch is what stops the implementation applying to
+// anyone who has the kit for another reason, and what brings it back for a comparison.
+static TAutoConsoleVariable<int32> CVarRoxieLegacyJumpPassive(
+	TEXT("Trace.Demo35.LegacyRoxieJump"),
+	0,
+	TEXT("0 (shipped, Demo 35): the +15% jump passive is removed.\n")
+	TEXT("1: restore it. Not pickable either way — there is no ability row for it."),
+	ECVF_Default);
+
 float UTraceAbilitySetRoxie::GetJumpVelocityScale() const
 {
+	// *** REMOVED BY DEMO 35. *** "Removed Roxie's jump passive" — the +15% apex is gone from the
+	// game, so this returns the identity and the ability has no row in the ability table, which is
+	// what makes it unpickable. The implementation is left standing rather than deleted: the square
+	// root below is the correct conversion from an apex bonus to a launch-velocity scale, it is
+	// documented against a mistake this project already shipped once, and the next pass may want the
+	// passive back. 1.0 is inert, and the arm restores it for a playtest comparison.
+	if (CVarRoxieLegacyJumpPassive.GetValueOnAnyThread() == 0)
+	{
+		return 1.f;
+	}
+
 	// *** THE SQUARE ROOT. *** Apex height is v^2 / 2g, so a +15% APEX costs sqrt(1.15) = 1.0724 on the
 	// launch velocity, not 1.15. See the header for the +25%-distance/+65.8%-actual mistake this
 	// project already shipped once on Chut's bash.
@@ -603,6 +624,24 @@ float UTraceAbilitySetRoxie::GetFireIntervalScale() const
 	if (!IsModdedActive())
 	{
 		return 1.f;
+	}
+
+	// *** DEMO 35: MODDED ONLY AFFECTS THE PISTOL. ***
+	//
+	// It used to scale whatever was in your hands, so loading a modded clip made the SMG — already
+	// the faster gun — faster again, which is the stacking Demo 35 closes. The ability still RUNS on
+	// the SMG (the clip is loaded, the timer spends, the HUD shows it); it simply grants no fire-rate
+	// bonus while the SMG is out, and gives it back the moment the pistol is.
+	//
+	// Asked of the weapon component per call rather than latched at activation, because a player can
+	// swap guns mid-clip and the answer has to follow the gun in hand.
+	if (const ATraceCharacter* MyPawn = GetCharacter())
+	{
+		const UTraceWeaponComponent* Weapon = MyPawn->FindComponentByClass<UTraceWeaponComponent>();
+		if (Weapon != nullptr && Weapon->IsSmgEquipped())
+		{
+			return 1.f;
+		}
 	}
 
 	// *** THE INVERSION. *** §2 asks for "fire rate x1.65"; FireInterval is a PERIOD, so the interval is

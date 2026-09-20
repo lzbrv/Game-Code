@@ -19,6 +19,7 @@
 #include "UI/TraceAbilityNames.h"
 #include "UI/Text/TraceCanvasText.h"
 #include "UI/Text/TraceText.h"
+#include "UI/Text/TraceTextWeight.h"
 #include "UI/Text/TraceGameText.h"
 
 namespace
@@ -124,41 +125,67 @@ namespace TraceLoadoutSelectFile
 		HUD->DrawRect(C, X + W - T, Y, T, H);
 	}
 
-	int32 KitCount()
+	/**
+	 * The abilities that fill @p Slot, in table order — one card each.
+	 *
+	 * *** THE GRID WALKS ABILITIES NOW, NOT THE TEN KITS. *** It used to be "one card per character",
+	 * which was the same list for all three columns because every kit served every slot. Demo 35
+	 * ended that: there are nine movement abilities and ten of each of the others, because BASH moved
+	 * into passive, ACROBATICS into movement, two abilities were replaced and one was removed. A grid
+	 * built from the roster would now show a card for an ability that is not in this slot, and miss
+	 * the two that are.
+	 */
+	const TArray<ETraceAbilityId>& AbilitiesFor(ETraceLoadoutSlot Slot)
 	{
-		return static_cast<int32>(TraceCharacterRoster::LastId)
-			- static_cast<int32>(TraceCharacterRoster::FirstId) + 1;
-	}
-
-	ETraceCharacterId KitAtCard(int32 CardIndex)
-	{
-		const int32 Count = KitCount();
-		if (Count <= 0)
+		// Built once per slot and kept: the table is static data and this is read every frame by the
+		// draw. Indexed by slot so the three lists cannot be confused for one another.
+		static TArray<ETraceAbilityId> Lists[static_cast<int32>(ETraceLoadoutSlot::Count)];
+		static bool bBuilt = false;
+		if (!bBuilt)
 		{
-			return ETraceCharacterId::None;
+			for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+			{
+				TraceAbilityTable::AllForSlot(static_cast<ETraceLoadoutSlot>(Index), Lists[Index]);
+			}
+			bBuilt = true;
 		}
-		const int32 Wrapped = ((CardIndex % Count) + Count) % Count;
-		return static_cast<ETraceCharacterId>(TraceCharacterRoster::FirstId + Wrapped);
+
+		const int32 SlotIndex = FMath::Clamp(static_cast<int32>(Slot), 0,
+			static_cast<int32>(ETraceLoadoutSlot::Count) - 1);
+		return Lists[SlotIndex];
 	}
 
-	int32 CardForKit(ETraceCharacterId Id)
+	int32 CardCount(ETraceLoadoutSlot Slot)
 	{
-		const int32 Card = static_cast<int32>(Id) - static_cast<int32>(TraceCharacterRoster::FirstId);
-		return (Card >= 0 && Card < KitCount()) ? Card : 0;
+		return AbilitiesFor(Slot).Num();
+	}
+
+	ETraceAbilityId AbilityAtCard(ETraceLoadoutSlot Slot, int32 CardIndex)
+	{
+		const TArray<ETraceAbilityId>& List = AbilitiesFor(Slot);
+		if (List.Num() == 0)
+		{
+			return ETraceAbilityId::None;
+		}
+		const int32 Wrapped = ((CardIndex % List.Num()) + List.Num()) % List.Num();
+		return List[Wrapped];
+	}
+
+	int32 CardForAbility(ETraceLoadoutSlot Slot, ETraceAbilityId Id)
+	{
+		const int32 Found = AbilitiesFor(Slot).IndexOfByKey(Id);
+		return (Found != INDEX_NONE) ? Found : 0;
 	}
 
 	/**
 	 * Draws @p Text inside @p MaxWidth, breaking on spaces, and returns the Y below the last line.
 	 *
-	 * *** THE FIRST BUILD OF THIS SCREEN DREW EACH DESCRIPTION AS ONE LINE. *** Every card's prose ran
-	 * straight through its own border and across its neighbour — five overlapping sentences per row,
-	 * which is precisely the "completely messed up" the rebuild was asked to fix, reappearing in a new
-	 * form. A card whose whole content is prose has to wrap; there is no shorter version to fall back
-	 * on, because these abilities have no names.
+	 * A card whose whole content is prose has to wrap; there is no shorter form to fall back on for
+	 * an unnamed ability. The first build of this screen drew each description as one line and every
+	 * card's text ran through its own border and across its neighbour.
 	 *
-	 * Measured in the SAME style it draws in. TraceText's own note is blunt about this: MeasureWidth
-	 * is only right if the caller hands it the weight it is going to draw with, because erosion makes
-	 * the light cut narrower than the bold one at the same size.
+	 * Measured in the SAME style it draws in — TraceText's own note is blunt that MeasureWidth is
+	 * only right if the caller hands it the weight it will draw with.
 	 */
 	float DrawWrapped(AHUD* HUD, const FString& Text, float X, float Y, float MaxWidth,
 		float Size, const FLinearColor& Color, float LineGap)
@@ -219,12 +246,12 @@ namespace TraceLoadoutSelectFile
 	 */
 	FString TabSummary(const FTraceLoadout& Loadout, ETraceLoadoutSlot Slot)
 	{
-		const ETraceCharacterId Id = Loadout.Get(Slot);
-		if (Id == ETraceCharacterId::None)
+		const ETraceAbilityId Id = Loadout.Get(Slot);
+		if (Id == ETraceAbilityId::None)
 		{
 			return TRACE_TEXT("LOADOUT.TAB_EMPTY", "NONE");
 		}
-		return TraceAbilityNames::ShortLabel(Id, Slot);
+		return TraceAbilityNames::ShortLabel(Id);
 	}
 }
 
@@ -293,12 +320,20 @@ void FTraceLoadoutSelect::SyncStagedFromServer(ATracePlayerState* LocalState)
 	// is legal but it is nobody's intent, and the half-time clock can run out while they read.
 	if (Staged.IsEmpty())
 	{
-		Staged = FTraceLoadout::Uniform(TraceLoadoutSelectFile::KitAtCard(0));
+		// The first ability of each column — a legal, complete starting point. It used to be one
+		// kit's three abilities, which after Demo 35 is not always a complete loadout (Chut has no
+		// movement, Lily no passive).
+		for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+		{
+			const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(Index);
+			Staged.Set(Slot, TraceLoadoutSelectFile::AbilityAtCard(Slot, 0));
+		}
 	}
 
 	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
 	{
-		Highlighted[Index] = TraceLoadoutSelectFile::CardForKit(Staged.Get(static_cast<ETraceLoadoutSlot>(Index)));
+		Highlighted[Index] = TraceLoadoutSelectFile::CardForAbility(static_cast<ETraceLoadoutSlot>(Index),
+			Staged.Get(static_cast<ETraceLoadoutSlot>(Index)));
 	}
 	Tab = 0;
 	LastMessage.Reset();
@@ -383,7 +418,7 @@ void FTraceLoadoutSelect::MoveTab(int32 Delta)
 
 void FTraceLoadoutSelect::MoveCard(int32 Delta)
 {
-	const int32 Count = TraceLoadoutSelectFile::KitCount();
+	const int32 Count = TraceLoadoutSelectFile::CardCount(static_cast<ETraceLoadoutSlot>(Tab));
 	if (Count <= 0)
 	{
 		return;
@@ -398,7 +433,7 @@ void FTraceLoadoutSelect::MoveCard(int32 Delta)
 void FTraceLoadoutSelect::EquipHighlighted()
 {
 	const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(Tab);
-	Staged.Set(Slot, TraceLoadoutSelectFile::KitAtCard(Highlighted[Tab]));
+	Staged.Set(Slot, TraceLoadoutSelectFile::AbilityAtCard(Slot, Highlighted[Tab]));
 	LastMessage.Reset();
 }
 
@@ -436,7 +471,7 @@ void FTraceLoadoutSelect::PollPointer(APlayerController* PC, ATracePlayerState* 
 	}
 
 	HoveredCard = INDEX_NONE;
-	for (int32 Index = 0; Index < TraceLoadoutSelectFile::KitCount(); ++Index)
+	for (int32 Index = 0; Index < TraceLoadoutSelectFile::CardCount(static_cast<ETraceLoadoutSlot>(Tab)); ++Index)
 	{
 		if (CardRects[Index].bIsValid && CardRects[Index].IsInside(CursorPos))
 		{
@@ -569,7 +604,8 @@ void FTraceLoadoutSelect::Recall(int32 Index)
 	Staged = Saved;
 	for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
 	{
-		Highlighted[SlotIndex] = TraceLoadoutSelectFile::CardForKit(Staged.Get(static_cast<ETraceLoadoutSlot>(SlotIndex)));
+		Highlighted[SlotIndex] = TraceLoadoutSelectFile::CardForAbility(static_cast<ETraceLoadoutSlot>(SlotIndex),
+			Staged.Get(static_cast<ETraceLoadoutSlot>(SlotIndex)));
 	}
 
 	LastMessage = FString::Format(*TRACE_TEXT("LOADOUT.SLOT_LOADED", "LOADED {0}"),
@@ -599,11 +635,19 @@ void FTraceLoadoutSelect::OpenLibrary(int32 SlotIndex)
 	Staged = UTraceUserSettings::Get().GetSavedLoadout(LibrarySlot);
 	if (Staged.IsEmpty())
 	{
-		Staged = FTraceLoadout::Uniform(TraceLoadoutSelectFile::KitAtCard(0));
+		// The first ability of each column — a legal, complete starting point. It used to be one
+		// kit's three abilities, which after Demo 35 is not always a complete loadout (Chut has no
+		// movement, Lily no passive).
+		for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+		{
+			const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(Index);
+			Staged.Set(Slot, TraceLoadoutSelectFile::AbilityAtCard(Slot, 0));
+		}
 	}
 	for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
 	{
-		Highlighted[Index] = TraceLoadoutSelectFile::CardForKit(Staged.Get(static_cast<ETraceLoadoutSlot>(Index)));
+		Highlighted[Index] = TraceLoadoutSelectFile::CardForAbility(static_cast<ETraceLoadoutSlot>(Index),
+			Staged.Get(static_cast<ETraceLoadoutSlot>(Index)));
 	}
 	Tab = 0;
 	LastMessage.Reset();
@@ -695,7 +739,7 @@ void FTraceLoadoutSelect::Draw(AHUD* HUD, const TCHAR* Title, const TCHAR* Foote
 		CardRects[Index] = FBox2D(ForceInit);
 	}
 
-	const int32 Count = FMath::Min(TraceLoadoutSelectFile::KitCount(), Columns * Rows);
+	const int32 Count = FMath::Min(TraceLoadoutSelectFile::CardCount(static_cast<ETraceLoadoutSlot>(Tab)), Columns * Rows);
 	for (int32 Index = 0; Index < Count; ++Index)
 	{
 		const int32 Col = Index % Columns;
@@ -755,7 +799,7 @@ void FTraceLoadoutSelect::DrawCard(AHUD* HUD, int32 Index, float X, float Y, flo
 
 	const float S = UIScale;
 	const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(Tab);
-	const ETraceCharacterId Id = TraceLoadoutSelectFile::KitAtCard(Index);
+	const ETraceAbilityId Id = TraceLoadoutSelectFile::AbilityAtCard(Slot, Index);
 
 	const bool bHighlighted = (Index == Highlighted[Tab]);
 	const bool bEquipped = (Staged.Get(Slot) == Id);
@@ -773,15 +817,35 @@ void FTraceLoadoutSelect::DrawCard(AHUD* HUD, int32 Index, float X, float Y, flo
 	// THE NAME, WHERE THERE IS ONE. Only the activated ability has one; movement and passive never
 	// did, and inventing one for them was the mistake this screen was rebuilt to undo. Their card is
 	// its description, which is exactly what the character screen showed for them.
-	const FString Name = TraceAbilityNames::Get(Id, Slot);
+	const FString Name = TraceAbilityNames::Get(Id);
 	if (!Name.IsEmpty())
 	{
-		TraceCanvasText::DrawBold(HUD, Name, TextX, TextY, SizeName * S,
+		// SHRINK A LONG NAME TO FIT RATHER THAN LET IT RUN OFF THE CARD. Demo 35 named the abilities
+		// and two of them — CARBON SLIDERS, STICKY GLOVES — are wider than a fifth of the screen at
+		// the display size, so they were drawn clipped mid-word. Scaling is the right answer over
+		// wrapping here: a name is one thing and reads as one line, and the sizes stay close enough
+		// that the grid still looks like a grid.
+		// MEASURED IN THE CUT IT IS DRAWN IN. TraceText's own note is blunt about this and it caught
+		// me anyway: the bold sheet is wider than the light one at the same size, so measuring with
+		// the default weight under-reads and a name that "fits" still runs off the card. STICKY
+		// GLOVES was clipped by exactly that.
+		const float NameSize = SizeName * S;
+		TraceText::FStyle NameStyle(NameSize, FLinearColor::White);
+		NameStyle.Weight = ETraceTextWeight::Bold;
+		const float Measured = TraceText::MeasureWidth(Name, NameStyle);
+		const float Fitted = (Measured > TextW && Measured > 0.f)
+			? NameSize * (TextW / Measured)
+			: NameSize;
+
+		TraceCanvasText::DrawBold(HUD, Name, TextX, TextY, Fitted,
 			bEquipped ? Good : (bHighlighted ? Ink : InkSoft));
+
+		// The row advances by the FULL size even when the name was shrunk, so every card's
+		// description starts on the same line and the grid stays aligned.
 		TextY += (SizeName + 8.f) * S;
 	}
 
-	const FString Body = TraceAbilityNames::Describe(Id, Slot);
+	const FString Body = TraceAbilityNames::Describe(Id);
 	TraceLoadoutSelectFile::DrawWrapped(HUD, Body, TextX, TextY, TextW, SizeBody * S,
 		bHighlighted ? InkSoft : InkDim, 4.f * S);
 
@@ -866,10 +930,10 @@ void FTraceLoadoutSelect::DrawPointer(AHUD* HUD)
 // Test seams
 // =================================================================================================
 
-void FTraceLoadoutSelect::DebugPick(ETraceLoadoutSlot Slot, ETraceCharacterId Id)
+void FTraceLoadoutSelect::DebugPick(ETraceLoadoutSlot Slot, ETraceAbilityId Id)
 {
 	Staged.Set(Slot, Id);
-	Highlighted[static_cast<int32>(Slot)] = TraceLoadoutSelectFile::CardForKit(Id);
+	Highlighted[static_cast<int32>(Slot)] = TraceLoadoutSelectFile::CardForAbility(Slot, Id);
 }
 
 void FTraceLoadoutSelect::DebugConfirm(ATracePlayerState* LocalState)
@@ -962,14 +1026,14 @@ namespace TraceLoadoutScreenVerify
 			TEXT("Trace.UI.LoadoutScreen"));
 
 		FTraceLoadoutSelect Screen;
-		Screen.DebugPick(ETraceLoadoutSlot::Movement,  ETraceCharacterId::Chut);
-		Screen.DebugPick(ETraceLoadoutSlot::Passive,   ETraceCharacterId::Mace);
-		Screen.DebugPick(ETraceLoadoutSlot::Activated, ETraceCharacterId::Elle);
+		Screen.DebugPick(ETraceLoadoutSlot::Movement,  ETraceAbilityId::StickyGloves);
+		Screen.DebugPick(ETraceLoadoutSlot::Passive,   ETraceAbilityId::Magnet);
+		Screen.DebugPick(ETraceLoadoutSlot::Activated, ETraceAbilityId::Snap);
 
 		FTraceLoadout Wanted;
-		Wanted.Movement  = ETraceCharacterId::Chut;
-		Wanted.Passive   = ETraceCharacterId::Mace;
-		Wanted.Activated = ETraceCharacterId::Elle;
+		Wanted.Movement  = ETraceAbilityId::StickyGloves;
+		Wanted.Passive   = ETraceAbilityId::Magnet;
+		Wanted.Activated = ETraceAbilityId::Snap;
 
 		Check(TEXT("three picks stage three different kits"),
 			Screen.GetStaged() == Wanted, TraceLoadoutToString(Screen.GetStaged()));
@@ -1107,46 +1171,56 @@ namespace TraceLoadoutScreenVerify
 		// The reverted state, asserted rather than eyeballed: exactly the ten roster ActivatedNames
 		// exist, and movement and passive have no name at all. An earlier pass invented thirty and
 		// renamed three real ones, which is the regression this guards.
+		// ---- EVERY ABILITY HAS SOMETHING TO DRAW, AND THE ACTIVATED ONES KEEP THE ROSTER'S NAMES ----
+		//
+		// Rewritten for Demo 35. The old version walked ten kits and asserted that movement and
+		// passive abilities had NO name — true then, and wrong now: the owner named most of them.
+		// What still holds is the rule underneath: a name is either the owner's or the roster's, and
+		// nothing is invented. So this checks that every ACTIVATED ability still carries exactly the
+		// roster's ActivatedName, and that no ability is left with nothing at all to put on a card.
 		int32 NameProblems = 0;
-		for (uint8 Id = TraceCharacterRoster::FirstId; Id <= TraceCharacterRoster::LastId; ++Id)
+		for (int32 IdIndex = 1; IdIndex < static_cast<int32>(ETraceAbilityId::Count); ++IdIndex)
 		{
-			const ETraceCharacterId Kit = static_cast<ETraceCharacterId>(Id);
-
-			if (!TraceAbilityNames::Get(Kit, ETraceLoadoutSlot::Movement).IsEmpty()
-				|| !TraceAbilityNames::Get(Kit, ETraceLoadoutSlot::Passive).IsEmpty())
+			const ETraceAbilityId Ability = static_cast<ETraceAbilityId>(IdIndex);
+			const FTraceAbilityDef* Def = TraceAbilityTable::Find(Ability);
+			if (Def == nullptr)
 			{
 				++NameProblems;
 				UE_LOG(LogTraceGame, Error,
-					TEXT("[LoadoutScreen]   kit %d has an invented movement/passive name"), Id);
+					TEXT("[LoadoutScreen]   ability %d has no row in the ability table"), IdIndex);
+				continue;
 			}
 
-			const FString Activated = TraceAbilityNames::Get(Kit, ETraceLoadoutSlot::Activated);
-			const TraceCharacterRoster::FTraceCharacterEntry* Entry = TraceCharacterRoster::Find(Id);
-			if (Entry == nullptr || Activated != FString(Entry->ActivatedName))
+			if (Def->Slot == ETraceLoadoutSlot::Activated)
 			{
-				++NameProblems;
-				UE_LOG(LogTraceGame, Error,
-					TEXT("[LoadoutScreen]   kit %d activated name '%s' is not the roster's '%s'"),
-					Id, *Activated, (Entry != nullptr) ? Entry->ActivatedName : TEXT("<none>"));
-			}
-
-			// Every ability must still have SOMETHING to draw, or a card would be blank.
-			for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
-			{
-				const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(SlotIndex);
-				if (TraceAbilityNames::Describe(Kit, Slot).IsEmpty()
-					|| TraceAbilityNames::ShortLabel(Kit, Slot).IsEmpty())
+				const TraceCharacterRoster::FTraceCharacterEntry* Entry =
+					TraceCharacterRoster::Find(static_cast<uint8>(Def->Kit));
+				const FString Name = TraceAbilityNames::Get(Ability);
+				if (Entry == nullptr || Name != FString(Entry->ActivatedName))
 				{
 					++NameProblems;
 					UE_LOG(LogTraceGame, Error,
-						TEXT("[LoadoutScreen]   kit %d slot %s has nothing to draw"),
-						Id, TraceLoadoutSlotToString(Slot));
+						TEXT("[LoadoutScreen]   %s: activated name '%s' is not the roster's '%s'"),
+						TraceAbilityIdToString(Ability), *Name,
+						(Entry != nullptr) ? Entry->ActivatedName : TEXT("<none>"));
 				}
+			}
+
+			// A card shows the name where there is one and the description otherwise, so an ability
+			// with neither would draw an empty plate. Three are deliberately unnamed (Demo 35 left
+			// two blank and marked one TBD) and they lean on their description entirely.
+			if (TraceAbilityNames::ShortLabel(Ability).IsEmpty())
+			{
+				++NameProblems;
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[LoadoutScreen]   %s has nothing to draw on a card"),
+					TraceAbilityIdToString(Ability));
 			}
 		}
 		Failures += NameProblems;
-		Check(TEXT("names are the roster's, and nothing is invented"), NameProblems == 0,
-			FString::Printf(TEXT("%d problem(s) across 10 kits"), NameProblems));
+		Check(TEXT("every ability has a label, and activated names match the roster"), NameProblems == 0,
+			FString::Printf(TEXT("%d problem(s) across %d abilities"),
+				NameProblems, static_cast<int32>(ETraceAbilityId::Count) - 1));
 
 		Comp->ApplyLoadout(Restore);
 		Subject->ServerSetCharacterSelectOpen(bRestoreSelect, 0.f);
@@ -1198,9 +1272,9 @@ namespace TraceLoadoutLibraryVerify
 		}
 
 		FTraceLoadout Wanted;
-		Wanted.Movement  = ETraceCharacterId::Chut;
-		Wanted.Passive   = ETraceCharacterId::Mace;
-		Wanted.Activated = ETraceCharacterId::Elle;
+		Wanted.Movement  = ETraceAbilityId::StickyGloves;
+		Wanted.Passive   = ETraceAbilityId::Magnet;
+		Wanted.Activated = ETraceAbilityId::Snap;
 
 		// SLOT 4, NOT SLOT 0: writing the last-but-one slot into an empty array is the case that would
 		// silently land at index 0 and become slot 1. The array has to GROW, with the gaps empty.
@@ -1213,9 +1287,9 @@ namespace TraceLoadoutLibraryVerify
 			Settings.GetSavedLoadout(99).IsEmpty(), TEXT("out of range is 'empty', never a bounds bug"));
 
 		FTraceLoadoutSelect Screen;
-		Screen.DebugPick(ETraceLoadoutSlot::Movement,  ETraceCharacterId::Rocco);
-		Screen.DebugPick(ETraceLoadoutSlot::Passive,   ETraceCharacterId::Rocco);
-		Screen.DebugPick(ETraceLoadoutSlot::Activated, ETraceCharacterId::Rocco);
+		Screen.DebugPick(ETraceLoadoutSlot::Movement,  ETraceAbilityId::JetBoots);
+		Screen.DebugPick(ETraceLoadoutSlot::Passive,   ETraceAbilityId::Blasters);
+		Screen.DebugPick(ETraceLoadoutSlot::Activated, ETraceAbilityId::Ripple);
 
 		Screen.DebugRecall(3);
 		Check(TEXT("recalling slot 4 loads it into the page"),
@@ -1225,7 +1299,7 @@ namespace TraceLoadoutLibraryVerify
 		Check(TEXT("recalling an EMPTY slot changes nothing"),
 			Screen.GetStaged() == Wanted, TraceLoadoutToString(Screen.GetStaged()));
 
-		Screen.DebugPick(ETraceLoadoutSlot::Movement, ETraceCharacterId::Lily);
+		Screen.DebugPick(ETraceLoadoutSlot::Movement, ETraceAbilityId::Overload);
 		Screen.DebugStore(0);
 		Check(TEXT("storing writes the staged loadout to slot 1"),
 			Settings.GetSavedLoadout(0) == Screen.GetStaged(),
