@@ -532,13 +532,17 @@ public:
 	/** Five, per the spec. A constant because the screen draws one row per slot and must agree. */
 	static constexpr int32 SavedLoadoutCount = 5;
 
-	/** Slot @p Index, or an empty loadout if the index is out of range or was never filled. */
 	/**
 	 * Throws away saved loadouts written before the current vocabulary. Safe to call repeatedly.
-	 * Called once from Get() on first use, beside the other load-time repairs.
+	 *
+	 * Returns true when it removed something the FILE holds, i.e. when the file now needs writing.
+	 * IT NEVER SAVES. RefreshFromConfig calls it after every binding has been parsed and saves once
+	 * afterwards if anything changed. It used to call Save() itself as the first thing the load did,
+	 * before the key and pad tables were read, and that save wrote every binding as None.
 	 */
-	void DiscardSavedLoadoutsIfStale();
+	bool DiscardSavedLoadoutsIfStale();
 
+	/** Slot @p Index, or an empty loadout if the index is out of range or was never filled. */
 	FTraceLoadout GetSavedLoadout(int32 Index) const;
 
 	/** Writes slot @p Index and persists immediately — a saved loadout the game forgets is a bug. */
@@ -618,6 +622,21 @@ public:
 
 	/** Bumped whenever the meaning of a saved slot changes. 1 = ability ids (Demo 35). */
 	static constexpr int32 CurrentSavedLoadoutVersion = 1;
+
+	/**
+	 * Which one-shot binding repairs this file has already had.
+	 *
+	 * 1 = THE DEMO 35 WIPE. The first build with saved loadouts saved the settings file before it had
+	 * read any bindings, so every file it touched says `None` for every key and every pad button
+	 * (see RepairBindingsWipedByLoadoutMigration). A file in exactly that state gets its bindings
+	 * back ONCE. After that the same state is taken at face value, because a player is allowed to
+	 * unbind whatever they like.
+	 */
+	UPROPERTY(config)
+	int32 BindingsRepairVersion = 0;
+
+	/** Bumped when a new one-shot binding repair is added. */
+	static constexpr int32 CurrentBindingsRepairVersion = 1;
 
 	/**
 	 * Extra multiplier applied to the VERTICAL axis only, on top of MouseSensitivity.
@@ -784,6 +803,10 @@ public:
 	 * Populates the runtime binding table from KeyBindings, filling any gap with the default.
 	 *
 	 * Safe to call repeatedly. Called lazily by Get() on first use, and by ResetToDefaults.
+	 *
+	 * The load-time repairs (stale saved loadouts, the Demo 35 binding wipe) run AFTER both binding
+	 * tables are parsed, and the file is saved at most once, at the end, and only if a repair
+	 * changed something. A fresh install therefore writes no file just by starting.
 	 */
 	void RefreshFromConfig();
 
@@ -1382,5 +1405,24 @@ private:
 	/** Mirrors PadBindings back into PadKeyBindings before a save. Twin of FlattenToConfig. */
 	void FlattenPadToConfig();
 
+	/** Fills Bindings with the shipped keyboard defaults, both slots. The loader's first step. */
+	void SeedKeyboardDefaults();
+
+	/** Fills PadBindings with the shipped pad defaults. The pad loader's first step. */
+	void SeedPadDefaults();
+
+	/**
+	 * THE ONE-SHOT REPAIR FOR FILES THE DEMO 35 LOAD ORDER WIPED. Returns true if it re-seeded.
+	 *
+	 * Runs after both tables are parsed. Re-seeds the key and pad defaults only when EVERY keyboard
+	 * slot AND EVERY pad button came back unbound, which is the exact signature the bad save left, and
+	 * only while BindingsRepairVersion is below 1. Nothing else is touched: mouse sensitivity, the
+	 * pad look settings, the crosshair and the audio all survived the wipe and keep their values.
+	 */
+	bool RepairBindingsWipedByLoadoutMigration();
+
 	bool bLoaded = false;
+
+	/** Trace.Settings.VerifyLoadoutMigration drives the first-use load and needs to rewind it. */
+	friend struct FTraceUserSettingsMigrationProbe;
 };

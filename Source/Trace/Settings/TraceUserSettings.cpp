@@ -1592,19 +1592,13 @@ void UTraceUserSettings::ClearKey(ETraceInputAction Action, int32 Slot)
 	Save();
 }
 
-void UTraceUserSettings::RefreshFromConfig()
+void UTraceUserSettings::SeedKeyboardDefaults()
 {
-	// BEFORE ANYTHING READS THEM. A saved loadout written in an older vocabulary is three in-range,
-	// wrong ability ids; discarding is the only safe reading. See DiscardSavedLoadoutsIfStale.
-	DiscardSavedLoadoutsIfStale();
-
 	const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
 
 	Bindings.Reset();
 	Bindings.SetNum(Table.Num() * MaxKeysPerAction);
 
-	// Start from the shipped defaults, then let the .ini override entry by entry. A truncated or
-	// partially corrupt file therefore degrades to "some defaults" rather than to "no controls".
 	for (int32 Index = 0; Index < Table.Num(); ++Index)
 	{
 		const ETraceInputAction Action = static_cast<ETraceInputAction>(Index);
@@ -1613,6 +1607,23 @@ void UTraceUserSettings::RefreshFromConfig()
 		Bindings[SlotIndex(Action, 1)] = (Table[Index].DefaultKeyAlt != nullptr)
 			? Table[Index].DefaultKeyAlt() : FKey();
 	}
+}
+
+void UTraceUserSettings::RefreshFromConfig()
+{
+	// *** NOTHING IN HERE MAY SAVE UNTIL BOTH BINDING TABLES ARE PARSED. ***
+	//
+	// Save() does not write Bindings; it FLATTENS them into KeyBindings first and writes that. Before
+	// the parse loop below has run, Bindings is whatever the constructor left, which is every slot
+	// unbound, so a save at that point writes `None` for every action and then this function reads
+	// those Nones straight back. Demo 35 did exactly that: the stale-loadout discard ran as the
+	// first line of this function and saved, and every settings file it touched lost every key and
+	// every pad button. The repairs now run at the bottom, and the one save happens after bLoaded.
+	const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
+
+	// Start from the shipped defaults, then let the .ini override entry by entry. A truncated or
+	// partially corrupt file therefore degrades to "some defaults" rather than to "no controls".
+	SeedKeyboardDefaults();
 
 	for (const FString& Entry : KeyBindings)
 	{
@@ -1696,7 +1707,56 @@ void UTraceUserSettings::RefreshFromConfig()
 	// do not, and every caller would then have to know which of the two it had.
 	RefreshPadFromConfig();
 
+	// ---- LOAD-TIME REPAIRS. Both tables are parsed, so a save from here writes real bindings. ----
+	//
+	// Neither repair saves on its own. Each says whether the file needs rewriting, and the one save
+	// below does it. A fresh install has nothing to repair and so writes nothing: the file appears
+	// the first time the player changes a setting, as it always did.
+	const bool bRepairedBindings = RepairBindingsWipedByLoadoutMigration();
+	const bool bDiscardedLoadouts = DiscardSavedLoadoutsIfStale();
+
 	bLoaded = true;
+
+	// AFTER bLoaded, because Save() broadcasts OnChanged and a listener that calls Get() must find a
+	// loaded object rather than start this function a second time.
+	if (bRepairedBindings || bDiscardedLoadouts)
+	{
+		Save();
+	}
+}
+
+bool UTraceUserSettings::RepairBindingsWipedByLoadoutMigration()
+{
+	if (BindingsRepairVersion >= CurrentBindingsRepairVersion)
+	{
+		return false;
+	}
+
+	// Marked done whatever happens next, so the check runs once per file. It reaches the disk with
+	// the next save of any kind, which is soon for anybody who plays and never for a file that needs
+	// nothing.
+	BindingsRepairVersion = CurrentBindingsRepairVersion;
+
+	// THE SIGNATURE, AND WHY IT IS THIS STRICT. The bad save wrote `None` for every keyboard slot and
+	// every pad button in one go. Nobody reaches that state by hand: unbinding all twenty actions on
+	// both pages leaves a game that cannot be played or even left with a pad. Anything short of all
+	// of it (one key still bound anywhere) is treated as the player's own choice and left alone.
+	const bool bAnyKeyBound = Bindings.ContainsByPredicate([](const FKey& Key) { return Key.IsValid(); });
+	const bool bAnyPadBound = PadBindings.ContainsByPredicate([](const FKey& Key) { return Key.IsValid(); });
+	if (bAnyKeyBound || bAnyPadBound)
+	{
+		return false;
+	}
+
+	UE_LOG(LogTraceGame, Warning,
+		TEXT("[Settings] Every key and every pad button in this settings file is unbound. That is the "
+		     "damage the Demo 35 loadout migration did by saving before the bindings were read. "
+		     "Restoring the default bindings once. Mouse, pad look, crosshair and audio settings are "
+		     "left as they are."));
+
+	SeedKeyboardDefaults();
+	SeedPadDefaults();
+	return true;
 }
 
 void UTraceUserSettings::FlattenToConfig()
@@ -1776,16 +1836,17 @@ bool UTraceUserSettings::IsAtDefaults() const
 // Saved loadouts
 // =================================================================================================
 
-void UTraceUserSettings::DiscardSavedLoadoutsIfStale()
+bool UTraceUserSettings::DiscardSavedLoadoutsIfStale()
 {
 	if (SavedLoadoutVersion == CurrentSavedLoadoutVersion)
 	{
-		return;
+		return false;
 	}
 
 	// A file written in an older vocabulary. The values are all in range and all wrong, which is the
 	// dangerous shape — so they go, once, loudly enough to explain the empty slots.
 	const int32 Had = SavedLoadouts.Num();
+	const int32 HadNames = SavedLoadoutNames.Num();
 	SavedLoadouts.Reset();
 	SavedLoadoutNames.Reset();
 	SavedLoadoutVersion = CurrentSavedLoadoutVersion;
@@ -1797,7 +1858,10 @@ void UTraceUserSettings::DiscardSavedLoadoutsIfStale()
 			     "hold a character and now holds an ability, so the old numbers name different "
 			     "abilities entirely. Rebuild them on the loadout page."), Had);
 	}
-	Save();
+
+	// NO SAVE HERE. See RefreshFromConfig. The version bump alone does not need one: until something
+	// is written, the next launch finds the same empty library and makes the same harmless decision.
+	return (Had > 0) || (HadNames > 0);
 }
 
 FTraceLoadout UTraceUserSettings::GetSavedLoadout(int32 Index) const
@@ -2065,20 +2129,27 @@ void UTraceUserSettings::ClearPadKey(ETraceInputAction Action)
 	Save();
 }
 
-void UTraceUserSettings::RefreshPadFromConfig()
+void UTraceUserSettings::SeedPadDefaults()
 {
 	const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
 
 	PadBindings.Reset();
 	PadBindings.SetNum(Table.Num());
 
-	// Defaults first, then the file overrides entry by entry — the keyboard loader's shape, and it
-	// buys the same thing: a truncated or corrupt file degrades to "some defaults" rather than to
-	// "no controller".
 	for (int32 Index = 0; Index < Table.Num(); ++Index)
 	{
 		PadBindings[Index] = (Table[Index].DefaultPadKey != nullptr) ? Table[Index].DefaultPadKey() : FKey();
 	}
+}
+
+void UTraceUserSettings::RefreshPadFromConfig()
+{
+	const TArray<FTraceInputActionInfo>& Table = TraceInputActions::All();
+
+	// Defaults first, then the file overrides entry by entry — the keyboard loader's shape, and it
+	// buys the same thing: a truncated or corrupt file degrades to "some defaults" rather than to
+	// "no controller".
+	SeedPadDefaults();
 
 	for (const FString& Entry : PadKeyBindings)
 	{
@@ -3812,6 +3883,366 @@ namespace TraceLookPolarityProbe
 		TEXT("in each case — with the pad's invert toggle off and again with it on. Six arms; three ")
 		TEXT("are controls. Restores the settings it changes and writes nothing to disk."),
 		FConsoleCommandDelegate::CreateStatic(&VerifyLookPolarity));
+}
+
+// =================================================================================================
+// Trace.Settings.VerifyLoadoutMigration — the Demo 35 load-order bug, driven through Get()
+//
+// THE BUG. The first build with saved loadouts discarded stale ones as the FIRST line of the load and
+// saved on the way out. Save() flattens the runtime binding tables into the file, and at that moment
+// the tables were still the constructor's: every slot unbound. So the file got `None` for every key
+// and every pad button, the rest of the load read those Nones back, and every later launch loaded
+// the same Nones because the file now said the loadouts were current. Nothing fell back to defaults.
+//
+// WHAT THIS DRIVES. The real first-use entry, UTraceUserSettings::Get(), on the real settings object,
+// with the object rewound to the state a fresh process has before that call (constructor tables,
+// not loaded) and the config members set to a fixture file. Four files:
+//
+//   A  a returning player's pre-Demo-35 file with custom binds AND saved loadouts. The loadouts must
+//      go, the binds must stay, and the save that records the discard must write the binds.
+//   B  a fresh install: nothing on disk. Starting the game must not write a settings file at all.
+//   C  a file the bug already wiped (every key and pad button None). It gets its default bindings
+//      back once, and nothing else in it changes.
+//   D  the same wiped state in a file that has already had that repair. It is left alone, because
+//      from then on "everything unbound" is the player's choice.
+//
+// RED ARM: move DiscardSavedLoadoutsIfStale() (with a Save() inside it) back to the top of
+// RefreshFromConfig and delete the repair call. A, B and C then fail. That was done once, by hand,
+// before this was committed; the commit message records the output.
+//
+// WHAT IT TOUCHES. Scenarios A and C save, and the settings file on disk briefly holds the fixture.
+// Everything is put back and saved again before the command returns, and the runtime tables are
+// compared slot by slot against the snapshot taken at the start.
+// =================================================================================================
+
+struct FTraceUserSettingsMigrationProbe
+{
+	/** The object as a fresh process has it just before the first Get(): constructor tables, unloaded. */
+	static void Rewind(UTraceUserSettings& Settings)
+	{
+		const int32 ActionCount = static_cast<int32>(ETraceInputAction::Count);
+		Settings.Bindings.Reset();
+		Settings.Bindings.SetNum(ActionCount * UTraceUserSettings::MaxKeysPerAction);
+		Settings.PadBindings.Reset();
+		Settings.PadBindings.SetNum(ActionCount);
+		Settings.bLoaded = false;
+	}
+
+	static bool IsLoaded(const UTraceUserSettings& Settings) { return Settings.bLoaded; }
+};
+
+namespace TraceUserSettingsMigrationVerify
+{
+	struct FConfigSnapshot
+	{
+		TArray<FString> KeyBindings;
+		TArray<FString> PadKeyBindings;
+		TArray<FTraceLoadout> SavedLoadouts;
+		TArray<FString> SavedLoadoutNames;
+		int32 SavedLoadoutVersion = 0;
+		int32 BindingsRepairVersion = 0;
+		float MouseSensitivity = 0.f;
+		TArray<FKey> Keys;
+		TArray<FKey> PadKeys;
+	};
+
+	void TakeSnapshot(const UTraceUserSettings& Settings, FConfigSnapshot& Out)
+	{
+		Out.KeyBindings = Settings.KeyBindings;
+		Out.PadKeyBindings = Settings.PadKeyBindings;
+		Out.SavedLoadouts = Settings.SavedLoadouts;
+		Out.SavedLoadoutNames = Settings.SavedLoadoutNames;
+		Out.SavedLoadoutVersion = Settings.SavedLoadoutVersion;
+		Out.BindingsRepairVersion = Settings.BindingsRepairVersion;
+		Out.MouseSensitivity = Settings.MouseSensitivity;
+		TraceUserSettingsVerify::Snapshot(Settings, Out.Keys);
+		Out.PadKeys.Reset();
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			Out.PadKeys.Add(Settings.GetPadKey(Info.Action));
+		}
+	}
+
+	void PutConfigBack(UTraceUserSettings& Settings, const FConfigSnapshot& From)
+	{
+		Settings.KeyBindings = From.KeyBindings;
+		Settings.PadKeyBindings = From.PadKeyBindings;
+		Settings.SavedLoadouts = From.SavedLoadouts;
+		Settings.SavedLoadoutNames = From.SavedLoadoutNames;
+		Settings.SavedLoadoutVersion = From.SavedLoadoutVersion;
+		Settings.BindingsRepairVersion = From.BindingsRepairVersion;
+		Settings.MouseSensitivity = From.MouseSensitivity;
+	}
+
+	/** What the first save of a scenario saw, captured from inside the OnChanged broadcast. */
+	struct FSaveWitness
+	{
+		int32 Saves = 0;
+		bool bLoadedAtFirstSave = false;
+		FKey JumpAtFirstSave;
+		FString JumpLineAtFirstSave;
+	};
+
+	FString LineFor(const TArray<FString>& Lines, const TCHAR* ConfigId)
+	{
+		const FString Prefix = FString(ConfigId) + TEXT("=");
+		for (const FString& Line : Lines)
+		{
+			if (Line.StartsWith(Prefix, ESearchCase::IgnoreCase))
+			{
+				return Line;
+			}
+		}
+		return FString();
+	}
+
+	bool KeysAreShippedDefaults(const UTraceUserSettings& Settings)
+	{
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			const FKey Alt = (Info.DefaultKeyAlt != nullptr) ? Info.DefaultKeyAlt() : FKey();
+			const FKey Pad = (Info.DefaultPadKey != nullptr) ? Info.DefaultPadKey() : FKey();
+			if (Settings.GetKey(Info.Action, 0) != Info.DefaultKey()
+				|| Settings.GetKey(Info.Action, 1) != Alt
+				|| Settings.GetPadKey(Info.Action) != Pad)
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	bool NothingBound(const UTraceUserSettings& Settings)
+	{
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+		{
+			if (Settings.GetKey(Info.Action, 0).IsValid() || Settings.GetKey(Info.Action, 1).IsValid()
+				|| Settings.GetPadKey(Info.Action).IsValid())
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+
+	void VerifyLoadoutMigration()
+	{
+		UTraceUserSettings& Settings = UTraceUserSettings::Get();
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[SettingsMigration] ===== does a stale-loadout migration keep the player's bindings? ====="));
+
+		FConfigSnapshot Original;
+		TakeSnapshot(Settings, Original);
+
+		int32 Checks = 0;
+		int32 Failures = 0;
+		const auto Check = [&Checks, &Failures](bool bOk, const FString& Claim)
+		{
+			++Checks;
+			if (bOk)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[SettingsMigration]   ok    %s"), *Claim);
+			}
+			else
+			{
+				++Failures;
+				UE_LOG(LogTraceGame, Error, TEXT("[SettingsMigration]   FAIL  %s"), *Claim);
+			}
+		};
+
+		// The witness is armed only while a scenario's Get() runs.
+		FSaveWitness Witness;
+		bool bWitnessArmed = false;
+		int32 SavesDuringRun = 0;
+		const FDelegateHandle Listener = UTraceUserSettings::OnChanged().AddLambda(
+			[&Witness, &bWitnessArmed, &SavesDuringRun, &Settings]()
+			{
+				++SavesDuringRun;
+				if (!bWitnessArmed)
+				{
+					return;
+				}
+				if (Witness.Saves == 0)
+				{
+					Witness.bLoadedAtFirstSave = FTraceUserSettingsMigrationProbe::IsLoaded(Settings);
+					Witness.JumpAtFirstSave = Settings.GetKey(ETraceInputAction::Jump, 0);
+					Witness.JumpLineAtFirstSave = LineFor(Settings.KeyBindings, TEXT("Jump"));
+				}
+				++Witness.Saves;
+			});
+
+		const auto RunFirstUse = [&Settings, &Witness, &bWitnessArmed]()
+		{
+			Witness = FSaveWitness();
+			FTraceUserSettingsMigrationProbe::Rewind(Settings);
+			bWitnessArmed = true;
+			UTraceUserSettings::Get();   // THE REAL ENTRY: bLoaded is false, so this is the first-use load
+			bWitnessArmed = false;
+		};
+
+		const float Sentinel = 2.25f;   // not the default, so "left alone" is visible
+
+		FTraceLoadout OldLoadout;
+		OldLoadout.Set(ETraceLoadoutSlot::Movement, ETraceAbilityId::JetBoots);
+		OldLoadout.Set(ETraceLoadoutSlot::Passive, ETraceAbilityId::Blasters);
+		OldLoadout.Set(ETraceLoadoutSlot::Activated, ETraceAbilityId::Ripple);
+
+		// ---- A: a returning player's pre-Demo-35 file, custom binds plus saved loadouts ----------
+		{
+			Settings.KeyBindings = { TEXT("Jump=F"), TEXT("Dash=G") };
+			Settings.PadKeyBindings = { TEXT("Jump=Gamepad_FaceButton_Top") };
+			Settings.SavedLoadouts = { OldLoadout, OldLoadout };
+			Settings.SavedLoadoutNames = { TEXT("OLD ONE"), TEXT("OLD TWO") };
+			Settings.SavedLoadoutVersion = 0;
+			Settings.BindingsRepairVersion = UTraceUserSettings::CurrentBindingsRepairVersion;
+			Settings.MouseSensitivity = Sentinel;
+
+			RunFirstUse();
+
+			Check(Settings.GetKey(ETraceInputAction::Jump, 0) == EKeys::F,
+				FString::Printf(TEXT("A: the file's JUMP=F survives the load (got '%s')"),
+					*UTraceUserSettings::DescribeKey(Settings.GetKey(ETraceInputAction::Jump, 0))));
+			Check(Settings.GetKey(ETraceInputAction::Dash, 0) == EKeys::G,
+				TEXT("A: the file's DASH=G survives the load"));
+			Check(Settings.GetPadKey(ETraceInputAction::Jump) == EKeys::Gamepad_FaceButton_Top,
+				TEXT("A: the file's pad JUMP=Y survives the load"));
+			Check(Settings.GetKey(ETraceInputAction::MoveForward, 0) == EKeys::W,
+				TEXT("A: an action the file does not name is on its default (W)"));
+			Check(Settings.SavedLoadouts.Num() == 0 && Settings.SavedLoadoutNames.Num() == 0,
+				TEXT("A: the pre-Demo-35 saved loadouts and their names are discarded"));
+			Check(Settings.SavedLoadoutVersion == UTraceUserSettings::CurrentSavedLoadoutVersion,
+				TEXT("A: the file is marked as current-vocabulary"));
+			Check(Witness.Saves == 1,
+				FString::Printf(TEXT("A: the discard is saved exactly once (saved %d time(s))"), Witness.Saves));
+			Check(Witness.Saves > 0 && Witness.bLoadedAtFirstSave,
+				TEXT("A: that save happens after the load finished, not in the middle of it"));
+			Check(Witness.Saves > 0 && Witness.JumpAtFirstSave == EKeys::F
+				&& Witness.JumpLineAtFirstSave.Equals(TEXT("Jump=F,None"), ESearchCase::IgnoreCase),
+				FString::Printf(TEXT("A: the save WRITES the player's binds (Jump line written: '%s')"),
+					*Witness.JumpLineAtFirstSave));
+			Check(FMath::IsNearlyEqual(Settings.MouseSensitivity, Sentinel),
+				TEXT("A: mouse sensitivity is untouched"));
+		}
+
+		// ---- B: a fresh install -------------------------------------------------------------------
+		{
+			Settings.KeyBindings.Reset();
+			Settings.PadKeyBindings.Reset();
+			Settings.SavedLoadouts.Reset();
+			Settings.SavedLoadoutNames.Reset();
+			Settings.SavedLoadoutVersion = 0;
+			Settings.BindingsRepairVersion = 0;
+			Settings.MouseSensitivity = UTraceUserSettings::DefaultSensitivity;
+
+			RunFirstUse();
+
+			Check(Witness.Saves == 0,
+				FString::Printf(TEXT("B: starting a fresh install writes no settings file (saved %d time(s))"),
+					Witness.Saves));
+			Check(KeysAreShippedDefaults(Settings),
+				TEXT("B: a fresh install has every shipped key and pad binding"));
+			Check(Settings.SavedLoadoutVersion == UTraceUserSettings::CurrentSavedLoadoutVersion,
+				TEXT("B: the in-memory library is current, so the first real save records it"));
+		}
+
+		// ---- C: a file the Demo 35 bug already wiped -----------------------------------------------
+		{
+			Settings.KeyBindings.Reset();
+			Settings.PadKeyBindings.Reset();
+			for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+			{
+				Settings.KeyBindings.Add(FString::Printf(TEXT("%s=None,None"), Info.ConfigId));
+				Settings.PadKeyBindings.Add(FString::Printf(TEXT("%s=None"), Info.ConfigId));
+			}
+			Settings.SavedLoadouts.Reset();
+			Settings.SavedLoadoutNames.Reset();
+			Settings.SavedLoadoutVersion = UTraceUserSettings::CurrentSavedLoadoutVersion;
+			Settings.BindingsRepairVersion = 0;
+			Settings.MouseSensitivity = Sentinel;
+
+			RunFirstUse();
+
+			Check(KeysAreShippedDefaults(Settings),
+				TEXT("C: a wiped file gets every default key and pad binding back"));
+			Check(FMath::IsNearlyEqual(Settings.MouseSensitivity, Sentinel),
+				TEXT("C: the repair leaves mouse sensitivity alone"));
+			Check(Witness.Saves == 1,
+				FString::Printf(TEXT("C: the repaired file is saved once (saved %d time(s))"), Witness.Saves));
+			Check(Settings.BindingsRepairVersion == UTraceUserSettings::CurrentBindingsRepairVersion,
+				TEXT("C: the file records that it has had the repair"));
+		}
+
+		// ---- D: the repair is one-shot --------------------------------------------------------------
+		{
+			// KeyBindings and PadKeyBindings are still the all-None lines from C.
+			Settings.KeyBindings.Reset();
+			Settings.PadKeyBindings.Reset();
+			for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+			{
+				Settings.KeyBindings.Add(FString::Printf(TEXT("%s=None,None"), Info.ConfigId));
+				Settings.PadKeyBindings.Add(FString::Printf(TEXT("%s=None"), Info.ConfigId));
+			}
+			Settings.BindingsRepairVersion = UTraceUserSettings::CurrentBindingsRepairVersion;
+
+			RunFirstUse();
+
+			Check(NothingBound(Settings),
+				TEXT("D: after the one repair, an all-unbound file is the player's choice and stays unbound"));
+			Check(Witness.Saves == 0,
+				FString::Printf(TEXT("D: and nothing is written (saved %d time(s))"), Witness.Saves));
+		}
+
+		// ---- Put everything back --------------------------------------------------------------------
+		//
+		// The config members first, then a normal load of them. The original versions are the current
+		// ones (the real first load already ran), so this load repairs nothing and saves nothing.
+		PutConfigBack(Settings, Original);
+		FTraceUserSettingsMigrationProbe::Rewind(Settings);
+		UTraceUserSettings::Get();
+
+		FConfigSnapshot After;
+		TakeSnapshot(Settings, After);
+		int32 NotRestored = 0;
+		for (int32 Index = 0; Index < Original.Keys.Num(); ++Index)
+		{
+			NotRestored += (After.Keys.IsValidIndex(Index) && After.Keys[Index] == Original.Keys[Index]) ? 0 : 1;
+		}
+		for (int32 Index = 0; Index < Original.PadKeys.Num(); ++Index)
+		{
+			NotRestored += (After.PadKeys.IsValidIndex(Index) && After.PadKeys[Index] == Original.PadKeys[Index]) ? 0 : 1;
+		}
+		Check(NotRestored == 0,
+			FString::Printf(TEXT("every binding this command touched is back as it was (%d slot(s) differ)"),
+				NotRestored));
+
+		// The scenarios above wrote the fixture to disk. Write the real settings back over it.
+		if (SavesDuringRun > 0)
+		{
+			Settings.Save();
+		}
+
+		UTraceUserSettings::OnChanged().Remove(Listener);
+
+		if (Failures == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[SettingsMigration] VERDICT: PASS. %d check(s). Bindings survive a stale-loadout "
+				     "migration, a fresh install writes nothing, a wiped file is repaired once."), Checks);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[SettingsMigration] VERDICT: FAIL. %d of %d check(s) failed."), Failures, Checks);
+		}
+	}
+
+	FAutoConsoleCommand CmdVerifyLoadoutMigration(
+		TEXT("Trace.Settings.VerifyLoadoutMigration"),
+		TEXT("Drives the settings object's first-use load over four fixture files: a pre-Demo-35 file ")
+		TEXT("with custom binds and saved loadouts, a fresh install, a file the Demo 35 load order ")
+		TEXT("wiped, and the same file after its one repair. Restores the real settings and re-saves them."),
+		FConsoleCommandDelegate::CreateStatic(&VerifyLoadoutMigration));
 }
 
 #endif // !UE_BUILD_SHIPPING
