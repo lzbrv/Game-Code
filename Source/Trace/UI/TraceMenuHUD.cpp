@@ -612,10 +612,12 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 		? FString(TRACE_TEXT("MENU.FOOTER_PAD_KEYS", "D-PAD   MOVE          A   SELECT          B   BACK"))
 		: FString();
 
-	// WP8.1 — the address prints in TWO places (the chip above, and the JOIN modal's "THIS MACHINE
-	// IS"), not five. This hint used to end "... AND TYPE YOUR ADDRESS ABOVE", which was repetition
-	// number four; the chip it pointed at is right there.
-	OutView.FooterHint = TRACE_TEXT("MENU.FOOTER_HINT", "PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE");
+	// THE HINT LINE IS EMPTY, and stays in the view rather than being deleted. It read "PLAY ALSO
+	// HOSTS - EVERY MATCH IS JOINABLE", which the PLAY blurb directly above it already says; the
+	// co-developer's text pass removed it. Emptied, not deleted, for the same two reasons as
+	// FooterKeys above: FooterHintText is a required BindWidget, and an empty string still measures
+	// as one line box, so PlaceFooterBelowBlurb places the footer stack exactly where it was.
+	OutView.FooterHint = FString();
 
 	// WP8.2 — the version AND the network compatibility code, bottom-right. The widget draws it
 	// because this Canvas cannot reach a UMG frame (AHUD's canvas composites under Slate); the Canvas
@@ -3028,13 +3030,11 @@ void ATraceMenuHUD::DrawJoinPrompt()
 		DrawTextCentered(Keys, TraceMenuStyle::InkDim, CX, PanelY + PanelH - (66.f * UIScale), FontSmall, KeysScale);
 	}
 
-	// ---- D32-PADMENU — what a controller can and cannot do at a text field ------------------------
+	// ---- D32-PADMENU — what a controller can do at a text field -----------------------------------
 	//
-	// Two lines, and the second one is the important one: it is the difference between a player
-	// concluding the pad is broken and a player knowing to reach for a keyboard. Only drawn once a
-	// controller has been seen (ShouldShowPadHints), so a keyboard-only player never reads either.
-	//
-	// It takes the "THIS MACHINE IS" line's slot rather than adding a third — see the else arm below.
+	// Only drawn once a controller has been seen (ShouldShowPadHints), so a keyboard-only player never
+	// reads it. It takes the "THIS MACHINE IS" line's slot rather than adding another — see the else
+	// arm below.
 	if (ShouldShowPadHints())
 	{
 		const FString PadKeys = TRACE_TEXT("MENU.JOIN_PAD_KEYS", "A   CONNECT          B   CANCEL          X   PASTE");
@@ -3044,28 +3044,20 @@ void ATraceMenuHUD::DrawJoinPrompt()
 		{
 			PadScale *= FMath::Max(0.72f, HintRoom / PadNatural);
 		}
-		DrawTextCentered(PadKeys, TraceMenuStyle::Cyan, CX, PanelY + PanelH - (46.f * UIScale), FontSmall, PadScale);
-
-		const FString PadNote = TRACE_TEXT("MENU.JOIN_PAD_TYPING_NOTE", "TYPING A NEW ADDRESS NEEDS A KEYBOARD");
-		float NoteScale = 0.92f * UIScale;
-		const float NoteNatural = MeasureWidth(PadNote, FontSmall, NoteScale);
-		if (NoteNatural > HintRoom && NoteNatural > 1.f)
-		{
-			NoteScale *= FMath::Max(0.72f, HintRoom / NoteNatural);
-		}
-		DrawTextCentered(PadNote, TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.7f),
-			CX, PanelY + PanelH - (26.f * UIScale), FontSmall, NoteScale);
+		// ONE LINE, on the baseline the keyboard arm's "THIS MACHINE IS" uses, so the panel reads the
+		// same with either device. There was a second line under it, "TYPING A NEW ADDRESS NEEDS A
+		// KEYBOARD"; the co-developer's text pass removed it.
+		DrawTextCentered(PadKeys, TraceMenuStyle::Cyan, CX, PanelY + PanelH - (40.f * UIScale), FontSmall, PadScale);
 	}
 	// Deliberately repeated here as well as on the title screen behind it. Somebody in this prompt is
 	// mid-conversation with the person they are trying to reach, and "what's yours?" is the very next
 	// question — having it on screen saves a round trip through Escape. Same fit guard: a long
 	// tailscale hostname is exactly the string that does not fit a 900 px panel.
 	//
-	// D32-PADMENU MADE THIS AN ELSE ARM rather than adding a third block. The panel has room for two
-	// lines under the key legend, and this is the one of the three that is a REPEAT — the title
-	// screen's own address chip is directly behind this scrim. A player holding a controller is not
-	// the player about to read their hostname down a call, so on a machine where a pad has been seen
-	// the captions win. Both arms draw exactly two lines, so nothing above them moves either way.
+	// D32-PADMENU MADE THIS AN ELSE ARM rather than adding another block. This line is a REPEAT —
+	// the title screen's own address chip is directly behind this scrim — and a player holding a
+	// controller is not the player about to read their hostname down a call, so on a machine where a
+	// pad has been seen the pad's buttons win. Both arms draw one line on the same baseline.
 	else
 	{
 		const FString Machine = TRACE_TEXTF("MENU.JOIN_THIS_MACHINE", "THIS MACHINE IS {0}", { TraceNet::GetHostEndpoint() });
@@ -3144,9 +3136,9 @@ void ATraceMenuHUD::DrawMenuRows()
 FString ATraceMenuHUD::BuildBlurb() const
 {
 	// One line of plain English under the rows, so "EASY" and "MODE B" mean something before you
-	// commit to them. It describes whichever row is SELECTED — every row now has something worth
-	// saying, and the two multiplayer rows have the most: PLAY silently became "host a server", and
-	// a player who is not told that will keep asking somebody else to host.
+	// commit to them. It describes whichever row is SELECTED, when that row has something worth
+	// saying — the two multiplayer rows have the most: PLAY silently became "host a server", and a
+	// player who is not told that will keep asking somebody else to host.
 	switch (Selected)
 	{
 	case ETraceMenuRow::Play:
@@ -3160,24 +3152,25 @@ FString ATraceMenuHUD::BuildBlurb() const
 			: TRACE_TEXTF("MENU.BLURB_JOIN_REMEMBERED",
 				"CONNECT TO SOMEBODY ELSE'S GAME.  ENTER RECONNECTS TO {0}.", { LastJoinAddress });
 
+	// PRACTICE, SETTINGS AND QUIT SAY NOTHING.
+	//
+	// QUIT (D30): "CLOSE TRACE." was the "close trace" in the owner's "remove the text at the bottom:
+	// close trace, w/s...", the one blurb that only said its own row's label back. PRACTICE's and
+	// SETTINGS' sentences were removed by the co-developer's text pass (SETTINGS' was out of date as
+	// well: that page has long since had video, crosshair, loadouts, audio and controller doors).
+	//
+	// EMPTY, not a deleted case: both renderers place the footer under the blurb's MEASURED bottom,
+	// and both measure an empty string as one line box (ATraceMenuHUD::MeasureHeight ignores the text
+	// outright; TraceText::Measure splits "" into one empty line). Returning nothing therefore leaves
+	// the footer exactly where it is instead of letting it jump a line as the selection moves.
+	//
+	// A plain empty string rather than a lookup with an empty default: those keys would only ever
+	// hold nothing, and the co-developer deleted their lines, so they are not registered at all — a
+	// dump will not write empty BLURB_* lines back into his file.
 	case ETraceMenuRow::Practice:
-		return TRACE_TEXT("MENU.BLURB_PRACTICE", "ALONE IN THE ARENA WITH FIVE DUMMIES.  NO MATCH, NO CLOCK, NO SCORE.");
-
 	case ETraceMenuRow::Settings:
-		return TRACE_TEXT("MENU.BLURB_SETTINGS", "MOUSE SENSITIVITY, INVERT Y AND EVERY KEY BINDING.");
-
 	case ETraceMenuRow::Quit:
-		// D30 — deliberately blank. "CLOSE TRACE." is the "close trace" in the owner's "remove the
-		// text at the bottom: close trace, w/s...", and it is the one blurb in this switch that only
-		// said its own row's label back. Every other case earns its line by saying something the
-		// label does not (PLAY silently hosts; JOIN remembers an address; PRACTICE has no clock).
-		//
-		// EMPTY, not a deleted case: both renderers place the footer under the blurb's MEASURED
-		// bottom, and both measure an empty string as one line box (ATraceMenuHUD::MeasureHeight
-		// ignores the text outright; TraceText::Measure splits "" into one empty line). Returning
-		// nothing therefore leaves the footer exactly where it is instead of letting it jump a line
-		// whenever QUIT happens to be the selected row.
-		return TRACE_TEXT("MENU.BLURB_QUIT", "");
+		return FString();
 
 	default:
 		return TraceMenuStyle::DifficultyBlurb(Difficulty);
@@ -3362,12 +3355,12 @@ void ATraceMenuHUD::DrawFooter()
 	const float CX = ViewW * 0.5f;
 
 	// D30 — THE KEYBOARD KEY LEGEND IS GONE. The line that used to sit on the first baseline
-	// ("W / S OR ARROWS MOVE ... ESC QUIT") was removed at the owner's request; the hint under it
-	// remains. The MATHS below is deliberately untouched — Y is still that first line's position and
-	// the hint is still drawn one 24px line under it — because the UMG twin
-	// (UTraceTitleMenuWidget::PlaceFooterBelowBlurb) lays its hint out at exactly KeysY +
-	// FooterLineGap and the two renderers have to keep landing in the same place. Emptying the
-	// string on one side and moving the line on the other is how they would drift apart.
+	// ("W / S OR ARROWS MOVE ... ESC QUIT") was removed at the owner's request, and the hint line
+	// under it has since been removed too (see the end of this function). The MATHS below is
+	// deliberately untouched — Y is still that first line's position — because the UMG twin
+	// (UTraceTitleMenuWidget::PlaceFooterBelowBlurb) lays its footer out at exactly KeysY, and the two
+	// renderers have to keep landing in the same place. Emptying a string on one side and moving the
+	// line on the other is how they would drift apart.
 	//
 	// D32-PADMENU — THE FOOTER IS THEREFORE ONE LINE OR TWO, AND THE SECOND ONE IS THE PAD'S. Y is no
 	// longer a vacant baseline: on a machine where a controller has been seen it carries D-PAD / A / B,
@@ -3403,40 +3396,34 @@ void ATraceMenuHUD::DrawFooter()
 		Y = FMath::Max(Y, BlurbBottomY + MinGap);
 	}
 
-	// Never off the bottom edge: the hint sits 24px under Y and still needs its own height. If the
-	// panel is so tall that even this cannot fit, the hint wins and the blurb is what gets
-	// overlapped — the blurb repeats itself every time the selection moves, the hint does not.
+	// Never off the bottom edge. The 46px floor was sized for the hint line that sat 24px under Y and
+	// is kept so the pad legend does not move; if the panel is so tall that even this cannot fit, the
+	// footer wins and the blurb is what gets overlapped.
 	Y = FMath::Min(Y, ViewH - (46.f * UIScale));
-
-	// The grid runs all the way to the bottom edge, so the hint gets its own dark strip. Same
-	// reasoning as the console panel above: legibility beats atmosphere every time. It hugs the one
-	// remaining line by the same 22px it used to give the key legend, rather than keeping a band
-	// sized for two lines with a blank row at the top of it.
-	const float HintY = Y + (24.f * UIScale);
 
 	// D32-PADMENU — the pad legend goes on the baseline the deleted keyboard legend used to hold (Y),
 	// which is exactly the slot the UMG twin keeps for it (BuildMenuView's FooterKeys). Drawn only
-	// once a controller has been seen; see ShouldShowPadHints.
+	// once a controller has been seen; see ShouldShowPadHints. The grid runs all the way to the
+	// bottom edge, so it gets its own dark strip, hugging the line by 22px — legibility beats
+	// atmosphere every time.
 	//
-	// THE BAND HAS TO GROW WITH IT. It is sized to hug whatever the TOPMOST footer line is, and with
-	// the pad line present that is Y rather than HintY — without this the caption would sit two
-	// pixels above the dark strip, on the grid, where it is unreadable. Same 22px hug either way.
-	const bool bPadLegend = ShouldShowPadHints();
-	const float TopLineY = bPadLegend ? Y : HintY;
-	const float BandY = TopLineY - (22.f * UIScale);
+	// THE HINT LINE THAT USED TO SIT 24px UNDER Y IS GONE: the co-developer's text pass removed "PLAY
+	// ALSO HOSTS - EVERY MATCH IS JOINABLE", which the PLAY blurb already says. So the strip now exists
+	// only for the pad legend — a dark band with nothing in it would be exactly the empty chrome a
+	// removed line must not leave behind — and on a keyboard-only machine this footer draws nothing,
+	// like the UMG twin, which never had a band.
+	const FString& PadLegend = TRACE_TEXT("MENU.FOOTER_PAD_KEYS", "D-PAD   MOVE          A   SELECT          B   BACK");
+	const bool bPadLegend = ShouldShowPadHints() && !PadLegend.IsEmpty();
+	if (!bPadLegend)
+	{
+		return;
+	}
+
+	const float BandY = Y - (22.f * UIScale);
 	DrawRect(FLinearColor(0.004f, 0.014f, 0.026f, 0.92f), 0.f, BandY, ViewW, ViewH - BandY);
 	DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.24f), 0.f, BandY, ViewW, FMath::Max(1.f, 1.f * UIScale));
 
-	if (bPadLegend)
-	{
-		DrawTextCentered(TRACE_TEXT("MENU.FOOTER_PAD_KEYS", "D-PAD   MOVE          A   SELECT          B   BACK"),
-			TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.75f), CX, Y, FontSmall, 1.f * UIScale);
-	}
-
-	// WP8.1 — no address repetition here any more; the chip under the tagline is the one source.
-	DrawTextCentered(TRACE_TEXT("MENU.FOOTER_HINT", "PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE"),
-		TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.6f),
-		CX, HintY, FontSmall, 1.f * UIScale);
+	DrawTextCentered(PadLegend, TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.75f), CX, Y, FontSmall, 1.f * UIScale);
 }
 
 void ATraceMenuHUD::DrawVersionString()

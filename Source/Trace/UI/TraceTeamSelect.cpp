@@ -71,8 +71,8 @@ namespace TraceTeamSelectStyle
  * exactly like TraceSelectLayout in the character select.
  *
  * The vertical budget adds up to 1080:
- *   34..104 title and countdown | 128 the rule line | 190..760 the two plates | 812 the verdict line
- *   | 900 the footer controls.
+ *   34..104 title and countdown | 190..760 the two plates | 812 the verdict line | 900 the footer
+ *   controls. (128 held a rule sentence until the co-developer's text pass removed it.)
  */
 namespace TraceTeamSelectLayout
 {
@@ -80,7 +80,6 @@ namespace TraceTeamSelectLayout
 	constexpr float HeaderTop   = 34.f;
 	constexpr float TitleSize   = 42.f;
 	constexpr float TitleTrack  = 7.0f;
-	constexpr float SubY        = 128.f;
 
 	constexpr float PlateTop    = 190.f;
 	constexpr float PlateH      = 570.f;
@@ -718,14 +717,10 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 			SizeLabel * S, TrackLabel * S, TraceText::EHAlign::Right);
 	}
 
-	// ---- The rule, said out loud ----------------------------------------------------------------
-	//
-	// The balance rule refuses things, and a refusal a player was never warned about reads as a bug.
-	// One line, always on screen, in the same words the refusal uses.
-	TraceTeamSelectFile::Text(HUD,
-		TRACE_TEXT("TEAMSELECT.RULE",
-			"A SWITCH IS REFUSED IF IT WOULD LEAVE ONE SIDE MORE THAN ONE PLAYER LARGER. A BOT WILL STAND DOWN FOR YOU."),
-		InkDim, CenterX, SubY * S, SizeLabel * S, TrackLabel * S, TraceText::EHAlign::Center);
+	// NO RULE LINE UNDER THE TITLE. It spelled out the balance rule in two sentences across the whole
+	// width; the co-developer's text pass removed it. A refusal still explains itself at the moment it
+	// happens — the verdict line below turns red with "REFUSED - UNEVEN TEAMS" — which is when the
+	// player needs it.
 
 	// ---- The two plates -------------------------------------------------------------------------
 	const float AvailW = ViewW - (2.f * Margin * S) - (PlateGap * S);

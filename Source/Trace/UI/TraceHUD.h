@@ -235,13 +235,11 @@ protected:
 	void DrawThrowChargeRing();
 
 	/**
-	 * True when DrawThrowChargeRing() will draw this frame. ONE definition, read by two passes.
+	 * True when DrawThrowChargeRing() will draw this frame. ONE definition.
 	 *
-	 * DrawCrosshair() needs it as well as DrawThrowChargeRing() does, because both write a caption
-	 * under the reticle and the ring's has to win. Measured, not theorised: the first armed capture
-	 * of the ring photographed "52%  -  POWER 66%" printed directly on top of "LMB  -  THROW", which
-	 * was unreadable. DrawCrosshair already suppresses itself the same way for the pass ring; this is
-	 * the same rule for the same reason.
+	 * DrawCrosshair() used to ask it too, because it wrote an "LMB  -  THROW" caption on the same
+	 * pixel row as the ring's "52%  -  POWER 66%" and the ring's had to win. That caption has since
+	 * been removed (the co-developer's text pass), so only the ring itself asks now.
 	 */
 	bool IsThrowChargeRingUp() const;
 

@@ -193,8 +193,8 @@ namespace TraceSelectStyle
  * Mortimer's overflows.
  *
  * The vertical budget adds up to 1080:
- *   34 top margin | 34..104 title, team chip and countdown | 106..143 rule, countdown bar, the screen's
- *   rule line | 156..566 the grid (two rows of 196) | 592..928 the detail panel | 958..1020 the footer
+ *   34 top margin | 34..104 title, team chip and countdown | 106..117 rule and countdown bar
+ *   | 156..566 the grid (two rows of 196) | 592..928 the detail panel | 958..1020 the footer
  *   controls and the server's verdict | the rest is bottom margin.
  */
 namespace TraceSelectLayout
@@ -207,7 +207,6 @@ namespace TraceSelectLayout
 	constexpr float RuleY       = 106.f;
 	constexpr float BarY        = 112.f;
 	constexpr float BarH        = 5.f;
-	constexpr float SubY        = 128.f;
 
 	constexpr float GridTop     = 156.f;
 	constexpr float TileH       = 196.f;
@@ -2685,13 +2684,10 @@ void FTraceCharacterSelect::Draw(AHUD* HUD, ATracePlayerState* LocalState)
 			Margin, BarY, InnerW * Fraction, BarH);
 	}
 
-	// The rule of the screen, in sentence case and at micro-copy size. It is guidance, not a heading,
-	// and setting it as one was part of what made the old screen read as an undifferentiated wall.
-	TraceCharacterSelectType::DrawCentered(HUD,
-		TRACE_TEXT("CHARSELECT.RULE",
-			"Nobody on your team may take the same character. The enemy may mirror your pick."),
-		TraceSelectStyle::InkDim, CenterX, TraceSelectLayout::SubY * S, nullptr,
-		TraceSelectLayout::SizeBody * 0.88f * S, 0.f);
+	// No rule sentence under the countdown. It read "Nobody on your team may take the same character.
+	// The enemy may mirror your pick."; the co-developer removed it (first by emptying its line, then
+	// by deleting the line, which brought it back — deleting never removed text). A taken tile is
+	// already drawn as taken.
 
 	// ---- The ten identity tiles ------------------------------------------------------------------
 	const float TileGapX = TraceSelectLayout::TileGapX * S;

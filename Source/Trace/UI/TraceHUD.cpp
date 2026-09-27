@@ -1536,8 +1536,8 @@ void ATraceHUD::DrawCrosshair()
 	//
 	//   THERE IS ALWAYS A CROSSHAIR AT THE EXACT CENTRE OF THE SCREEN, IN BOTH CAMERA MODES.
 	//
-	// The pass state is LAYERED ON TOP of it — brackets that close around it, a colour change, a
-	// caption — instead of replacing it. Three layers, back to front:
+	// The pass state is LAYERED ON TOP of it — brackets that close around it and a colour change —
+	// instead of replacing it. Three layers, back to front:
 	//
 	//   1. the centre crosshair          — always, both modes, never fades below full strength;
 	//   2. the pass brackets             — third person only, CONCENTRIC with the centre crosshair,
@@ -1699,22 +1699,12 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 
 	const bool bLocked = HoveredPassTarget.IsValid();
 
-	// Cooldown state is worth its own colour: a player hovering a teammate and wondering why nothing
-	// happens is exactly the confusion this reticle exists to remove.
-	//
-	// Gated on actually being the carrier: the cooldown is a property of the CORE, not of a player,
-	// so the teammate who just received a pass inherits the tail of it — and telling someone who is
-	// not holding anything that their pass is not ready would be noise.
-	ATraceCore* Core = (TraceGS != nullptr) ? TraceGS->Core : nullptr;
-	const float CooldownRemaining = (Core != nullptr) ? Core->GetPassCooldownRemaining() : 0.f;
-	const bool bOnCooldown = bLocalCarrying && (CooldownRemaining > TraceHUDStyle::TimeEpsilon);
-
+	// NO COOLDOWN RED ANY MORE. The brackets went red, with "THROW READY IN x.x" under them, while
+	// ATraceCore::GetPassCooldownRemaining() was positive — and that clock is only ever started by a
+	// GrantTo(..., Pass), which after the hover-pass was removed only the test harnesses issue. In a
+	// real match the tint and the caption could not appear, so both went, with the caption's text.
 	FLinearColor Base = TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.72f);
-	if (bOnCooldown)
-	{
-		Base = TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, 0.75f);
-	}
-	else if (bLocked)
+	if (bLocked)
 	{
 		// Team coloured and lifted toward white: a pass is the one action whose whole point is the
 		// teammate on the other end of it, so the lock wears the team's colour.
@@ -1790,57 +1780,14 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 		}
 	}
 
-	// ---- Caption ---------------------------------------------------------------------------------
+	// ---- NO CAPTION --------------------------------------------------------------------------------
 	//
-	// Suppressed once the hold has started: DrawPassProgress owns the ring and the word PASSING at
-	// that point, and two captions on the same pixel is how a HUD starts overlapping itself.
-	const bool bPassing = (TracePC != nullptr) && (TracePC->GetPassProgress() >= 0.f);
-	if (bPassing)
-	{
-		return;
-	}
-
-	// Spec v16 §2 — the same rule for the throw charge, and it is not a style call. The ring writes
-	// "62%  -  POWER 72%" on this exact pixel row, and the first armed capture photographed it
-	// printed straight through "LMB  -  THROW" into an unreadable smear. Whichever ring is up owns
-	// the caption; the crosshair goes quiet.
-	if (IsThrowChargeRingUp())
-	{
-		return;
-	}
-
-	FString Caption;
-	FLinearColor CaptionColor = TraceHUDStyle::InkDim;
-
-	// ---- THE CAPTION IS THE CONTROL SCHEME -------------------------------------------------------
-	//
-	// Spec v4 §7: "The carrier should be able to throw the core forward by left clicking." There is
-	// no receiver to acquire, no hold, and no teammate to name — the throw goes where the crosshair
-	// points and the first player to reach it, either team, takes it.
-	//
-	// THE OTHER HALF OF THIS FUNCTION IS GONE WITH THE ENDZONE RULESET. It wrote "PASS READY IN x"
-	// or "HOLD TO PASS - <RECEIVER>", naming the receiver because in a 5v5 with two teammates
-	// overlapping on screen "which one" is a real question and the Core picked whoever was nearest
-	// the crosshair. There is no hover-pass to caption now, so the throw arm — which was already
-	// taken first, before any of that receiver logic could put a teammate's name under a reticle
-	// that does not aim at teammates — is the whole of it.
-	if (bOnCooldown)
-	{
-		Caption = TRACE_TEXTF("HUD.CROSSHAIR_THROW_READY_IN", "THROW READY IN {0}",
-			{ FString::Printf(TEXT("%.1f"), CooldownRemaining) });
-		CaptionColor = TraceHUDStyle::Danger;
-	}
-	else if (bLocalCarrying)
-	{
-		Caption = TRACE_TEXT("HUD.CROSSHAIR_LMB_THROW", "LMB  -  THROW");
-		CaptionColor = TraceHUDStyle::Shade(TraceTeamColor(LocalTeam), 1.0f, 0.35f);
-	}
-
-	if (!Caption.IsEmpty())
-	{
-		DrawTextCentered(Caption, TraceHUDStyle::WithAlpha(CaptionColor, Visibility),
-			X, Y + Radius + (14.f * UIScale), FontSmall, UIScale);
-	}
+	// This wrote "LMB  -  THROW" under the brackets for as long as the Core was held (and "THROW READY
+	// IN x.x" on a pass cooldown real play never starts). The co-developer's text pass removed both
+	// lines, together with the "YOU HAVE THE CORE - LMB THROWS" banner: the carrier is in third person
+	// holding the Core, the WEAPON row is dimmed, and LMB is the button they were already pressing to
+	// shoot. The "LMB" was also hard-coded — THROW / PASS CORE is rebindable, so after a rebind the
+	// caption named the wrong key. The throw charge ring still writes its own power readout here.
 }
 
 void ATraceHUD::DrawPassProgress()
@@ -2475,6 +2422,10 @@ void ATraceHUD::DrawAbilityToast(float TopY, float Margin, float RowH)
 	const float Alpha = FMath::Clamp((ToastSeconds - Age) / FadeSeconds, 0.f, 1.f);
 
 	const FString Label = ToastText.ToString();
+	if (Label.IsEmpty())
+	{
+		return;   // a toast whose line the document removed: no words, so no chip
+	}
 	const float ChipH = FMath::Max(RowH * 1.8f, 20.f * UIScale);
 	const float PadX = 10.f * UIScale;
 	const float ChipW = MeasureWidth(Label, FontSmall, UIScale) + PadX * 2.f;
@@ -2809,8 +2760,9 @@ void ATraceHUD::DrawHealthAndDash()
 		const float Cooling = TraceMelee::GetSwingCooldownRemaining(LocalChar);
 
 		// The CARRIER's weapon is stowed, not held: they cannot shoot and cannot swing, and saying
-		// "KNIFE" to somebody whose knife does nothing is the same lie the SHIELD DOWN callout exists
-		// to avoid. They get the row, but it says what is actually true.
+		// "KNIFE" to somebody whose knife does nothing would be a lie. They keep the row — dimmed
+		// label, 35% dim meter, so nothing below it moves — and it names NO weapon. It used to read
+		// "STOWED"; the co-developer's text pass removed that word, and the dim row says it already.
 		// *** SPEC v29 §5 — THERE ARE THREE WEAPON STATES NOW, SO THIS ROW NAMES THREE. ***
 		// It said KNIFE or GUN, which was a complete answer while the selector had two reachable
 		// values. v28 §9 added the SMG (so "GUN" covered two different weapons with different damage,
@@ -2819,7 +2771,7 @@ void ATraceHUD::DrawHealthAndDash()
 		// leaving the screen says it, and this row is the second, unambiguous confirmation.
 		const bool bSmgOut = TraceMelee::IsWeaponEquipped(LocalChar, ETraceEquippedWeapon::Smg);
 		const FString WeaponText = bLocalCarrying
-			? TRACE_TEXT("HUD.WEAPON_STOWED", "STOWED")
+			? FString()
 			: (bKnife ? TRACE_TEXT("HUD.WEAPON_KNIFE", "KNIFE")
 			          : (bSmgOut ? TRACE_TEXT("HUD.WEAPON_SMG", "SMG")
 			                     : TRACE_TEXT("HUD.WEAPON_PISTOL", "PISTOL")));
@@ -2856,7 +2808,9 @@ void ATraceHUD::DrawHealthAndDash()
 				                                                : ETraceEquippedWeapon::Gun)));
 			Fraction = FMath::Clamp(1.f - (Deploy / SwapTotal), 0.f, 1.f);
 			WeaponColor = TraceHUDStyle::Shade(TeamTint, 0.45f, 0.0f);
-			StatusText = TRACE_TEXTF("HUD.WEAPON_DRAWING", "{0}  DRAWING", { WeaponText });
+			// The caption stays the weapon's NAME while it is drawn. It used to flicker to
+			// "PISTOL  DRAWING" for the 0.13-0.2 s of the pullout; the co-developer's text pass removed
+			// that word, and the darker meter filling from empty already says it.
 		}
 		else if (bKnife && !bLocalCarrying && Cooling > TraceHUDStyle::TimeEpsilon)
 		{
@@ -2874,9 +2828,12 @@ void ATraceHUD::DrawHealthAndDash()
 
 		DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, Fraction, WeaponColor);
 
-		DrawTextLeft(StatusText, TraceHUDStyle::InkDim,
-			Margin + BarW + (10.f * UIScale),
-			VCenterTextY(StatusText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+		if (!StatusText.IsEmpty())
+		{
+			DrawTextLeft(StatusText, TraceHUDStyle::InkDim,
+				Margin + BarW + (10.f * UIScale),
+				VCenterTextY(StatusText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+		}
 
 		RowY -= (RowH + RowGap);
 	}
@@ -3101,22 +3058,19 @@ void ATraceHUD::DrawHealthAndDash()
 		// Carrying the Core means bullets cannot touch you — the single most important piece of
 		// state a player can have, so it gets a callout right on the health bar.
 		//
-		// ...except during a pass. Spec §4: the moment a pass is input the shield DROPS, and telling
-		// the player they are invulnerable at the exact instant they stop being so would be the worst
-		// possible lie for this HUD to tell. The pass window has its own callout.
+		// ALWAYS "INVULNERABLE" NOW. There was a pulsing red "SHIELD DOWN" for the pass window, when
+		// the carrier's shield dropped; that window only opens from the removed hover-pass (the Core's
+		// bPassInputHeld has no writer) or a test harness, so in real play the carrier's shield is
+		// never down and that branch could not run. It went with its text.
 		if (bLocalCarrying)
 		{
-			const bool bPassing = (TracePC->GetPassProgress() >= 0.f);
-			const FString InvulnText = bPassing
-				? TRACE_TEXT("HUD.CARRIER_SHIELD_DOWN", "SHIELD DOWN")
-				: TRACE_TEXT("HUD.CARRIER_INVULNERABLE", "INVULNERABLE");
-			const FLinearColor InvulnColor = bPassing
-				? TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, 0.7f + 0.3f * FMath::Sin(Now * 12.f))
-				: TraceHUDStyle::Ink;
-
-			DrawTextLeft(InvulnText, InvulnColor,
-				Margin + (10.f * UIScale),
-				VCenterTextY(InvulnText, FontSmall, UIScale, HealthY, HealthH), FontSmall, UIScale);
+			const FString& InvulnText = TRACE_TEXT("HUD.CARRIER_INVULNERABLE", "INVULNERABLE");
+			if (!InvulnText.IsEmpty())
+			{
+				DrawTextLeft(InvulnText, TraceHUDStyle::Ink,
+					Margin + (10.f * UIScale),
+					VCenterTextY(InvulnText, FontSmall, UIScale, HealthY, HealthH), FontSmall, UIScale);
+			}
 		}
 	}
 }
@@ -3546,7 +3500,6 @@ namespace TraceHUDStatusStyle
 	static const FLinearColor Vulnerable (1.00f, 0.35f, 0.45f, 1.f);   // rose — X's mark
 	static const FLinearColor Chud       (1.00f, 0.80f, 0.30f, 1.f);   // armour gold
 	static const FLinearColor Suspend    (0.72f, 0.55f, 1.00f, 1.f);   // violet — Mace
-	static const FLinearColor Pull       (0.85f, 0.72f, 1.00f, 1.f);   // the same family: one ability
 
 	// ---- FX/AUDIO plan §7.3's four additions ----------------------------------------------------
 	//
@@ -4078,22 +4031,10 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 					Remaining / Total, TraceHUDStatusStyle::Suspend });
 			}
 
-			// THE PULL HAS NO CLOCK, so its draining indicator is DISTANCE — which is the pull's real
-			// progress and the only honest thing to drain here. Spec v16 §2 asks for "a duration
-			// readout OR a draining indicator"; inventing a fake timer to satisfy the first would
-			// have been a HUD that lies about a mechanic that ends on arrival, not on a stopwatch.
-			if (MaceSet->IsPulling())
-			{
-				const float ToAnchor = static_cast<float>(
-					FVector::Dist(LocalChar->GetActorLocation(), MaceSet->GetSpikeAnchorLocation()));
-				const float Range = FMath::Max(1.f, UTraceSettings::Get().MaceSpikeRangeUU);
-
-				OutState.Chips.Add({
-					TRACE_TEXT("HUD.STATUS_SPIKE_PULL", "SPIKE PULL"),
-					TRACE_TEXTF("HUD.STATUS_READOUT_METRES", "{0}m",
-						{ FString::Printf(TEXT("%.0f"), ToAnchor / 100.f) }),
-					FMath::Clamp(ToAnchor / Range, 0.f, 1.f), TraceHUDStatusStyle::Pull });
-			}
+			// NO CHIP FOR THE SPIKE PULL. It read "SPIKE PULL  12m" over a distance-drain bar; the
+			// co-developer's text pass removed its name, and a nameless chip holding a bare "12m" is
+			// not a status anybody can read. The pull shows itself — the rope, the motion — and it
+			// ends on arrival, not on a clock, so there is no countdown to lose with it.
 		}
 		else if (const UTraceAbilitySetChut* ChutSet = Cast<UTraceAbilitySetChut>(LocalSet))
 		{
@@ -4232,7 +4173,7 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 			// A HELD state therefore draws a FULL drain bar rather than an empty one. Spec v16 §2's
 			// rule is that "a bare icon that never changes is not a status display" — but an
 			// indicator draining to nothing while the state persists would be worse than bare, it
-			// would be wrong. Mace's SPIKE PULL solved the same problem by draining a DISTANCE;
+			// would be wrong. Mace's spike pull (whose chip has since been removed) drained a DISTANCE;
 			// there is no equivalent quantity here, so the honest answer is a full bar and the word
 			// HELD where the seconds would be.
 			if (SlimeSet->IsStuck())
@@ -4252,6 +4193,12 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 			}
 		}
 	}
+
+	// A CHIP WHOSE NAME THE DOCUMENT REMOVED IS NOT DRAWN AT ALL. "KEY =" is how a line is taken off
+	// the screen (see TraceGameText.h); a status chip is one line, and drawing its panel, tab and
+	// drain with no name in it would leave exactly the unlabelled box the removal was meant to get
+	// rid of. Done here, once, so the Canvas and UMG corners cannot disagree about it.
+	OutState.Chips.RemoveAll([](const FTraceHudCornerChip& Chip) { return Chip.Label.IsEmpty(); });
 
 	return true;
 }
@@ -4991,12 +4938,11 @@ void ATraceHUD::DrawCoreBanner()
 	}
 	else if (Carrier == LocalChar.Get())
 	{
-		// The banner is the one piece of HUD a carrier is guaranteed to be looking at, so it names the
-		// verb. Spec v4 §7 made LMB mean two different things while carrying — a 0.5 s hover-hold
-		// pass, or an outright throw — and this line picked between them. The hover-pass went with
-		// the endzone ruleset.
-		BannerText = TRACE_TEXT("HUD.BANNER_YOU_HAVE_CORE", "YOU HAVE THE CORE - LMB THROWS");
-		BannerColor = TraceTeamColor(LocalTeam);
+		// NO BANNER FOR THE CARRIER THEMSELVES. It read "YOU HAVE THE CORE - LMB THROWS", and the
+		// co-developer's text pass removed it: the carrier already knows — third-person camera, the
+		// Core in their hands, INVULNERABLE on the health bar — and the "LMB" was hard-coded against a
+		// rebindable key. Everybody else still gets "<TEAM> HAS THE CORE".
+		return;
 	}
 	else
 	{
@@ -5006,10 +4952,17 @@ void ATraceHUD::DrawCoreBanner()
 		BannerColor = TraceTeamColor(CarrierTeam);
 	}
 
-	// Pulse anything that demands a reaction: you are carrying it, an enemy is, or it is lying on
-	// the field and the next person to touch it owns the possession.
+	// A line the document removed ("KEY =") takes its shadow pill with it — a 32 px dark box with
+	// nothing in it is not a removal.
+	if (BannerText.IsEmpty())
+	{
+		return;
+	}
+
+	// Pulse anything that demands a reaction: an enemy has it, or it is lying on the field and the
+	// next person to touch it owns the possession. (The local carrier returned above.)
 	const bool bUrgent = (Carrier != nullptr)
-		? (Carrier == LocalChar.Get() || Carrier->GetTeam() != LocalTeam)
+		? (Carrier->GetTeam() != LocalTeam)
 		: Core->IsLoose();
 	if (bUrgent)
 	{
@@ -5791,6 +5744,10 @@ void ATraceHUD::DrawParryKillBanner()
 
 	const FString Line = TRACE_TEXTF("HUD.BANNER_PARRIED", "PARRIED - {0} DASHED YOUR TRACE",
 		{ VictimName.ToUpper() });
+	if (Line.IsEmpty())
+	{
+		return;   // removed in the document: no text, so no pill either
+	}
 
 	// Below the Core banner, above the crosshair: the carrier is looking at one or the other, and
 	// this must never sit on top of either.

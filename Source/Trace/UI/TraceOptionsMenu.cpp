@@ -1751,11 +1751,26 @@ void FTraceOptionsMenu::RebuildRows()
 {
 	Rows.Reset();
 
+	// A HEADER OR A NOTE WHOSE WORDS THE DOCUMENT REMOVED IS NOT A ROW. "KEY =" is how a line is
+	// taken off the screen (TraceGameText.h), and a note row with no words in it is still a full row
+	// pitch of nothing — exactly the gap the removal was meant to close. The blank spacer row a page
+	// WANTS (above RESET / BACK) is AddSpacer, so the two can never be confused.
 	auto AddHeader = [this](const TCHAR* Label)
 	{
+		if (Label == nullptr || *Label == TEXT('\0'))
+		{
+			return;
+		}
 		FRow Row;
 		Row.Kind = ERowKind::Header;
 		Row.Label = Label;
+		Rows.Add(MoveTemp(Row));
+	};
+
+	auto AddSpacer = [this]()
+	{
+		FRow Row;
+		Row.Kind = ERowKind::Header;
 		Rows.Add(MoveTemp(Row));
 	};
 
@@ -1770,6 +1785,10 @@ void FTraceOptionsMenu::RebuildRows()
 
 	auto AddNote = [this](const TCHAR* Label)
 	{
+		if (Label == nullptr || *Label == TEXT('\0'))
+		{
+			return;
+		}
 		FRow Row;
 		Row.Kind = ERowKind::Note;
 		Row.Label = Label;
@@ -1810,8 +1829,6 @@ void FTraceOptionsMenu::RebuildRows()
 		// above the mode, the resolution and all nine quality groups.
 		AddHeader(*TRACE_TEXT("OPTIONS.VIDEO.HDR_PERFORMANCE", "PERFORMANCE"));
 		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.VIDEO.ROW_RESOLUTION_SCALE", "RESOLUTION SCALE"), ESetting::ResolutionScale);
-		AddNote(*TRACE_TEXT("OPTIONS.VIDEO.NOTE_RESOLUTION_SCALE",
-			"THE BIGGEST WIN IF THE GAME RUNS SLOW. THIS FRAME IS LIMITED BY PIXELS."));
 		AddAction(*TRACE_TEXT("OPTIONS.VIDEO.ROW_AUTO_DETECT_QUALITY", "AUTO-DETECT QUALITY"), EAction::AutoDetectQuality);
 		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_OVERALL_QUALITY", "OVERALL QUALITY"), ESetting::OverallQuality);
 
@@ -1835,7 +1852,7 @@ void FTraceOptionsMenu::RebuildRows()
 		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_EFFECTS", "EFFECTS"), ESetting::QualityEffects);
 		AddValue(ERowKind::Choice, *TRACE_TEXT("OPTIONS.VIDEO.ROW_SHADING", "SHADING"), ESetting::QualityShading);
 
-		AddHeader(TEXT(""));
+		AddSpacer();
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetVideoDefaults);
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
@@ -1875,9 +1892,7 @@ void FTraceOptionsMenu::RebuildRows()
 			Rows.Add(MoveTemp(Row));
 		}
 
-		AddHeader(TEXT(""));
-		AddNote(*TRACE_TEXT("OPTIONS.LOADOUTS.NOTE",
-			"THESE ARE YOURS AND STAY ON THIS MACHINE. LOAD ONE WITH 1-5 ON THE LOADOUT SCREEN."));
+		AddSpacer();
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
 	else if (Page == EPage::Crosshair)
@@ -1904,13 +1919,7 @@ void FTraceOptionsMenu::RebuildRows()
 		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.CROSSHAIR.ROW_CENTRE_DOT", "CENTRE DOT"), ESetting::CrosshairDot);
 		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.CROSSHAIR.ROW_OUTLINE", "OUTLINE"), ESetting::CrosshairOutline);
 
-		// Not decoration. The preview beside this list draws at ACTUAL SIZE, which at 1080p is a cross
-		// about twenty pixels across sitting in a box ten times that — and a player who does not know
-		// it is 1:1 reads that as the preview being broken. The note is how they are told.
-		AddNote(*TRACE_TEXT("OPTIONS.CROSSHAIR.NOTE_PREVIEW_ACTUAL_SIZE",
-			"PREVIEW IS ACTUAL SIZE, OVER THE TWO SURFACES THE ARENA IS MADE OF."));
-
-		AddHeader(TEXT(""));
+		AddSpacer();
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetCrosshairDefaults);
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
@@ -1933,7 +1942,7 @@ void FTraceOptionsMenu::RebuildRows()
 		// (FX_AUDIO_PLAN §5.7). A note explaining an absence that is not there would be the exact
 		// mistake the original note was written to avoid, one release later.
 
-		AddHeader(TEXT(""));
+		AddSpacer();
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetAudioDefaults);
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
@@ -1946,21 +1955,18 @@ void FTraceOptionsMenu::RebuildRows()
 		// owner will report as broken — so the analog feel comes first, above every bind, and the
 		// binds are what a player scrolls down to once the thing feels right.
 		//
-		// MOVE AND LOOK HAVE NO BIND ROWS AT ALL, and the note says so rather than leaving a reader
-		// to wonder where they went. They are the two sticks, they are not per-action buttons, and
-		// there is nothing to rebind about them but the numbers immediately below.
+		// MOVE AND LOOK HAVE NO BIND ROWS AT ALL. They are the two sticks, they are not per-action
+		// buttons, and there is nothing to rebind about them but the numbers immediately below — the
+		// LOOK STICK / MOVE STICK headers say which is which. (A note spelling that out, and one
+		// explaining the dead zone, were removed by the co-developer's text pass.)
 		AddHeader(*TRACE_TEXT("OPTIONS.CONTROLLER.HDR_CONTROLLER", "CONTROLLER"));
 		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_CONTROLLER_INPUT", "CONTROLLER INPUT"), ESetting::PadEnabled);
-		AddNote(*TRACE_TEXT("OPTIONS.CONTROLLER.NOTE_STICKS",
-			"LEFT STICK MOVES, RIGHT STICK LOOKS. THE KEYBOARD AND MOUSE KEEP WORKING."));
 
 		AddHeader(*TRACE_TEXT("OPTIONS.CONTROLLER.HDR_LOOK_STICK", "LOOK STICK"));
 		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_LOOK_SPEED", "LOOK SPEED"),          ESetting::PadLookRate);
 		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_VERTICAL_SPEED", "VERTICAL SPEED"),      ESetting::PadLookYScale);
 		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_INVERT_LOOK_Y", "INVERT LOOK Y"),       ESetting::PadInvertY);
 		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_LOOK_DEAD_ZONE", "LOOK DEAD ZONE"),      ESetting::PadLookDeadzone);
-		AddNote(*TRACE_TEXT("OPTIONS.CONTROLLER.NOTE_DEAD_ZONE",
-			"RAISE THIS IF THE VIEW DRIFTS WHEN YOU ARE NOT TOUCHING THE STICK."));
 
 		AddHeader(*TRACE_TEXT("OPTIONS.CONTROLLER.HDR_MOVE_STICK", "MOVE STICK"));
 		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_MOVE_DEAD_ZONE", "MOVE DEAD ZONE"),      ESetting::PadMoveDeadzone);
@@ -1985,7 +1991,7 @@ void FTraceOptionsMenu::RebuildRows()
 			Rows.Add(MoveTemp(Row));
 		}
 
-		AddHeader(TEXT(""));
+		AddSpacer();
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetControllerDefaults);
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
@@ -2040,9 +2046,9 @@ void FTraceOptionsMenu::RebuildRows()
 		// the GAME is rather than how it is driven, and because the one thing a player is looking for
 		// when they come here about characters is the switch that turns them off.
 		//
-		// The note is not optional. This row cannot retro-apply to a match already being served by
-		// somebody else's machine, and a toggle that appears to do nothing is worse than no toggle —
-		// the player needs to be told it is a HOST setting and that it lands on the next match.
+		// It is a HOST setting and it lands on the NEXT match: it cannot retro-apply to a match already
+		// being served. A second note used to say so ("APPLIES TO MATCHES YOU HOST, FROM THE NEXT
+		// MATCH. GOALS MODE ONLY."); the co-developer's text pass removed it and kept the OFF note.
 		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_MATCH", "MATCH"));
 		// LABELLED "ABILITIES" NOW. The setting is unchanged and its key is unchanged — it is still the
 		// mode A switch — but what it turns off is abilities, and there are no characters left to name.
@@ -2050,8 +2056,6 @@ void FTraceOptionsMenu::RebuildRows()
 		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.SETTINGS.ROW_CHARACTERS", "ABILITIES"), ESetting::CharactersEnabled);
 		AddNote(*TRACE_TEXT("OPTIONS.SETTINGS.NOTE_CHARACTERS_OFF",
 			"OFF: EVERYONE PLAYS THE DEFAULT MANNEQUIN, NO ABILITIES, NO LOADOUT SCREEN."));
-		AddNote(*TRACE_TEXT("OPTIONS.SETTINGS.NOTE_CHARACTERS_HOST",
-			"APPLIES TO MATCHES YOU HOST, FROM THE NEXT MATCH. GOALS MODE ONLY."));
 
 		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_MOUSE", "MOUSE"));
 
@@ -2088,7 +2092,7 @@ void FTraceOptionsMenu::RebuildRows()
 			Rows.Add(MoveTemp(Row));
 		}
 
-		AddHeader(TEXT(""));
+		AddSpacer();
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetDefaults);
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
