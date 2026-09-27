@@ -203,6 +203,10 @@ namespace TraceMenuArtStyle
 	 * subtracted from under it, so on a page carrying both there were two identical blades and one of
 	 * them was the mouse pointer (UI QA finding 6b). The thumb is drawn as a vertical fader cap now;
 	 * see DrawSliderRow. A re-cut that produced a vertical thumb sprite would make this live again.
+	 *
+	 * The shared kit renderer (TraceMenuKit.h) can draw the blade as the kit's thumb —
+	 * TraceMenuKit::DrawSliderHandle — because the style spec names it as one. No screen calls it
+	 * yet; whoever does has to answer finding 6b first.
 	 */
 	static const TCHAR* const SliderTrack  = TEXT("/Game/Trace/UI/Art/T_MenuSliderTrack.T_MenuSliderTrack");
 	static const TCHAR* const SliderHandle = TEXT("/Game/Trace/UI/Art/T_MenuSliderHandle.T_MenuSliderHandle");
@@ -315,6 +319,28 @@ namespace TraceMenuArtStyle
 	 * §2.5). WordHover itself stays untouched above — it is the artist record this derives from.
 	 */
 	TRACE_API FLinearColor WordHoverLifted();
+
+	/**
+	 * The DISABLED plate's own two colours, sampled off T_MenuBtn_Disabled's plate on the sheet:
+	 * a near-black fill sRGB(13,14,14) inside a thin grey ring sRGB(67,67,67). The sprite carries
+	 * both; these are for anything that has to stand in for it (the kit's fallback rectangle when
+	 * the texture is not drawable yet — UI/Widgets/Menu/TraceMenuKit.h).
+	 */
+	static const FLinearColor DisabledFill = FLinearColor::FromSRGBColor(FColor(13, 14, 14));
+	static const FLinearColor DisabledRing = FLinearColor::FromSRGBColor(FColor(67, 67, 67));
+
+	/**
+	 * The VALUE BOX and SLIDER RAIL glow: GOLD, not the button's orange. Sheet peak sRGB(97,72,0) on
+	 * black. Baked into T_MenuValueBox and T_MenuSliderTrack; named here for anything drawn beside
+	 * them that has to match.
+	 */
+	static const FLinearColor ValueGlow = FLinearColor::FromSRGBColor(FColor(97, 72, 0));
+
+	/**
+	 * ValueGlow's HUE at full brightness: sRGB(97,72,0) -> sRGB(255,189,0), #FFBD00. The same stated
+	 * transformation as AmberLifted, for a flat shape drawn in the gold (a slider's fill, say).
+	 */
+	TRACE_API FLinearColor ValueGlowLifted();
 
 	// =============================================================================================
 	// 9-slice geometry, in SHEET pixels. Mirrored in Scripts/slice-ui-assets.py.

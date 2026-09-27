@@ -10,6 +10,7 @@
 #include "UObject/UObjectGlobals.h"
 
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
+#include "UI/Widgets/Menu/TraceMenuKit.h"   // TraceMenuKit::IsDrawable — the one render-resource guard
 
 // Named after the file for the unity/jumbo build; see Scripts/check-jumbo-build-collisions.py.
 namespace TraceCanvasTextFile
@@ -86,8 +87,15 @@ namespace TraceCanvasTextFile
 		// The sheet for THIS STYLE'S WEIGHT. The quads below come from a layout pass that used the
 		// same weight, so the cells and the sheet always match; asking for the default sheet here
 		// would address the right cells of the wrong ink and draw the whole string in light.
+		//
+		// DRAWABLE, not merely resourced: this used to test GetResource() alone, which is the guard that
+		// was MEASURED not to stop the render-thread crash on the menu sprites (the resource object
+		// exists straight after the load; its RHI texture arrives a frame or two later). The glyph
+		// sheets are handed to the canvas exactly the way those sprites were, so they get the same
+		// guard — the shared kit's. A sheet that is not drawable yet draws nothing for that frame,
+		// which is what a missing sheet already did.
 		UTexture2D* Atlas = TraceText::AtlasTexture(Style.Weight);
-		if (Surface == nullptr || Atlas == nullptr || Atlas->GetResource() == nullptr)
+		if (Surface == nullptr || !TraceMenuKit::IsDrawable(Atlas))
 		{
 			return 0.f;
 		}
@@ -106,7 +114,7 @@ namespace TraceCanvasTextFile
 			// dimensions. Sampling this string's own sheet for it would draw a smear of the wrong
 			// letters — see TraceText::QuadTexture, which is the only thing that decides.
 			UTexture2D* Sheet = TraceText::QuadTexture(Quad, Style.Weight);
-			if (Sheet == nullptr || Sheet->GetResource() == nullptr)
+			if (!TraceMenuKit::IsDrawable(Sheet))
 			{
 				continue;
 			}

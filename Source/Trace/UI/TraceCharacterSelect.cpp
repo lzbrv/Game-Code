@@ -31,6 +31,7 @@
 #include "UI/Text/TraceCanvasText.h"       // spec v22 §A1 — the cards type from the glyph atlas
 #include "UI/Text/TraceGameText.h"
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"   // the artist's sprites, colours and 9-slice numbers
+#include "UI/Widgets/Menu/TraceMenuKit.h"        // the shared, guarded kit renderer that draws them
 
 #if !UE_BUILD_SHIPPING
 int32 GTraceCharacterSelectDebugPick = 0;
@@ -282,87 +283,34 @@ namespace TraceSelectGrid
 // THE ARTIST'S SPRITES ON CANVAS — spec v20 §6.7 ("nothing uses the artist's art")
 // =============================================================================================
 //
-// NAMED after the file, like every other namespace here, for the unity-build reason at the top.
+// DRAWN THROUGH THE SHARED KIT RENDERER (UI/Widgets/Menu/TraceMenuKit.h). This file used to carry
+// its own sprite cache and its own 9-slice, and its copy was the one of three that had NO
+// render-resource guard: it handed the canvas any texture LoadObject returned, and a texture whose
+// RHI resource has not arrived yet is a render-thread crash (UI/TraceOptionsMenu.cpp has the
+// measurement). This screen opens during warm-up INSIDE A LIVE MATCH, which is the likeliest place
+// in the game to be the first thing touching /Game/Trace/UI/Art — so it was the likeliest to hit it.
+// The kit's Sprite() returns null until the texture is drawable, and its DrawPlate refuses anything
+// that is not, so the frames before the art is ready draw the fallback rectangles below instead.
 //
-// TWO THINGS MAKE THIS SAFE TO PUT IN A SCREEN THAT OPENS INSIDE A LIVE MATCH:
+// EVERY CALL SITE STILL FALLS BACK. A build where the art fails to cook loses the artist's plates
+// and keeps a working, readable pick screen — it can never lose the element altogether.
 //
-// 1. EVERY CALL SITE FALLS BACK. Sprite() returns null when a texture is missing, and every caller
-//    below is written as "if the sprite is there use it, otherwise draw the rectangle this screen
-//    drew before". A build where the art fails to cook loses the artist's plates and keeps a working,
-//    readable pick screen — it can never lose the element altogether, which is what a Slate brush
-//    would do (it would draw a white box instead).
-//
-// 2. THE CACHE IS WEAK. FTraceCharacterSelect is deliberately not a UObject and its header states as
-//    an invariant that it "holds no UObject references that outlive a frame". Nothing else on the
-//    Arena map references these menu textures, so a raw UTexture2D* here would be collected out from
-//    under a long match and then drawn through. A TWeakObjectPtr that re-resolves when it goes stale
-//    costs a FindObject on an already-loaded package, which is nothing.
-//
-// CANVAS HAS NO 9-SLICE. AHUD::DrawTexture builds one FCanvasTileItem and stretches the whole bitmap,
-// so the artist's corner radius would come out oval on anything that is not the sheet's aspect ratio.
-// DrawPlate below hand-rolls the 9-slice out of nine DrawTexture calls with UV sub-rects, using the
-// SAME measurements the UMG title screen uses (TraceMenuArtStyle::FSpriteFrame) rather than new ones.
+// The kit ROOTS the textures (it used to be a weak cache here). They are four small sprites, the
+// options overlay already rooted the same ones whenever it opened, and a rooted texture cannot be
+// collected out from under a long match.
 namespace TraceCharacterSelectArt
 {
-	// The POINTER is not in this list any more. It used to be, and this file drew it itself; since the
-	// UI QA pass every surface draws it through TraceHardwareCursor::DrawPointer instead, which owns
-	// the one sprite, the one size and the one tint. See FTraceCharacterSelect::DrawCursor.
-	enum class ESprite : uint8
+	// The POINTER is not in this list: every surface draws it through TraceHardwareCursor::DrawPointer,
+	// which owns the one sprite, the one size and the one tint. See FTraceCharacterSelect::DrawCursor.
+	static const ETraceKitSprite UsedSprites[] =
 	{
-		PlateDefault = 0,
-		PlateHover,
-		PlateDisabled,
-		ValueBox,
-		Count
+		ETraceKitSprite::BtnDefault,
+		ETraceKitSprite::BtnHover,
+		ETraceKitSprite::BtnDisabled,
+		ETraceKitSprite::ValueBox,
 	};
 
-	static const TCHAR* PathFor(ESprite Which)
-	{
-		switch (Which)
-		{
-		case ESprite::PlateDefault:  return TraceMenuArtStyle::BtnDefault;
-		case ESprite::PlateHover:    return TraceMenuArtStyle::BtnHover;
-		case ESprite::PlateDisabled: return TraceMenuArtStyle::BtnDisabled;
-		case ESprite::ValueBox:      return TraceMenuArtStyle::ValueBox;
-		default:                     return nullptr;
-		}
-	}
-
-	static constexpr int32 SpriteCount = static_cast<int32>(ESprite::Count);
-
-	static TWeakObjectPtr<UTexture2D> Cache[SpriteCount];
-
-	/** Set once when a path fails, so a broken install does not attempt a package load every frame. */
-	static bool bFailed[SpriteCount] = {};
-
 	static bool bLoggedInventory = false;
-
-	UTexture2D* Sprite(ESprite Which)
-	{
-		const int32 Index = static_cast<int32>(Which);
-		if (Index < 0 || Index >= SpriteCount || bFailed[Index])
-		{
-			return nullptr;
-		}
-
-		if (UTexture2D* Live = Cache[Index].Get())
-		{
-			return Live;
-		}
-
-		UTexture2D* Loaded = LoadObject<UTexture2D>(nullptr, PathFor(Which));
-		if (Loaded == nullptr)
-		{
-			bFailed[Index] = true;
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[CharSelect] %s did not load. That element falls back to the plain rectangle it "
-				     "used to be; the screen is still readable."), PathFor(Which));
-			return nullptr;
-		}
-
-		Cache[Index] = Loaded;
-		return Loaded;
-	}
 
 	/** One line, once per process, so a capture can be told apart from a build with no art in it. */
 	void LogInventoryOnce()
@@ -374,79 +322,19 @@ namespace TraceCharacterSelectArt
 		bLoggedInventory = true;
 
 		int32 Resolved = 0;
-		for (int32 Index = 0; Index < SpriteCount; ++Index)
+		for (const ETraceKitSprite Which : UsedSprites)
 		{
-			Resolved += (Sprite(static_cast<ESprite>(Index)) != nullptr) ? 1 : 0;
+			// Sprite() loads; PeekSprite() then says whether it LOADED, which is the question here —
+			// on the first frame a loaded sprite is usually not drawable yet, and that is not a fault.
+			TraceMenuKit::Sprite(Which);
+			Resolved += (TraceMenuKit::PeekSprite(Which) != nullptr) ? 1 : 0;
 		}
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[CharSelect] Art: %d/%d of the artist's sprites resolved (button plate x3, value chip). "
-			     "Anything missing falls back to a drawn rectangle. The pointer is not counted here - "
-			     "TraceHardwareCursor owns it and logs its own line."), Resolved, SpriteCount);
-	}
-
-	/**
-	 * The artist's plate, 9-sliced onto the rect (@p X, @p Y, @p W, @p H).
-	 *
-	 * @param CornerHeight  the PLATE HEIGHT the corner should be sized as if it were, in screen px.
-	 *
-	 * That last parameter is the whole reason this is not three lines. The sheet's button is 4723 x
-	 * 1230 with a 428-pixel corner, i.e. a corner 35% of the plate's height — which reads as a modest
-	 * rounding on a very wide, short menu row and as a lozenge on anything squarer. A card tile here is
-	 * 346 x 196, so taking the corner from the tile's own height would round it by 68 px and the
-	 * artist's shape language would come out as a pill. A 9-slice explicitly lets the author choose the
-	 * corner size independently of the stretched middle (Slate does the same thing through a Box
-	 * brush's ImageSize), so callers pass the height of a MENU ROW and the corner comes out the size
-	 * the artist drew it, whatever shape the thing being framed is.
-	 *
-	 * The glow margin is scaled by the same corner scale and drawn OUTSIDE the rect: the hover plate's
-	 * amber ring lives in it, and forgetting it is what makes a 9-sliced plate come out too small.
-	 */
-	void DrawPlate(AHUD* HUD, UTexture2D* Texture, const TraceMenuArtStyle::FSpriteFrame& Frame,
-		float X, float Y, float W, float H, float CornerHeight, const FLinearColor& Tint)
-	{
-		if (HUD == nullptr || Texture == nullptr || W <= 1.f || H <= 1.f || Frame.PlateH <= 0.f)
-		{
-			return;
-		}
-
-		const float CornerScale = FMath::Max(CornerHeight, 1.f) / Frame.PlateH;
-		const float Inset = Frame.Glow * CornerScale;
-
-		const float SX = X - Inset;
-		const float SY = Y - Inset;
-		const float SW = W + Inset * 2.f;
-		const float SH = H + Inset * 2.f;
-
-		// Half the sprite, minus a pixel, is the hard ceiling: two corners that met in the middle would
-		// draw the flat centre at a negative width and flip the quad.
-		const float Cap = FMath::Clamp(Frame.Cap * CornerScale, 1.f, FMath::Min(SW, SH) * 0.5f - 1.f);
-
-		const float UCap = Frame.Cap / Frame.SpriteW();
-		const float VCap = Frame.Cap / Frame.SpriteH();
-
-		const float Xs[3] = { SX, SX + Cap, SX + SW - Cap };
-		const float Ws[3] = { Cap, SW - Cap * 2.f, Cap };
-		const float Us[3] = { 0.f, UCap, 1.f - UCap };
-		const float UWs[3] = { UCap, 1.f - UCap * 2.f, UCap };
-
-		const float Ys[3] = { SY, SY + Cap, SY + SH - Cap };
-		const float Hs[3] = { Cap, SH - Cap * 2.f, Cap };
-		const float Vs[3] = { 0.f, VCap, 1.f - VCap };
-		const float VHs[3] = { VCap, 1.f - VCap * 2.f, VCap };
-
-		for (int32 Row = 0; Row < 3; ++Row)
-		{
-			for (int32 Column = 0; Column < 3; ++Column)
-			{
-				if (Ws[Column] <= 0.f || Hs[Row] <= 0.f)
-				{
-					continue;
-				}
-				HUD->DrawTexture(Texture, Xs[Column], Ys[Row], Ws[Column], Hs[Row],
-					Us[Column], Vs[Row], UWs[Column], VHs[Row], Tint);
-			}
-		}
+			TEXT("[CharSelect] Art: %d/%d of the artist's sprites resolved (button plate x3, value chip), "
+			     "drawn through the shared kit renderer. Anything missing or not yet drawable falls back to "
+			     "a drawn rectangle. The pointer is not counted here - TraceHardwareCursor owns it and logs "
+			     "its own line."), Resolved, static_cast<int32>(UE_ARRAY_COUNT(UsedSprites)));
 	}
 }
 
@@ -1762,11 +1650,8 @@ namespace TraceCharacterSelectFile
 		const float TextW = TraceCharacterSelectType::Width(HUD, Text, nullptr, TextSize, Tracking);
 		const float W = FMath::Max(MinW, TextW + H * 0.90f);
 
-		if (UTexture2D* Box = TraceCharacterSelectArt::Sprite(TraceCharacterSelectArt::ESprite::ValueBox))
-		{
-			TraceCharacterSelectArt::DrawPlate(HUD, Box, TraceMenuArtStyle::ValueFrame, X, Y, W, H, H, PlateTint);
-		}
-		else
+		if (!TraceMenuKit::DrawPlate(HUD, TraceMenuKit::Sprite(ETraceKitSprite::ValueBox),
+			TraceMenuArtStyle::ValueFrame, X, Y, W, H, H, PlateTint))
 		{
 			// The fallback is the rectangle this screen drew before there was any art, so a missing
 			// texture costs the artist's corner and loses nothing a player needs.
@@ -3401,20 +3286,16 @@ void FTraceCharacterSelect::DrawCard(AHUD* HUD, ATracePlayerState* LocalState, i
 	// ---- The artist's plate, in the sheet's own three states -------------------------------------
 	//
 	// The corner is sized as if the tile were a 78-pixel menu row rather than a 196-pixel tile: see
-	// DrawPlate's CornerHeight argument for why taking it from the tile's own height turns the artist's
-	// rounding into a lozenge.
+	// the CornerHeight argument of TraceMenuKit::PlateQuads for why taking it from the tile's own
+	// height turns the artist's rounding into a lozenge.
+	//
+	// The plate comes from the kit's one state switch: a taken card is DISABLED, the highlighted one
+	// is HOVER. The tint stays flat white — this screen has never breathed its cards.
 	{
-		const TraceCharacterSelectArt::ESprite Which = bTaken
-			? TraceCharacterSelectArt::ESprite::PlateDisabled
-			: (bSelected ? TraceCharacterSelectArt::ESprite::PlateHover
-			             : TraceCharacterSelectArt::ESprite::PlateDefault);
+		const FTraceKitVisuals CardVisuals = TraceMenuKit::VisualsFor(TraceMenuKit::StateFor(!bTaken, bSelected));
 
-		if (UTexture2D* Plate = TraceCharacterSelectArt::Sprite(Which))
-		{
-			TraceCharacterSelectArt::DrawPlate(HUD, Plate, TraceMenuArtStyle::ButtonFrame,
-				X, Y, W, H, 78.f * S, FLinearColor::White);
-		}
-		else
+		if (!TraceMenuKit::DrawPlate(HUD, TraceMenuKit::Sprite(CardVisuals.Plate), TraceMenuArtStyle::ButtonFrame,
+			X, Y, W, H, 78.f * S, FLinearColor::White))
 		{
 			// Exactly the rectangle this screen drew before there was any art.
 			HUD->DrawRect(TraceSelectStyle::WithAlpha(TraceSelectStyle::Plate, bTaken ? 0.55f : 0.92f), X, Y, W, H);

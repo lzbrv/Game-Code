@@ -26,7 +26,6 @@
 #include "HAL/PlatformTime.h"
 #include "Settings/TraceGamepadInput.h"   // D32-PADMENU — TracePadMenu, the shared pad vocabulary
 #include "Settings/TraceUserSettings.h"
-#include "TextureResource.h"          // WP9 — the RHI-readiness guard on the Canvas title's sprites
 #include "TimerManager.h"
 #include "Trace.h"                    // LogTraceGame
 #include "UI/Text/TraceCanvasText.h"   // spec v22 §A1 — this renderer types from the atlas
@@ -36,6 +35,7 @@
 #include "UI/TraceMatchOptions.h"
 #include "UI/TraceNetworking.h"
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"   // WP9 — the Canvas title draws the artist's sprites
+#include "UI/Widgets/Menu/TraceMenuKit.h"        // ...through the shared, guarded kit renderer
 #include "UI/Widgets/Menu/TraceMenuPalette.h"
 #include "UI/Widgets/Menu/TraceTitleMenuWidget.h"
 
@@ -327,125 +327,17 @@ namespace TraceMenuHUDFile
 // drew the stroke-vector wordmark on plateless rows — so opening a modal swapped 58.8% of the frame
 // to what read as a DIFFERENT GAME under the scrim. The full Slate/UMG modal rebuild is deferred
 // (TraceOptionsMenu.h documents why); the shipped mitigation is to draw the artist's sprites HERE
-// too: wordmark, swoosh, and the button plates as a horizontal 3-slice (Canvas cannot 9-slice, but
-// at a fixed row height a 3-slice is exact). The stroke wordmark and the flat rects remain as the
-// fallback whenever a texture is unavailable — the standing rule that a missing texture must leave
-// the menu drawable.
+// too: wordmark, swoosh, and the button plates (9-sliced by the kit out of nine DrawTexture calls;
+// at a fixed row height that is exactly the 3-slice this file used to draw). The stroke wordmark and
+// the flat rects remain as the fallback whenever a texture is unavailable — the standing rule that a
+// missing texture must leave the menu drawable.
 //
 // THE GUARD IS NOT OPTIONAL. "A LOADED TEXTURE IS NOT A DRAWABLE ONE": AHUD::DrawTexture hands
 // Texture->GetResource() straight to an FCanvasTileItem, and a texture whose FTextureResource has no
-// RHI texture yet is a SIGSEGV on the render thread ~130 ms later — measured, three callstacks, in
-// TraceOptionsMenu.cpp:339-420, whose loader this cache duplicates verbatim rather than re-learning.
-namespace TraceMenuHUDSprites
-{
-	enum class ESprite : uint8
-	{
-		BtnDefault,
-		BtnHover,
-		Wordmark,
-		Swoosh,
-		Count
-	};
-
-	static const TCHAR* const SpritePaths[static_cast<int32>(ESprite::Count)] =
-	{
-		TraceMenuArtStyle::BtnDefault,
-		TraceMenuArtStyle::BtnHover,
-		TraceMenuArtStyle::Wordmark,
-		TraceMenuArtStyle::Swoosh,
-	};
-
-	static TWeakObjectPtr<UTexture2D> GCache[static_cast<int32>(ESprite::Count)];
-
-	/** Set only on a genuine load failure: a collected texture is re-fetched, a missing one is not re-hunted every frame. */
-	static bool GFailed[static_cast<int32>(ESprite::Count)] = {};
-
-	/** The measured crash guard — see the banner above and TraceOptionsMenu.cpp's original. */
-	static bool IsDrawable(const UTexture2D* Tex)
-	{
-		if (Tex == nullptr)
-		{
-			return false;
-		}
-		const FTextureResource* Resource = Tex->GetResource();
-		if (Resource == nullptr || !Resource->TextureRHI.IsValid())
-		{
-			UE_LOG(LogTraceGame, Verbose, TEXT("[MenuArt] '%s' is loaded but has no RHI texture yet; ")
-				TEXT("the Canvas title draws its fallback this frame."), *Tex->GetName());
-			return false;
-		}
-		return true;
-	}
-
-	/** The texture, or null — which every caller treats as "draw what you drew before spec WP9". */
-	static UTexture2D* Sprite(ESprite Which)
-	{
-		const int32 Index = static_cast<int32>(Which);
-		if (UTexture2D* Cached = GCache[Index].Get())
-		{
-			return IsDrawable(Cached) ? Cached : nullptr;
-		}
-		if (GFailed[Index])
-		{
-			return nullptr;
-		}
-
-		UTexture2D* Loaded = LoadObject<UTexture2D>(nullptr, SpritePaths[Index]);
-		if (Loaded == nullptr)
-		{
-			// Once. A warning per frame per sprite on the title screen is its own defect.
-			GFailed[Index] = true;
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[MenuArt] Canvas title art '%s' did not load; that element keeps its stroke/rect fallback."),
-				SpritePaths[Index]);
-			return nullptr;
-		}
-
-		// Rooted: on a pure Canvas session nothing else references these (the WBP that would is
-		// exactly what is not loaded), and a GC mid-session would blank the title for a frame.
-		Loaded->AddToRoot();
-		GCache[Index] = Loaded;
-		return IsDrawable(Loaded) ? Loaded : nullptr;
-	}
-
-	/**
-	 * Three-slice in X: the two caps keep their shape, only the middle stretches. Same shape as
-	 * TraceOptionsMenuArt::Draw3H, for the same reason — at a fixed plate height this is exactly
-	 * what the 9-slice would have drawn.
-	 *
-	 * @param CapU   the cap as a fraction of the sprite's WIDTH (a texture coordinate)
-	 * @param CapPx  the cap's width on screen, derived from the sprite's height scale by the caller
-	 */
-	static void Draw3H(AHUD* HUD, UTexture2D* Tex, float X, float Y, float W, float H,
-		float CapU, float CapPx, const FLinearColor& Tint)
-	{
-		const float Cap = FMath::Min(CapPx, W * 0.5f);
-		const float MidW = W - Cap * 2.f;
-
-		HUD->DrawTexture(Tex, X, Y, Cap, H, 0.f, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
-		if (MidW > 0.f)
-		{
-			HUD->DrawTexture(Tex, X + Cap, Y, MidW, H, CapU, 0.f, 1.f - CapU * 2.f, 1.f, Tint, BLEND_Translucent);
-		}
-		HUD->DrawTexture(Tex, X + W - Cap, Y, Cap, H, 1.f - CapU, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
-	}
-
-	/**
-	 * Draws a button-plate sprite so its PLATE lands exactly on (X, Y, W, H) — the row rect — with
-	 * the glow overhanging outside, which is what the UMG row's GlowInset does. Forget the overhang
-	 * and the plate comes out a fifth small inside its own row (measured once already, on the UMG
-	 * side).
-	 */
-	static void DrawPlate(AHUD* HUD, UTexture2D* Tex, float X, float Y, float W, float H, const FLinearColor& Tint)
-	{
-		const TraceMenuArtStyle::FSpriteFrame& Frame = TraceMenuArtStyle::ButtonFrame;
-		const float Grow = H * (Frame.Glow / Frame.PlateH);
-		const float DrawnH = H + Grow * 2.f;
-		const float CapU = Frame.Cap / Frame.SpriteW();
-		const float CapPx = DrawnH * (Frame.Cap / Frame.SpriteH());
-		Draw3H(HUD, Tex, X - Grow, Y - Grow, W + Grow * 2.f, DrawnH, CapU, CapPx, Tint);
-	}
-}
+// RHI texture yet is a SIGSEGV on the render thread ~130 ms later. The sprites, the guard and the
+// plate are the shared kit renderer's now (UI/Widgets/Menu/TraceMenuKit.h) — this file used to carry
+// its own copy of all three. TraceMenuKit::Sprite returns null until a texture is drawable, and every
+// caller below keeps the stroke / rect fallback it had.
 
 bool ATraceMenuHUD::TryAdoptMenuWidget()
 {
@@ -2522,7 +2414,7 @@ void ATraceMenuHUD::DrawHUD()
 	// it is the Canvas title screen rather than the artist's UMG one — measured at 1920x1080 as 58.8%
 	// of the frame changing renderer on one keypress. That is the trade spec v25 §1 asks for, and the
 	// release pass (UI plan WP9) shrank what it costs: the Canvas title now draws the artist's
-	// wordmark, swoosh and button plates itself (see TraceMenuHUDSprites), so the swap is a renderer
+	// wordmark, swoosh and button plates itself (through TraceMenuKit), so the swap is a renderer
 	// change the player is not supposed to notice rather than a different-looking game under a scrim.
 	//
 	// STILL TAKEN HERE, NOT INSIDE EACH MODAL, and that has not stopped mattering: a frame that kept
@@ -2602,6 +2494,12 @@ void ATraceMenuHUD::DrawHUD()
 
 	// Last of all, over everything, including the travel overlay. Tick() is a no-op while closed.
 	OptionsMenu.Tick(this, GetOwningPlayerController(), ViewW, ViewH, UIScale, Now);
+
+#if !UE_BUILD_SHIPPING
+	// `Trace.UI.Kit.Specimen 1` — every handmade-kit control on one black page, over all of the
+	// above, for a screenshot. A no-op while the CVar is 0. See UI/Widgets/Menu/TraceMenuKit.h.
+	TraceMenuKit::DrawSpecimenIfRequested(this, ViewW, ViewH, UIScale, Now);
+#endif
 }
 
 void ATraceMenuHUD::DrawBackdrop()
@@ -2721,7 +2619,7 @@ void ATraceMenuHUD::DrawWordmark()
 	// The stroke wordmark below is the FALLBACK, kept per the standing rule that a missing texture
 	// must leave the menu drawable — and it is still what a fresh checkout shows before the sprites
 	// are generated.
-	UTexture2D* Mark = TraceMenuHUDSprites::Sprite(TraceMenuHUDSprites::ESprite::Wordmark);
+	UTexture2D* Mark = TraceMenuKit::Sprite(ETraceKitSprite::Wordmark);
 	if (Mark != nullptr && Mark->GetSizeX() > 0 && Mark->GetSizeY() > 0)
 	{
 		using namespace TraceTitleLayout;
@@ -2734,7 +2632,7 @@ void ATraceMenuHUD::DrawWordmark()
 		DrawTexture(Mark, CX - MarkW * 0.5f, MarkTop, MarkW, MarkH,
 			0.f, 0.f, 1.f, 1.f, FLinearColor::White, BLEND_Translucent);
 
-		UTexture2D* SwooshTex = TraceMenuHUDSprites::Sprite(TraceMenuHUDSprites::ESprite::Swoosh);
+		UTexture2D* SwooshTex = TraceMenuKit::Sprite(ETraceKitSprite::Swoosh);
 		if (SwooshTex != nullptr && SwooshTex->GetSizeX() > 0 && SwooshTex->GetSizeY() > 0)
 		{
 			const float SwooshAspect =
@@ -3101,8 +2999,8 @@ void ATraceMenuHUD::DrawMenuRows()
 	// the old cyan-edged console behind them would be the "different game" tell surviving in a
 	// frame. The panel remains the fallback's legibility device when the sprites are absent.
 	const bool bPlates =
-		TraceMenuHUDSprites::Sprite(TraceMenuHUDSprites::ESprite::BtnDefault) != nullptr
-		&& TraceMenuHUDSprites::Sprite(TraceMenuHUDSprites::ESprite::BtnHover) != nullptr;
+		TraceMenuKit::Sprite(ETraceKitSprite::BtnDefault) != nullptr
+		&& TraceMenuKit::Sprite(ETraceKitSprite::BtnHover) != nullptr;
 	if (!bPlates)
 	{
 		DrawRect(TraceMenuStyle::PanelFill, PanelX, PanelY, PanelW, PanelH);
@@ -3244,21 +3142,20 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 	const float X = CenterX - Width * 0.5f;
 	const float PadX = TraceMenuStyle::RowPadX * UIScale;
 
-	// ---- WP9: the artist's plate, as a horizontal 3-slice -----------------------------------------
+	// ---- WP9: the artist's plate, 9-sliced by the kit -----------------------------------------------
 	//
 	// The selected row wears the HOVER plate (ring and all) exactly as the UMG row does — selection
-	// and hover are one state on this screen. Canvas cannot 9-slice, but the row height is fixed, so
-	// a 3-slice whose caps scale with the sprite's height is exactly what the 9-slice would draw.
-	// The pre-WP9 rectangles remain the fallback for a missing texture.
-	UTexture2D* Plate = TraceMenuHUDSprites::Sprite(bSelected
-		? TraceMenuHUDSprites::ESprite::BtnHover
-		: TraceMenuHUDSprites::ESprite::BtnDefault);
+	// and hover are one state on this screen. The kit's 9-slice with CornerHeight == the row height
+	// draws exactly the 3-slice this file used to (Trace.UI.Kit.Verify compares them point by point).
+	// The pre-WP9 rectangles remain the fallback for a missing or not-yet-drawable texture.
+	//
+	// Plate and word both come from the kit's one state switch (the same one the UMG row uses), so the
+	// two renderers cannot pick different plates or words for the same row. This renderer has never
+	// dimmed a disabled row or breathed the selected plate, and still does neither: a flat white tint.
+	const FTraceKitVisuals RowVisuals = TraceMenuKit::VisualsFor(TraceMenuKit::StateFor(/*bEnabled=*/true, bSelected));
 	const float Pulse = 0.72f + 0.28f * FMath::Sin(Now * 4.5f);
-	if (Plate != nullptr)
-	{
-		TraceMenuHUDSprites::DrawPlate(this, Plate, X, Y, Width, RowH, FLinearColor::White);
-	}
-	else
+	if (!TraceMenuKit::DrawPlate(this, TraceMenuKit::Sprite(RowVisuals.Plate), TraceMenuArtStyle::ButtonFrame,
+		X, Y, Width, RowH, RowH, FLinearColor::White))
 	{
 		// Plate. Always opaque enough to lift the label off the grid; brighter when selected.
 		DrawRect(FLinearColor(0.f, 0.02f, 0.04f, bSelected ? 0.80f : 0.55f), X, Y, Width, RowH);
@@ -3285,11 +3182,10 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 		DrawRect(TraceMenuStyle::WithAlpha(TraceMenuArtStyle::AmberLifted(), Pulse), RailX, Y, RailW, RowH);
 	}
 
-	// WP4 — the word colours, shared with the UMG row's VisualsFor(): the selected/hovered word is
-	// the artist's green lifted to read on the plate (#CBFF70, art bible §2.5), every other label is
-	// the sheet's white.
-	const FLinearColor LabelColor = bSelected
-		? TraceMenuArtStyle::WordHoverLifted() : TraceMenuArtStyle::WordDefault;
+	// WP4 — the word colour, from the same switch as the plate above (TraceMenuKit::VisualsFor, which
+	// the UMG row also reads): the selected/hovered word is the artist's green lifted to read on the
+	// plate (#CBFF70, art bible §2.5), every other label is the sheet's white.
+	const FLinearColor LabelColor = RowVisuals.Label;
 	const float LabelScale = 1.55f * UIScale;
 
 	// WHAT the row says is decided in exactly one place, BuildRowView, because the UMG renderer says

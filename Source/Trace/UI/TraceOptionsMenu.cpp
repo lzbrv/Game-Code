@@ -15,7 +15,7 @@
 #include "Widgets/SViewport.h"           // spec v28 §3a - the widget the synthetic click is aimed at
 #include "UnrealClient.h"                // FViewport::GetMouseCaptureMode, the gate being measured
 #include "Engine/Texture2D.h"            // the artist's sprites - see the art block below
-#include "TextureResource.h"             // FTextureResource::TextureRHI - see IsDrawable
+#include "TextureResource.h"             // FTextureResource::TextureRHI - see LogReadiness
 #include "GameFramework/HUD.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
@@ -33,6 +33,7 @@
 #include "Audio/TraceMusicPlayer.h"     // UI plan WP3 - RefreshVolume, so a MUSIC drag is heard live
 #include "GameFramework/PlayerState.h"  // UI plan WP2.4 - the name the submit path is replacing
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"  // WP11.1 - AmberLifted() for the slider thumb
+#include "UI/Widgets/Menu/TraceMenuKit.h"       // the shared, guarded kit renderer: sprites, plates, trough
 #include "UI/TraceHardwareCursor.h"        // UI QA finding 6 - one pointer, drawn in one place
 #include "Gameplay/TraceMelee.h"       // kept for the transitive gameplay types; the v28 §10 row-label override it fed is deleted (v29 §5)
 
@@ -294,15 +295,13 @@ namespace TraceOptionsStyle
 //     UObject reference that outlives a frame (see the header). In a match nothing else in the world
 //     references these textures, so a cached raw pointer would be collected out from under the pause
 //     menu and a bare weak pointer would re-stream the art off disk mid-match. AddToRoot costs about
-//     a megabyte for ten small UI textures and makes both failures impossible — and it is done here,
-//     at file scope, rather than in a member, so the header's invariant still holds.
+//     a megabyte for ten small UI textures and makes both failures impossible — and it is done in
+//     the shared kit (TraceMenuKit::Sprite), not in a member, so the header's invariant still holds.
 //
-// CANVAS HAS NO 9-SLICE. FCanvasTileItem stretches the whole bitmap, so the 160x91 chip drawn 120x17
-// would come out with its corner squashed 7:1 — which reads as sloppy art rather than as a missing
-// engine feature. Everything with a corner is therefore drawn as a THREE-slice in X: left cap,
-// stretched middle, right cap, with the cap's on-screen width derived from the sprite's HEIGHT
-// scale, which is what keeps the corner circular at every row width. Three and not nine because the
-// vertical scale is the reference — nothing here is ever stretched past its natural aspect in Y.
+// ALL OF IT IS NOW DRAWN THROUGH THE SHARED KIT RENDERER (UI/Widgets/Menu/TraceMenuKit.h): the sprite
+// cache, the render-resource guard, the plate and the slider trough. This page used to own copies of
+// all four; the kit's are the same arithmetic, moved (Trace.UI.Kit.Verify proves the plate is the
+// same pixels), so nothing on this page moved when it changed.
 // =================================================================================================
 
 namespace TraceOptionsMenuArt
@@ -328,236 +327,39 @@ namespace TraceOptionsMenuArt
 		ECVF_Default);
 #endif
 
-	enum class ESprite : uint8
+	/** The kit sprites this page draws: three button plates, the slider trough and the value chip. */
+	static const ETraceKitSprite UsedSprites[] =
 	{
-		PlateDefault = 0,
-		PlateHover,
-		PlateDisabled,
-		SliderTrack,
-		ValueBox,
-		WordKeybind,
-		WordKey,
-		Chevron,
-		Count
+		ETraceKitSprite::BtnDefault,
+		ETraceKitSprite::BtnHover,
+		ETraceKitSprite::BtnDisabled,
+		ETraceKitSprite::SliderTrack,
+		ETraceKitSprite::ValueBox,
 	};
-
-	static const TCHAR* const SpritePaths[int32(ESprite::Count)] =
-	{
-		TEXT("/Game/Trace/UI/Art/T_MenuBtn_Default.T_MenuBtn_Default"),
-		TEXT("/Game/Trace/UI/Art/T_MenuBtn_Hover.T_MenuBtn_Hover"),
-		TEXT("/Game/Trace/UI/Art/T_MenuBtn_Disabled.T_MenuBtn_Disabled"),
-		TEXT("/Game/Trace/UI/Art/T_MenuSliderTrack.T_MenuSliderTrack"),
-		TEXT("/Game/Trace/UI/Art/T_MenuValueBox.T_MenuValueBox"),
-		TEXT("/Game/Trace/UI/Art/T_MenuWord_Keybind.T_MenuWord_Keybind"),
-		TEXT("/Game/Trace/UI/Art/T_MenuWord_Key.T_MenuWord_Key"),
-		TEXT("/Game/Trace/UI/Art/T_MenuBack.T_MenuBack"),
-	};
-
-	static TWeakObjectPtr<UTexture2D> GCache[int32(ESprite::Count)];
-
-	/** Set only on a genuine load failure, so a collected texture is re-fetched but a missing one is not re-hunted every frame. */
-	static bool GFailed[int32(ESprite::Count)] = {};
 
 	/**
-	 * *** A LOADED TEXTURE IS NOT A DRAWABLE ONE, AND DRAWING ONE ANYWAY IS A CRASH. ***
+	 * The texture, or null — which every caller treats as "draw the rectangle you drew before".
 	 *
-	 * `AHUD::DrawTexture` passes `Texture->GetResource()` STRAIGHT into an FCanvasTileItem and checks
-	 * only the UTexture (Engine HUD.cpp:986). A texture that is LOADED but whose render resource has
-	 * no RHI texture yet therefore becomes a batched element the render thread cannot draw, and it
-	 * dies on it: SIGSEGV in FBatchedElements::Draw at address 0x30, on the render thread, ~130 ms
-	 * after this page first drew.
+	 * *** A LOADED TEXTURE IS NOT A DRAWABLE ONE, AND DRAWING ONE ANYWAY IS A CRASH. *** This page is
+	 * where that was found and measured, and the finding now lives in TraceMenuKit::IsDrawable:
+	 * `AHUD::DrawTexture` passes `Texture->GetResource()` straight into an FCanvasTileItem and checks
+	 * only the UTexture (Engine HUD.cpp:986), so a texture that is LOADED but whose render resource
+	 * has no RHI texture yet became a batched element the render thread died on — SIGSEGV in
+	 * FBatchedElements::Draw at address 0x30, ~130 ms after this page first drew. Guarding on
+	 * `GetResource() != nullptr` did NOT fix it (the resource object exists straight away); guarding
+	 * on `FTextureResource::TextureRHI` did. Spec v23 §A2 exposed it: until then the Canvas title
+	 * screen had always warmed these textures earlier in the same DrawHUD.
 	 *
-	 * MEASURED, in this order, because the first two answers were wrong:
-	 *   - `Trace.Menu.Art 0` (no textures at all) ran clean, and so did the JOIN prompt, which draws
-	 *     rects and atlas text and no textures. So it was the sprites, not the surface.
-	 *   - guarding on `GetResource() != nullptr` did NOT fix it: the resource object exists straight
-	 *     away. It is `FTextureResource::TextureRHI` that arrives later, from the render thread.
-	 *   - guarding on that fixed it. Same binary, same arm, six captures, no crash.
-	 *
-	 * THIS IS A LATENT BUG SPEC v23 §A2 EXPOSED, not one it introduced. LoadObject returns the object
-	 * as soon as the package is in memory and the RHI texture lands a frame or two later. Until v23
-	 * this overlay could not be on screen without the CANVAS title screen being on screen underneath
-	 * it — that is the whole defect §A2 fixed — and that screen draws TraceMenuCanvasArt out of the
-	 * same /Game/Trace/UI/Art package, earlier in the same DrawHUD, which happened to warm these ten
-	 * textures before this page ever asked for one. Take the Canvas title screen away and this page
-	 * is the first thing in the process to touch that package.
-	 *
-	 * The guard costs one pointer compare per sprite per frame and fails the way every other sprite
-	 * failure on this page fails: Sprite() returns null, the caller draws the plain rectangle it drew
-	 * before spec v20, for the one or two frames before the RHI texture exists.
+	 * The kit returns null for the one or two frames before the RHI texture exists, and the caller
+	 * draws the plain rectangle it drew before spec v20 — the same path a missing file takes.
 	 */
-	static bool IsDrawable(const UTexture2D* Tex)
-	{
-		if (Tex == nullptr)
-		{
-			return false;
-		}
-		const FTextureResource* Resource = Tex->GetResource();
-		if (Resource == nullptr || !Resource->TextureRHI.IsValid())
-		{
-			// Loud once per sprite: this is the state that used to crash, so a build that starts
-			// hitting it a lot is a build whose art is arriving later than this page draws.
-			UE_LOG(LogTraceGame, Verbose, TEXT("[Options] '%s' is loaded but has no RHI texture yet; ")
-				TEXT("drawing the plain rectangle this frame."), *Tex->GetName());
-			return false;
-		}
-		return true;
-	}
-
-	/** The texture, or null — which every caller treats as "draw the rectangle you drew before". */
-	static UTexture2D* Sprite(ESprite Which)
+	static UTexture2D* Sprite(ETraceKitSprite Which)
 	{
 		if (GEnabled == 0)
 		{
 			return nullptr;
 		}
-
-		const int32 Index = int32(Which);
-		if (UTexture2D* Cached = GCache[Index].Get())
-		{
-			return IsDrawable(Cached) ? Cached : nullptr;
-		}
-		if (GFailed[Index])
-		{
-			return nullptr;
-		}
-
-		UTexture2D* Loaded = LoadObject<UTexture2D>(nullptr, SpritePaths[Index]);
-		if (Loaded == nullptr)
-		{
-			// Once. A warning per frame per sprite in front of a paused match is its own defect.
-			GFailed[Index] = true;
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[Options] Menu art '%s' did not load; that control keeps its plain rectangle."),
-				SpritePaths[Index]);
-			return nullptr;
-		}
-
-		// See point 3 in the block above: nothing else in a match holds these.
-		Loaded->AddToRoot();
-		GCache[Index] = Loaded;
-		return IsDrawable(Loaded) ? Loaded : nullptr;
-	}
-
-	/** Plain stretch. For alpha masks and for anything whose corners are not being distorted. */
-	static void Draw(AHUD* HUD, UTexture2D* Tex, float X, float Y, float W, float H, const FLinearColor& Tint)
-	{
-		HUD->DrawTexture(Tex, X, Y, W, H, 0.f, 0.f, 1.f, 1.f, Tint, BLEND_Translucent);
-	}
-
-	/**
-	 * Three-slice in X: the two caps keep their shape, only the middle stretches.
-	 *
-	 * @param CapU   the cap as a fraction of the sprite's WIDTH (a texture coordinate)
-	 * @param CapPx  the cap's width on screen, derived from the sprite's height scale by the caller
-	 */
-	static void Draw3H(AHUD* HUD, UTexture2D* Tex, float X, float Y, float W, float H,
-		float CapU, float CapPx, const FLinearColor& Tint)
-	{
-		// A row narrower than two caps is not a layout this screen produces, but clamping is one line
-		// and the alternative is the two caps drawing over each other back to front.
-		const float Cap = FMath::Min(CapPx, W * 0.5f);
-		const float MidW = W - Cap * 2.f;
-
-		HUD->DrawTexture(Tex, X, Y, Cap, H, 0.f, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
-		if (MidW > 0.f)
-		{
-			HUD->DrawTexture(Tex, X + Cap, Y, MidW, H, CapU, 0.f, 1.f - CapU * 2.f, 1.f, Tint, BLEND_Translucent);
-		}
-		HUD->DrawTexture(Tex, X + W - Cap, Y, Cap, H, 1.f - CapU, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
-	}
-
-	/**
-	 * A sprite that was cut as a PLATE plus a margin of glow, in the sheet's own pixels.
-	 *
-	 * Mirrored from TraceMenuArtStyle::FSpriteFrame rather than included: that header describes Slate
-	 * Box brushes, which do not exist on this side of the fence, and the numbers below are the sheet's
-	 * and not the engine's. If the slicer's crop boxes change, both copies change.
-	 */
-	struct FPlateFrame
-	{
-		float PlateW;
-		float PlateH;
-		/** Sheet pixels of glow kept OUTSIDE the plate on every side. */
-		float Glow;
-		/** Sheet pixels from the sprite's edge to where the corner curve is fully open. */
-		float Cap;
-
-		float SpriteW() const { return PlateW + Glow * 2.f; }
-	};
-
-	/** The wide button: plate 4723x1230 inside a 4979x1486 crop, corner open by 428. */
-	static const FPlateFrame ButtonFrame = { 4723.f, 1230.f, 128.f, 428.f };
-
-	/** The chip beside a slider: ring 1034x538 inside a 1154x656 crop, corner open by 150. */
-	static const FPlateFrame ValueFrame  = { 1034.f,  538.f,  60.f, 150.f };
-
-	/**
-	 * Draws @p Tex so that its PLATE lands exactly on (X, Y, W, H), with the glow overhanging outside.
-	 *
-	 * Forget the overhang and the plate comes out a fifth small inside its own row — which is the
-	 * mistake the UMG row widget documents having made once already.
-	 */
-	static void DrawPlate(AHUD* HUD, UTexture2D* Tex, const FPlateFrame& Frame,
-		float X, float Y, float W, float H, const FLinearColor& Tint)
-	{
-		// Height is the reference scale: the glow and the corner are square in the sheet, so scaling
-		// both by H/PlateH is what keeps the corner circular however wide the row is.
-		const float Scale = H / Frame.PlateH;
-		const float GlowPx = Frame.Glow * Scale;
-		const float CapPx = Frame.Cap * Scale;
-		const float CapU = Frame.Cap / Frame.SpriteW();
-
-		Draw3H(HUD, Tex, X - GlowPx, Y - GlowPx, W + GlowPx * 2.f, H + GlowPx * 2.f, CapU, CapPx, Tint);
-	}
-
-	// Sprite aspects, measured off the PNGs rather than guessed, so nothing here is stretched.
-	//
-	// TWO ENTRIES ARE GONE FROM THIS LIST, and their absence is the finding rather than a tidy-up.
-	// `CursorAspect` and the tip fractions `CursorTipU/V` were a third copy of numbers TraceMenuArtStyle
-	// already derives from the sprite's own pixel size; UI/TraceHardwareCursor.h now owns the whole
-	// pointer — sprite, size, anchor and tint — and this page calls it. `HandleAspect` was 64/87, the
-	// SAME aspect, because T_MenuSliderHandle is the same blade as T_MenuCursor; the thumb is drawn as
-	// a fader cap now and needs no sprite aspect at all. See DrawSliderRow.
-	static constexpr float ChevronAspect = 96.f / 125.f;
-	static constexpr float KeybindAspect = 256.f / 42.f;
-	static constexpr float KeyAspect     = 128.f / 47.f;
-
-	/** The slider sprite is a trough: its solid rail occupies rows 6..17 of its 23. */
-	static constexpr float TrackRailTopV = 6.f / 23.f;
-	static constexpr float TrackRailV    = 11.f / 23.f;
-
-	/**
-	 * Draws T_MenuSliderTrack as a trough, AVOIDING THE HANDLE THAT IS BAKED INTO IT.
-	 *
-	 * MEASURED, because it cost a capture to find: the slicer's crop kept the artist's own handle
-	 * blade inside the track sprite. Columns 37..78 of its 512 — 7.2% to 15.2% along — are a bright
-	 * white diagonal, and a plain stretch therefore paints a SECOND, immovable handle at a fixed
-	 * tenth of every slider, next to the real one. The first capture of this work had two blades on
-	 * every row and it read as a rendering bug.
-	 *
-	 * So the middle is sampled from a clean band in the sprite's uniform centre rather than from the
-	 * span between the caps. The caps themselves (16 px at each end, the artist's soft lip) are clear
-	 * of the blade and are drawn as they were cut.
-	 *
-	 * The real fix is a re-cut in Scripts/slice-ui-assets.py, which is not this agent's file — this
-	 * is a faithful presentation of the sprite as shipped, not a workaround hiding a bad asset.
-	 */
-	static void DrawTrough(AHUD* HUD, UTexture2D* Tex, float X, float Y, float W, float H, const FLinearColor& Tint)
-	{
-		constexpr float CapU = 16.f / 512.f;   // the lip, and it is clean
-		constexpr float MidU = 0.30f;          // a band of the uniform centre, well past the blade
-		constexpr float MidUW = 0.40f;
-
-		const float Cap = FMath::Min(H * (16.f / 23.f), W * 0.5f);
-		const float MidW = W - Cap * 2.f;
-
-		HUD->DrawTexture(Tex, X, Y, Cap, H, 0.f, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
-		if (MidW > 0.f)
-		{
-			HUD->DrawTexture(Tex, X + Cap, Y, MidW, H, MidU, 0.f, MidUW, 1.f, Tint, BLEND_Translucent);
-		}
-		HUD->DrawTexture(Tex, X + W - Cap, Y, Cap, H, 1.f - CapU, 0.f, CapU, 1.f, Tint, BLEND_Translucent);
+		return TraceMenuKit::Sprite(Which);
 	}
 
 #if !UE_BUILD_SHIPPING
@@ -591,11 +393,11 @@ namespace TraceOptionsMenuArt
 		};
 
 		FString Line;
-		for (int32 Index = 0; Index < int32(ESprite::Count); ++Index)
+		for (int32 Index = 0; Index < int32(UE_ARRAY_COUNT(UsedSprites)); ++Index)
 		{
-			// GCache directly, NOT Sprite(): Sprite() would LoadObject and flush async loading from
-			// inside a draw pass, which is a thing this diagnostic must observe and not cause.
-			Line += FString::Printf(TEXT("%d=%s "), Index, State(GCache[Index].Get()));
+			// PeekSprite, NOT Sprite(): Sprite() would LoadObject and flush async loading from inside
+			// a draw pass, which is a thing this diagnostic must observe and not cause.
+			Line += FString::Printf(TEXT("%d=%s "), Index, State(TraceMenuKit::PeekSprite(UsedSprites[Index])));
 		}
 
 		const UTexture2D* AtlasLight = TraceText::AtlasTexture(ETraceTextWeight::Light);
@@ -632,22 +434,23 @@ namespace TraceOptionsMenuArt
 		}
 		bLogged = true;
 
+		// Sprite() loads (and is gated by Trace.Menu.Art); PeekSprite() then says whether it LOADED. A
+		// loaded sprite is usually not drawable on the first frame, and that is not a fault.
 		int32 Resolved = 0;
-		for (int32 Index = 0; Index < int32(ESprite::Count); ++Index)
+		const int32 Wanted = int32(UE_ARRAY_COUNT(UsedSprites));
+		for (const ETraceKitSprite Which : UsedSprites)
 		{
-			if (Sprite(ESprite(Index)) != nullptr)
-			{
-				++Resolved;
-			}
+			Sprite(Which);
+			Resolved += (GEnabled != 0 && TraceMenuKit::PeekSprite(Which) != nullptr) ? 1 : 0;
 		}
 
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[Options] Menu art: %d of %d sprites resolved (Trace.Menu.Art = %d). %s"),
-			Resolved, int32(ESprite::Count), GEnabled,
+			Resolved, Wanted, GEnabled,
 			(GEnabled == 0)
 				? TEXT("Art is OFF: every control is drawing the plain rectangle it drew before spec v20.")
-				: ((Resolved == int32(ESprite::Count))
-					? TEXT("Plates, slider, chips, KEYBIND/KEY and the cursor are the artist's, on both hosts.")
+				: ((Resolved == Wanted)
+					? TEXT("Plates, slider and chips are the artist's, through the shared kit renderer, on both hosts.")
 					: TEXT("Some controls are drawing their fallback rectangles; see the warnings above.")));
 	}
 }
@@ -4522,11 +4325,11 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 	// v20 §0.5 is what happens when a decorative hover tint gets promoted to a selection indicator.
 	bool bPlateDrawn = false;
 	{
-		const TraceOptionsMenuArt::ESprite Which = !Row.bEnabled
-			? TraceOptionsMenuArt::ESprite::PlateDisabled
-			: (bSelected ? TraceOptionsMenuArt::ESprite::PlateHover : TraceOptionsMenuArt::ESprite::PlateDefault);
+		// The plate from the kit's one state switch. The TINT below is still this page's own (it knocks
+		// unselected rows back); converting that onto the kit's is a visual change, and not this one.
+		const FTraceKitVisuals RowVisuals = TraceMenuKit::VisualsFor(TraceMenuKit::StateFor(Row.bEnabled, bSelected));
 
-		if (UTexture2D* Plate = TraceOptionsMenuArt::Sprite(Which))
+		if (UTexture2D* Plate = TraceOptionsMenuArt::Sprite(RowVisuals.Plate))
 		{
 			// Unselected rows are knocked back rather than the selected row being knocked forward: a
 			// page of thirty plates all at full strength is a wall, and the eye needs the selected one
@@ -4535,8 +4338,7 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 				? FLinearColor(0.80f, 0.80f, 0.80f, 0.75f)
 				: (bSelected ? FLinearColor::White : FLinearColor(0.78f, 0.78f, 0.78f, 0.90f));
 
-			TraceOptionsMenuArt::DrawPlate(HUD, Plate, TraceOptionsMenuArt::ButtonFrame, X, Y, W, H, Tint);
-			bPlateDrawn = true;
+			bPlateDrawn = TraceMenuKit::DrawPlate(HUD, Plate, TraceMenuArtStyle::ButtonFrame, X, Y, W, H, H, Tint);
 		}
 	}
 	if (!bPlateDrawn)
@@ -4982,7 +4784,7 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 	const float TrackY = Y + (H - TrackH) * 0.5f;
 
 	bool bTrackDrawn = false;
-	if (UTexture2D* TrackTex = TraceOptionsMenuArt::Sprite(TraceOptionsMenuArt::ESprite::SliderTrack))
+	if (TraceOptionsMenuArt::Sprite(ETraceKitSprite::SliderTrack) != nullptr)
 	{
 		// The sprite is a TROUGH — 23 rows with the solid rail occupying its middle eleven and a halo
 		// above and below — so drawing it at the 6px the plain bar used would throw the shape away. It
@@ -4991,15 +4793,15 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		// function, and that rect is what a drag maps the pointer across.
 		const float SpriteH = FMath::Clamp(H * 0.60f, TrackH, 21.f * UIScale);
 		const float SpriteY = Y + (H - SpriteH) * 0.5f;
-		TraceOptionsMenuArt::DrawTrough(HUD, TrackTex, TrackLeft, SpriteY, TrackW, SpriteH, FLinearColor::White);
+		TraceMenuKit::DrawSliderTrack(HUD, TrackLeft, SpriteY, TrackW, SpriteH, FLinearColor::White);
 
 		// THE FILL IS STILL A PLAIN BAR, deliberately. The sheet has no filled-track sprite (the
 		// slicer's own note says the artist drew an empty trough), and tinting this one cannot make a
 		// fill: a Canvas tint MULTIPLIES, so a navy trough times cyan is a darker navy trough. So the
 		// rail is drawn INSIDE the artist's trough, inset to the sprite's own solid band, and the
 		// artist's lip and halo frame it.
-		const float RailTop = SpriteY + SpriteH * TraceOptionsMenuArt::TrackRailTopV;
-		const float RailH = FMath::Max(2.f, SpriteH * TraceOptionsMenuArt::TrackRailV);
+		const float RailTop = SpriteY + SpriteH * TraceMenuKit::TrackRailTopV;
+		const float RailH = FMath::Max(2.f, SpriteH * TraceMenuKit::TrackRailV);
 		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, bSelected ? 0.95f : 0.55f),
 			TrackLeft, RailTop, TrackW * Alpha, RailH);
 
@@ -5310,14 +5112,8 @@ void FTraceOptionsMenu::PreviewAudioChange(ESetting Setting)
 
 bool FTraceOptionsMenu::DrawValueChip(AHUD* HUD, float X, float Y, float W, float H) const
 {
-	UTexture2D* Chip = TraceOptionsMenuArt::Sprite(TraceOptionsMenuArt::ESprite::ValueBox);
-	if (Chip == nullptr)
-	{
-		return false;
-	}
-
-	TraceOptionsMenuArt::DrawPlate(HUD, Chip, TraceOptionsMenuArt::ValueFrame, X, Y, W, H, FLinearColor::White);
-	return true;
+	return TraceMenuKit::DrawPlate(HUD, TraceOptionsMenuArt::Sprite(ETraceKitSprite::ValueBox),
+		TraceMenuArtStyle::ValueFrame, X, Y, W, H, H, FLinearColor::White);
 }
 
 void FTraceOptionsMenu::DrawFrame(AHUD* HUD, float X, float Y, float W, float H)

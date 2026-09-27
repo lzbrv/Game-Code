@@ -14,6 +14,7 @@
 
 #include "Trace.h"                              // LogTraceGame
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
+#include "UI/Widgets/Menu/TraceMenuKit.h"       // the kit's one state switch, shared with the Canvas screens
 #include "UI/Widgets/Menu/TraceMenuPalette.h"   // TraceMenuStyle::RowHeight / RowPadX / PanelMaxWidth
 
 // Named after the file, not anonymous — Scripts/check-jumbo-build-collisions.py, and the unity build
@@ -61,12 +62,10 @@ namespace TraceMenuRowWidgetLocal
 	//   * on an unselected row, 85% white — plainly legible at 9.6:1 and quiet enough that the
 	//     selected row is the one the eye lands on;
 	//   * on a disabled row, TraceMenuArtStyle::WordDisabled.
-
-	/** Furniture on a selected / pressed row. Full white. */
-	static const FLinearColor FurnitureSelected = FLinearColor::White;
-
-	/** Furniture on an unselected row. */
-	static const FLinearColor FurnitureUnselected = FLinearColor(0.85f, 0.85f, 0.85f, 1.f);
+	//
+	// Those three values, and the whole state switch below, now live in the shared kit
+	// (UI/Widgets/Menu/TraceMenuKit.h: TraceMenuKit::FurnitureSelected / FurnitureUnselected and
+	// TraceMenuKit::VisualsFor), so the Canvas screens read the same table this row does.
 
 	/**
 	 * THE RED ARM for spec v24 §3. Non-zero puts the pre-v24 white word back on the hover state,
@@ -86,16 +85,10 @@ namespace TraceMenuRowWidgetLocal
 		TEXT("artist's green can be measured against the defect it replaced from one build."),
 		ECVF_Cheat);
 
-	/**
-	 * The plate's breathing tint on the selected row.
-	 *
-	 * It used to be 0.88 + 0.12*sin, i.e. a selected plate that spent most of its cycle DARKER than
-	 * every unselected plate beside it — the same mistake as the word colour, one layer down, and it
-	 * put up to 12% of noise into any before/after comparison of this row. Now it breathes upwards
-	 * from parity, so the selected row is never the dim one at any phase.
-	 */
-	static constexpr float SelectedPlateBase = 1.f;
-	static constexpr float SelectedPlateSwing = 0.10f;
+	// The plate's breathing tint on the selected row is TraceMenuKit::HoverPulseBase/HoverPulseSwing
+	// (1.0 +/- 0.10). It used to be 0.88 + 0.12*sin, i.e. a selected plate that spent most of its
+	// cycle DARKER than every unselected plate beside it; it is centred on parity now. The SPEED is
+	// still this widget's own PulseSpeed property, which a designer can edit on WBP_TitleMenu.
 
 	/** Alpha for the address readout on a row. Brighter on the selected row, as its label now is. */
 	static constexpr float StatusAlphaSelected = 0.88f;
@@ -205,26 +198,17 @@ namespace TraceMenuRowWidgetLocal
 	// =============================================================================================
 
 	/**
-	 * The four states a row can be in, in the order a player would rank them.
+	 * The four states a row can be in — THE KIT'S four states (TraceMenuKit.h), not a copy of them.
 	 *
 	 * Disabled outranks everything: a row that cannot be pressed must not look pressable even while
 	 * the cursor is on it. Pressed outranks hovered, because a press IS the hover plus a finger down.
 	 * Hover and keyboard selection are the same thing on this menu — see ATraceMenuHUD::DrawHUD.
 	 */
-	enum class ERowState : uint8
-	{
-		Normal,
-		Hovered,
-		Pressed,
-		Disabled,
-	};
+	using ERowState = ETraceKitState;
 
 	static ERowState StateFor(const FTraceMenuRowView& InView)
 	{
-		if (!InView.bEnabled)          { return ERowState::Disabled; }
-		if (InView.bPressed)           { return ERowState::Pressed; }
-		if (InView.bSelected)          { return ERowState::Hovered; }
-		return ERowState::Normal;
+		return TraceMenuKit::StateFor(InView.bEnabled, InView.bSelected, InView.bPressed);
 	}
 
 	/**
@@ -232,35 +216,24 @@ namespace TraceMenuRowWidgetLocal
 	 *
 	 * This struct is the whole of §3's guarantee. The orange outline is a property of @c Plate (it is
 	 * baked into T_MenuBtn_Hover) and the green word is @c Label; they are produced by ONE switch
-	 * over ONE value, so the only way to light the ring without turning the word green — the exact
-	 * defect reported — is to delete a line from a single case.
+	 * over ONE value — TraceMenuKit::VisualsFor, shared with every Canvas screen — so the only way to
+	 * light the ring without turning the word green, the exact defect reported, is to delete a line
+	 * from a single case.
 	 */
-	struct FRowVisuals
+	struct FRowVisuals : FTraceKitVisuals
 	{
-		/** Which of the three plates the artist drew. The hover plate is the one with the ring. */
-		enum class EPlate : uint8 { Default, Hover, Disabled } Plate = EPlate::Default;
-
-		/** The label's colour, from the artist's palette. */
-		FLinearColor Label = TraceMenuArtStyle::WordDefault;
-
-		/** Neutral for the row's own furniture: the address readout, the value, the arrows. */
-		FLinearColor Furniture = FurnitureUnselected;
-
-		/** true while this state should breathe. Pressed does not; it is held. */
-		bool bPulses = false;
-
-		/** Flat multiplier applied to the plate and the rail when the state does not breathe. */
-		float FlatTint = 1.f;
-
 		/**
 		 * SPEC v26 §7 / v28 §1 — the white outline, on the DEFAULT state and nowhere else.
 		 *
 		 * A FIELD OF THIS STRUCT, not a separate `if (!bSelected)` twenty lines away, and that is the
 		 * same argument §3 made for the label: "Hover keeps its amber ring; do not stack both" is a
 		 * statement about two things never being true at once, and the cheapest way to guarantee it is
-		 * to make them one value. The ring lives in EPlate::Hover and the stroke lives here, and the
-		 * switch below sets each case's pair together — so a frame carrying both would take editing a
-		 * case to say so out loud.
+		 * to make them one value. The ring lives in the Hover plate and the stroke lives here, and
+		 * VisualsFor below sets it from the same state — so a frame carrying both would take editing
+		 * it to say so out loud.
+		 *
+		 * TITLE ONLY. The owner asked for this outline on the title screen; it is not part of the kit
+		 * and TraceMenuKit::VisualsFor deliberately does not know about it.
 		 */
 		bool bOutline = false;
 	};
@@ -268,54 +241,20 @@ namespace TraceMenuRowWidgetLocal
 	static FRowVisuals VisualsFor(ERowState InState)
 	{
 		FRowVisuals Out;
-		switch (InState)
+		static_cast<FTraceKitVisuals&>(Out) = TraceMenuKit::VisualsFor(InState);
+
+		// SPEC v26 §7. THE ONLY STATE THAT GETS IT. "The default button state (non-hover)" is this
+		// state by name: Hover and Pressed both wear the sheet's amber ring and must not stack a second
+		// outline on it, and Disabled is not the default state — it is the artist's own near-black
+		// plate with a grey ring, whose entire job is to say "you cannot press this", and a bright
+		// white stroke around a dead row would be the loudest thing on the screen.
+		Out.bOutline = (InState == ETraceKitState::Default);
+
+		// The red arm sits AFTER the shared switch, deliberately: it must be able to break the pairing
+		// the switch guarantees, because a red arm that cannot reproduce the defect proves nothing.
+		if (GRowHoverWordRedArm != 0 && (InState == ETraceKitState::Hover || InState == ETraceKitState::Pressed))
 		{
-		case ERowState::Disabled:
-			Out.Plate = FRowVisuals::EPlate::Disabled;
-			Out.Label = TraceMenuArtStyle::WordDisabled;
-			Out.Furniture = TraceMenuArtStyle::WordDisabled;
-			break;
-
-		case ERowState::Pressed:
-			// The sheet has three plates and a press is not one of them, so pressed is the HOVER
-			// plate — ring and all — knocked down. Marked as the stand-in it is; a fourth sprite
-			// would replace this case and nothing else.
-			Out.Plate = FRowVisuals::EPlate::Hover;
-			Out.Label = TraceMenuArtStyle::WordHoverLifted();
-			Out.Furniture = FurnitureSelected;
-			Out.FlatTint = TraceMenuArtStyle::PressedTint;
-			break;
-
-		case ERowState::Hovered:
-			// THE TWO HALVES OF §3, ON ADJACENT LINES. The ring comes from the plate; the green comes
-			// from the artist's palette; neither can be true without the other. Lifted, not raw:
-			// WordHoverLifted() is the artist's hue byte-normalised to read on the plate (release art
-			// bible §2.5 — the same transformation precedent as AmberLifted, stated in the palette).
-			Out.Plate = FRowVisuals::EPlate::Hover;
-			Out.Label = TraceMenuArtStyle::WordHoverLifted();
-			Out.Furniture = FurnitureSelected;
-			Out.bPulses = true;
-			break;
-
-		case ERowState::Normal:
-		default:
-			Out.Plate = FRowVisuals::EPlate::Default;
-			Out.Label = TraceMenuArtStyle::WordDefault;
-			Out.Furniture = FurnitureUnselected;
-			// SPEC v26 §7. THE ONLY CASE THAT SETS IT. "The default button state (non-hover)" is this
-			// case by name: Hovered and Pressed both wear the sheet's amber ring and must not stack a
-			// second outline on it, and Disabled is not the default state — it is the artist's own
-			// near-black plate with a grey ring, whose entire job is to say "you cannot press this",
-			// and a bright white stroke around a dead row would be the loudest thing on the screen.
-			Out.bOutline = true;
-			break;
-		}
-
-		// The red arm sits AFTER the switch, deliberately: it must be able to break the pairing the
-		// switch guarantees, because a red arm that cannot reproduce the defect proves nothing.
-		if (GRowHoverWordRedArm != 0 && (InState == ERowState::Hovered || InState == ERowState::Pressed))
-		{
-			Out.Label = FurnitureSelected;
+			Out.Label = TraceMenuKit::FurnitureSelected;
 		}
 
 		return Out;
@@ -895,23 +834,21 @@ void UTraceMenuRow::ApplyView(const FTraceMenuRowView& InView, float InNow)
 
 	// Kept as a named boolean because several call sites below read better for it; it is now DERIVED
 	// from the state rather than being a second, parallel decision.
-	const bool bDisabled = RowState == TraceMenuRowWidgetLocal::ERowState::Disabled;
+	const bool bDisabled = RowState == ETraceKitState::Disabled;
 
 	// The plate's tint: the breathing that has always marked a hovered row, or the flat knock-down a
 	// press and a disabled row use. One expression, so the rail below can share it and the two can
 	// never fall out of phase.
 	const float PlateTint = Visuals.bPulses
-		? (TraceMenuRowWidgetLocal::SelectedPlateBase
-			+ TraceMenuRowWidgetLocal::SelectedPlateSwing * FMath::Sin(InNow * PulseSpeed))
-		: Visuals.FlatTint;
+		? TraceMenuKit::HoverPulse(InNow, PulseSpeed)
+		: Visuals.PlateTint;
 
 	if (PlateSprite != nullptr)
 	{
-		using EPlate = TraceMenuRowWidgetLocal::FRowVisuals::EPlate;
 		const FSlateBrush& Chosen =
-			  (Visuals.Plate == EPlate::Disabled) ? PlateDisabledBrush
-			: (Visuals.Plate == EPlate::Hover)    ? PlateHoverBrush
-			:                                       PlateDefaultBrush;
+			  (Visuals.Plate == ETraceKitSprite::BtnDisabled) ? PlateDisabledBrush
+			: (Visuals.Plate == ETraceKitSprite::BtnHover)    ? PlateHoverBrush
+			:                                                   PlateDefaultBrush;
 		PlateSprite->SetBrush(Chosen);
 		PlateSprite->SetColorAndOpacity(FLinearColor(PlateTint, PlateTint, PlateTint, 1.f));
 	}
@@ -993,9 +930,9 @@ void UTraceMenuRow::ApplyView(const FTraceMenuRowView& InView, float InNow)
 			// green — an address a host reads out loud is the last string on this screen that should
 			// be sitting at 2.34:1.
 			const float StatusAlpha =
-				  (RowState == TraceMenuRowWidgetLocal::ERowState::Disabled) ? TraceMenuRowWidgetLocal::StatusAlphaDisabled
-				: (RowState == TraceMenuRowWidgetLocal::ERowState::Normal)   ? TraceMenuRowWidgetLocal::StatusAlphaNormal
-				:                                                             TraceMenuRowWidgetLocal::StatusAlphaSelected;
+				  (RowState == ETraceKitState::Disabled) ? TraceMenuRowWidgetLocal::StatusAlphaDisabled
+				: (RowState == ETraceKitState::Default)  ? TraceMenuRowWidgetLocal::StatusAlphaNormal
+				:                                          TraceMenuRowWidgetLocal::StatusAlphaSelected;
 			StatusText->SetColorAndOpacity(FSlateColor(FLinearColor(
 				FurnitureColor.R, FurnitureColor.G, FurnitureColor.B, StatusAlpha)));
 			StatusText->SetText(FText::FromString(InView.Status));

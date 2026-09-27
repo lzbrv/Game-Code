@@ -6,7 +6,6 @@
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/Texture2D.h"             // the pointer sprite
-#include "TextureResource.h"              // FTextureResource::TextureRHI — see PointerSprite
 #include "Engine/World.h"
 #include "Framework/Application/SlateApplication.h"
 #include "GameFramework/HUD.h"            // AHUD::DrawTexture — the one pointer draw
@@ -17,6 +16,7 @@
 #include "Trace.h"                        // LogTraceGame
 #include "UI/TraceMenuHUD.h"              // ATraceMenuHUD::IsOptionsOpen — see PollMenuSurfaces
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"   // the sprite's path, aspect and tip — named once
+#include "UI/Widgets/Menu/TraceMenuKit.h"        // TraceMenuKit::IsDrawable — see PointerSprite
 #include "UI/Widgets/Menu/TraceMenuPalette.h"    // TraceMenuStyle::Cyan — see PointerTint
 
 // Named after the file, not anonymous. Scripts/check-jumbo-build-collisions.py, and the unity build
@@ -309,8 +309,8 @@ namespace TraceHardwareCursorFile
 			PointerCache = Texture;
 		}
 
-		const FTextureResource* Resource = Texture->GetResource();
-		if (Resource == nullptr || !Resource->TextureRHI.IsValid())
+		// The kit's one render-resource guard (UI/Widgets/Menu/TraceMenuKit.h), not a copy of it.
+		if (!TraceMenuKit::IsDrawable(Texture))
 		{
 			return nullptr;
 		}

@@ -268,6 +268,13 @@ FLinearColor TraceMenuArtStyle::WordHoverLifted()
 	return TraceMenuArtStyleFile::ByteNormalised(TraceMenuArtStyle::WordHover);
 }
 
+FLinearColor TraceMenuArtStyle::ValueGlowLifted()
+{
+	// sRGB(97,72,0) x (255/97) = sRGB(255,189,0), #FFBD00 — the gold the value box and the slider
+	// rail glow in, at a level a flat shape can carry.
+	return TraceMenuArtStyleFile::ByteNormalised(TraceMenuArtStyle::ValueGlow);
+}
+
 FSlateFontInfo TraceMenuArtStyle::MenuFont(float InSize)
 {
 	TraceMenuArtStyleFile::Resolve();
