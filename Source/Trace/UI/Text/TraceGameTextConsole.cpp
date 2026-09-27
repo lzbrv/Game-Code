@@ -163,6 +163,14 @@ namespace
 				{ TEXT("delete a slot the code fills"),TEXT("RESPAWN IN {0}"),  TEXT("RESPAWNING"),          false },
 				{ TEXT("add a slot to a plain string"),TEXT("PLAY"),            TEXT("PLAY {0}"),            false },
 				{ TEXT("braces that are not a slot"),  TEXT("SET {MODE}"),      TEXT("CHOOSE {MODE}"),       true  },
+
+				// "KEY =" IS HOW A LINE IS REMOVED, and it has to work on a line with a number in it
+				// too. The rule used to refuse the second of these ("expected {0}, found (none)"),
+				// which put the built-in wording straight back: blanking WEAPON_DRAWING or
+				// CROSSHAIR_THROW_READY_IN was impossible from the document.
+				{ TEXT("remove a plain line (empty)"), TEXT("PLAY ALSO HOSTS"), TEXT(""),                    true  },
+				{ TEXT("remove a line with a slot (empty)"),
+				                                       TEXT("{0}  DRAWING"),    TEXT(""),                    true  },
 			};
 
 			int32 Failures = 0;
@@ -172,10 +180,12 @@ namespace
 			for (const FCase& Case : Cases)
 			{
 				// THE SHIPPED RULE, not a copy of it: ApplyDocumentTo accepts an override exactly when
-				// the two slot signatures are equal, and this asks the same function the same question.
+				// the two slot signatures are equal — or the edit is empty, which removes the line —
+				// and this asks the same function (AcceptsOverride) the same question.
 				const FString Want = TraceGameText::ExtractSlots(Case.Default);
 				const FString Got = TraceGameText::ExtractSlots(Case.Edit);
-				const bool bAccepted = (Want == Got);
+				FString RefusalReason;
+				const bool bAccepted = TraceGameText::AcceptsOverride(Case.Default, Case.Edit, RefusalReason);
 
 				const bool bPass = (bAccepted == Case.bShouldBeAccepted);
 				Failures += bPass ? 0 : 1;
@@ -199,6 +209,22 @@ namespace
 				TEXT("[GameText]   %-4s %-38s a slot with no argument renders as \"%s\" — no crash, no "
 				     "garbage, just a visible blank."),
 				bSurvived ? TEXT("ok") : TEXT("FAIL"), TEXT("missing argument is survivable"), *Underfilled);
+
+			// ---- THE DOCUMENT ROUND TRIP: what a line shows, and what a dump writes back ------------
+			//
+			// The table above proves the RULE. This proves the two things the co-developer's cuts
+			// actually ran into: a line has to be removable from the document (an empty value, even
+			// on a line with a {0}), and regenerating the document must not change a line he wrote —
+			// not a trailing space, not a refused edit, and not an empty value.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[GameText] ===== the document: removing a line, and a dump keeping every edit ====="));
+			TArray<FString> RoundTripLines;
+			const bool bRoundTripOk = TraceGameText::SelfTestDocument(RoundTripLines);
+			for (const FString& ReportLine : RoundTripLines)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[GameText]   %s"), *ReportLine);
+			}
+			Failures += bRoundTripOk ? 0 : 1;
 
 			UE_LOG(LogTraceGame, Display, TEXT("[GameText] ===== %s ====="),
 				(Failures == 0) ? TEXT("PASS") : TEXT("*** FAIL ***"));
@@ -275,6 +301,70 @@ namespace
 			{
 				UE_LOG(LogTraceGame, Display,
 					TEXT("[GameText]   ok   every line in the document matches a string the game asked for."));
+			}
+
+			// ---- strings with NO line in the document, and lines the document removes -------------
+			//
+			// THE FIRST LIST IS HOW A DELETION IS CAUGHT. Deleting a line does not remove its text —
+			// the game falls back to the wording built into it — and that is how twenty lines the
+			// co-developer deleted to get rid of them all stayed on screen, unchanged, with nothing
+			// anywhere saying so. Every string listed here is showing words nobody wrote into the
+			// document. Keys whose built-in wording is itself empty are left out; they show nothing
+			// either way. Informational, not a failure: a brand-new label, or one of the table-driven
+			// keys the source scanner cannot see, lands here too until the next dump.
+			{
+				TArray<const TraceGameText::FEntry*> KeysWithoutLine;
+				TArray<const TraceGameText::FEntry*> KeysRemovedByDocument;
+				for (const TraceGameText::FEntry& Entry : Entries)
+				{
+					if (Entry.DefaultText.IsEmpty())
+					{
+						continue;
+					}
+					if (!Entry.bInDocument)
+					{
+						KeysWithoutLine.Add(&Entry);
+					}
+					else if (Entry.bOverridden && Entry.Text.IsEmpty())
+					{
+						KeysRemovedByDocument.Add(&Entry);
+					}
+				}
+
+				if (KeysWithoutLine.Num() > 0)
+				{
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("[GameText] %d string(s) on screen have NO line in the document, so they show the "
+						     "wording built into the game. A line that was DELETED comes back like this - to "
+						     "remove one, keep the line and leave nothing after the \"=\":"),
+						KeysWithoutLine.Num());
+					for (int32 Index = 0; Index < FMath::Min(KeysWithoutLine.Num(), 30); ++Index)
+					{
+						UE_LOG(LogTraceGame, Warning, TEXT("[GameText]   %-40s \"%s\""),
+							*KeysWithoutLine[Index]->Key, *KeysWithoutLine[Index]->DefaultText);
+					}
+					if (KeysWithoutLine.Num() > 30)
+					{
+						UE_LOG(LogTraceGame, Warning,
+							TEXT("[GameText]   ... and %d more"), KeysWithoutLine.Num() - 30);
+					}
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[GameText]   ok   every string on screen has a line in the document."));
+				}
+
+				if (KeysRemovedByDocument.Num() > 0)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[GameText] %d line(s) are removed by the document (left empty) and show nothing:"),
+						KeysRemovedByDocument.Num());
+					for (const TraceGameText::FEntry* RemovedEntry : KeysRemovedByDocument)
+					{
+						UE_LOG(LogTraceGame, Display, TEXT("[GameText]   %s"), *RemovedEntry->Key);
+					}
+				}
 			}
 
 			// ---- characters the font cannot draw in the screen's own typeface ---------------------

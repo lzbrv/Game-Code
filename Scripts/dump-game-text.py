@@ -29,8 +29,20 @@ still contains; only genuinely new keys arrive at their compiled-in default. Key
 has are kept in a clearly labelled section at the end rather than deleted, because throwing away
 somebody's rewritten sentence is the one unrecoverable thing a generator can do.
 
+"WINS" MEANS BYTE FOR BYTE. A line already in the document is written back exactly as it was typed:
+a trailing space stays, an empty value stays empty (that is how a line is REMOVED from the screen),
+and a line the game refuses because its {0} blanks do not match stays too, with a warning - it used
+to be replaced with the built-in wording, which quietly threw the owner's sentence away.
+
+WHAT A DELETED LINE MEANS. Deleting a line does not remove its text; the game falls back to the
+wording built into the code, and this script writes that wording back. --check says so by name, so
+a deletion that brought a sentence back to the screen cannot go unnoticed. To remove a line, keep it
+and leave nothing after the "=".
+
     python3 Scripts/dump-game-text.py            # rewrite Config/TraceGameText.ini in place
     python3 Scripts/dump-game-text.py --check    # change nothing; exit 1 if it is out of date
+    python3 Scripts/dump-game-text.py -o X.ini   # write a copy elsewhere, still keeping the edits
+                                                 # in Config/TraceGameText.ini
 """
 
 import argparse
@@ -134,14 +146,21 @@ def scan():
 
 
 def read_existing(path):
-    """key -> value from a document, ignoring comments. Section headers prefix their keys."""
+    """key -> value AS TYPED from a document, ignoring comments. Section headers prefix their keys.
+
+    AS TYPED: only the spaces between the "=" and the first character are dropped. The game trims
+    both ends when it READS a value (a trailing space never reaches the screen), but this is the
+    copy that gets WRITTEN BACK, and a generator that "tidied" the owner's lines would turn every
+    regenerate into a diff of lines nobody changed - BANNER_PARRIED ends in a space, and that space
+    is his. Same rule as the game's own writer (GDocumentAsTyped in TraceGameText.cpp)."""
     values = {}
     if not os.path.isfile(path):
         return values
     section = ""
     with open(path, encoding="utf-8", errors="replace") as handle:
-        for line in handle:
-            line = line.strip()
+        for raw in handle:
+            raw = raw.rstrip("\r\n")
+            line = raw.strip()
             if not line or line.startswith("#") or line.startswith(";"):
                 continue
             if line.startswith("[") and line.endswith("]"):
@@ -149,12 +168,13 @@ def read_existing(path):
                 continue
             if "=" not in line:
                 continue
-            name, _, value = line.partition("=")
+            name, _, _ = line.partition("=")
             name = name.strip()
             if not name:
                 continue
+            value = raw.partition("=")[2].lstrip(" \t")
             full = f"{section}.{name}" if section else name
-            values[full.upper()] = value.strip()
+            values[full.upper()] = value
     return values
 
 
@@ -182,11 +202,16 @@ HEADER = """\
 #    3. Write \\n where you want a line break.
 #    4. Stick to ordinary keyboard characters. Run Trace.Text.Verify to check.
 #
-#  Delete a line and that string goes back to the wording built into the game, so
-#  nothing here can be broken beyond repair.
+#  TO REMOVE A LINE FROM THE SCREEN, leave the right side empty:
+#       TAGLINE                            =
+#  The game then shows nothing in its place.
+#
+#  DELETING a line does NOT remove it. It brings back the wording built into the
+#  game, and the next regenerate writes that wording back into this file.
 #
 #  Regenerate with:  python3 Scripts/dump-game-text.py
-#  It keeps every edit you have made and only adds lines for text that is new.
+#  It keeps every line you have written exactly as you wrote it and only adds
+#  lines for text that is new.
 # =============================================================================
 """
 
@@ -200,15 +225,19 @@ def compose(found, existing):
     for key, default in found.items():
         if key in existing:
             candidate = existing[key]
-            # THE SAME RULE THE GAME APPLIES AT RUNTIME, applied here so the file this writes is one
-            # the game will actually honour. A line whose blanks do not match the code is dropped back
-            # to the default rather than written out to be silently ignored later.
-            if slots(candidate) == slots(default):
-                merged[key] = candidate
-                kept += 1
-                continue
-            print(f"  !! {key} kept its built-in wording: the edit's blanks {slots(candidate)} do not "
-                  f"match the code's {slots(default)}", file=sys.stderr)
+            # KEPT AS TYPED, WHATEVER IT SAYS. The game applies the blanks rule when it reads the file
+            # (and an empty value is always allowed - it removes the line); a line it refuses is named
+            # by Trace.Text.Verify and in the log. What this script must not do is decide for the
+            # owner: it used to swap a refused line for the built-in wording, which deleted his
+            # sentence to fix a typo in it. So it warns and keeps the line.
+            shown = candidate.strip()
+            if shown and slots(shown) != slots(default):
+                print(f"  !! {key}: the game will IGNORE this line until its blanks match - it has "
+                      f"{slots(shown)}, the code fills {slots(default)}. Kept as you wrote it.",
+                      file=sys.stderr)
+            merged[key] = candidate
+            kept += 1
+            continue
         merged[key] = default
         fresh += 1
 
@@ -248,12 +277,23 @@ def compose(found, existing):
     return "".join(lines), kept, fresh, len(orphans)
 
 
+def missing_from_document(found, existing):
+    """Keys the code can show that have no line in the document - sorted.
+
+    Every one of these is on screen at its BUILT-IN wording. That is right for a label added since
+    the last regenerate, and wrong for a line somebody deleted meaning to remove it, which is the
+    mistake this list exists to catch: deleting a line never removed anything."""
+    return sorted(k for k, default in found.items() if k not in existing and default != "")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--check", action="store_true",
                         help="change nothing; exit 1 if the document is out of date")
     parser.add_argument("-o", "--output", default=DOCUMENT, help="where to write")
+    parser.add_argument("-i", "--input", default=DOCUMENT,
+                        help="the document whose edits are kept (default: Config/TraceGameText.ini)")
     args = parser.parse_args()
 
     found, _, dynamic = scan()
@@ -261,7 +301,10 @@ def main():
         print("No TRACE_TEXT call sites found under Source/. Nothing to write.", file=sys.stderr)
         return 1
 
-    existing = read_existing(args.output)
+    # THE EDITS COME FROM THE DOCUMENT, NOT FROM WHEREVER THE OUTPUT GOES. This read args.output,
+    # so `-o preview.ini` started from an empty file and wrote a "preview" with every one of the
+    # owner's edits reverted to the built-in wording - a copy that looked authoritative and was not.
+    existing = read_existing(args.input)
     text, kept, fresh, orphans = compose(found, existing)
 
     if args.check:
@@ -274,6 +317,14 @@ def main():
             return 0
         print(f"OUT OF DATE: {len(found)} string(s) in the code, {len(existing)} in the document. "
               f"Run: python3 Scripts/dump-game-text.py", file=sys.stderr)
+        missing = missing_from_document(found, existing)
+        if missing:
+            print(f"  {len(missing)} string(s) the game can show have NO line in the document, so the "
+                  f"game shows its built-in wording for them. A line that was DELETED to remove it "
+                  f"comes back like this - to remove a line, keep it and leave nothing after the "
+                  f"\"=\":", file=sys.stderr)
+            for key in missing:
+                print(f"    {key:<44} {found[key]!r}", file=sys.stderr)
         return 1
 
     os.makedirs(os.path.dirname(args.output), exist_ok=True)

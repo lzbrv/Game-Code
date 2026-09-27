@@ -9,7 +9,7 @@
 
 namespace TraceGameText
 {
-namespace
+namespace TraceGameTextFile
 {
 	/**
 	 * STABLE ADDRESSES, AND THAT IS NOT A STYLE CHOICE.
@@ -30,11 +30,23 @@ namespace
 	/** Parsed document: normalised key -> raw value. Kept so a later Get() can apply it. */
 	TMap<FString, FString> GDocument;
 
+	/**
+	 * The same lines EXACTLY AS TYPED — only the whitespace between "=" and the first character is
+	 * dropped, and nothing at the end. GDocument's values are trimmed because trailing spaces are
+	 * never meant to reach the screen; this copy exists only so Trace.Text.Dump can write a line back
+	 * without changing a byte of it. A dump that "tidied" the owner's file would be a diff in every
+	 * line he ever touched, and a reason not to trust the tool.
+	 */
+	TMap<FString, FString> GDocumentAsTyped;
+
 	TArray<FString> GUnmatchedDocumentKeys;
 	TArray<TPair<FString, FString>> GRejectedOverrides;
 
 	FString GLoadedPath;
 	bool bGLoaded = false;
+
+	/** Set only while SelfTestDocument drives a deliberately refused line, so its log stays clean. */
+	bool bGQuietRefusals = false;
 
 	/** Keys are compared case-insensitively so the owner can type one in lower case and be right. */
 	FString NormaliseKey(const FString& Key)
@@ -68,6 +80,24 @@ namespace
 	}
 
 	/**
+	 * WHAT A DUMP WRITES TO THE RIGHT OF "=" FOR ONE KEY — the single decision Trace.Text.Dump makes
+	 * per line, pulled out so Trace.Text.SelfTest can check the same function the writer calls.
+	 *
+	 * A line the document already has is written back AS TYPED: not from Entry.Text, which is
+	 * trimmed, and which for a REFUSED line is the built-in wording rather than the owner's sentence.
+	 * Only a key with no line at all is written from the code — which is also what a DELETED line
+	 * gets, and why deleting a line never removed anything.
+	 */
+	FString DumpValueFor(const FEntry& Entry)
+	{
+		if (const FString* AsTyped = GDocumentAsTyped.Find(NormaliseKey(Entry.Key)))
+		{
+			return *AsTyped;
+		}
+		return EscapeForDocument(Entry.Text);
+	}
+
+	/**
 	 * Applies the document to one entry, or refuses and says why.
 	 *
 	 * THE PLACEHOLDER RULE IS THE WHOLE OF THE SAFETY STORY. Call sites hand these strings to
@@ -82,30 +112,32 @@ namespace
 	{
 		Entry.Text = Entry.DefaultText;
 		Entry.bOverridden = false;
+		Entry.bInDocument = false;
 
 		const FString* Raw = GDocument.Find(NormaliseKey(Entry.Key));
 		if (Raw == nullptr)
 		{
+			// NO LINE MEANS THE BUILT-IN WORDING, NOT "NOTHING". Deleting a line is therefore not how
+			// a line is removed — an empty value is (see AcceptsOverride). Trace.Text.Verify lists
+			// every key in this state so a deletion that brought a sentence back is visible.
 			return;
 		}
 
+		Entry.bInDocument = true;
 		const FString Candidate = ApplyEscapes(*Raw);
 
-		const FString WantSlots = ExtractSlots(Entry.DefaultText);
-		const FString GotSlots = ExtractSlots(Candidate);
-		if (WantSlots != GotSlots)
+		FString Reason;
+		if (!AcceptsOverride(Entry.DefaultText, Candidate, Reason))
 		{
-			const FString Reason = FString::Printf(
-				TEXT("the slots must be the same ones the game fills: expected %s, found %s"),
-				WantSlots.IsEmpty() ? TEXT("(none)") : *WantSlots,
-				GotSlots.IsEmpty() ? TEXT("(none)") : *GotSlots);
-
 			GRejectedOverrides.Emplace(Entry.Key, Reason);
 
-			UE_LOG(LogTraceGame, Error,
-				TEXT("[GameText] REFUSED the document's wording for %s: %s. The shipped wording is being "
-				     "used instead. Fix the line and run Trace.Text.Reload."),
-				*Entry.Key, *Reason);
+			if (!bGQuietRefusals)
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[GameText] REFUSED the document's wording for %s: %s. The shipped wording is being "
+					     "used instead. Fix the line and run Trace.Text.Reload."),
+					*Entry.Key, *Reason);
+			}
 			return;
 		}
 
@@ -148,6 +180,7 @@ namespace
 	int32 ParseDocument(const TArray<FString>& Lines, const FString& PathForMessages)
 	{
 		GDocument.Reset();
+		GDocumentAsTyped.Reset();
 
 		FString Section;
 		int32 Count = 0;
@@ -201,12 +234,25 @@ namespace
 			}
 
 			GDocument.Add(Normalised, Value);
+
+			// The as-typed copy, cut from the UNTRIMMED line. The trimmed Line above lost any trailing
+			// space, which is the whole thing this copy is here to keep.
+			{
+				FString AsTyped;
+				int32 RawEquals = INDEX_NONE;
+				if (Lines[Index].FindChar(TEXT('='), RawEquals))
+				{
+					AsTyped = Lines[Index].Mid(RawEquals + 1).TrimStart();
+					AsTyped.RemoveFromEnd(TEXT("\r"));
+				}
+				GDocumentAsTyped.Add(Normalised, AsTyped);
+			}
 			++Count;
 		}
 
 		return Count;
 	}
-} // namespace
+} // namespace TraceGameTextFile
 
 FString ExtractSlots(const FString& Format)
 {
@@ -260,11 +306,46 @@ FString ExtractSlots(const FString& Format)
 	return Out;
 }
 
+bool AcceptsOverride(const FString& DefaultText, const FString& Candidate, FString& OutReason)
+{
+	OutReason.Reset();
+
+	// EMPTY REMOVES THE LINE, and it is accepted for every key — including one with slots, which the
+	// slot rule below would otherwise refuse ("expected {0}, found (none)") and so put the default
+	// straight back. That refusal is what made blanking a line with a number in it impossible. It is
+	// safe: FString::Format of an empty string is an empty string whatever arguments it is handed,
+	// so there is no slot left to misfill.
+	if (Candidate.IsEmpty())
+	{
+		return true;
+	}
+
+	const FString WantSlots = ExtractSlots(DefaultText);
+	const FString GotSlots = ExtractSlots(Candidate);
+	if (WantSlots == GotSlots)
+	{
+		return true;
+	}
+
+	OutReason = FString::Printf(
+		TEXT("the slots must be the same ones the game fills: expected %s, found %s"),
+		WantSlots.IsEmpty() ? TEXT("(none)") : *WantSlots,
+		GotSlots.IsEmpty() ? TEXT("(none)") : *GotSlots);
+	return false;
+}
+
 FString Format(const TCHAR* Key, const TCHAR* DefaultText, const FStringFormatOrderedArguments& Args)
 {
 	// FString::Format takes a plain TCHAR* and is therefore safe with a string read from a file —
 	// which FString::Printf is not, in this engine version. See the header.
-	return FString::Format(*Get(Key, DefaultText), Args);
+	//
+	// A line the document removed stays removed: no format, no arguments, nothing to draw.
+	const FString& Pattern = Get(Key, DefaultText);
+	if (Pattern.IsEmpty())
+	{
+		return FString();
+	}
+	return FString::Format(*Pattern, Args);
 }
 
 FString GetDefaultDocumentPath()
@@ -275,10 +356,10 @@ FString GetDefaultDocumentPath()
 
 void LoadDocument()
 {
-	bGLoaded = true;
-	GLoadedPath.Reset();
-	GUnmatchedDocumentKeys.Reset();
-	GRejectedOverrides.Reset();
+	TraceGameTextFile::bGLoaded = true;
+	TraceGameTextFile::GLoadedPath.Reset();
+	TraceGameTextFile::GUnmatchedDocumentKeys.Reset();
+	TraceGameTextFile::GRejectedOverrides.Reset();
 
 	// A LOOSE FILE BESIDE THE GAME WINS. In a packaged build ProjectDir() is a real directory on
 	// disk (it holds Binaries/ and Content/) while the Config copy is inside the pak, so this is the
@@ -294,15 +375,15 @@ void LoadDocument()
 		if (IFileManager::Get().FileExists(*Candidate)
 			&& FFileHelper::LoadFileToStringArray(Lines, *Candidate))
 		{
-			GLoadedPath = Candidate;
+			TraceGameTextFile::GLoadedPath = Candidate;
 			break;
 		}
 	}
 
 	int32 ParsedCount = 0;
-	if (GLoadedPath.IsEmpty())
+	if (TraceGameTextFile::GLoadedPath.IsEmpty())
 	{
-		GDocument.Reset();
+		TraceGameTextFile::GDocument.Reset();
 
 		// NOT AN ERROR, AND THE LEVEL SAYS SO. Every key falls back to the wording compiled into the
 		// game, which is the wording the build shipped with. A build with no document is a correct
@@ -314,62 +395,62 @@ void LoadDocument()
 	}
 	else
 	{
-		ParsedCount = ParseDocument(Lines, GLoadedPath);
+		ParsedCount = TraceGameTextFile::ParseDocument(Lines, TraceGameTextFile::GLoadedPath);
 	}
 
 	// Re-apply to everything already registered, so a reload takes effect on screens that are
 	// already on screen rather than only on ones opened afterwards.
-	for (const TUniquePtr<FEntry>& Entry : GEntries)
+	for (const TUniquePtr<FEntry>& Entry : TraceGameTextFile::GEntries)
 	{
 		if (Entry.IsValid())
 		{
-			ApplyDocumentTo(*Entry);
+			TraceGameTextFile::ApplyDocumentTo(*Entry);
 		}
 	}
 
 	// Document keys that match nothing REGISTERED SO FAR. See GetUnmatchedDocumentKeys.
-	for (const TPair<FString, FString>& Pair : GDocument)
+	for (const TPair<FString, FString>& Pair : TraceGameTextFile::GDocument)
 	{
-		if (!GByKey.Contains(Pair.Key))
+		if (!TraceGameTextFile::GByKey.Contains(Pair.Key))
 		{
-			GUnmatchedDocumentKeys.Add(Pair.Key);
+			TraceGameTextFile::GUnmatchedDocumentKeys.Add(Pair.Key);
 		}
 	}
-	GUnmatchedDocumentKeys.Sort();
+	TraceGameTextFile::GUnmatchedDocumentKeys.Sort();
 
-	if (!GLoadedPath.IsEmpty())
+	if (!TraceGameTextFile::GLoadedPath.IsEmpty())
 	{
 		UE_LOG(LogTraceGame, Log,
 			TEXT("[GameText] read %d entr(ies) from %s. %d of %d registered string(s) are using the "
 			     "document's wording."),
-			ParsedCount, *GLoadedPath, GetOverriddenCount(), GetRegisteredCount());
+			ParsedCount, *TraceGameTextFile::GLoadedPath, GetOverriddenCount(), GetRegisteredCount());
 	}
 }
 
 const FString& Get(const TCHAR* Key, const TCHAR* DefaultText)
 {
-	if (!bGLoaded)
+	if (!TraceGameTextFile::bGLoaded)
 	{
 		LoadDocument();
 	}
 
-	return FindOrRegister(Key, DefaultText).Text;
+	return TraceGameTextFile::FindOrRegister(Key, DefaultText).Text;
 }
 
 FString GetLoadedPath()
 {
-	return GLoadedPath;
+	return TraceGameTextFile::GLoadedPath;
 }
 
 int32 GetRegisteredCount()
 {
-	return GEntries.Num();
+	return TraceGameTextFile::GEntries.Num();
 }
 
 int32 GetOverriddenCount()
 {
 	int32 Count = 0;
-	for (const TUniquePtr<FEntry>& Entry : GEntries)
+	for (const TUniquePtr<FEntry>& Entry : TraceGameTextFile::GEntries)
 	{
 		if (Entry.IsValid() && Entry->bOverridden)
 		{
@@ -382,8 +463,8 @@ int32 GetOverriddenCount()
 void GetAllEntries(TArray<FEntry>& Out)
 {
 	Out.Reset();
-	Out.Reserve(GEntries.Num());
-	for (const TUniquePtr<FEntry>& Entry : GEntries)
+	Out.Reserve(TraceGameTextFile::GEntries.Num());
+	for (const TUniquePtr<FEntry>& Entry : TraceGameTextFile::GEntries)
 	{
 		if (Entry.IsValid())
 		{
@@ -395,12 +476,12 @@ void GetAllEntries(TArray<FEntry>& Out)
 
 void GetUnmatchedDocumentKeys(TArray<FString>& Out)
 {
-	Out = GUnmatchedDocumentKeys;
+	Out = TraceGameTextFile::GUnmatchedDocumentKeys;
 }
 
 void GetRejectedOverrides(TArray<TPair<FString, FString>>& Out)
 {
-	Out = GRejectedOverrides;
+	Out = TraceGameTextFile::GRejectedOverrides;
 }
 
 bool WriteDocument(const FString& Path, FString& OutError)
@@ -423,11 +504,11 @@ bool WriteDocument(const FString& Path, FString& OutError)
 	TSet<FString> Registered;
 	for (const FEntry& Entry : Entries)
 	{
-		Registered.Add(NormaliseKey(Entry.Key));
+		Registered.Add(TraceGameTextFile::NormaliseKey(Entry.Key));
 	}
 
 	TArray<FString> Orphans;
-	for (const TPair<FString, FString>& Pair : GDocument)
+	for (const TPair<FString, FString>& Pair : TraceGameTextFile::GDocument)
 	{
 		if (!Registered.Contains(Pair.Key))
 		{
@@ -453,11 +534,15 @@ bool WriteDocument(const FString& Path, FString& OutError)
 	Out += TEXT("#    3. Write \\n where you want a line break.\n");
 	Out += TEXT("#    4. Stick to ordinary keyboard characters. Run Trace.Text.Verify to check.\n");
 	Out += TEXT("#\n");
-	Out += TEXT("#  Delete a line and that string goes back to the wording built into the game, so\n");
-	Out += TEXT("#  nothing here can be broken beyond repair.\n");
+	Out += TEXT("#  TO REMOVE A LINE FROM THE SCREEN, leave the right side empty:\n");
+	Out += TEXT("#       TAGLINE                            =\n");
+	Out += TEXT("#  The game then shows nothing in its place.\n");
 	Out += TEXT("#\n");
-	Out += TEXT("#  Regenerate with Trace.Text.Dump - it keeps every edit you have made and only adds\n");
-	Out += TEXT("#  lines for text that is new.\n");
+	Out += TEXT("#  DELETING a line does NOT remove it. It brings back the wording built into the\n");
+	Out += TEXT("#  game, and the next regenerate writes that wording back into this file.\n");
+	Out += TEXT("#\n");
+	Out += TEXT("#  Regenerate with Trace.Text.Dump - it keeps every line you have written exactly\n");
+	Out += TEXT("#  as you wrote it and only adds lines for text that is new.\n");
 	Out += TEXT("# =============================================================================\n");
 
 	FString CurrentSection;
@@ -481,7 +566,8 @@ bool WriteDocument(const FString& Path, FString& OutError)
 			Out += TEXT("]\n");
 		}
 
-		Out += FString::Printf(TEXT("%-34s = %s\n"), *Name, *EscapeForDocument(Entry.Text));
+		// As typed when the document has the line; from the code only when it does not.
+		Out += FString::Printf(TEXT("%-34s = %s\n"), *Name, *TraceGameTextFile::DumpValueFor(Entry));
 	}
 
 	if (Orphans.Num() > 0)
@@ -500,7 +586,7 @@ bool WriteDocument(const FString& Path, FString& OutError)
 		Out += TEXT("\n[]\n");
 		for (const FString& Orphan : Orphans)
 		{
-			const FString* Value = GDocument.Find(Orphan);
+			const FString* Value = TraceGameTextFile::GDocumentAsTyped.Find(Orphan);
 			Out += FString::Printf(TEXT("%-34s = %s\n"), *Orphan, Value != nullptr ? **Value : TEXT(""));
 		}
 	}
@@ -513,5 +599,82 @@ bool WriteDocument(const FString& Path, FString& OutError)
 
 	return true;
 }
+
+#if !UE_BUILD_SHIPPING
+bool SelfTestDocument(TArray<FString>& OutLines)
+{
+	OutLines.Reset();
+
+	// THE LIVE DOCUMENT IS PUT BACK EXACTLY AS IT WAS. This runs the shipped parser, which starts by
+	// resetting the parsed maps, so they are copied out first and copied back last. The registered
+	// entries are never touched: every probe below is a SCRATCH entry, applied and thrown away, so a
+	// later Trace.Text.Dump cannot pick up a SELFTEST key.
+	const TMap<FString, FString> SavedDocument = TraceGameTextFile::GDocument;
+	const TMap<FString, FString> SavedAsTyped = TraceGameTextFile::GDocumentAsTyped;
+	const TArray<TPair<FString, FString>> SavedRejected = TraceGameTextFile::GRejectedOverrides;
+
+	// Written the way a person writes them: padded keys, a bare "=", and one line with a space
+	// after the last word — copied from the co-developer's BANNER_PARRIED, which has exactly that.
+	const TArray<FString> SelfTestLines =
+	{
+		TEXT("[SELFTEST]"),
+		TEXT("REMOVED_PLAIN                      ="),
+		TEXT("REMOVED_WITH_SLOT                  = "),
+		TEXT("TRAILING_SPACE                     = PARRIED {0} "),
+		TEXT("REFUSED_EDIT                       = RESPAWNING"),
+	};
+	TraceGameTextFile::ParseDocument(SelfTestLines, TEXT("(self-test document)"));
+
+	struct FProbe
+	{
+		const TCHAR* Key;
+		const TCHAR* Default;
+		const TCHAR* WantShown;     // what Get() would hand the screen
+		const TCHAR* WantWritten;   // what a dump writes to the right of "=" for this key
+		const TCHAR* Meaning;
+	};
+	static const FProbe Probes[] =
+	{
+		{ TEXT("SELFTEST.REMOVED_PLAIN"), TEXT("PLAY ALSO HOSTS - EVERY MATCH IS JOINABLE"),
+		  TEXT(""), TEXT(""), TEXT("an empty value removes the line") },
+		{ TEXT("SELFTEST.REMOVED_WITH_SLOT"), TEXT("{0}  DRAWING"),
+		  TEXT(""), TEXT(""), TEXT("...including a line with a {0} in it") },
+		{ TEXT("SELFTEST.TRAILING_SPACE"), TEXT("PARRIED - {0} DASHED YOUR TRACE"),
+		  TEXT("PARRIED {0}"), TEXT("PARRIED {0} "), TEXT("shown trimmed, written back byte for byte") },
+		{ TEXT("SELFTEST.REFUSED_EDIT"), TEXT("RESPAWN IN {0}"),
+		  TEXT("RESPAWN IN {0}"), TEXT("RESPAWNING"), TEXT("a refused edit is kept in the file, not overwritten") },
+		{ TEXT("SELFTEST.DELETED_LINE"), TEXT("THE BUILT-IN WORDING"),
+		  TEXT("THE BUILT-IN WORDING"), TEXT("THE BUILT-IN WORDING"),
+		  TEXT("a DELETED line brings the built-in wording back") },
+	};
+
+	bool bAllPassed = true;
+	TraceGameTextFile::bGQuietRefusals = true;
+	for (const FProbe& Probe : Probes)
+	{
+		FEntry Scratch;
+		Scratch.Key = Probe.Key;
+		Scratch.DefaultText = Probe.Default;
+		TraceGameTextFile::ApplyDocumentTo(Scratch);
+
+		// THE WRITER'S OWN DECISION, not a re-derivation of it: WriteDocument calls DumpValueFor too.
+		const FString Written = TraceGameTextFile::DumpValueFor(Scratch);
+		const bool bShownOk = Scratch.Text.Equals(Probe.WantShown, ESearchCase::CaseSensitive);
+		const bool bWrittenOk = Written.Equals(Probe.WantWritten, ESearchCase::CaseSensitive);
+		const bool bPass = bShownOk && bWrittenOk;
+		bAllPassed = bAllPassed && bPass;
+
+		OutLines.Add(FString::Printf(TEXT("%-4s %-52s shows \"%s\", dump writes \"%s\""),
+			bPass ? TEXT("ok") : TEXT("FAIL"), Probe.Meaning, *Scratch.Text, *Written));
+	}
+	TraceGameTextFile::bGQuietRefusals = false;
+
+	TraceGameTextFile::GDocument = SavedDocument;
+	TraceGameTextFile::GDocumentAsTyped = SavedAsTyped;
+	TraceGameTextFile::GRejectedOverrides = SavedRejected;
+
+	return bAllPassed;
+}
+#endif   // !UE_BUILD_SHIPPING
 
 } // namespace TraceGameText

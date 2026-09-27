@@ -21,10 +21,17 @@
 //
 // That one shape buys four properties that a plain lookup table cannot have:
 //
-//   NOTHING CAN EVER BE BLANK. Delete the document, delete one line of it, typo a key, ship a build
-//   with no document at all — every one of those falls back to the words in the code, which are the
-//   words the game shipped with. There is no state in which the player sees an empty label, and that
-//   is worth more than any amount of tooling around a file that might not be there.
+//   NOTHING GOES BLANK BY ACCIDENT. Delete the document, delete one line of it, typo a key, ship a
+//   build with no document at all — every one of those falls back to the words in the code, which
+//   are the words the game shipped with.
+//
+//   THE ONE WAY TO SHOW NOTHING IS TO ASK FOR IT: "KEY =" with nothing after the equals sign. That
+//   is the supported way to REMOVE a line, and it is accepted for every key, including one with
+//   {0} slots (FString::Format of an empty string is an empty string). Deleting the line does NOT
+//   remove it — it brings the built-in wording back, which is exactly how the co-developer's first
+//   twenty cuts came to change nothing on screen. So a caller that draws chrome AROUND a string (a
+//   pill behind a banner, a note row, a status chip, a footer band) must skip that chrome when the
+//   string is empty, and the shared helpers that do most of this drawing already do.
 //
 //   THE DOCUMENT IS GENERATED, NOT MAINTAINED BY HAND. Every call registers its key and its default,
 //   so the game knows the complete set. Trace.Text.Dump writes the file out from that set, which
@@ -84,7 +91,8 @@
 //
 // An override whose set of slots does not match the default's is REFUSED and the default is used,
 // with an error naming the key. The owner can rewrite every word around a slot and can reorder the
-// slots; they cannot invent one the code will not fill or delete one it will.
+// slots; they cannot invent one the code will not fill or delete one it will. The single exception
+// is the EMPTY override, which removes the line outright and fills nothing — see AcceptsOverride.
 //
 // CHARACTERS. The HUD and menus draw through TraceText's bitmap atlas. Its drawing faces carry
 // ASCII 32..126 and nothing else; a wider fallback face covers Latin-1 and the common typographic
@@ -128,6 +136,10 @@ namespace TraceGameText
 	 * THE ONE LOOKUP. Returns the document's wording for @p Key, or @p DefaultText when the document
 	 * has nothing usable for it.
 	 *
+	 * The result is EMPTY when the document removes the line ("KEY =" with no value). Draw code that
+	 * puts anything around the words — a backing pill, a row, a chip — skips it on an empty string, so
+	 * a removed line leaves no gap behind.
+	 *
 	 * Registers (Key, DefaultText) the first time it sees them, which is what lets Trace.Text.Dump
 	 * write a complete document. Call it with a literal key and a literal default — see TRACE_TEXT
 	 * below, which is the shape every call site should use.
@@ -167,6 +179,11 @@ namespace TraceGameText
 	 * keep the edit; keys that no longer exist in the code are kept too, in a clearly labelled
 	 * section at the end, because deleting somebody's words is worse than leaving a stale line.
 	 *
+	 * "KEEP THE EDIT" MEANS BYTE FOR BYTE. A line already in the document is written back exactly as
+	 * it was typed — trailing spaces, an empty value, even a line the game is REFUSING because its
+	 * {0} blanks do not match (Trace.Text.Verify keeps naming that one until it is fixed; replacing
+	 * it with the built-in wording would quietly throw the owner's sentence away).
+	 *
 	 * @return true when the file was written.
 	 */
 	TRACE_API bool WriteDocument(const FString& Path, FString& OutError);
@@ -181,6 +198,7 @@ namespace TraceGameText
 		FString DefaultText;
 		FString Text;          // what Get() hands out — the override when there is one
 		bool bOverridden = false;
+		bool bInDocument = false;   // the document has a line for this key (used, or refused)
 	};
 
 	/** Every registered key, sorted, for Trace.Text.Verify and Trace.Text.Dump. */
@@ -209,6 +227,32 @@ namespace TraceGameText
 	 * should drive the shipped rule rather than re-implement it.
 	 */
 	TRACE_API FString ExtractSlots(const FString& Format);
+
+	/**
+	 * THE RULE ITSELF: whether the document's @p Candidate may replace @p DefaultText. The loader
+	 * asks exactly this, and so does Trace.Text.SelfTest, so the harness drives the shipped rule
+	 * rather than a copy of it.
+	 *
+	 *   - An EMPTY candidate is always accepted. It removes the line, and it cannot misfill a slot
+	 *     because it has none to fill.
+	 *   - Otherwise the two must carry the same set of {N} slots (any order).
+	 *
+	 * @param OutReason  on a refusal, why — worded for the owner, not for a programmer.
+	 */
+	TRACE_API bool AcceptsOverride(const FString& DefaultText, const FString& Candidate, FString& OutReason);
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * Trace.Text.SelfTest's second half: feeds a small in-memory document through the SHIPPED parser
+	 * and the SHIPPED apply step, and checks what each line would show and what a dump would write
+	 * back — an empty value removes a line (with or without a {0}), a trailing space survives a dump,
+	 * a refused edit is kept rather than overwritten, a deleted line brings the default back.
+	 *
+	 * Registers nothing and restores the live document before returning, so it is safe mid-session
+	 * and a later Trace.Text.Dump cannot pick up its keys. @return true when every check passed.
+	 */
+	TRACE_API bool SelfTestDocument(TArray<FString>& OutLines);
+#endif
 
 	/**
 	 * The formatting half of Get(): looks the key up, then fills its slots from @p Args.
