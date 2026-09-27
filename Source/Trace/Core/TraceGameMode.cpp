@@ -4244,13 +4244,16 @@ void ATraceGameMode::PollCharacterSelect()
 			{
 				Candidate->ServerSetCharacterSelectOpen(/*bOpen=*/false, 0.f);
 			}
-			if (Candidate->GetSelectedCharacter() != TraceCharacterRoster::NoneId)
+			// HasAnyAbility, NOT HasCharacter. A player who locked in a LOADOUT holds three abilities
+			// and no character id, and asking about the id alone left them all three with characters
+			// switched off.
+			if (Candidate->HasAnyAbility())
 			{
 				if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Candidate))
 				{
-					// Setting None is documented as always allowed and never refused, which is what
-					// makes this a safe unconditional clear rather than a request that might bounce.
-					Abilities->ServerSetCharacter(ETraceCharacterId::None);
+					// Clears the loadout AND the character id. Infallible, and it bypasses the loadout
+					// lock on purpose: this is the server removing abilities, not a player changing them.
+					Abilities->ServerClearToMannequin();
 				}
 				Candidate->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
 			}
@@ -4321,8 +4324,9 @@ void ATraceGameMode::PollCharacterSelect()
 			// THE ORDERING. Asked of the framework rather than answered here, because the AI slice's
 			// own ATraceBotController::UpdateAutoCharacter assigns characters too and the two must not
 			// be able to disagree about whose turn it is. The predicate is deliberately "has every
-			// human on this team got a character yet", NOT "is anybody's screen still open" — see
-			// UTraceAbilityComponent::AreHumansOnTeamSettled for why the difference matters.
+			// human on this team locked in (or got a character)", NOT "is anybody's screen still
+			// open" — see UTraceAbilityComponent::AreHumansOnTeamSettled for why the difference
+			// matters, and for why a loadout LOCK IN, which sets no character, has to count.
 			//
 			// THIS CANNOT DEADLOCK, and the reason is the timeout below rather than anything here: an
 			// idle human's screen expires, they are auto-assigned, they become settled, and the next
@@ -5665,6 +5669,7 @@ void ATraceGameMode::StartBotCharacterVerify(bool bRedArm)
 		ATracePlayerState* State = nullptr;
 		bool bWasBot = true;
 		uint8 Character = TraceCharacterRoster::NoneId;
+		FTraceLoadout Loadout;
 		bool bWasLocked = false;
 		bool bSelectWasOpen = false;
 	};
@@ -5685,6 +5690,10 @@ void ATraceGameMode::StartBotCharacterVerify(bool bRedArm)
 		Snapshot.State = Candidate;
 		Snapshot.bWasBot = Candidate->IsABot();
 		Snapshot.Character = Candidate->GetSelectedCharacter();
+		if (const UTraceAbilityComponent* SnapAbilities = UTraceAbilityComponent::Get(Candidate))
+		{
+			Snapshot.Loadout = SnapAbilities->GetLoadout();
+		}
 		Snapshot.bWasLocked = Candidate->bCharacterLocked;
 		Snapshot.bSelectWasOpen = Candidate->IsCharacterSelectOpen();
 		Snapshots.Add(Snapshot);
@@ -6005,6 +6014,49 @@ void ATraceGameMode::StartBotCharacterVerify(bool bRedArm)
 	ReportCharacterVerify(CountClashes() == 0,
 		TEXT("the post-timeout fill is still unique across the team"));
 
+	// ---- 5b. A LOADOUT LOCK-IN SETTLES THE HUMAN, AND THE BOTS THEN FILL -----------------------
+	//
+	// THE SHIPPED PATH SINCE THE LOADOUT SCREEN REPLACED CHARACTER SELECT. LOCK IN sends
+	// ServerRequestSetLoadout, which records the lock and closes the window and gives the player NO
+	// character id. The ordering gate used to ask for a character id alone, so this human counted as
+	// "still choosing" for the rest of the match and every bot behind them stayed a characterless
+	// Mannequin. Driven through the RPC the screen itself calls, with a MIXED loadout (three kits),
+	// because that is the case with no character to fall back on.
+	{
+		ClearTeam();
+		BorrowedHuman->ServerSetCharacterSelectOpen(/*bOpen=*/true, /*DeadlineServerTime=*/0.f);
+		RunPoll();
+
+		ReportCharacterVerify(CountBotsHolding() == 0,
+			TEXT("before LOCK IN the bots are still waiting for the human (the ordering still holds)"));
+
+		FTraceLoadout Mixed;
+		Mixed.Set(ETraceLoadoutSlot::Movement, ETraceAbilityId::StickyGloves);
+		Mixed.Set(ETraceLoadoutSlot::Passive, ETraceAbilityId::Magnet);
+		Mixed.Set(ETraceLoadoutSlot::Activated, ETraceAbilityId::Snap);
+
+		if (UTraceAbilityComponent* HumanAbilities = UTraceAbilityComponent::Get(BorrowedHuman))
+		{
+			HumanAbilities->ServerRequestSetLoadout(Mixed);   // what the loadout screen's LOCK IN sends
+		}
+
+		const UTraceAbilityComponent* LockedAbilities = UTraceAbilityComponent::Get(BorrowedHuman);
+		const bool bLockedWithNoCharacter = !BorrowedHuman->HasCharacter()
+			&& BorrowedHuman->IsCharacterLocked()
+			&& !BorrowedHuman->IsCharacterSelectOpen()
+			&& LockedAbilities != nullptr && LockedAbilities->GetLoadout() == Mixed;
+		ReportCharacterVerify(bLockedWithNoCharacter,
+			TEXT("LOCK IN on the loadout screen: the human is locked, the screen closed, three abilities "
+			     "equipped and NO character id (the state that used to hold the bots)"));
+
+		RunPoll();
+
+		ReportCharacterVerify(CountBotsHolding() == TeamBots.Num(),
+			TEXT("*** every bot fills once its human team-mate LOCKS IN A LOADOUT, with no character id ***"));
+		ReportCharacterVerify(CountClashes() == 0,
+			TEXT("the post-lock-in fill is still unique across the team"));
+	}
+
 	// ---- 6. THE DISABLE TOGGLE PUTS EVERYONE, BOTS INCLUDED, BACK ON THE MANNEQUIN -------------
 	//
 	// Spec v15 §2, verbatim: "the 'disable characters' setting must still make everyone, bots
@@ -6020,6 +6072,18 @@ void ATraceGameMode::StartBotCharacterVerify(bool bRedArm)
 
 		ReportCharacterVerify(CountBotsHolding() == 0 && !BorrowedHuman->HasCharacter(),
 			TEXT("*** with characters OFF, every player INCLUDING every bot is the default Mannequin ***"));
+
+		// ABILITIES, NOT ONLY THE CHARACTER ID. The human above locked in a LOADOUT in 5b and has no
+		// character id to clear, and a bot cleared by ServerSetCharacter(None) alone kept its kits'
+		// passives. "The default Mannequin" means nothing equipped.
+		int32 AnyoneWithAbilities = BorrowedHuman->HasAnyAbility() ? 1 : 0;
+		for (const ATracePlayerState* Bot : TeamBots)
+		{
+			AnyoneWithAbilities += Bot->HasAnyAbility() ? 1 : 0;
+		}
+		ReportCharacterVerify(AnyoneWithAbilities == 0,
+			*FString::Printf(TEXT("*** with characters OFF nobody keeps an ability, including a human who "
+			                      "locked in a LOADOUT (%d player(s) still equipped) ***"), AnyoneWithAbilities));
 
 		MutableSettings->bCharactersEnabled = bWasEnabled;
 	}
@@ -6042,6 +6106,9 @@ void ATraceGameMode::StartBotCharacterVerify(bool bRedArm)
 		Snapshot.State->SetIsABot(Snapshot.bWasBot);
 		if (UTraceAbilityComponent* Abilities = UTraceAbilityComponent::Get(Snapshot.State))
 		{
+			// The LOADOUT first: section 5b gave the borrowed human a mixed one, and a character set
+			// over a mixed loadout keeps the loadout (RebuildAbilitySet lets a mixed one win).
+			Abilities->ApplyLoadout(Snapshot.Loadout);
 			Abilities->ServerSetCharacter(static_cast<ETraceCharacterId>(Snapshot.Character));
 		}
 		Snapshot.State->ServerMarkCharacterResolved(Snapshot.bWasLocked, /*bWasChosen=*/false);

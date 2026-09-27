@@ -443,6 +443,14 @@ void UTraceAbilityComponent::ServerSetCharacter(ETraceCharacterId NewCharacter)
 	// outlawed.
 	if (NewCharacter == ETraceCharacterId::None)
 	{
+		// *** THE CHARACTER'S ABILITIES GO WITH IT. *** A character pick writes the uniform loadout
+		// for that character, and clearing the id used to leave that loadout in place: the kits were
+		// unequipped but stayed in EquippedSets, so the "Mannequin" still answered V and jump presses
+		// and still had the kits' speed, magnet and fire-rate passives. A loadout the player BUILT
+		// (anything but this character's own uniform one) is theirs and is kept.
+		const bool bLoadoutWasThisCharacters = (CharacterId != ETraceCharacterId::None)
+			&& (Loadout == FTraceLoadout::Uniform(CharacterId));
+
 		if (CharacterId != ETraceCharacterId::None)
 		{
 			UE_LOG(LogTraceGame, Log, TEXT("[Ability] %s: %s -> None (default Mannequin)."),
@@ -450,6 +458,10 @@ void UTraceAbilityComponent::ServerSetCharacter(ETraceCharacterId NewCharacter)
 		}
 		CharacterId = ETraceCharacterId::None;
 		ResetAllSlotStates();
+		if (bLoadoutWasThisCharacters)
+		{
+			ApplyLoadout(FTraceLoadout());   // unequips every kit once and empties the loadout
+		}
 		MarkNetStateDirty();
 		OnRep_CharacterId();
 		return;
@@ -500,7 +512,7 @@ void UTraceAbilityComponent::ServerSetCharacter(ETraceCharacterId NewCharacter)
 	{
 		UE_LOG(LogTraceGame, Log,
 			TEXT("[Ability] %s (bot) asked for %s — REFUSED, a human on its team has not settled yet "
-			     "(spec v15 §2: bots pick last). The select timeout is what guarantees this ends."),
+			     "(spec v15 §2: bots pick last). It ends when they lock in or the select timeout assigns them."),
 			*GetNameSafe(GetOwningPlayerState()), TraceCharacterIdToString(NewCharacter));
 		return;
 	}
@@ -637,6 +649,35 @@ void UTraceAbilityComponent::ServerSetCharacter(ETraceCharacterId NewCharacter)
 			}
 		}
 	}
+}
+
+void UTraceAbilityComponent::ServerClearToMannequin()
+{
+	if (!HasAuthorityOwner())
+	{
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Ability] ServerClearToMannequin on %s without authority — ignored."),
+			*GetNameSafe(GetOwningPlayerState()));
+		return;
+	}
+
+	// THE LOADOUT FIRST, then the id. Emptying the loadout unequips every kit once and leaves
+	// AbilitySet null, so the rebuild that the id change triggers below finds nothing left to tear
+	// down. The other order unequips the kits through the rebuild and then again through the empty
+	// loadout.
+	if (!Loadout.IsEmpty())
+	{
+		UE_LOG(LogTraceGame, Log, TEXT("[Ability] %s: loadout %s -> empty (characters are off)."),
+			*GetNameSafe(GetOwningPlayerState()), *TraceLoadoutToString(Loadout));
+
+		// The same rule every other change of abilities follows: the transient state belonged to the
+		// kits that are leaving. The cooldown is not touched.
+		ResetAllSlotStates();
+		MarkNetStateDirty();
+		ApplyLoadout(FTraceLoadout());
+	}
+
+	ServerSetCharacter(ETraceCharacterId::None);
 }
 
 void UTraceAbilityComponent::ServerRequestSetCharacter_Implementation(ETraceCharacterId NewCharacter)
@@ -790,10 +831,20 @@ void UTraceAbilityComponent::RebuildAbilitySet()
 		return;
 	}
 
-	if (AbilitySet != nullptr)
+	if (AbilitySet != nullptr || EquippedSets.Num() > 0)
 	{
 		ForEachEquipped(EquippedSets, [](UTraceCharacterAbilitySet* Set) { Set->OnUnequipped(); });
 		AbilitySet = nullptr;
+
+		// AND DROPPED. An unequipped kit left in EquippedSets is still offered every V and jump
+		// press (OfferUntilConsumed walks the slot table) and still counted by every passive hook
+		// that walks the list, so a player "back on the Mannequin" kept their old movement ability
+		// and their old passives. Whatever is built next is built from the loadout, fresh.
+		EquippedSets.Reset();
+		for (int32 Index = 0; Index < static_cast<int32>(ETraceLoadoutSlot::Count); ++Index)
+		{
+			SetIndexBySlot[Index] = INDEX_NONE;
+		}
 	}
 
 	BuiltForCharacter = CharacterId;
@@ -805,6 +856,17 @@ void UTraceAbilityComponent::RebuildAbilitySet()
 	if (CharacterId == ETraceCharacterId::None && Loadout.IsEmpty())
 	{
 		return;   // the default characterless Mannequin. Every hook must be a no-op here.
+	}
+
+	// NO CHARACTER, BUT A LOADOUT THE PLAYER BUILT. Reached when a character is cleared from
+	// somebody whose loadout is not that character's own (ServerSetCharacter(None) empties that one).
+	// The loadout is what they chose, so it is rebuilt rather than left torn down: there is no kit
+	// class for "None" to look up below.
+	if (CharacterId == ETraceCharacterId::None)
+	{
+		ApplyLoadout(Loadout);
+		RouteNetStateEdges();
+		return;
 	}
 
 	UClass* SetClass = UTraceCharacterAbilitySet::FindClassFor(CharacterId);
@@ -2342,10 +2404,23 @@ bool UTraceAbilityComponent::AreHumansOnTeamSettled(const UObject* WorldContextO
 			continue;
 		}
 
+		// *** LOCKED IN COUNTS, NOT ONLY "HOLDS A CHARACTER". ***
+		//
+		// A player who presses LOCK IN on the loadout screen is finished choosing and still holds no
+		// character id: ServerRequestSetLoadout records the lock and closes the window, and nothing
+		// ever gives them a face. This used to ask for the id alone, so once a human locked in a
+		// loadout every bot on their team was refused for the whole match and played as a Mannequin
+		// with no abilities. The same test ATraceGameMode::PollCharacterSelect uses to decide that a
+		// player is done: they hold a character, or the server has accepted their pick.
+		if (AsTraceState->IsCharacterLocked())
+		{
+			continue;   // LOCK IN on either screen, or the select timeout's assignment
+		}
+
 		const UTraceAbilityComponent* Comp = Entry->FindComponentByClass<UTraceAbilityComponent>();
 		if (Comp != nullptr && Comp->GetCharacterId() != ETraceCharacterId::None)
 		{
-			continue;   // chose it, or the select timeout assigned it. Either way they are done.
+			continue;   // holds a character (a fixture, or a lock that has since been cleared)
 		}
 
 		// THE UNSERVICEABLE HUMAN. If the roster has nothing left for them, waiting cannot help and

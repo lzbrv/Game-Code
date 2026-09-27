@@ -212,6 +212,17 @@ public:
 	void ServerSetCharacter(ETraceCharacterId NewCharacter);
 
 	/**
+	 * AUTHORITY ONLY. Takes EVERYTHING off this player: the loadout and the character id.
+	 *
+	 * ServerSetCharacter(None) clears the character id and nothing else, so a player who LOCKED IN a
+	 * loadout (and therefore holds no character id) keeps all three abilities through it. The rule
+	 * "characters off means everybody is the plain Mannequin" needs both halves cleared, and this is
+	 * the one call that does it. Bypasses the loadout lock on purpose: the lock stops a PLAYER
+	 * changing their abilities mid-half, and this is the server removing them.
+	 */
+	void ServerClearToMannequin();
+
+	/**
 	 * Press E. Returns true if the ability fired.
 	 *
 	 * Called on the OWNING CLIENT (where it predicts locally and sends the RPC) and on the SERVER
@@ -590,14 +601,19 @@ public:
 	 * finished choosing?
 	 *
 	 * Verbatim: "the computers should wait for any actual humans on its team to choose before all
-	 * loading in with randomly chosen characters". A human is SETTLED when they hold a character —
-	 * whether they picked it or the select timeout assigned it — and a human who cannot be served at
-	 * all (their team already holds every character in the roster) is settled too, because otherwise
-	 * one unserviceable player would keep every bot on their team a Mannequin forever.
+	 * loading in with randomly chosen characters". A human is SETTLED when the server has accepted
+	 * their pick (ATracePlayerState::IsCharacterLocked: LOCK IN on the loadout screen, a character
+	 * pick, or the select timeout's assignment) or when they hold a character. A human who cannot be
+	 * served at all (their team already holds every character in the roster) is settled too, because
+	 * otherwise one unserviceable player would keep every bot on their team a Mannequin forever.
+	 *
+	 * LOCKED, NOT ONLY "HOLDS A CHARACTER". A loadout LOCK IN leaves the character id at None, and
+	 * asking for the id alone kept every bot on that player's team characterless for the whole match.
 	 *
 	 * Note what is NOT consulted: whether the select screen is currently OPEN. That would let a bot
 	 * jump the queue in the quarter second between a human joining and PollCharacterSelect opening
-	 * their screen — "no character yet" is the fact that matters, and it is true across that gap.
+	 * their screen — "not locked and no character yet" is the fact that matters, and it is true
+	 * across that gap.
 	 *
 	 * True for a team with no humans on it, which is the ordinary singleplayer case for the enemy
 	 * side: there is nobody to wait for.

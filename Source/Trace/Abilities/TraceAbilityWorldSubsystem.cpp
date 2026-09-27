@@ -262,12 +262,14 @@ void UTraceAbilityWorldSubsystem::EnforceModeAFreeze()
 
 	for (UTraceAbilityComponent* Comp : Components)
 	{
-		if (Comp->GetCharacterId() != ETraceCharacterId::None)
+		// A CHARACTER OR A LOADOUT. A player who locked in a loadout has abilities and no character
+		// id, and checking the id alone let them keep all three with characters switched off.
+		if (Comp->GetCharacterId() != ETraceCharacterId::None || !Comp->GetLoadout().IsEmpty())
 		{
 			UE_LOG(LogTraceGame, Log,
 				TEXT("[Ability] Characters are OFF (the disable toggle) — forcing %s back to the default Mannequin."),
 				*GetNameSafe(Comp->GetOwner()));
-			Comp->ServerSetCharacter(ETraceCharacterId::None);
+			Comp->ServerClearToMannequin();
 		}
 	}
 }
