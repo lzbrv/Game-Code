@@ -23,7 +23,7 @@
 #include "Abilities/TraceAbilityComponent.h"
 #include "Abilities/TraceAbilityTypes.h"                 // TraceAbilityFlags::MovementActive
 #include "Abilities/TraceAbilityWorldSubsystem.h"        // GatherAllComponents — the stick poll's roll call
-#include "Abilities/Characters/TraceAbilitySetElle.h"    // IsCloakVisualApplied — §1.2's cloak rule
+#include "Abilities/TraceAbilityCloak.h"                  // IsCloakVisualAppliedTo — §1.2's cloak rule
 #include "Audio/TraceAudio.h"
 #include "Audio/TraceSoundEvents.h"
 #include "Core/TraceCharacter.h"
@@ -482,14 +482,9 @@ void UTraceSlimewallSlowComponent::UpdateSlowTellFx()
 	// be outlined by a glowing blue pool she did not ask for and cannot switch off. Hidden rather than
 	// detached, so decloaking costs no rebuild and no budget churn. (The identical treatment, for the
 	// identical reason, as Oyster's poison drips.)
-	bool bHiddenByCloak = false;
-	if (const UTraceAbilityComponent* Comp = UTraceAbilityComponent::Get(Victim))
-	{
-		if (const UTraceAbilitySetElle* Elle = Comp->GetAbilitySetAs<UTraceAbilitySetElle>())
-		{
-			bHiddenByCloak = Elle->IsCloakVisualApplied();
-		}
-	}
+	// ANY CLOAK ON ANY SLOT: SHIMMER is a passive, and so is Oyster's dash cloak. This used to ask
+	// only the kit on E, so a player cloaked by a passive under somebody else's E was outlined anyway.
+	const bool bHiddenByCloak = TraceAbilityCloak::IsCloakVisualAppliedTo(Victim);
 
 	if (SlowTellRing == nullptr)
 	{
@@ -1840,14 +1835,8 @@ void UTraceSlimeStickFxComponent::TickComponent(float DeltaTime, ELevelTick Tick
 	// Elle's cloak — FX_AUDIO_PLAN §1.2. She cannot hold a slime wall, but the rule is about ATTACHED
 	// emissive FX and not about who owns them, and applying it uniformly is what stops the next effect
 	// added here from being the exception.
-	bool bHiddenByCloak = false;
-	if (const UTraceAbilityComponent* Comp = UTraceAbilityComponent::Get(Pawn))
-	{
-		if (const UTraceAbilitySetElle* Elle = Comp->GetAbilitySetAs<UTraceAbilitySetElle>())
-		{
-			bHiddenByCloak = Elle->IsCloakVisualApplied();
-		}
-	}
+	// ANY CLOAK ON ANY SLOT, for the reason the slow tell above gives.
+	const bool bHiddenByCloak = TraceAbilityCloak::IsCloakVisualAppliedTo(Pawn);
 
 	// Re-probe on a timer rather than every frame: he can slide down the wall
 	// (SlimeballWallStickSlideSpeed), so the contact point moves, but it moves slowly and eight line
@@ -2001,7 +1990,11 @@ void UTraceSlimeStickSubsystem::Tick(float DeltaTime)
 
 	for (UTraceAbilityComponent* Comp : Components)
 	{
-		if (Comp == nullptr || Comp->GetCharacterId() != ETraceCharacterId::Slimeball)
+		// STICKY GLOVES EQUIPPED, not "is this player Slimeball". The stick is Slimeball's MOVEMENT
+		// ability, and a player who locked it into a loadout has no character id at all: asking for
+		// the id here meant the goo was never attached and the stick sound never played for them,
+		// while both reads below had already been moved onto the movement slot.
+		if (Comp == nullptr || !Comp->IsKitIn(ETraceCharacterId::Slimeball, ETraceLoadoutSlot::Movement))
 		{
 			// NOT a "was he stuck" reset: a character SWITCH already drops MovementActive, and a
 			// player who leaves takes his component with him. Nothing to forget.

@@ -35,6 +35,7 @@
 // Each is one accessor on the character's own set, exactly as the four above are.
 #include "Abilities/Characters/TraceAbilitySetElle.h"      // CLOAKED, and the §2.5 owner vignette
 #include "Abilities/Characters/TraceAbilitySetLily.h"      // ZIP
+#include "Abilities/Characters/TraceAbilitySetOyster.h"    // CLOAKED from his dash cloak, and its owner vignette
 #include "Abilities/Characters/TraceAbilitySetRoxie.h"     // MODDED
 #include "Abilities/Characters/TraceAbilitySetSlimeball.h" // STUCK
 #include "Abilities/Characters/TraceSlimewall.h"           // the wall's own slow, for the SLOWED chip
@@ -3692,18 +3693,29 @@ void ATraceHUD::DrawOwnerVignettes()
 	// IsCloaked() reads the REPLICATED flag, so this is the same fact every other machine has —
 	// never the local cosmetic bCloakVisualApplied, which is deliberately allowed to be false on a
 	// machine that draws nothing.
-	if (const UTraceCharacterAbilitySet* LocalSet = UTraceAbilityComponent::GetAbilitySetFor(LocalChar))
+	//
+	// *** ANY EQUIPPED KIT, NOT THE ONE ON E. *** Both cloaks are PASSIVES (Elle's SHIMMER, Oyster's
+	// dash cloak). This used to look only at the activated kit, so a player who took SHIMMER under
+	// somebody else's E got no band at all, and Oyster's cloak never had one. One band for either
+	// cloak: two at once would double the alpha past the bible's 0.10.
+	bool bOwnerCloaked = false;
+	if (const UTraceAbilityComponent* OwnerAbilities = UTraceAbilityComponent::Get(LocalChar))
 	{
-		if (const UTraceAbilitySetElle* ElleSet = Cast<UTraceAbilitySetElle>(LocalSet))
+		if (const UTraceAbilitySetElle* ElleSet = OwnerAbilities->FindEquippedSet<UTraceAbilitySetElle>())
 		{
-			if (ElleSet->IsCloaked())
-			{
-				DrawScreenEdgeVignette(TraceHUDStyle::Cloak, 0.10f);
-#if !UE_BUILD_SHIPPING
-				DrawnVignettes.Add(TEXT("CLOAK a=0.10"));
-#endif
-			}
+			bOwnerCloaked = bOwnerCloaked || ElleSet->IsCloaked();
 		}
+		if (const UTraceAbilitySetOyster* OysterSet = OwnerAbilities->FindEquippedSet<UTraceAbilitySetOyster>())
+		{
+			bOwnerCloaked = bOwnerCloaked || OysterSet->IsDashCloaked();
+		}
+	}
+	if (bOwnerCloaked)
+	{
+		DrawScreenEdgeVignette(TraceHUDStyle::Cloak, 0.10f);
+#if !UE_BUILD_SHIPPING
+		DrawnVignettes.Add(TEXT("CLOAK a=0.10"));
+#endif
 	}
 
 	// ---- OYSTER'S POISON, ON THE VICTIM (FX plan §2.6; bible §6.4 fixes the 0.18) ---------------
@@ -4022,8 +4034,8 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 
 	// ---- The OWN-ABILITY chips: Mace, Chut, Rocco, and (FX plan §7.3) Roxie, Elle, Lily, Slimeball -
 	//
-	// All of them hang off the local player's OWN ability set, so one lookup serves them all and a
-	// character who is none of them simply matches no branch.
+	// All of them hang off the local player's OWN equipped kits, and a kit that has none of these
+	// states simply matches no branch.
 	//
 	// *** THE §7.3 ADDITIONS CLOSE THE code-abilities §6 COVERAGE MATRIX. *** Four of the ten
 	// characters had a timed state with no HUD at all: Roxie's MODDED (a 5 s window that changes her
@@ -4033,8 +4045,24 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 	//
 	// EACH IS ONE PUBLISHED ACCESSOR, and every one of those accessors reads the REPLICATED fact
 	// rather than a local mirror, so a chip cannot disagree with the machine that owns the rule.
-	if (const UTraceCharacterAbilitySet* LocalSet = UTraceAbilityComponent::GetAbilitySetFor(LocalChar))
+	//
+	// *** EVERY EQUIPPED KIT, NOT THE ONE ON E. *** A loadout takes its movement, passive and
+	// activated abilities from up to three kits. This used to ask only the activated kit, so
+	// SUSPENDED (Mace's movement), STUCK (Slimeball's movement), SPEED BOOST (Rocco's passive) and
+	// CLOAKED (Elle's passive) never drew unless E came from the same kit. The kits are distinct
+	// classes, so each one matches at most one branch below and no chip can appear twice.
+	bool bCloakChipAdded = false;
+	const UTraceAbilityComponent* LocalAbilities = UTraceAbilityComponent::Get(LocalChar);
+	const TArray<TObjectPtr<UTraceCharacterAbilitySet>> NoKits;
+	for (const TObjectPtr<UTraceCharacterAbilitySet>& EquippedKit :
+		(LocalAbilities != nullptr) ? LocalAbilities->GetEquippedSets() : NoKits)
 	{
+		const UTraceCharacterAbilitySet* LocalSet = EquippedKit.Get();
+		if (LocalSet == nullptr)
+		{
+			continue;
+		}
+
 		if (const UTraceAbilitySetMace* MaceSet = Cast<UTraceAbilitySetMace>(LocalSet))
 		{
 			if (MaceSet->IsSuspending())
@@ -4143,8 +4171,31 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 				const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon,
 					UTraceSettings::Get().ElleCloakDurationSeconds);
 
+				if (Remaining > 0.f && !bCloakChipAdded)
+				{
+					bCloakChipAdded = true;
+					OutState.Chips.Add({
+						TRACE_TEXT("HUD.STATUS_CLOAKED", "CLOAKED"),
+						TRACE_TEXTF("HUD.STATUS_READOUT_SECONDS_1DP", "{0}s",
+							{ FString::Printf(TEXT("%.1f"), Remaining) }),
+						FMath::Clamp(Remaining / Total, 0.f, 1.f), TraceHUDStatusStyle::Cloaked });
+				}
+			}
+		}
+		else if (const UTraceAbilitySetOyster* OysterSet = Cast<UTraceAbilitySetOyster>(LocalSet))
+		{
+			// CLOAKED, from Oyster's DASH CLOAK (his passive since Demo 35). The same chip as Elle's,
+			// because it is the same state to the player: nobody can see you, and it ends on a timer.
+			// Read from the replicated state (IsDashCloaked), so a remote owning client sees it too.
+			if (OysterSet->IsDashCloaked() && !bCloakChipAdded)
+			{
+				const float Remaining = OysterSet->GetDashCloakEndMatchTime() - MatchNow;
+				const float Total = FMath::Max(TraceHUDStyle::TimeEpsilon,
+					UTraceSettings::Get().OysterDashCloakDurationSeconds);
+
 				if (Remaining > 0.f)
 				{
+					bCloakChipAdded = true;
 					OutState.Chips.Add({
 						TRACE_TEXT("HUD.STATUS_CLOAKED", "CLOAKED"),
 						TRACE_TEXTF("HUD.STATUS_READOUT_SECONDS_1DP", "{0}s",

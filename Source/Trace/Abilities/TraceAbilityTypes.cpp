@@ -166,17 +166,26 @@ float TraceAbilityDebuff::GetMoveSpeedMultiplier(const AActor* Target)
 
 namespace TraceAbilityTraitsFile
 {
-	/** The live ability set for @p Actor, or null. One PlayerState hop, exactly as the other hooks do. */
-	const UTraceCharacterAbilitySet* SetFor(const AActor* Actor)
+	/**
+	 * The equipped Mortimer or Lily kit for @p Actor, in WHICHEVER SLOT, or null.
+	 *
+	 * *** NOT THE ACTIVATED KIT. *** This used to be UTraceAbilityComponent::GetAbilitySetFor, which
+	 * answers for the kit on E. Every trait below belongs to a movement or passive ability (Lily's
+	 * OVERLOAD and ACROBATICS, Mortimer's dash/throw passive), so a loadout that took one of them
+	 * under somebody else's E lost it, and a loadout with Mortimer's QUAKE on E got his passive's
+	 * shorter dash without picking it. Each kit's getter checks IsAbility for the ability it serves.
+	 */
+	template <typename KitType>
+	const KitType* KitFor(const AActor* Actor)
 	{
-		return (Actor != nullptr) ? UTraceAbilityComponent::GetAbilitySetFor(Actor) : nullptr;
+		return (Actor != nullptr) ? UTraceAbilityComponent::FindEquippedSetFor<KitType>(Actor) : nullptr;
 	}
 }
 
 float TraceAbilityTraits::GetDashDistanceScale(const AActor* Actor)
 {
 	if (const UTraceAbilitySetMortimer* Mortimer =
-		Cast<UTraceAbilitySetMortimer>(TraceAbilityTraitsFile::SetFor(Actor)))
+		TraceAbilityTraitsFile::KitFor<UTraceAbilitySetMortimer>(Actor))
 	{
 		return Mortimer->GetDashDistanceScale();
 	}
@@ -189,7 +198,7 @@ float TraceAbilityTraits::GetDashCooldownScale(const AActor* Actor)
 	// identity behaviour for the other nine characters — see the header for the one line in
 	// UTraceCharacterMovementComponent::GetDashCooldown() that this is still waiting on.
 	if (const UTraceAbilitySetMortimer* Mortimer =
-		Cast<UTraceAbilitySetMortimer>(TraceAbilityTraitsFile::SetFor(Actor)))
+		TraceAbilityTraitsFile::KitFor<UTraceAbilitySetMortimer>(Actor))
 	{
 		return Mortimer->GetDashCooldownScale();
 	}
@@ -198,7 +207,7 @@ float TraceAbilityTraits::GetDashCooldownScale(const AActor* Actor)
 
 int32 TraceAbilityTraits::GetExtraDashCharges(const AActor* Actor)
 {
-	if (const UTraceAbilitySetLily* Lily = Cast<UTraceAbilitySetLily>(TraceAbilityTraitsFile::SetFor(Actor)))
+	if (const UTraceAbilitySetLily* Lily = TraceAbilityTraitsFile::KitFor<UTraceAbilitySetLily>(Actor))
 	{
 		return Lily->GetExtraDashCharges();
 	}
@@ -207,7 +216,7 @@ int32 TraceAbilityTraits::GetExtraDashCharges(const AActor* Actor)
 
 float TraceAbilityTraits::GetWallJumpMomentumScale(const AActor* Actor)
 {
-	if (const UTraceAbilitySetLily* Lily = Cast<UTraceAbilitySetLily>(TraceAbilityTraitsFile::SetFor(Actor)))
+	if (const UTraceAbilitySetLily* Lily = TraceAbilityTraitsFile::KitFor<UTraceAbilitySetLily>(Actor))
 	{
 		return Lily->GetWallJumpMomentumScale();
 	}
@@ -216,7 +225,7 @@ float TraceAbilityTraits::GetWallJumpMomentumScale(const AActor* Actor)
 
 float TraceAbilityTraits::GetMaxHealthOverride(const AActor* Actor)
 {
-	if (const UTraceAbilitySetLily* Lily = Cast<UTraceAbilitySetLily>(TraceAbilityTraitsFile::SetFor(Actor)))
+	if (const UTraceAbilitySetLily* Lily = TraceAbilityTraitsFile::KitFor<UTraceAbilitySetLily>(Actor))
 	{
 		return Lily->GetMaxHealthOverride();
 	}
@@ -229,7 +238,7 @@ bool TraceAbilityTraits::IsMantleAllowed(const AActor* Actor)
 	// That is not a default, it is the feature: the ledge desync that the mantle's removal in
 	// `d2319b2` both forced and fixed cannot return for anybody who never reaches the probe.
 	if (const UTraceAbilitySetMortimer* Mortimer =
-		Cast<UTraceAbilitySetMortimer>(TraceAbilityTraitsFile::SetFor(Actor)))
+		TraceAbilityTraitsFile::KitFor<UTraceAbilitySetMortimer>(Actor))
 	{
 		return Mortimer->AllowsMantle();
 	}
@@ -239,7 +248,7 @@ bool TraceAbilityTraits::IsMantleAllowed(const AActor* Actor)
 float TraceAbilityTraits::GetMantleGenerosityScale(const AActor* Actor)
 {
 	if (const UTraceAbilitySetMortimer* Mortimer =
-		Cast<UTraceAbilitySetMortimer>(TraceAbilityTraitsFile::SetFor(Actor)))
+		TraceAbilityTraitsFile::KitFor<UTraceAbilitySetMortimer>(Actor))
 	{
 		return Mortimer->GetMantleGenerosityScale();
 	}
@@ -249,7 +258,7 @@ float TraceAbilityTraits::GetMantleGenerosityScale(const AActor* Actor)
 float TraceAbilityTraits::GetThrowChargeHoldScale(const AActor* Actor)
 {
 	if (const UTraceAbilitySetMortimer* Mortimer =
-		Cast<UTraceAbilitySetMortimer>(TraceAbilityTraitsFile::SetFor(Actor)))
+		TraceAbilityTraitsFile::KitFor<UTraceAbilitySetMortimer>(Actor))
 	{
 		return Mortimer->GetThrowChargeHoldScale();
 	}
@@ -263,7 +272,7 @@ float TraceAbilityTraits::GetThrowChargePastFullScale(const AActor* Actor)
 	// and their hold cap IS the original 100% point, so that quantity is identically zero. This
 	// branch cannot change another character's throw even if the knob were set to 0.
 	if (const UTraceAbilitySetMortimer* Mortimer =
-		Cast<UTraceAbilitySetMortimer>(TraceAbilityTraitsFile::SetFor(Actor)))
+		TraceAbilityTraitsFile::KitFor<UTraceAbilitySetMortimer>(Actor))
 	{
 		return Mortimer->GetThrowChargePastFullScale();
 	}

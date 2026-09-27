@@ -727,6 +727,16 @@ void ATraceMortimerQuakeWave::Tick(float DeltaSeconds)
 
 float UTraceAbilitySetMortimer::GetDashDistanceScale() const
 {
+	// ABILITY GUARD, on all four halves of this passive. They are reached through TraceAbilityTraits,
+	// which used to find only the ACTIVATED kit: a player with QUAKE got the shorter dash, the longer
+	// dash cooldown and the longer throw without picking this passive, and a player who picked it
+	// under somebody else's E got none of it. The traits find this kit in any slot now, so the kit
+	// has to say which ability the numbers belong to.
+	if (!IsAbility(ETraceAbilityId::MortimerLoad))
+	{
+		return 1.f;
+	}
+
 	// Clamped rather than trusted: a zero here would be a dash that does not move him at all, which
 	// is not "75% shorter", it is a broken movement kit with no error message.
 	return FMath::Clamp(UTraceSettings::Get().MortimerDashDistanceScale, 0.05f, 4.f);
@@ -734,6 +744,11 @@ float UTraceAbilitySetMortimer::GetDashDistanceScale() const
 
 float UTraceAbilitySetMortimer::GetDashCooldownScale() const
 {
+	if (!IsAbility(ETraceAbilityId::MortimerLoad))
+	{
+		return 1.f;   // see GetDashDistanceScale
+	}
+
 	// Floored at 0.25 rather than at 1: the knob is a general per-character scale and a future
 	// character could legitimately want a SHORTER cooldown, so this clamps the arithmetic instead of
 	// enforcing a design opinion. Demo 20 asks for 1.25.
@@ -742,6 +757,11 @@ float UTraceAbilitySetMortimer::GetDashCooldownScale() const
 
 float UTraceAbilitySetMortimer::GetThrowChargeHoldScale() const
 {
+	if (!IsAbility(ETraceAbilityId::MortimerLoad))
+	{
+		return 1.f;   // see GetDashDistanceScale
+	}
+
 	// Floored at 1: a value below 1 would make Mortimer's throw WEAKER than everybody's, which is the
 	// opposite of the passive and would look like the sign of the knob had been flipped.
 	return FMath::Clamp(UTraceSettings::Get().MortimerThrowChargeHoldScale, 1.f, 8.f);
@@ -749,6 +769,11 @@ float UTraceAbilitySetMortimer::GetThrowChargeHoldScale() const
 
 float UTraceAbilitySetMortimer::GetThrowChargePastFullScale() const
 {
+	if (!IsAbility(ETraceAbilityId::MortimerLoad))
+	{
+		return 1.f;   // see GetDashDistanceScale. 1.0 is the identity here, as the red arm's note says.
+	}
+
 	// DEMO 21 ITEM 7. The red arm returns the IDENTITY (1.0) rather than 0, because "no modifier" is
 	// what the pre-Demo-21 game did — a 0 here would mean "extra charge is worth nothing", which is a
 	// third behaviour that never shipped and would make the arm prove the wrong thing.

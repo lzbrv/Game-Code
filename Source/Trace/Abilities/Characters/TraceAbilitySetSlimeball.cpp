@@ -103,12 +103,14 @@ namespace TraceSlimeball
 
 	float GetFireIntervalScaleFor(const AActor* Shooter)
 	{
-		if (const UTraceCharacterAbilitySet* Set = UTraceAbilityComponent::GetAbilitySetFor(Shooter))
+		// The Slimeball kit in ANY slot, answering through its GUARDED seam (VISTECH PADDING only).
+		// This used to ask for the kit on E and then call the unguarded multiplier, so it disagreed
+		// with the gun (UTraceAbilityComponent::GetFireIntervalScaleFor) for every mixed loadout:
+		// VISTECH PADDING under somebody else's E read 1.0 here, SLIMEWALL without it read the bonus.
+		if (const UTraceAbilitySetSlimeball* Slime =
+			UTraceAbilityComponent::FindEquippedSetFor<UTraceAbilitySetSlimeball>(Shooter))
 		{
-			if (const UTraceAbilitySetSlimeball* Slime = Cast<const UTraceAbilitySetSlimeball>(Set))
-			{
-				return Slime->GetFireIntervalMultiplier();
-			}
+			return Slime->GetFireIntervalScale();
 		}
 		return 1.f;
 	}
@@ -709,6 +711,15 @@ bool UTraceAbilitySetSlimeball::ProbeForWall(FVector& OutPoint, FVector& OutNorm
 
 float UTraceAbilitySetSlimeball::ModifyIncomingDamage(float Damage, const FTraceAbilityDamageContext& Context) const
 {
+	// ABILITY GUARD — "take less while stuck" is VISTECH PADDING, the passive. The fire-rate half
+	// already had this guard (GetFireIntervalScale); the damage half did not, and it did not need one
+	// while only the activated kit was asked. Every equipped kit is asked now, so a Slimeball kit
+	// equipped for STICKY GLOVES or SLIMEWALL alone must not reduce damage.
+	if (!IsAbility(ETraceAbilityId::VistechPadding))
+	{
+		return Damage;
+	}
+
 	if (!IsStuck() || CVarSlimeballStuckPassive.GetValueOnAnyThread() == 0)
 	{
 		return Damage;

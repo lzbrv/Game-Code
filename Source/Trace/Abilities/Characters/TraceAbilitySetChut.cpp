@@ -320,6 +320,14 @@ float UTraceAbilitySetChut::GetChudSecondsRemaining() const
 
 float UTraceAbilitySetChut::ModifyOutgoingDamage(float Damage, const FTraceAbilityDamageContext& Context) const
 {
+	// ABILITY GUARD — the knife buff is CUSTOM STEEL, one of this kit's two passives. Every equipped
+	// kit is asked about damage now (ModifyDamageThroughPassives), so a Chut kit equipped only for
+	// BASH or only for CHUD must not hand out a knife buff nobody picked.
+	if (!IsAbility(ETraceAbilityId::CustomSteel))
+	{
+		return Damage;
+	}
+
 	if (CVarChutKnifeBuffEnabled.GetValueOnAnyThread() == 0)
 	{
 		return Damage;   // RED ARM
@@ -356,7 +364,9 @@ float UTraceAbilitySetChut::ModifyOutgoingDamage(float Damage, const FTraceAbili
 
 float UTraceAbilitySetChut::ModifyIncomingDamage(float Damage, const FTraceAbilityDamageContext& Context) const
 {
-	if (!IsChudActive() || CVarChudEnabled.GetValueOnAnyThread() == 0)
+	// ABILITY GUARD — the reduction is CHUD, the activated ability. Only an activation can raise the
+	// Chud flag, so this is belt and braces, but it states which ability this body belongs to.
+	if (!IsAbility(ETraceAbilityId::Chud) || !IsChudActive() || CVarChudEnabled.GetValueOnAnyThread() == 0)
 	{
 		return Damage;
 	}

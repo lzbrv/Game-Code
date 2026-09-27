@@ -125,6 +125,19 @@ public:
 	/** Live jars this Oyster owns, oldest first. Server only — jars are not tracked on clients. */
 	int32 GetLiveJarCount() const;
 
+	/**
+	 * Is the DASH CLOAK up right now? Read from the REPLICATED state, so it is the same answer on the
+	 * server, on the owning client and on everybody else. Not from CloakEndMatchTime, which only the
+	 * server writes and which is always 0 on a client.
+	 */
+	bool IsDashCloaked() const;
+
+	/** Match time the dash cloak ends, from the replicated state; 0 when it is not up. */
+	float GetDashCloakEndMatchTime() const;
+
+	/** Whether THIS machine is drawing the cloak look right now. Cosmetic; see IsDashCloaked for the fact. */
+	bool IsDashCloakVisualApplied() const { return bCloakVisualApplied; }
+
 	/** HARNESS. Places a jar on the ground at @p Location, skipping the dash / the lob. Server only. */
 	ATraceOysterJar* DebugSpawnJarAt(const FVector& Location, bool bPickler);
 

@@ -390,7 +390,10 @@ public:
 
 	/**
 	 * The full passive pipeline WITHOUT touching health, for the weapon and melee slices to fold in.
-	 * Applies the target's Chud reduction and vulnerable amplification to @p Damage.
+	 * Every equipped kit of the instigator modifies outgoing damage, then every equipped kit of the
+	 * target reduces it, then every one amplifies it. A kit applies only the abilities it was picked
+	 * for (its IsAbility guards), so asking all of them is what makes a passive work whichever kit
+	 * happens to be on E.
 	 *
 	 * Static, and safe when either side has no component: a Mannequin returns @p Damage unchanged.
 	 */
@@ -400,11 +403,57 @@ public:
 	// Character set access — how a character file and the HUD reach the live abilities
 	// =============================================================================================
 
-	/** The live ability set, or null at ETraceCharacterId::None. Valid on every machine. */
+	/**
+	 * The kit that fills the ACTIVATED slot (or the first kit, when nothing does), or null.
+	 *
+	 * *** ONE KIT OF UP TO THREE. *** Before loadouts this was "the" ability set. A loadout can now
+	 * take its movement, passive and activated abilities from three different kits, and this answers
+	 * for one of them. To ask "does this player have kit X's ability equipped", use FindEquippedSet
+	 * or GetEquippedSets below; to ask about one slot, GetAbilitySetForSlot.
+	 */
 	UTraceCharacterAbilitySet* GetAbilitySet() const { return AbilitySet; }
 
 	/** The kit filling @p Slot, or null. With a uniform loadout all three answer the same object. */
 	UTraceCharacterAbilitySet* GetAbilitySetForSlot(ETraceLoadoutSlot Slot) const;
+
+	/**
+	 * Every DISTINCT kit this player has equipped: at most three, often one, none for the Mannequin.
+	 *
+	 * Deduped by class when the loadout is built, so a kit that fills two slots appears once. Walk
+	 * this when every equipped kit must be asked (a status display, a damage modifier); a kit's own
+	 * IsAbility() then says which of its abilities the player actually picked.
+	 */
+	const TArray<TObjectPtr<UTraceCharacterAbilitySet>>& GetEquippedSets() const { return EquippedSets; }
+
+	/**
+	 * The equipped kit of class @p T, whichever slot or slots it fills, or null.
+	 *
+	 * *** THE REPLACEMENT FOR GetAbilitySetAs<T>() WHEN THE QUESTION IS "IS THIS KIT EQUIPPED AT ALL".
+	 * *** GetAbilitySetAs only looks at the activated kit, so a player running Elle's SHIMMER as their
+	 * passive under somebody else's E came back null there, and their cloak, their chips and their
+	 * passives were silently missing. At most one instance per class exists, so this finds it or
+	 * nothing. Check the kit's IsAbility() before applying anything it owns.
+	 */
+	template <typename T>
+	T* FindEquippedSet() const
+	{
+		for (const TObjectPtr<UTraceCharacterAbilitySet>& Set : EquippedSets)
+		{
+			if (T* Found = Cast<T>(Set.Get()))
+			{
+				return Found;
+			}
+		}
+		return nullptr;
+	}
+
+	/** FindEquippedSet for any actor Get() resolves: a pawn, a controller or a player state. Null-safe. */
+	template <typename T>
+	static T* FindEquippedSetFor(const AActor* Actor)
+	{
+		const UTraceAbilityComponent* Comp = Get(Actor);
+		return (Comp != nullptr) ? Comp->FindEquippedSet<T>() : nullptr;
+	}
 
 	/**
 	 * WHICH SLOT'S STRUCT HOLDS @p Slot's REPLICATED STATE.
@@ -487,7 +536,10 @@ public:
 	/** Would ServerSetLoadout accept this? Pure — safe to ask from UI to grey out an illegal pick. */
 	static bool IsLoadoutLegal(const FTraceLoadout& InLoadout, FString* OutReason = nullptr);
 
-	/** Typed sugar: `if (UTraceAbilitySetMace* M = Comp->GetAbilitySetAs<UTraceAbilitySetMace>())`. */
+	/**
+	 * Typed sugar over GetAbilitySet(): the ACTIVATED kit as @p T, or null. For "is kit T equipped in
+	 * any slot", use FindEquippedSet<T>().
+	 */
 	template <typename T>
 	T* GetAbilitySetAs() const { return Cast<T>(AbilitySet); }
 
@@ -539,7 +591,13 @@ public:
 	 */
 	static UTraceAbilityComponent* Get(const AActor* Actor);
 
-	/** Get(), but null unless the player actually has a character. Sugar for the passive hooks. */
+	/**
+	 * Get()->GetAbilitySet(): the ACTIVATED kit only, or null.
+	 *
+	 * Right for questions about E (whose ability is on the key, whose cooldown the ring shows). Wrong
+	 * for "which abilities does this player have": a loadout's movement and passive can come from
+	 * other kits, and this cannot see them. Use FindEquippedSetFor<T> or GetEquippedSets for that.
+	 */
 	static UTraceCharacterAbilitySet* GetAbilitySetFor(const AActor* Actor);
 
 	/** The PlayerState this component hangs off. */

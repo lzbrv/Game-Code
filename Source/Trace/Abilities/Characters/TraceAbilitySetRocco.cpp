@@ -592,6 +592,14 @@ bool UTraceAbilitySetRocco::OnJumpPressed()
 
 void UTraceAbilitySetRocco::OnKill(ATraceCharacter* Victim, FName Cause, bool bHeadshot)
 {
+	// ABILITY GUARD — the headshot stack is BLASTERS, the passive. The speed it grants was already
+	// guarded (GetMoveSpeedMultiplier); the stack itself was not, so a Rocco kit equipped for JET
+	// BOOTS or RIPPLE alone still counted kills and lit a SPEED BOOST chip for a boost it never gave.
+	if (!IsAbility(ETraceAbilityId::Blasters))
+	{
+		return;
+	}
+
 	if (!HasAuthority() || !bHeadshot)
 	{
 		// HEADSHOT KILLS ONLY. A body-shot kill, a knife kill and a trace kill all leave the stack

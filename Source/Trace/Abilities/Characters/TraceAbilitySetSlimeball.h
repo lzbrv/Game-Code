@@ -115,7 +115,8 @@ namespace TraceSlimeball
 	 * make him fire SLOWER while the card claims he is faster — which reads in a playtest as "the
 	 * passive does nothing", the hardest kind of bug to report.
 	 *
-	 * 1.0 for everybody who is not a stuck Slimeball, including every Mannequin and every bot.
+	 * 1.0 for everybody who is not stuck with VISTECH PADDING equipped (in whichever slot the kit
+	 * sits, whatever is on E), including every Mannequin.
 	 */
 	TRACE_API float GetFireIntervalScaleFor(const AActor* Shooter);
 }

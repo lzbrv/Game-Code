@@ -25,6 +25,7 @@
 
 #include "Materials/MaterialInstanceDynamic.h"
 
+#include "Abilities/Characters/TraceAbilitySetOyster.h"   // TraceAbilityCloak::IsCloakVisualAppliedTo asks his dash cloak too
 #include "Abilities/Characters/TraceElleGate.h"
 #include "Abilities/TraceAbilityComponent.h"
 #include "Audio/TraceAudio.h"                // ElleCloak / ElleDecloak — World, server, at the two edges
@@ -410,6 +411,15 @@ void UTraceAbilitySetElle::TickCloakTrigger()
 	ATraceCharacter* MyPawn = GetCharacter();
 	const bool bHoldsCoreNow = ATraceCore::IsCoreHolder(MyPawn);
 
+	// ABILITY GUARD — the pass cloak is SHIMMER, the passive. An Elle kit equipped only for CARBON
+	// SLIDERS or SNAP must not cloak on a pass. The edge memory is still kept current, so equipping
+	// SHIMMER later cannot fire on a stale "was holding" from before.
+	if (!IsAbility(ETraceAbilityId::Shimmer))
+	{
+		bHeldCoreLastTick = bHoldsCoreNow;
+		return;
+	}
+
 	// THE EDGE, AND WHY IT IS QUALIFIED RATHER THAN BARE.
 	//
 	// "Right after passing or throwing" is not "right after ceasing to hold". A carrier stops holding
@@ -555,6 +565,25 @@ namespace TraceAbilityCloak
 		{
 			TraceAbilitySetElleFile::RestoreFromCloak(Pawn);
 		}
+	}
+
+	bool IsCloakVisualAppliedTo(const AActor* Pawn)
+	{
+		if (const UTraceAbilitySetElle* Elle = UTraceAbilityComponent::FindEquippedSetFor<UTraceAbilitySetElle>(Pawn))
+		{
+			if (Elle->IsCloakVisualApplied())
+			{
+				return true;
+			}
+		}
+		if (const UTraceAbilitySetOyster* Oyster = UTraceAbilityComponent::FindEquippedSetFor<UTraceAbilitySetOyster>(Pawn))
+		{
+			if (Oyster->IsDashCloakVisualApplied())
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 }
 
@@ -814,10 +843,16 @@ bool UTraceAbilitySetElle::DebugPlaceGatePair(const FVector& MouthA, const FVect
 
 float UTraceAbilitySetElle::GetSlideJumpWindowSpeedBonusForElle(const AActor* Actor, float GlobalWellTimedBonus)
 {
-	// Everybody who is not Elle keeps the number they have. This is what makes the passive ELLE ONLY
-	// — spec v18 §4's "do not regress ... slide-jump 1.446875 (Elle changes only her own)".
-	const UTraceCharacterAbilitySet* const Set = UTraceAbilityComponent::GetAbilitySetFor(Actor);
-	if (Set == nullptr || Set->GetCharacterId() != ETraceCharacterId::Elle)
+	// Everybody who has not equipped CARBON SLIDERS keeps the number they have. This is what makes
+	// the bonus theirs alone — spec v18 §4's "do not regress ... slide-jump 1.446875 (Elle changes
+	// only her own)".
+	//
+	// *** THE KIT IN ANY SLOT, NOT THE KIT ON E. *** This used to ask GetAbilitySetFor, which is the
+	// activated kit, and then check that kit was Elle. CARBON SLIDERS is a MOVEMENT ability, so a
+	// loadout that took it under somebody else's E never got the bonus: the per-kit hook fired, handed
+	// the question to this function, and this function looked at the wrong kit and said no.
+	const UTraceAbilitySetElle* const Elle = UTraceAbilityComponent::FindEquippedSetFor<UTraceAbilitySetElle>(Actor);
+	if (Elle == nullptr || !Elle->IsAbility(ETraceAbilityId::CarbonSliders))
 	{
 		return GlobalWellTimedBonus;
 	}

@@ -16,7 +16,7 @@
 
 #include "Abilities/TraceAbilityComponent.h"
 #include "Abilities/Characters/TraceOysterJar.h"   // TraceOysterJar::IsLegacyE — spec v26 §6's red arm
-#include "Abilities/Characters/TraceAbilitySetElle.h"   // IsCloakVisualApplied — §1.2's cloak rule
+#include "Abilities/TraceAbilityCloak.h"                 // IsCloakVisualAppliedTo — §1.2's cloak rule
 #include "Audio/TraceAudio.h"
 #include "Audio/TraceSoundEvents.h"
 #include "Components/CapsuleComponent.h"
@@ -189,9 +189,13 @@ namespace TraceOysterPoisonFile
 			return;
 		}
 
-		if (SourceComp->GetCharacterId() != ETraceCharacterId::Oyster)
+		// PICKLER ON E, not "is this player Oyster". The refund resets the E cooldown, so it belongs to
+		// whoever has Oyster's E. This used to ask for the character id, which a player who locked in
+		// a loadout does not have: their Pickler never refunded, however many people they poisoned.
+		// And a player with only Oyster's jar passive must not have somebody else's E reset by it.
+		if (SourceComp->GetLoadout().Get(ETraceLoadoutSlot::Activated) != ETraceAbilityId::Pickler)
 		{
-			Refuse(TEXT("the source component is not running Oyster"));
+			Refuse(TEXT("the source's E is not PICKLER"));
 			return;
 		}
 
@@ -481,14 +485,10 @@ void UTraceOysterPoisonComponent::UpdateDripFx()
 	// somebody else's passive, on every machine, with no way for her to know. The pieces are plainly
 	// HIDDEN rather than detached, so they resume the instant she decloaks with no rebuild and no
 	// budget churn.
-	bool bHiddenByCloak = false;
-	if (const UTraceAbilityComponent* Comp = UTraceAbilityComponent::Get(Victim))
-	{
-		if (const UTraceAbilitySetElle* Elle = Comp->GetAbilitySetAs<UTraceAbilitySetElle>())
-		{
-			bHiddenByCloak = Elle->IsCloakVisualApplied();
-		}
-	}
+	//
+	// ANY CLOAK ON ANY SLOT: SHIMMER is a passive, and so is Oyster's own dash cloak. This used to ask
+	// only the kit on E, so a victim cloaked by a passive under somebody else's E was lit up anyway.
+	const bool bHiddenByCloak = TraceAbilityCloak::IsCloakVisualAppliedTo(Victim);
 
 	const UCapsuleComponent* Capsule = Victim->GetCapsuleComponent();
 	if (Capsule == nullptr)

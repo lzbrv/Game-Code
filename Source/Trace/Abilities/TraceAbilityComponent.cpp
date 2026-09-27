@@ -1735,19 +1735,45 @@ float UTraceAbilityComponent::ModifyDamageThroughPassives(float Damage, const FT
 {
 	float Result = Damage;
 
-	if (const UTraceCharacterAbilitySet* InstigatorSet = GetAbilitySetFor(Context.Instigator))
+	// *** EVERY EQUIPPED KIT ON BOTH SIDES, NOT THE ACTIVATED ONE. ***
+	//
+	// This used to ask GetAbilitySetFor, which is the kit on E. Two of the three damage passives
+	// live in the PASSIVE slot (Chut's CUSTOM STEEL knife, Slimeball's VISTECH PADDING), so a player
+	// who took either under somebody else's E never got it, and a player who took Chut's or
+	// Slimeball's E got the passive they had not picked. Each kit now guards its own body with
+	// IsAbility, and every kit is asked.
+	if (const UTraceAbilityComponent* InstigatorComp = Get(Context.Instigator))
 	{
-		Result = InstigatorSet->ModifyOutgoingDamage(Result, Context);
+		for (const TObjectPtr<UTraceCharacterAbilitySet>& Set : InstigatorComp->EquippedSets)
+		{
+			if (Set != nullptr)
+			{
+				Result = Set->ModifyOutgoingDamage(Result, Context);
+			}
+		}
 	}
 
-	if (const UTraceCharacterAbilitySet* TargetSet = GetAbilitySetFor(Context.Target))
+	if (const UTraceAbilityComponent* TargetComp = Get(Context.Target))
 	{
 		// REDUCTION FIRST, THEN AMPLIFICATION, and the order is defined rather than incidental:
 		// Chut's Chud (−30%) and X's vulnerable (+25%) will meet, and 100 must resolve the same way
 		// on every machine. 100 -> 70 -> 87.5, not 100 -> 125 -> 87.5 (which happens to agree here,
-		// but stops agreeing the moment either becomes non-multiplicative).
-		Result = TargetSet->ModifyIncomingDamage(Result, Context);
-		Result *= FMath::Max(0.f, TargetSet->GetIncomingDamageMultiplier());
+		// but stops agreeing the moment either becomes non-multiplicative). With several kits, EVERY
+		// reduction runs before ANY amplification, for the same reason.
+		for (const TObjectPtr<UTraceCharacterAbilitySet>& Set : TargetComp->EquippedSets)
+		{
+			if (Set != nullptr)
+			{
+				Result = Set->ModifyIncomingDamage(Result, Context);
+			}
+		}
+		for (const TObjectPtr<UTraceCharacterAbilitySet>& Set : TargetComp->EquippedSets)
+		{
+			if (Set != nullptr)
+			{
+				Result *= FMath::Max(0.f, Set->GetIncomingDamageMultiplier());
+			}
+		}
 	}
 
 	return FMath::Max(0.f, Result);

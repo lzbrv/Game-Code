@@ -19,10 +19,22 @@
 
 #include "CoreMinimal.h"
 
+class AActor;
 class ATraceCharacter;
 
 namespace TraceAbilityCloak
 {
+	/**
+	 * Is @p Pawn drawn cloaked on THIS machine right now, by any ability that cloaks?
+	 *
+	 * For attached FX that must hide while their wearer is cloaked (a slime tell, poison drips): they
+	 * follow the LOOK, so they read the cosmetic flag rather than the replicated timer. Asks every
+	 * equipped kit that can cloak, in whichever slot it was picked: Elle's SHIMMER is a passive and
+	 * Oyster's dash cloak is a passive, so asking only the kit on E missed both whenever somebody
+	 * else's ability was on E.
+	 */
+	TRACE_API bool IsCloakVisualAppliedTo(const AActor* Pawn);
+
 	/**
 	 * Turns the cloak look on or off for @p Pawn.
 	 *

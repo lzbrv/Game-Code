@@ -601,18 +601,29 @@ void UTraceAbilitySetOyster::TryDashCloak()
 	DashEndedMatchTime = 0.f;
 }
 
+bool UTraceAbilitySetOyster::IsDashCloaked() const
+{
+	// READ FROM THE REPLICATED STATE, not from the local deadline: this is asked on every machine
+	// and only the server wrote CloakEndMatchTime. The state is what a remote client has.
+	const FTraceAbilityNetState& Current = State();
+	return IsAbility(ETraceAbilityId::DashCloak)
+		&& (Current.Flags & TraceAbilityFlags::EffectActive) != 0
+		&& MatchTimeNow() < Current.EffectEndMatchTime;
+}
+
+float UTraceAbilitySetOyster::GetDashCloakEndMatchTime() const
+{
+	return IsDashCloaked() ? State().EffectEndMatchTime : 0.f;
+}
+
 void UTraceAbilitySetOyster::TickDashCloak()
 {
 	const ATraceCharacter* MyPawn = GetCharacter();
 
-	// READ FROM THE REPLICATED STATE, not from the local deadline: this runs on every machine and
-	// only the server wrote CloakEndMatchTime. The state is what a remote client has.
-	const FTraceAbilityNetState& Current = State();
-	const bool bWantCloak = IsAbility(ETraceAbilityId::DashCloak)
+	// The replicated fact (IsDashCloaked), and a living pawn to draw it on.
+	const bool bWantCloak = IsDashCloaked()
 		&& MyPawn != nullptr
-		&& MyPawn->IsAlive()
-		&& (Current.Flags & TraceAbilityFlags::EffectActive) != 0
-		&& MatchTimeNow() < Current.EffectEndMatchTime;
+		&& MyPawn->IsAlive();
 
 	if (bWantCloak != bCloakVisualApplied)
 	{
