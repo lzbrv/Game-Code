@@ -84,6 +84,13 @@ struct TRACE_API FTraceLoadoutSelect
 {
 	bool IsOpen() const { return bOpen; }
 
+	/**
+	 * Should the in-match page be up for @p LocalState this frame? The server's select window AND
+	 * the Trace.UI.LoadoutScreen arm. With the arm off the character page is the one that shows, and
+	 * this page must neither draw over it nor take its input.
+	 */
+	static bool WantsOpen(const ATracePlayerState* LocalState);
+
 	void Tick(AHUD* HUD, APlayerController* PC, ATracePlayerState* LocalState,
 		float InViewW, float InViewH, float InUIScale, float InNow, bool bInputAllowed);
 

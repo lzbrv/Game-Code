@@ -259,6 +259,18 @@ namespace TraceLoadoutSelectFile
 // Frame
 // =================================================================================================
 
+bool FTraceLoadoutSelect::WantsOpen(const ATracePlayerState* LocalState)
+{
+	// THE SERVER DECIDES WHETHER THIS IS UP — the one replicated condition, so "the half time break
+	// shows this screen" is true by construction rather than by a clock that could miss the whistle.
+	//
+	// AND THE ARM DECIDES WHICH PAGE IT IS. The character page returns before its cards only while
+	// the arm is on; with it off, this page used to open anyway and draw its translucent columns
+	// over the ten cards, so `Trace.UI.LoadoutScreen 0` showed two screens on top of each other.
+	return TraceLoadoutSelect::IsArmed()
+		&& (LocalState != nullptr) && LocalState->IsCharacterSelectOpen();
+}
+
 void FTraceLoadoutSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerState* LocalState,
 	float InViewW, float InViewH, float InUIScale, float InNow, bool bInputAllowed)
 {
@@ -267,9 +279,7 @@ void FTraceLoadoutSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerSta
 	UIScale = InUIScale;
 	Now = InNow;
 
-	// THE SERVER DECIDES WHETHER THIS IS UP — the one replicated condition, so "the half time break
-	// shows this screen" is true by construction rather than by a clock that could miss the whistle.
-	const bool bWantOpen = (LocalState != nullptr) && LocalState->IsCharacterSelectOpen();
+	const bool bWantOpen = WantsOpen(LocalState);
 
 	if (bWantOpen && !bOpen)
 	{
@@ -1024,6 +1034,27 @@ namespace TraceLoadoutScreenVerify
 
 		Check(TEXT("the loadout page is the armed one"), TraceLoadoutSelect::IsArmed(),
 			TEXT("Trace.UI.LoadoutScreen"));
+
+		// ---- DISARMED, THIS PAGE STAYS SHUT ------------------------------------------------------
+		//
+		// With Trace.UI.LoadoutScreen 0 the character page draws its ten cards, and this page used to
+		// open on the same select window and draw its three columns over them. Asked with the window
+		// OPEN, so the only thing that can keep it shut is the arm.
+		{
+			Subject->ServerSetCharacterSelectOpen(/*bOpen=*/true, 0.f);
+			const int32 SavedArm = GTraceLoadoutScreenArmed;
+
+			GTraceLoadoutScreenArmed = 1;
+			const bool bArmedOpens = FTraceLoadoutSelect::WantsOpen(Subject);
+			GTraceLoadoutScreenArmed = 0;
+			const bool bDisarmedOpens = FTraceLoadoutSelect::WantsOpen(Subject);
+			GTraceLoadoutScreenArmed = SavedArm;
+
+			Check(TEXT("armed, the select window opens this page"), bArmedOpens,
+				TEXT("the window is open"));
+			Check(TEXT("disarmed, it stays shut over the character page"), !bDisarmedOpens,
+				TEXT("Trace.UI.LoadoutScreen 0 must show ONE screen"));
+		}
 
 		FTraceLoadoutSelect Screen;
 		Screen.DebugPick(ETraceLoadoutSlot::Movement,  ETraceAbilityId::StickyGloves);
