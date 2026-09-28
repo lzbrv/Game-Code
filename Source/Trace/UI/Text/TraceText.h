@@ -162,6 +162,23 @@ namespace TraceText
 		EHAlign HAlign = EHAlign::Left;
 		EVAlign VAlign = EVAlign::Top;
 
+		/**
+		 * TABULAR FIGURES: every digit 0-9 advances by the face's WIDEST digit and is centred in that
+		 * cell, so a number that changes keeps its width. OFF by default, ON for anything that counts.
+		 *
+		 * All three faces have PROPORTIONAL digits (the cell model has no tabular set): in Sofachrome
+		 * Light a '1' is 29 atlas px wide and a '0' is 96. A centred or right-aligned number therefore
+		 * slid sideways every time a digit changed — the match clock, "KEEPING YOUR TEAM IN 9", a
+		 * slider's value while it is dragged, the FPS readout four times a second. This fixes the
+		 * ADVANCE only; the glyphs are the face's own. Off by default because a spaced-out '1' reads
+		 * oddly inside a sentence, and a sentence does not tick.
+		 *
+		 * Measurement honours it (MeasureWidth/LayoutString go through one resolver), so a caller that
+		 * sizes a plate from the number gets the width the number is drawn at. The Lato fallback path
+		 * ignores it (degraded mode; Lato's own figures are what they are).
+		 */
+		bool bTabularDigits = false;
+
 		FStyle() = default;
 		explicit FStyle(float InSize) : Size(InSize) {}
 		FStyle(float InSize, const FLinearColor& InColor) : Size(InSize), Color(InColor) {}

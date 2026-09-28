@@ -147,6 +147,24 @@ float TraceCanvasText::Draw(UCanvas* Canvas, const FString& Text, float X, float
 		return 0.f;
 	}
 
+	// P10 — THE SCREEN'S FADE. A kit screen fading open or closed wraps its draw in a
+	// TraceMenuKit::FScopedOpacity; every word on it comes through here, so this is the one place the
+	// words learn about it. Fully faded, nothing is drawn but the width is still reported: a caller
+	// laying out a row by the width it got back must not see its layout move with the fade.
+	const float ScreenOpacity = TraceMenuKit::Opacity();
+	if (ScreenOpacity < 1.f)
+	{
+		TraceText::FStyle Dimmed = Style;
+		Dimmed.Color.A *= ScreenOpacity;
+		if (Dimmed.Color.A <= 0.f)
+		{
+			return TraceText::MeasureWidth(Text, Style);
+		}
+		return TraceText::IsAtlasActive()
+			? TraceCanvasTextFile::DrawAtlas(Canvas, Text, X, Y, Dimmed)
+			: TraceCanvasTextFile::DrawFallback(Canvas, Text, X, Y, Dimmed);
+	}
+
 	return TraceText::IsAtlasActive()
 		? TraceCanvasTextFile::DrawAtlas(Canvas, Text, X, Y, Style)
 		: TraceCanvasTextFile::DrawFallback(Canvas, Text, X, Y, Style);

@@ -501,6 +501,10 @@ void FTraceLoadoutSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerSta
 	ViewH = InViewH;
 	UIScale = InUIScale;
 	Now = InNow;
+	{
+		const UWorld* const ClockWorld = (HUD != nullptr) ? HUD->GetWorld() : nullptr;
+		AnimNow = (ClockWorld != nullptr) ? static_cast<float>(ClockWorld->GetRealTimeSeconds()) : InNow;
+	}
 
 	const bool bWantOpen = WantsOpen(LocalState);
 	if (bWantOpen && !bOpen)
@@ -509,8 +513,19 @@ void FTraceLoadoutSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerSta
 	}
 	bOpen = bWantOpen;
 
+	// P10 — THE PAGE FADES OPEN AND CLOSED, on real time.
+	const float PageAlpha = Fade.Update(bOpen);
+
 	if (!bOpen)
 	{
+		// THE CLOSE: LOCK IN (or the deadline) shut the window, and the page fades off the match as it
+		// last stood — the picks the player just sent, no countdown, no input, no pointer.
+		if (PageAlpha > 0.f && HUD != nullptr && TraceLoadoutSelect::IsArmed())
+		{
+			bPointerOwned = false;
+			TraceMenuKit::FScopedOpacity Fading(PageAlpha);
+			Draw(HUD, PC, LocalState, TRACE_TEXT("LOADOUT.TITLE", "BUILD YOUR LOADOUT"));
+		}
 		return;
 	}
 
@@ -551,6 +566,7 @@ void FTraceLoadoutSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerSta
 		Confirm(LocalState);
 	}
 
+	TraceMenuKit::FScopedOpacity Fading(PageAlpha);
 	Draw(HUD, PC, LocalState, TRACE_TEXT("LOADOUT.TITLE", "BUILD YOUR LOADOUT"));
 }
 
@@ -1053,6 +1069,7 @@ bool FTraceLoadoutSelect::TickLibrary(AHUD* HUD, APlayerController* PC,
 	ViewH = InViewH;
 	UIScale = InUIScale;
 	Now = InNow;
+	AnimNow = InNow;   // the options overlay's clock, which is already real time
 
 	// The editor is the front-most surface wherever it is hosted; its bInputAllowed is only the
 	// host's one-frame debounce, and a pointer that vanished for it would flicker on every open.
@@ -1158,7 +1175,7 @@ void FTraceLoadoutSelect::DrawHeader(AHUD* HUD, const ATracePlayerState* LocalSt
 	const float BoxX = ViewW - TraceLoadoutLayout::Margin * S - BoxW;
 	TraceMenuKit::DrawValueBox(HUD, BoxX, CapMid - BoxH * 0.5f, BoxW, BoxH,
 		FString::FromInt(FMath::Max(0, FMath::CeilToInt(Remaining))),
-		bUrgent ? TraceLoadoutSelectFile::Urgent(Now) : TraceMenuArtStyle::WordDefault);
+		bUrgent ? TraceLoadoutSelectFile::Urgent(AnimNow) : TraceMenuArtStyle::WordDefault);
 
 	const FString Label = TRACE_TEXT("LOADOUT.TIMER_LABEL", "TIME");
 	if (!Label.IsEmpty())
@@ -1193,14 +1210,14 @@ void FTraceLoadoutSelect::DrawTabs(AHUD* HUD, APlayerController* PC, float X, fl
 	const float LeftW = TraceMenuKit::KeyChipWidth(LeftKey, ChipH);
 	if (LeftW > 0.f)
 	{
-		TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, X, ChipY, ChipH, LeftKey, Now);
+		TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, X, ChipY, ChipH, LeftKey, AnimNow);
 		RowX += LeftW + Gap;
 		RowW -= LeftW + Gap;
 	}
 	const float RightW = TraceMenuKit::KeyChipWidth(RightKey, ChipH);
 	if (RightW > 0.f)
 	{
-		TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, X + W - RightW, ChipY, ChipH, RightKey, Now);
+		TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, X + W - RightW, ChipY, ChipH, RightKey, AnimNow);
 		RowW -= RightW + Gap;
 	}
 
@@ -1218,9 +1235,8 @@ void FTraceLoadoutSelect::DrawTabs(AHUD* HUD, APlayerController* PC, float X, fl
 		const bool bActive = (Index == Tab);
 		const ETraceKitState State = bActive ? ETraceKitState::Hover
 			: ((Index == HoveredTab) ? ETraceKitState::Pressed : ETraceKitState::Default);
-		const FTraceKitVisuals Visuals = TraceMenuKit::VisualsFor(State);
-
-		TraceMenuKit::DrawStatePlate(HUD, State, TabX, Y, TabW, TabH, Now);
+		TraceMenuKit::DrawStatePlate(HUD, State, TabX, Y, TabW, TabH, AnimNow);
+		const FTraceKitVisuals Visuals = TraceMenuKit::VisualsAt(State, TabX, Y, TabW, TabH);
 
 		// WHAT IS IN THE SLOT, on the tab itself, so the whole loadout reads without visiting all three.
 		const float TextMax = TabW - TabH * 0.5f;
@@ -1330,8 +1346,9 @@ void FTraceLoadoutSelect::DrawCard(AHUD* HUD, int32 Index, float X, float Y, flo
 	CardRects[Index] = FBox2D(FVector2D(X, Y), FVector2D(X + W, Y + H));
 
 	const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, bHighlighted);
-	const FTraceKitVisuals Visuals = TraceMenuKit::VisualsFor(State);
-	TraceMenuKit::DrawStatePlate(HUD, State, X, Y, W, H, Now, TraceLoadoutLayout::CardCorner * S);
+	TraceMenuKit::DrawStatePlate(HUD, State, X, Y, W, H, AnimNow, TraceLoadoutLayout::CardCorner * S);
+	// The card's words follow its hover ring as it eases on and off.
+	const FTraceKitVisuals Visuals = TraceMenuKit::VisualsAt(State, X, Y, W, H);
 
 	const float Pad = TraceLoadoutLayout::CardPad * S;
 	const float TextX = X + Pad;
@@ -1422,14 +1439,14 @@ void FTraceLoadoutSelect::DrawActionRow(AHUD* HUD, APlayerController* PC, float 
 		const FString Key = bPad ? TRACE_TEXT("LOADOUT.PAD_KEY_LOCK_IN", "X") : TRACE_TEXT("LOADOUT.KEY_LOCK_IN", "F");
 		const float PlateX = Right - BtnW;
 		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, bHoveredConfirm || bLockHint);
-		ConfirmRect = TraceMenuKit::DrawButton(HUD, State, PlateX, Y, BtnW, BtnH, Word, Now)
+		ConfirmRect = TraceMenuKit::DrawButton(HUD, State, PlateX, Y, BtnW, BtnH, Word, AnimNow)
 			? FBox2D(FVector2D(PlateX, Y), FVector2D(PlateX + BtnW, Y + BtnH))
 			: FBox2D(ForceInit);
 		Right = PlateX;
 		if (ConfirmRect.bIsValid)
 		{
 			const float KeyW = TraceMenuKit::KeyChipWidth(Key, ChipH);
-			TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, Right - ChipGap - KeyW, ChipY, ChipH, Key, Now);
+			TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, Right - ChipGap - KeyW, ChipY, ChipH, Key, AnimNow);
 			Right -= (KeyW > 0.f) ? (ChipGap + KeyW) : 0.f;
 		}
 		Right -= GroupGap;
@@ -1443,11 +1460,11 @@ void FTraceLoadoutSelect::DrawActionRow(AHUD* HUD, APlayerController* PC, float 
 		const FString Key = bPad ? TRACE_TEXT("LOADOUT.PAD_KEY_BACK", "B") : TRACE_TEXT("LOADOUT.KEY_BACK", "ESC");
 		const float PlateX = Right - BtnW;
 		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, bHoveredBack);
-		if (TraceMenuKit::DrawButton(HUD, State, PlateX, Y, BtnW, BtnH, Word, Now))
+		if (TraceMenuKit::DrawButton(HUD, State, PlateX, Y, BtnW, BtnH, Word, AnimNow))
 		{
 			BackRect = FBox2D(FVector2D(PlateX, Y), FVector2D(PlateX + BtnW, Y + BtnH));
 			const float KeyW = TraceMenuKit::KeyChipWidth(Key, ChipH);
-			TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, PlateX - ChipGap - KeyW, ChipY, ChipH, Key, Now);
+			TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, PlateX - ChipGap - KeyW, ChipY, ChipH, Key, AnimNow);
 		}
 		for (FBox2D& Rect : SavedRects)
 		{
@@ -1508,7 +1525,7 @@ void FTraceLoadoutSelect::DrawSavedRow(AHUD* HUD, float X, float Y, float MaxW)
 		}
 
 		const ETraceKitState State = TraceMenuKit::StateFor(bUsable, Index == HoveredSaved);
-		if (TraceMenuKit::DrawButton(HUD, State, SlotX, Y, SlotW, H, Word, Now))
+		if (TraceMenuKit::DrawButton(HUD, State, SlotX, Y, SlotW, H, Word, AnimNow))
 		{
 			SavedRects[Index] = FBox2D(FVector2D(SlotX, Y), FVector2D(SlotX + SlotW, Y + H));
 		}
@@ -1561,8 +1578,8 @@ void FTraceLoadoutSelect::DrawFooter(AHUD* HUD, APlayerController* PC, float Y)
 	const float ChipH = TraceMenuKit::KeyLegendFit(FullChipH, ViewW - TraceLoadoutLayout::Margin * 2.f * S,
 		{ TraceMenuKit::KeyLegendWidth(Keyboard, FullChipH), TraceMenuKit::KeyLegendWidth(Pad, FullChipH) });
 
-	TraceMenuKit::DrawKeyLegend(HUD, Keyboard, ViewW * 0.5f, Y, ChipH, Now);
-	TraceMenuKit::DrawKeyLegend(HUD, Pad, ViewW * 0.5f, Y + TraceLoadoutLayout::PadLineGap * S, ChipH, Now);
+	TraceMenuKit::DrawKeyLegend(HUD, Keyboard, ViewW * 0.5f, Y, ChipH, AnimNow);
+	TraceMenuKit::DrawKeyLegend(HUD, Pad, ViewW * 0.5f, Y + TraceLoadoutLayout::PadLineGap * S, ChipH, AnimNow);
 }
 
 void FTraceLoadoutSelect::DrawPointer(AHUD* HUD, APlayerController* PC)

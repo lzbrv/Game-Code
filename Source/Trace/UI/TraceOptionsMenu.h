@@ -37,6 +37,7 @@
 #include "UI/TraceNetworking.h"           // FTraceTextEntry - the CALL SIGN row types in it (WP2.2)
 #include "UI/Text/TraceTextWeight.h"      // ETraceTextWeight - which FACE a string is set in (v26 §2)
 #include "UI/TraceLoadoutSelect.h"   // the loadout library editor this menu hosts
+#include "UI/Widgets/Menu/TraceKitMotion.h"   // FTraceKitFade — the overlay's open/close fade (P10)
 
 class AHUD;
 class APawn;
@@ -276,6 +277,25 @@ public:
 	void Close();
 
 	bool IsOpen() const { return Page != EPage::Closed; }
+
+	/**
+	 * P10: the overlay's opacity this frame, 0..1. It fades in after any Open*() and, after Close(),
+	 * keeps drawing the page it closed on (no input, no pointer) while it fades out. IsOpen() is NOT
+	 * widened by the fade: input, the pause and the host's input mode all follow Close() at once.
+	 */
+	float GetFadeAlpha() const { return Fade.Alpha(); }
+
+	/** The same fade's raw progress, linear in real time (a harness checks its RATE). */
+	float GetFadeLinear() const { return Fade.Linear(); }
+
+	/** Open, or still fading out. A host that stands something down under the overlay asks this. */
+	bool IsVisible() const { return IsOpen() || Fade.IsVisible(); }
+
+	/**
+	 * Advances the fade to now (idempotent within a frame; Tick calls it too). A host that reads
+	 * GetFadeAlpha BEFORE this frame's Tick calls this first, so both see the same value.
+	 */
+	void UpdateFade() { Fade.Update(IsOpen()); }
 
 	/** True while the overlay is waiting for the player to press the key they want to bind. */
 	bool IsCapturingKey() const { return bCapturingKey; }
@@ -957,6 +977,12 @@ private:
 
 	void Draw(AHUD* HUD, APlayerController* PC);
 
+	/**
+	 * P10 — the close: the page Close() left, drawn at @p Alpha with no pointer and the PAUSED/MENU
+	 * title it had, so nothing on it changes while it fades. A no-op at alpha 0 or with no page.
+	 */
+	void DrawClosing(AHUD* HUD, APlayerController* PC, float Alpha);
+
 	void DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W, float H, bool bSelected);
 	void DrawCursor(AHUD* HUD, APlayerController* PC);
 
@@ -1052,6 +1078,18 @@ private:
 
 	/** The world is really paused this frame (standalone). Decides PAUSED against MENU on the root. */
 	bool bWorldPaused = false;
+
+	// ---- P10: the open/close fade ------------------------------------------------------------------
+
+	/** The overlay's fade, on real time. See GetFadeAlpha. */
+	FTraceKitFade Fade;
+
+	/** The page Close() closed, and whether it said PAUSED — what DrawClosing draws while it fades. */
+	EPage ClosingPage = EPage::Closed;
+	bool bClosingWorldPaused = false;
+
+	/** True inside DrawClosing: the pointer is not drawn (input already went back to the game). */
+	bool bDrawingClosing = false;
 
 	/**
 	 * This machine is a listen host with somebody connected: leaving ends the match for them too, and

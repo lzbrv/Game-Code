@@ -301,6 +301,10 @@ void FTraceTeamSelect::Tick(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 	ViewH = InViewH;
 	UIScale = InUIScale;
 	Now = InNow;
+	{
+		const UWorld* const ClockWorld = HUD->GetWorld();
+		AnimNow = (ClockWorld != nullptr) ? static_cast<float>(ClockWorld->GetRealTimeSeconds()) : InNow;
+	}
 
 	// THE ONLY CONDITION. Replicated from the server, so "may this player change team at all" is
 	// answered upstream and nothing is re-derived here. See the header.
@@ -351,8 +355,20 @@ void FTraceTeamSelect::Tick(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 		}
 	}
 
+	// P10 — THE PAGE FADES OPEN AND CLOSED, on real time (TraceMenuKit::FadeInSeconds / FadeOutSeconds).
+	const float PageAlpha = Fade.Update(bOpen);
+
 	if (!bOpen)
 	{
+		// THE CLOSE: the page as it last stood, fading out, reading no input and drawing no pointer —
+		// over the match after an H, or over the loadout page fading in at the start of a match (the
+		// HUD keeps the black under both, so the arena never shows between them).
+		if (PageAlpha > 0.f && PC != nullptr)
+		{
+			bPointerOwned = false;
+			TraceMenuKit::FScopedOpacity Fading(PageAlpha);
+			Draw(HUD, PC, LocalState);
+		}
 		return;
 	}
 
@@ -376,6 +392,7 @@ void FTraceTeamSelect::Tick(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 	}
 #endif
 
+	TraceMenuKit::FScopedOpacity Fading(PageAlpha);
 	Draw(HUD, PC, LocalState);
 }
 
@@ -708,12 +725,15 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 		const bool bUrgent = Remaining <= 5.f;
 		const FLinearColor Amber = TraceMenuArtStyle::AmberLifted();
 		const FLinearColor CountColor = bUrgent
-			? TraceTeamSelectStyle::WithAlpha(Amber, 0.72f + 0.28f * FMath::Sin(Now * 9.f))
+			? TraceTeamSelectStyle::WithAlpha(Amber, 0.72f + 0.28f * FMath::Sin(AnimNow * 9.f))
 			: TraceMenuKit::FurnitureUnselected;
 
 		TraceText::FStyle CountStyle(TraceTeamSelectLayout::SizeLabel * S, CountColor, ETraceTextWeight::Light);
 		CountStyle.Tracking = TraceTeamSelectLayout::TrackLabel * S;
 		CountStyle.HAlign = TraceText::EHAlign::Right;
+		// Right-aligned and ticking: tabular figures, or the whole line lurched every second (a Light
+		// '1' is under a third of a '0').
+		CountStyle.bTabularDigits = true;
 		const FString CountText = TRACE_TEXTF("TEAMSELECT.COUNTDOWN", "KEEPING YOUR TEAM IN {0}",
 			{ FMath::Max(0, FMath::CeilToInt(Remaining)) });
 		const float CountRight = ViewW - TraceTeamSelectLayout::Margin * S;
@@ -811,8 +831,8 @@ void FTraceTeamSelect::DrawFooter(AHUD* HUD, ATracePlayerController* PC)
 		{ TraceMenuKit::KeyLegendWidth(Keyboard, FullChipH), TraceMenuKit::KeyLegendWidth(Pad, FullChipH) });
 
 	const float FooterTop = TraceTeamSelectLayout::FooterY * S;
-	TraceMenuKit::DrawKeyLegend(HUD, Keyboard, ViewW * 0.5f, FooterTop, ChipH, Now);
-	TraceMenuKit::DrawKeyLegend(HUD, Pad, ViewW * 0.5f, FooterTop + TraceTeamSelectLayout::PadFooterGap * S, ChipH, Now);
+	TraceMenuKit::DrawKeyLegend(HUD, Keyboard, ViewW * 0.5f, FooterTop, ChipH, AnimNow);
+	TraceMenuKit::DrawKeyLegend(HUD, Pad, ViewW * 0.5f, FooterTop + TraceTeamSelectLayout::PadFooterGap * S, ChipH, AnimNow);
 }
 
 void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATracePlayerState* LocalState,
@@ -839,8 +859,9 @@ void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATra
 
 	// ---- Plate: the kit's, in the state the row is in -------------------------------------------
 	const ETraceKitState State = TraceMenuKit::StateFor(bAllowed, bHighlighted);
-	const FTraceKitVisuals Visuals = TraceMenuKit::VisualsFor(State);
-	TraceMenuKit::DrawStatePlate(HUD, State, X, Y, W, H, Now, TraceTeamSelectLayout::PlateCorner * S);
+	TraceMenuKit::DrawStatePlate(HUD, State, X, Y, W, H, AnimNow, TraceTeamSelectLayout::PlateCorner * S);
+	// The plate's words follow its hover ring as it eases on and off (the same blend, this frame).
+	const FTraceKitVisuals Visuals = TraceMenuKit::VisualsAt(State, X, Y, W, H);
 
 	const float PadX = TraceTeamSelectLayout::PlatePad * S;
 	float CursorY = Y + PadX;
@@ -856,14 +877,14 @@ void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATra
 		: TRACE_TEXT("TEAMSELECT.PLATE_KEY_ORANGE", "2");
 	const float ChipW = TraceMenuKit::KeyChipWidth(KeyName, ChipH);
 	TraceMenuKit::DrawKeyChip(HUD, bAllowed ? ETraceKitState::Default : ETraceKitState::Disabled,
-		X + W - PadX - ChipW, CursorY + (TraceText::LineHeight(NameSize) - ChipH) * 0.5f, ChipH, KeyName, Now);
+		X + W - PadX - ChipW, CursorY + (TraceText::LineHeight(NameSize) - ChipH) * 0.5f, ChipH, KeyName, AnimNow);
 
 	CursorY += TraceText::LineHeight(NameSize) + (4.f * S);
 
 	// THE TEAM'S COLOUR, as an accent under its name: the fastest read on the screen, and the one
 	// thing that makes the orange side look orange before a word is parsed. Dimmed with the plate.
-	HUD->DrawRect(bAllowed ? Tint : TraceTeamSelectStyle::WithAlpha(Tint, 0.35f), X + PadX, CursorY, 96.f * S,
-		FMath::Max(2.f, 4.f * S));
+	HUD->DrawRect(TraceMenuKit::Faded(bAllowed ? Tint : TraceTeamSelectStyle::WithAlpha(Tint, 0.35f)), X + PadX, CursorY,
+		96.f * S, FMath::Max(2.f, 4.f * S));
 	CursorY += 18.f * S;
 
 	// ---- The count, which is what the rule is about ---------------------------------------------
@@ -895,8 +916,8 @@ void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATra
 	CursorY += TraceText::LineHeight(TraceTeamSelectLayout::SizeLead * S) + (14.f * S);
 
 	// A hairline under the header block.
-	HUD->DrawRect(TraceTeamSelectStyle::WithAlpha(Visuals.Furniture, 0.22f), X + PadX, CursorY, W - (2.f * PadX),
-		FMath::Max(1.f, 1.f * S));
+	HUD->DrawRect(TraceMenuKit::Faded(TraceTeamSelectStyle::WithAlpha(Visuals.Furniture, 0.22f)), X + PadX, CursorY,
+		W - (2.f * PadX), FMath::Max(1.f, 1.f * S));
 	CursorY += 16.f * S;
 
 	// ---- The roster ------------------------------------------------------------------------------

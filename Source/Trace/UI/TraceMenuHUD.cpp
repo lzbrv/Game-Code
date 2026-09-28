@@ -3193,7 +3193,11 @@ void ATraceMenuHUD::DrawHUD()
 	// card over it (DrawTravelOverlay), which is what lets the connecting card carry the ESC CANCEL
 	// legend, the elapsed seconds and the pointer.
 	const bool bWidgetAvailable = TryAdoptMenuWidget();
-	const bool bModalOpen = OptionsMenu.IsOpen() || IsJoinPromptOpen() || bTravelling;
+	// IsVisible, not IsOpen (P10): SETTINGS fades out over the Canvas title after it closes, and the UMG
+	// title — which Slate paints OVER the Canvas — must not come back until it has, or it would cover
+	// the fade-out and pop in one frame. The swap itself is invisible (see above).
+	OptionsMenu.UpdateFade();
+	const bool bModalOpen = OptionsMenu.IsVisible() || IsJoinPromptOpen() || bTravelling;
 	const bool bUseWidgetThisFrame = bWidgetAvailable && !bModalOpen;
 	bMenuUmgActive = bUseWidgetThisFrame;
 	bMenuUmgAvailable = bWidgetAvailable;

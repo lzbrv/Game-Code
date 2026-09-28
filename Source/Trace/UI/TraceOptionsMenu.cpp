@@ -233,7 +233,8 @@ namespace TraceOptionsMenuText
 
 	/** @p Text with its caps centred on @p CapCenterY, X per @p HAlign, shrunk to @p MaxW (0: no limit). */
 	static float Draw(AHUD* HUD, const FString& Text, float X, float CapCenterY, float CapH,
-		const FLinearColor& Color, ETraceTextWeight Weight, TraceText::EHAlign HAlign, float MaxW = 0.f)
+		const FLinearColor& Color, ETraceTextWeight Weight, TraceText::EHAlign HAlign, float MaxW = 0.f,
+		bool bTabularDigits = false)
 	{
 		if (HUD == nullptr || Text.IsEmpty())
 		{
@@ -241,6 +242,7 @@ namespace TraceOptionsMenuText
 		}
 		TraceText::FStyle Drawn = MakeStyle(CapH, Color, Weight);
 		Drawn.HAlign = HAlign;
+		Drawn.bTabularDigits = bTabularDigits;
 		if (MaxW > 0.f)
 		{
 			const float Natural = TraceText::MeasureWidth(Text, Drawn);
@@ -1683,6 +1685,10 @@ void FTraceOptionsMenu::Close()
 		ApplyVideo(/*bResolutionAffecting=*/true, /*bPersist=*/true);
 	}
 
+	// P10 — what the fade-out draws: this page, titled as it was.
+	ClosingPage = Page;
+	bClosingWorldPaused = bWorldPaused;
+
 	Page = EPage::Closed;
 	bCapturingKey = false;
 	// D31-PAD — reset with its partner and never on its own. A stale bCapturingPadKey would make the
@@ -2217,7 +2223,11 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	TickVerify(PC);
 #endif
 
-	if (Page == EPage::Closed || HUD == nullptr || InViewW <= 0.f || InViewH <= 0.f)
+	// P10 — THE OVERLAY FADES OPEN AND CLOSED, on real time. Updated before the closed-page early-out,
+	// because a closed overlay still has its fade-out to draw.
+	const float OverlayAlpha = Fade.Update(IsOpen());
+
+	if (HUD == nullptr || InViewW <= 0.f || InViewH <= 0.f)
 	{
 		return;
 	}
@@ -2225,6 +2235,16 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	ViewW = InViewW;
 	ViewH = InViewH;
 	UIScale = InUIScale;
+
+	if (Page == EPage::Closed)
+	{
+		DrawClosing(HUD, PC, OverlayAlpha);
+		return;
+	}
+
+	// Everything below draws at the overlay's fade (the pointer excepted: it is the player's, and it
+	// appears the frame the menu does).
+	TraceMenuKit::FScopedOpacity Fading(OverlayAlpha);
 
 	// *** THE LOADOUT EDITOR OWNS THE FRAME WHILE IT IS OPEN. ***
 	//
@@ -2312,10 +2332,13 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 		PollInput(PC);
 	}
 
-	// PollInput can close us (Escape, RESUME). Drawing a closed overlay would leave a frame of dimmed
-	// screen over a game that has already resumed.
+	// PollInput can close us (Escape, RESUME). What is drawn then is the CLOSE — the page it left,
+	// starting its fade-out this very frame. Returning with nothing drawn was a one-frame blink of the
+	// bare match before the fade-out's first frame. At 1: this is already inside the overlay's opacity
+	// scope above, and a second OverlayAlpha would dim this one frame twice.
 	if (Page == EPage::Closed)
 	{
+		DrawClosing(HUD, PC, 1.f);
 		return;
 	}
 
@@ -2343,6 +2366,7 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	// after PollInput above.
 	if (Page == EPage::Closed)
 	{
+		DrawClosing(HUD, PC, 1.f);   // inside the overlay's scope already, as above
 		return;
 	}
 #endif
@@ -4373,8 +4397,10 @@ void FTraceOptionsMenu::DrawPerfReadout(AHUD* HUD, float RightX, float Y)
 
 	// BODY, not a header (spec v26 §2): a live READOUT of the page's own effect, in the face the
 	// in-match HUD reports numbers in. @p Y is the title's cap centre line: it shares the title's line.
+	// Right-aligned and refreshed four times a second: tabular figures, or the whole line shuffled
+	// sideways on every update (P10).
 	TraceOptionsMenuText::Draw(HUD, Line, RightX, Y, 12.f * UIScale, Color, TraceOptionsMenuType::BodyFace,
-		TraceText::EHAlign::Right);
+		TraceText::EHAlign::Right, 0.f, /*bTabularDigits=*/true);
 }
 
 // =================================================================================================
@@ -4538,7 +4564,7 @@ void FTraceOptionsMenu::DrawValueBoxFor(AHUD* HUD, float X, float Y, float W, fl
 	const FLinearColor Tint = bEnabled ? FLinearColor::White : FLinearColor(0.45f, 0.45f, 0.45f, 1.f);
 	if (TraceOptionsMenuArt::GEnabled == 0)
 	{
-		HUD->DrawRect(TraceMenuArtStyle::PlateFill * Tint, X, Y, W, H);
+		HUD->DrawRect(TraceMenuKit::Faded(TraceMenuArtStyle::PlateFill * Tint), X, Y, W, H);
 		return;
 	}
 	TraceMenuKit::DrawValueBoxPlate(HUD, X, Y, W, H, Tint);
@@ -4619,7 +4645,7 @@ void FTraceOptionsMenu::Draw(AHUD* HUD, APlayerController* PC)
 
 	// A borderless black panel under the list, over the scrim. No bezel and no corner ticks: the kit
 	// has none, and a flat rect with a coloured edge is exactly what stylespec §0 rules out.
-	HUD->DrawRect(TraceOptionsMenuPalette::PanelFill, PanelX, PanelY, PanelW, PanelH);
+	HUD->DrawRect(TraceMenuKit::Faded(TraceOptionsMenuPalette::PanelFill), PanelX, PanelY, PanelW, PanelH);
 
 	if (bDrawPreview)
 	{
@@ -4678,6 +4704,31 @@ void FTraceOptionsMenu::Draw(AHUD* HUD, APlayerController* PC)
 	}
 
 	DrawCursor(HUD, PC);
+}
+
+void FTraceOptionsMenu::DrawClosing(AHUD* HUD, APlayerController* PC, float Alpha)
+{
+	if (HUD == nullptr || Alpha <= 0.f || ClosingPage == EPage::Closed || Rows.Num() == 0)
+	{
+		return;
+	}
+
+	// The rows Close() left are still here (it clears none), so the page draws exactly as it last
+	// stood. Page and the PAUSED flag are lent back for the draw and restored: the world unpaused on
+	// the frame the menu closed, and a title that changed from PAUSED to MENU while fading would be a
+	// flicker of its own.
+	const EPage OpenPage = Page;
+	const bool bPausedNow = bWorldPaused;
+	Page = ClosingPage;
+	bWorldPaused = bClosingWorldPaused;
+	bDrawingClosing = true;
+	{
+		TraceMenuKit::FScopedOpacity Fading(Alpha);
+		Draw(HUD, PC);
+	}
+	bDrawingClosing = false;
+	bWorldPaused = bPausedNow;
+	Page = OpenPage;
 }
 
 void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W, float H, bool bSelected)
@@ -4747,7 +4798,7 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		const float RuleLeft = X + Drawn + 12.f * S;
 		if (ControlRight > RuleLeft)
 		{
-			HUD->DrawRect(TraceOptionsMenuPalette::Rule, RuleLeft, CapMid, ControlRight - RuleLeft, FMath::Max(1.f, S));
+			HUD->DrawRect(TraceMenuKit::Faded(TraceOptionsMenuPalette::Rule), RuleLeft, CapMid, ControlRight - RuleLeft, FMath::Max(1.f, S));
 		}
 		return;
 	}
@@ -4984,7 +5035,7 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		if (bEditing && CallSignEntry.IsCaretVisible(Now))
 		{
 			const float CaretX = TextX + TraceOptionsMenuText::Width(Shown.Left(CallSignEntry.GetCaret()), BodyCapH, Body);
-			HUD->DrawRect(TraceMenuArtStyle::WordDefault, CaretX + 1.f * S, MidY - BodyCapH * 0.75f,
+			HUD->DrawRect(TraceMenuKit::Faded(TraceMenuArtStyle::WordDefault), CaretX + 1.f * S, MidY - BodyCapH * 0.75f,
 				FMath::Max(2.f, 2.f * S), BodyCapH * 1.5f);
 		}
 		return;
@@ -5046,8 +5097,9 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 	const float SliderBoxW = FMath::Min(ControlW * 0.5f, OL::SliderValueW * S);
 	const float SliderBoxX = ControlRight - SliderBoxW;
 	DrawValueBoxFor(HUD, SliderBoxX, BoxY, SliderBoxW, BoxH, /*bEnabled=*/true);
+	// Tabular: the number changes under the player's drag and must not slide about in its box (P10).
 	TraceMenuKit::DrawLabel(HUD, FormatSettingValue(Row.Setting, Value), SliderBoxX + SliderBoxW * 0.5f, MidY, BodyPlateH,
-		ValueColor, SliderBoxW - BoxH * 0.5f, Body);
+		ValueColor, SliderBoxW - BoxH * 0.5f, Body, /*bTabularDigits=*/true);
 
 	const float TrackH = BoxH / TraceMenuKit::ValuePlateToTrack;
 	const float HandleW = static_cast<float>(TraceMenuKit::SliderHandleRect(0.f, 0.f, TrackH).GetSize().X);
@@ -5064,7 +5116,7 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 
 	if (TraceOptionsMenuArt::GEnabled == 0)
 	{
-		HUD->DrawRect(TraceMenuArtStyle::PlateFill, TrackLeft, TrackY + TrackH * TraceMenuKit::TrackRailTopV,
+		HUD->DrawRect(TraceMenuKit::Faded(TraceMenuArtStyle::PlateFill), TrackLeft, TrackY + TrackH * TraceMenuKit::TrackRailTopV,
 			TrackW, FMath::Max(2.f, TrackH * TraceMenuKit::TrackRailV));
 	}
 	else
@@ -5079,13 +5131,13 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		FLinearColor Fill = TraceMenuArtStyle::ValueGlowLifted();
 		Fill.A = bSelected ? 1.f : 0.7f;
 		const float FillH = FMath::Max(2.f, TrackH * TraceMenuKit::TrackRailV * 0.45f);
-		HUD->DrawRect(Fill, RailLeft, MidY - FillH * 0.5f, FMath::Max(0.f, HandleX - RailLeft), FillH);
+		HUD->DrawRect(TraceMenuKit::Faded(Fill), RailLeft, MidY - FillH * 0.5f, FMath::Max(0.f, HandleX - RailLeft), FillH);
 	}
 
 	if (TraceOptionsMenuArt::GEnabled == 0)
 	{
 		const FBox2D Blade = TraceMenuKit::SliderHandleRect(HandleX, MidY, TrackH);
-		HUD->DrawRect(FLinearColor::White, HandleX - 1.5f * S, static_cast<float>(Blade.Min.Y), 3.f * S,
+		HUD->DrawRect(TraceMenuKit::Faded(FLinearColor::White), HandleX - 1.5f * S, static_cast<float>(Blade.Min.Y), 3.f * S,
 			static_cast<float>(Blade.GetSize().Y));
 	}
 	else
@@ -5117,8 +5169,8 @@ void FTraceOptionsMenu::DrawCrosshairPreview(AHUD* HUD, float X, float Y, float 
 	const float BoxH = FMath::RoundToFloat(H);
 	const float HalfW = FMath::RoundToFloat(BoxW * 0.5f);
 
-	HUD->DrawRect(FLinearColor(0.004f, 0.014f, 0.026f, 1.f), BoxX, BoxY, HalfW, BoxH);
-	HUD->DrawRect(FLinearColor(0.757f, 0.988f, 0.992f, 1.f), BoxX + HalfW, BoxY, BoxW - HalfW, BoxH);
+	HUD->DrawRect(TraceMenuKit::Faded(FLinearColor(0.004f, 0.014f, 0.026f, 1.f)), BoxX, BoxY, HalfW, BoxH);
+	HUD->DrawRect(TraceMenuKit::Faded(FLinearColor(0.757f, 0.988f, 0.992f, 1.f)), BoxX + HalfW, BoxY, BoxW - HalfW, BoxH);
 
 	// ---- The crosshair, from the SAME geometry the HUD draws -----------------------------------
 	//
@@ -5140,13 +5192,13 @@ void FTraceOptionsMenu::DrawCrosshairPreview(AHUD* HUD, float X, float Y, float 
 		for (int32 Index = 0; Index < NumBars; ++Index)
 		{
 			const FTraceCrosshairBar& B = Bars[Index];
-			HUD->DrawRect(Outline, B.X - 1.f, B.Y - 1.f, B.W + 2.f, B.H + 2.f);
+			HUD->DrawRect(TraceMenuKit::Faded(Outline), B.X - 1.f, B.Y - 1.f, B.W + 2.f, B.H + 2.f);
 		}
 	}
 	for (int32 Index = 0; Index < NumBars; ++Index)
 	{
 		const FTraceCrosshairBar& B = Bars[Index];
-		HUD->DrawRect(Ink, B.X, B.Y, B.W, B.H);
+		HUD->DrawRect(TraceMenuKit::Faded(Ink), B.X, B.Y, B.W, B.H);
 	}
 
 	// ---- Caption -------------------------------------------------------------------------------
@@ -5294,7 +5346,8 @@ void FTraceOptionsMenu::DrawCursor(AHUD* HUD, APlayerController* PC)
 	// this overlay releases it — so the overlay draws its own: the kit's white blade, TIP-ANCHORED on
 	// the point PollMouse hit-tests, through TraceMenuKit::ShowCursor (which also keeps the OS arrow
 	// hidden for as long as ours is drawn — stylespec §9, the pointer rule every kit screen follows).
-	if (!bHasCursor)
+	// Not while the overlay is fading out: input has already gone back to the game (P10).
+	if (!bHasCursor || bDrawingClosing)
 	{
 		return;
 	}

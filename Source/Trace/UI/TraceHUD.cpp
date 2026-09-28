@@ -474,8 +474,10 @@ namespace TraceHUDStroke
 {
 	/** Appends the two triangles of one stroke to @p Tris. Nothing for a zero-length or invisible stroke. */
 	static void AddQuad(TArray<FCanvasUVTri>& Tris, float X0, float Y0, float X1, float Y1,
-		const FLinearColor& Color, float Thickness)
+		const FLinearColor& InColor, float Thickness)
 	{
+		// Through the screen's fade (P10): a stroke under a fading overlay fades with the rest of the HUD.
+		const FLinearColor Color = TraceMenuKit::Faded(InColor);
 		const FVector2D From(X0, Y0);
 		const FVector2D To(X1, Y1);
 		FVector2D Along = To - From;
@@ -511,6 +513,28 @@ namespace TraceHUDStroke
 			InCanvas->DrawItem(Item);
 		}
 		Tris.Reset();
+	}
+
+	/**
+	 * AHUD::DrawLine for a pass that only holds an AHUD*, through the screen's fade (P10): at full
+	 * strength exactly AHUD::DrawLine, and while the HUD is fading under an overlay a translucent quad
+	 * instead, because AHUD::DrawLine discards alpha.
+	 */
+	static void LineThroughFade(AHUD* HUD, float X0, float Y0, float X1, float Y1, const FLinearColor& Color,
+		float Thickness)
+	{
+		if (HUD == nullptr)
+		{
+			return;
+		}
+		if (TraceMenuKit::Opacity() >= 1.f)
+		{
+			HUD->DrawLine(X0, Y0, X1, Y1, Color, Thickness);
+			return;
+		}
+		TArray<FCanvasUVTri> Tris;
+		AddQuad(Tris, X0, Y0, X1, Y1, Color, Thickness);
+		Flush(TraceCanvasText::GameCanvas(), Tris);
 	}
 }
 
@@ -881,7 +905,7 @@ namespace TraceHUDPullRing
 		{
 			const FVector2D A = PointAt(static_cast<float>(Index) / Segments);
 			const FVector2D B = PointAt(static_cast<float>(Index + 1) / Segments);
-			HUD->DrawLine(A.X, A.Y, B.X, B.Y, Track, Thickness * 0.7f);
+			TraceHUDStroke::LineThroughFade(HUD, A.X, A.Y, B.X, B.Y, Track, Thickness * 0.7f);
 		}
 
 		const float Filled = FMath::Clamp(Progress, 0.f, 1.f);
@@ -900,7 +924,7 @@ namespace TraceHUDPullRing
 		{
 			const FVector2D A = PointAt(static_cast<float>(Index) / Segments);
 			const FVector2D B = PointAt(FMath::Min(Filled, static_cast<float>(Index + 1) / Segments));
-			HUD->DrawLine(A.X, A.Y, B.X, B.Y, FillColor, Thickness);
+			TraceHUDStroke::LineThroughFade(HUD, A.X, A.Y, B.X, B.Y, FillColor, Thickness);
 		}
 
 		// ---- The prompt, while the ring is empty ----------------------------------------------------
@@ -1239,7 +1263,10 @@ void ATraceHUD::DrawHUD()
 
 	// Once the whistle has gone the live chrome is noise: a crosshair you cannot shoot with, a
 	// clock that has stopped, a Core banner nobody can act on. DrawMatchResult takes the screen.
-	const bool bPostMatch = (TraceGS != nullptr) && (TraceGS->TraceMatchState == ETraceMatchState::PostMatch);
+	//
+	// P10: it takes it with a FADE (ResultFade), and the chrome fades out under it (ChromeOpacity)
+	// instead of vanishing on the whistle's frame.
+	// (bPostMatch used to be a local here; ResultFade now carries it — see UpdateOverlayFades.)
 
 	// *** NOTHING OF THE MATCH DRAWS UNDER A SCREEN THAT OWNS THE VIEW. ***
 	//
@@ -1248,16 +1275,34 @@ void ATraceHUD::DrawHUD()
 	// loadout page's scrim, and photographed as ghost text ("00:18", "CORE OUT OF PLAY") cutting
 	// through BUILD YOUR LOADOUT. The page has its own countdown now (TIME, top right), so the match
 	// clock is not needed there either.
-	const bool bOverlayUp = IsFullScreenOverlayUp();
+	//
+	// P10 — AND IT GOES AWAY WITH THE FADE, NOT BEFORE IT. The gate used to be the overlay's open flag,
+	// so the whole HUD vanished on the frame an overlay opened — before the overlay had faded in over
+	// it — and reappeared on the frame it closed. Now the match layer draws at 1 - (the overlay's
+	// opacity): a crossfade, reaching nothing at all exactly when the overlay is fully up.
+	// IsFullScreenOverlayUp keeps meaning "an overlay is open" for everything else (input, records).
+	UpdateOverlayFades();
+	const bool bChrome = ChromeOpacity > 0.f;
 
 #if !UE_BUILD_SHIPPING
 	HudKitRecord = FHudKitRecord();
-	HudKitRecord.bOverlayUp = bOverlayUp;
+	HudKitRecord.bOverlayUp = IsFullScreenOverlayUp();
 	HudKitRecord.ViewSize = FVector2D(ViewW, ViewH);
+	HudKitRecord.MatchLayerOpacity = MatchLayerOpacity;
+	HudKitRecord.ChromeOpacity = ChromeOpacity;
+	HudKitRecord.PageBackdropAlpha = PageBackdropFade.Alpha();
+	HudKitRecord.PauseAlpha = PauseMenu.GetFadeAlpha();
+	HudKitRecord.ResultAlpha = ResultFade.Alpha();
+	HudKitRecord.DrawRealSeconds = TraceMenuKit::RealSeconds();
+	HudKitRecord.PauseLinear = PauseMenu.GetFadeLinear();
+	HudKitRecord.PageBackdropLinear = PageBackdropFade.Linear();
 #endif
 
-	if (!bPostMatch && !bOverlayUp)
+	// The live-play chrome, at ChromeOpacity (the match layer's fade, times the results screen's).
+	if (bChrome)
 	{
+		TraceMenuKit::FScopedOpacity ChromeFade(ChromeOpacity);
+
 		// UNDER EVERYTHING ELSE, and that ordering is the whole reason it is safe to draw over the
 		// play area at all: Canvas is immediate mode, so the band goes down before the crosshair,
 		// the reticle and every panel, and none of them is tinted by it. FX plan §2.5/§2.6.
@@ -1292,18 +1337,13 @@ void ATraceHUD::DrawHUD()
 
 		// Health, dash charges and the ability rows.
 		DrawHealthAndDash();
-	}
 
-	// Spec v16 §2 — the bottom-right corner. OUTSIDE the overlay gate and inside the post-match one:
-	// it hides itself under an overlay (both presenters), and it must RUN to do that — a UMG corner
-	// keeps painting until it is told not to. See DrawAmmoAndStatuses.
-	if (!bPostMatch)
-	{
+		// Spec v16 §2 — the bottom-right corner. Drawn while any of the chrome is; when none is, it is
+		// not called, and the tail of DrawHUD hides a UMG corner that nothing addressed
+		// (bCornerAddressedThisDraw). While the chrome is fading, the UMG corner fades with it
+		// (PresentCornerUmg sets its render opacity).
 		DrawAmmoAndStatuses();
-	}
 
-	if (!bPostMatch && !bOverlayUp)
-	{
 		DrawScoresAndClock();
 		DrawCoreBanner();
 		DrawPhaseBanner();
@@ -1313,26 +1353,43 @@ void ATraceHUD::DrawHUD()
 		DrawScoreboard();
 	}
 
+	// At its own fade. NOT under the match layer's: the pause menu opened at full time has always sat
+	// over the results, not replaced them.
 	DrawMatchResult();
 
 	// Outside the bPostMatch gate on purpose: a broken install is broken on the result screen too,
 	// and this is the one message that must not be possible to wait out.
 	DrawArtWarning();
 
-	// Same reasoning: who is hosting, and whether the connection just broke, are true in every phase
-	// of the match including the full-time screen.
-	//
-	// KillFeedTopY is reset here and republished by DrawNetworkStatus below, so the feed hangs off
-	// whatever height that panel actually took this frame rather than off a guessed clearance. Both
-	// passes RUN under an overlay (the connection log and the feed's easing keep their state) and
-	// draw nothing there.
-	KillFeedTopY = TraceHUDStyle::TopPanelY * UIScale;
-	DrawNetworkStatus();
-	DrawNetworkFailureBanner();
+	// The feed and the network chips are match layer (not chrome): they stay on the full-time screen,
+	// and fade with an overlay.
+	{
+		TraceMenuKit::FScopedOpacity LayerFade(MatchLayerOpacity);
 
-	// After the network panel, and outside the bPostMatch gate: the last few kills are still worth
-	// reading on the full-time screen, and they are the only record of how a half ended.
-	DrawKillFeed();
+		// Same reasoning: who is hosting, and whether the connection just broke, are true in every phase
+		// of the match including the full-time screen.
+		//
+		// KillFeedTopY is reset here and republished by DrawNetworkStatus below, so the feed hangs off
+		// whatever height that panel actually took this frame rather than off a guessed clearance. Both
+		// passes RUN under an overlay (the connection log and the feed's easing keep their state) and
+		// draw nothing there.
+		KillFeedTopY = TraceHUDStyle::TopPanelY * UIScale;
+		DrawNetworkStatus();
+		DrawNetworkFailureBanner();
+
+		// After the network panel, and outside the bPostMatch gate: the last few kills are still worth
+		// reading on the full-time screen, and they are the only record of how a half ended.
+		DrawKillFeed();
+	}
+
+	// ---- P10 — THE PAGES' SHARED BLACK, under whichever page is up or fading -----------------------
+	//
+	// See PageBackdropFade. Solid through the team -> loadout page turn; faded only where the pages
+	// meet the match. The pages draw their own black too, at their own fade, which is harmless on top.
+	if (PageBackdropFade.IsVisible())
+	{
+		TraceMenuKit::DrawScrim(this, ViewW, ViewH, PageBackdropFade.Alpha());
+	}
 
 	// Spec v14 §3 — the character select screen, over the match and under the pause menu.
 	//
@@ -1356,7 +1413,15 @@ void ATraceHUD::DrawHUD()
 		/*bInputAllowed=*/!PauseMenu.IsOpen() && !CharacterSelect.IsTeamSelectOpen()
 			&& TraceLoadoutSelect::IsArmed());
 
-	// Last, over everything including the full-time takeover. A no-op while closed.
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.TeamSelectAlpha = CharacterSelect.GetTeamSelectFadeAlpha();
+	HudKitRecord.LoadoutAlpha = LoadoutSelect.GetFadeAlpha();
+	HudKitRecord.bTeamSelectOpen = CharacterSelect.IsTeamSelectOpen();
+	HudKitRecord.bLoadoutOpen = LoadoutSelect.IsOpen();
+	HudKitRecord.bPauseOpen = PauseMenu.IsOpen();
+#endif
+
+	// Last, over everything including the full-time takeover. Draws nothing once closed AND faded out.
 	PauseMenu.Tick(this, TracePC.Get(), ViewW, ViewH, UIScale, Now);
 
 	// SPEC v17 §4 (step 4b). The Canvas corner simply is not drawn on a frame where its pass does not
@@ -1888,13 +1953,13 @@ void ATraceHUD::DrawAimReticle(float CX, float CY, float Visibility, float Scale
 		for (int32 Index = 0; Index < NumBars; ++Index)
 		{
 			const FTraceCrosshairBar& B = Bars[Index];
-			DrawRect(Shadow, B.X - 1.f, B.Y - 1.f, B.W + 2.f, B.H + 2.f);
+			DrawHudRect(Shadow, B.X - 1.f, B.Y - 1.f, B.W + 2.f, B.H + 2.f);
 		}
 	}
 	for (int32 Index = 0; Index < NumBars; ++Index)
 	{
 		const FTraceCrosshairBar& B = Bars[Index];
-		DrawRect(Ink, B.X, B.Y, B.W, B.H);
+		DrawHudRect(Ink, B.X, B.Y, B.W, B.H);
 	}
 }
 
@@ -1980,11 +2045,11 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 
 	for (const float* B : Bars)
 	{
-		DrawRect(Shadow, B[0] - 1.f, B[1] - 1.f, B[2] + 2.f, B[3] + 2.f);
+		DrawHudRect(Shadow, B[0] - 1.f, B[1] - 1.f, B[2] + 2.f, B[3] + 2.f);
 	}
 	for (const float* B : Bars)
 	{
-		DrawRect(Ink, B[0], B[1], B[2], B[3]);
+		DrawHudRect(Ink, B[0], B[1], B[2], B[3]);
 	}
 
 	// ---- The pass-point marker -------------------------------------------------------------------
@@ -2013,12 +2078,12 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 		for (float Row = -D; Row <= D; Row += 1.f)
 		{
 			const float HalfWidth = D - FMath::Abs(Row);
-			DrawRect(Shadow, MX - HalfWidth - 1.f, MY + Row, (HalfWidth * 2.f) + 3.f, 1.f);
+			DrawHudRect(Shadow, MX - HalfWidth - 1.f, MY + Row, (HalfWidth * 2.f) + 3.f, 1.f);
 		}
 		for (float Row = -D; Row <= D; Row += 1.f)
 		{
 			const float HalfWidth = D - FMath::Abs(Row);
-			DrawRect(Ink, MX - HalfWidth, MY + Row, (HalfWidth * 2.f) + 1.f, 1.f);
+			DrawHudRect(Ink, MX - HalfWidth, MY + Row, (HalfWidth * 2.f) + 1.f, 1.f);
 		}
 	}
 
@@ -2375,7 +2440,7 @@ namespace TraceHUDThrowRings
 		{
 			const FVector2D A = PointAt(static_cast<float>(Index) / Segments);
 			const FVector2D B = PointAt(static_cast<float>(Index + 1) / Segments);
-			HUD->DrawLine(A.X, A.Y, B.X, B.Y, Track, Thickness * 0.7f);
+			TraceHUDStroke::LineThroughFade(HUD, A.X, A.Y, B.X, B.Y, Track, Thickness * 0.7f);
 		}
 
 		// The fill PULSES IN BRIGHTNESS, at the same 12 rad/s every "act now" state on this HUD uses,
@@ -2396,7 +2461,7 @@ namespace TraceHUDThrowRings
 		{
 			const FVector2D A = PointAt(static_cast<float>(Index) / Segments);
 			const FVector2D B = PointAt(FMath::Min(Alpha, static_cast<float>(Index + 1) / Segments));
-			HUD->DrawLine(A.X, A.Y, B.X, B.Y, Fill, Thickness);
+			TraceHUDStroke::LineThroughFade(HUD, A.X, A.Y, B.X, B.Y, Fill, Thickness);
 		}
 
 		// THE CHORDS, not the alpha. A ring that computed a healthy 0.62 and emitted nothing would
@@ -2467,7 +2532,7 @@ void ATraceHUD::DrawCrosshairRing(float FillAlpha, const FLinearColor& FillColor
 	{
 		const FVector2D A = PointAt(static_cast<float>(Index) / Segments);
 		const FVector2D B = PointAt(static_cast<float>(Index + 1) / Segments);
-		DrawLine(A.X, A.Y, B.X, B.Y, Track, Thickness * 0.7f);
+		DrawHudLine(A.X, A.Y, B.X, B.Y, Track, Thickness * 0.7f);
 	}
 
 	const int32 Filled = FMath::CeilToInt(ClampedAlpha * Segments);
@@ -2475,7 +2540,7 @@ void ATraceHUD::DrawCrosshairRing(float FillAlpha, const FLinearColor& FillColor
 	{
 		const FVector2D A = PointAt(static_cast<float>(Index) / Segments);
 		const FVector2D B = PointAt(FMath::Min(ClampedAlpha, static_cast<float>(Index + 1) / Segments));
-		DrawLine(A.X, A.Y, B.X, B.Y, FillColor, Thickness);
+		DrawHudLine(A.X, A.Y, B.X, B.Y, FillColor, Thickness);
 	}
 
 #if !UE_BUILD_SHIPPING
@@ -3097,7 +3162,7 @@ void ATraceHUD::DrawHealthAndDash()
 
 		// THE FLOOR TICK: an instant click is 15% power, not zero, and the bar says so once.
 		const float FloorFraction = FMath::Clamp(ATraceCore::GetThrowChargeScaleForHold(0.f), 0.f, 1.f);
-		DrawRect(TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.55f),
+		DrawHudRect(TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.55f),
 			MeterX + (MeterW * FloorFraction), RowY, FMath::Max(1.f, 1.f * UIScale), RowH);
 
 		DrawStackCaption(bFull ? FString(TEXT("FULL")) : FString::Printf(TEXT("%.0f%%"), 100.f * FMath::Max(0.f, Power)),
@@ -3140,10 +3205,10 @@ void ATraceHUD::DrawHealthAndDash()
 			const float FrameY = HealthY - Reach;
 			const float FrameW = BarW + Reach * 2.f;
 			const float FrameH = HealthH + Reach * 2.f;
-			DrawRect(TraceHUDStyle::ShieldWhite, FrameX, FrameY, FrameW, Thick);
-			DrawRect(TraceHUDStyle::ShieldWhite, FrameX, FrameY + FrameH - Thick, FrameW, Thick);
-			DrawRect(TraceHUDStyle::ShieldWhite, FrameX, FrameY + Thick, Thick, FrameH - Thick * 2.f);
-			DrawRect(TraceHUDStyle::ShieldWhite, FrameX + FrameW - Thick, FrameY + Thick, Thick, FrameH - Thick * 2.f);
+			DrawHudRect(TraceHUDStyle::ShieldWhite, FrameX, FrameY, FrameW, Thick);
+			DrawHudRect(TraceHUDStyle::ShieldWhite, FrameX, FrameY + FrameH - Thick, FrameW, Thick);
+			DrawHudRect(TraceHUDStyle::ShieldWhite, FrameX, FrameY + Thick, Thick, FrameH - Thick * 2.f);
+			DrawHudRect(TraceHUDStyle::ShieldWhite, FrameX + FrameW - Thick, FrameY + Thick, Thick, FrameH - Thick * 2.f);
 		}
 	}
 }
@@ -3501,11 +3566,11 @@ void ATraceHUD::DrawHealthBar(const UTraceHealthComponent* HealthComp, float X, 
 	const float FuseFraction = bRegenerating ? 1.f : FMath::Clamp(1.f - (SecondsUntil / Delay), 0.f, 1.f);
 
 	const float FuseEdge = FMath::Max(1.f, 1.f * UIScale);
-	DrawRect(TraceHUDStyle::Shadow, X - FuseEdge, FuseY - FuseEdge, W + FuseEdge * 2.f, FuseH + FuseEdge * 2.f);
-	DrawRect(TraceHUDStyle::Trough, X, FuseY, W, FuseH);
+	DrawHudRect(TraceHUDStyle::Shadow, X - FuseEdge, FuseY - FuseEdge, W + FuseEdge * 2.f, FuseH + FuseEdge * 2.f);
+	DrawHudRect(TraceHUDStyle::Trough, X, FuseY, W, FuseH);
 	if (FuseFraction > 0.f)
 	{
-		DrawRect(TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, bRegenerating ? (0.6f + 0.4f * Pulse) : 0.85f),
+		DrawHudRect(TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, bRegenerating ? (0.6f + 0.4f * Pulse) : 0.85f),
 			X, FuseY, W * FuseFraction, FuseH);
 	}
 
@@ -3522,10 +3587,10 @@ void ATraceHUD::DrawHealthBar(const UTraceHealthComponent* HealthComp, float X, 
 
 		const float CrestW = FMath::Min(FMath::Max(4.f, 7.f * UIScale), FMath::Max(0.f, W - FillW) + (7.f * UIScale));
 		const float CrestX = FMath::Clamp(X + FillW - (CrestW * 0.5f), X, X + W - CrestW);
-		DrawRect(TraceHUDStyle::WithAlpha(Crest, 0.45f + 0.5f * Pulse), CrestX, Y, CrestW, H);
+		DrawHudRect(TraceHUDStyle::WithAlpha(Crest, 0.45f + 0.5f * Pulse), CrestX, Y, CrestW, H);
 
 		const float RailH = FMath::Max(1.f, 2.f * UIScale);
-		DrawRect(TraceHUDStyle::WithAlpha(Crest, 0.25f + 0.35f * Pulse), X, Y, FillW, RailH);
+		DrawHudRect(TraceHUDStyle::WithAlpha(Crest, 0.25f + 0.35f * Pulse), X, Y, FillW, RailH);
 	}
 
 	// ---- The words, to the right of the bar, where every other row in this stack puts its status --
@@ -3724,10 +3789,10 @@ void ATraceHUD::DrawScreenEdgeVignette(const FLinearColor& Hue, float PeakAlpha)
 		const float SideY = Inset + Thick;
 		const float SideH = FMath::Max(0.f, ViewH - (Inset * 2.f) - (Thick * 2.f));
 
-		DrawRect(StepColor, Inset, Inset, ViewW - Inset * 2.f, Thick);
-		DrawRect(StepColor, Inset, ViewH - Inset - Thick, ViewW - Inset * 2.f, Thick);
-		DrawRect(StepColor, Inset, SideY, Thick, SideH);
-		DrawRect(StepColor, ViewW - Inset - Thick, SideY, Thick, SideH);
+		DrawHudRect(StepColor, Inset, Inset, ViewW - Inset * 2.f, Thick);
+		DrawHudRect(StepColor, Inset, ViewH - Inset - Thick, ViewW - Inset * 2.f, Thick);
+		DrawHudRect(StepColor, Inset, SideY, Thick, SideH);
+		DrawHudRect(StepColor, ViewW - Inset - Thick, SideY, Thick, SideH);
 	}
 }
 
@@ -3820,8 +3885,12 @@ void ATraceHUD::DrawAmmoAndStatuses()
 	// reads. Inferring one screen's state from another's is how the corner meters ended up drawn over
 	// a full-screen menu: the inference was right in principle and the photograph disagreed, and a
 	// page that owns the screen should say so itself rather than be deduced from its neighbour.
-	const bool bOverlayOwnsScreen =
-		PauseMenu.IsOpen() || CharacterSelect.IsOpen() || LoadoutSelect.IsOpen();
+	//
+	// P10: "owns the screen" is now "has faded the chrome out completely". DrawHUD only calls this pass
+	// while ChromeOpacity > 0, and while an overlay is fading in or out over it the corner fades with the
+	// rest of the chrome (the Canvas corner through the draw scope, the UMG corner through its render
+	// opacity) instead of vanishing on the overlay's first frame.
+	const bool bOverlayOwnsScreen = ChromeOpacity <= 0.f;
 
 	if (PresentCornerUmg(bCornerLive && !bOverlayOwnsScreen, CornerState))
 	{
@@ -4439,9 +4508,11 @@ float ATraceHUD::DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX
 	DrawTextRight(CapacityText, TraceHUDStyle::InkDim, RightX,
 		CountTop + FMath::Max(0.f, CountH - CapacityH) - (2.f * UIScale), FontSmall, UIScale);
 
+	// The count is right-aligned against the capacity and ticks on every shot: tabular figures, so it
+	// stays put instead of its left edge jumping between "11" and "10" (P10).
 	const float CapacityW = MeasureWidth(CapacityText, FontSmall, UIScale);
 	DrawTextRight(CountText, CountColor, RightX - CapacityW - (4.f * UIScale),
-		CountTop, FontLarge, UIScale * CountScale);
+		CountTop, FontLarge, UIScale * CountScale, /*bTabular=*/true);
 
 	// ---- The magazine strip -----------------------------------------------------------------------
 	//
@@ -4449,19 +4520,19 @@ float ATraceHUD::DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX
 	// fat pips is a visibly different object from thirty thin ones, before any colour or word is
 	// read. Mid-reload the strip becomes a single filling bar instead — a third shape, so "the gun is
 	// coming back" never has to be inferred from a number that is briefly meaningless.
-	DrawRect(TraceHUDStyle::Trough, RightX - BlockW, StripTop, BlockW, StripH);
+	DrawHudRect(TraceHUDStyle::Trough, RightX - BlockW, StripTop, BlockW, StripH);
 
 	int32 LitTicks = 0;
 	if (bReloading)
 	{
-		DrawRect(InState.ReloadBarColor, RightX - BlockW, StripTop,
+		DrawHudRect(InState.ReloadBarColor, RightX - BlockW, StripTop,
 			BlockW * FMath::Clamp(InState.ReloadFraction, 0.f, 1.f), StripH);
 	}
 	else if (InState.DeployFraction >= 0.f)
 	{
 		// THE PULLOUT: the gun is coming out and cannot fire yet, so the strip is a dim bar filling
 		// toward the clip — a fourth shape, where the WEAPON row's meter used to say it.
-		DrawRect(TraceHUDStyle::WithAlpha(RoundsColor, 0.45f), RightX - BlockW, StripTop,
+		DrawHudRect(TraceHUDStyle::WithAlpha(RoundsColor, 0.45f), RightX - BlockW, StripTop,
 			BlockW * FMath::Clamp(InState.DeployFraction, 0.f, 1.f), StripH);
 	}
 	else
@@ -4478,7 +4549,7 @@ float ATraceHUD::DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX
 		for (int32 Index = 0; Index < ClipCapacity; ++Index)
 		{
 			const bool bLit = (Index < InClip);
-			DrawRect(bLit ? RoundsColor : TraceHUDStyle::WithAlpha(RoundsColor, 0.14f),
+			DrawHudRect(bLit ? RoundsColor : TraceHUDStyle::WithAlpha(RoundsColor, 0.14f),
 				StripLeft + (Index * StrideW), StripTop, TickW, StripH);
 			LitTicks += bLit ? 1 : 0;
 		}
@@ -4528,8 +4599,8 @@ float ATraceHUD::DrawKnifeBlock(const FTraceHudCornerState& InState, float Right
 
 	const float Fraction = FMath::Clamp(InState.KnifeFraction, 0.f, 1.f);
 	const bool bReady = Fraction >= 1.f;
-	DrawRect(TraceHUDStyle::Trough, RightX - BlockW, StripTop, BlockW, StripH);
-	DrawRect(bReady ? TraceHUDStatusStyle::NormalRounds : TraceHUDStyle::WithAlpha(TraceHUDStatusStyle::NormalRounds, 0.45f),
+	DrawHudRect(TraceHUDStyle::Trough, RightX - BlockW, StripTop, BlockW, StripH);
+	DrawHudRect(bReady ? TraceHUDStatusStyle::NormalRounds : TraceHUDStyle::WithAlpha(TraceHUDStatusStyle::NormalRounds, 0.45f),
 		RightX - BlockW, StripTop, BlockW * Fraction, StripH);
 
 	DrawTextLeft(InState.KnifeLabel, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
@@ -4563,7 +4634,7 @@ float ATraceHUD::DrawStatusChip(float RightX, float BottomY, float ChipW, const 
 	const float PipW = FMath::Max(2.f, FMath::RoundToFloat(3.f * UIScale));
 	const float PipH = FMath::RoundToFloat((ChipH - DrainH) * 0.5f);
 	const float PipX = ChipLeft + Corner;
-	DrawRect(Tint, PipX, ChipTop + ((ChipH - DrainH) - PipH) * 0.5f, PipW, PipH);
+	DrawHudRect(Tint, PipX, ChipTop + ((ChipH - DrainH) - PipH) * 0.5f, PipW, PipH);
 
 	// The label SHRINKS to fit beside its readout rather than running into it: "SLOWED  -35% SPEED"
 	// and a seconds readout share 260 px, and the words are the document's to lengthen.
@@ -4589,8 +4660,8 @@ float ATraceHUD::DrawStatusChip(float RightX, float BottomY, float ChipW, const 
 	const float DrainLeft = ChipLeft + Corner;
 	const float DrainSpan = FMath::Max(0.f, ChipW - Corner * 2.f);
 	const float DrainTop = ChipTop + ChipH - DrainH - FMath::Max(1.f, FMath::RoundToFloat(2.f * UIScale));
-	DrawRect(TraceHUDStyle::Trough, DrainLeft, DrainTop, DrainSpan, DrainH);
-	DrawRect(Tint, DrainLeft, DrainTop, DrainSpan * FMath::Clamp(Fraction, 0.f, 1.f), DrainH);
+	DrawHudRect(TraceHUDStyle::Trough, DrainLeft, DrainTop, DrainSpan, DrainH);
+	DrawHudRect(Tint, DrainLeft, DrainTop, DrainSpan * FMath::Clamp(Fraction, 0.f, 1.f), DrainH);
 
 #if !UE_BUILD_SHIPPING
 	// The chip records the LABEL AND THE FRACTION IT ACTUALLY DREW, not the state it was handed —
@@ -4842,6 +4913,14 @@ bool ATraceHUD::PresentCornerUmg(bool bInLive, const FTraceHudCornerState& InSta
 	const float CornerDesignScale = UIScale / ViewportDpiScale;
 	const FTraceHudCornerPresented Presented = CornerWidget->PresentCorner(InState, CornerDesignScale);
 
+	// P10 — the corner fades with the chrome. Slate paints it OVER the Canvas, so without this it sat
+	// at full strength on top of an overlay fading in, then vanished. Touched only when it changes.
+	if (!FMath::IsNearlyEqual(CornerWidgetOpacity, ChromeOpacity, 1e-3f))
+	{
+		CornerWidgetOpacity = ChromeOpacity;
+		CornerWidget->SetRenderOpacity(ChromeOpacity);
+	}
+
 	// One line, once, naming the three numbers that decide whether the two corners come out the same
 	// SIZE. Printed rather than assumed because getting it wrong is invisible in a log and obvious
 	// only in a photograph — which is exactly how the first armed capture of this corner came out
@@ -5012,7 +5091,7 @@ void ATraceHUD::DrawScoresAndClock()
 	// needs it — "HALF ENDS AT NEXT TURNOVER" with the hard-cap seconds in the gutter must never
 	// collide. OPAQUE, for the measured reason written beside TraceHUDStyle::PanelAlpha.
 	const float FooterW = MeasureWidth(FooterText, FontSmall, UIScale);
-	const float CapW = CapText.IsEmpty() ? 0.f : MeasureWidth(CapText, FontSmall, UIScale);
+	const float CapW = CapText.IsEmpty() ? 0.f : MeasureWidth(CapText, FontSmall, UIScale, /*bTabular=*/true);
 	const float GutterPad = 16.f * UIScale;
 	const float PanelW = FMath::Max(TraceHUDStyle::TopPanelW * UIScale,
 		FooterW + 2.f * (CapW + GutterPad * 2.f));
@@ -5025,12 +5104,15 @@ void ATraceHUD::DrawScoresAndClock()
 
 	// Blue always sits left, Orange always right, on every client — a fixed layout is far easier
 	// to read at a glance than a "your team first" one.
+	//
+	// TABULAR FIGURES on the scores and the clock (P10): the clock is centred and ticks every second,
+	// and with proportional digits it slid sideways on every tick ("1:11" is narrower than "0:00").
 	DrawTextRight(FString::FromInt(BlueScore), TraceTeamColor(ETraceTeam::Blue),
-		CX - ScoreInset, ScoreY, FontLarge, ScoreScale);
+		CX - ScoreInset, ScoreY, FontLarge, ScoreScale, /*bTabular=*/true);
 	DrawTextLeft(FString::FromInt(OrangeScore), TraceTeamColor(ETraceTeam::Orange),
-		CX + ScoreInset, ScoreY, FontLarge, ScoreScale);
+		CX + ScoreInset, ScoreY, FontLarge, ScoreScale, /*bTabular=*/true);
 
-	DrawTextCentered(ClockText, ClockColor, CX, ScoreY + (6.f * UIScale), FontLarge, ClockScale);
+	DrawTextCentered(ClockText, ClockColor, CX, ScoreY + (6.f * UIScale), FontLarge, ClockScale, /*bTabular=*/true);
 
 	const float FooterY = PanelY + PanelH - (22.f * UIScale);
 
@@ -5044,7 +5126,8 @@ void ATraceHUD::DrawScoresAndClock()
 
 	if (!CapText.IsEmpty())
 	{
-		DrawTextRight(CapText, TraceHUDStyle::InkDim, PanelX + PanelW - GutterPad, FooterY, FontSmall, UIScale);
+		DrawTextRight(CapText, TraceHUDStyle::InkDim, PanelX + PanelW - GutterPad, FooterY, FontSmall, UIScale,
+			/*bTabular=*/true);
 	}
 
 	// ---- Mercy-rule warning ---------------------------------------------------------------------
@@ -5351,15 +5434,19 @@ void ATraceHUD::DrawNetworkStatus()
 	// THE PANEL FADES rather than vanishing (NetPanelFadeSeconds), and the kill feed hanging under it
 	// eases after it (DrawKillFeed), so its going no longer yanks the whole feed up in one frame.
 	const bool bWarningState = (ConnectionRole == TraceNet::ERole::Offline);
-	const bool bWantPanel = !IsFullScreenOverlayUp()
+	//
+	// P10: "under an overlay" is the match layer having faded out (MatchLayerOpacity), and while it fades
+	// the chip fades with it through the draw scope DrawHUD holds around this pass.
+	const bool bLayerGone = MatchLayerOpacity <= 0.f;
+	const bool bWantPanel = !bLayerGone
 		&& (bWarningState || IsScoreboardHeld() || (Now - LastRoleChangeTime) <= TraceHUDStyle::NetRevealSeconds);
 	{
 		const float FadeDelta = (GetWorld() != nullptr) ? FMath::Clamp(GetWorld()->GetDeltaSeconds(), 0.f, 0.1f) : 0.f;
 		const float Step = FadeDelta / FMath::Max(0.01f, TraceHUDStyle::NetPanelFadeSeconds);
 		NetPanelAlpha = bWantPanel ? FMath::Min(1.f, NetPanelAlpha + Step) : FMath::Max(0.f, NetPanelAlpha - Step);
-		if (IsFullScreenOverlayUp())
+		if (bLayerGone)
 		{
-			NetPanelAlpha = 0.f;   // not a fade: the overlay owns the view on this very frame
+			NetPanelAlpha = 0.f;   // the overlay has faded fully in over the match
 		}
 	}
 	if (NetPanelAlpha <= 0.f)
@@ -5428,8 +5515,9 @@ void ATraceHUD::DrawNetworkFailureBanner()
 		return;
 	}
 
-	// Nothing of the match draws under a screen that owns the view (IsFullScreenOverlayUp).
-	if (IsFullScreenOverlayUp())
+	// Nothing of the match draws under a screen that owns the view — once it has faded fully in (P10;
+	// until then this fades with the match layer).
+	if (MatchLayerOpacity <= 0.f)
 	{
 		return;
 	}
@@ -5847,7 +5935,7 @@ void ATraceHUD::DrawKillIcon(ETraceKillIcon Icon, float X, float Y, float Cell, 
 		TraceHUDStroke::Flush(Canvas, GlyphTris);
 		for (const TraceKillFeedArt::FGlyphDot& Dot : Dots)
 		{
-			DrawRect(PassColor,
+			DrawHudRect(PassColor,
 				X + Dot.X * Scale - Grow, Y + Dot.Y * Scale - Grow,
 				Dot.W * Scale + Grow * 2.f, Dot.H * Scale + Grow * 2.f);
 		}
@@ -5892,8 +5980,9 @@ void ATraceHUD::DrawKillFeed()
 			: FMath::FInterpTo(DrawnKillFeedTopY, KillFeedTopY, EaseDelta, TraceHUDStyle::KillFeedAnchorEase);
 	}
 
-	// Nothing of the match draws under a screen that owns the view (IsFullScreenOverlayUp).
-	if (IsFullScreenOverlayUp())
+	// Nothing of the match draws under a screen that owns the view — once it has faded fully in (P10;
+	// until then the feed fades with the match layer).
+	if (MatchLayerOpacity <= 0.f)
 	{
 		return;
 	}
@@ -6104,21 +6193,33 @@ void ATraceHUD::DrawPhaseBanner()
 	//
 	// The side switch has ALREADY happened by the time this shows: the break is spent looking at the
 	// end you are about to attack, so telling the player it happened is the whole point of the card.
-	if (TraceGS->IsHalfTimeBreak())
+	// THE GOAL FIRST, THEN THE CARD. A goal scored while the half was pending ends the half in the
+	// same server call, and this card (0.30 H) and the 2.4 s score flash's band (0.33-0.42 H) drew
+	// two headline stacks on top of each other. The break is tens of seconds long; the card can
+	// wait for the flash.
+	const bool bBreak = TraceGS->IsHalfTimeBreak();
+	const bool bCardWanted = bBreak
+		&& !(ScoreFlashTeam != ETraceTeam::None
+			&& TraceHUDKickoff::HalfTimeCardYieldsTo(Now - ScoreFlashTime, TraceHUDStyle::ScoreFlashDuration));
+
+	// P10: the card fades in when it is due and out when the break ends (real time), drawn on the way
+	// out with the line it last showed rather than a live "RESUMING IN 0".
+	const float CardAlpha = HalfTimeFade.Update(bCardWanted);
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.HalfTimeAlpha = CardAlpha;
+#endif
+	if (CardAlpha > 0.f)
 	{
-		// THE GOAL FIRST, THEN THE CARD. A goal scored while the half was pending ends the half in the
-		// same server call, and this card (0.30 H) and the 2.4 s score flash's band (0.33-0.42 H) drew
-		// two headline stacks on top of each other. The break is tens of seconds long; the card can
-		// wait for the flash.
-		if (ScoreFlashTeam != ETraceTeam::None
-			&& TraceHUDKickoff::HalfTimeCardYieldsTo(Now - ScoreFlashTime, TraceHUDStyle::ScoreFlashDuration))
+		if (bCardWanted)
 		{
-			return;
+			HalfTimeSubline = TRACE_TEXTF("HUD.BANNER_SIDES_SWITCHED", "SIDES SWITCHED  -  RESUMING IN {0}",
+				{ FString::Printf(TEXT("%.0f"), TraceGS->GetMatchTimeRemaining()) });
+#if !UE_BUILD_SHIPPING
+			HudKitRecord.bHalfTimeCard = true;
+#endif
 		}
 
-#if !UE_BUILD_SHIPPING
-		HudKitRecord.bHalfTimeCard = true;
-#endif
+		TraceMenuKit::FScopedOpacity CardFade(CardAlpha);
 
 		// The subtitle is placed off the MEASURED height of the headline, not off a hand-picked
 		// constant. A 3.0-scaled FontLarge is ~64px tall at UIScale 1, so the previous fixed 46px
@@ -6127,13 +6228,14 @@ void ATraceHUD::DrawPhaseBanner()
 		const float HalfTimeScale = 3.0f * UIScale;
 		DrawTextCentered(TRACE_TEXT("HUD.BANNER_HALF_TIME", "HALF TIME"), TraceHUDStyle::Ink,
 			CX, BannerY, FontLarge, HalfTimeScale);
-		DrawTextCentered(
-			TRACE_TEXTF("HUD.BANNER_SIDES_SWITCHED", "SIDES SWITCHED  -  RESUMING IN {0}",
-				{ FString::Printf(TEXT("%.0f"), TraceGS->GetMatchTimeRemaining()) }),
-			TraceHUDStyle::InkDim, CX,
+		DrawTextCentered(HalfTimeSubline, TraceHUDStyle::InkDim, CX,
 			BannerY + MeasureHeight(TRACE_TEXT("HUD.BANNER_HALF_TIME", "HALF TIME"), FontLarge, HalfTimeScale)
 				+ (10.f * UIScale),
-			FontSmall, 1.2f * UIScale);
+			FontSmall, 1.2f * UIScale, /*bTabular=*/true);
+	}
+
+	if (bBreak)
+	{
 		return;
 	}
 
@@ -6209,9 +6311,9 @@ void ATraceHUD::DrawScoreFlash()
 	// colour, on a band washed with that same colour, over an arena lit in it — "BLUE SCORES" was the
 	// least legible text on its own band. The wash is gone (the underlay is the kit's black scrim) and
 	// the two team-coloured rules still answer "who scored?" at a glance.
-	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.62f * Alpha), 0.f, BandY, ViewW, BandH);
-	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.85f * Alpha), 0.f, BandY, ViewW, Rule);
-	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.85f * Alpha), 0.f, BandY + BandH, ViewW, Rule);
+	DrawHudRect(FLinearColor(0.f, 0.f, 0.f, 0.62f * Alpha), 0.f, BandY, ViewW, BandH);
+	DrawHudRect(TraceHUDStyle::WithAlpha(TeamColor, 0.85f * Alpha), 0.f, BandY, ViewW, Rule);
+	DrawHudRect(TraceHUDStyle::WithAlpha(TeamColor, 0.85f * Alpha), 0.f, BandY + BandH, ViewW, Rule);
 
 #if !UE_BUILD_SHIPPING
 	HudKitRecord.bScoreFlash = true;
@@ -6292,10 +6394,18 @@ void ATraceHUD::DrawParryKillBanner()
 
 void ATraceHUD::DrawDeathPanel()
 {
-	if (!bLocalDead)
+	// P10: the panel fades in on the death and out on the respawn (real time) instead of popping. On
+	// the way out it still reads true: the killer line is the controller's, and a respawned player's
+	// countdown has run out, so it says RESPAWNING... — which is what just happened.
+	const float PanelAlpha = DeathFade.Update(bLocalDead);
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.DeathAlpha = PanelAlpha;
+#endif
+	if (PanelAlpha <= 0.f)
 	{
 		return;
 	}
+	TraceMenuKit::FScopedOpacity PanelFade(PanelAlpha);
 
 	const float CX = ViewW * 0.5f;
 	const float PadX = 28.f * UIScale;
@@ -6400,7 +6510,8 @@ void ATraceHUD::DrawDeathPanel()
 	const float KillerTextW = KillerLine.IsEmpty() ? 0.f : MeasureWidth(KillerLine, FontMedium, KillerScale);
 	const float KillerW = KillerTextW + (bHaveIcon ? IconGap + IconPx : 0.f);
 	const float ContentW = FMath::Max(FMath::Max(MeasureWidth(HeadText, FontLarge, HeadScale), KillerW),
-		FMath::Max(MeasureWidth(ParryText, FontSmall, ParryScale), MeasureWidth(RespawnText, FontMedium, RespawnScale)));
+		FMath::Max(MeasureWidth(ParryText, FontSmall, ParryScale),
+			MeasureWidth(RespawnText, FontMedium, RespawnScale, /*bTabular=*/true)));
 
 	// ---- THE PLATE: the kit's, OPAQUE, and as big as its lines -----------------------------------
 	//
@@ -6437,10 +6548,12 @@ void ATraceHUD::DrawDeathPanel()
 	}
 
 	LineY += LineGap * 1.5f;
-	DrawTextCentered(RespawnText, TraceHUDStyle::Ink, CX, LineY, FontMedium, RespawnScale);
+	DrawTextCentered(RespawnText, TraceHUDStyle::Ink, CX, LineY, FontMedium, RespawnScale, /*bTabular=*/true);
 
 #if !UE_BUILD_SHIPPING
-	HudKitRecord.bDeathPanel = true;
+	// Recorded while the player is DEAD, not while the panel is fading out after the respawn: the
+	// harnesses read this as "the death panel is up".
+	HudKitRecord.bDeathPanel = bLocalDead;
 	HudKitRecord.DeathKillerLine = KillerLine;
 	HudKitRecord.DeathIcon = bHaveIcon
 		? StaticEnum<ETraceKillIcon>()->GetNameStringByValue(static_cast<int64>(CauseIcon))
@@ -6518,6 +6631,10 @@ void ATraceHUD::DrawMatchResult()
 
 	const int32 Blue = TraceGS->GetScore(ETraceTeam::Blue);
 	const int32 Orange = TraceGS->GetScore(ETraceTeam::Orange);
+
+	// P10: the whole takeover fades in on the whistle (ResultFade, real time) while the live chrome
+	// fades out under it. The music below does not read this; it only dims what is drawn.
+	TraceMenuKit::FScopedOpacity ResultsFade(ResultFade.Alpha());
 
 	// Dim the whole world. Nothing happening out there matters any more. The kit's modal scrim.
 	TraceMenuKit::DrawScrim(this, ViewW, ViewH);
@@ -6863,12 +6980,20 @@ bool ATraceHUD::IsScoreboardHeld() const
 void ATraceHUD::DrawScoreboard()
 {
 	// Hold-Tab only. This used to force itself open at full time as well; DrawMatchResult now owns
-	// that moment with a bigger version of the same rosters, and DrawHUD does not call this pass at
-	// all once the match is over.
-	if (!IsScoreboardHeld())
+	// that moment with a bigger version of the same rosters.
+	//
+	// P10: it fades in on the press and out on the release (real time), instead of blinking. The
+	// board's contents are live either way, so the fade-out simply keeps drawing them.
+	const float BoardAlpha = ScoreboardFade.Update(IsScoreboardHeld());
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.ScoreboardAlpha = BoardAlpha;
+	HudKitRecord.ScoreboardLinear = ScoreboardFade.Linear();
+#endif
+	if (BoardAlpha <= 0.f)
 	{
 		return;
 	}
+	TraceMenuKit::FScopedOpacity BoardFade(BoardAlpha);
 
 	const float PanelW = FMath::Min(ViewW - (80.f * UIScale), 1040.f * UIScale);
 	const float PanelH = FMath::Min(ViewH - (160.f * UIScale), 560.f * UIScale);
@@ -6963,7 +7088,7 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 	const bool bShowCharacters = false;
 
 	// ---- Header -------------------------------------------------------------------------------
-	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.25f), X, Y, Width, HeaderH);
+	DrawHudRect(TraceHUDStyle::WithAlpha(TeamColor, 0.25f), X, Y, Width, HeaderH);
 
 	const FString TeamLabel = TraceTeamName(Team).ToString().ToUpper();
 	DrawTextLeft(TeamLabel, TeamColor, NameX, VCenterTextY(TeamLabel, FontMedium, UIScale, Y, HeaderH), FontMedium, UIScale);
@@ -7000,7 +7125,7 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 		if (bIsLocal)
 		{
 			// Subtle highlight so you can find yourself instantly.
-			DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.14f), X, RowY - (2.f * UIScale), Width, RowH);
+			DrawHudRect(TraceHUDStyle::WithAlpha(TeamColor, 0.14f), X, RowY - (2.f * UIScale), Width, RowH);
 		}
 
 		// Upper case, as the team screen already draws it: an engine-made machine name arrives mixed-case.
@@ -7338,7 +7463,8 @@ namespace TraceHUDType
 	}
 }
 
-void ATraceHUD::DrawTextLeft(const FString& Text, const FLinearColor& Color, float X, float Y, UFont* Font, float Scale)
+void ATraceHUD::DrawTextLeft(const FString& Text, const FLinearColor& Color, float X, float Y, UFont* Font, float Scale,
+	bool bTabular)
 {
 	TraceHUDType::WarnIfUndrawable(Text);
 
@@ -7353,10 +7479,12 @@ void ATraceHUD::DrawTextLeft(const FString& Text, const FLinearColor& Color, flo
 	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale), Color);
 	Style.HAlign = TraceText::EHAlign::Left;
 	Style.Weight = TraceHUDType::HudWeight();   // spec v25 §4 — Erbaum Bold for the in-match HUD
+	Style.bTabularDigits = bTabular;
 	TraceCanvasText::Draw(this, Text, X, Y, Style);
 }
 
-void ATraceHUD::DrawTextCentered(const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale)
+void ATraceHUD::DrawTextCentered(const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale,
+	bool bTabular)
 {
 	// On all three draws rather than only on the name sites: the death panel and the parry banner
 	// interpolate a player name into a sentence, and a check that only guarded the two obvious call
@@ -7366,20 +7494,23 @@ void ATraceHUD::DrawTextCentered(const FString& Text, const FLinearColor& Color,
 	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale), Color);
 	Style.HAlign = TraceText::EHAlign::Center;
 	Style.Weight = TraceHUDType::HudWeight();
+	Style.bTabularDigits = bTabular;
 	TraceCanvasText::Draw(this, Text, CenterX, Y, Style);
 }
 
-void ATraceHUD::DrawTextRight(const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale)
+void ATraceHUD::DrawTextRight(const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale,
+	bool bTabular)
 {
 	TraceHUDType::WarnIfUndrawable(Text);
 
 	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale), Color);
 	Style.HAlign = TraceText::EHAlign::Right;
 	Style.Weight = TraceHUDType::HudWeight();
+	Style.bTabularDigits = bTabular;
 	TraceCanvasText::Draw(this, Text, RightX, Y, Style);
 }
 
-float ATraceHUD::MeasureWidth(const FString& Text, UFont* Font, float Scale)
+float ATraceHUD::MeasureWidth(const FString& Text, UFont* Font, float Scale, bool bTabular)
 {
 	// THE SAME FACE THE THREE DRAWS ABOVE USE, and this line is load-bearing rather than tidy: the
 	// three faces do NOT share advances (Erbaum's alphabet measures 1823 atlas px against Sofachrome
@@ -7388,6 +7519,7 @@ float ATraceHUD::MeasureWidth(const FString& Text, UFont* Font, float Scale)
 	// disagreement is what spec v23 §A4's red arm reproduces, one face-change earlier.
 	TraceText::FStyle Style(TraceHUDType::SizeFor(this, Font, Scale));
 	Style.Weight = TraceHUDType::HudWeight();
+	Style.bTabularDigits = bTabular;
 	return TraceText::MeasureWidth(Text, Style);
 }
 
@@ -7406,20 +7538,41 @@ float ATraceHUD::VCenterTextY(const FString& Text, UFont* Font, float Scale, flo
 
 void ATraceHUD::DrawPanel(float X, float Y, float W, float H, const FLinearColor& Fill, const FLinearColor& Border)
 {
-	DrawRect(Fill, X, Y, W, H);
+	DrawHudRect(Fill, X, Y, W, H);
 
 	// Canvas has no stroked-rect primitive, so the border is four thin fills.
 	const float T = FMath::Max(1.f, 1.5f * UIScale);
-	DrawRect(Border, X, Y, W, T);
-	DrawRect(Border, X, Y + H - T, W, T);
-	DrawRect(Border, X, Y, T, H);
-	DrawRect(Border, X + W - T, Y, T, H);
+	DrawHudRect(Border, X, Y, W, T);
+	DrawHudRect(Border, X, Y + H - T, W, T);
+	DrawHudRect(Border, X, Y, T, H);
+	DrawHudRect(Border, X + W - T, Y, T, H);
 }
 
 void ATraceHUD::DrawKitPanel(float X, float Y, float W, float H, float Alpha, bool bAboutYou)
 {
 	TraceMenuKit::DrawPanelPlate(this, bAboutYou ? ETraceKitState::Hover : ETraceKitState::Default,
 		X, Y, W, H, FMath::Min(H, TraceHUDStyle::PanelCornerMax * UIScale), Alpha);
+}
+
+void ATraceHUD::DrawHudRect(const FLinearColor& Color, float X, float Y, float W, float H)
+{
+	const FLinearColor Shown = TraceMenuKit::Faded(Color);
+	if (Shown.A > 0.f)
+	{
+		DrawRect(Shown, X, Y, W, H);
+	}
+}
+
+void ATraceHUD::DrawHudLine(float X0, float Y0, float X1, float Y1, const FLinearColor& Color, float Thickness)
+{
+	// Full strength: AHUD::DrawLine, pixel-for-pixel what this HUD always drew. Faded: AHUD::DrawLine
+	// would throw the alpha away, so the stroke goes through DrawLineAlpha (which applies the fade).
+	if (TraceMenuKit::Opacity() >= 1.f)
+	{
+		DrawLine(X0, Y0, X1, Y1, Color, Thickness);
+		return;
+	}
+	DrawLineAlpha(X0, Y0, X1, Y1, Color, Thickness);
 }
 
 void ATraceHUD::DrawLineAlpha(float X0, float Y0, float X1, float Y1, const FLinearColor& Color, float Thickness)
@@ -7435,7 +7588,10 @@ void ATraceHUD::DrawStackCaption(const FString& Text, const FLinearColor& Color,
 	{
 		return;
 	}
-	DrawTextLeft(Text, Color, X, VCenterTextY(Text, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+	// Tabular figures (P10): a countdown caption keeps its width as it ticks, instead of its right edge
+	// shuffling every tenth of a second.
+	DrawTextLeft(Text, Color, X, VCenterTextY(Text, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale,
+		/*bTabular=*/true);
 
 	// Measured with every digit as a zero, so "RIPPLE  9.1" and "RIPPLE  10.0" size the plate alike and a
 	// countdown never makes it breathe.
@@ -7448,7 +7604,7 @@ void ATraceHUD::DrawStackCaption(const FString& Text, const FLinearColor& Color,
 		}
 	}
 	StackCaptionRightThisFrame = FMath::Max(StackCaptionRightThisFrame,
-		X + MeasureWidth(Template, FontSmall, UIScale));
+		X + MeasureWidth(Template, FontSmall, UIScale, /*bTabular=*/true));
 }
 
 bool ATraceHUD::IsFullScreenOverlayUp() const
@@ -7456,17 +7612,39 @@ bool ATraceHUD::IsFullScreenOverlayUp() const
 	return PauseMenu.IsOpen() || CharacterSelect.IsOpen() || LoadoutSelect.IsOpen();
 }
 
+void ATraceHUD::UpdateOverlayFades()
+{
+	// A page is wanted from the REPLICATED flags as well as from last frame's open state: the pages tick
+	// after this, so this frame's opening would otherwise start the black a frame late. The hand-off
+	// hold is inside CharacterSelect.IsOpen(), which is what keeps the black solid across a page turn
+	// whose second page arrives a few frames after the first one closes (a remote client).
+	const bool bPageWanted = CharacterSelect.IsOpen() || LoadoutSelect.IsOpen()
+		|| (TracePC != nullptr && TracePC->IsTeamSelectOpen())
+		|| (LocalPS != nullptr && LocalPS->IsCharacterSelectOpen());
+	PageBackdropFade.Update(bPageWanted);
+
+	// The pause menu's own fade, advanced now so this frame's crossfade and its Tick (later this frame,
+	// same clock, so a no-op) agree.
+	PauseMenu.UpdateFade();
+
+	ResultFade.Update((TraceGS != nullptr) && TraceGS->TraceMatchState == ETraceMatchState::PostMatch);
+
+	const float Cover = FMath::Max(PageBackdropFade.Alpha(), PauseMenu.GetFadeAlpha());
+	MatchLayerOpacity = FMath::Clamp(1.f - Cover, 0.f, 1.f);
+	ChromeOpacity = MatchLayerOpacity * (1.f - ResultFade.Alpha());
+}
+
 void ATraceHUD::DrawMeter(float X, float Y, float W, float H, float Fraction, const FLinearColor& FillColor)
 {
 	const float Edge = FMath::Max(1.f, 1.f * UIScale);
 
-	DrawRect(TraceHUDStyle::Shadow, X - Edge, Y - Edge, W + Edge * 2.f, H + Edge * 2.f);
-	DrawRect(TraceHUDStyle::Trough, X, Y, W, H);
+	DrawHudRect(TraceHUDStyle::Shadow, X - Edge, Y - Edge, W + Edge * 2.f, H + Edge * 2.f);
+	DrawHudRect(TraceHUDStyle::Trough, X, Y, W, H);
 
 	const float FillW = FMath::Clamp(Fraction, 0.f, 1.f) * W;
 	if (FillW > 0.f)
 	{
-		DrawRect(FillColor, X, Y, FillW, H);
+		DrawHudRect(FillColor, X, Y, FillW, H);
 	}
 }
 
@@ -9797,6 +9975,492 @@ namespace TraceHUDKitVerify
 		TEXT("the goal flash, then 60 s of drawn frames: no match chrome under an overlay, the gun named ")
 		TEXT("on the ammo plate, no reload prompt on a healthy clip, and a death panel with the feed's ")
 		TEXT("glyph instead of the internal cause name."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
+}
+#endif // !UE_BUILD_SHIPPING
+
+#if !UE_BUILD_SHIPPING
+// =================================================================================================
+// Trace.UI.Fade.Verify — P10: the overlays fade on REAL time, and the match shows through none of it
+//
+// Frame-driven, in a match, started while TEAM SELECT is still up (-TraceExecAt=4 or so). It drives
+// the real flow itself through the real doors — Trace.Teams.Close, Trace.Loadout.Press lock, the pause
+// menu opened as Escape opens it and closed as RESUME closes it, the Tab scoreboard held by its capture
+// cvar — and reads every drawn frame's fades out of the HUD's draw record. It claims:
+//
+//   PAGE TURN   team select fades out while the loadout page fades in, and the black under them never
+//               lets the arena through (combined coverage stays 1) — no match chrome in between;
+//   LOCK IN     the loadout page fades off the match, and the match comes back WITH it (a crossfade),
+//               finishing in about FadeOutSeconds of real time;
+//   PAUSE       the pause menu fades in and out in about FadeIn/OutSeconds of REAL time while the world
+//               is PAUSED (world time frozen) — the proof the fade is not on world time — and the match
+//               layer is exactly 1 - the menu's opacity on every frame of it;
+//   SCOREBOARD  Tab fades the board in and out rather than blinking.
+//
+// Screenshots at mid-fade: Saved/Screenshots/FadeVerify_*.png (each requested while the fade is in its
+// first half, so the captured frame — the next one — is mid-fade).
+// =================================================================================================
+namespace TraceHUDFadeVerify
+{
+	enum class EStep : uint8 { WaitTeam, PageTurn, Settle, Leave, PauseIn, PauseHold, PauseOut, BoardIn, BoardOut, Done };
+
+	struct FRun
+	{
+		TWeakObjectPtr<UWorld> World;
+		EStep Step = EStep::WaitTeam;
+		double StepStart = 0.0;
+		double Deadline = 0.0;
+		int32 Passes = 0;
+		int32 Failures = 0;
+
+		// Per-step samples, reset by Enter.
+		float MinCover = 1.f;
+		float MaxLayer = 0.f;
+		float MaxLayerError = 0.f;
+		int32 GhostFrames = 0;
+		int32 MidFramesA = 0;
+		int32 MidFramesB = 0;
+		double FlipReal = -1.0;
+		double WorldAtFlip = 0.0;
+		double DoneReal = -1.0;
+		bool bWorldFrozen = true;
+		bool bWasPaused = false;
+		bool bShot = false;
+		float LastLayer = 0.f;
+		bool bLayerMonotonic = true;
+
+		/**
+		 * When the harness last saw a frame. A fade is judged by the last frame on which it was still
+		 * running, not by the frame on which it is first seen finished: a screenshot request stalls the
+		 * next frame by ~200 ms, and that stall is the capture's, not the fade's.
+		 */
+		double LastTickReal = 0.0;
+
+		/**
+		 * THE RATE CHECK. The previous distinct drawn frame's UI clock and a fade's linear progress:
+		 * each new frame's progress must equal the previous one moved by (real seconds passed) / the
+		 * fade's duration, clamped to 0..1. A fade on world time does not move while the world is
+		 * paused; a per-frame fade moves the same amount whatever time passed. Both fail this.
+		 */
+		double RatePrevTime = -1.0;
+		float RatePrevLinear = 0.f;
+		float RateWorstError = 0.f;
+		int32 RateFrames = 0;
+		double RateFirstTime = -1.0;
+		double RateSettledTime = -1.0;
+	};
+
+	/** Feeds one drawn frame to the rate check for a fade heading to @p bTarget over @p Seconds. */
+	static void RateSample(FRun& Run, double DrawTime, float Linear, bool bTarget, float Seconds)
+	{
+		if (DrawTime <= 0.0 || DrawTime == Run.RatePrevTime)
+		{
+			return;   // no new frame drawn since the last sample
+		}
+		if (Run.RatePrevTime > 0.0)
+		{
+			const float Moved = static_cast<float>((DrawTime - Run.RatePrevTime) / FMath::Max(1e-3f, Seconds));
+			const float Expected = FMath::Clamp(Run.RatePrevLinear + (bTarget ? Moved : -Moved), 0.f, 1.f);
+			Run.RateWorstError = FMath::Max(Run.RateWorstError, FMath::Abs(Linear - Expected));
+			++Run.RateFrames;
+			if (Run.RateSettledTime < 0.0 && Linear == (bTarget ? 1.f : 0.f))
+			{
+				Run.RateSettledTime = DrawTime;
+			}
+		}
+		else
+		{
+			Run.RateFirstTime = DrawTime;
+		}
+		Run.RatePrevTime = DrawTime;
+		Run.RatePrevLinear = Linear;
+	}
+
+	static void Report(FRun& Run, const TCHAR* Label, bool bPass, const FString& Detail)
+	{
+		(bPass ? Run.Passes : Run.Failures) += 1;
+		UE_LOG(LogTraceGame, Display, TEXT("[FadeVerify]   %-4s %-72s %s"), bPass ? TEXT("ok") : TEXT("FAIL"), Label, *Detail);
+	}
+
+	static void Enter(FRun& Run, EStep Next)
+	{
+		Run.Step = Next;
+		Run.StepStart = FPlatformTime::Seconds();
+		Run.MinCover = 1.f;
+		Run.MaxLayer = 0.f;
+		Run.MaxLayerError = 0.f;
+		Run.GhostFrames = 0;
+		Run.MidFramesA = 0;
+		Run.MidFramesB = 0;
+		Run.FlipReal = -1.0;
+		Run.DoneReal = -1.0;
+		Run.bWorldFrozen = true;
+		Run.bWasPaused = false;
+		Run.bShot = false;
+		Run.LastLayer = 0.f;
+		Run.bLayerMonotonic = true;
+		Run.RatePrevTime = -1.0;
+		Run.RatePrevLinear = 0.f;
+		Run.RateWorstError = 0.f;
+		Run.RateFrames = 0;
+		Run.RateFirstTime = -1.0;
+		Run.RateSettledTime = -1.0;
+	}
+
+	static void Shot(FRun& Run, const TCHAR* Name)
+	{
+		if (Run.bShot)
+		{
+			return;
+		}
+		Run.bShot = true;
+		const FString Path = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"),
+			FString::Printf(TEXT("FadeVerify_%s.png"), Name));
+		UE_LOG(LogTraceGame, Display, TEXT("[FadeVerify] mid-fade screenshot requested: %s"), *Path);
+		FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+	}
+
+	static bool Mid(float Alpha)
+	{
+		return Alpha > 0.001f && Alpha < 0.999f;
+	}
+
+	static void Exec(UWorld* WorldPtr, const TCHAR* Command)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[FadeVerify] > %s"), Command);
+		if (GEngine != nullptr)
+		{
+			GEngine->Exec(WorldPtr, Command);
+		}
+	}
+
+	static bool TickOnce(FRun& Run);
+
+	/** One drawn frame. Returns false when the run is over. */
+	static bool Tick(FRun& Run)
+	{
+		const bool bMore = TickOnce(Run);
+		Run.LastTickReal = FPlatformTime::Seconds();
+		return bMore;
+	}
+
+	static bool TickOnce(FRun& Run)
+	{
+		UWorld* WorldPtr = Run.World.Get();
+		ATraceHUD* HudPtr = (WorldPtr != nullptr) ? TraceHudCornerVerify::FindLocalHud(WorldPtr) : nullptr;
+		if (HudPtr == nullptr)
+		{
+			return WorldPtr != nullptr && FPlatformTime::Seconds() < Run.Deadline;
+		}
+
+		const ATraceHUD::FHudKitRecord& Rec = HudPtr->GetHudKitRecord();
+		const double RealNow = FPlatformTime::Seconds();
+		const double SinceStep = RealNow - Run.StepStart;
+		const float In = TraceMenuKit::FadeInSeconds;
+		const float Out = TraceMenuKit::FadeOutSeconds;
+
+		if (RealNow > Run.Deadline)
+		{
+			Report(Run, TEXT("the run finished in its time limit"), false,
+				FString::Printf(TEXT("stuck at step %d"), static_cast<int32>(Run.Step)));
+			return false;
+		}
+
+		switch (Run.Step)
+		{
+		case EStep::WaitTeam:
+		{
+			// A settled team page. (Not "and the black is up": whether the black is there is one of the
+			// things being tested.)
+			if (Rec.bTeamSelectOpen && Rec.TeamSelectAlpha >= 1.f)
+			{
+				Enter(Run, EStep::PageTurn);
+				Exec(WorldPtr, TEXT("Trace.Teams.Close"));
+				return true;
+			}
+			if (SinceStep > 12.0)
+			{
+				Report(Run, TEXT("team select was up to start from"), false,
+					TEXT("INCONCLUSIVE: start this with -TraceExecAt=4 on the Arena, before team select times out"));
+				return false;
+			}
+			return true;
+		}
+
+		case EStep::PageTurn:
+		{
+			const float Cover = 1.f - (1.f - Rec.PageBackdropAlpha) * (1.f - Rec.TeamSelectAlpha) * (1.f - Rec.LoadoutAlpha);
+			Run.MinCover = FMath::Min(Run.MinCover, Cover);
+			Run.MaxLayer = FMath::Max(Run.MaxLayer, Rec.MatchLayerOpacity);
+			Run.GhostFrames += (!Rec.bTeamSelectOpen && Rec.TeamSelectAlpha > 0.f) ? 1 : 0;
+			Run.MidFramesA += Mid(Rec.TeamSelectAlpha) ? 1 : 0;
+			Run.MidFramesB += Mid(Rec.LoadoutAlpha) ? 1 : 0;
+			if (!Rec.bTeamSelectOpen && Run.FlipReal < 0.0)
+			{
+				Run.FlipReal = RealNow;
+			}
+			if (Rec.TeamSelectAlpha > 0.1f && Rec.TeamSelectAlpha < 0.75f && Rec.LoadoutAlpha > 0.05f)
+			{
+				Shot(Run, TEXT("1_PageTurn"));
+			}
+
+			if (Rec.bLoadoutOpen && Rec.LoadoutAlpha >= 1.f && Rec.TeamSelectAlpha <= 0.f)
+			{
+				Report(Run, TEXT("PAGE TURN: team select fades out, drawn after it closed"),
+					Run.GhostFrames >= 1 && Run.MidFramesA >= 1,
+					FString::Printf(TEXT("%d closed-but-drawn frames, %d mid-fade"), Run.GhostFrames, Run.MidFramesA));
+				Report(Run, TEXT("PAGE TURN: the loadout page fades in"), Run.MidFramesB >= 1,
+					FString::Printf(TEXT("%d mid-fade frames"), Run.MidFramesB));
+				Report(Run, TEXT("PAGE TURN: the black never lets the arena through"), Run.MinCover >= 0.999f,
+					FString::Printf(TEXT("least coverage on any frame %.4f (black x team x loadout)"), Run.MinCover));
+				Report(Run, TEXT("PAGE TURN: no match chrome between the pages"), Run.MaxLayer <= 0.001f,
+					FString::Printf(TEXT("match layer peaked at %.3f"), Run.MaxLayer));
+				Enter(Run, EStep::Settle);
+			}
+			else if (SinceStep > 6.0)
+			{
+				Report(Run, TEXT("PAGE TURN: the loadout page came up after team select"), false,
+					FString::Printf(TEXT("team open %d alpha %.2f, loadout open %d alpha %.2f"), Rec.bTeamSelectOpen ? 1 : 0,
+						Rec.TeamSelectAlpha, Rec.bLoadoutOpen ? 1 : 0, Rec.LoadoutAlpha));
+				return false;
+			}
+			return true;
+		}
+
+		case EStep::Settle:
+		{
+			// The page reads nothing until every key has been seen up; give the press queue a clean page.
+			if (SinceStep > 0.8)
+			{
+				Enter(Run, EStep::Leave);
+				Exec(WorldPtr, TEXT("Trace.Loadout.Press lock"));
+			}
+			return true;
+		}
+
+		case EStep::Leave:
+		{
+			if (!Rec.bLoadoutOpen && Run.FlipReal < 0.0)
+			{
+				Run.FlipReal = RealNow;
+				Run.LastLayer = Rec.MatchLayerOpacity;
+			}
+			if (Run.FlipReal > 0.0)
+			{
+				RateSample(Run, Rec.DrawRealSeconds, Rec.PageBackdropLinear, /*bTarget=*/false, Out);
+				Run.GhostFrames += (Rec.LoadoutAlpha > 0.f) ? 1 : 0;
+				Run.MidFramesA += Mid(Rec.MatchLayerOpacity) ? 1 : 0;
+				Run.bLayerMonotonic &= (Rec.MatchLayerOpacity + 1e-4f >= Run.LastLayer);
+				Run.LastLayer = Rec.MatchLayerOpacity;
+				if (Rec.LoadoutAlpha > 0.35f && Rec.LoadoutAlpha < 0.9f)
+				{
+					Shot(Run, TEXT("2_LoadoutOut"));
+				}
+				if (Rec.MatchLayerOpacity >= 1.f && Rec.LoadoutAlpha <= 0.f)
+				{
+					Report(Run, TEXT("LOCK IN: the loadout page fades off the match"), Run.GhostFrames >= 1,
+						FString::Printf(TEXT("%d frames drawn after it closed"), Run.GhostFrames));
+					Report(Run, TEXT("LOCK IN: the match comes back WITH it (crossfade), steadily"),
+						Run.MidFramesA >= 1 && Run.bLayerMonotonic,
+						FString::Printf(TEXT("%d frames of part-drawn match, monotonic %d"), Run.MidFramesA, Run.bLayerMonotonic ? 1 : 0));
+					Report(Run, TEXT("LOCK IN: the black lifts at exactly real time / FadeOutSeconds per frame"),
+						Run.RateFrames >= 2 && Run.RateWorstError < 0.02f,
+						FString::Printf(TEXT("%d frames, worst progress error %.4f (fade %.0f ms)"), Run.RateFrames,
+							Run.RateWorstError, Out * 1000.f));
+					Enter(Run, EStep::PauseIn);
+					HudPtr->DebugOpenPauseMenu();
+					Run.FlipReal = RealNow;
+					Run.WorldAtFlip = WorldPtr->GetTimeSeconds();
+				}
+			}
+			if (SinceStep > 12.0)
+			{
+				Report(Run, TEXT("LOCK IN: the loadout page closed and the match came back"), false,
+					FString::Printf(TEXT("loadout open %d alpha %.2f, match layer %.2f"), Rec.bLoadoutOpen ? 1 : 0,
+						Rec.LoadoutAlpha, Rec.MatchLayerOpacity));
+				return false;
+			}
+			return true;
+		}
+
+		case EStep::PauseIn:
+		case EStep::PauseOut:
+		{
+			const bool bIn = (Run.Step == EStep::PauseIn);
+			// The world clock is read from the first frame the pause is seen, and must not move after it.
+			const bool bPaused = WorldPtr->IsPaused();
+			if (bPaused && !Run.bWasPaused)
+			{
+				Run.WorldAtFlip = WorldPtr->GetTimeSeconds();
+			}
+			Run.bWasPaused |= bPaused;
+			if (bPaused && !FMath::IsNearlyEqual(WorldPtr->GetTimeSeconds(), Run.WorldAtFlip, 1e-6))
+			{
+				Run.bWorldFrozen = false;
+			}
+			Run.MidFramesA += Mid(Rec.PauseAlpha) ? 1 : 0;
+			Run.GhostFrames += (!Rec.bPauseOpen && Rec.PauseAlpha > 0.f) ? 1 : 0;
+			RateSample(Run, Rec.DrawRealSeconds, Rec.PauseLinear, bIn, bIn ? In : Out);
+			// The page's black is gone by now, so the match layer is the pause menu's complement exactly.
+			Run.MaxLayerError = FMath::Max(Run.MaxLayerError, FMath::Abs(Rec.MatchLayerOpacity - (1.f - Rec.PauseAlpha)));
+
+			if (Rec.PauseAlpha > 0.2f && Rec.PauseAlpha < 0.6f)
+			{
+				Shot(Run, bIn ? TEXT("3_PauseIn") : TEXT("4_PauseOut"));
+			}
+
+			const bool bSettled = bIn ? (Rec.PauseAlpha >= 1.f) : (Rec.PauseAlpha <= 0.f);
+			if (bSettled)
+			{
+				const float Want = bIn ? In : Out;
+				const FString Rate = FString::Printf(TEXT("%d frames at real time / %.0f ms, worst progress error %.4f"),
+					Run.RateFrames, Want * 1000.f, Run.RateWorstError);
+				const bool bRateOk = Run.RateFrames >= 2 && Run.RateWorstError < 0.02f;
+				if (bIn)
+				{
+					Report(Run, TEXT("PAUSE: the menu fades in"), Run.MidFramesA >= 1,
+						FString::Printf(TEXT("%d mid-fade frames"), Run.MidFramesA));
+					Report(Run, TEXT("PAUSE: on REAL time, with the world paused and its clock frozen"),
+						Run.bWasPaused && Run.bWorldFrozen && bRateOk,
+						FString::Printf(TEXT("world paused %d, world clock frozen %d; %s"),
+							Run.bWasPaused ? 1 : 0, Run.bWorldFrozen ? 1 : 0, *Rate));
+				}
+				else
+				{
+					Report(Run, TEXT("PAUSE: RESUME fades the menu out on real time, drawn after it closed"),
+						Run.GhostFrames >= 1 && Run.MidFramesA >= 1 && bRateOk,
+						FString::Printf(TEXT("%d closed-but-drawn frames; %s"), Run.GhostFrames, *Rate));
+					Report(Run, TEXT("PAUSE: ...and the world is running again"), !bPaused, TEXT(""));
+				}
+				Report(Run, bIn ? TEXT("PAUSE: the match layer is exactly 1 - the menu, every frame (in)")
+				                : TEXT("PAUSE: the match layer is exactly 1 - the menu, every frame (out)"),
+					Run.MaxLayerError < 0.01f, FString::Printf(TEXT("worst error %.4f"), Run.MaxLayerError));
+
+				if (bIn)
+				{
+					Enter(Run, EStep::PauseHold);
+				}
+				else
+				{
+					Enter(Run, EStep::BoardIn);
+					IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.HUD.ForceScoreboard"))->Set(1, ECVF_SetByConsole);
+					Run.FlipReal = RealNow;
+				}
+			}
+			else if (SinceStep > 3.0)
+			{
+				Report(Run, bIn ? TEXT("PAUSE: the menu finished fading in") : TEXT("PAUSE: the menu finished fading out"),
+					false, FString::Printf(TEXT("alpha %.3f after %.1f s real, world paused %d"), Rec.PauseAlpha, SinceStep,
+						bPaused ? 1 : 0));
+				return false;
+			}
+			return true;
+		}
+
+		case EStep::PauseHold:
+		{
+			if (SinceStep > 0.5)
+			{
+				Enter(Run, EStep::PauseOut);
+				HudPtr->DebugClosePauseMenu();
+				Run.FlipReal = RealNow;
+				Run.WorldAtFlip = WorldPtr->GetTimeSeconds();
+			}
+			return true;
+		}
+
+		case EStep::BoardIn:
+		case EStep::BoardOut:
+		{
+			const bool bIn = (Run.Step == EStep::BoardIn);
+			Run.MidFramesA += Mid(Rec.ScoreboardAlpha) ? 1 : 0;
+			RateSample(Run, Rec.DrawRealSeconds, Rec.ScoreboardLinear, bIn, bIn ? In : Out);
+			if (bIn && Rec.ScoreboardAlpha > 0.2f && Rec.ScoreboardAlpha < 0.6f)
+			{
+				Shot(Run, TEXT("5_Scoreboard"));
+			}
+			const bool bSettled = bIn ? (Rec.ScoreboardAlpha >= 1.f) : (Rec.ScoreboardAlpha <= 0.f);
+			if (bSettled)
+			{
+				Report(Run, bIn ? TEXT("SCOREBOARD: Tab fades the board in, on real time")
+				                : TEXT("SCOREBOARD: releasing Tab fades it out, on real time"),
+					Run.MidFramesA >= 1 && Run.RateFrames >= 2 && Run.RateWorstError < 0.02f,
+					FString::Printf(TEXT("%d mid-fade frames, worst progress error %.4f"), Run.MidFramesA, Run.RateWorstError));
+				if (bIn)
+				{
+					Enter(Run, EStep::BoardOut);
+					IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.HUD.ForceScoreboard"))->Set(0, ECVF_SetByConsole);
+					Run.FlipReal = RealNow;
+				}
+				else
+				{
+					Enter(Run, EStep::Done);
+					return false;
+				}
+			}
+			else if (SinceStep > 3.0)
+			{
+				Report(Run, TEXT("SCOREBOARD: the board finished fading"), false,
+					FString::Printf(TEXT("alpha %.3f (is the match layer up? %.2f)"), Rec.ScoreboardAlpha, Rec.MatchLayerOpacity));
+				IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.HUD.ForceScoreboard"))->Set(0, ECVF_SetByConsole);
+				return false;
+			}
+			return true;
+		}
+
+		default:
+			return false;
+		}
+	}
+
+	static void Finish(FRun& Run)
+	{
+		if (Run.Failures == 0 && Run.Step == EStep::Done)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[FadeVerify] ===== PASS (%d checks) — VERDICT: overlays fade on real time ====="),
+				Run.Passes);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[FadeVerify] ===== *** FAIL *** %d of %d check(s)%s ====="),
+				Run.Failures, Run.Failures + Run.Passes, (Run.Step != EStep::Done) ? TEXT(", run did not finish") : TEXT(""));
+		}
+	}
+
+	static void Start(const TArray<FString>& /*Args*/, UWorld* WorldPtr)
+	{
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[FadeVerify] Trace.UI.Fade.Verify: no world."));
+			return;
+		}
+
+		TSharedRef<FRun> Run = MakeShared<FRun>();
+		Run->World = WorldPtr;
+		Run->Deadline = FPlatformTime::Seconds() + 60.0;
+		Enter(*Run, EStep::WaitTeam);
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[FadeVerify] ===== P10: page turn, lock in, pause and scoreboard fades (in %.0f ms, out %.0f ms, real time) ====="),
+			TraceMenuKit::FadeInSeconds * 1000.f, TraceMenuKit::FadeOutSeconds * 1000.f);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Run](float /*Delta*/) -> bool
+		{
+			if (!Tick(*Run))
+			{
+				Finish(*Run);
+				return false;
+			}
+			return true;
+		}), 0.f);
+	}
+
+	static FAutoConsoleCommandWithWorldAndArgs CmdFadeVerify(
+		TEXT("Trace.UI.Fade.Verify"),
+		TEXT("P10: drives team select -> loadout -> lock in -> pause -> resume -> Tab and checks, frame by frame, ")
+		TEXT("that every overlay fades on REAL time (the pause fade completes with the world paused), that the ")
+		TEXT("pages' black never lets the arena through a page turn, and that the match crossfades with them. ")
+		TEXT("Run on the Arena while team select is up: -TraceExecAt=4 -TraceExec=\"Trace.UI.Fade.Verify\"."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
 }
 #endif // !UE_BUILD_SHIPPING

@@ -128,6 +128,13 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Atlas Text")
 	ETraceTextWeight Weight = ETraceTextWeight::Light;
 
+	/**
+	 * Tabular figures (TraceText::FStyle::bTabularDigits): every digit advances by the widest one, so
+	 * a number that ticks keeps its width and does not slide. For counts; off for words.
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Atlas Text")
+	bool bTabularDigits = false;
+
 	/** Only meaningful in a slot bigger than the text; an auto-sized slot fits it exactly. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Atlas Text")
 	TEnumAsByte<EHorizontalAlignment> HorizontalAlignment = HAlign_Center;
@@ -143,6 +150,10 @@ public:
 
 	UFUNCTION(BlueprintCallable, Category = "Trace Atlas Text")
 	void SetColor(const FLinearColor& InColor);
+
+	/** See bTabularDigits. */
+	UFUNCTION(BlueprintCallable, Category = "Trace Atlas Text")
+	void SetTabularDigits(bool bInTabular);
 
 	/** Bold is for the character names on the select screen; everything else stays Light. */
 	UFUNCTION(BlueprintCallable, Category = "Trace Atlas Text")

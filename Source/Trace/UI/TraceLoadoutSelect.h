@@ -64,6 +64,7 @@
 #include "Abilities/TraceAbilityTypes.h"
 #include "TraceTypes.h"   // ETraceMatchState
 #include "UI/Text/TraceTextWeight.h"
+#include "UI/Widgets/Menu/TraceKitMotion.h"   // FTraceKitFade — the page's open/close fade (P10)
 
 class AHUD;
 class APlayerController;
@@ -135,6 +136,13 @@ struct FTraceLoadoutKeys
 struct TRACE_API FTraceLoadoutSelect
 {
 	bool IsOpen() const { return bOpen; }
+
+	/**
+	 * P10: the in-match page's opacity this frame, 0..1 — fading in after it opens, and fading out for
+	 * FadeOutSeconds after it closes (drawn as it last stood: no input, no pointer). IsOpen() does not
+	 * include the fade. Library mode does not fade: its host (the options overlay) does.
+	 */
+	float GetFadeAlpha() const { return Fade.Alpha(); }
 
 	/**
 	 * Should the in-match page be up for @p LocalState this frame? The server's select window AND
@@ -258,6 +266,15 @@ private:
 	float ViewH = 0.f;
 	float UIScale = 1.f;
 	float Now = 0.f;
+
+	/**
+	 * The clock the page ANIMATES on (hover breath, the urgent timer pulse): real time, which keeps
+	 * running under the pause menu. Now stays the clock of the page's logic (key repeat, messages).
+	 */
+	float AnimNow = 0.f;
+
+	/** P10 — the in-match page's open/close fade, on real time. */
+	FTraceKitFade Fade;
 
 	// ---- pointer ---------------------------------------------------------------------------------
 	FVector2D CursorPos = FVector2D::ZeroVector;

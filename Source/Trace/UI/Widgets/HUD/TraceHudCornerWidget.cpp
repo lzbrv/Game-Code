@@ -209,6 +209,11 @@ void UTraceHudCornerWidget::InstallAtlasLabels()
 	// take the same face from TraceHUDType::HudWeight().
 	AtlasLabels.Reset();
 	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, CountText, 0.f, 1.f, ETraceTextWeight::Hud));
+	// The count ticks on every shot: tabular figures, so it keeps its width (P10). Same as the Canvas corner.
+	if (AtlasLabels.Num() > 0 && AtlasLabels.Last().Atlas != nullptr)
+	{
+		AtlasLabels.Last().Atlas->SetTabularDigits(true);
+	}
 	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, CapacityText, 0.f, 1.f, ETraceTextWeight::Hud));
 	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, AmmoLabelText, 0.f, 1.f, ETraceTextWeight::Hud));
 	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, ReloadLabelText, 0.f, 1.f, ETraceTextWeight::Hud));

@@ -436,7 +436,23 @@ namespace TraceTextFile
 		bool bSubstituted = false;
 		/** Atlas pixels. Scaled by ScaleFor(Size) at the point of use. */
 		float Advance = 0.f;
+		/** Atlas pixels the quad sits right of the pen: half the slack of a TABULAR digit, else 0. */
+		float Offset = 0.f;
 	};
+
+	/**
+	 * The widest digit's advance in @p Face — the cell every digit gets when a style asks for tabular
+	 * figures (FStyle::bTabularDigits). Ten reads of constexpr data; not worth a cache.
+	 */
+	static float TabularDigitAdvance(const Metrics::FFace& Face)
+	{
+		float Widest = 0.f;
+		for (TCHAR Digit = TEXT('0'); Digit <= TEXT('9'); ++Digit)
+		{
+			Widest = FMath::Max(Widest, static_cast<float>(Face.Cells[Digit - Metrics::FirstCode].USize));
+		}
+		return Widest;
+	}
 
 	/**
 	 * THE ONE PLACE THAT DECIDES WHICH SHEET A CHARACTER COMES FROM.
@@ -446,7 +462,7 @@ namespace TraceTextFile
 	 * mis-sized the kill feed before spec v23 §A4, and it would come straight back if the fallback
 	 * were applied in the draw loop alone.
 	 */
-	static FResolvedGlyph ResolveGlyph(const Metrics::FFace& Face, TCHAR Char)
+	static FResolvedGlyph ResolveGlyph(const Metrics::FFace& Face, TCHAR Char, bool bTabularDigits = false)
 	{
 		FResolvedGlyph Out;
 		const int32 Code = static_cast<int32>(Char);
@@ -465,6 +481,17 @@ namespace TraceTextFile
 		{
 			Out.Cell = Own;
 			Out.Advance = Own->USize;
+
+			// TABULAR FIGURES (FStyle::bTabularDigits): the digit keeps its own glyph and is centred in
+			// the widest digit's cell, so "10" and "00" are the same width and a ticking number stands
+			// still. HERE, in the one resolver, so the width a caller measured and the width it is drawn
+			// at cannot disagree.
+			if (bTabularDigits && Char >= TEXT('0') && Char <= TEXT('9'))
+			{
+				const float Cell = TabularDigitAdvance(Face);
+				Out.Offset = (Cell - Out.Advance) * 0.5f;
+				Out.Advance = Cell;
+			}
 			return Out;
 		}
 
@@ -539,7 +566,8 @@ namespace TraceTextFile
 		}
 	}
 
-	static float AtlasLineWidth(const FString& Line, float Size, float Tracking, ETraceTextWeight Weight)
+	static float AtlasLineWidth(const FString& Line, float Size, float Tracking, ETraceTextWeight Weight,
+		bool bTabularDigits = false)
 	{
 		const Metrics::FFace& Face = EffectiveFace(Weight);
 		const float Scale = ScaleFor(Size);
@@ -551,7 +579,7 @@ namespace TraceTextFile
 			// the width it will be DRAWN at. Measuring it as a blank space here — which is what this
 			// loop did before WP12 — would under-report every accented name by the difference and
 			// centre it off by half of that.
-			Width += ResolveGlyph(Face, Line[Index]).Advance * Scale;
+			Width += ResolveGlyph(Face, Line[Index], bTabularDigits).Advance * Scale;
 			++Drawn;
 		}
 		// Tracking is between glyphs, not after the last one — otherwise a centred string drifts
@@ -878,7 +906,7 @@ float TraceText::MeasureWidth(const FString& Text, const FStyle& Style)
 	for (const FString& Line : Lines)
 	{
 		const float Width = bAtlas
-			? TraceTextFile::AtlasLineWidth(Line, Style.Size, Style.Tracking, Style.Weight)
+			? TraceTextFile::AtlasLineWidth(Line, Style.Size, Style.Tracking, Style.Weight, Style.bTabularDigits)
 			: TraceTextFile::FallbackLineWidth(Line, Style.Size);
 		Widest = FMath::Max(Widest, Width);
 	}
@@ -971,8 +999,8 @@ bool TraceText::LayoutString(const FString& Text, const FStyle& Style, TArray<FG
 		// Every line is aligned inside the BLOCK, so a centred two-line label centres both lines
 		// rather than centring the longest and left-aligning the rest.
 		float PenX = Origin.X;
-		const float LineWidth =
-			TraceTextFile::AtlasLineWidth(Line, Style.Size, Style.Tracking, Style.Weight);
+		const float LineWidth = TraceTextFile::AtlasLineWidth(Line, Style.Size, Style.Tracking, Style.Weight,
+			Style.bTabularDigits);
 		switch (Style.HAlign)
 		{
 		case EHAlign::Center: PenX += (Block.X - LineWidth) * 0.5f; break;
@@ -987,7 +1015,7 @@ bool TraceText::LayoutString(const FString& Text, const FStyle& Style, TArray<FG
 			// The SAME resolver the measurement above ran, so the quads and the width this string
 			// was centred by can never disagree about which sheet a character came from.
 			const TraceTextFile::FResolvedGlyph Glyph =
-				TraceTextFile::ResolveGlyph(Face, Line[CharIndex]);
+				TraceTextFile::ResolveGlyph(Face, Line[CharIndex], Style.bTabularDigits);
 
 			// Whitespace and unmapped characters advance and draw nothing. Emitting a quad for a
 			// space would be a transparent draw call per space, on every frame, for nothing.
@@ -1000,7 +1028,7 @@ bool TraceText::LayoutString(const FString& Text, const FStyle& Style, TArray<FG
 				FGlyphQuad& Quad = OutQuads.AddDefaulted_GetRef();
 				// A fallback glyph is lifted onto this line's baseline. Everything else about it —
 				// the pen, the tracking, the alignment it was laid out inside — is identical.
-				Quad.Pos = FVector2f(PenX, PenY + (Glyph.bFallback ? FallbackLift : 0.f));
+				Quad.Pos = FVector2f(PenX + Glyph.Offset * Scale, PenY + (Glyph.bFallback ? FallbackLift : 0.f));
 				Quad.Size = FVector2f(Cell.USize * Scale, Cell.VSize * Scale);
 				Quad.UVMin = FVector2f(Cell.U / SheetW, Cell.V / SheetH);
 				Quad.UVSize = FVector2f(Cell.USize / SheetW, Cell.VSize / SheetH);

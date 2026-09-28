@@ -38,6 +38,7 @@
 #include "UI/TraceKillFeed.h"     // ETraceKillIcon, ATraceKillFeedRelay — spec v8 §6
 #include "UI/TraceOptionsMenu.h"  // FTraceOptionsMenu
 #include "UI/Widgets/HUD/TraceHudCornerData.h" // FTraceHudCornerState — spec v17 §4 (step 4b)
+#include "UI/Widgets/Menu/TraceKitMotion.h"   // FTraceKitFade — the overlays' open/close fades (P10)
 
 #include "TraceHUD.generated.h"
 
@@ -175,6 +176,37 @@ public:
 		/** A pause / select / loadout screen owned the view on this frame. */
 		bool bOverlayUp = false;
 
+		/**
+		 * P10 — the fades as this frame drew them: the match layer (1 - the most opaque overlay), the
+		 * live chrome (that, times 1 - the results screen), the pages' shared black, the pause menu, the
+		 * results screen, and each page's own content fade.
+		 */
+		float MatchLayerOpacity = 1.f;
+		float ChromeOpacity = 1.f;
+		float PageBackdropAlpha = 0.f;
+		float PauseAlpha = 0.f;
+		float ResultAlpha = 0.f;
+		float TeamSelectAlpha = 0.f;
+		float LoadoutAlpha = 0.f;
+		float ScoreboardAlpha = 0.f;
+		float DeathAlpha = 0.f;
+		float HalfTimeAlpha = 0.f;
+
+		/**
+		 * The UI clock (TraceMenuKit::RealSeconds) this frame's fades were advanced to, and three of the
+		 * fades' raw LINEAR progress: Trace.UI.Fade.Verify checks that progress moved by exactly the real
+		 * time that passed, frame by frame — which a world-time or per-frame fade cannot do.
+		 */
+		double DrawRealSeconds = 0.0;
+		float PauseLinear = 0.f;
+		float ScoreboardLinear = 0.f;
+		float PageBackdropLinear = 0.f;
+
+		/** The open flags behind those fades, as this frame's draw saw them. */
+		bool bTeamSelectOpen = false;
+		bool bLoadoutOpen = false;
+		bool bPauseOpen = false;
+
 		/** The top score bar, the crosshair, and how many kill-feed rows drew. */
 		bool bTopPanel = false;
 		bool bCrosshair = false;
@@ -228,6 +260,10 @@ public:
 		FVector2D ViewSize = FVector2D::ZeroVector;
 	};
 	const FHudKitRecord& GetHudKitRecord() const { return HudKitRecord; }
+
+	/** Trace.UI.Fade.Verify: the pause menu opened exactly as Escape opens it, and closed as RESUME does. */
+	void DebugOpenPauseMenu() { OpenPauseMenu(); }
+	void DebugClosePauseMenu() { PauseMenu.Close(); }
 #endif
 
 protected:
@@ -655,11 +691,18 @@ protected:
 	float DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Width);
 
 	// ---- Small drawing helpers ----------------------------------------------------------------
-	void DrawTextLeft(const FString& Text, const FLinearColor& Color, float X, float Y, UFont* Font, float Scale);
-	void DrawTextCentered(const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale);
-	void DrawTextRight(const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale);
+	//
+	// @p bTabular: tabular figures (TraceText::FStyle::bTabularDigits) — for a number that ticks (the
+	// clock, a countdown, a score, the ammo count), so it keeps its width instead of sliding. A caller
+	// that MEASURES such a number must pass the same flag.
+	void DrawTextLeft(const FString& Text, const FLinearColor& Color, float X, float Y, UFont* Font, float Scale,
+		bool bTabular = false);
+	void DrawTextCentered(const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale,
+		bool bTabular = false);
+	void DrawTextRight(const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale,
+		bool bTabular = false);
 
-	float MeasureWidth(const FString& Text, UFont* Font, float Scale);
+	float MeasureWidth(const FString& Text, UFont* Font, float Scale, bool bTabular = false);
 	float MeasureHeight(const FString& Text, UFont* Font, float Scale);
 
 	/** Top-left Y that vertically centres @p Text inside the box [BoxY, BoxY + BoxH]. */
@@ -705,8 +748,33 @@ protected:
 	 * True while a screen that owns the whole view is up — the pause menu, team select, character
 	 * select, the loadout page. The match chrome (clock, banners, kill feed, crosshair, the two corners)
 	 * does not draw under them: under their scrims it was ghost text cutting through the page title.
+	 *
+	 * P10: that is now reached through the FADE, not this flag: the chrome draws at MatchLayerOpacity
+	 * (1 - the overlay's opacity) and stops drawing when that reaches 0, so it crossfades with the
+	 * overlay rather than vanishing the frame the overlay opens. This flag stays the "is one open"
+	 * answer for input and the draw record.
 	 */
 	bool IsFullScreenOverlayUp() const;
+
+	// ---- P10: the overlays' fades, and what they leave of the match -----------------------------
+
+	/**
+	 * Advances every overlay fade this HUD owns (the pages' shared black, the results screen) and the
+	 * pause menu's, and derives MatchLayerOpacity / ChromeOpacity from them. Top of DrawHUD, once.
+	 */
+	void UpdateOverlayFades();
+
+	/**
+	 * AHUD::DrawRect at the current TraceMenuKit::Opacity(): EVERY flat rect this HUD draws goes
+	 * through here, so the match layer crossfades with an overlay instead of vanishing under it.
+	 */
+	void DrawHudRect(const FLinearColor& Color, float X, float Y, float W, float H);
+
+	/**
+	 * AHUD::DrawLine at the current opacity. AHUD::DrawLine throws alpha away (see DrawLineAlpha), so a
+	 * faded frame is drawn as DrawLineAlpha and a full-strength frame exactly as before.
+	 */
+	void DrawHudLine(float X0, float Y0, float X1, float Y1, const FLinearColor& Color, float Thickness);
 
 	/** Horizontal meter: drop shadow, dark trough, coloured fill from the left. Fraction is clamped. */
 	void DrawMeter(float X, float Y, float W, float H, float Fraction, const FLinearColor& FillColor);
@@ -834,6 +902,39 @@ private:
 
 	/** Binds the select screen's input-suppression callbacks. Idempotent; called from BeginPlay. */
 	void WireCharacterSelect();
+
+	// ---- P10: overlay fades (all on real time; see UI/Widgets/Menu/TraceKitMotion.h) ----------------
+
+	/**
+	 * THE PAGES' SHARED BLACK. Team select, the loadout page and character select each fade their own
+	 * content in and out, and each sits on opaque black; drawn only by the pages, the black would
+	 * crossfade too, and the arena would show through the middle of the team -> loadout page turn (two
+	 * half-faded blacks cover 75%). So the HUD keeps ONE black under all of them, faded on "any page up
+	 * (or in its hand-off hold)" — it stays solid through a page turn and fades only at the ends.
+	 */
+	FTraceKitFade PageBackdropFade;
+
+	/** The Tab scoreboard, the death panel, the HALF TIME card, and the full-time results. */
+	FTraceKitFade ScoreboardFade;
+	FTraceKitFade DeathFade;
+	FTraceKitFade HalfTimeFade;
+	FTraceKitFade ResultFade;
+
+	/** The HALF TIME card's second line as last drawn, for its fade-out after the break ends. */
+	FString HalfTimeSubline;
+
+	/**
+	 * What the overlays leave of the match THIS frame: 1 - the most opaque of (the pages' black, the
+	 * pause menu). The kill feed, the net chips and all the chrome draw at it; 0 means nothing of the
+	 * match draws (the old IsFullScreenOverlayUp gate, reached at the END of a fade instead of the start).
+	 */
+	float MatchLayerOpacity = 1.f;
+
+	/** MatchLayerOpacity, further faded out as the results screen fades in — the live-play chrome. */
+	float ChromeOpacity = 1.f;
+
+	/** The UMG corner's render opacity as last set, so it is only touched when it changes. */
+	float CornerWidgetOpacity = 1.f;
 
 	// ---- The UMG corner (spec v17 §4, step 4b) --------------------------------------------------
 	//

@@ -190,6 +190,7 @@ FTraceAtlasTextParams UTraceAtlasText::BuildParams() const
 	Out.Style.Color = Color;
 	Out.Style.Tracking = Tracking;
 	Out.Style.Weight = Weight;
+	Out.Style.bTabularDigits = bTabularDigits;
 
 	// The block is laid out from its own top-left; where that block lands inside the slot is the
 	// SlotH/VAlign question, handled in OnPaint. Keeping them separate is what makes a
@@ -240,6 +241,15 @@ void UTraceAtlasText::SetColor(const FLinearColor& InColor)
 {
 	Color = InColor;
 	SynchronizeProperties();
+}
+
+void UTraceAtlasText::SetTabularDigits(bool bInTabular)
+{
+	if (bTabularDigits != bInTabular)
+	{
+		bTabularDigits = bInTabular;
+		SynchronizeProperties();
+	}
 }
 
 void UTraceAtlasText::SetWeight(ETraceTextWeight InWeight)

@@ -50,6 +50,7 @@
 #include "Math/Box2D.h"
 
 #include "UI/Text/TraceText.h"
+#include "UI/Widgets/Menu/TraceKitMotion.h"   // FTraceKitFade — the kit's one open/close fade (P10)
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 
 class AHUD;
@@ -188,10 +189,66 @@ namespace TraceMenuKit
 	static constexpr float TrackRailTopV = 6.f / 23.f;
 	static constexpr float TrackRailV = 11.f / 23.f;
 
+	// =============================================================================================
+	// MOTION (P10) — one set of timings for every kit screen, all on REAL time
+	// =============================================================================================
+
+	/** An overlay's open fade: the page, the pause menu, the scoreboard, the death panel. */
+	static constexpr float FadeInSeconds = 0.15f;
+
+	/** ...and its close. A touch quicker: a closing menu should get out of the way. */
+	static constexpr float FadeOutSeconds = 0.12f;
+
+	/**
+	 * A plate's hover ring coming on, and going off. Quick on, so the pointer never feels late; slower
+	 * off, so a highlight walked down a list leaves a short fading trail instead of blinking.
+	 */
+	static constexpr float HoverInSeconds = 0.08f;
+	static constexpr float HoverOutSeconds = 0.16f;
+
 	/** The hover breath: tint = Base + Swing * sin(t * Speed), i.e. 0.90..1.10 around parity. */
 	static constexpr float HoverPulseBase = 1.f;
 	static constexpr float HoverPulseSwing = 0.10f;
 	static constexpr float HoverPulseSpeed = 4.5f;
+
+	// =============================================================================================
+	// REAL TIME AND OPACITY (P10)
+	// =============================================================================================
+
+	/**
+	 * The UI's clock: FApp::GetCurrentTime — the application's frame time. It keeps running while the
+	 * world is paused, is not dilated, and is the same value for the whole frame. Use it (or
+	 * UWorld::GetRealTimeSeconds) for anything that animates; never UWorld::GetTimeSeconds.
+	 * DOUBLE on purpose: the platform clock carries a large offset, and narrowed to float it rounds.
+	 */
+	TRACE_API double RealSeconds();
+
+	/**
+	 * The opacity every kit draw in this file, and every TraceCanvasText draw, is multiplied by right
+	 * now. 1 outside any FScopedOpacity.
+	 */
+	TRACE_API float Opacity();
+
+	/**
+	 * Multiplies Opacity() by @p Alpha for its lifetime, and restores it on exit; scopes nest by
+	 * multiplying. This is how a whole screen fades without every draw call learning an alpha: wrap the
+	 * screen's Draw in one of these. Covers the kit (plates, labels, chips, legends, value boxes,
+	 * sliders, background, scrim) and TraceCanvasText. NOT the pointer (TraceHardwareCursor draws it
+	 * at full strength): it is the player's, and it appears the frame the screen does. A screen's OWN
+	 * raw HUD->DrawRect calls must pass their colour through Faded().
+	 */
+	struct TRACE_API FScopedOpacity
+	{
+		explicit FScopedOpacity(float Alpha);
+		~FScopedOpacity();
+		FScopedOpacity(const FScopedOpacity&) = delete;
+		FScopedOpacity& operator=(const FScopedOpacity&) = delete;
+	private:
+		float Saved = 1.f;
+	};
+
+	/** @p Color with its alpha multiplied by Opacity() — for a screen's own raw DrawRect / DrawLine. */
+	TRACE_API FLinearColor Faded(const FLinearColor& Color);
 
 	// =============================================================================================
 	// THE GUARD AND THE SPRITES
@@ -255,6 +312,32 @@ namespace TraceMenuKit
 
 	/** The plate multiplier @p Visuals wants at @p NowSeconds: HoverPulse if it breathes, else PlateTint. */
 	TRACE_API float PlateTintAt(const FTraceKitVisuals& Visuals, float NowSeconds);
+
+	// ---- HOVER TRANSITIONS (P10) -----------------------------------------------------------------
+	//
+	// DrawStatePlate (and so DrawButton and DrawKeyChip) no longer SWAPS the default plate for the
+	// hover plate in one frame: it keeps a small blend per plate, keyed by the plate's rect, and lays
+	// the hover plate over the default one at that blend (HoverInSeconds on, HoverOutSeconds off, real
+	// time). No screen keeps any state for it. A rect that was not drawn on the previous frame starts
+	// at its target — a page that has just opened does not animate its highlight in, and a plate that
+	// moves simply does what it always did. Disabled and Pressed are immediate (a press must feel
+	// instant; a disabled plate is a different sprite).
+
+	/**
+	 * The hover blend (0 = default, 1 = hover) of the plate at this rect, advanced to this frame with
+	 * @p bHovered as its target. Idempotent within a frame, so a screen can ask for it to colour its
+	 * own label and the plate draw will read the same value.
+	 */
+	TRACE_API float HoverBlend(float X, float Y, float W, float H, bool bHovered);
+
+	/** Default -> Hover visuals mixed at @p Blend (label, furniture). For Disabled/Pressed, VisualsFor(State). */
+	TRACE_API FTraceKitVisuals VisualsForBlend(ETraceKitState State, float Blend);
+
+	/**
+	 * VisualsFor, eased: the label and furniture colours of the plate at this rect as they are THIS
+	 * frame, mid-transition included. Use it where a screen colours its own words on a state plate.
+	 */
+	TRACE_API FTraceKitVisuals VisualsAt(ETraceKitState State, float X, float Y, float W, float H);
 
 	// =============================================================================================
 	// PLATES
@@ -328,10 +411,12 @@ namespace TraceMenuKit
 	 * @p Text centred on (CenterX, CenterY) by its CAPS, sized for a @p PlateH plate, shrunk to fit
 	 * @p MaxWidth if it would not (MaxWidth <= 0: no limit). Light weight by default (owner's choice,
 	 * v23); the settings submenus pass ETraceTextWeight::Hud for their body (Erbaum Bold, spec v26 §2).
-	 * Draws nothing for an empty string. Returns the width drawn.
+	 * Draws nothing for an empty string. Returns the width drawn. @p bTabularDigits for a VALUE that
+	 * changes (a slider's number, a countdown): see TraceText::FStyle::bTabularDigits.
 	 */
 	TRACE_API float DrawLabel(AHUD* HUD, const FString& Text, float CenterX, float CenterY, float PlateH,
-		const FLinearColor& Color, float MaxWidth = 0.f, ETraceTextWeight Weight = ETraceTextWeight::Light);
+		const FLinearColor& Color, float MaxWidth = 0.f, ETraceTextWeight Weight = ETraceTextWeight::Light,
+		bool bTabularDigits = false);
 
 	// =============================================================================================
 	// CONTROLS
@@ -353,7 +438,8 @@ namespace TraceMenuKit
 
 	/**
 	 * A value box holding @p Text, centred. The sheet sets the number in olive; use white
-	 * (WordDefault) or WordHoverLifted(), never cyan. Draws nothing for an empty string.
+	 * (WordDefault) or WordHoverLifted(), never cyan. Draws nothing for an empty string. Its digits are
+	 * TABULAR: a value box holds a value, and a value that changes must not slide about in its box.
 	 */
 	TRACE_API bool DrawValueBox(AHUD* HUD, float X, float Y, float W, float H, const FString& Text,
 		const FLinearColor& TextColor = FLinearColor::White);

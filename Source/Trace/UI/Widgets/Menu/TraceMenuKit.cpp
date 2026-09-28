@@ -8,6 +8,7 @@
 #include "GameFramework/HUD.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
+#include "Misc/App.h"                   // FApp::GetCurrentTime — the UI's real clock (P10)
 #include "TextureResource.h"            // FTextureResource::TextureRHI — the guard
 #include "UObject/Package.h"            // GetTransientPackage — Trace.UI.Kit.Verify's unready texture
 
@@ -36,31 +37,232 @@ namespace TraceMenuKitFile
 	static FLinearColor GLastQuadTint = FLinearColor::Transparent;
 #endif
 
+	// ---- P10: the opacity every kit draw is multiplied by (TraceMenuKit::FScopedOpacity) ----------
+
+	/** Opacity() — 1 outside any scope. Game thread only, like every draw that reads it. */
+	static float GOpacity = 1.f;
+
+	/**
+	 * `Trace.UI.Motion 0` puts back the pre-P10 behaviour for a side-by-side: every FTraceKitFade snaps
+	 * to its target and every plate swaps its hover sprite in one frame. Not a player setting.
+	 */
+	static int32 GMotion = 1;
+	static FAutoConsoleVariableRef CVarMotion(
+		TEXT("Trace.UI.Motion"),
+		GMotion,
+		TEXT("1 (default): kit overlays fade open/closed on real time and plates ease their hover ring. ")
+		TEXT("0: every fade snaps and every hover swaps in one frame (the behaviour before P10), for a ")
+		TEXT("side-by-side comparison."),
+		ECVF_Default);
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * `Trace.UI.FadeScale 10`: every kit fade and hover ease takes ten times as long — a slow-motion
+	 * switch for photographing a fade half-way (a 150 ms fade is two or three frames of a headless
+	 * capture). Dev builds only; Trace.UI.Kit.Verify pins it to 1 while it measures.
+	 */
+	static float GFadeScale = 1.f;
+	static FAutoConsoleVariableRef CVarFadeScale(
+		TEXT("Trace.UI.FadeScale"),
+		GFadeScale,
+		TEXT("Dev only. Multiplies every kit fade and hover ease duration (1 = shipped timing). For ")
+		TEXT("capturing a fade mid-way; never leave it on."),
+		ECVF_Default);
+	static float FadeScale() { return FMath::Max(0.01f, GFadeScale); }
+#else
+	static constexpr float FadeScale() { return 1.f; }
+#endif
+
 	static void IssueTexturedQuad(AHUD* HUD, UTexture2D* Texture, const FTraceKitQuad& Quad,
 		const FLinearColor& Tint)
 	{
+		// The screen's fade, applied to every sprite quad in the kit at the one place they are issued.
+		FLinearColor Shown = Tint;
+		Shown.A *= GOpacity;
+		if (Shown.A <= 0.f)
+		{
+			return;
+		}
 		HUD->DrawTexture(Texture, Quad.X, Quad.Y, Quad.W, Quad.H, Quad.U, Quad.V, Quad.UW, Quad.VH,
-			Tint, BLEND_Translucent);
+			Shown, BLEND_Translucent);
 #if !UE_BUILD_SHIPPING
 		++GTexturedQuadsIssued;
-		GLastQuadTint = Tint;
+		GLastQuadTint = Shown;
 #endif
+	}
+
+	/** Every flat rect the kit draws, through the screen's fade. Nothing at alpha 0. */
+	static void FadedRect(AHUD* HUD, const FLinearColor& Color, float X, float Y, float W, float H)
+	{
+		const FLinearColor Shown = TraceMenuKit::Faded(Color);
+		if (Shown.A > 0.f && W > 0.f && H > 0.f)
+		{
+			HUD->DrawRect(Shown, X, Y, W, H);
+		}
 	}
 
 	/** A rect outline, @p Thick px, inside (X, Y, W, H). */
 	static void StrokeRect(AHUD* HUD, float X, float Y, float W, float H, float Thick, const FLinearColor& Color)
 	{
 		const float T = FMath::Min(Thick, FMath::Min(W, H) * 0.5f);
-		HUD->DrawRect(Color, X, Y, W, T);
-		HUD->DrawRect(Color, X, Y + H - T, W, T);
-		HUD->DrawRect(Color, X, Y + T, T, H - T * 2.f);
-		HUD->DrawRect(Color, X + W - T, Y + T, T, H - T * 2.f);
+		FadedRect(HUD, Color, X, Y, W, T);
+		FadedRect(HUD, Color, X, Y + H - T, W, T);
+		FadedRect(HUD, Color, X, Y + T, T, H - T * 2.f);
+		FadedRect(HUD, Color, X + W - T, Y + T, T, H - T * 2.f);
+	}
+
+	// ---- P10: hover transitions, one blend per plate rect ---------------------------------------
+
+	struct FHoverEntry
+	{
+		float Blend = 0.f;
+		double LastTime = 0.0;
+		uint64 LastFrame = 0;
+	};
+
+	static TMap<uint64, FHoverEntry> GHover;
+	static uint64 GHoverSweptAt = 0;
+
+	/** A plate's identity for the blend: its rect, rounded to whole pixels, 16 bits a side. */
+	static uint64 HoverKey(float X, float Y, float W, float H)
+	{
+		const uint64 KX = static_cast<uint64>(static_cast<uint16>(FMath::RoundToInt(X)));
+		const uint64 KY = static_cast<uint64>(static_cast<uint16>(FMath::RoundToInt(Y)));
+		const uint64 KW = static_cast<uint64>(static_cast<uint16>(FMath::RoundToInt(W)));
+		const uint64 KH = static_cast<uint64>(static_cast<uint16>(FMath::RoundToInt(H)));
+		return KX | (KY << 16) | (KW << 32) | (KH << 48);
+	}
+
+	/** One rate-limited step toward the target: InSeconds from 0 to 1, OutSeconds back. Real seconds. */
+	static float StepToward(float Value, bool bTarget, double Elapsed, float InSeconds, float OutSeconds)
+	{
+		if (Elapsed <= 0.0)
+		{
+			return Value;
+		}
+		return bTarget
+			? FMath::Min(1.f, Value + static_cast<float>(Elapsed / FMath::Max(1e-3f, InSeconds)))
+			: FMath::Max(0.f, Value - static_cast<float>(Elapsed / FMath::Max(1e-3f, OutSeconds)));
+	}
+
+	/**
+	 * THE blend, at an explicit frame and time (the harness drives it directly). A plate that was not
+	 * drawn on the previous frame starts AT its target: a page that has just opened must not animate a
+	 * highlight in under its own fade, and a plate whose rect moved is a new plate.
+	 */
+	static float HoverBlendAt(uint64 Key, bool bTarget, uint64 Frame, double NowSeconds)
+	{
+		if (GMotion == 0)
+		{
+			return bTarget ? 1.f : 0.f;
+		}
+
+		// Forget plates nobody has drawn for a while, so the table stays the size of one screen.
+		if (GHover.Num() > 256 || Frame > GHoverSweptAt + 600)
+		{
+			GHoverSweptAt = Frame;
+			for (auto It = GHover.CreateIterator(); It; ++It)
+			{
+				if (It.Value().LastFrame + 2 < Frame)
+				{
+					It.RemoveCurrent();
+				}
+			}
+		}
+
+		FHoverEntry* Entry = GHover.Find(Key);
+		if (Entry == nullptr || Entry->LastFrame + 1 < Frame)
+		{
+			FHoverEntry& Fresh = GHover.FindOrAdd(Key);
+			Fresh.Blend = bTarget ? 1.f : 0.f;
+			Fresh.LastTime = NowSeconds;
+			Fresh.LastFrame = Frame;
+			return Fresh.Blend;
+		}
+
+		// Same frame, same time: no time passes, so a second ask this frame reads the same value.
+		Entry->Blend = StepToward(Entry->Blend, bTarget, NowSeconds - Entry->LastTime,
+			TraceMenuKit::HoverInSeconds * FadeScale(), TraceMenuKit::HoverOutSeconds * FadeScale());
+		Entry->LastTime = NowSeconds;
+		Entry->LastFrame = Frame;
+		return Entry->Blend;
 	}
 
 	static FLinearColor Scaled(const FLinearColor& InColor, float InTint)
 	{
 		return FLinearColor(InColor.R * InTint, InColor.G * InTint, InColor.B * InTint, InColor.A);
 	}
+}
+
+// =================================================================================================
+// REAL TIME, OPACITY AND THE FADE (P10)
+// =================================================================================================
+
+double TraceMenuKit::RealSeconds()
+{
+	return FApp::GetCurrentTime();
+}
+
+float TraceMenuKit::Opacity()
+{
+	return TraceMenuKitFile::GOpacity;
+}
+
+TraceMenuKit::FScopedOpacity::FScopedOpacity(float Alpha)
+	: Saved(TraceMenuKitFile::GOpacity)
+{
+	TraceMenuKitFile::GOpacity = Saved * FMath::Clamp(Alpha, 0.f, 1.f);
+}
+
+TraceMenuKit::FScopedOpacity::~FScopedOpacity()
+{
+	TraceMenuKitFile::GOpacity = Saved;
+}
+
+FLinearColor TraceMenuKit::Faded(const FLinearColor& Color)
+{
+	return FLinearColor(Color.R, Color.G, Color.B, Color.A * TraceMenuKitFile::GOpacity);
+}
+
+float FTraceKitFade::Update(bool bShown, float InSeconds, float OutSeconds)
+{
+	return UpdateAt(bShown, TraceMenuKit::RealSeconds(), InSeconds, OutSeconds);
+}
+
+float FTraceKitFade::UpdateAt(bool bShown, double NowSeconds, float InSeconds, float OutSeconds)
+{
+	const float In = ((InSeconds > 0.f) ? InSeconds : TraceMenuKit::FadeInSeconds) * TraceMenuKitFile::FadeScale();
+	const float Out = ((OutSeconds > 0.f) ? OutSeconds : TraceMenuKit::FadeOutSeconds) * TraceMenuKitFile::FadeScale();
+
+	if (TraceMenuKitFile::GMotion == 0)
+	{
+		Progress = bShown ? 1.f : 0.f;
+	}
+	else if (LastTime >= 0.0)
+	{
+		// ELAPSED REAL SECONDS, not a per-frame step: the same 150 ms at 30 fps and at 240, and a long
+		// hitch simply finishes the fade. A clock that went backwards (a new world, a test rewinding)
+		// counts as no time.
+		Progress = TraceMenuKitFile::StepToward(Progress, bShown, FMath::Max(0.0, NowSeconds - LastTime), In, Out);
+	}
+
+	LastTime = NowSeconds;
+	bTarget = bShown;
+	return Alpha();
+}
+
+void FTraceKitFade::Snap(bool bShown)
+{
+	Progress = bShown ? 1.f : 0.f;
+	bTarget = bShown;
+}
+
+float FTraceKitFade::Alpha() const
+{
+	// Smoothstep: eases both ends, and because it is a function of Progress a reversal mid-fade is
+	// continuous in alpha as well as in progress.
+	const float P = FMath::Clamp(Progress, 0.f, 1.f);
+	return P * P * (3.f - 2.f * P);
 }
 
 // =================================================================================================
@@ -227,6 +429,34 @@ float TraceMenuKit::PlateTintAt(const FTraceKitVisuals& Visuals, float NowSecond
 	return Visuals.bPulses ? HoverPulse(NowSeconds) : Visuals.PlateTint;
 }
 
+float TraceMenuKit::HoverBlend(float X, float Y, float W, float H, bool bHovered)
+{
+	return TraceMenuKitFile::HoverBlendAt(TraceMenuKitFile::HoverKey(X, Y, W, H), bHovered, GFrameCounter,
+		RealSeconds());
+}
+
+FTraceKitVisuals TraceMenuKit::VisualsForBlend(ETraceKitState State, float Blend)
+{
+	if (State == ETraceKitState::Disabled || State == ETraceKitState::Pressed)
+	{
+		return VisualsFor(State);
+	}
+
+	const float B = FMath::Clamp(Blend, 0.f, 1.f);
+	const FTraceKitVisuals Off = VisualsFor(ETraceKitState::Default);
+	const FTraceKitVisuals On = VisualsFor(ETraceKitState::Hover);
+	FTraceKitVisuals Out = (B >= 0.5f) ? On : Off;
+	Out.Label = FMath::Lerp(Off.Label, On.Label, B);
+	Out.Furniture = FMath::Lerp(Off.Furniture, On.Furniture, B);
+	return Out;
+}
+
+FTraceKitVisuals TraceMenuKit::VisualsAt(ETraceKitState State, float X, float Y, float W, float H)
+{
+	const bool bLit = (State == ETraceKitState::Hover || State == ETraceKitState::Pressed);
+	return VisualsForBlend(State, HoverBlend(X, Y, W, H, bLit));
+}
+
 // =================================================================================================
 // PLATES
 // =================================================================================================
@@ -331,7 +561,8 @@ void TraceMenuKit::DrawFallbackPlate(AHUD* HUD, ETraceKitState State, float X, f
 	const bool bDisabled = (State == ETraceKitState::Disabled);
 	const float Thick = FMath::Max(1.f, FMath::RoundToFloat(H * 0.03f));
 
-	HUD->DrawRect(TraceMenuKitFile::Scaled(bDisabled ? TraceMenuArtStyle::DisabledFill : TraceMenuArtStyle::PlateFill, Tint),
+	TraceMenuKitFile::FadedRect(HUD,
+		TraceMenuKitFile::Scaled(bDisabled ? TraceMenuArtStyle::DisabledFill : TraceMenuArtStyle::PlateFill, Tint),
 		X, Y, W, H);
 
 	if (bDisabled)
@@ -352,14 +583,44 @@ void TraceMenuKit::DrawStatePlate(AHUD* HUD, ETraceKitState State, float X, floa
 		return;
 	}
 
-	const FTraceKitVisuals Visuals = VisualsFor(State);
-	const float PlateTint = PlateTintAt(Visuals, NowSeconds);
 	const float Corner = (CornerHeight > 0.f) ? CornerHeight : H;
+
+	// P10 — THE HOVER RING EASES ON AND OFF instead of swapping in one frame. Disabled and Pressed stay
+	// immediate (a press must feel instant), but still move the blend, so a plate released from a
+	// press or re-enabled continues from where it is rather than jumping.
+	const bool bLit = (State == ETraceKitState::Hover || State == ETraceKitState::Pressed);
+	const float Blend = HoverBlend(X, Y, W, H, bLit);
+	ETraceKitState Drawn = State;
+	if (State == ETraceKitState::Default || State == ETraceKitState::Hover)
+	{
+		Drawn = (Blend >= 1.f) ? ETraceKitState::Hover : ETraceKitState::Default;
+
+		if (Blend > 0.f && Blend < 1.f)
+		{
+			// Mid-transition: the default plate, and the hover plate (ring, glow and breath) laid over it
+			// at the blend. Both sprites share the navy body, so the body stays solid and only the ring
+			// comes and goes.
+			UTexture2D* Base = Sprite(ETraceKitSprite::BtnDefault);
+			UTexture2D* Lit = Sprite(ETraceKitSprite::BtnHover);
+			if (Base != nullptr && Lit != nullptr)
+			{
+				const float Breath = HoverPulse(NowSeconds);
+				DrawPlate(HUD, Base, TraceMenuArtStyle::ButtonFrame, X, Y, W, H, Corner, FLinearColor::White);
+				DrawPlate(HUD, Lit, TraceMenuArtStyle::ButtonFrame, X, Y, W, H, Corner,
+					FLinearColor(Breath, Breath, Breath, Blend));
+				return;
+			}
+			Drawn = (Blend >= 0.5f) ? ETraceKitState::Hover : ETraceKitState::Default;
+		}
+	}
+
+	const FTraceKitVisuals Visuals = VisualsFor(Drawn);
+	const float PlateTint = PlateTintAt(Visuals, NowSeconds);
 
 	if (!DrawPlate(HUD, Sprite(Visuals.Plate), TraceMenuArtStyle::ButtonFrame, X, Y, W, H, Corner,
 		FLinearColor(PlateTint, PlateTint, PlateTint, 1.f)))
 	{
-		DrawFallbackPlate(HUD, State, X, Y, W, H, PlateTint);
+		DrawFallbackPlate(HUD, Drawn, X, Y, W, H, PlateTint);
 	}
 }
 
@@ -389,7 +650,7 @@ bool TraceMenuKit::DrawPanelPlate(AHUD* HUD, ETraceKitState State, float X, floa
 	FLinearColor Fill = TraceMenuKitFile::Scaled(bDisabled ? TraceMenuArtStyle::DisabledFill : TraceMenuArtStyle::PlateFill,
 		PlateTint);
 	Fill.A = A;
-	HUD->DrawRect(Fill, X, Y, W, H);
+	TraceMenuKitFile::FadedRect(HUD, Fill, X, Y, W, H);
 
 	if (bDisabled || State == ETraceKitState::Hover || State == ETraceKitState::Pressed)
 	{
@@ -411,7 +672,7 @@ float TraceMenuKit::LabelSize(float PlateH, ETraceTextWeight Weight)
 }
 
 float TraceMenuKit::DrawLabel(AHUD* HUD, const FString& Text, float CenterX, float CenterY, float PlateH,
-	const FLinearColor& Color, float MaxWidth, ETraceTextWeight Weight)
+	const FLinearColor& Color, float MaxWidth, ETraceTextWeight Weight, bool bTabularDigits)
 {
 	if (HUD == nullptr || Text.IsEmpty() || PlateH <= 0.f)
 	{
@@ -419,6 +680,7 @@ float TraceMenuKit::DrawLabel(AHUD* HUD, const FString& Text, float CenterX, flo
 	}
 
 	TraceText::FStyle Style(LabelSize(PlateH, Weight), Color, Weight);
+	Style.bTabularDigits = bTabularDigits;
 	if (MaxWidth > 0.f)
 	{
 		const float Natural = TraceText::MeasureWidth(Text, Style);
@@ -452,7 +714,8 @@ bool TraceMenuKit::DrawButton(AHUD* HUD, ETraceKitState State, float X, float Y,
 
 	// A tall card keeps a button-sized corner, and a button-sized word with it.
 	const float WordPlateH = (CornerHeight > 0.f) ? FMath::Min(CornerHeight, H) : H;
-	DrawLabel(HUD, Label, X + W * 0.5f, Y + H * 0.5f, WordPlateH, VisualsFor(State).Label,
+	// The word follows the plate's blend (VisualsAt reads the value DrawStatePlate just advanced).
+	DrawLabel(HUD, Label, X + W * 0.5f, Y + H * 0.5f, WordPlateH, VisualsAt(State, X, Y, W, H).Label,
 		W - WordPlateH * LabelPadFraction * 2.f);
 	return true;
 }
@@ -466,7 +729,7 @@ void TraceMenuKit::DrawValueBoxPlate(AHUD* HUD, float X, float Y, float W, float
 
 	if (!DrawPlate(HUD, Sprite(ETraceKitSprite::ValueBox), TraceMenuArtStyle::ValueFrame, X, Y, W, H, H, Tint))
 	{
-		HUD->DrawRect(TraceMenuArtStyle::PlateFill, X, Y, W, H);
+		TraceMenuKitFile::FadedRect(HUD, TraceMenuArtStyle::PlateFill, X, Y, W, H);
 		TraceMenuKitFile::StrokeRect(HUD, X, Y, W, H, FMath::Max(1.f, FMath::RoundToFloat(H * 0.04f)),
 			TraceMenuArtStyle::ValueGlowLifted());
 	}
@@ -481,7 +744,8 @@ bool TraceMenuKit::DrawValueBox(AHUD* HUD, float X, float Y, float W, float H, c
 	}
 
 	DrawValueBoxPlate(HUD, X, Y, W, H);
-	DrawLabel(HUD, Text, X + W * 0.5f, Y + H * 0.5f, H, TextColor, W - H * LabelPadFraction * 2.f);
+	DrawLabel(HUD, Text, X + W * 0.5f, Y + H * 0.5f, H, TextColor, W - H * LabelPadFraction * 2.f,
+		ETraceTextWeight::Light, /*bTabularDigits=*/true);
 	return true;
 }
 
@@ -495,7 +759,7 @@ void TraceMenuKit::DrawSliderTrack(AHUD* HUD, float X, float Y, float W, float H
 	UTexture2D* Track = Sprite(ETraceKitSprite::SliderTrack);
 	if (Track == nullptr)
 	{
-		HUD->DrawRect(TraceMenuArtStyle::PlateFill, X, Y + H * TrackRailTopV, W, FMath::Max(2.f, H * TrackRailV));
+		TraceMenuKitFile::FadedRect(HUD, TraceMenuArtStyle::PlateFill, X, Y + H * TrackRailTopV, W, FMath::Max(2.f, H * TrackRailV));
 		return;
 	}
 
@@ -562,7 +826,7 @@ void TraceMenuKit::DrawSliderHandle(AHUD* HUD, float CenterX, float CenterY, flo
 	}
 
 	const float BarW = FMath::Max(2.f, static_cast<float>(Size.X) * 0.25f);
-	HUD->DrawRect(Tint, CenterX - BarW * 0.5f, static_cast<float>(Rect.Min.Y), BarW, static_cast<float>(Size.Y));
+	TraceMenuKitFile::FadedRect(HUD, Tint, CenterX - BarW * 0.5f, static_cast<float>(Rect.Min.Y), BarW, static_cast<float>(Size.Y));
 }
 
 float TraceMenuKit::KeyChipWidth(const FString& Key, float H)
@@ -586,7 +850,8 @@ float TraceMenuKit::DrawKeyChip(AHUD* HUD, ETraceKitState State, float X, float 
 	}
 
 	DrawStatePlate(HUD, State, X, Y, W, H, NowSeconds, H);
-	DrawLabel(HUD, Key, X + W * 0.5f, Y + H * 0.5f, H, VisualsFor(State).Label, W - H * LabelPadFraction * 2.f);
+	DrawLabel(HUD, Key, X + W * 0.5f, Y + H * 0.5f, H, VisualsAt(State, X, Y, W, H).Label,
+		W - H * LabelPadFraction * 2.f);
 	return W;
 }
 
@@ -716,7 +981,7 @@ void TraceMenuKit::DrawBackground(AHUD* HUD, float ViewW, float ViewH)
 {
 	if (HUD != nullptr)
 	{
-		HUD->DrawRect(Background, 0.f, 0.f, ViewW, ViewH);
+		TraceMenuKitFile::FadedRect(HUD, Background, 0.f, 0.f, ViewW, ViewH);
 	}
 }
 
@@ -724,7 +989,7 @@ void TraceMenuKit::DrawScrim(AHUD* HUD, float ViewW, float ViewH, float Alpha)
 {
 	if (HUD != nullptr)
 	{
-		HUD->DrawRect(FLinearColor(0.f, 0.f, 0.f, FMath::Clamp(Alpha, 0.f, 1.f)), 0.f, 0.f, ViewW, ViewH);
+		TraceMenuKitFile::FadedRect(HUD, FLinearColor(0.f, 0.f, 0.f, FMath::Clamp(Alpha, 0.f, 1.f)), 0.f, 0.f, ViewW, ViewH);
 	}
 }
 
@@ -1293,6 +1558,224 @@ namespace TraceMenuKitFile
 		// ---- 9. PRIME LOADS EVERY SPRITE ---------------------------------------------------------
 		Check(TEXT("Prime() loads every kit sprite"), TraceMenuKit::Prime() == SpriteCount,
 			FString::Printf(TEXT("%d/%d"), TraceMenuKit::Prime(), SpriteCount));
+
+		// ---- 10. P10: A FADE TAKES THE SAME REAL TIME AT ANY FRAME RATE -----------------------------
+		//
+		// Driven with explicit timestamps, frame by frame, at four frame rates. A per-frame step (the
+		// failure this guards against) would open in 9 frames at every rate: 38 ms at 240 fps, 300 ms at
+		// 30 fps. The fade must instead be at the same place at the same TIME.
+		{
+			// GMotion and the fade scale are console knobs; the check measures the shipped behaviour.
+			const int32 SavedMotion = GMotion;
+			const float SavedScale = GFadeScale;
+			GMotion = 1;
+			GFadeScale = 1.f;
+
+			const float Rates[] = { 30.f, 60.f, 144.f, 240.f };
+			const double Probe = TraceMenuKit::FadeInSeconds * 0.5;
+			float AtProbe[4] = {};
+			float Worst = 0.f;
+			bool bAllOpenOnTime = true;
+			FString Detail;
+			for (int32 Each = 0; Each < 4; ++Each)
+			{
+				FTraceKitFade Fade;
+				const double Step = 1.0 / Rates[Each];
+				double T = 100.0;
+				Fade.UpdateAt(false, T);
+				const double OpenedAt = T;
+				bool bProbed = false;
+				while (T - OpenedAt < TraceMenuKit::FadeInSeconds + 0.1)
+				{
+					T += Step;
+					Fade.UpdateAt(true, T);
+					if (!bProbed && (T - OpenedAt) >= Probe)
+					{
+						// Interpolated back to the probe instant so a frame boundary is not a difference.
+						AtProbe[Each] = Fade.Linear() - static_cast<float>(((T - OpenedAt) - Probe) / TraceMenuKit::FadeInSeconds);
+						bProbed = true;
+					}
+					if ((T - OpenedAt) >= TraceMenuKit::FadeInSeconds + 1e-6 && !Fade.IsFullyShown())
+					{
+						bAllOpenOnTime = false;
+					}
+					if ((T - OpenedAt) < TraceMenuKit::FadeInSeconds - Step && Fade.IsFullyShown())
+					{
+						bAllOpenOnTime = false;   // finished early: a per-frame step at a high rate
+					}
+				}
+				Worst = FMath::Max(Worst, FMath::Abs(AtProbe[Each] - 0.5f));
+				Detail += FString::Printf(TEXT("%.0ffps %.3f  "), Rates[Each], AtProbe[Each]);
+			}
+			Check(TEXT("P10: a fade is half open at half its time, at 30/60/144/240 fps"),
+				Worst < 0.01f, Detail);
+			Check(TEXT("P10: ...and fully open at FadeInSeconds, not a frame count"),
+				bAllOpenOnTime, FString::Printf(TEXT("%.0f ms"), TraceMenuKit::FadeInSeconds * 1000.f));
+
+			// A close that interrupts an open turns round from where it is: no jump in alpha.
+			FTraceKitFade Turn;
+			double T = 50.0;
+			Turn.UpdateAt(false, T);
+			float Previous = 0.f;
+			float WorstJump = 0.f;
+			for (int32 Frame = 0; Frame < 30; ++Frame)
+			{
+				T += 1.0 / 60.0;
+				const float A = Turn.UpdateAt(Frame < 4, T);
+				WorstJump = FMath::Max(WorstJump, FMath::Abs(A - Previous));
+				Previous = A;
+			}
+			Check(TEXT("P10: an open reversed mid-fade closes from where it was"),
+				WorstJump < 0.25f && Previous == 0.f,
+				FString::Printf(TEXT("largest per-frame change %.3f, ends at %.2f"), WorstJump, Previous));
+
+			// Two updates in one frame (the HUD advances the pause menu's fade, then the menu's Tick does).
+			FTraceKitFade Twice;
+			Twice.UpdateAt(false, 10.0);
+			const float First = Twice.UpdateAt(true, 10.05);
+			const float Second = Twice.UpdateAt(true, 10.05);
+			Check(TEXT("P10: a second update in the same frame changes nothing"), First == Second && First > 0.f,
+				FString::Printf(TEXT("%.3f then %.3f"), First, Second));
+
+			GMotion = SavedMotion;
+			GFadeScale = SavedScale;
+		}
+
+		// ---- 11. P10: THE SCREEN'S OPACITY SCOPE ---------------------------------------------------
+		{
+			const float Before = TraceMenuKit::Opacity();
+			float Inner = 0.f;
+			float Outer = 0.f;
+			FLinearColor Shown = FLinearColor::White;
+			{
+				TraceMenuKit::FScopedOpacity Half(0.5f);
+				Outer = TraceMenuKit::Opacity();
+				{
+					TraceMenuKit::FScopedOpacity Again(0.5f);
+					Inner = TraceMenuKit::Opacity();
+					Shown = TraceMenuKit::Faded(FLinearColor(1.f, 1.f, 1.f, 0.8f));
+				}
+			}
+			Check(TEXT("P10: opacity scopes multiply, and restore on exit"),
+				Before == 1.f && FMath::IsNearlyEqual(Outer, 0.5f) && FMath::IsNearlyEqual(Inner, 0.25f)
+					&& FMath::IsNearlyEqual(Shown.A, 0.2f) && TraceMenuKit::Opacity() == 1.f,
+				FString::Printf(TEXT("%.2f -> %.2f -> %.2f; 0.8 alpha drawn at %.2f"), Before, Outer, Inner, Shown.A));
+
+			AHUD* LiveHUD = FindLocalHUD();
+			if (LiveHUD != nullptr && TraceMenuKit::Sprite(ETraceKitSprite::BtnDefault) != nullptr)
+			{
+				const int64 BeforeQuads = GTexturedQuadsIssued;
+				{
+					TraceMenuKit::FScopedOpacity Faint(0.4f);
+					TraceMenuKit::DrawPanelPlate(LiveHUD, ETraceKitState::Default, 10.f, 10.f, 200.f, 40.f, 0.f, 0.5f);
+				}
+				Check(TEXT("P10: a kit plate drawn inside a scope carries the scope's opacity"),
+					GTexturedQuadsIssued > BeforeQuads && FMath::IsNearlyEqual(GLastQuadTint.A, 0.2f, 1e-4f),
+					FString::Printf(TEXT("panel alpha 0.5 in a 0.4 scope drew at %.3f"), GLastQuadTint.A));
+			}
+			else
+			{
+				Check(TEXT("P10: a kit plate drawn inside a scope carries the scope's opacity"), false,
+					TEXT("INCONCLUSIVE: needs a local HUD and a drawable plate - run in a game world"));
+			}
+		}
+
+		// ---- 12. P10: THE HOVER RING EASES, ON REAL TIME ------------------------------------------
+		{
+			const int32 SavedMotion = GMotion;
+			const float SavedScale = GFadeScale;
+			const uint64 SavedSweep = GHoverSweptAt;
+			GMotion = 1;
+			GFadeScale = 1.f;
+			const uint64 Key = HoverKey(-3000.f, -3000.f, 97.f, 31.f);   // a rect no screen draws
+			GHover.Remove(Key);
+
+			// A plate seen for the first time starts AT its target (a page that just opened does not
+			// animate its highlight in under its own fade).
+			const float Fresh = HoverBlendAt(Key, true, 1000, 5.0);
+
+			// Then off, at 60 fps: it must take HoverOutSeconds, whatever the frame rate.
+			float At60 = 1.f;
+			uint64 Frame = 1000;
+			double T = 5.0;
+			const double Half = TraceMenuKit::HoverOutSeconds * 0.5;
+			while (T - 5.0 < Half - 1e-9)
+			{
+				T += 1.0 / 60.0;
+				At60 = HoverBlendAt(Key, false, ++Frame, T);
+			}
+			GHover.Remove(Key);
+			HoverBlendAt(Key, true, 5000, 20.0);
+			float At144 = 1.f;
+			Frame = 5000;
+			T = 20.0;
+			while (T - 20.0 < Half - 1e-9)
+			{
+				T += 1.0 / 144.0;
+				At144 = HoverBlendAt(Key, false, ++Frame, T);
+			}
+			// A gap of a frame (the plate was not drawn) and it starts over at its target.
+			const float AfterGap = HoverBlendAt(Key, true, Frame + 5, T + 0.2);
+			GHover.Remove(Key);
+			GMotion = SavedMotion;
+			GFadeScale = SavedScale;
+			GHoverSweptAt = SavedSweep;
+
+			Check(TEXT("P10: a plate seen for the first time starts at its target"), Fresh == 1.f,
+				FString::Printf(TEXT("%.2f"), Fresh));
+			Check(TEXT("P10: the hover ring is half off at half HoverOutSeconds, 60 or 144 fps"),
+				FMath::Abs(At60 - 0.5f) < 0.07f && FMath::Abs(At144 - 0.5f) < 0.04f,
+				FString::Printf(TEXT("60fps %.3f, 144fps %.3f (%.0f ms)"), At60, At144,
+					TraceMenuKit::HoverOutSeconds * 1000.f));
+			Check(TEXT("P10: a plate that was not drawn last frame starts over at its target"), AfterGap == 1.f,
+				FString::Printf(TEXT("%.2f"), AfterGap));
+			const FTraceKitVisuals Mid = TraceMenuKit::VisualsForBlend(ETraceKitState::Hover, 0.5f);
+			const FLinearColor Expect = FMath::Lerp(TraceMenuArtStyle::WordDefault, TraceMenuArtStyle::WordHoverLifted(), 0.5f);
+			Check(TEXT("P10: the word eases with the ring (half-way colour at half blend)"),
+				Mid.Label.Equals(Expect, 1e-4f),
+				FString::Printf(TEXT("(%.3f, %.3f, %.3f)"), Mid.Label.R, Mid.Label.G, Mid.Label.B));
+		}
+
+		// ---- 13. P10: TABULAR FIGURES -----------------------------------------------------------------
+		//
+		// The clock, the countdowns, the slider values and the FPS readout ask for them; every digit
+		// must then take the same advance in every face, so "11:11" and "00:00" are the same width.
+		{
+			FString Detail;
+			bool bSteady = true;
+			bool bProportionalDiffers = false;
+			for (int32 Face = 0; Face < static_cast<int32>(ETraceTextWeight::Count); ++Face)
+			{
+				TraceText::FStyle Tab(40.f, FLinearColor::White, static_cast<ETraceTextWeight>(Face));
+				Tab.bTabularDigits = true;
+				const float W11 = TraceText::MeasureWidth(TEXT("11:11"), Tab);
+				const float W00 = TraceText::MeasureWidth(TEXT("00:00"), Tab);
+				const float W47 = TraceText::MeasureWidth(TEXT("47:29"), Tab);
+				bSteady &= FMath::IsNearlyEqual(W11, W00, 0.01f) && FMath::IsNearlyEqual(W47, W00, 0.01f);
+
+				TraceText::FStyle Prop = Tab;
+				Prop.bTabularDigits = false;
+				const float P11 = TraceText::MeasureWidth(TEXT("11:11"), Prop);
+				const float P00 = TraceText::MeasureWidth(TEXT("00:00"), Prop);
+				bProportionalDiffers |= !FMath::IsNearlyEqual(P11, P00, 0.5f);
+
+				Detail += FString::Printf(TEXT("%s: %.1f/%.1f/%.1f (prop %.1f/%.1f)  "),
+					TraceText::WeightName(static_cast<ETraceTextWeight>(Face)), W11, W00, W47, P11, P00);
+			}
+			Check(TEXT("P10: tabular digits keep a ticking number's width, every face"),
+				bSteady && bProportionalDiffers && TraceText::IsAtlasActive(), Detail);
+
+			// ...and a '1' sits CENTRED in its wider cell: its quad is shifted, not left-aligned.
+			TraceText::FStyle One(40.f, FLinearColor::White, ETraceTextWeight::Light);
+			One.bTabularDigits = true;
+			TArray<TraceText::FGlyphQuad> Quads;
+			const bool bLaid = TraceText::LayoutString(TEXT("1"), One, Quads);
+			const float Cell = TraceText::MeasureWidth(TEXT("1"), One);
+			const float Centre = (bLaid && Quads.Num() == 1) ? (Quads[0].Pos.X + Quads[0].Size.X * 0.5f) : -1.f;
+			Check(TEXT("P10: ...and a narrow digit is centred in the tabular cell"),
+				bLaid && Quads.Num() == 1 && FMath::IsNearlyEqual(Centre, Cell * 0.5f, 0.05f),
+				FString::Printf(TEXT("'1' centre %.2f in a %.2f cell"), Centre, Cell));
+		}
 
 		if (Failures == 0)
 		{

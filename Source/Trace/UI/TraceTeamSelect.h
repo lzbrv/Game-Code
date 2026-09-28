@@ -54,6 +54,7 @@
 #include "UObject/WeakObjectPtr.h"
 
 #include "TraceTypes.h"   // ETraceTeam
+#include "UI/Widgets/Menu/TraceKitMotion.h"   // FTraceKitFade — the page's open/close fade (P10)
 
 class AHUD;
 class ATracePlayerController;
@@ -72,6 +73,13 @@ class TRACE_API FTraceTeamSelect
 public:
 	/** True while the overlay is being drawn. The host folds this into its own IsOpen(). */
 	bool IsOpen() const { return bOpen; }
+
+	/**
+	 * P10: the page's opacity this frame, 0..1 — fading in after it opens, fading out (drawn as it last
+	 * stood, with no input and no pointer) for FadeOutSeconds after it closes. IsOpen() is unchanged by
+	 * the fade: input, the pointer and every rule still follow the replicated flag alone.
+	 */
+	float GetFadeAlpha() const { return Fade.Alpha(); }
 
 	/**
 	 * Poll input and draw. Call exactly once per frame, before the character select's own draw.
@@ -147,6 +155,16 @@ private:
 	FString VerdictLine(const ATracePlayerController* PC) const;
 
 	bool bOpen = false;
+
+	/** P10 — the page's open/close fade, on real time. See GetFadeAlpha. */
+	FTraceKitFade Fade;
+
+	/**
+	 * The clock the page ANIMATES on (hover breath, the urgent countdown pulse): the world's REAL time,
+	 * which keeps running under the pause menu. Now (the host's world time) stays the clock of this
+	 * page's logic, because the verdict timestamps it is compared with are world time.
+	 */
+	float AnimNow = 0.f;
 
 	/**
 	 * 0..RowCount-1. STARTS ON THE PLAYER'S OWN TEAM, so the reflex "continue" press — ENTER or A —

@@ -111,6 +111,9 @@ public:
 	 */
 	bool IsTeamSelectOpen() const { return TeamSelect.IsOpen(); }
 
+	/** P10: the team page's fade this frame (0..1), fading out included. See FTraceTeamSelect::GetFadeAlpha. */
+	float GetTeamSelectFadeAlpha() const { return TeamSelect.GetFadeAlpha(); }
+
 	/**
 	 * Poll input and draw. Call exactly once per frame from the owning AHUD::DrawHUD.
 	 *
