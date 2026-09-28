@@ -54,6 +54,8 @@ SOURCE = os.path.join(ROOT, "Source", "Trace")
 USING_RE = re.compile(r"^\s*using\s+namespace\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;")
 
 # `namespace`, `namespace Foo`, `namespace Foo::Bar` - with or without its brace.
+USING_ANYWHERE_RE = re.compile(r"using\s+namespace\s+[A-Za-z_][A-Za-z0-9_:]*\s*;")
+
 NAMESPACE_RE = re.compile(r"^\s*namespace\b[^{;]*$|^\s*namespace\b[^{;]*\{")
 
 
@@ -104,24 +106,30 @@ def scan(path):
             work = re.sub(r'"(\\.|[^"\\])*"', '""', work)
             work = re.sub(r"'(\\.|[^'\\])*'", "''", work)
 
-            match = USING_RE.match(line)
-            if match and all(stack):
-                out.append((line_no, line.strip()))
-
-            # `namespace Foo` may put its brace on this line or the next.
+            # CHARACTER BY CHARACTER, so a directive is judged by the braces open AT ITS POSITION —
+            # not by where the line starts. `namespace { using namespace X; }` on one line is exactly
+            # as dangerous as the three-line form, and a line-start regex waved it through.
             if NAMESPACE_RE.match(work):
                 pending_namespace = True
 
-            for char in work:
-                if char == "{":
+            i = 0
+            while i < len(work):
+                ch = work[i]
+                if ch == "{":
                     stack.append(pending_namespace)
                     pending_namespace = False
-                elif char == "}":
+                elif ch == "}":
                     if stack:
                         stack.pop()
-
-            if "{" in work:
-                pending_namespace = False
+                elif work.startswith("namespace", i) and (i == 0 or not (work[i-1].isalnum() or work[i-1] == "_")):
+                    # a `namespace` keyword mid-line opens a namespace brace at the next '{'
+                    if not work.startswith("using", max(0, i - 6)):
+                        pending_namespace = True
+                elif work.startswith("using", i) and (i == 0 or not (work[i-1].isalnum() or work[i-1] == "_")):
+                    m = USING_ANYWHERE_RE.match(work, i)
+                    if m and all(stack):
+                        out.append((line_no, line.strip()))
+                i += 1
 
     return out
 

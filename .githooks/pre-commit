@@ -17,11 +17,13 @@ set -e
 
 ROOT=$(git rev-parse --show-toplevel)
 
-# Nothing staged under Config/ means nothing to check; stay silent and fast.
+# Whether any Config/*.ini is staged. ONLY the config check below depends on this — it used to
+# `exit 0` here, which meant a Source-only commit never reached the unity-hygiene check at the
+# bottom, so the one Windows-build safety net a Mac can run was silently disarmed for exactly the
+# commits that need it most.
+CONFIG_STAGED=0
 if git diff --cached --name-only --diff-filter=ACM | grep -qiE '^Config/.*\.ini$'; then
-    :
-else
-    exit 0
+    CONFIG_STAGED=1
 fi
 
 # Windows installs frequently expose python as `python`, not `python3`.
@@ -32,7 +34,7 @@ else
     exit 0
 fi
 
-if ! "$PY" "$ROOT/Scripts/config-hygiene.py" --check; then
+if [ "$CONFIG_STAGED" = "1" ] && ! "$PY" "$ROOT/Scripts/config-hygiene.py" --check; then
     echo
     echo "pre-commit: refusing the commit - Config/*.ini carries editor noise."
     echo "  Fix it:      $PY Scripts/config-hygiene.py --fix && git add Config"
