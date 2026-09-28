@@ -394,6 +394,51 @@ void ClearFailure()
 	LastFailureTime = -1.0;
 }
 
+// The title screen's JOIN attempt, remembered across the reload a failed join causes. Named, not
+// anonymous: this module is a unity build (Scripts/check-jumbo-build-collisions.py).
+namespace TraceNetJoinAttempt
+{
+	/** FPlatformTime::Seconds() when the last JOIN started dialling; negative when none is pending. */
+	static double StartTime = -1.0;
+
+	/** A failure more than this long after the attempt began is not about the attempt (a match that
+	 *  was joined and later dropped). The engine's own connect timeouts are well inside it. */
+	static constexpr double ConnectWindowSeconds = 150.0;
+
+	/** A failure older than this when the title comes back is stale. */
+	static constexpr double FreshSeconds = 60.0;
+}
+
+void NoteJoinAttempt()
+{
+	TraceNetJoinAttempt::StartTime = FPlatformTime::Seconds();
+}
+
+void ForgetJoinAttempt()
+{
+	TraceNetJoinAttempt::StartTime = -1.0;
+}
+
+bool ConsumeFailedJoin(FString& OutHeadline, FString& OutDetail)
+{
+	const double Started = TraceNetJoinAttempt::StartTime;
+	TraceNetJoinAttempt::StartTime = -1.0;
+
+	if (Started < 0.0 || LastFailureTime < Started)
+	{
+		return false;
+	}
+	if (LastFailureTime - Started > TraceNetJoinAttempt::ConnectWindowSeconds
+		|| FPlatformTime::Seconds() - LastFailureTime > TraceNetJoinAttempt::FreshSeconds)
+	{
+		return false;
+	}
+
+	OutHeadline = LastFailureHeadline;
+	OutDetail = LastFailureDetail;
+	return true;
+}
+
 bool GetLastFailure(FString& OutHeadline, FString& OutDetail, double& OutAgeSeconds)
 {
 	if (LastFailureTime < 0.0)
@@ -844,6 +889,34 @@ bool FTraceTextEntry::ConsumeCancel()
 	const bool bResult = bCancelled;
 	bCancelled = false;
 	return bResult;
+}
+
+bool FTraceTextEntry::PasteReplace(const FString& Raw, float Now)
+{
+	// The same rule as the Ctrl/Cmd+V branch of Poll: one line, legal characters only, for THIS
+	// opening's charset. People paste "  100.1.2.3:7777\n" out of a terminal all the time.
+	FString Cleaned;
+	for (const TCHAR Char : Raw)
+	{
+		if (Char == TEXT('\n') || Char == TEXT('\r'))
+		{
+			break;
+		}
+		if (IsLegalChar(Charset, Char))
+		{
+			Cleaned.AppendChar(Char);
+		}
+	}
+	if (Cleaned.IsEmpty())
+	{
+		return false;
+	}
+
+	Text = Cleaned.Left(MaxLength);
+	Caret = Text.Len();
+	LastPasteTime = Now;
+	LastEditTime = Now;
+	return true;
 }
 
 bool FTraceTextEntry::IsCaretVisible(float Now) const

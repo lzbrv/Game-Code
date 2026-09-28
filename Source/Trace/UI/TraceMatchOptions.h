@@ -78,11 +78,32 @@ namespace TraceDifficulty
 	/** URL option carried across the travel from the menu into the arena: "?difficulty=easy". */
 	inline const TCHAR* UrlOption = TEXT("difficulty");
 
-	/** "EASY" / "NORMAL" / "HARD", for the menu and the in-game HUD. */
+	/**
+	 * "EASY" / "NORMAL" / "HARD", for the menu — Ranen's words, from Config/TraceGameText.ini
+	 * (MENU.DIFFICULTY_*). NEVER used to build the travel URL: see ToUrlValue.
+	 */
 	TRACE_API FString ToDisplayName(ETraceBotDifficulty Difficulty);
 
-	/** Lowercase token used in the travel URL. */
+	/**
+	 * Lowercase token used in the travel URL: "easy" / "normal" / "hard", FIXED. It used to be the
+	 * display name lower-cased, so renaming the label in the text document would have changed the
+	 * token the arena parses and silently played every match on the default difficulty.
+	 */
 	TRACE_API FString ToUrlValue(ETraceBotDifficulty Difficulty);
+
+	/** The title screen's one line under the rows when DIFFICULTY is selected (MENU.BLURB_DIFFICULTY_*). */
+	TRACE_API FString ToBlurb(ETraceBotDifficulty Difficulty);
+
+	/**
+	 * The difficulty this machine last picked on the title screen, or Default when it never has.
+	 * GameUserSettings.ini (per machine, outside source control), the same storage TraceCharacters
+	 * uses. The title screen seeds its DIFFICULTY row from it, so a HARD player who comes back from a
+	 * match finds HARD, not NORMAL.
+	 */
+	TRACE_API ETraceBotDifficulty GetSavedSetting();
+
+	/** Saves @p Difficulty for GetSavedSetting and flushes it. A no-op when nothing changed. */
+	TRACE_API void SetSavedSetting(ETraceBotDifficulty Difficulty);
 
 	/** Parses "easy"/"normal"/"hard" or "0"/"1"/"2". Falls back to Default on anything else. */
 	TRACE_API ETraceBotDifficulty FromUrlValue(const FString& Value);

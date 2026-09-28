@@ -82,14 +82,24 @@ void ATraceMenuPlayerController::SetupInputComponent()
 		InputComponent->BindKey(Key, IE_Released, this, Handler).bConsumeInput = false;
 	};
 
-	Bind(EKeys::Up,        &ATraceMenuPlayerController::OnUp);
-	Bind(EKeys::W,         &ATraceMenuPlayerController::OnUp);
-	Bind(EKeys::Down,      &ATraceMenuPlayerController::OnDown);
-	Bind(EKeys::S,         &ATraceMenuPlayerController::OnDown);
-	Bind(EKeys::Left,      &ATraceMenuPlayerController::OnLeft);
-	Bind(EKeys::A,         &ATraceMenuPlayerController::OnLeft);
-	Bind(EKeys::Right,     &ATraceMenuPlayerController::OnRight);
-	Bind(EKeys::D,         &ATraceMenuPlayerController::OnRight);
+	// HELD KEYS REPEAT. The OS's key repeat reaches an InputComponent as IE_Repeat, not as another
+	// IE_Pressed, so a navigation key bound on IE_Pressed alone stepped exactly once however long it was
+	// held — while the pad on this same screen, and every other menu, repeats. Bound on both, the
+	// keyboard repeats at the player's own system rate.
+	auto BindWithRepeat = [this, &Bind](const FKey& Key, void (ATraceMenuPlayerController::*Handler)())
+	{
+		Bind(Key, Handler);
+		InputComponent->BindKey(Key, IE_Repeat, this, Handler).bConsumeInput = false;
+	};
+
+	BindWithRepeat(EKeys::Up,    &ATraceMenuPlayerController::OnUp);
+	BindWithRepeat(EKeys::W,     &ATraceMenuPlayerController::OnUp);
+	BindWithRepeat(EKeys::Down,  &ATraceMenuPlayerController::OnDown);
+	BindWithRepeat(EKeys::S,     &ATraceMenuPlayerController::OnDown);
+	BindWithRepeat(EKeys::Left,  &ATraceMenuPlayerController::OnLeft);
+	BindWithRepeat(EKeys::A,     &ATraceMenuPlayerController::OnLeft);
+	BindWithRepeat(EKeys::Right, &ATraceMenuPlayerController::OnRight);
+	BindWithRepeat(EKeys::D,     &ATraceMenuPlayerController::OnRight);
 	Bind(EKeys::Enter,     &ATraceMenuPlayerController::OnAccept);
 	Bind(EKeys::SpaceBar,  &ATraceMenuPlayerController::OnAccept);
 	Bind(EKeys::Escape,    &ATraceMenuPlayerController::OnCancel);

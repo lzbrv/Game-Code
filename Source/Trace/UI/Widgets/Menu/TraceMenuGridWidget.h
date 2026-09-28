@@ -59,11 +59,10 @@
 //           therefore literally the same colour, which is what stops the background reading as a
 //           second design. The old grid's pure cyan, sRGB(111,241,255), is a different hue from
 //           anything the artist drew.
-//   AMBER   TraceMenuArtStyle::Amber = RGB(116,58,0), the same way: sRGB(255,135,0). Measured
-//           against the wordmark's own glow (TraceTitleMenuWidget's WordmarkGlow, RGB(255,140,40))
-//           that is 5 bytes of green and 40 of blue apart — the same colour to the eye. It appears
-//           in exactly ONE place, the horizon, so the brightest line in the background is the same
-//           colour as the brightest thing in the title.
+//   AMBER   TraceMenuArtStyle::Amber = RGB(116,58,0), the same way: sRGB(255,135,0) — the hue of
+//           the wordmark's own amber glow (the slicer ships it at AmberLifted, RGB(255,128,0)). It
+//           appears in exactly ONE place, the horizon, so the brightest line in the background is
+//           the same colour as the glow around the title.
 //
 // "Grungy" is four specific departures from the clean neon original, all of them cheap:
 //   1. every rung is drawn as nine independently jittered cells with occasional near-dropouts, so no
@@ -147,7 +146,13 @@ struct FTraceMenuGridParams
 
 	float RailAlpha = 0.085f;
 	float RungAlpha = 0.115f;
-	float HazeStrength = 0.13f;
+	/**
+	 * 0.06, down from 0.13. The handmade kit's ONLY hover signal is the orange glow baked into the
+	 * hover plate, and at 0.13 this amber wash tinted the black beside the DIFFICULTY and SETTINGS
+	 * rows orange (measured sRGB(148,80,6) next to the stack), so the background competed with the
+	 * selection. The owner-requested grid and its amber horizon line are unchanged.
+	 */
+	float HazeStrength = 0.06f;
 	float HazeHeightFraction = 0.30f;
 	float HorizonHaloAlpha = 0.13f;
 	float HorizonMidAlpha = 0.28f;

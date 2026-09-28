@@ -555,10 +555,40 @@ float TraceMenuKit::DrawTextCapCentered(AHUD* HUD, const FString& Text, float X,
 	{
 		return 0.f;
 	}
-	TraceText::FStyle CapStyle = Style;
-	CapStyle.VAlign = TraceText::EVAlign::CapTop;
-	const float Caps = TraceText::CapHeight(CapStyle.Size, CapStyle.Weight);
-	return TraceCanvasText::Draw(HUD, Text, X, CapCenterY - Caps * 0.5f, CapStyle);
+	TraceText::FStyle CapTopStyle = Style;
+	CapTopStyle.VAlign = TraceText::EVAlign::CapTop;
+	const float Caps = TraceText::CapHeight(CapTopStyle.Size, CapTopStyle.Weight);
+	return TraceCanvasText::Draw(HUD, Text, X, CapCenterY - Caps * 0.5f, CapTopStyle);
+}
+
+TraceText::FStyle TraceMenuKit::CapStyle(float CapH, const FLinearColor& Color, ETraceTextWeight Weight)
+{
+	return TraceText::FStyle(TraceText::SizeForCapHeight(FMath::Max(1.f, CapH), Weight), Color, Weight);
+}
+
+float TraceMenuKit::CapTextWidth(const FString& Text, float CapH, ETraceTextWeight Weight)
+{
+	return Text.IsEmpty() ? 0.f : TraceText::MeasureWidth(Text, CapStyle(CapH, FLinearColor::White, Weight));
+}
+
+float TraceMenuKit::DrawCapText(AHUD* HUD, const FString& Text, float X, float CapCenterY, float CapH,
+	const FLinearColor& Color, ETraceTextWeight Weight, TraceText::EHAlign HAlign, float MaxW)
+{
+	if (HUD == nullptr || Text.IsEmpty() || CapH <= 0.f)
+	{
+		return 0.f;
+	}
+	TraceText::FStyle Drawn = CapStyle(CapH, Color, Weight);
+	Drawn.HAlign = HAlign;
+	if (MaxW > 0.f)
+	{
+		const float Natural = TraceText::MeasureWidth(Text, Drawn);
+		if (Natural > MaxW && Natural > 0.f)
+		{
+			Drawn.Size *= MaxW / Natural;
+		}
+	}
+	return DrawTextCapCentered(HUD, Text, X, CapCenterY, Drawn);
 }
 
 namespace TraceMenuKitFile
@@ -978,6 +1008,24 @@ namespace TraceMenuKitFile
 					&& TraceMenuKit::PlateTintAt(D, 1.234f) == 1.f
 					&& TraceMenuKit::PlateTintAt(P, 1.234f) == TraceMenuArtStyle::PressedTint,
 				FString::Printf(TEXT("%.2f +/- %.2f"), TraceMenuKit::HoverPulseBase, TraceMenuKit::HoverPulseSwing));
+
+			// THE KIT'S COLOURS (stylespec §2). The hover word is a MODERATE lift of the sheet's olive,
+			// #88AB4B: dimmer than the white default word, as on the sheet. It shipped as #CBFF70, the
+			// loudest text on the screen; the luminance comparison is what would catch that coming back.
+			const FColor GreenBytes = Green.ToFColor(/*bSRGB=*/true);
+			const float GreenLum = 0.2126f * Green.R + 0.7152f * Green.G + 0.0722f * Green.B;
+			Check(TEXT("the hover word is the sheet's olive lifted to #88AB4B"),
+				GreenBytes.R == 136 && GreenBytes.G == 171 && GreenBytes.B == 75,
+				FString::Printf(TEXT("sRGB(%d,%d,%d)"), GreenBytes.R, GreenBytes.G, GreenBytes.B));
+			Check(TEXT("...and it is DIMMER than the default white word"),
+				GreenLum < 0.5f,
+				FString::Printf(TEXT("relative luminance %.3f (white is 1.0)"), GreenLum));
+
+			// The pointer is the artist's WHITE blade, not the pre-kit interface cyan (stylespec §9).
+			const FLinearColor PointerInk = TraceHardwareCursor::PointerTint();
+			Check(TEXT("the pointer is white"),
+				PointerInk.Equals(FLinearColor::White, 1e-3f),
+				FString::Printf(TEXT("tint (%.2f, %.2f, %.2f)"), PointerInk.R, PointerInk.G, PointerInk.B));
 		}
 
 		// ---- 2. THE PLATE IS THE ONE THE THREE SCREENS DREW ---------------------------------------

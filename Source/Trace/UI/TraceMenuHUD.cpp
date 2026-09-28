@@ -9,6 +9,7 @@
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
 #include "Engine/GameViewportClient.h"
+#include "Engine/PendingNetGame.h"    // Trace.Menu.JoinVerify reads FWorldContext::PendingNetGame
 #include "Engine/Texture2D.h"         // WP9 — the Canvas title's sprite cache
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
@@ -55,9 +56,9 @@
 // (UI/Widgets/Menu/TraceStrokeTextWidget.h) is the same five glyphs for the UMG renderer.
 //
 // SINCE THE RELEASE PASS (UI plan WP9) THIS IS THE WORDMARK'S FALLBACK, NOT ITS RENDERER: the
-// Canvas title draws the artist's T_TraceWordmark sprite whenever it is loadable and drawable, and
-// these glyphs are what a fresh checkout (or a failed import) shows instead of nothing. The travel
-// overlay still strokes its dim TRACE from them every time.
+// Canvas title and the travel card draw the artist's T_TraceWordmark sprite whenever it is loadable
+// and drawable, and these glyphs (in white) are what a fresh checkout (or a failed import) shows
+// instead of nothing.
 // =================================================================================================
 
 // Spec v22 §A1 — this renderer types in the artist's face too. See TraceMenuHUDType below.
@@ -192,7 +193,7 @@ namespace TraceMenuHUDFile
 	 *      /Game/Maps/MainMenu: pre-v19 asset 49 TraceRetired resolves, 13 ensures, 23.1 s wall;
 	 *      regenerated asset 0 and 0 and 17.0 s, against 17.5 s for the Canvas path.
 	 *   2. THE WORDMARK — closed in v19/v20. It is no longer stroked at all; it is the artist's own
-	 *      sprite (T_TraceWordmark), lifted to legible ink at load by UTraceTitleMenuWidget.
+	 *      sprite (T_TraceWordmark), navy in its amber glow as the handmade image draws it.
 	 *   3. ONLY TWO OF FOUR SCREENS EXIST — CLOSED IN v20, and this was the whole of the reason the
 	 *      switch stayed at 0. FTraceOptionsMenu now draws the artist's button plates, slider,
 	 *      value chips, KEYBIND/KEY lettering and cursor on the SHARED options path, so the title
@@ -315,6 +316,91 @@ namespace TraceMenuHUDFile
 				: TRACE_TEXTF("MENU.VERSION_LINE", "V {0}   {1}", { Version, NetLabel });
 		}();
 		return Label;
+	}
+}
+
+// =================================================================================================
+// THE JOIN PROMPT AND THE TRAVEL CARD, ON THE HANDMADE KIT
+// =================================================================================================
+//
+// Both used to be the pre-kit design — a flat dark rectangle with 1.6 px cyan edges, cyan title,
+// cyan caret, cyan key hints — drawn over a Canvas title screen that had turned into a cyan Tron
+// grid. They are the kit now: black, the artist's plates and words, the kit's [KEY] VERB legend, and
+// the white blade pointer. Layout in 1080p reference px (x UIScale). Named namespaces, not anonymous:
+// this module is a unity build.
+
+namespace TraceMenuHUDJoin
+{
+	/** Indices into ATraceMenuHUD::JoinButtonRects. */
+	static constexpr int32 Connect = 0;
+	static constexpr int32 Back    = 1;
+	static constexpr int32 ButtonCount = 2;
+
+	static constexpr float PanelW       = 820.f;   // the black panel, at most (and 0.86 of the view)
+	static constexpr float PanelTopFrac = 0.28f;   // of the view height
+	static constexpr float PanelPadTop  = 34.f;
+	static constexpr float PanelPadBottom = 30.f;
+	static constexpr float PanelAlpha   = 0.90f;   // over the kit's 0.82 scrim, as the options pages
+
+	static constexpr float TitleCap     = 30.f;    // Sofachrome, white — the options pages' title size
+	static constexpr float SubtitleCap  = 12.f;
+	static constexpr float SubtitleGap  = 18.f;    // title caps' bottom to the subtitle caps' top
+	static constexpr float FieldTop     = 118.f;   // panel top to the field plate (its glow clears the subtitle)
+	static constexpr float FieldH       = 64.f;
+	static constexpr float FieldSide    = 60.f;    // panel edge to the field plate
+	static constexpr float FieldTextCap = 22.f;    // Erbaum Bold, the settings pages' body face
+	static constexpr float FieldTextPad = 28.f;    // plate edge to the first character
+	static constexpr float NoteGap      = 24.f;    // field bottom to the note's cap centre
+	static constexpr float NoteCap      = 12.f;
+	static constexpr float ButtonsGap   = 50.f;    // field bottom to the buttons' top
+	static constexpr float ButtonH      = 60.f;    // the title rows' height
+	static constexpr float ButtonW      = 240.f;
+	static constexpr float ButtonSpacing = 44.f;
+	static constexpr float LegendGap    = 34.f;    // buttons' bottom to the legend's chips
+	static constexpr float LegendChipH  = 28.f;    // the options pages' legend chip
+	static constexpr float LegendLineGap = 38.f;
+	static constexpr float MachineGap   = 28.f;    // last legend line to the "THIS MACHINE" caps centre
+	static constexpr float MachineCap   = 11.f;
+}
+
+namespace TraceMenuHUDPointer
+{
+	/**
+	 * The stand-in pointer for the frame or two before the blade sprite is drawable (and a build with
+	 * no menu art): a small white gap-cross on the tip. White, like the blade — never the old cyan.
+	 */
+	static void DrawCross(AHUD* HUD, const FVector2D& Tip, float InUIScale)
+	{
+		if (HUD == nullptr)
+		{
+			return;
+		}
+		const float Arm = 9.f * InUIScale;
+		const float Weight = FMath::Max(1.f, 1.5f * InUIScale);
+		const FLinearColor Ink(1.f, 1.f, 1.f, 0.9f);
+		HUD->DrawLine(Tip.X - Arm, Tip.Y, Tip.X - Arm * 0.35f, Tip.Y, Ink, Weight);
+		HUD->DrawLine(Tip.X + Arm * 0.35f, Tip.Y, Tip.X + Arm, Tip.Y, Ink, Weight);
+		HUD->DrawLine(Tip.X, Tip.Y - Arm, Tip.X, Tip.Y - Arm * 0.35f, Ink, Weight);
+		HUD->DrawLine(Tip.X, Tip.Y + Arm * 0.35f, Tip.X, Tip.Y + Arm, Ink, Weight);
+	}
+}
+
+namespace TraceMenuHUDTravel
+{
+	static constexpr float CaptionCap   = 22.f;    // white, Sofachrome
+	static constexpr float CaptionY     = 0.47f;   // of the view height, the caption's cap centre
+	static constexpr float ElapsedGap   = 40.f;    // caption to the elapsed line's cap centre
+	static constexpr float ElapsedCap   = 13.f;
+	static constexpr float LegendGap    = 34.f;    // elapsed line to the legend's chips
+	static constexpr float LegendChipH  = 28.f;
+	static constexpr float LegendLineGap = 38.f;
+
+	/** "12s" — how long the join has been dialling. Ranen's words (MENU.TRAVEL_ELAPSED). */
+	static FString ElapsedText(const AActor* Context, float StartRealTime)
+	{
+		const UWorld* World = (Context != nullptr) ? Context->GetWorld() : nullptr;
+		const float Elapsed = (World != nullptr) ? FMath::Max(0.f, World->GetRealTimeSeconds() - StartRealTime) : 0.f;
+		return TRACE_TEXTF("MENU.TRAVEL_ELAPSED", "{0}s", { FMath::FloorToInt(Elapsed) });
 	}
 }
 
@@ -537,13 +623,16 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 	}
 
 	// ---- Travel overlay ---------------------------------------------------------------------------
+	//
+	// NOT REACHED ON A TRAVEL FRAME ANY MORE: DrawHUD stands the widget down for the whole of a travel
+	// and draws the kit's black travel card on the Canvas (DrawTravelOverlay), so the connecting card
+	// can carry the kit's ESC CANCEL legend and the pointer. Kept truthful anyway, from the same
+	// state the card reads — the travel KIND, never the caption's wording.
 	OutView.bTravelVisible = bTravelling;
 	if (bTravelling)
 	{
 		OutView.TravelCaption = TravelCaption.IsEmpty() ? FString(TRACE_TEXT("MENU.TRAVEL_ENTERING_ARENA", "ENTERING THE ARENA")) : TravelCaption;
-		OutView.TravelHint = TravelCaption.StartsWith(TEXT("CONNECTING"))
-			? FString(TRACE_TEXT("MENU.TRAVEL_CONNECT_HINT", "THIS CAN TAKE A FEW SECONDS.  A FAILURE WILL BE REPORTED, NOT SWALLOWED."))
-			: FString();
+		OutView.TravelHint = IsJoinInFlight() ? TraceMenuHUDTravel::ElapsedText(this, TravelStartRealTime) : FString();
 	}
 
 	// ---- Cursor ------------------------------------------------------------------------------------
@@ -632,9 +721,10 @@ void ATraceMenuHUD::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// The title screen chose Easy for the player; make that true of the settings straight away so
-	// the value on screen is never a promise the match fails to keep. StartMatch() re-applies it
-	// (and the arena's game mode applies whatever arrives in the URL), so this is belt and braces.
+	// The difficulty this machine last picked, not the default: a HARD player coming back from a
+	// match (or from a failed join) finds HARD. Applied straight away so the value on screen is never a
+	// promise the match fails to keep; StartMatch() re-applies it and the URL carries it.
+	Difficulty = TraceDifficulty::GetSavedSetting();
 	TraceDifficulty::ApplyToSettings(Difficulty);
 
 	// Bound here rather than in a module startup because both HUDs need it and neither owns the
@@ -646,6 +736,26 @@ void ATraceMenuHUD::BeginPlay()
 	// The address the player typed last time, straight off disk. Empty on a fresh install, which is
 	// exactly when the prompt falls back to showing an example instead.
 	LastJoinAddress = TraceNet::LoadLastJoinAddress();
+
+	// A JOIN THAT JUST FAILED BRINGS THE PLAYER BACK TO ITS OWN PROMPT. A failed join reloads this map
+	// with a fresh HUD, which used to land on PLAY under a banner across the wordmark — so Enter, the
+	// natural "try again", HOSTED a match instead. Now the prompt is open again with the address they
+	// were dialling and the reason under the field: retrying is Enter, fixing it is typing. The reason
+	// is shown there instead of the banner, not as well (the engine's code is still in the log).
+	{
+		FString FailedHeadline;
+		FString FailedDetail;
+		if (TraceNet::ConsumeFailedJoin(FailedHeadline, FailedDetail))
+		{
+			Selected = ETraceMenuRow::Join;
+			OpenJoinPrompt();
+			JoinError = FailedHeadline;
+			JoinErrorText = JoinEntry.GetText();
+			TraceNet::ClearFailure();
+			UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] The last JOIN failed (%s | %s); the prompt is open again on '%s'."),
+				*FailedHeadline, *FailedDetail, *JoinEntry.GetText());
+		}
+	}
 
 	// The handmade kit's sprites, loaded now rather than inside the first frame of SETTINGS: a sprite
 	// loaded mid-draw stalls that frame and draws its flat fallback until its render resource lands.
@@ -1361,8 +1471,7 @@ void ATraceMenuHUD::ClickTestStep()
 		World->GetTimerManager().ClearTimer(ClickTestStepTimer);
 
 		OptionsMenu.Close();
-		Difficulty = ClickTestBaselineDifficulty;
-		TraceDifficulty::ApplyToSettings(Difficulty);
+		SetDifficulty(ClickTestBaselineDifficulty);   // saved too: phase 0's click saved the cycled value
 
 		const bool bPass = (ClickTestPairsUsed[0] == 1) && (ClickTestPairsUsed[1] == 1) && (ClickTestPairsUsed[2] == 1);
 
@@ -1510,6 +1619,348 @@ void ATraceMenuHUD::ClickTestStep()
 	++ClickTestPhase;
 	ClickTestSubStep = 0;
 	ClickTestDeadPairs = 0;
+}
+
+// =================================================================================================
+// Trace.Menu.JoinVerify — the JOIN prompt and the connecting card, one drawn frame at a time
+// =================================================================================================
+//
+// THE STUCK STATE IT GUARDS. After CONNECT the card said "CONNECTING TO x" for the whole handshake
+// (20 s to a dead address) with no way out, and CancelPressed had no travel guard: the first Escape
+// moved the hidden highlight to QUIT and the second closed the game. Every step below goes through
+// the entry point a player reaches — a real Escape key edge through APlayerController::InputKey (the
+// same path -TraceAutoSettings drives), a real mouse click on the drawn legend and buttons — and
+// checks the ENGINE's state, not just this HUD's: the pending net game must be gone and the queued
+// travel URL empty, or the "cancelled" join would still connect behind the prompt.
+//
+// It dials 10.255.255.1 (unroutable, so nothing is ever joined) and puts the player's remembered JOIN
+// address back at the end. Run on the title map:
+//     -TraceExecOn=Menu -TraceExecAt=4 -TraceExec="Trace.Menu.JoinVerify"
+// Against the pre-fix CancelPressed, step 4 fails ("still travelling, highlight on QUIT") and the
+// harness stops there rather than pressing Escape a second time, which would have quit the game.
+
+namespace TraceMenuJoinVerify
+{
+	static const TCHAR* const DeadAddress = TEXT("10.255.255.1:7777");
+}
+
+static FAutoConsoleCommandWithWorldAndArgs CmdMenuJoinVerify(
+	TEXT("Trace.Menu.JoinVerify"),
+	TEXT("Dev only. Drives the title screen's JOIN prompt and connecting card (Escape cancels a join, never ")
+	TEXT("quits; the pending connection is really dropped; CONNECT / BACK / CANCEL take a click) and prints ")
+	TEXT("a VERDICT. Run on the title map."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+		[](const TArray<FString>& /*Args*/, UWorld* World)
+		{
+			APlayerController* const PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+			ATraceMenuHUD* const MenuHUD = (PC != nullptr) ? Cast<ATraceMenuHUD>(PC->GetHUD()) : nullptr;
+			if (MenuHUD == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[JoinVerify] No title-screen HUD here — run this on the menu map."));
+				return;
+			}
+			MenuHUD->BeginJoinVerify();
+		}));
+
+/**
+ * `Trace.Menu.JoinOnce <address>` — JOIN through the real prompt ONCE PER PROCESS, for a headless
+ * capture of what a failed join comes back to. -TraceExec re-arms on every title screen, and a failed
+ * join reloads the title, so a plain command would join again on the reloaded screen and hide the
+ * very prompt the capture is for. Dev only.
+ */
+static FAutoConsoleCommandWithWorldAndArgs CmdMenuJoinOnce(
+	TEXT("Trace.Menu.JoinOnce"),
+	TEXT("Dev only. Trace.Menu.JoinOnce <address> - open the title's JOIN prompt on <address> and CONNECT, ")
+	TEXT("once per process (a failed join reloads the title; the reloaded title does not join again)."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+		[](const TArray<FString>& Args, UWorld* World)
+		{
+			static bool bJoinedOnce = false;
+			APlayerController* const PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+			ATraceMenuHUD* const MenuHUD = (PC != nullptr) ? Cast<ATraceMenuHUD>(PC->GetHUD()) : nullptr;
+			if (MenuHUD == nullptr || Args.Num() < 1 || bJoinedOnce)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[Menu] Trace.Menu.JoinOnce: %s."),
+					bJoinedOnce ? TEXT("already joined once this process") : TEXT("needs the title map and an address"));
+				return;
+			}
+			bJoinedOnce = true;
+			MenuHUD->DebugJoin(Args[0]);
+		}));
+
+void ATraceMenuHUD::DebugJoin(const FString& Address)
+{
+	Selected = ETraceMenuRow::Join;
+	OpenJoinPrompt();
+	JoinEntry.SetText(Address);
+	ConfirmJoin();
+}
+
+void ATraceMenuHUD::BeginJoinVerify()
+{
+	if (JoinVerifyStep != 0)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[JoinVerify] Already running."));
+		return;
+	}
+	if (bTravelling || OptionsMenu.IsOpen())
+	{
+		UE_LOG(LogTraceGame, Error, TEXT("[JoinVerify] VERDICT: INCONCLUSIVE — the title is travelling or SETTINGS is open."));
+		return;
+	}
+
+	JoinVerifySavedAddress = LastJoinAddress;
+	JoinVerifyFailures = 0;
+	JoinVerifyStep = 1;
+	JoinVerifyStepTime = (GetWorld() != nullptr) ? GetWorld()->GetRealTimeSeconds() : 0.f;
+	UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] ===== JOIN prompt and connecting card (dialling %s) ====="),
+		TraceMenuJoinVerify::DeadAddress);
+}
+
+void ATraceMenuHUD::TickJoinVerify()
+{
+	if (JoinVerifyStep == 0)
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	APlayerController* PC = GetOwningPlayerController();
+	FWorldContext* Context = (GEngine != nullptr && World != nullptr) ? GEngine->GetWorldContextFromWorld(World) : nullptr;
+	if (World == nullptr || PC == nullptr || Context == nullptr)
+	{
+		return;
+	}
+
+	const float RealNow = World->GetRealTimeSeconds();
+	const float StepAge = RealNow - JoinVerifyStepTime;
+	const auto Advance = [this, RealNow]()
+	{
+		++JoinVerifyStep;
+		JoinVerifyStepTime = RealNow;
+	};
+	const auto Check = [this](const TCHAR* What, bool bPass, const FString& Detail)
+	{
+		JoinVerifyFailures += bPass ? 0 : 1;
+		UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify]   %-4s %-62s %s"), bPass ? TEXT("ok") : TEXT("FAIL"), What, *Detail);
+	};
+	const auto Pending = [Context]() { return Context->PendingNetGame != nullptr; };
+	const auto Queued = [Context]() { return !Context->TravelURL.IsEmpty(); };
+	const auto DescribeState = [this, &Pending, &Queued]()
+	{
+		return FString::Printf(TEXT("travelling=%d kind=%d prompt=%d row=%d pendingNetGame=%d queuedURL=%d field='%s'"),
+			bTravelling ? 1 : 0, static_cast<int32>(TravelKind), IsJoinPromptOpen() ? 1 : 0, static_cast<int32>(Selected),
+			Pending() ? 1 : 0, Queued() ? 1 : 0, *JoinEntry.GetText());
+	};
+	const auto ClickAt = [PC](const FBox2D& Rect)
+	{
+		const FVector2D Center = Rect.GetCenter();
+		PC->SetMouseLocation(FMath::RoundToInt(Center.X), FMath::RoundToInt(Center.Y));
+	};
+
+	switch (JoinVerifyStep)
+	{
+	// ---- 1. open the prompt on the dead address, and CONNECT ---------------------------------------
+	case 1:
+		Selected = ETraceMenuRow::Join;
+		OpenJoinPrompt();
+		JoinEntry.SetText(TraceMenuJoinVerify::DeadAddress);
+		Advance();
+		break;
+
+	case 2:
+		ConfirmJoin();
+		Check(TEXT("CONNECT: the join is in flight and the connect is queued"),
+			IsJoinInFlight() && Queued() && !IsJoinPromptOpen(), DescribeState());
+		Advance();
+		break;
+
+	// ---- 2. a second later the engine is really dialling; the card offers the way out --------------
+	case 3:
+		if (StepAge < 1.0f)
+		{
+			break;
+		}
+		Check(TEXT("the engine is dialling (a pending net game exists)"), Pending(), DescribeState());
+		Check(TEXT("the connecting card draws its CANCEL legend"), TravelCancelRect.bIsValid,
+			TravelCancelRect.bIsValid ? TravelCancelRect.ToString() : FString(TEXT("no legend")));
+		InjectKey(PC, EKeys::Escape, /*bPressed=*/true);
+		Advance();
+		break;
+
+	case 4:
+		InjectKey(PC, EKeys::Escape, /*bPressed=*/false);
+		Advance();
+		break;
+
+	// ---- 3. ESCAPE CANCELLED IT: engine state gone, prompt back, highlight NOT on QUIT ---------------
+	case 5:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		{
+			const bool bCancelled = !bTravelling && TravelKind == ETraceMenuTravel::None && !Pending() && !Queued();
+			const bool bPromptBack = IsJoinPromptOpen() && JoinEntry.GetText() == TraceMenuJoinVerify::DeadAddress;
+			const bool bNotQuit = Selected == ETraceMenuRow::Join;
+			Check(TEXT("ESCAPE cancels the join (no pending game, nothing queued)"), bCancelled, DescribeState());
+			Check(TEXT("...the prompt is back, holding the address that was dialled"), bPromptBack, DescribeState());
+			Check(TEXT("...and the highlight is on JOIN, never walked to QUIT"), bNotQuit, DescribeState());
+			if (!(bCancelled && bNotQuit))
+			{
+				// The pre-fix behaviour. Stop HERE: a second Escape on that build quits the game.
+				JoinVerifyStep = 100;
+				break;
+			}
+		}
+		Advance();
+		break;
+
+	// ---- 4. the same-frame race: confirm and cancel before the engine ticks the travel -------------
+	case 6:
+		ConfirmJoin();
+		CancelPressed();
+		Check(TEXT("confirm + cancel in ONE frame: nothing left queued"), !bTravelling && !Queued(), DescribeState());
+		Advance();
+		break;
+
+	case 7:
+		if (StepAge < 1.0f)
+		{
+			break;
+		}
+		Check(TEXT("...and a second later no connection was ever started"), !Pending() && !bTravelling && IsJoinPromptOpen(),
+			DescribeState());
+		Advance();
+		break;
+
+	// ---- 5. the mouse: CONNECT, then a click on the card's CANCEL legend ----------------------------
+	case 8:
+		if (!JoinButtonRects[TraceMenuHUDJoin::Connect].bIsValid)
+		{
+			Check(TEXT("the prompt draws a CONNECT button"), false, TEXT("no rect"));
+			JoinVerifyStep = 100;
+			break;
+		}
+		ClickAt(JoinButtonRects[TraceMenuHUDJoin::Connect]);
+		Advance();
+		break;
+
+	case 9:
+		if (StepAge < 0.2f)
+		{
+			break;
+		}
+		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/true);
+		Advance();
+		break;
+
+	case 10:
+		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/false);
+		Advance();
+		break;
+
+	case 11:
+		if (StepAge < 1.0f)
+		{
+			break;
+		}
+		Check(TEXT("a click on CONNECT dials"), IsJoinInFlight() && (Pending() || Queued()), DescribeState());
+		if (!TravelCancelRect.bIsValid)
+		{
+			Check(TEXT("the card's CANCEL legend is there to click"), false, TEXT("no rect"));
+			JoinVerifyStep = 100;
+			break;
+		}
+		ClickAt(TravelCancelRect);
+		Advance();
+		break;
+
+	case 12:
+		if (StepAge < 0.2f)
+		{
+			break;
+		}
+		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/true);
+		Advance();
+		break;
+
+	case 13:
+		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/false);
+		Advance();
+		break;
+
+	case 14:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		Check(TEXT("a click on CANCEL cancels the join"), !bTravelling && !Pending() && !Queued() && IsJoinPromptOpen(),
+			DescribeState());
+		if (JoinButtonRects[TraceMenuHUDJoin::Back].bIsValid)
+		{
+			ClickAt(JoinButtonRects[TraceMenuHUDJoin::Back]);
+		}
+		Advance();
+		break;
+
+	// ---- 6. BACK closes the prompt, onto JOIN ------------------------------------------------------
+	case 15:
+		if (StepAge < 0.2f)
+		{
+			break;
+		}
+		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/true);
+		Advance();
+		break;
+
+	case 16:
+		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/false);
+		Advance();
+		break;
+
+	case 17:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		Check(TEXT("a click on BACK closes the prompt, highlight on JOIN"),
+			!IsJoinPromptOpen() && !bTravelling && Selected == ETraceMenuRow::Join, DescribeState());
+		JoinVerifyStep = 100;
+		break;
+
+	default:
+		break;
+	}
+
+	if (JoinVerifyStep < 100)
+	{
+		return;
+	}
+
+	// ---- Put everything back, then the verdict ----------------------------------------------------
+	if (bTravelling)
+	{
+		CancelJoin();
+	}
+	if (IsJoinPromptOpen())
+	{
+		CloseJoinPrompt(TEXT("JoinVerify done"));
+	}
+	LastJoinAddress = JoinVerifySavedAddress;
+	TraceNet::SaveLastJoinAddress(JoinVerifySavedAddress);
+	TraceNet::ForgetJoinAttempt();
+	TraceNet::ClearFailure();
+	JoinVerifyStep = 0;
+
+	if (JoinVerifyFailures == 0)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] VERDICT: PASS — Escape and CANCEL call a join off (the engine's pending connection is dropped), the prompt comes back, and nothing walks to QUIT."));
+	}
+	else
+	{
+		UE_LOG(LogTraceGame, Error, TEXT("[JoinVerify] VERDICT: FAIL — %d check(s) failed."), JoinVerifyFailures);
+	}
 }
 #endif
 
@@ -1678,18 +2129,11 @@ void ATraceMenuHUD::PollPadTitle(APlayerController* PC, bool bConfirm, bool bBac
 //
 // TYPING IS NOT SOLVED, AND IS NOT PRETENDED TO BE. An on-screen keyboard is out of scope for this
 // tranche (stated in the brief). A pad alone cannot enter an address that is neither remembered nor
-// on the clipboard; that needs a keyboard, and the panel now says so in as many words whenever a pad
-// has been seen. It is in the report as a known limitation rather than buried here.
+// on the clipboard; that needs a keyboard. (The panel used to say so; the co-developer's text pass cut
+// the line.) A known limitation rather than a buried one.
 //
-// WHY THE PASTE IS REIMPLEMENTED RATHER THAN CALLED. FTraceTextEntry (UI/TraceNetworking.h) owns
-// Ctrl/Cmd+V and does the same job, but it is another tranche's file this pass and exposes no
-// "paste" entry point — only SetText. Synthesising a Ctrl+V chord was the alternative and was
-// refused: UTraceGamepadInputSubsystem's header argues at length that Escape is the ONE key in this
-// build that is provably safe to synthesise, and a two-key chord through a modifier is exactly the
-// kind of thing that argument rules out. So the clipboard is read here and filtered here, with the
-// filter kept deliberately identical to that file's IsLegalChar for the Address charset. If the two
-// ever disagree the field simply refuses a character this accepted — a paste that comes up short,
-// never a corrupt address.
+// THE PASTE is FTraceTextEntry::PasteReplace: the field's own legal-character filter, so the pad and a
+// typed Ctrl/Cmd+V cannot disagree about what an address may contain.
 
 void ATraceMenuHUD::PollPadJoinPrompt(bool bConfirm, bool bBack, bool bAlt)
 {
@@ -1699,40 +2143,22 @@ void ATraceMenuHUD::PollPadJoinPrompt(bool bConfirm, bool bBack, bool bAlt)
 	// it ever throws or early-returns, the way out must already have been taken.
 	if (bBack)
 	{
-		UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] Pad B -> JOIN prompt cancelled."));
-		JoinEntry.End();
-		JoinError.Reset();
-		JoinErrorText.Reset();
+		CloseJoinPrompt(TEXT("Pad B"));
 		return;
 	}
 
 	// ---- X: paste ------------------------------------------------------------------------------------
+	//
+	// Through FTraceTextEntry::PasteReplace — the field's own filter (the same legal-character rule a
+	// typed Ctrl/Cmd+V uses), the caret at the END of the pasted address, and the paste stamped so the
+	// PASTED note shows. This used to be a second copy of the filter here, and it left the caret at the
+	// start of the field and never showed the note.
 	if (bAlt)
 	{
 		FString Clipboard;
 		FPlatformApplicationMisc::ClipboardPaste(Clipboard);
 
-		// One line only, and only the characters an address may contain. People paste
-		// "  100.1.2.3:7777\n" out of a terminal constantly, and a trailing newline in a travel URL
-		// is a silent failure. Same rule, same order, as FTraceTextEntry::Poll's Ctrl+V branch.
-		FString Cleaned;
-		for (const TCHAR Char : Clipboard)
-		{
-			if (Char == TEXT('\n') || Char == TEXT('\r'))
-			{
-				break;
-			}
-			// The Address charset: alphanumeric plus '.', ':', '-', '_'. Mirrors IsLegalChar in
-			// UI/TraceNetworking.cpp — see the note above this function about which way a
-			// disagreement fails.
-			if (FChar::IsAlnum(Char) || Char == TEXT('.') || Char == TEXT(':')
-				|| Char == TEXT('-') || Char == TEXT('_'))
-			{
-				Cleaned.AppendChar(Char);
-			}
-		}
-
-		if (Cleaned.IsEmpty())
+		if (!JoinEntry.PasteReplace(Clipboard, Now))
 		{
 			// Said out loud rather than swallowed: a paste button that does nothing on an empty
 			// clipboard is indistinguishable from a paste button that is broken.
@@ -1742,13 +2168,9 @@ void ATraceMenuHUD::PollPadJoinPrompt(bool bConfirm, bool bBack, bool bAlt)
 			return;
 		}
 
-		// SetText clamps the caret to the new length rather than moving it; setting empty first puts
-		// it at the start, which is where a field the player has not typed into should draw it.
-		JoinEntry.SetText(FString());
-		JoinEntry.SetText(Cleaned);
 		JoinError.Reset();
 		JoinErrorText.Reset();
-		UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] Pad X -> pasted '%s' into the JOIN field."), *Cleaned);
+		UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] Pad X -> pasted '%s' into the JOIN field."), *JoinEntry.GetText());
 		return;
 	}
 
@@ -1798,8 +2220,15 @@ void ATraceMenuHUD::AdjustSelection(int32 Delta)
 
 	if (Selected == ETraceMenuRow::Difficulty)
 	{
-		Difficulty = TraceDifficulty::Step(Difficulty, Delta);
-		TraceDifficulty::ApplyToSettings(Difficulty);
+		const ETraceBotDifficulty Next = TraceDifficulty::Step(Difficulty, Delta);
+
+		// The same focus-change sound every other change on this screen makes, and only on a change:
+		// holding RIGHT on HARD repeats this call while nothing moves.
+		if (Next != Difficulty)
+		{
+			TraceAudio::PlayLocal2D(this, TraceSoundEvents::UIHover);
+		}
+		SetDifficulty(Next);
 		return;
 	}
 
@@ -1858,8 +2287,7 @@ void ATraceMenuHUD::ActivateSelection()
 	case ETraceMenuRow::Difficulty:
 		// Activating the row cycles it. Wraps, unlike the arrow keys: a click has no "other
 		// direction" to offer, so stopping dead at HARD would just look broken.
-		Difficulty = static_cast<ETraceBotDifficulty>((static_cast<int32>(Difficulty) + 1) % TraceDifficulty::Count);
-		TraceDifficulty::ApplyToSettings(Difficulty);
+		SetDifficulty(static_cast<ETraceBotDifficulty>((static_cast<int32>(Difficulty) + 1) % TraceDifficulty::Count));
 		break;
 
 	case ETraceMenuRow::Settings:
@@ -1877,6 +2305,25 @@ void ATraceMenuHUD::ActivateSelection()
 
 void ATraceMenuHUD::CancelPressed()
 {
+	// ---- A TRAVEL OWNS ESCAPE, AND IT NEVER REACHES QUIT ----------------------------------------------
+	//
+	// THE STUCK STATE THIS FIXES. After CONNECT the card read "CONNECTING TO x" for as long as the
+	// handshake took (20 s to a dead address) with no way out, and this function had no travel guard:
+	// the first Escape / pad B / MENU silently moved the hidden highlight to QUIT, and the second one
+	// CLOSED THE GAME. The natural "cancel" gesture quit the application.
+	//
+	// Now: during a JOIN, Escape cancels it and puts the prompt back; during PLAY or PRACTICE (a local
+	// load that is gone within a frame) it does nothing. First, before every other branch, so no path
+	// through this function can quit while a travel is under way. Pad B and MENU/START arrive here too.
+	if (bTravelling)
+	{
+		if (IsJoinInFlight())
+		{
+			CancelJoin();
+		}
+		return;
+	}
+
 	if (OptionsMenu.IsOpen() || IsJoinPromptOpen())
 	{
 		// Both overlays own Escape while they are up and close themselves on it. Letting this
@@ -1956,8 +2403,39 @@ void ATraceMenuHUD::UpdateWindowFocus()
 void ATraceMenuHUD::MousePressed()
 {
 	PressedRow = INDEX_NONE;
+	JoinPressedButton = INDEX_NONE;
+	bTravelCancelArmed = false;
 
-	if (OptionsMenu.IsOpen() || IsJoinPromptOpen() || bTravelling || !bRowRectsValid)
+	if (OptionsMenu.IsOpen())
+	{
+		return;
+	}
+
+	// ---- THE JOIN PROMPT'S CONNECT / BACK, and the connecting card's CANCEL -----------------------
+	//
+	// Both used to ignore the mouse entirely: the prompt had nothing to click and the card could not
+	// be left at all. Same contract as the rows: the press ARMS whatever is under the pointer, the
+	// release on the same target fires (MouseReleased). No cursor-has-moved test here — that defence
+	// is for the stray click a window can deliver the moment the title appears, and neither of these
+	// can be on screen before the player has already done something.
+	if (IsJoinPromptOpen())
+	{
+		FVector2D PromptPoint = FVector2D::ZeroVector;
+		if (GetCursorPoint(PromptPoint))
+		{
+			JoinPressedButton = JoinButtonAtPoint(PromptPoint);
+		}
+		return;
+	}
+	if (bTravelling)
+	{
+		FVector2D CardPoint = FVector2D::ZeroVector;
+		bTravelCancelArmed = IsJoinInFlight() && TravelCancelRect.bIsValid && GetCursorPoint(CardPoint)
+			&& TravelCancelRect.IsInside(CardPoint);
+		return;
+	}
+
+	if (!bRowRectsValid)
 	{
 		return;
 	}
@@ -2040,8 +2518,49 @@ void ATraceMenuHUD::MouseReleased()
 {
 	const int32 Armed = PressedRow;
 	PressedRow = INDEX_NONE;
+	const int32 ArmedButton = JoinPressedButton;
+	JoinPressedButton = INDEX_NONE;
+	const bool bCancelArmed = bTravelCancelArmed;
+	bTravelCancelArmed = false;
 
-	if (OptionsMenu.IsOpen() || IsJoinPromptOpen() || bTravelling || Armed == INDEX_NONE)
+	if (OptionsMenu.IsOpen())
+	{
+		return;
+	}
+
+	if (IsJoinPromptOpen())
+	{
+		FVector2D PromptPoint = FVector2D::ZeroVector;
+		if (ArmedButton == INDEX_NONE || !GetCursorPoint(PromptPoint) || JoinButtonAtPoint(PromptPoint) != ArmedButton)
+		{
+			return;
+		}
+		TraceAudio::PlayLocal2D(this, TraceSoundEvents::ButtonPress);
+		if (ArmedButton == TraceMenuHUDJoin::Connect)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] CONNECT clicked ('%s')."), *JoinEntry.GetText());
+			ConfirmJoin();
+		}
+		else
+		{
+			CloseJoinPrompt(TEXT("BACK clicked"));
+		}
+		return;
+	}
+
+	if (bTravelling)
+	{
+		FVector2D CardPoint = FVector2D::ZeroVector;
+		if (bCancelArmed && IsJoinInFlight() && TravelCancelRect.bIsValid && GetCursorPoint(CardPoint)
+			&& TravelCancelRect.IsInside(CardPoint))
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] CANCEL clicked on the connecting card."));
+			CancelJoin();
+		}
+		return;
+	}
+
+	if (Armed == INDEX_NONE)
 	{
 		return;
 	}
@@ -2074,6 +2593,11 @@ void ATraceMenuHUD::StartMatch()
 		return;
 	}
 	bTravelling = true;
+	TravelKind = ETraceMenuTravel::Host;
+	if (const UWorld* World = GetWorld())
+	{
+		TravelStartRealTime = World->GetRealTimeSeconds();
+	}
 
 	// Applied here as well as carried in the URL: on a listen server the travel destination reads
 	// the option and applies it itself, but in standalone this call is what makes the very first
@@ -2158,6 +2682,8 @@ void ATraceMenuHUD::OpenJoinPrompt()
 
 	JoinError.Reset();
 	JoinErrorText.Reset();
+	JoinPressedButton = INDEX_NONE;
+	JoinHoveredButton = INDEX_NONE;
 
 	// Pre-filled with the last address that worked, so the common case — the same four people
 	// playing again tomorrow — is Enter, Enter. A fresh install gets an empty field and the example
@@ -2196,9 +2722,17 @@ void ATraceMenuHUD::ConfirmJoin()
 	TraceNet::SaveLastJoinAddress(Address);
 
 	TraceNet::ClearFailure();
+	TraceNet::NoteJoinAttempt();
 	JoinEntry.End();
+	JoinPressedButton = INDEX_NONE;
 
+	// AFTER the two early returns above, so a refused address cannot leave a join marked in flight.
 	bTravelling = true;
+	TravelKind = ETraceMenuTravel::Join;
+	if (const UWorld* World = GetWorld())
+	{
+		TravelStartRealTime = World->GetRealTimeSeconds();
+	}
 	TravelCaption = TRACE_TEXTF("MENU.TRAVEL_CONNECTING_TO", "CONNECTING TO {0}", { Address });
 
 	UE_LOG(LogTraceGame, Display, TEXT("Title screen: JOIN -> ClientTravel('%s', TRAVEL_Absolute)."), *Address);
@@ -2232,6 +2766,11 @@ void ATraceMenuHUD::StartPracticeRange()
 		return;
 	}
 	bTravelling = true;
+	TravelKind = ETraceMenuTravel::Practice;
+	if (const UWorld* World = GetWorld())
+	{
+		TravelStartRealTime = World->GetRealTimeSeconds();
+	}
 
 	// A new attempt: whatever went wrong last time is no longer what is happening now.
 	TraceNet::ClearFailure();
@@ -2267,6 +2806,85 @@ void ATraceMenuHUD::QuitGame()
 {
 	UE_LOG(LogTraceGame, Log, TEXT("Title screen: QUIT."));
 	UKismetSystemLibrary::QuitGame(this, GetOwningPlayerController(), EQuitPreference::Quit, /*bIgnorePlatformRestrictions=*/false);
+}
+
+void ATraceMenuHUD::SetDifficulty(ETraceBotDifficulty InDifficulty)
+{
+	Difficulty = InDifficulty;
+	TraceDifficulty::ApplyToSettings(Difficulty);
+
+	// Saved on every change, so the next title screen — after a match, a failed join, RETURN TO TITLE
+	// or a restart — shows what the player picked instead of quietly resetting to NORMAL.
+	TraceDifficulty::SetSavedSetting(Difficulty);
+}
+
+void ATraceMenuHUD::CloseJoinPrompt(const TCHAR* Why)
+{
+	UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] JOIN prompt closed (%s)."), Why);
+	JoinEntry.End();
+	JoinError.Reset();
+	JoinErrorText.Reset();
+	JoinPressedButton = INDEX_NONE;
+	JoinHoveredButton = INDEX_NONE;
+}
+
+void ATraceMenuHUD::CancelJoin()
+{
+	if (!IsJoinInFlight())
+	{
+		return;
+	}
+
+	UWorld* World = GetWorld();
+	const float Dialled = (World != nullptr) ? FMath::Max(0.f, World->GetRealTimeSeconds() - TravelStartRealTime) : 0.f;
+
+	if (GEngine != nullptr && World != nullptr)
+	{
+		// BOTH halves, in this order. ClientTravel only QUEUED the address in the world context; the
+		// engine builds the pending net game from it on its next tick. A cancel in the same frame as the
+		// connect therefore finds no pending game at all, and without clearing the queued URL the join
+		// would go ahead one tick later, behind a prompt that says it did not.
+		if (FWorldContext* Context = GEngine->GetWorldContextFromWorld(World))
+		{
+			Context->TravelURL.Empty();
+		}
+
+		// Closes the half-open connection, destroys its net driver and drops the pending game.
+		GEngine->CancelPending(World);
+	}
+
+	bTravelling = false;
+	TravelKind = ETraceMenuTravel::None;
+	TravelCaption.Reset();
+	TravelCancelRect = FBox2D(ForceInit);
+	bTravelCancelArmed = false;
+
+	// The player called it off: nothing failed, and the next title screen must not treat this attempt
+	// as a failed join.
+	TraceNet::ForgetJoinAttempt();
+	TraceNet::ClearFailure();
+
+	UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] JOIN cancelled after %.1fs; the prompt is open again on '%s'."),
+		Dialled, *LastJoinAddress);
+
+	// Back to the prompt, pre-filled with the address that was being dialled (ConfirmJoin remembered
+	// it), because the commonest reason to cancel is a wrong address. Escape again returns to the rows.
+	// FTraceTextEntry::Begin ignores the rest of this frame, so the Escape that cancelled cannot also
+	// close the prompt it reopens.
+	Selected = ETraceMenuRow::Join;
+	OpenJoinPrompt();
+}
+
+int32 ATraceMenuHUD::JoinButtonAtPoint(const FVector2D& Point) const
+{
+	for (int32 Index = 0; Index < TraceMenuHUDJoin::ButtonCount; ++Index)
+	{
+		if (JoinButtonRects[Index].bIsValid && JoinButtonRects[Index].IsInside(Point))
+		{
+			return Index;
+		}
+	}
+	return INDEX_NONE;
 }
 
 // =================================================================================================
@@ -2317,10 +2935,13 @@ void ATraceMenuHUD::DrawHUD()
 	// Mouse hover, but only once the cursor has actually moved. Without the movement test a cursor
 	// parked over QUIT would silently override every keyboard press.
 	//
-	// Skipped entirely while the overlay is up: the pointer is over the SETTINGS panel then, and
-	// tracking it here would quietly re-select whichever title row happened to be underneath, so
-	// closing the overlay would drop the player on a different row than the one they left.
-	if (APlayerController* PC = (OptionsMenu.IsOpen() || IsJoinPromptOpen()) ? nullptr : GetOwningPlayerController())
+	// Skipped entirely while the SETTINGS overlay is up: it samples and draws its own pointer, and
+	// tracking it here would quietly re-select whichever title row happened to be underneath.
+	//
+	// SAMPLED while the JOIN prompt is up and while travelling — the prompt has CONNECT / BACK and the
+	// connecting card has CANCEL, and both draw the live pointer (it used to freeze where it was when
+	// the prompt opened, dimmed under the scrim) — but the ROWS only follow it when neither is up.
+	if (APlayerController* PC = OptionsMenu.IsOpen() ? nullptr : GetOwningPlayerController())
 	{
 		float MouseX = 0.f;
 		float MouseY = 0.f;
@@ -2348,7 +2969,7 @@ void ATraceMenuHUD::DrawHUD()
 					FirstCursorPos = Position;
 				}
 				bHasCursor = true;
-				if (bRowRectsValid && !bTravelling)
+				if (bRowRectsValid && !bTravelling && !IsJoinPromptOpen())
 				{
 					for (int32 Index = 0; Index < static_cast<int32>(ETraceMenuRow::Count); ++Index)
 					{
@@ -2370,6 +2991,17 @@ void ATraceMenuHUD::DrawHUD()
 				}
 			}
 			LastCursorPos = Position;
+
+			// The JOIN buttons' half of "focus change": the hover sound when the pointer moves onto one.
+			if (IsJoinPromptOpen())
+			{
+				const int32 Hovered = JoinButtonAtPoint(Position);
+				if (Hovered != INDEX_NONE && Hovered != JoinHoveredButton)
+				{
+					TraceAudio::PlayLocal2D(this, TraceSoundEvents::UIHover);
+				}
+				JoinHoveredButton = Hovered;
+			}
 		}
 	}
 
@@ -2386,10 +3018,7 @@ void ATraceMenuHUD::DrawHUD()
 		}
 		else if (JoinEntry.ConsumeCancel())
 		{
-			UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] JOIN prompt cancelled."));
-			JoinEntry.End();
-			JoinError.Reset();
-			JoinErrorText.Reset();
+			CloseJoinPrompt(TEXT("Escape"));
 		}
 		else if (!JoinError.IsEmpty() && JoinEntry.GetText() != JoinErrorText)
 		{
@@ -2423,8 +3052,15 @@ void ATraceMenuHUD::DrawHUD()
 	// STILL TAKEN HERE, NOT INSIDE EACH MODAL, and that has not stopped mattering: a frame that kept
 	// the widget up while a modal drew underneath it would be a title screen with an INVISIBLE
 	// settings panel behind it — a hard lock on a screen with no way out. One bool, one decision.
+	//
+	// SINCE THE HANDMADE-KIT PASS THE SWAP IS INVISIBLE, and a TRAVEL takes this path too. The Canvas
+	// title below is the kit — pure black, the artist's navy wordmark and white swoosh, the plates, the
+	// white blade — with no cyan grid, bezel or slate backdrop left in it, so opening SETTINGS or JOIN
+	// dims the same screen instead of switching to a teal one. A travel draws the kit's black travel
+	// card over it (DrawTravelOverlay), which is what lets the connecting card carry the ESC CANCEL
+	// legend, the elapsed seconds and the pointer.
 	const bool bWidgetAvailable = TryAdoptMenuWidget();
-	const bool bModalOpen = OptionsMenu.IsOpen() || IsJoinPromptOpen();
+	const bool bModalOpen = OptionsMenu.IsOpen() || IsJoinPromptOpen() || bTravelling;
 	const bool bUseWidgetThisFrame = bWidgetAvailable && !bModalOpen;
 	bMenuUmgActive = bUseWidgetThisFrame;
 	bMenuUmgAvailable = bWidgetAvailable;
@@ -2458,19 +3094,16 @@ void ATraceMenuHUD::DrawHUD()
 			MenuWidget->SetVisibility(ESlateVisibility::Collapsed);
 		}
 
+		// No grid floor and no bezel any more: both were the pre-kit cyan Tron screen, and this is the
+		// screen every SETTINGS / JOIN modal shows through. Black, like the kit (stylespec §1).
 		DrawBackdrop();
-		DrawGridFloor();
 		DrawWordmark();
 		DrawAddressChip();
 		DrawMenuRows();
 		DrawFooter();
 
-		// After the footer, not before: the footer's dark strip runs to the bottom edge and would
-		// otherwise swallow the frame's bottom rail and two of its corner ticks.
-		DrawBezel();
-
-		// After the strip and the bezel so it sits on both; before the join prompt below and the
-		// options overlay at the end of DrawHUD, so a modal's scrim dims it rather than losing it.
+		// Before the join prompt below and the options overlay at the end of DrawHUD, so a modal's
+		// scrim dims it rather than losing it.
 		DrawVersionString();
 
 		DrawCursor();
@@ -2502,164 +3135,91 @@ void ATraceMenuHUD::DrawHUD()
 	// `Trace.UI.Kit.Specimen 1` — every handmade-kit control on one black page, over all of the
 	// above, for a screenshot. A no-op while the CVar is 0. See UI/Widgets/Menu/TraceMenuKit.h.
 	TraceMenuKit::DrawSpecimenIfRequested(this, ViewW, ViewH, UIScale, Now);
+
+	// `Trace.Menu.JoinVerify` — one step per drawn frame, after this frame's input and draw.
+	TickJoinVerify();
 #endif
 }
 
 void ATraceMenuHUD::DrawBackdrop()
 {
-	// Opaque, and drawn first: the menu map is empty, and whatever the renderer decides to put
-	// behind an empty map is not something the title screen should be at the mercy of.
-	DrawRect(TraceMenuStyle::Void, 0.f, 0.f, ViewW, ViewH);
-
-	// A cold glow sitting on the horizon, faked as a stack of strips because Canvas has no gradient.
-	const float HorizonY = ViewH * TraceMenuStyle::HorizonFraction;
-	const int32 Bands = 26;
-	const float BandH = (ViewH * 0.26f) / Bands;
-	for (int32 Index = 0; Index < Bands; ++Index)
-	{
-		const float T = static_cast<float>(Index) / static_cast<float>(Bands - 1);
-		const float Alpha = 0.10f * T * T;
-		DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::CyanDeep, Alpha),
-			0.f, HorizonY - (ViewH * 0.26f) + Index * BandH, ViewW, BandH + 1.f);
-	}
+	// Opaque, and drawn first: the menu map is empty, and whatever the renderer decides to put behind
+	// an empty map is not something the title screen should be at the mercy of.
+	//
+	// THE KIT'S BLACK (stylespec §1), the same black the UMG title's Backdrop is. This used to be a
+	// slate "Void" with a cyan haze, and under it DrawGridFloor drew a full cyan perspective grid and
+	// DrawBezel a cyan frame with corner ticks — so the black title turned into a teal Tron screen the
+	// moment SETTINGS or JOIN opened. Both are gone. The UMG title's steel/amber grid is owner-requested
+	// and stays on that renderer; under a modal's 0.82 scrim it is all but invisible, so this path
+	// does not reproduce it.
+	TraceMenuKit::DrawBackground(this, ViewW, ViewH);
 }
 
-void ATraceMenuHUD::DrawGridFloor()
+float ATraceMenuHUD::DrawTitleBlock()
 {
-	const float HorizonY = ViewH * TraceMenuStyle::HorizonFraction;
+	UTexture2D* Mark = TraceMenuKit::Sprite(ETraceKitSprite::Wordmark);
+	if (Mark == nullptr || Mark->GetSizeX() <= 0 || Mark->GetSizeY() <= 0)
+	{
+		return -1.f;
+	}
+
+	// The SAME composition the UMG widget uses (TraceTitleLayout, one copy for both renderers): the
+	// artist's navy wordmark in its amber glow, their white metal swoosh under it at the measured
+	// offsets. White tint — the sprites carry their own colour, cut by Scripts/slice-ui-assets.py
+	// notes 6 and 7 exactly as the artist drew them.
 	const float CX = ViewW * 0.5f;
-	const float Thin = FMath::Max(1.f, 1.f * UIScale);
+	const float MarkW = FMath::Min(TraceTitleLayout::MarkWidth * UIScale, ViewW * TraceTitleLayout::MarkMaxWidthFraction);
+	const float MarkH = MarkW * (static_cast<float>(Mark->GetSizeY()) / static_cast<float>(Mark->GetSizeX()));
+	const float MarkTop = TraceTitleLayout::MarkTopY * UIScale;
+	const float TaglineTop = TraceTitleLayout::TaglineY * UIScale;
 
-	// Rails converging on the vanishing point. Alpha falls off towards the edges so the grid
-	// dissolves into the dark instead of ending in a hard line.
-	const int32 Rails = 16;
-	const float RailSpread = ViewW * 0.34f;
-	for (int32 Index = -Rails; Index <= Rails; ++Index)
-	{
-		const float T = static_cast<float>(Index) / static_cast<float>(Rails);
-		const float BottomX = CX + T * RailSpread * Rails * 0.14f;
-		const float Alpha = 0.34f * (1.f - FMath::Abs(T) * 0.75f);
-		DrawLine(CX, HorizonY, BottomX, ViewH, TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, Alpha), Thin);
-	}
+	DrawTexture(Mark, CX - MarkW * 0.5f, MarkTop, MarkW, MarkH,
+		0.f, 0.f, 1.f, 1.f, FLinearColor::White, BLEND_Translucent);
 
-	// Rungs, scrolling towards the viewer. The exponent is what sells the perspective: evenly
-	// spaced rungs read as a ladder, squared spacing reads as a floor running away from you.
-	const int32 Rungs = 22;
-	const float Scroll = FMath::Fmod(Now * 0.18f, 1.f);
-	for (int32 Index = 0; Index < Rungs; ++Index)
+	float Bottom = MarkTop + MarkH;
+
+	UTexture2D* SwooshTex = TraceMenuKit::Sprite(ETraceKitSprite::Swoosh);
+	if (SwooshTex != nullptr && SwooshTex->GetSizeX() > 0 && SwooshTex->GetSizeY() > 0)
 	{
-		const float T = (static_cast<float>(Index) + Scroll) / static_cast<float>(Rungs);
-		if (T <= 0.f || T > 1.f)
+		const float SwooshAspect =
+			static_cast<float>(SwooshTex->GetSizeY()) / static_cast<float>(SwooshTex->GetSizeX());
+		float SwooshW = MarkW * TraceTitleLayout::SwooshWidthOfMark;
+		const float SwooshTop = MarkTop + MarkH + MarkW * TraceTitleLayout::SwooshGapOfMark;
+
+		// The same clamp the widget applies: whatever the sheet says, the flourish stops short of the
+		// tagline.
+		const float MaxSwooshH = FMath::Max(1.f, TaglineTop - TraceTitleLayout::SwooshClearOfTagline * UIScale - SwooshTop);
+		if (SwooshW * SwooshAspect > MaxSwooshH)
 		{
-			continue;
+			SwooshW = MaxSwooshH / FMath::Max(SwooshAspect, KINDA_SMALL_NUMBER);
 		}
-		const float Y = HorizonY + (ViewH - HorizonY) * FMath::Pow(T, 2.6f);
-		const float Alpha = 0.32f * T;
-		DrawLine(0.f, Y, ViewW, Y, TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, Alpha), Thin);
+
+		DrawTexture(SwooshTex,
+			CX - MarkW * TraceTitleLayout::SwooshLeftOfMark - SwooshW * 0.5f, SwooshTop,
+			SwooshW, SwooshW * SwooshAspect,
+			0.f, 0.f, 1.f, 1.f,
+			FLinearColor(1.f, 1.f, 1.f, TraceTitleLayout::SwooshOpacity), BLEND_Translucent);
+
+		Bottom = SwooshTop + SwooshW * SwooshAspect;
 	}
 
-	// The horizon itself, bright, because every straight edge in the frame should point at it.
-	DrawGlowLine(0.f, HorizonY, ViewW, HorizonY, TraceMenuStyle::Cyan, FMath::Max(1.f, 1.2f * UIScale));
-
-	// Scanlines over the whole frame. Cheap, and the single strongest cue that this is a screen
-	// inside a machine rather than a slide.
-	const float Step = FMath::Max(2.f, 4.f * UIScale);
-	for (float Y = 0.f; Y < ViewH; Y += Step)
-	{
-		DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.16f), 0.f, Y, ViewW, 1.f);
-	}
-}
-
-void ATraceMenuHUD::DrawBezel()
-{
-	// An earlier pass put a pair of counter-rotating wireframe hexagons behind the wordmark as a
-	// nod to the Core. On screen it read as scribble crossing the letterforms — ornament competing
-	// with the one thing that must be legible. This replaces it: a frame with corner ticks, which
-	// gives the composition an edge to sit inside and stays out of the type's way entirely.
-	const float InsetX = ViewW * 0.028f;
-	const float InsetY = ViewH * 0.038f;
-	const float Left = InsetX;
-	const float Right = ViewW - InsetX;
-	const float Top = InsetY;
-	const float Bottom = ViewH - InsetY;
-
-	const float Thin = FMath::Max(1.f, 1.f * UIScale);
-	const FLinearColor Frame = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.22f);
-
-	DrawLine(Left, Top, Right, Top, Frame, Thin);
-	DrawLine(Left, Bottom, Right, Bottom, Frame, Thin);
-	DrawLine(Left, Top, Left, Bottom, Frame, Thin);
-	DrawLine(Right, Top, Right, Bottom, Frame, Thin);
-
-	// Corner ticks: short, bright, and the only place the frame asserts itself.
-	const float Tick = 26.f * UIScale;
-	const float TickT = FMath::Max(1.f, 2.f * UIScale);
-	const FLinearColor Bright = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.85f);
-
-	DrawLine(Left, Top, Left + Tick, Top, Bright, TickT);
-	DrawLine(Left, Top, Left, Top + Tick, Bright, TickT);
-	DrawLine(Right - Tick, Top, Right, Top, Bright, TickT);
-	DrawLine(Right, Top, Right, Top + Tick, Bright, TickT);
-	DrawLine(Left, Bottom - Tick, Left, Bottom, Bright, TickT);
-	DrawLine(Left, Bottom, Left + Tick, Bottom, Bright, TickT);
-	DrawLine(Right, Bottom - Tick, Right, Bottom, Bright, TickT);
-	DrawLine(Right - Tick, Bottom, Right, Bottom, Bright, TickT);
+	return Bottom;
 }
 
 void ATraceMenuHUD::DrawWordmark()
 {
 	const float CX = ViewW * 0.5f;
+	const FString& Tagline = TRACE_TEXT("MENU.TAGLINE", "5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER");
 
-	// ---- WP9: THE ARTIST'S MARK, ON THIS RENDERER TOO ---------------------------------------------
+	// ---- THE ARTIST'S MARK ----------------------------------------------------------------------------
 	//
-	// This screen is what shows through every modal's scrim, and until the release pass it announced
-	// itself with a stroke-vector TRACE in cyan — the audit's single loudest "different game" tell.
-	// So the sprite path comes first, at the SAME composition the UMG widget uses (TraceTitleLayout,
-	// one copy for both renderers): the artist's wordmark, their swoosh under it at their measured
-	// offsets, the tagline at its authored line. White tint — the sprites carry their own colour
-	// since the slicer's lift/re-tone (slice-ui-assets.py notes 6 and 7).
-	//
-	// The stroke wordmark below is the FALLBACK, kept per the standing rule that a missing texture
-	// must leave the menu drawable — and it is still what a fresh checkout shows before the sprites
-	// are generated.
-	UTexture2D* Mark = TraceMenuKit::Sprite(ETraceKitSprite::Wordmark);
-	if (Mark != nullptr && Mark->GetSizeX() > 0 && Mark->GetSizeY() > 0)
+	// This screen is what shows through every modal's scrim. The sprite path comes first; the stroke
+	// wordmark below is the FALLBACK, kept per the standing rule that a missing texture must leave the
+	// menu drawable — and it is still what a fresh checkout shows before the sprites are generated.
+	if (DrawTitleBlock() >= 0.f)
 	{
-		using namespace TraceTitleLayout;
-
-		const float MarkW = FMath::Min(MarkWidth * UIScale, ViewW * MarkMaxWidthFraction);
-		const float MarkH = MarkW * (static_cast<float>(Mark->GetSizeY()) / static_cast<float>(Mark->GetSizeX()));
-		const float MarkTop = MarkTopY * UIScale;
-		const float TaglineTop = TaglineY * UIScale;
-
-		DrawTexture(Mark, CX - MarkW * 0.5f, MarkTop, MarkW, MarkH,
-			0.f, 0.f, 1.f, 1.f, FLinearColor::White, BLEND_Translucent);
-
-		UTexture2D* SwooshTex = TraceMenuKit::Sprite(ETraceKitSprite::Swoosh);
-		if (SwooshTex != nullptr && SwooshTex->GetSizeX() > 0 && SwooshTex->GetSizeY() > 0)
-		{
-			const float SwooshAspect =
-				static_cast<float>(SwooshTex->GetSizeY()) / static_cast<float>(SwooshTex->GetSizeX());
-			float SwooshW = MarkW * SwooshWidthOfMark;
-			const float SwooshTop = MarkTop + MarkH + MarkW * SwooshGapOfMark;
-
-			// The same clamp the widget applies: whatever the sheet says, the flourish stops short
-			// of the tagline.
-			const float MaxSwooshH = FMath::Max(1.f, TaglineTop - SwooshClearOfTagline * UIScale - SwooshTop);
-			if (SwooshW * SwooshAspect > MaxSwooshH)
-			{
-				SwooshW = MaxSwooshH / FMath::Max(SwooshAspect, KINDA_SMALL_NUMBER);
-			}
-
-			DrawTexture(SwooshTex,
-				CX - MarkW * SwooshLeftOfMark - SwooshW * 0.5f, SwooshTop,
-				SwooshW, SwooshW * SwooshAspect,
-				0.f, 0.f, 1.f, 1.f,
-				FLinearColor(1.f, 1.f, 1.f, SwooshOpacity), BLEND_Translucent);
-		}
-
-		DrawTextCentered(TRACE_TEXT("MENU.TAGLINE", "5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER"),
-			TraceMenuStyle::InkDim, CX, TaglineTop, FontSmall, 1.15f * UIScale);
+		const float TaglineTop = TraceTitleLayout::TaglineY * UIScale;
+		DrawTextCentered(Tagline, TraceMenuKit::CaptionInk, CX, TaglineTop, FontSmall, 1.15f * UIScale);
 
 		// Remembered for DrawAddressChip, which has to sit exactly under the tagline and must not
 		// re-derive the wordmark's geometry to find out where that is.
@@ -2671,20 +3231,14 @@ void ATraceMenuHUD::DrawWordmark()
 	const float TitleY = ViewH * 0.135f;
 	const float Thickness = FMath::Max(2.f, CapHeight * 0.055f);
 
-	DrawStrokeTextCentered(TRACE_TEXT("MENU.WORDMARK", "TRACE"), TraceMenuStyle::Cyan, CX, TitleY, CapHeight, Thickness);
+	// White, not the retired cyan: the kit has no cyan in it.
+	DrawStrokeTextCentered(TRACE_TEXT("MENU.WORDMARK", "TRACE"), TraceMenuArtStyle::WordDefault, CX, TitleY, CapHeight, Thickness);
 
-	// Rule + tagline. The rule is exactly as wide as the wordmark, which is the only reason the
-	// block below it looks deliberate rather than dropped in.
-	const float MarkW = MeasureStrokeText(TRACE_TEXT("MENU.WORDMARK", "TRACE"), CapHeight);
-	const float RuleY = TitleY + CapHeight + (28.f * UIScale);
-	DrawGlowLine(CX - MarkW * 0.5f, RuleY, CX + MarkW * 0.5f, RuleY,
-		TraceMenuStyle::Cyan, FMath::Max(1.f, 2.f * UIScale));
-
-	DrawTextCentered(TRACE_TEXT("MENU.TAGLINE", "5 V 5    -    ONE CORE    -    DASH THE TRAIL TO KILL THE CARRIER"),
-		TraceMenuStyle::InkDim, CX, RuleY + (18.f * UIScale), FontSmall, 1.15f * UIScale);
+	const float TaglineTop = TitleY + CapHeight + (46.f * UIScale);
+	DrawTextCentered(Tagline, TraceMenuKit::CaptionInk, CX, TaglineTop, FontSmall, 1.15f * UIScale);
 
 	// Remembered for DrawAddressChip, same as the sprite arm above.
-	TaglineBottomY = RuleY + (18.f * UIScale) + MeasureHeight(TEXT("X"), FontSmall, 1.15f * UIScale);
+	TaglineBottomY = TaglineTop + MeasureHeight(TEXT("X"), FontSmall, 1.15f * UIScale);
 }
 
 void ATraceMenuHUD::DrawAddressChip()
@@ -2708,7 +3262,7 @@ void ATraceMenuHUD::DrawAddressChip()
 	const float ValueH = MeasureHeight(Endpoint, FontMedium, ValueScale);
 
 	const float Gap = 14.f * UIScale;
-	const float PadX = 18.f * UIScale;
+	const float PadX = 20.f * UIScale;
 	const float PadY = 7.f * UIScale;
 
 	const float ChipW = CaptionW + Gap + ValueW + PadX * 2.f;
@@ -2716,21 +3270,19 @@ void ATraceMenuHUD::DrawAddressChip()
 	const float ChipX = CX - ChipW * 0.5f;
 	const float ChipY = TaglineBottomY + (14.f * UIScale);
 
-	DrawRect(FLinearColor(0.004f, 0.014f, 0.026f, 0.90f), ChipX, ChipY, ChipW, ChipH);
-
-	const float Edge = FMath::Max(1.f, 1.2f * UIScale);
-	const FLinearColor EdgeColor = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.45f);
-	DrawRect(EdgeColor, ChipX, ChipY, ChipW, Edge);
-	DrawRect(EdgeColor, ChipX, ChipY + ChipH - Edge, ChipW, Edge);
-	DrawRect(EdgeColor, ChipX, ChipY, Edge, ChipH);
-	DrawRect(EdgeColor, ChipX + ChipW - Edge, ChipY, Edge, ChipH);
+	// The artist's plate, as on the UMG chip (a button frame at chip height), not the flat
+	// cyan-edged box it used to be. The kit's fallback when the texture is not drawable yet.
+	if (!TraceMenuKit::DrawPlate(this, TraceMenuKit::Sprite(ETraceKitSprite::BtnDefault), TraceMenuArtStyle::ButtonFrame,
+		ChipX, ChipY, ChipW, ChipH, ChipH, FLinearColor::White))
+	{
+		TraceMenuKit::DrawFallbackPlate(this, ETraceKitState::Default, ChipX, ChipY, ChipW, ChipH);
+	}
 
 	const float CaptionY = ChipY + (ChipH - MeasureHeight(Caption, FontSmall, CaptionScale)) * 0.5f;
-	TraceMenuHUDType::Draw(this, Caption, TraceMenuStyle::InkDim, ChipX + PadX, CaptionY, FontSmall, CaptionScale);
+	TraceMenuHUDType::Draw(this, Caption, TraceMenuKit::CaptionInk, ChipX + PadX, CaptionY, FontSmall, CaptionScale);
 
-	// Bright cyan, and it is the only place on this screen a raw number is allowed to be the loudest
-	// thing in its own box.
-	TraceMenuHUDType::Draw(this, Endpoint, TraceMenuStyle::Cyan, ChipX + PadX + CaptionW + Gap, ChipY + PadY, FontMedium, ValueScale);
+	// White: the only place on this screen a raw number is allowed to be the loudest thing in its box.
+	TraceMenuHUDType::Draw(this, Endpoint, TraceMenuArtStyle::WordDefault, ChipX + PadX + CaptionW + Gap, ChipY + PadY, FontMedium, ValueScale);
 
 	// MEASURED CAVEAT. If something else already holds UDP 7777, UIpNetDriver does not fail — it
 	// binds the next free port instead (observed: "IpNetDriver listening on port 7778"). The match is
@@ -2740,7 +3292,7 @@ void ATraceMenuHUD::DrawAddressChip()
 	if (!TraceNet::IsDefaultPortFreeCached())
 	{
 		DrawTextCentered(TRACE_TEXT("MENU.PORT_BUSY_WARNING", "PORT 7777 IS BUSY ON THIS MACHINE - THE HUD WILL SHOW THE REAL PORT IN-GAME"),
-			TraceMenuStyle::Amber, CX, ChipY + ChipH + (4.f * UIScale), FontSmall, 0.95f * UIScale);
+			TraceMenuArtStyle::AmberLifted(), CX, ChipY + ChipH + (4.f * UIScale), FontSmall, 0.95f * UIScale);
 	}
 }
 
@@ -2790,7 +3342,7 @@ void ATraceMenuHUD::DrawFailureBanner()
 
 	// The engine's own code and message, kept verbatim under the readable sentence. The player does
 	// not need it; the person they paste their log to does.
-	DrawTextCentered(Detail, TraceMenuStyle::WithAlpha(TraceMenuStyle::Ink, 0.8f * Fade),
+	DrawTextCentered(Detail, TraceMenuStyle::WithAlpha(TraceMenuArtStyle::WordDefault, 0.8f * Fade),
 		ViewW * 0.5f, BannerY + PadY + HeadH + (4.f * UIScale), FontSmall, DetailScale);
 }
 
@@ -2798,178 +3350,183 @@ void ATraceMenuHUD::DrawJoinPrompt()
 {
 	if (!JoinEntry.IsActive())
 	{
+		JoinButtonRects[TraceMenuHUDJoin::Connect] = FBox2D(ForceInit);
+		JoinButtonRects[TraceMenuHUDJoin::Back] = FBox2D(ForceInit);
 		return;
 	}
 
-	// This drew inside a foreground-canvas scope from spec v23 §A2 until spec v25 §1 removed the
-	// elevation — see the header of UI/TraceOptionsMenu.h. The prompt now draws where every other
-	// Canvas element on this screen draws, on the surface the host handed it.
+	namespace MJ = TraceMenuHUDJoin;
+	const float S = UIScale;
 
-	// Dim everything behind it. The prompt has swallowed the keyboard — including the W/A/S/D that
-	// normally move the selection — so the screen has to say plainly that the menu is not listening.
+	// ---- ON THE HANDMADE KIT ---------------------------------------------------------------------
 	//
-	// ---- ONE SCRIM STRENGTH, AND IT STAYS ONE ----------------------------------------------------
+	// This was the pre-kit design: a flat dark rectangle with 1.6 px cyan edges, a cyan title, a
+	// cyan-edged field with a cyan caret, and key hints as one long string — with no pointer (the OS
+	// arrow came back) and nothing a mouse could press. Now it is built from the kit like the options
+	// pages it sits beside: the kit's black scrim and a black panel with no edges, the field as the
+	// artist's glowing HOVER plate (it has the keyboard, so it is the focused control), CONNECT and BACK
+	// as real kit buttons, a [KEY] VERB legend, and the white blade pointer.
 	//
-	// This was `bMenuUmgAvailable ? 0.94f : 0.78f` before v23: the prompt could only be seen if the
-	// UMG title screen stood down, so what sat behind it was the RETIRED stroked-vector title — a
-	// different wordmark in a different typeface, plainly legible at 0.78 — and the mitigation was to
-	// crush the scrim to 0.94 until the stand-in read as unlit background. It cost the screen its
-	// depth to hide a screen that should not have been there.
-	//
-	// The stand-in IS behind the prompt again now that the elevation is gone, so the 0.94 case has
-	// come back with it — and it is still not being restored. 0.78 is the value this screen was
-	// designed at, a scrim that hides the screen behind it entirely is not a scrim, and the honest
-	// reading of the v25 §1 trade is that the Canvas title screen shows through a modal. Raising the
-	// number here would be hiding the cost rather than paying it. WP9 shrank that cost at its source
-	// instead: the Canvas title now draws the artist's wordmark, swoosh and plates itself, so what
-	// shows through this scrim is the same screen, not a different-looking game.
-	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.78f), 0.f, 0.f, ViewW, ViewH);
+	// The screen behind it is the Canvas title, which is the kit too now (DrawBackdrop), so opening
+	// JOIN dims the same black screen instead of switching it to a teal one.
+	TraceMenuKit::DrawScrim(this, ViewW, ViewH);
 
 	const float CX = ViewW * 0.5f;
-	const float PanelW = FMath::Min(ViewW * 0.72f, 900.f * UIScale);
-	const float PanelH = 300.f * UIScale;
+	const float PanelW = FMath::Min(MJ::PanelW * S, ViewW * 0.86f);
 	const float PanelX = CX - PanelW * 0.5f;
-	const float PanelY = ViewH * 0.30f;
+	const float PanelY = ViewH * MJ::PanelTopFrac;
 
-	DrawRect(FLinearColor(0.004f, 0.016f, 0.030f, 0.97f), PanelX, PanelY, PanelW, PanelH);
+	// ---- The legend first, because the panel's height depends on how many lines it has ------------
+	const FString ConnectWord = TRACE_TEXT("MENU.JOIN_CONNECT", "CONNECT");
+	const FString BackWord = TRACE_TEXT("MENU.JOIN_BACK", "BACK");
+	const FString PasteWord = TRACE_TEXT("MENU.JOIN_PASTE", "PASTE");
 
-	const float Edge = FMath::Max(1.f, 1.6f * UIScale);
-	const FLinearColor EdgeColor = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.65f);
-	DrawRect(EdgeColor, PanelX, PanelY, PanelW, Edge);
-	DrawRect(EdgeColor, PanelX, PanelY + PanelH - Edge, PanelW, Edge);
-	DrawRect(EdgeColor, PanelX, PanelY, Edge, PanelH);
-	DrawRect(EdgeColor, PanelX + PanelW - Edge, PanelY, Edge, PanelH);
+	TArray<FTraceKitLegendItem> Keys;
+	Keys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_SELECT", "ENTER"), ConnectWord });
+	Keys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_BACK", "ESC"), BackWord });
+	Keys.Add({ TRACE_TEXT("MENU.JOIN_KEY_PASTE", "CTRL+V"), PasteWord });
 
-	DrawTextCentered(TRACE_TEXT("MENU.JOIN_TITLE", "JOIN A GAME"), TraceMenuStyle::Cyan, CX, PanelY + (22.f * UIScale), FontMedium, 1.5f * UIScale);
-	DrawTextCentered(TRACE_TEXT("MENU.JOIN_SUBTITLE", "TYPE THE HOST'S ADDRESS"), TraceMenuStyle::InkDim,
-		CX, PanelY + (58.f * UIScale), FontSmall, 1.f * UIScale);
+	// Only once a controller has been seen (ShouldShowPadHints): a keyboard-only player is not told
+	// about buttons they do not have.
+	TArray<FTraceKitLegendItem> PadKeys;
+	if (ShouldShowPadHints())
+	{
+		PadKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_SELECT", "A"), ConnectWord });
+		PadKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_BACK", "B"), BackWord });
+		PadKeys.Add({ TRACE_TEXT("MENU.JOIN_PAD_KEY_PASTE", "X"), PasteWord });
+	}
 
-	// ---- The field -----------------------------------------------------------------------------
-	const float FieldW = PanelW - (72.f * UIScale);
-	const float FieldH = 56.f * UIScale;
-	const float FieldX = CX - FieldW * 0.5f;
-	const float FieldY = PanelY + (92.f * UIScale);
+	const float FullChipH = MJ::LegendChipH * S;
+	const float LegendMaxW = PanelW - 2.f * 40.f * S;
+	const float ChipH = TraceMenuKit::KeyLegendFit(FullChipH, LegendMaxW,
+		{ TraceMenuKit::KeyLegendWidth(Keys, FullChipH), TraceMenuKit::KeyLegendWidth(PadKeys, FullChipH) });
+	const int32 LegendLines = (TraceMenuKit::KeyLegendWidth(Keys, ChipH) > 0.f ? 1 : 0)
+		+ (TraceMenuKit::KeyLegendWidth(PadKeys, ChipH) > 0.f ? 1 : 0);
 
-	DrawRect(FLinearColor(0.00f, 0.03f, 0.05f, 0.95f), FieldX, FieldY, FieldW, FieldH);
-	const FLinearColor FieldEdge = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.55f);
-	DrawRect(FieldEdge, FieldX, FieldY, FieldW, Edge);
-	DrawRect(FieldEdge, FieldX, FieldY + FieldH - Edge, FieldW, Edge);
-	DrawRect(FieldEdge, FieldX, FieldY, Edge, FieldH);
-	DrawRect(FieldEdge, FieldX + FieldW - Edge, FieldY, Edge, FieldH);
+	// ---- Vertical layout, top to bottom, in one place --------------------------------------------
+	const float TitleMid = PanelY + (MJ::PanelPadTop + MJ::TitleCap * 0.5f) * S;
+	const float SubtitleMid = TitleMid + (MJ::TitleCap * 0.5f + MJ::SubtitleGap + MJ::SubtitleCap * 0.5f) * S;
+	const float FieldY = PanelY + MJ::FieldTop * S;
+	const float FieldH = MJ::FieldH * S;
+	const float NoteMid = FieldY + FieldH + MJ::NoteGap * S;
+	const float ButtonsY = FieldY + FieldH + MJ::ButtonsGap * S;
+	const float ButtonH = MJ::ButtonH * S;
+	const float LegendY = ButtonsY + ButtonH + MJ::LegendGap * S;
+	const float LegendBottom = LegendY + ((LegendLines > 0) ? (ChipH + (LegendLines - 1) * MJ::LegendLineGap * S) : 0.f);
+	const float MachineMid = LegendBottom + MJ::MachineGap * S;
+	const float PanelH = (MachineMid + MJ::MachineCap * 0.5f * S + MJ::PanelPadBottom * S) - PanelY;
 
+	// A black panel with NO coloured edges (stylespec §0), over the scrim, as the options pages do it.
+	DrawRect(FLinearColor(0.f, 0.f, 0.f, MJ::PanelAlpha), PanelX, PanelY, PanelW, PanelH);
+
+	// ---- Title and subtitle: Sofachrome, the page-title face -------------------------------------
+	TraceMenuKit::DrawCapText(this, TRACE_TEXT("MENU.JOIN_TITLE", "JOIN A GAME"), CX, TitleMid, MJ::TitleCap * S,
+		TraceMenuArtStyle::WordDefault, ETraceTextWeight::Light, TraceText::EHAlign::Center, PanelW - 80.f * S);
+	TraceMenuKit::DrawCapText(this, TRACE_TEXT("MENU.JOIN_SUBTITLE", "TYPE THE HOST'S ADDRESS"), CX, SubtitleMid,
+		MJ::SubtitleCap * S, TraceMenuKit::CaptionInk, ETraceTextWeight::Light, TraceText::EHAlign::Center, PanelW - 80.f * S);
+
+	// ---- The field: the artist's HOVER plate, because it is the focused control -------------------
+	const float FieldX = PanelX + MJ::FieldSide * S;
+	const float FieldW = PanelW - 2.f * MJ::FieldSide * S;
+	if (!TraceMenuKit::DrawPlate(this, TraceMenuKit::Sprite(ETraceKitSprite::BtnHover), TraceMenuArtStyle::ButtonFrame,
+		FieldX, FieldY, FieldW, FieldH, FieldH, FLinearColor::White))
+	{
+		TraceMenuKit::DrawFallbackPlate(this, ETraceKitState::Hover, FieldX, FieldY, FieldW, FieldH);
+	}
+
+	// The address in the settings pages' body face (Erbaum Bold): digits and dots have to be read
+	// exactly, and it is the face that reads them best. White, shrunk to fit rather than clipped.
 	const FString Typed = JoinEntry.GetText();
-	const float TextScale = 1.5f * UIScale;
-	const float TextX = FieldX + (18.f * UIScale);
-	const float TextY = FieldY + (FieldH - MeasureHeight(TEXT("0"), FontMedium, TextScale)) * 0.5f;
+	const float FieldMid = FieldY + FieldH * 0.5f;
+	const float TextX = FieldX + MJ::FieldTextPad * S;
+	const float TextRoom = FieldW - 2.f * MJ::FieldTextPad * S;
+	const FString Shown = Typed.IsEmpty()
+		? TRACE_TEXTF("MENU.JOIN_FIELD_PLACEHOLDER", "100.101.102.103:{0}", { TraceNet::DefaultPort })
+		: Typed;
 
-	if (Typed.IsEmpty())
+	TraceText::FStyle FieldStyle = TraceMenuKit::CapStyle(MJ::FieldTextCap * S,
+		Typed.IsEmpty() ? FLinearColor(1.f, 1.f, 1.f, 0.35f) : TraceMenuArtStyle::WordDefault, ETraceTextWeight::Hud);
+	FieldStyle.HAlign = TraceText::EHAlign::Left;
 	{
-		// Ghost text, dim enough that nobody mistakes it for a value they can press Enter on.
-		TraceMenuHUDType::Draw(this, TRACE_TEXTF("MENU.JOIN_FIELD_PLACEHOLDER", "100.101.102.103:{0}", { TraceNet::DefaultPort }),
-			TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.35f), TextX, TextY, FontMedium, TextScale);
+		const float Natural = TraceText::MeasureWidth(Shown, FieldStyle);
+		if (Natural > TextRoom && Natural > 0.f)
+		{
+			FieldStyle.Size *= TextRoom / Natural;
+		}
 	}
-	else
-	{
-		TraceMenuHUDType::Draw(this, Typed, TraceMenuStyle::Ink, TextX, TextY, FontMedium, TextScale);
-	}
+	TraceMenuKit::DrawTextCapCentered(this, Shown, TextX, FieldMid, FieldStyle);
 
-	// Caret. Measured off the substring LEFT of the caret rather than assuming a fixed advance —
-	// the engine fonts are proportional, and a caret that drifts off the character it is editing is
-	// worse than no caret at all.
+	// Caret: white, measured off the substring LEFT of it in the same style, so it sits on the
+	// character it is editing however the field shrank.
 	if (JoinEntry.IsCaretVisible(Now))
 	{
-		const FString LeftOfCaret = Typed.Left(JoinEntry.GetCaret());
-		const float CaretX = TextX + MeasureWidth(LeftOfCaret, FontMedium, TextScale);
-		DrawRect(TraceMenuStyle::Cyan, CaretX, FieldY + (10.f * UIScale),
-			FMath::Max(2.f, 2.f * UIScale), FieldH - (20.f * UIScale));
+		const float CaretCap = TraceText::CapHeight(FieldStyle.Size, FieldStyle.Weight);
+		const float CaretX = TextX + (Typed.IsEmpty() ? 0.f : TraceText::MeasureWidth(Typed.Left(JoinEntry.GetCaret()), FieldStyle));
+		DrawRect(TraceMenuArtStyle::WordDefault, CaretX + FMath::Max(1.f, 1.f * S), FieldMid - CaretCap * 0.8f,
+			FMath::Max(2.f, 2.f * S), CaretCap * 1.6f);
 	}
 
-	// ---- Error, or the reassurance that replaces it ----------------------------------------------
-	const float NoteY = FieldY + FieldH + (12.f * UIScale);
+	// ---- Error, or the confirmation that replaces it, or the port note ---------------------------
 	if (!JoinError.IsEmpty())
 	{
-		DrawTextCentered(JoinError, TraceMenuStyle::Amber, CX, NoteY, FontSmall, 1.05f * UIScale);
+		TraceMenuKit::DrawCapText(this, JoinError, CX, NoteMid, MJ::NoteCap * S, TraceMenuArtStyle::AmberLifted(),
+			ETraceTextWeight::Hud, TraceText::EHAlign::Center, FieldW);
 	}
 	else if (JoinEntry.WasRecentlyPasted(Now))
 	{
-		DrawTextCentered(TRACE_TEXT("MENU.JOIN_PASTED_NOTE", "PASTED FROM CLIPBOARD"), TraceMenuStyle::Cyan, CX, NoteY, FontSmall, 1.05f * UIScale);
+		TraceMenuKit::DrawCapText(this, TRACE_TEXT("MENU.JOIN_PASTED_NOTE", "PASTED FROM CLIPBOARD"), CX, NoteMid,
+			MJ::NoteCap * S, TraceMenuArtStyle::WordHoverLifted(), ETraceTextWeight::Hud, TraceText::EHAlign::Center, FieldW);
 	}
 	else
 	{
-		DrawTextCentered(TRACE_TEXTF("MENU.JOIN_PORT_NOTE", "PORT {0} IS ADDED FOR YOU IF YOU LEAVE IT OFF",
-			{ TraceNet::DefaultPort }),
-			TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.75f), CX, NoteY, FontSmall, 1.05f * UIScale);
+		TraceMenuKit::DrawCapText(this, TRACE_TEXTF("MENU.JOIN_PORT_NOTE", "PORT {0} IS ADDED FOR YOU IF YOU LEAVE IT OFF",
+			{ TraceNet::DefaultPort }), CX, NoteMid, MJ::NoteCap * S, TraceMenuKit::CaptionInk, ETraceTextWeight::Hud,
+			TraceText::EHAlign::Center, FieldW);
 	}
 
-	// ---- Keys, and this machine's own address ----------------------------------------------------
+	// ---- CONNECT and BACK: kit buttons the mouse can press ---------------------------------------
 	//
-	// WP5 — FITTED, NOT ASSUMED. The four-hint line overflowed the 900 px panel at 1080p
-	// (photographed in the release audit). The house measure-and-shrink pattern
-	// (TraceCharacterSelect's name fit): measure at natural scale WITH THE FACE THAT DRAWS IT —
-	// measure-with-the-face-you-draw is the HUD's own law — and multiply the scale down, floored at
-	// 0.72 so it degrades into smaller type rather than unreadable type. Below the floor (cannot
-	// happen with the current copy) the PASTE segment goes first: paste is discoverable,
-	// connect/cancel are not.
-	const float HintPad = 24.f * UIScale;
-	const float HintRoom = PanelW - HintPad * 2.f;
+	// Hover follows the pointer; a press held on a button draws it PRESSED; the release on the same
+	// button fires it (MouseReleased). An emptied label (Ranen's "KEY =") draws no button and leaves
+	// nothing to click.
+	const float ButtonW = FMath::Min(MJ::ButtonW * S, (FieldW - MJ::ButtonSpacing * S) * 0.5f);
+	const float ButtonsX = CX - (ButtonW * 2.f + MJ::ButtonSpacing * S) * 0.5f;
+	const FString ButtonWords[MJ::ButtonCount] = { ConnectWord, BackWord };
+	for (int32 Index = 0; Index < MJ::ButtonCount; ++Index)
 	{
-		FString Keys = TRACE_TEXT("MENU.JOIN_KEYS_LONG", "ENTER   CONNECT          ESC   CANCEL          CTRL / CMD + V   PASTE          BACKSPACE   DELETE");
-		float KeysScale = 1.f * UIScale;
-		float Natural = MeasureWidth(Keys, FontSmall, KeysScale);
-		if (Natural > HintRoom && Natural > 1.f)
-		{
-			if (HintRoom / Natural < 0.72f)
-			{
-				Keys = TRACE_TEXT("MENU.JOIN_KEYS_SHORT", "ENTER   CONNECT          ESC   CANCEL          BACKSPACE   DELETE");
-				Natural = MeasureWidth(Keys, FontSmall, KeysScale);
-			}
-			if (Natural > HintRoom && Natural > 1.f)
-			{
-				KeysScale *= FMath::Max(0.72f, HintRoom / Natural);
-			}
-		}
-		DrawTextCentered(Keys, TraceMenuStyle::InkDim, CX, PanelY + PanelH - (66.f * UIScale), FontSmall, KeysScale);
+		const float BX = ButtonsX + Index * (ButtonW + MJ::ButtonSpacing * S);
+		const FBox2D Rect(FVector2D(BX, ButtonsY), FVector2D(BX + ButtonW, ButtonsY + ButtonH));
+		const bool bUnderPointer = bHasCursor && Rect.IsInside(LastCursorPos);
+		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, bUnderPointer,
+			bUnderPointer && JoinPressedButton == Index);
+		JoinButtonRects[Index] = TraceMenuKit::DrawButton(this, State, BX, ButtonsY, ButtonW, ButtonH, ButtonWords[Index], Now)
+			? Rect : FBox2D(ForceInit);
 	}
 
-	// ---- D32-PADMENU — what a controller can do at a text field -----------------------------------
-	//
-	// Only drawn once a controller has been seen (ShouldShowPadHints), so a keyboard-only player never
-	// reads it. It takes the "THIS MACHINE IS" line's slot rather than adding another — see the else
-	// arm below.
-	if (ShouldShowPadHints())
+	// ---- The legend: [ENTER] CONNECT  [ESC] BACK  [CTRL+V] PASTE, and the pad's line under it -----
+	float LineY = LegendY;
+	if (TraceMenuKit::KeyLegendWidth(Keys, ChipH) > 0.f)
 	{
-		const FString PadKeys = TRACE_TEXT("MENU.JOIN_PAD_KEYS", "A   CONNECT          B   CANCEL          X   PASTE");
-		float PadScale = 1.f * UIScale;
-		const float PadNatural = MeasureWidth(PadKeys, FontSmall, PadScale);
-		if (PadNatural > HintRoom && PadNatural > 1.f)
-		{
-			PadScale *= FMath::Max(0.72f, HintRoom / PadNatural);
-		}
-		// ONE LINE, on the baseline the keyboard arm's "THIS MACHINE IS" uses, so the panel reads the
-		// same with either device. There was a second line under it, "TYPING A NEW ADDRESS NEEDS A
-		// KEYBOARD"; the co-developer's text pass removed it.
-		DrawTextCentered(PadKeys, TraceMenuStyle::Cyan, CX, PanelY + PanelH - (40.f * UIScale), FontSmall, PadScale);
+		TraceMenuKit::DrawKeyLegend(this, Keys, CX, LineY, ChipH, Now);
+		LineY += MJ::LegendLineGap * S;
 	}
+	TraceMenuKit::DrawKeyLegend(this, PadKeys, CX, LineY, ChipH, Now);
+
 	// Deliberately repeated here as well as on the title screen behind it. Somebody in this prompt is
 	// mid-conversation with the person they are trying to reach, and "what's yours?" is the very next
-	// question — having it on screen saves a round trip through Escape. Same fit guard: a long
-	// tailscale hostname is exactly the string that does not fit a 900 px panel.
+	// question — having it on screen saves a round trip through Escape.
+	TraceMenuKit::DrawCapText(this, TRACE_TEXTF("MENU.JOIN_THIS_MACHINE", "THIS MACHINE IS {0}", { TraceNet::GetHostEndpoint() }),
+		CX, MachineMid, MJ::MachineCap * S, TraceMenuKit::CaptionInk, ETraceTextWeight::Light, TraceText::EHAlign::Center,
+		PanelW - 80.f * S);
+
+	// ---- The pointer, on top of everything the prompt drew ----------------------------------------
 	//
-	// D32-PADMENU MADE THIS AN ELSE ARM rather than adding another block. This line is a REPEAT —
-	// the title screen's own address chip is directly behind this scrim — and a player holding a
-	// controller is not the player about to read their hostname down a call, so on a machine where a
-	// pad has been seen the pad's buttons win. Both arms draw one line on the same baseline.
-	else
+	// Live, not frozen: DrawHUD keeps sampling it while the prompt is up. ShowCursor renews the lease
+	// that hides the OS arrow, so there is exactly one pointer and it is the artist's.
+	if (bHasCursor
+		&& !TraceMenuKit::ShowCursor(this, GetOwningPlayerController(), TEXT("JOIN prompt"), LastCursorPos, UIScale))
 	{
-		const FString Machine = TRACE_TEXTF("MENU.JOIN_THIS_MACHINE", "THIS MACHINE IS {0}", { TraceNet::GetHostEndpoint() });
-		float MachineScale = 1.f * UIScale;
-		const float Natural = MeasureWidth(Machine, FontSmall, MachineScale);
-		if (Natural > HintRoom && Natural > 1.f)
-		{
-			MachineScale *= FMath::Max(0.72f, HintRoom / Natural);
-		}
-		DrawTextCentered(Machine, TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.7f),
-			CX, PanelY + PanelH - (40.f * UIScale), FontSmall, MachineScale);
+		TraceMenuHUDPointer::DrawCross(this, LastCursorPos, UIScale);
 	}
 }
 
@@ -2980,41 +3537,18 @@ void ATraceMenuHUD::DrawMenuRows()
 	const float CX = ViewW * 0.5f;
 	const float Spacing = TraceMenuStyle::RowSpacing * UIScale;
 
-	// The rows sat on an opaque console rather than straight on the grid, because the perspective
-	// lines ran right through the labels — the grid wins every legibility contest it is allowed to
-	// enter. Since WP9 the plates themselves are opaque sprites and the console only draws on the
-	// spriteless fallback; see bPlates below.
-	//
-	// The arithmetic moved into TraceMenuStyle::ComputeConsoleLayout in spec v17 §4 so that
+	// The arithmetic lives in TraceMenuStyle::ComputeConsoleLayout (spec v17 §4) so that
 	// GetCanvasRowRect (which the UMG verifier compares against) and this draw cannot disagree.
-	// 0.395 rather than 0.415: JOIN made this a six-row panel, and at 1080p the old anchor pushed its
-	// bottom edge 7px under the footer's dark strip.
+	//
+	// NO CONSOLE PANEL behind the rows, on either renderer: every row is an opaque navy plate (the
+	// kit's own fallback rectangle while a sprite is not drawable yet) on black, exactly as on the UMG
+	// screen, whose ConsolePanel is a CLEAR border. The old cyan-edged console went with the cyan grid
+	// it was there to hide; the panel rect is still what places the blurb.
 	const TraceMenuStyle::FConsoleLayout Layout =
 		TraceMenuStyle::ComputeConsoleLayout(ViewW, ViewH, UIScale, RowCount);
 	const float RowW = Layout.RowW;
-	const float PanelX = Layout.PanelX;
 	const float PanelY = Layout.PanelY;
-	const float PanelW = Layout.PanelW;
 	const float PanelH = Layout.PanelH;
-
-	// WP9: when the artist's plates are drawable the rows are opaque navy buttons and carry their
-	// own legibility, exactly as on the UMG screen — whose ConsolePanel is a CLEAR border. Drawing
-	// the old cyan-edged console behind them would be the "different game" tell surviving in a
-	// frame. The panel remains the fallback's legibility device when the sprites are absent.
-	const bool bPlates =
-		TraceMenuKit::Sprite(ETraceKitSprite::BtnDefault) != nullptr
-		&& TraceMenuKit::Sprite(ETraceKitSprite::BtnHover) != nullptr;
-	if (!bPlates)
-	{
-		DrawRect(TraceMenuStyle::PanelFill, PanelX, PanelY, PanelW, PanelH);
-
-		const float Edge = FMath::Max(1.f, 1.2f * UIScale);
-		const FLinearColor PanelEdge = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.28f);
-		DrawRect(PanelEdge, PanelX, PanelY, PanelW, Edge);
-		DrawRect(PanelEdge, PanelX, PanelY + PanelH - Edge, PanelW, Edge);
-		DrawRect(PanelEdge, PanelX, PanelY, Edge, PanelH);
-		DrawRect(PanelEdge, PanelX + PanelW - Edge, PanelY, Edge, PanelH);
-	}
 
 	const float FirstY = Layout.FirstRowY;
 	for (int32 Index = 0; Index < RowCount; ++Index)
@@ -3030,7 +3564,7 @@ void ATraceMenuHUD::DrawMenuRows()
 	// it is still there and can still be collided with, so this measurement still earns its keep.)
 	const FString Blurb = BuildBlurb();
 	const float BlurbY = PanelY + PanelH - (36.f * UIScale);
-	DrawTextCentered(Blurb, TraceMenuStyle::InkDim, CX, BlurbY, FontSmall, 1.1f * UIScale);
+	DrawTextCentered(Blurb, TraceMenuKit::CaptionInk, CX, BlurbY, FontSmall, 1.1f * UIScale);
 	BlurbBottomY = BlurbY + MeasureHeight(Blurb, FontSmall, 1.1f * UIScale);
 }
 
@@ -3074,7 +3608,7 @@ FString ATraceMenuHUD::BuildBlurb() const
 		return FString();
 
 	default:
-		return TraceMenuStyle::DifficultyBlurb(Difficulty);
+		return TraceDifficulty::ToBlurb(Difficulty);
 	}
 }
 
@@ -3093,8 +3627,14 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 	// the title appears (AcceptsActivation swallows an Enter that early — see AcceptUnlockTime) and
 	// after PLAY or JOIN has been taken and the level is loading. Both used to look completely live
 	// while doing nothing, which is the worst thing a button can do.
+	//
+	// NOT THE GRACE PERIOD ANY MORE. It used to be `!bTravelling && AcceptsActivation()`, so for the
+	// first 0.35 s of every title screen (every launch, every return from a match) all six rows drew the
+	// near-black DISABLED plate and then popped to navy: the whole menu blinked grey to blue. The grace
+	// period still swallows an early Enter (ActivateSelection) — it just is not DRAWN, because it is a
+	// guard against a stray key, not a state the player needs to see.
 	OutView.bPressed = (PressedRow == static_cast<int32>(Row));
-	OutView.bEnabled = !bTravelling && AcceptsActivation();
+	OutView.bEnabled = !bTravelling;
 
 	switch (Row)
 	{
@@ -3126,12 +3666,10 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 	{
 		OutView.Value = TraceDifficulty::ToDisplayName(Difficulty);
 
-		// Cyan, and the art bible §2.4 guard rail is why: menu accents on one screen come from at
-		// most two systems, and only team-flavoured values may be amber. The mode row used to wear
-		// amber and DIFFICULTY used to colour-code its setting (mint/cyan/amber), which put a third
-		// and fourth accent voice on a screen whose selection language is already amber ring + rail.
-		// The WORDS carry the setting; the colour stays neutral.
-		OutView.ValueColor = TraceMenuStyle::Cyan;
+		// The row's own word colour, never a colour of its own: white, and the hover olive on the
+		// selected row, exactly as the label beside it (the sheet sets the number in its value box in
+		// that olive). It was the pre-kit cyan; the kit has no cyan in it. The WORDS carry the setting.
+		OutView.ValueColor = bSelected ? TraceMenuArtStyle::WordHoverLifted() : TraceMenuArtStyle::WordDefault;
 
 		OutView.bShowArrows = true;
 		OutView.bCanLeft = (Difficulty != ETraceBotDifficulty::Easy);
@@ -3145,104 +3683,98 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 	const float X = CenterX - Width * 0.5f;
 	const float PadX = TraceMenuStyle::RowPadX * UIScale;
 
-	// ---- WP9: the artist's plate, 9-sliced by the kit -----------------------------------------------
+	// WHAT the row says is decided in exactly one place, BuildRowView, because the UMG renderer says
+	// the same things from the same call (spec v17 §4). This function is purely HOW it looks on a
+	// Canvas.
+	FTraceMenuRowView RowView;
+	BuildRowView(Row, bSelected, RowView);
+
+	// ---- The artist's plate, 9-sliced by the kit ------------------------------------------------------
 	//
-	// The selected row wears the HOVER plate (ring and all) exactly as the UMG row does — selection
-	// and hover are one state on this screen. The kit's 9-slice with CornerHeight == the row height
-	// draws exactly the 3-slice this file used to (Trace.UI.Kit.Verify compares them point by point).
-	// The pre-WP9 rectangles remain the fallback for a missing or not-yet-drawable texture.
-	//
-	// Plate and word both come from the kit's one state switch (the same one the UMG row uses), so the
-	// two renderers cannot pick different plates or words for the same row. This renderer has never
-	// dimmed a disabled row or breathed the selected plate, and still does neither: a flat white tint.
-	const FTraceKitVisuals RowVisuals = TraceMenuKit::VisualsFor(TraceMenuKit::StateFor(/*bEnabled=*/true, bSelected));
-	const float Pulse = 0.72f + 0.28f * FMath::Sin(Now * 4.5f);
+	// The selected row wears the HOVER plate (ring and all) exactly as the UMG row does — selection and
+	// hover are one state on this screen. Plate and word come from the kit's one state switch (the same
+	// one the UMG row uses), so the two renderers cannot pick different plates or words for the same
+	// row. A flat white tint: this renderer has never breathed the selected plate (P03's decision).
+	// The kit's own fallback rectangle stands in while a texture is not drawable yet.
+	const ETraceKitState RowState = TraceMenuKit::StateFor(/*bEnabled=*/true, bSelected);
+	const FTraceKitVisuals RowVisuals = TraceMenuKit::VisualsFor(RowState);
 	if (!TraceMenuKit::DrawPlate(this, TraceMenuKit::Sprite(RowVisuals.Plate), TraceMenuArtStyle::ButtonFrame,
 		X, Y, Width, RowH, RowH, FLinearColor::White))
 	{
-		// Plate. Always opaque enough to lift the label off the grid; brighter when selected.
-		DrawRect(FLinearColor(0.f, 0.02f, 0.04f, bSelected ? 0.80f : 0.55f), X, Y, Width, RowH);
-
-		const float Edge = FMath::Max(1.f, 1.2f * UIScale);
-		DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, bSelected ? 0.55f : 0.16f), X, Y, Width, Edge);
-		DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, bSelected ? 0.55f : 0.16f), X, Y + RowH - Edge, Width, Edge);
-
-		if (bSelected)
-		{
-			// Breathing wash across the plate, as before WP9.
-			DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.10f * Pulse), X, Y, Width, RowH);
-		}
+		TraceMenuKit::DrawFallbackPlate(this, RowState, X, Y, Width, RowH);
 	}
 
 	if (bSelected)
 	{
-		// The selection rail on the leading edge. Amber — the selection language the UMG row
-		// established (amber ring, amber rail) — drawn just outside the plate where the widget puts
-		// its mark, breathing on the same clock the old cyan bar did. On the spriteless fallback it
-		// still reads correctly against the flat rect.
-		const float RailW = 6.f * UIScale;
-		const float RailX = X - (24.f * UIScale);
-		DrawRect(TraceMenuStyle::WithAlpha(TraceMenuArtStyle::AmberLifted(), Pulse), RailX, Y, RailW, RowH);
+		// THE TITLE'S AMBER SELECTION RAIL — owner-requested, title only — from the ONE definition the
+		// UMG row uses (TraceMenuStyle::SelectionRail*): two thirds of the row tall, 0.15 of it wide,
+		// 14 px outside the plate, breathing on the kit's hover pulse. It used to be a 6x60 bar 24 px
+		// out on a different pulse, so the same selection looked different on the two renderers.
+		const float RailW = RowH * TraceMenuStyle::SelectionRailWidthOfRow;
+		const float RailH = RowH * TraceMenuStyle::SelectionRailHeightOfRow;
+		const float RailX = X - TraceMenuStyle::SelectionRailGap * UIScale - RailW;
+		const float Breath = TraceMenuKit::HoverPulse(Now);
+		const FLinearColor RailAmber = TraceMenuArtStyle::AmberLifted();
+		DrawRect(FLinearColor(RailAmber.R * Breath, RailAmber.G * Breath, RailAmber.B * Breath, 1.f),
+			RailX, Y + (RowH - RailH) * 0.5f, RailW, RailH);
 	}
 
-	// WP4 — the word colour, from the same switch as the plate above (TraceMenuKit::VisualsFor, which
-	// the UMG row also reads): the selected/hovered word is the artist's green lifted to read on the
-	// plate (#CBFF70, art bible §2.5), every other label is the sheet's white.
-	const FLinearColor LabelColor = RowVisuals.Label;
+	// The word colour, from the same switch as the plate above: the hover olive on the selected row,
+	// the sheet's white on every other.
 	const float LabelScale = 1.55f * UIScale;
-
-	// WHAT the row says is decided in exactly one place, BuildRowView, because the UMG renderer says
-	// the same things from the same call (spec v17 §4). This function is now purely HOW it looks on
-	// a Canvas.
-	FTraceMenuRowView RowView;
-	BuildRowView(Row, bSelected, RowView);
-
 	const float LabelY = Y + (RowH - MeasureHeight(RowView.Label, FontMedium, LabelScale)) * 0.5f;
-	TraceMenuHUDType::Draw(this, RowView.Label, LabelColor, X + PadX, LabelY, FontMedium, LabelScale);
+	TraceMenuHUDType::Draw(this, RowView.Label, RowVisuals.Label, X + PadX, LabelY, FontMedium, LabelScale);
+
+	// The row's own FURNITURE (the JOIN readout, the DIFFICULTY value's arrows) in the kit's furniture
+	// colour, as on the UMG row — white on the selected row, 0.85 white otherwise. Never cyan.
+	const FLinearColor RowFurniture = RowVisuals.Furniture;
 
 	if (!RowView.Status.IsEmpty())
 	{
 		const float ValueScale = 1.05f * UIScale;
-		const FLinearColor StatusColor = bSelected
-			? TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.95f)
-			: TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.85f);
+		const FLinearColor StatusColor(RowFurniture.R, RowFurniture.G, RowFurniture.B, bSelected ? 0.88f : 0.70f);
 
 		const float StatusW = MeasureWidth(RowView.Status, FontSmall, ValueScale);
 		const float StatusY = Y + (RowH - MeasureHeight(RowView.Status, FontSmall, ValueScale)) * 0.5f;
 		TraceMenuHUDType::Draw(this, RowView.Status, StatusColor, X + Width - PadX - StatusW, StatusY, FontSmall, ValueScale);
 	}
 
-	// The two VALUE rows share one renderer: right-aligned value, arrows either side, dimmed at the
-	// ends of the range. Written once because two copies of this maths is two copies to keep in
-	// alignment, and a title screen where one row's arrows sit two pixels off the other's is the
-	// kind of thing that reads as sloppy without anyone being able to say why.
+	// ---- The value, its arrows, and the artist's value box behind them --------------------------------
+	//
+	// As the UMG row lays it out: the value box (T_MenuValueBox, gold-edged) sits 8 px in from the
+	// plate's right end, 34 px tall, holding "<  VALUE  >" with 16 px of padding and 14 px between the
+	// arrows and the value.
 	if (!RowView.Value.IsEmpty())
 	{
-		const float ValueW = MeasureWidth(RowView.Value, FontMedium, LabelScale);
-		const float ValueRight = X + Width - PadX;
-		const float ValueY = Y + (RowH - MeasureHeight(RowView.Value, FontMedium, LabelScale)) * 0.5f;
+		const float ArrowS = 8.f * UIScale;
+		const float ArrowT = FMath::Max(1.f, 2.f * UIScale);
+		const float ArrowGap = 14.f * UIScale;
+		const float BoxPad = 16.f * UIScale;
+		const float BoxH = 34.f * UIScale;
 
+		const float ValueW = MeasureWidth(RowView.Value, FontMedium, LabelScale);
+		const float BoxRight = X + Width - 8.f * UIScale;
+		const float RightArrowX = BoxRight - BoxPad - ArrowS;
+		const float ValueRight = RightArrowX - ArrowGap;
+		const float LeftArrowX = ValueRight - ValueW - ArrowGap - ArrowS;
+		const float BoxLeft = LeftArrowX - BoxPad;
+
+		TraceMenuKit::DrawValueBoxPlate(this, BoxLeft, Y + (RowH - BoxH) * 0.5f, BoxRight - BoxLeft, BoxH);
+
+		const float ValueY = Y + (RowH - MeasureHeight(RowView.Value, FontMedium, LabelScale)) * 0.5f;
 		TraceMenuHUDType::Draw(this, RowView.Value, RowView.ValueColor, ValueRight - ValueW, ValueY, FontMedium, LabelScale);
 
 		if (RowView.bShowArrows)
 		{
-			// Arrows on both sides of the value, dimmed at the ends of the range so the player can see
-			// there is nothing further in that direction.
+			// Dimmed at the ends of the range so the player can see there is nothing further that way.
 			const float ArrowY = Y + RowH * 0.5f;
-			const float ArrowS = 8.f * UIScale;
-			const float ArrowT = FMath::Max(1.f, 2.f * UIScale);
+			const FLinearColor LeftInk(RowFurniture.R, RowFurniture.G, RowFurniture.B, RowView.bCanLeft ? 0.95f : 0.20f);
+			const FLinearColor RightInk(RowFurniture.R, RowFurniture.G, RowFurniture.B, RowView.bCanRight ? 0.95f : 0.20f);
 
-			const float LeftX = ValueRight - ValueW - (22.f * UIScale);
-			DrawLine(LeftX, ArrowY, LeftX + ArrowS, ArrowY - ArrowS,
-				TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, RowView.bCanLeft ? 0.95f : 0.20f), ArrowT);
-			DrawLine(LeftX, ArrowY, LeftX + ArrowS, ArrowY + ArrowS,
-				TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, RowView.bCanLeft ? 0.95f : 0.20f), ArrowT);
-
-			const float RightX = ValueRight + (14.f * UIScale);
-			DrawLine(RightX, ArrowY - ArrowS, RightX + ArrowS, ArrowY,
-				TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, RowView.bCanRight ? 0.95f : 0.20f), ArrowT);
-			DrawLine(RightX, ArrowY + ArrowS, RightX + ArrowS, ArrowY,
-				TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, RowView.bCanRight ? 0.95f : 0.20f), ArrowT);
+			DrawLine(LeftArrowX, ArrowY, LeftArrowX + ArrowS, ArrowY - ArrowS, LeftInk, ArrowT);
+			DrawLine(LeftArrowX, ArrowY, LeftArrowX + ArrowS, ArrowY + ArrowS, LeftInk, ArrowT);
+			DrawLine(RightArrowX, ArrowY - ArrowS, RightArrowX + ArrowS, ArrowY, RightInk, ArrowT);
+			DrawLine(RightArrowX, ArrowY + ArrowS, RightArrowX + ArrowS, ArrowY, RightInk, ArrowT);
 		}
 	}
 
@@ -3318,11 +3850,10 @@ void ATraceMenuHUD::DrawFooter()
 		return;
 	}
 
-	const float BandY = Y - (22.f * UIScale);
-	DrawRect(FLinearColor(0.004f, 0.014f, 0.026f, 0.92f), 0.f, BandY, ViewW, ViewH - BandY);
-	DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.24f), 0.f, BandY, ViewW, FMath::Max(1.f, 1.f * UIScale));
-
-	DrawTextCentered(PadLegend, TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.75f), CX, Y, FontSmall, 1.f * UIScale);
+	// NO BAND BEHIND IT ANY MORE. The dark strip and its cyan rule existed to lift the line off the
+	// cyan grid floor; the grid is gone (the backdrop is the kit's black), so the line sits on black
+	// like the UMG twin's.
+	DrawTextCentered(PadLegend, TraceMenuStyle::WithAlpha(TraceMenuKit::CaptionInk, 0.75f), CX, Y, FontSmall, 1.f * UIScale);
 }
 
 void ATraceMenuHUD::DrawVersionString()
@@ -3337,7 +3868,7 @@ void ATraceMenuHUD::DrawVersionString()
 		return;
 	}
 	TraceMenuHUDType::Draw(this, Label,
-		TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.55f),
+		TraceMenuStyle::WithAlpha(TraceMenuKit::CaptionInk, 0.55f),
 		ViewW - (24.f * UIScale), ViewH - (28.f * UIScale),
 		FontSmall, 0.9f * UIScale, TraceText::EHAlign::Right);
 }
@@ -3372,6 +3903,13 @@ void ATraceMenuHUD::DrawCursor()
 		return;
 	}
 
+	// The JOIN prompt draws the pointer itself, AFTER its panel, so it sits on top of the prompt rather
+	// than under its scrim. Drawing it here too would be a second, dimmed pointer.
+	if (IsJoinPromptOpen())
+	{
+		return;
+	}
+
 	// ---- HIDE THE OS POINTER WHILE WE DRAW OUR OWN (spec v24 §2, integration) --------------------
 	//
 	// Past this point this function IS drawing a pointer, so the hardware arrow must go, exactly as it
@@ -3390,60 +3928,109 @@ void ATraceMenuHUD::DrawCursor()
 
 	// ---- ONE SCREEN, ONE POINTER, ON BOTH RENDERERS (UI QA finding 6) ---------------------------
 	//
-	// This function used to draw a nine-pixel cyan gap-cross, and that was invisible as a defect for
-	// as long as the cross was the only pointer in the project. It stopped being invisible when the
-	// UMG title screen started drawing the artist's blade: the SAME SCREEN, one CVar apart, showed
-	// two different pointers, photographed side by side in `crop_cursor_umg_vs_canvas.png`. Spec v17
-	// §0's rule for this pair is that the two renderers must not look different, and the pointer was
-	// the last place they did.
-	//
-	// The blade wins, in the cross's own colour. UI/TraceHardwareCursor.h has the whole argument; the
-	// short version is that the artist drew a pointer and this screen was not using it, while the
-	// palette's own two-hue rule says a white one would have been a third colour on a screen that
-	// allows two.
-	//
-	// The cross stays as the FALLBACK, and it is a real one rather than a courtesy: DrawPointer
-	// returns false on a build with no menu art and for the frame or two before the sprite's RHI
-	// texture lands, and a title screen with no pointer at all is unusable with a mouse.
+	// The artist's white blade, through TraceHardwareCursor::DrawPointer — the same pointer the UMG
+	// title, the options pages and the select screens draw. The small white cross is the FALLBACK for
+	// a build with no menu art and for the frame or two before the sprite's RHI texture lands: a title
+	// screen with no pointer at all is unusable with a mouse.
 	if (TraceHardwareCursor::DrawPointer(this, LastCursorPos, UIScale))
 	{
 		return;
 	}
-
-	const float S = 9.f * UIScale;
-	const float T = FMath::Max(1.f, 1.5f * UIScale);
-	const FLinearColor Color = TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.9f);
-
-	DrawLine(LastCursorPos.X - S, LastCursorPos.Y, LastCursorPos.X - S * 0.35f, LastCursorPos.Y, Color, T);
-	DrawLine(LastCursorPos.X + S * 0.35f, LastCursorPos.Y, LastCursorPos.X + S, LastCursorPos.Y, Color, T);
-	DrawLine(LastCursorPos.X, LastCursorPos.Y - S, LastCursorPos.X, LastCursorPos.Y - S * 0.35f, Color, T);
-	DrawLine(LastCursorPos.X, LastCursorPos.Y + S * 0.35f, LastCursorPos.X, LastCursorPos.Y + S, Color, T);
+	TraceMenuHUDPointer::DrawCross(this, LastCursorPos, UIScale);
 }
 
 void ATraceMenuHUD::DrawTravelOverlay()
 {
+	TravelCancelRect = FBox2D(ForceInit);
 	if (!bTravelling)
 	{
 		return;
 	}
 
-	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.72f), 0.f, 0.f, ViewW, ViewH);
-	DrawStrokeTextCentered(TRACE_TEXT("MENU.WORDMARK", "TRACE"), TraceMenuStyle::WithAlpha(TraceMenuStyle::Cyan, 0.55f),
-		ViewW * 0.5f, ViewH * 0.36f, ViewH * 0.10f, FMath::Max(2.f, ViewH * 0.10f * 0.055f));
+	namespace MT = TraceMenuHUDTravel;
+	const float S = UIScale;
+	const float CX = ViewW * 0.5f;
+
+	// ---- ONE BLACK CARD ---------------------------------------------------------------------------
+	//
+	// It was a 72 % scrim with a second, smaller TRACE over the tagline — the six rows still readable
+	// underneath and looking pressable — and on this renderer a stroke-vector cyan TRACE. Now: opaque
+	// black (the kit), the artist's wordmark and swoosh in exactly the place the title had them, so the
+	// mark does not jump when the card comes up, and the caption in white.
+	TraceMenuKit::DrawBackground(this, ViewW, ViewH);
+	if (DrawTitleBlock() < 0.f)
+	{
+		const float CapHeight = ViewH * 0.10f;
+		DrawStrokeTextCentered(TRACE_TEXT("MENU.WORDMARK", "TRACE"), TraceMenuArtStyle::WordDefault,
+			CX, ViewH * 0.20f, CapHeight, FMath::Max(2.f, CapHeight * 0.055f));
+	}
 
 	// The caption names what is actually happening — "HOSTING ON 100.x.y.z:7777" or "CONNECTING TO
-	// <addr>" — rather than one generic line for two very different operations. A join that hangs
-	// for fifteen seconds and then fails needs the player to have seen the address it was dialling.
+	// <addr>" — rather than one generic line for two very different operations. A join that hangs for
+	// fifteen seconds and then fails needs the player to have seen the address it was dialling.
 	const FString Caption = TravelCaption.IsEmpty() ? FString(TRACE_TEXT("MENU.TRAVEL_ENTERING_ARENA", "ENTERING THE ARENA")) : TravelCaption;
-	DrawTextCentered(Caption, TraceMenuStyle::Ink, ViewW * 0.5f, ViewH * 0.55f,
-		FontMedium, 1.4f * UIScale);
+	const float CaptionMid = ViewH * MT::CaptionY;
+	TraceMenuKit::DrawCapText(this, Caption, CX, CaptionMid, MT::CaptionCap * S, TraceMenuArtStyle::WordDefault,
+		ETraceTextWeight::Light, TraceText::EHAlign::Center, ViewW - 160.f * S);
 
-	// Only a join can sit here for a noticeable time; a local map load is instant. Say so, so that
-	// three seconds of nothing does not read as a hang.
-	if (TravelCaption.StartsWith(TEXT("CONNECTING")))
+	// ---- ONLY A JOIN WAITS, AND ONLY A JOIN CAN BE CALLED OFF --------------------------------------
+	//
+	// Decided by the travel KIND (IsJoinInFlight), never by the caption's wording — the caption is
+	// Ranen's editable MENU.TRAVEL_CONNECTING_TO, and the old `StartsWith("CONNECTING")` test would have
+	// silently dropped the hint the day it was reworded. A local PLAY / PRACTICE load is gone within a
+	// frame and gets neither line.
+	//
+	// Elapsed seconds instead of "THIS CAN TAKE A FEW SECONDS": a join to a dead address sits here for
+	// the whole connect timeout, and a counter that keeps moving is what tells the player the game has
+	// not hung. And the way out, which did not exist: [ESC] CANCEL (and [B] CANCEL once a pad has been
+	// seen). The legend is clickable too.
+	if (!IsJoinInFlight())
 	{
-		DrawTextCentered(TRACE_TEXT("MENU.TRAVEL_CONNECT_HINT", "THIS CAN TAKE A FEW SECONDS.  A FAILURE WILL BE REPORTED, NOT SWALLOWED."),
-			TraceMenuStyle::InkDim, ViewW * 0.5f, ViewH * 0.55f + (34.f * UIScale), FontSmall, 1.05f * UIScale);
+		return;
+	}
+
+	const float ElapsedMid = CaptionMid + MT::ElapsedGap * S;
+	TraceMenuKit::DrawCapText(this, MT::ElapsedText(this, TravelStartRealTime), CX, ElapsedMid, MT::ElapsedCap * S,
+		TraceMenuKit::CaptionInk, ETraceTextWeight::Light, TraceText::EHAlign::Center);
+
+	const FString CancelWord = TRACE_TEXT("OPTIONS.LEGEND.CANCEL", "CANCEL");
+	TArray<FTraceKitLegendItem> Keys;
+	Keys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_BACK", "ESC"), CancelWord });
+	TArray<FTraceKitLegendItem> PadKeys;
+	if (ShouldShowPadHints())
+	{
+		PadKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_BACK", "B"), CancelWord });
+	}
+
+	const float ChipH = MT::LegendChipH * S;
+	const float KeysW = TraceMenuKit::KeyLegendWidth(Keys, ChipH);
+	const float PadW = TraceMenuKit::KeyLegendWidth(PadKeys, ChipH);
+	float LineY = ElapsedMid + MT::LegendGap * S;
+	const float LegendTop = LineY;
+	if (KeysW > 0.f)
+	{
+		TraceMenuKit::DrawKeyLegend(this, Keys, CX, LineY, ChipH, Now);
+		LineY += MT::LegendLineGap * S;
+	}
+	if (PadW > 0.f)
+	{
+		TraceMenuKit::DrawKeyLegend(this, PadKeys, CX, LineY, ChipH, Now);
+		LineY += MT::LegendLineGap * S;
+	}
+
+	// The legend is the card's one control: a click on it cancels (MousePressed / MouseReleased).
+	const float LegendW = FMath::Max(KeysW, PadW);
+	if (LegendW > 0.f)
+	{
+		const float Slop = 8.f * S;
+		TravelCancelRect = FBox2D(FVector2D(CX - LegendW * 0.5f - Slop, LegendTop - Slop),
+			FVector2D(CX + LegendW * 0.5f + Slop, LineY - MT::LegendLineGap * S + ChipH + Slop));
+	}
+
+	if (bHasCursor
+		&& !TraceMenuKit::ShowCursor(this, GetOwningPlayerController(), TEXT("connecting card"), LastCursorPos, UIScale))
+	{
+		TraceMenuHUDPointer::DrawCross(this, LastCursorPos, UIScale);
 	}
 }
 

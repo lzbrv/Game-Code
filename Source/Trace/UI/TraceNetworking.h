@@ -163,6 +163,23 @@ namespace TraceNet
 	/** Forgets the last failure. Called when the player starts a fresh attempt. */
 	TRACE_API void ClearFailure();
 
+	/**
+	 * The title screen's JOIN just started dialling. Remembered across the map reload a failed join
+	 * causes, so the NEXT title screen can tell "your join failed" from any other failure.
+	 */
+	TRACE_API void NoteJoinAttempt();
+
+	/** The join the title screen was dialling was cancelled by the player. */
+	TRACE_API void ForgetJoinAttempt();
+
+	/**
+	 * True once, when the last failure belongs to the last JOIN attempt: it happened after the
+	 * attempt started, within the connect window, and recently. Clears the attempt either way, so it
+	 * answers once per title screen. The title screen uses it to put the player back in the JOIN
+	 * prompt with the reason under the field instead of on PLAY under a banner.
+	 */
+	TRACE_API bool ConsumeFailedJoin(FString& OutHeadline, FString& OutDetail);
+
 	/** Plain-English form of an engine failure code. "Connection timed out", not "ConnectionTimeout". */
 	TRACE_API FString DescribeNetworkFailure(ENetworkFailure::Type FailureType);
 	TRACE_API FString DescribeTravelFailure(ETravelFailure::Type FailureType);
@@ -360,6 +377,15 @@ public:
 
 	/** Set for two seconds after a paste, so the panel can confirm it did something. */
 	bool WasRecentlyPasted(float Now) const { return (Now - LastPasteTime) < 2.f; }
+
+	/**
+	 * REPLACES the field with the legal characters of @p Raw's first line (the same filter and the
+	 * same one-line rule a typed Ctrl/Cmd+V uses), puts the caret at the end and stamps the paste, so
+	 * the "PASTED" note shows. The controller's X comes here.
+	 *
+	 * @return false, leaving the field untouched, when @p Raw holds nothing legal.
+	 */
+	bool PasteReplace(const FString& Raw, float Now);
 
 private:
 	/**

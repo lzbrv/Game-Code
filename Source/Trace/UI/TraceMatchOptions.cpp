@@ -2,9 +2,10 @@
 
 #include "UI/TraceMatchOptions.h"
 
-#include "Misc/ConfigCacheIni.h"   // GConfig — the characters toggle's storage
+#include "Misc/ConfigCacheIni.h"   // GConfig — the characters toggle's and the difficulty's storage
 #include "Trace.h"          // LogTraceGame
 #include "TraceSettings.h"
+#include "UI/Text/TraceGameText.h"   // TRACE_TEXT — the difficulty's words are Ranen's
 
 namespace
 {
@@ -31,15 +32,75 @@ FString TraceDifficulty::ToDisplayName(ETraceBotDifficulty Difficulty)
 {
 	switch (Difficulty)
 	{
-	case ETraceBotDifficulty::Easy: return TEXT("EASY");
-	case ETraceBotDifficulty::Hard: return TEXT("HARD");
-	default:                        return TEXT("NORMAL");
+	case ETraceBotDifficulty::Easy: return TRACE_TEXT("MENU.DIFFICULTY_EASY", "EASY");
+	case ETraceBotDifficulty::Hard: return TRACE_TEXT("MENU.DIFFICULTY_HARD", "HARD");
+	default:                        return TRACE_TEXT("MENU.DIFFICULTY_NORMAL", "NORMAL");
 	}
 }
 
 FString TraceDifficulty::ToUrlValue(ETraceBotDifficulty Difficulty)
 {
-	return ToDisplayName(Difficulty).ToLower();
+	// Fixed tokens, never the display name: FromUrlValue parses exactly these three, and the display
+	// name is editable text.
+	switch (Difficulty)
+	{
+	case ETraceBotDifficulty::Easy: return TEXT("easy");
+	case ETraceBotDifficulty::Hard: return TEXT("hard");
+	default:                        return TEXT("normal");
+	}
+}
+
+FString TraceDifficulty::ToBlurb(ETraceBotDifficulty Difficulty)
+{
+	switch (Difficulty)
+	{
+	case ETraceBotDifficulty::Easy: return TRACE_TEXT("MENU.BLURB_DIFFICULTY_EASY", "BOTS REACT SLOWLY AND SHOOT LOOSELY.");
+	case ETraceBotDifficulty::Hard: return TRACE_TEXT("MENU.BLURB_DIFFICULTY_HARD", "BOTS REACT FAST, AIM TIGHT AND PUSH THE CORE.");
+	default:                        return TRACE_TEXT("MENU.BLURB_DIFFICULTY_NORMAL", "BOTS PLAY A FAIR FIGHT.");
+	}
+}
+
+// Named, not anonymous: this module is a unity build (Scripts/check-jumbo-build-collisions.py).
+namespace TraceDifficultyFile
+{
+	/** GameUserSettings.ini — per machine, outside source control. See TraceCharacters below. */
+	static const TCHAR* const ConfigSection = TEXT("/Script/Trace.TraceDifficulty");
+	static const TCHAR* const ConfigKey = TEXT("Difficulty");
+}
+
+ETraceBotDifficulty TraceDifficulty::GetSavedSetting()
+{
+	FString Saved;
+	if (GConfig != nullptr
+		&& GConfig->GetString(TraceDifficultyFile::ConfigSection, TraceDifficultyFile::ConfigKey, Saved, GGameUserSettingsIni)
+		&& !Saved.IsEmpty())
+	{
+		return FromUrlValue(Saved);
+	}
+	return Default;
+}
+
+void TraceDifficulty::SetSavedSetting(ETraceBotDifficulty Difficulty)
+{
+	if (GConfig == nullptr)
+	{
+		return;
+	}
+
+	FString Saved;
+	const bool bHadOne = GConfig->GetString(TraceDifficultyFile::ConfigSection, TraceDifficultyFile::ConfigKey,
+		Saved, GGameUserSettingsIni);
+	const FString Token = ToUrlValue(Difficulty);
+	if (bHadOne && Saved == Token)
+	{
+		return;
+	}
+
+	GConfig->SetString(TraceDifficultyFile::ConfigSection, TraceDifficultyFile::ConfigKey, *Token, GGameUserSettingsIni);
+
+	// Flushed now, for the reason TraceCharacters::SetEnabledSetting gives: this build is usually
+	// closed with pkill, and a choice that only survives a clean exit does not survive.
+	GConfig->Flush(/*bRead=*/false, GGameUserSettingsIni);
 }
 
 ETraceBotDifficulty TraceDifficulty::FromUrlValue(const FString& Value)

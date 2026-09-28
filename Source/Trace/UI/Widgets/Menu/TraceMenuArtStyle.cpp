@@ -233,7 +233,7 @@ TraceMenuArtStyle::FPlateSilhouette TraceMenuArtStyle::ResolvePlateSilhouette(
 namespace TraceMenuArtStyleFile
 {
 	/**
-	 * The one lift, shared by AmberLifted() and WordHoverLifted() so the two "stated transformation"
+	 * The one full-level lift, shared by AmberLifted() and ValueGlowLifted() so the "stated transformation"
 	 * functions in the palette cannot drift apart. Round-trips through the sheet's own byte values,
 	 * so the ratio being preserved is the one that was measured off the art rather than its
 	 * linear-light cousin. See the header.
@@ -254,6 +254,28 @@ namespace TraceMenuArtStyleFile
 		};
 		return FLinearColor::FromSRGBColor(FColor(Lift(Bytes.R), Lift(Bytes.G), Lift(Bytes.B), Bytes.A));
 	}
+
+	/**
+	 * The sheet colour's bytes times @p InFactor, clamped. The same "stated transformation" rule as
+	 * ByteNormalised — the ratio between the channels is the artist's — for a lift that stops short
+	 * of full brightness on purpose.
+	 */
+	static FLinearColor ByteScaled(const FLinearColor& InSheetColour, float InFactor)
+	{
+		const FColor Bytes = InSheetColour.ToFColor(/*bSRGB=*/true);
+		const auto Lift = [InFactor](uint8 InChannel)
+		{
+			return static_cast<uint8>(FMath::Clamp(FMath::RoundToInt(InChannel * InFactor), 0, 255));
+		};
+		return FLinearColor::FromSRGBColor(FColor(Lift(Bytes.R), Lift(Bytes.G), Lift(Bytes.B), Bytes.A));
+	}
+
+	/**
+	 * How far the hover word is lifted off the sheet's olive. 1.6 x sRGB(85,107,47) = sRGB(136,171,75),
+	 * #88AB4B: 5.4:1 on PlateFill (clears WCAG AA) and still plainly DIMMER than the white default word,
+	 * which is the sheet's own gesture — hover dims the word under the orange glow.
+	 */
+	static constexpr float WordHoverLift = 1.6f;
 }
 
 FLinearColor TraceMenuArtStyle::AmberLifted()
@@ -263,9 +285,11 @@ FLinearColor TraceMenuArtStyle::AmberLifted()
 
 FLinearColor TraceMenuArtStyle::WordHoverLifted()
 {
-	// sRGB(85,107,47) x (255/107) = sRGB(203,255,112), #CBFF70 — 12.2:1 on PlateFill against the
-	// artist record's 2.34:1. Release art bible §2.5; the reasoning lives in the header.
-	return TraceMenuArtStyleFile::ByteNormalised(TraceMenuArtStyle::WordHover);
+	// sRGB(85,107,47) x 1.6 = sRGB(136,171,75), #88AB4B — 5.4:1 on PlateFill against the artist
+	// record's 2.34:1. It used to be byte-normalised to #CBFF70 (12.2:1), which made the hovered word
+	// the LOUDEST text on the screen — the opposite of the sheet, where hover dims the word. The
+	// reasoning lives in the header.
+	return TraceMenuArtStyleFile::ByteScaled(TraceMenuArtStyle::WordHover, TraceMenuArtStyleFile::WordHoverLift);
 }
 
 FLinearColor TraceMenuArtStyle::ValueGlowLifted()

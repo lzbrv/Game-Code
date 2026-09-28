@@ -18,19 +18,19 @@
 // its own layout maths used to fill. So -TraceAutoPlay, -TraceAutoJoin, -TraceAutoSettings and
 // -TraceMenuClickTest all drive the same code on either renderer.
 //
-// The look is stroke-drawn, not typeset. The engine's built-in fonts are bitmaps and go to mush
-// somewhere around 3x, so the wordmark is a tiny vector font (TraceStrokeFont in the .cpp, and
-// UTraceStrokeText on the UMG side) made of line segments and drawn at whatever size the viewport
-// wants. Everything smaller — menu rows, hints, the difficulty blurb — uses the bitmap fonts at
-// scales they actually hold up at.
+// The wordmark is the artist's sprite on both renderers (T_TraceWordmark); the stroke-vector TRACE
+// (TraceStrokeFont in the .cpp) is only the fallback for a build with no menu art. The words are
+// set in the artist's face from the glyph atlas (UI/Text).
 //
 // ATraceMenuPlayerController owns nothing but the key bindings and forwards them here; that split
 // keeps the layout maths and the hit testing in one file instead of two copies that drift.
 //
 // THE MODALS DO SWAP THE RENDERER AGAIN, DELIBERATELY (spec v25 §1 reverts spec v23 §A2). The
-// settings overlay and the JOIN prompt are Canvas, Canvas is composited under Slate, so the UMG
-// title screen is collapsed for as long as one of them is up and the Canvas title screen draws
-// behind it instead. v23 §A2 avoided that by drawing the modals on the engine's FOREGROUND canvas;
+// settings overlay, the JOIN prompt and the travel card are Canvas, Canvas is composited under
+// Slate, so the UMG title screen is collapsed for as long as one of them is up and the Canvas title
+// screen draws behind it instead. Since the handmade-kit pass the Canvas title IS the kit — black,
+// the artist's navy wordmark and white swoosh, the plates, the white pointer, no cyan grid or bezel
+// — so the swap dims the same screen rather than turning it into a teal one. v23 §A2 avoided that by drawing the modals on the engine's FOREGROUND canvas;
 // that surface is deferred to the render thread on the engine's own schedule, and it is what made
 // "opening settings crashes the entire game" — reported three times, captured as a callstack the
 // third. The elevation is gone. See the header of UI/TraceOptionsMenu.h for the evidence and the
@@ -114,6 +114,23 @@ enum class ETraceMenuRow : uint8
 	Count      = 6
 };
 
+/**
+ * What a title-screen travel is FOR. Set next to bTravelling by the three things that travel.
+ *
+ * Only a JOIN can sit on screen for a noticeable time (a remote handshake: 20 s to a dead address),
+ * and only a JOIN can be cancelled — PLAY and PRACTICE are a local OpenLevel that is gone within a
+ * frame. Everything that differs between them (the ESC CANCEL legend, the elapsed seconds, what
+ * Escape does) branches on THIS, never on the caption text: the caption is Ranen's editable wording
+ * and a reword must not change behaviour.
+ */
+enum class ETraceMenuTravel : uint8
+{
+	None,
+	Host,
+	Join,
+	Practice
+};
+
 UCLASS()
 class TRACE_API ATraceMenuHUD : public AHUD
 {
@@ -179,8 +196,19 @@ public:
 	/** Enter / Space / left click on the selected row. */
 	void ActivateSelection();
 
-	/** Escape. Quits from the title screen — there is nothing above it to back out to. */
+	/**
+	 * Escape (and pad B, and the MENU/START that arrives as a synthetic Escape).
+	 *
+	 * WHILE A JOIN IS CONNECTING it cancels the join and puts the prompt back — see CancelJoin. While
+	 * PLAY or PRACTICE is loading it does nothing. It can NEVER reach QuitGame during a travel: that
+	 * was the stuck state where Esc on the CONNECTING card walked a hidden highlight to QUIT and the
+	 * second press closed the game. On the title rows: moves the highlight to QUIT, and quits if it is
+	 * already there.
+	 */
 	void CancelPressed();
+
+	/** True while a JOIN is dialling: the connecting card is up and Escape / B / a click cancels. */
+	bool IsJoinInFlight() const { return bTravelling && TravelKind == ETraceMenuTravel::Join; }
 
 	/**
 	 * Left mouse button DOWN. Selects whatever is under the cursor and arms it — it does not
@@ -221,6 +249,17 @@ public:
 
 #if !UE_BUILD_SHIPPING
 	/**
+	 * `Trace.Menu.JoinVerify` — the JOIN prompt and the connecting card, driven one frame at a time
+	 * through the real entry points (a real Escape key edge, a real pad B edge), with a PASS/FAIL
+	 * verdict. It dials an unroutable address, so nothing is ever joined, and it puts the player's
+	 * remembered JOIN address back afterwards. See TickJoinVerify.
+	 */
+	void BeginJoinVerify();
+
+	/** Trace.Menu.JoinOnce: JOIN @p Address through the real prompt and ConfirmJoin. Dev only. */
+	void DebugJoin(const FString& Address);
+
+	/**
 	 * D32-PADMENU — prints which row is highlighted and what state the screen is in, in one line.
 	 *
 	 * Exists because a synthetic pad press has to be checkable. Every other verification surface on
@@ -232,13 +271,19 @@ public:
 
 protected:
 	// ---- Draw passes, back to front --------------------------------------------------------------
+	/** The kit's opaque black (stylespec §1). */
 	void DrawBackdrop();
-	void DrawGridFloor();
-
-	/** Inset frame with corner ticks. Gives the screen an edge so it reads as an instrument. */
-	void DrawBezel();
 
 	void DrawWordmark();
+
+	/**
+	 * The artist's wordmark and swoosh at the title's composition (TraceTitleLayout). Shared by the
+	 * title and the travel card so the mark does not move when the card comes up.
+	 *
+	 * @return the bottom of the block in screen px, or a negative number when the wordmark sprite is
+	 *         not drawable this frame (the caller draws its fallback).
+	 */
+	float DrawTitleBlock();
 
 	/**
 	 * "YOUR ADDRESS — 100.101.102.103:7777", directly under the tagline.
@@ -262,8 +307,29 @@ protected:
 	void DrawCursor();
 	void DrawTravelOverlay();
 
-	/** The modal address field raised by the JOIN row. Draws nothing while the field is inactive. */
+	/**
+	 * The modal address field raised by the JOIN row, on the handmade kit: a black panel over the
+	 * kit scrim, the field as a glowing plate, CONNECT and BACK as real buttons the mouse can press,
+	 * a [KEY] VERB legend, and the blade pointer. Draws nothing while the field is inactive.
+	 */
 	void DrawJoinPrompt();
+
+	/** Closes the JOIN prompt without connecting. Esc, pad B and the BACK button all come here. */
+	void CloseJoinPrompt(const TCHAR* Why);
+
+	/**
+	 * Cancels the join that is dialling and puts the prompt back, pre-filled with the address that was
+	 * being dialled. No-op unless IsJoinInFlight().
+	 *
+	 * Both engine halves are cleared: ClientTravel only QUEUES the URL (FWorldContext::TravelURL) and
+	 * Browse builds the pending net game on the NEXT tick, so a cancel in the same frame as the
+	 * confirm finds no pending game — clearing the queued URL is what stops that join going ahead
+	 * anyway. UEngine::CancelPending closes the half-open connection and drops the pending game.
+	 */
+	void CancelJoin();
+
+	/** Which JOIN button (TraceMenuHUDJoin::Connect / Back) is under @p Point, or INDEX_NONE. */
+	int32 JoinButtonAtPoint(const FVector2D& Point) const;
 
 	/** One menu row. Returns the row's screen rect so the caller can store it for hit testing. */
 	FBox2D DrawRow(ETraceMenuRow Row, float CenterX, float Y, float Width, bool bSelected);
@@ -313,6 +379,9 @@ protected:
 	void StartPracticeRange();
 
 	void QuitGame();
+
+	/** Sets, applies and SAVES the bot difficulty (TraceDifficulty::SetSavedSetting). */
+	void SetDifficulty(ETraceBotDifficulty InDifficulty);
 
 	// ---- Small drawing helpers -------------------------------------------------------------------
 	void DrawTextCentered(const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale);
@@ -419,8 +488,20 @@ private:
 	/** Set once Play has been taken, so a second Enter during the level load cannot travel twice. */
 	bool bTravelling = false;
 
+	/** What the travel is for; set with bTravelling. See ETraceMenuTravel. */
+	ETraceMenuTravel TravelKind = ETraceMenuTravel::None;
+
+	/** Real seconds when the travel began. The connecting card counts up from it. */
+	float TravelStartRealTime = 0.f;
+
 	/** What the travel overlay should say: "ENTERING THE ARENA" or "CONNECTING TO <addr>". */
 	FString TravelCaption;
+
+	/** The connecting card's cancel legend, as last drawn: a click inside it cancels the join. */
+	FBox2D TravelCancelRect = FBox2D(ForceInit);
+
+	/** A mouse-down landed on TravelCancelRect; the release inside it cancels (press arms, release fires). */
+	bool bTravelCancelArmed = false;
 
 	// ---- JOIN ------------------------------------------------------------------------------------
 
@@ -446,6 +527,15 @@ private:
 
 	/** The field contents JoinError was raised about; any edit away from it clears the message. */
 	FString JoinErrorText;
+
+	/** CONNECT and BACK as last drawn, indexed TraceMenuHUDJoin::Connect / Back. */
+	FBox2D JoinButtonRects[2] = { FBox2D(ForceInit), FBox2D(ForceInit) };
+
+	/** The JOIN button a mouse-down armed, or INDEX_NONE. Press arms, release on the same one fires. */
+	int32 JoinPressedButton = INDEX_NONE;
+
+	/** The JOIN button under the pointer last frame, for the hover sound on a change. */
+	int32 JoinHoveredButton = INDEX_NONE;
 
 	/**
 	 * World time at which the title screen started accepting Enter/Space.
@@ -784,5 +874,21 @@ private:
 
 	/** Submits 2.5s after the prompt opens, so -TraceAutoShot has a window to photograph it. */
 	FTimerHandle AutoJoinSubmitTimer;
+
+	// ---- Trace.Menu.JoinVerify (see BeginJoinVerify) --------------------------------------------
+
+	/** One step of the harness, run at the end of every DrawHUD while it is armed. */
+	void TickJoinVerify();
+
+	/** 0 = not running; otherwise the step the harness is on. */
+	int32 JoinVerifyStep = 0;
+
+	/** Real seconds the current step began, for its waits. */
+	float JoinVerifyStepTime = 0.f;
+
+	int32 JoinVerifyFailures = 0;
+
+	/** The player's remembered JOIN address, put back when the harness finishes. */
+	FString JoinVerifySavedAddress;
 #endif
 };

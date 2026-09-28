@@ -17,6 +17,7 @@
 #include "UI/Text/TraceText.h"
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 #include "UI/Widgets/Menu/TraceMenuGridWidget.h"
+#include "UI/Widgets/Menu/TraceMenuKit.h"        // CaptionInk — the version label
 #include "UI/Widgets/Menu/TraceMenuPalette.h"
 
 // Named after the file, not anonymous: UBT concatenates .cpp files for the unity build and two
@@ -262,11 +263,11 @@ void UTraceTitleMenuWidget::InstallVersionLabel()
 		return;
 	}
 
-	// FS_FOOTER x 0.9 and ink-dim at 0.55: a build identifier for screenshots and bug reports, and
-	// deliberately the quietest type on the screen. The Canvas path draws the same string at the
-	// same corner (ATraceMenuHUD::DrawVersionString).
+	// FS_FOOTER x 0.9 and the kit's caption grey at 0.55: a build identifier for screenshots and bug
+	// reports, and deliberately the quietest type on the screen. The Canvas path draws the same
+	// string at the same corner in the same colour (ATraceMenuHUD::DrawVersionString).
 	Label->SetSize(11.7f);
-	Label->SetColor(TraceMenuStyle::WithAlpha(TraceMenuStyle::InkDim, 0.55f));
+	Label->SetColor(TraceMenuStyle::WithAlpha(TraceMenuKit::CaptionInk, 0.55f));
 	Label->SetVisibility(ESlateVisibility::HitTestInvisible);
 
 	UCanvasPanelSlot* LabelSlot = RootCanvas->AddChildToCanvas(Label);

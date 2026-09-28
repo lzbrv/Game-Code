@@ -144,6 +144,14 @@ namespace TraceMenuKit
 	/** Furniture on an unselected control — legible, and quiet enough that the selected one wins. */
 	static const FLinearColor FurnitureUnselected = FLinearColor(0.85f, 0.85f, 0.85f, 1.f);
 
+	/**
+	 * Secondary words on black — a tagline, a caption, a note, a version string. A neutral grey with a
+	 * hair of blue, the value the UMG title has always set its tagline and captions in
+	 * (Scripts/generate-menu-widgets.py INK_DIM), so both title renderers agree. Not the pre-kit
+	 * TraceMenuStyle::InkDim, which is a cyan.
+	 */
+	static const FLinearColor CaptionInk = FLinearColor(0.52f, 0.55f, 0.62f, 1.f);
+
 	// =============================================================================================
 	// PROPORTIONS, measured off the sheet (Scripts/slice-ui-assets.py's crop boxes).
 	// =============================================================================================
@@ -372,6 +380,22 @@ namespace TraceMenuKit
 	 */
 	TRACE_API float DrawTextCapCentered(AHUD* HUD, const FString& Text, float X, float CapCenterY,
 		const TraceText::FStyle& Style);
+
+	/** The text style whose CAPS are @p CapH tall in @p Weight. */
+	TRACE_API TraceText::FStyle CapStyle(float CapH, const FLinearColor& Color,
+		ETraceTextWeight Weight = ETraceTextWeight::Light);
+
+	/** The width @p Text takes at caps @p CapH in @p Weight. 0 for an empty string. */
+	TRACE_API float CapTextWidth(const FString& Text, float CapH, ETraceTextWeight Weight = ETraceTextWeight::Light);
+
+	/**
+	 * @p Text with caps @p CapH tall, centred on @p CapCenterY, X per @p HAlign, shrunk to fit
+	 * @p MaxW (0: no limit). Draws nothing for an empty string. Returns the width drawn. The caption /
+	 * note / field-text primitive for a kit screen that is not a button.
+	 */
+	TRACE_API float DrawCapText(AHUD* HUD, const FString& Text, float X, float CapCenterY, float CapH,
+		const FLinearColor& Color, ETraceTextWeight Weight = ETraceTextWeight::Light,
+		TraceText::EHAlign HAlign = TraceText::EHAlign::Center, float MaxW = 0.f);
 
 	// ---- A KEY LEGEND: [KEY] VERB   [KEY] VERB ... ----------------------------------------------
 	//

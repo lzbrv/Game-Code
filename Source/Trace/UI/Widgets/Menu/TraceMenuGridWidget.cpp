@@ -75,11 +75,8 @@ namespace TraceMenuGridWidgetFile
 	}
 
 	/**
-	 * The artist's amber, RGB(116,58,0), the same way. sRGB(255,135,0).
-	 *
-	 * Measured against the wordmark's own lifted glow (TraceTitleMenuWidget's WordmarkGlow,
-	 * RGB(255,140,40)) that is 5 bytes of green and 40 of blue apart — the same colour to the eye,
-	 * arrived at from the constant that is actually named rather than by copying a literal.
+	 * The artist's amber, RGB(116,58,0), the same way. sRGB(255,135,0) — the hue of the wordmark's
+	 * own glow, arrived at from the constant that is actually named rather than by copying a literal.
 	 */
 	static const FLinearColor& HorizonAmber()
 	{

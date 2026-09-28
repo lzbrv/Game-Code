@@ -62,9 +62,8 @@
 // =================================================================================================
 // The second failure this has to be immune to is the one the spec calls worse than the bug: a
 // surface that hides the pointer and then stops drawing its own. A travel starts, a modal with no
-// pointer of its own opens (the JOIN prompt is exactly that — it is keyboard-only and draws no
-// arrow), the map changes, the HUD is destroyed. Any of those, with a set-once flag, strands the
-// player with nothing to point with.
+// pointer of its own opens, the map changes, the HUD is destroyed. Any of those, with a set-once
+// flag, strands the player with nothing to point with.
 //
 // So suppression is a LEASE THAT EXPIRES. Whoever is drawing Trace's own pointer renews it every
 // frame; two frames without a renewal and the hardware arrow comes back on its own. Nothing has to
@@ -106,18 +105,14 @@
 // geometry constants and applies them to its own UImage — which is the same three numbers reaching
 // the same sprite by the only route a widget has.
 //
-// WHY THE POINTER IS TINTED AT ALL, since the sprite was perfectly visible white. The title palette
-// states the rule this was breaking (UI/Widgets/Menu/TraceMenuPalette.h): "the whole screen is two
-// hues — a cyan that carries the interface and an amber that only ever marks danger or the Hard
-// setting — over near-black ... the moment a third colour appears, the grid stops reading as a grid
-// and starts reading as noise." A pure-white pointer WAS that third colour, on every screen, at all
-// times. Cyan is not an invention here either: it is the colour the Canvas title screen was already
-// drawing its pointer in, so unifying on it keeps one of the two arms exactly as it shipped.
+// THE POINTER IS WHITE — THE ARTIST'S BLADE, UNTINTED. It was tinted the pre-kit interface cyan for a
+// while, under the old title palette's "two hues, cyan and amber" rule. That palette is retired: the
+// handmade kit is navy, orange and white on black and has no cyan in it at all, and the pointer on
+// the sheet is white. PointerTint() is therefore white, and every surface follows from that one line.
 //
-// The sprite survives the tint intact because of what is actually in it: 835 of its 1,382 opaque
-// pixels are pure white and the rim is sRGB(71,54,4), a near-black olive. A Canvas tint multiplies,
-// so the body becomes the tint and the rim stays a dark keyline — which is the thing that keeps the
-// pointer readable over the arena's white walkways on the select screen.
+// What is in the sprite: 835 of its 1,382 opaque pixels are pure white and the rim is sRGB(71,54,4),
+// a near-black olive keyline — the thing that keeps the pointer readable over the arena's white
+// walkways on the select screen.
 
 #pragma once
 
@@ -177,7 +172,8 @@ namespace TraceHardwareCursor
 	TRACE_API bool IsRedArmed();
 
 	/**
-	 * THE ONE COLOUR TRACE'S POINTER IS DRAWN IN, on every surface and both renderers.
+	 * THE ONE COLOUR TRACE'S POINTER IS DRAWN IN, on every surface and both renderers: white, the
+	 * artist's blade as drawn (stylespec §9). Trace.UI.Kit.Verify asserts it.
 	 *
 	 * A function rather than a constant so the UMG title screen and the three Canvas surfaces cannot
 	 * end up holding two copies of it — which is exactly how they ended up holding two pictures.

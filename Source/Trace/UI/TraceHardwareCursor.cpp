@@ -17,7 +17,6 @@
 #include "UI/TraceMenuHUD.h"              // ATraceMenuHUD::IsOptionsOpen — see PollMenuSurfaces
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"   // the sprite's path, aspect and tip — named once
 #include "UI/Widgets/Menu/TraceMenuKit.h"        // TraceMenuKit::IsDrawable — see PointerSprite
-#include "UI/Widgets/Menu/TraceMenuPalette.h"    // TraceMenuStyle::Cyan — see PointerTint
 
 // Named after the file, not anonymous. Scripts/check-jumbo-build-collisions.py, and the unity build
 // it exists to protect: two files' anonymous namespaces become one under UBT's jumbo compilation.
@@ -191,12 +190,10 @@ namespace TraceHardwareCursorFile
 	 * editing it, this asks the question from outside through ATraceMenuHUD::IsOptionsOpen(), which is
 	 * already public and already documented as "true while the settings overlay owns the screen".
 	 *
-	 * THE JOIN PROMPT IS DELIBERATELY NOT LISTED HERE, and that is the whole reason this is a
-	 * whitelist rather than "a modal is up". ATraceMenuHUD::DrawJoinPrompt draws a scrim, a panel and
-	 * a text field and NO pointer of any kind — it is keyboard-only — while the title screen's own
-	 * arrow is hidden for exactly those frames (see BuildMenuView's bModalOwnsScreen). Suppressing the
-	 * hardware cursor there would leave the player with nothing to point with at all, which spec §2
-	 * names as the worse bug. So JOIN gets the OS arrow back, and that is correct rather than missed.
+	 * THE JOIN PROMPT AND THE CONNECTING CARD ARE NOT LISTED HERE because they do not need to be: both
+	 * draw the blade themselves and renew the lease through TraceMenuKit::ShowCursor on every frame
+	 * they draw it (ATraceMenuHUD::DrawJoinPrompt / DrawTravelOverlay). This whitelist is only for a
+	 * surface that cannot renew its own lease.
 	 *
 	 * The in-match pause / settings overlay does NOT need to be here: FTraceCharacterSelect::Tick runs
 	 * every frame of every match and is already told when something in front of it owns the keyboard.
@@ -385,12 +382,9 @@ bool TraceHardwareCursor::IsRedArmed()
 
 FLinearColor TraceHardwareCursor::PointerTint()
 {
-	// THE INTERFACE CYAN ITSELF, not a copy of its three floats. TraceMenuStyle::Cyan is the value
-	// the title palette's own comment calls "a cyan that carries the interface", and reading it
-	// rather than restating it is what stops this from becoming the fourth place that number lives.
-	// It costs nothing: the include is confined to this .cpp, so the select screen still does not
-	// compile the menu map's types to draw an arrow.
-	return TraceMenuStyle::Cyan;
+	// WHITE: the artist's blade, untinted (stylespec §9). It was the pre-kit interface cyan; the kit
+	// has no cyan in it. See the header.
+	return FLinearColor::White;
 }
 
 float TraceHardwareCursor::PointerHeight(float InUIScale)

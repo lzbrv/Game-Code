@@ -184,8 +184,10 @@ namespace TraceMenuRowWidgetLocal
 	 * follows the row instead of having to be re-tuned after it. At today's RowHeight of 60 these
 	 * evaluate to exactly the 9 and 40 they replace, so nothing on screen moves in this pass.
 	 */
-	static constexpr float MarkHeightOfRow = 2.f / 3.f;
-	static constexpr float MarkWidthOfRow = 0.15f;
+	// The proportions live in TraceMenuStyle (TraceMenuPalette.h) since the Canvas title draws the
+	// same rail from them — one definition for both renderers.
+	static constexpr float MarkHeightOfRow = TraceMenuStyle::SelectionRailHeightOfRow;
+	static constexpr float MarkWidthOfRow = TraceMenuStyle::SelectionRailWidthOfRow;
 
 	static constexpr float MarkWidth = TraceMenuStyle::RowHeight * MarkWidthOfRow;
 	static constexpr float MarkHeight = TraceMenuStyle::RowHeight * MarkHeightOfRow;

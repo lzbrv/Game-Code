@@ -307,16 +307,21 @@ namespace TraceMenuArtStyle
 	TRACE_API FLinearColor AmberLifted();
 
 	/**
-	 * WordHover's HUE at full brightness: sRGB(85,107,47) -> sRGB(203,255,112), #CBFF70.
+	 * WordHover, lifted a MODERATE step: sRGB(85,107,47) x 1.6 -> sRGB(136,171,75), #88AB4B.
 	 *
-	 * The same stated transformation as AmberLifted, applied to the artist's other glow colour, for
-	 * the same reason and under the same rule — a TRANSFORMATION of the sheet's colour, not an
-	 * invented one, and it moves when WordHover does. The artist's hover green is a flat fill at
-	 * 2.34:1 against PlateFill (measured, see WordHover above): legible on their backlit sheet,
-	 * not on a screen. Byte-normalised it keeps the exact hue and clears the plate at 12.2:1.
+	 * A stated transformation of the sheet's colour, not an invented one — the channel ratio is the
+	 * artist's and it moves when WordHover does. The artist's hover olive is a flat fill at 2.34:1
+	 * against PlateFill (measured, see WordHover above): legible on their backlit sheet, not on a
+	 * screen. At 1.6x it clears the plate at 5.4:1 (WCAG AA) and stays visibly DIMMER than the white
+	 * default word, which is the sheet's own gesture: hover dims the word under the orange glow.
 	 *
-	 * This is what the hovered/selected WORD is drawn in, on both renderers (release art bible
-	 * §2.5). WordHover itself stays untouched above — it is the artist record this derives from.
+	 * IT USED TO BE BYTE-NORMALISED, #CBFF70 at 12.2:1. That made the hovered word a bright lime, the
+	 * loudest text on the screen, inverting the kit. The handmade-kit audit measured it and the style
+	 * spec named #88AB4B.
+	 *
+	 * This is what the hovered/selected WORD is drawn in, on every kit screen (title rows on both
+	 * renderers, the options pages, the select screens). WordHover itself stays untouched above — it
+	 * is the artist record this derives from.
 	 */
 	TRACE_API FLinearColor WordHoverLifted();
 

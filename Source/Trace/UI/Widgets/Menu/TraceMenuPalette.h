@@ -6,9 +6,13 @@
 // palettes that drift. Everything the Canvas path draws with, the widget classes default to, and
 // `Trace.UI.VerifyMenu` compares the two.
 //
-// The whole screen is two hues — a cyan that carries the interface and an amber that only ever
-// marks danger or the Hard setting — over near-black. That restraint is the entire look: the moment
-// a third colour appears, the grid stops reading as a grid and starts reading as noise.
+// THE COLOURS BELOW ARE THE PRE-KIT "TRON" PALETTE AND ARE RETIRED FOR EVERY KIT SCREEN. The title,
+// the JOIN prompt, the travel card and the pointer are all on the handmade kit now — navy plates,
+// an orange hover glow and white words on black (UI/Widgets/Menu/TraceMenuArtStyle.h for the
+// artist's colours, TraceMenuKit.h for how they are used). Cyan is not a kit colour. Cyan, CyanDeep,
+// Ink, InkDim, Void and PanelFill stay only for the screens that have not been converted yet; do not
+// reach for them on a new one. The layout constants below are still live and shared by both title
+// renderers.
 //
 // Every pixel constant is authored against a 1080-tall viewport and multiplied by UIScale. The UMG
 // path gets the same number a different way: UMG's DPI scale is (shortest side / 1080) under the
@@ -74,25 +78,22 @@ namespace TraceMenuStyle
 		return FLinearColor(C.R, C.G, C.B, A);
 	}
 
-	// DifficultyColor() lived here — mint for EASY, Amber for HARD — "so the setting is legible
-	// without reading the word". RETIRED by the release art bible §2.4 guard rail (menu accents on
-	// one screen come from at most two systems; only team-flavoured values may be amber): both the
-	// DIFFICULTY and SCORING MODE values now render the plain Cyan above, set in
-	// ATraceMenuHUD::BuildRowView for both renderers. Deleted rather than left unused, because an
-	// unused palette function that claims to colour the menu is a lie waiting for a reader.
+	// DifficultyColor() and DifficultyBlurb() lived here. The colour was retired by the release art
+	// bible; the blurb moved to TraceDifficulty::ToBlurb (UI/TraceMatchOptions.h) so its words go
+	// through TRACE_TEXT and Ranen can edit them.
 
-	static FString DifficultyBlurb(ETraceBotDifficulty InDifficulty)
-	{
-		switch (InDifficulty)
-		{
-		case ETraceBotDifficulty::Easy:
-			return TEXT("BOTS REACT SLOWLY AND SHOOT LOOSELY.  START HERE.");
-		case ETraceBotDifficulty::Hard:
-			return TEXT("BOTS REACT FAST, AIM TIGHT AND PUSH THE CORE.");
-		default:
-			return TEXT("BOTS PLAY THE SHIPPED TUNING.  A FAIR FIGHT.");
-		}
-	}
+	/**
+	 * THE TITLE'S AMBER SELECTION RAIL — owner-requested, TITLE ONLY (not part of the kit; the kit's
+	 * VisualsFor deliberately leaves it out). One definition for both title renderers: the UMG row
+	 * (TraceMenuRowWidget) and the Canvas row (ATraceMenuHUD::DrawRow) used to draw two different
+	 * bars — 9x40 rounded 14 px out, and 6x60 square 24 px out on a different pulse.
+	 *
+	 * Proportions of the row height, so the rail follows the row; the gap is reference px between
+	 * the rail and the plate (the UMG row's slot is authored 14 px out by the widget generator).
+	 */
+	static constexpr float SelectionRailWidthOfRow  = 0.15f;
+	static constexpr float SelectionRailHeightOfRow = 2.f / 3.f;
+	static constexpr float SelectionRailGap         = 14.f;
 
 	/**
 	 * The console panel's rect, in reference pixels, for a viewport of @p InViewH reference-height
