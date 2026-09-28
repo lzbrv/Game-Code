@@ -336,6 +336,12 @@ namespace TraceLoadoutSelectFile
 	{
 		return (Keys.NavX != 0) ? Keys.NavX : Keys.NavY * 2;
 	}
+
+	/** A saved slot that can be loaded: not empty, and legal under today's rules. Else its plate is disabled. */
+	bool SavedUsable(const FTraceLoadout& Loadout)
+	{
+		return !Loadout.IsEmpty() && UTraceAbilityComponent::IsLoadoutLegal(Loadout);
+	}
 }
 
 #if !UE_BUILD_SHIPPING
@@ -484,6 +490,7 @@ void FTraceLoadoutSelect::OnOpened(ATracePlayerState* LocalState)
 	HoveredSaved = INDEX_NONE;
 	bHoveredConfirm = false;
 	bHoveredBack = false;
+	bPointerLed = false;   // the page opens on the keys' highlight, whatever the pointer rests on
 
 	// FBox2D's default leaves bIsValid uninitialised, and last opening's rects must not be hit.
 	for (FBox2D& Rect : CardRects)
@@ -680,6 +687,18 @@ void FTraceLoadoutSelect::StepInput(const FTraceLoadoutKeys& Down, ATracePlayerS
 
 	// ---- 2. THE VERBS ------------------------------------------------------------------------------
 
+	// ANY VERB HANDS THE HOVER LOOK BACK TO THE KEYS' HIGHLIGHT. Without this a pointer resting on a
+	// tab or LOCK IN kept its glow while the arrows walked the grid, and the page showed two.
+	bool bAnyDigit = false;
+	for (const bool bEach : bNumberPressed)
+	{
+		bAnyDigit = bAnyDigit || bEach;
+	}
+	if (bTabLeftPressed || bTabRightPressed || bEquipPressed || bBackPressed || bLockPressed || bAnyDigit)
+	{
+		bPointerLed = false;
+	}
+
 	// Q / E and LB / RB change tab. The comment above this line claimed the shoulder buttons for as
 	// long as the page existed and nothing read them: a pad player could not leave MOVEMENT.
 	if (bTabLeftPressed != bTabRightPressed)
@@ -698,6 +717,7 @@ void FTraceLoadoutSelect::StepInput(const FTraceLoadoutKeys& Down, ATracePlayerS
 	else if (TracePadMenu::StepRepeat(NavDir, NavLastDir, NavNextTime, Now))
 	{
 		MoveCard((FMath::Abs(NavDir) == 1) ? NavDir : 0, (FMath::Abs(NavDir) == 2) ? NavDir / 2 : 0);
+		bPointerLed = false;
 	}
 
 	// THE FIVE SAVED LOADOUTS, in match mode. In the library the page IS one of them, and a number key
@@ -819,23 +839,29 @@ void FTraceLoadoutSelect::LockIn(ATracePlayerState* LocalState)
 
 void FTraceLoadoutSelect::PollPointer(APlayerController* PC, ATracePlayerState* LocalState, bool bAct)
 {
+	float MouseX = 0.f;
+	float MouseY = 0.f;
+	const bool bSampled = PC->GetMousePosition(MouseX, MouseY);
+	StepPointer(bSampled, FVector2D(MouseX, MouseY), PC->IsInputKeyDown(EKeys::LeftMouseButton),
+		PC->IsInputKeyDown(EKeys::LeftShift) || PC->IsInputKeyDown(EKeys::RightShift), LocalState, bAct);
+}
+
+void FTraceLoadoutSelect::StepPointer(bool bSampled, const FVector2D& SamplePos, bool bButtonDown, bool bShiftHeld,
+	ATracePlayerState* LocalState, bool bAct)
+{
 	// SAMPLED EVERY FRAME, like the keys: the position stays current under the pause menu, so its
 	// first sample after the menu closes is not a "move" that drags the highlight.
 	bool bCursorMoved = false;
-	float MouseX = 0.f;
-	float MouseY = 0.f;
-	if (PC->GetMousePosition(MouseX, MouseY))
+	if (bSampled)
 	{
-		const FVector2D NewPos(MouseX, MouseY);
-		bCursorMoved = bHasCursor && FVector2D::DistSquared(NewPos, CursorPos) > 4.f;   // 2 px
-		CursorPos = NewPos;
+		bCursorMoved = bHasCursor && FVector2D::DistSquared(SamplePos, CursorPos) > 4.f;   // 2 px
+		CursorPos = SamplePos;
 		bHasCursor = true;
 	}
 
-	const bool bDown = PC->IsInputKeyDown(EKeys::LeftMouseButton);
-	const bool bPressedNow = bDown && !bMouseWasDown;
-	const bool bJustReleased = !bDown && bMouseWasDown;
-	bMouseWasDown = bDown;
+	const bool bPressedNow = bButtonDown && !bMouseWasDown;
+	const bool bJustReleased = !bButtonDown && bMouseWasDown;
+	bMouseWasDown = bButtonDown;
 
 	if (!bAct)
 	{
@@ -893,11 +919,16 @@ void FTraceLoadoutSelect::PollPointer(APlayerController* PC, ATracePlayerState* 
 	bHoveredBack = BackRect.bIsValid && BackRect.IsInside(CursorPos);
 
 	// *** THE POINTER MUST HAVE MOVED BEFORE IT MAY TAKE THE HIGHLIGHT. *** Otherwise a pointer left
-	// resting over the grid pins the highlight and neither the keys nor the pad can shift it.
-	if (HoveredCard != INDEX_NONE && bCursorMoved)
+	// resting over the grid pins the highlight and neither the keys nor the pad can shift it. A PRESS
+	// takes it too, moved or not, so the card that shows PRESSED is the one the release equips.
+	if (bCursorMoved || bPressedNow)
 	{
-		Highlighted[Tab] = HoveredCard;
-		bLockHint = false;
+		bPointerLed = true;   // the pointer leads the hover look until a key is pressed (ResolveLit)
+		if (HoveredCard != INDEX_NONE)
+		{
+			Highlighted[Tab] = HoveredCard;
+			bLockHint = false;
+		}
 	}
 
 	if (!bJustReleased || !bMouseArmed)
@@ -926,8 +957,7 @@ void FTraceLoadoutSelect::PollPointer(APlayerController* PC, ATracePlayerState* 
 	if (HoveredSaved != INDEX_NONE)
 	{
 		// A plain click RECALLS; shift-click stores. Same pairing as the number keys.
-		const bool bShift = PC->IsInputKeyDown(EKeys::LeftShift) || PC->IsInputKeyDown(EKeys::RightShift);
-		bShift ? Store(HoveredSaved) : Recall(HoveredSaved);
+		bShiftHeld ? Store(HoveredSaved) : Recall(HoveredSaved);
 		return;
 	}
 
@@ -942,6 +972,68 @@ void FTraceLoadoutSelect::PollPointer(APlayerController* PC, ATracePlayerState* 
 	{
 		LockIn(LocalState);
 	}
+}
+
+FTraceLoadoutLit FTraceLoadoutSelect::ResolveLit() const
+{
+	// ONE HOVER ON THE PAGE. The first draw of this page lit up to three things at once: the tab you
+	// were on (always the hover plate), a tab under the pointer (the PRESSED plate, which is the hover
+	// plate at 0.72 with the same olive word, so it read as a second hover), and the keys' card, which
+	// kept its glow while the pointer sat on LOCK IN. Now exactly one thing wears the look.
+	FTraceLoadoutLit Out;
+
+	// 1. THE POINTER'S TARGET, while the pointer is what the player used last. A disabled saved slot
+	//    is not a target: pointing at it leaves the keys' card lit, as a non-selectable row does on
+	//    the options page.
+	if (bPointerLed)
+	{
+		if (HoveredTab != INDEX_NONE)
+		{
+			Out.Tab = HoveredTab;
+		}
+		else if (bHoveredConfirm)
+		{
+			Out.bConfirm = true;
+		}
+		else if (bHoveredBack)
+		{
+			Out.bBack = true;
+		}
+		else if (HoveredSaved != INDEX_NONE
+			&& TraceLoadoutSelectFile::SavedUsable(UTraceUserSettings::Get().GetSavedLoadout(HoveredSaved)))
+		{
+			Out.Saved = HoveredSaved;
+		}
+	}
+
+	// 2. OTHERWISE THE KEYS' FOCUS: LOCK IN once ENTER has answered the last question, else the
+	//    highlighted card (a pointer that walked onto a card moved the highlight there).
+	if (Out.Count() == 0)
+	{
+		if (bLockHint)
+		{
+			Out.bConfirm = true;
+		}
+		else
+		{
+			const int32 CardIndex = Highlighted[Tab];
+			if (CardIndex >= 0 && CardIndex < TraceLoadoutSelectFile::CardCount(static_cast<ETraceLoadoutSlot>(Tab)))
+			{
+				Out.Card = CardIndex;
+			}
+		}
+	}
+
+	// 3. PRESSED is what the kit means by it: the button held on the lit thing, the press begun here.
+	if (bMouseArmed && bMouseWasDown)
+	{
+		Out.bPressed = (Out.Tab != INDEX_NONE && Out.Tab == HoveredTab)
+			|| (Out.Card != INDEX_NONE && Out.Card == HoveredCard)
+			|| (Out.Saved != INDEX_NONE && Out.Saved == HoveredSaved)
+			|| (Out.bConfirm && bHoveredConfirm)
+			|| (Out.bBack && bHoveredBack);
+	}
+	return Out;
 }
 
 // =================================================================================================
@@ -1127,6 +1219,9 @@ void FTraceLoadoutSelect::Draw(AHUD* HUD, APlayerController* PC, const ATracePla
 	const float X = TraceLoadoutLayout::Margin * S;
 	const float W = ViewW - TraceLoadoutLayout::Margin * 2.f * S;
 
+	// The one thing in the hover look this frame, asked once so the tabs, the grid and the buttons agree.
+	FrameLit = ResolveLit();
+
 	// OPAQUE BLACK (stylespec §1). The old translucent navy scrim let the match clock, the CORE LOOSE
 	// banner and the first-person weapon ghost through behind the title and the cards; the countdown
 	// the clock stood in for is on this page now.
@@ -1238,13 +1333,19 @@ void FTraceLoadoutSelect::DrawTabs(AHUD* HUD, APlayerController* PC, float X, fl
 		const float TabX = RowX + (TabW + Gap) * Index;
 		TabRects[Index] = FBox2D(FVector2D(TabX, Y), FVector2D(TabX + TabW, Y + TabH));
 
-		// The question you are on wears the hover plate; a pointer over another tab gets the hover
-		// plate knocked down, so there is only ever one full glow in the row.
-		const bool bActive = (Index == Tab);
-		const ETraceKitState State = bActive ? ETraceKitState::Hover
-			: ((Index == HoveredTab) ? ETraceKitState::Pressed : ETraceKitState::Default);
+		// A TAB WEARS THE HOVER PLATE ONLY WHILE THE POINTER IS ON IT (PRESSED while the button is
+		// down on it). The question you are ON is not a hover — it used to wear the hover plate for as
+		// long as it was current, beside the keys' lit card — so it keeps the default plate and says
+		// which it is with the olive word and white summary.
+		const bool bLitTab = (Index == FrameLit.Tab);
+		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, bLitTab, bLitTab && FrameLit.bPressed);
 		TraceMenuKit::DrawStatePlate(HUD, State, TabX, Y, TabW, TabH, AnimNow);
-		const FTraceKitVisuals Visuals = TraceMenuKit::VisualsAt(State, TabX, Y, TabW, TabH);
+		FTraceKitVisuals Visuals = TraceMenuKit::VisualsAt(State, TabX, Y, TabW, TabH);
+		if (Index == Tab && !bLitTab)
+		{
+			Visuals.Label = TraceMenuArtStyle::WordHoverLifted();
+			Visuals.Furniture = TraceMenuKit::FurnitureSelected;
+		}
 
 		// WHAT IS IN THE SLOT, on the tab itself, so the whole loadout reads without visiting all three.
 		const float TextMax = TabW - TabH * 0.5f;
@@ -1324,12 +1425,12 @@ void FTraceLoadoutSelect::DrawGrid(AHUD* HUD, float X, float Y, float W, float H
 
 	// THE HIGHLIGHTED CARD LAST: its glow overhangs the plate and a neighbour drawn after it would
 	// paint over the ring.
-	const int32 Lit = Highlighted[Tab];
+	const int32 LastCard = Highlighted[Tab];
 	for (int32 Pass = 0; Pass < 2; ++Pass)
 	{
 		for (int32 Index = 0; Index < Count; ++Index)
 		{
-			if ((Index == Lit) != (Pass == 1))
+			if ((Index == LastCard) != (Pass == 1))
 			{
 				continue;
 			}
@@ -1348,12 +1449,14 @@ void FTraceLoadoutSelect::DrawCard(AHUD* HUD, int32 Index, float X, float Y, flo
 	const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(Tab);
 	const ETraceAbilityId Id = TraceLoadoutSelectFile::AbilityAtCard(Slot, Index);
 
-	const bool bHighlighted = (Index == Highlighted[Tab]);
+	// Lit only when the page's one hover is on the grid: not while the pointer leads on a tab, LOCK
+	// IN or a saved slot, and not while ENTER has handed the look to LOCK IN (ResolveLit).
+	const bool bLitCard = (Index == FrameLit.Card);
 	const bool bEquipped = (Staged.Get(Slot) == Id);
 
 	CardRects[Index] = FBox2D(FVector2D(X, Y), FVector2D(X + W, Y + H));
 
-	const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, bHighlighted);
+	const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, bLitCard, bLitCard && FrameLit.bPressed);
 	TraceMenuKit::DrawStatePlate(HUD, State, X, Y, W, H, AnimNow, TraceLoadoutLayout::CardCorner * S);
 	// The card's words follow its hover ring as it eases on and off.
 	const FTraceKitVisuals Visuals = TraceMenuKit::VisualsAt(State, X, Y, W, H);
@@ -1446,7 +1549,8 @@ void FTraceLoadoutSelect::DrawActionRow(AHUD* HUD, APlayerController* PC, float 
 		const FString Word = bLibrary ? TRACE_TEXT("LOADOUT.SAVE_SLOT", "SAVE") : TRACE_TEXT("LOADOUT.LOCK_IN", "LOCK IN");
 		const FString Key = bPad ? TRACE_TEXT("LOADOUT.PAD_KEY_LOCK_IN", "X") : TRACE_TEXT("LOADOUT.KEY_LOCK_IN", "F");
 		const float PlateX = Right - BtnW;
-		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, bHoveredConfirm || bLockHint);
+		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, FrameLit.bConfirm,
+			FrameLit.bConfirm && FrameLit.bPressed);
 		ConfirmRect = TraceMenuKit::DrawButton(HUD, State, PlateX, Y, BtnW, BtnH, Word, AnimNow)
 			? FBox2D(FVector2D(PlateX, Y), FVector2D(PlateX + BtnW, Y + BtnH))
 			: FBox2D(ForceInit);
@@ -1467,7 +1571,8 @@ void FTraceLoadoutSelect::DrawActionRow(AHUD* HUD, APlayerController* PC, float 
 		const FString Word = TRACE_TEXT("LOADOUT.BACK", "BACK");
 		const FString Key = bPad ? TRACE_TEXT("LOADOUT.PAD_KEY_BACK", "B") : TRACE_TEXT("LOADOUT.KEY_BACK", "ESC");
 		const float PlateX = Right - BtnW;
-		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, bHoveredBack);
+		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, FrameLit.bBack,
+			FrameLit.bBack && FrameLit.bPressed);
 		if (TraceMenuKit::DrawButton(HUD, State, PlateX, Y, BtnW, BtnH, Word, AnimNow))
 		{
 			BackRect = FBox2D(FVector2D(PlateX, Y), FVector2D(PlateX + BtnW, Y + BtnH));
@@ -1519,7 +1624,7 @@ void FTraceLoadoutSelect::DrawSavedRow(AHUD* HUD, float X, float Y, float MaxW)
 	{
 		const float SlotX = PenX + (SlotW + Gap) * Index;
 		const FTraceLoadout Saved = Settings.GetSavedLoadout(Index);
-		const bool bUsable = !Saved.IsEmpty() && UTraceAbilityComponent::IsLoadoutLegal(Saved);
+		const bool bUsable = TraceLoadoutSelectFile::SavedUsable(Saved);
 
 		// WHAT THE SLOT HOLDS, not just its number: its activated ability names it (or the name the
 		// player gave it). An empty slot, or one the rules no longer allow, is the disabled plate.
@@ -1532,7 +1637,8 @@ void FTraceLoadoutSelect::DrawSavedRow(AHUD* HUD, float X, float Y, float MaxW)
 				: TRACE_TEXTF("LOADOUT.SAVED_SLOT", "{0} {1}", { Index + 1, Activated });
 		}
 
-		const ETraceKitState State = TraceMenuKit::StateFor(bUsable, Index == HoveredSaved);
+		const ETraceKitState State = TraceMenuKit::StateFor(bUsable, Index == FrameLit.Saved,
+			Index == FrameLit.Saved && FrameLit.bPressed);
 		if (TraceMenuKit::DrawButton(HUD, State, SlotX, Y, SlotW, H, Word, AnimNow))
 		{
 			SavedRects[Index] = FBox2D(FVector2D(SlotX, Y), FVector2D(SlotX + SlotW, Y + H));
@@ -1668,6 +1774,27 @@ void FTraceLoadoutSelect::DebugSetCursor(const FVector2D& Pos)
 FBox2D FTraceLoadoutSelect::DebugCardRect(int32 Index) const
 {
 	return (Index >= 0 && Index < MaxCards) ? CardRects[Index] : FBox2D(ForceInit);
+}
+
+void FTraceLoadoutSelect::DebugSetTabRect(int32 Index, const FBox2D& Rect)
+{
+	if (Index >= 0 && Index < static_cast<int32>(ETraceLoadoutSlot::Count))
+	{
+		TabRects[Index] = Rect;
+	}
+}
+
+void FTraceLoadoutSelect::DebugSetCardRect(int32 Index, const FBox2D& Rect)
+{
+	if (Index >= 0 && Index < MaxCards)
+	{
+		CardRects[Index] = Rect;
+	}
+}
+
+void FTraceLoadoutSelect::DebugPointer(const FVector2D& Pos, bool bButtonDown, ATracePlayerState* LocalState)
+{
+	StepPointer(/*bSampled=*/true, Pos, bButtonDown, /*bShiftHeld=*/false, LocalState, /*bAct=*/true);
 }
 
 #if !UE_BUILD_SHIPPING
@@ -2167,6 +2294,111 @@ namespace TraceLoadoutScreenVerify
 			Page.Tick(nullptr, nullptr, Subject, 1920.f, 1080.f, 1.f, 1.4f, /*bInputAllowed=*/true);
 			Check(TEXT("a reopened page carries no stale pointer sample"), !Page.DebugWouldDrawPointer(),
 				TEXT("the half-time page's first sample counted as a move and dragged the highlight"));
+		}
+
+		// ---- ONE HOVER ON THE PAGE ------------------------------------------------------------------
+		//
+		// The kit's rule (stylespec §5): hover and keyboard selection are ONE state, so one thing wears
+		// the look. The page lit up to three at once: the current tab always, a pointed-at tab in
+		// PRESSED (the same plate, dimmed), and the keys' card while the pointer sat on LOCK IN or a
+		// tab. Driven through the real pointer and key paths, against hit rects where a 1080p draw
+		// leaves them (tabs 143 + 552 i wide 530, cards 366 apart, LOCK IN at the bottom right).
+		{
+			Subject->ServerSetCharacterSelectOpen(/*bOpen=*/true, 0.f);
+			FTraceLoadoutSelect Page;
+			Page.DebugBeginInput(Subject);
+			for (int32 TabIndex = 0; TabIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++TabIndex)
+			{
+				const float TabLeftX = 143.f + 552.f * TabIndex;
+				Page.DebugSetTabRect(TabIndex, FBox2D(FVector2D(TabLeftX, 100.f), FVector2D(TabLeftX + 530.f, 174.f)));
+			}
+			for (int32 CardIndex = 0; CardIndex < FTraceLoadoutSelect::MaxCards; ++CardIndex)
+			{
+				const FVector2D CardTopLeft(54.f + 366.f * (CardIndex % TraceLoadoutLayout::Columns),
+					198.f + 344.f * (CardIndex / TraceLoadoutLayout::Columns));
+				Page.DebugSetCardRect(CardIndex, FBox2D(CardTopLeft, CardTopLeft + FVector2D(346.f, 326.f)));
+			}
+			Page.DebugSetConfirmRect(FBox2D(FVector2D(1616.f, 888.f), FVector2D(1866.f, 942.f)));
+
+			float Clock = 300.f;
+			auto KeyFrame = [&Page, Subject, &Clock](const FTraceLoadoutKeys& FrameKeys)
+			{
+				Clock += 0.05f;
+				Page.DebugInput(FrameKeys, Subject, /*bInputAllowed=*/true, Clock);
+			};
+			auto PointerTo = [&Page, Subject](float PX, float PY, bool bButton)
+			{
+				Page.DebugPointer(FVector2D(PX, PY), bButton, Subject);
+			};
+			auto DescribeLit = [](const FTraceLoadoutLit& LitState)
+			{
+				return FString::Printf(TEXT("lit: card %d, tab %d, saved %d, lock in %d, back %d, pressed %d = %d"),
+					LitState.Card, LitState.Tab, LitState.Saved, LitState.bConfirm ? 1 : 0, LitState.bBack ? 1 : 0,
+					LitState.bPressed ? 1 : 0, LitState.Count());
+			};
+			const FTraceLoadoutKeys Nothing;
+			FTraceLoadoutKeys Right;  Right.NavX = 1;
+			FTraceLoadoutKeys Enter;  Enter.bEquip = true;
+
+			KeyFrame(Nothing);                 // the open edge assumed every key held
+			PointerTo(960.f, 60.f, false);     // on the title: the first sample, not a move
+			const FTraceLoadoutLit OnOpen = Page.DebugLit();
+			PointerTo(960.f, 140.f, false);    // onto PASSIVE, not the tab the page is on
+			const FTraceLoadoutLit OnOtherTab = Page.DebugLit();
+			PointerTo(408.f, 140.f, false);    // onto MOVEMENT, the tab the page is on
+			const FTraceLoadoutLit OnOwnTab = Page.DebugLit();
+			PointerTo(1740.f, 915.f, false);   // onto LOCK IN
+			const FTraceLoadoutLit OnLockIn = Page.DebugLit();
+
+			Check(TEXT("*** one hover: the page opens with only its card lit ***"),
+				OnOpen.Count() == 1 && OnOpen.Card == Page.GetHighlighted(ETraceLoadoutSlot::Movement),
+				DescribeLit(OnOpen));
+			Check(TEXT("*** one hover: a pointer on another tab lights only it ***"),
+				OnOtherTab.Count() == 1 && OnOtherTab.Tab == 1 && !OnOtherTab.bPressed && Page.GetTab() == 0,
+				DescribeLit(OnOtherTab));
+			Check(TEXT("one hover: on the current tab, or LOCK IN, only that"),
+				OnOwnTab.Count() == 1 && OnOwnTab.Tab == 0 && OnLockIn.Count() == 1 && OnLockIn.bConfirm,
+				DescribeLit(OnOwnTab) + TEXT(" / ") + DescribeLit(OnLockIn));
+
+			// An arrow while the pointer RESTS on LOCK IN: the keys lead, and the resting pointer
+			// lights nothing (it used to keep LOCK IN glowing beside the card the arrow moved to).
+			const int32 BeforeKey = Page.GetHighlighted(ETraceLoadoutSlot::Movement);
+			KeyFrame(Right);
+			PointerTo(1740.f, 915.f, false);
+			KeyFrame(Nothing);
+			PointerTo(1740.f, 915.f, false);
+			const FTraceLoadoutLit AfterKey = Page.DebugLit();
+			Check(TEXT("*** one hover: a key takes it back from a resting pointer ***"),
+				AfterKey.Count() == 1 && AfterKey.Card == Page.GetHighlighted(ETraceLoadoutSlot::Movement)
+					&& AfterKey.Card != BeforeKey,
+				DescribeLit(AfterKey));
+
+			// PRESSED means a finger down: a press on ACTIVATED, then its release.
+			PointerTo(1512.f, 140.f, true);
+			const FTraceLoadoutLit WhilePressed = Page.DebugLit();
+			PointerTo(1512.f, 140.f, false);
+			const FTraceLoadoutLit AfterClick = Page.DebugLit();
+			Check(TEXT("a press on a tab is PRESSED; its release changes tab"),
+				WhilePressed.Count() == 1 && WhilePressed.Tab == 2 && WhilePressed.bPressed
+					&& AfterClick.Count() == 1 && AfterClick.Tab == 2 && !AfterClick.bPressed && Page.GetTab() == 2,
+				DescribeLit(WhilePressed) + TEXT(" / ") + DescribeLit(AfterClick));
+
+			// The pointer walks onto card 3: the one hover goes with it.
+			PointerTo(54.f + 366.f * 3.f + 170.f, 360.f, false);
+			const FTraceLoadoutLit OnCard = Page.DebugLit();
+			Check(TEXT("a pointer on the grid moves the one hover to its card"),
+				OnCard.Count() == 1 && OnCard.Card == 3 && Page.GetHighlighted(ETraceLoadoutSlot::Activated) == 3,
+				DescribeLit(OnCard));
+
+			// ENTER on the last tab: LOCK IN takes the look, and the card gives it up.
+			KeyFrame(Enter);
+			PointerTo(54.f + 366.f * 3.f + 170.f, 360.f, false);
+			KeyFrame(Nothing);
+			PointerTo(54.f + 366.f * 3.f + 170.f, 360.f, false);
+			const FTraceLoadoutLit AfterEnter = Page.DebugLit();
+			Check(TEXT("*** ENTER on the last tab hands the one hover to LOCK IN ***"),
+				AfterEnter.Count() == 1 && AfterEnter.bConfirm && Subject->IsCharacterSelectOpen(),
+				DescribeLit(AfterEnter));
 		}
 
 		// ---- THE LIBRARY EDITOR: BACK, EQUIP, SAVE --------------------------------------------------

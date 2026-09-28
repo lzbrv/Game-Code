@@ -39,6 +39,12 @@
 // highlight, so a keyboard or pad player could not change a single ability: they arrowed to SUSPEND,
 // pressed ENTER and locked in JET BOOTS. Equipping and locking in are now two different keys.
 //
+// ONE THING WEARS THE HOVER LOOK AT A TIME (stylespec §5: hover and keyboard selection are one
+// state). Whichever the player used last leads: a pointer that MOVED lights what it is on (a tab,
+// LOCK IN, a saved slot, or the card it walked onto); a key or pad press hands the look back to the
+// highlighted card, or to LOCK IN once ENTER has answered the last question. The tab you are on is
+// not a hover: it keeps the default plate and says so with the olive word. See ResolveLit.
+//
 // EVERY KEY IS AN EDGE AGAINST THE KEY'S OWN LAST STATE, SAMPLED ON EVERY FRAME THE PAGE IS OPEN —
 // including the frames its input is gated off (the pause menu in front, the frame it opened). Before
 // that, the page only remembered a key while it was allowed to read it, so an ENTER still held from
@@ -133,6 +139,28 @@ struct FTraceLoadoutKeys
 	}
 };
 
+/**
+ * What wears the kit's hover look this frame — at most ONE thing on the page. Resolved in one place
+ * (FTraceLoadoutSelect::ResolveLit), drawn from, and read back by the harness.
+ */
+struct FTraceLoadoutLit
+{
+	int32 Card = INDEX_NONE;
+	int32 Tab = INDEX_NONE;
+	int32 Saved = INDEX_NONE;
+	bool bConfirm = false;   // LOCK IN (SAVE in the library)
+	bool bBack = false;      // the library's BACK
+
+	/** The pointer's button is down on the lit thing, and the press began on this page: PRESSED. */
+	bool bPressed = false;
+
+	int32 Count() const
+	{
+		return (Card != INDEX_NONE ? 1 : 0) + (Tab != INDEX_NONE ? 1 : 0) + (Saved != INDEX_NONE ? 1 : 0)
+			+ (bConfirm ? 1 : 0) + (bBack ? 1 : 0);
+	}
+};
+
 struct TRACE_API FTraceLoadoutSelect
 {
 	bool IsOpen() const { return bOpen; }
@@ -203,6 +231,17 @@ struct TRACE_API FTraceLoadoutSelect
 	/** Test seam: the screen rect of card @p Index as of the last draw, for a scripted click. */
 	FBox2D DebugCardRect(int32 Index) const;
 
+	/** Test seams: park hit rects where a draw would leave them, so the pointer path runs without a canvas. */
+	void DebugSetTabRect(int32 Index, const FBox2D& Rect);
+	void DebugSetCardRect(int32 Index, const FBox2D& Rect);
+	void DebugSetConfirmRect(const FBox2D& Rect) { ConfirmRect = Rect; }
+
+	/** One pointer sample at @p Pos, button up or down, through the SAME path the live page polls. */
+	void DebugPointer(const FVector2D& Pos, bool bButtonDown, ATracePlayerState* LocalState);
+
+	/** What would wear the hover look if the page drew now. */
+	FTraceLoadoutLit DebugLit() const { return ResolveLit(); }
+
 	/** The most cards one tab can hold: the grid is Columns x Rows. */
 	static constexpr int32 MaxCards = 10;
 
@@ -217,6 +256,13 @@ private:
 	void StepInput(const FTraceLoadoutKeys& Down, ATracePlayerState* LocalState, bool bInputAllowed);
 
 	void PollPointer(APlayerController* PC, ATracePlayerState* LocalState, bool bAct);
+
+	/** PollPointer past the controller: one sample (position if @p bSampled, the button, SHIFT). */
+	void StepPointer(bool bSampled, const FVector2D& SamplePos, bool bButtonDown, bool bShiftHeld,
+		ATracePlayerState* LocalState, bool bAct);
+
+	/** The ONE thing that wears the hover look, from the pointer, the keys' highlight and LOCK IN's hint. */
+	FTraceLoadoutLit ResolveLit() const;
 
 	void MoveTab(int32 Delta);
 	void MoveCard(int32 DeltaX, int32 DeltaY);
@@ -299,6 +345,15 @@ private:
 	int32 HoveredSaved = INDEX_NONE;
 	bool bHoveredConfirm = false;
 	bool bHoveredBack = false;
+
+	/**
+	 * The pointer, not the keys, was used last: what it rests on wears the hover look. A pointer that
+	 * moves (or presses) sets it; any key or pad verb clears it. Off on every open.
+	 */
+	bool bPointerLed = false;
+
+	/** ResolveLit, taken once at the top of Draw so every plate on the frame reads the same answer. */
+	FTraceLoadoutLit FrameLit;
 
 	// ---- keys ------------------------------------------------------------------------------------
 	/** Last frame's levels. Every verb is an edge against this. */
