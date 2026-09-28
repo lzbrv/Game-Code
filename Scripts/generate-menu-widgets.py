@@ -129,6 +129,12 @@
 #   TRACE_MENU_ART_DIR  package dir for the sprites. Default /Game/Trace/UI/Art
 #   TRACE_MENU_FONT_DIR package dir for the font.    Default /Game/Trace/UI/Fonts
 #   TRACE_SKIP_IMPORT   set to 1 to re-author the widgets without re-importing
+#   TRACE_IMPORT_ONLY   comma-separated sprite names (e.g. T_TraceWordmark,T_MenuSwoosh):
+#                       re-import JUST those textures with the settings below and stop.
+#                       No font import, no widget is touched. For a re-slice of one or
+#                       two sprites, where re-authoring both widget blueprints would be a
+#                       much bigger diff than the change. The .uasset files are Git LFS
+#                       and checked out read-only: chmod u+w them first, u-w after.
 #   TRACE_FONT_IMPORT   0 to never attempt the font import, 1 to force it (see
 #                       slate_is_available(); forcing it in a commandlet crashes)
 # =============================================================================
@@ -149,6 +155,7 @@ except ImportError:  # pragma: no cover - only possible outside the editor
 MENU_DIR = os.environ.get("TRACE_MENU_UI_DIR", "/Game/Trace/UI/Menu")
 ART_DIR = os.environ.get("TRACE_MENU_ART_DIR", "/Game/Trace/UI/Art")
 SKIP_IMPORT = os.environ.get("TRACE_SKIP_IMPORT", "0") == "1"
+IMPORT_ONLY = [n.strip() for n in os.environ.get("TRACE_IMPORT_ONLY", "").split(",") if n.strip()]
 
 PROJECT_DIR = unreal.Paths.convert_relative_path_to_full(unreal.Paths.project_dir())
 SPRITE_SOURCE_DIR = os.path.join(PROJECT_DIR, "Content", "Trace", "UI", "Art", "Source")
@@ -622,8 +629,13 @@ def import_sprites():
              "artist's sheet into the sprites this script imports.".format(SPRITE_SOURCE_DIR))
         return
 
+    wanted = [entry for entry in SPRITES if not IMPORT_ONLY or entry[0] in IMPORT_ONLY]
+    for name in IMPORT_ONLY:
+        if name not in [entry[0] for entry in SPRITES]:
+            fail("TRACE_IMPORT_ONLY names {0}, which is not one of the sliced sprites.".format(name))
+
     tasks = []
-    for name, _placed in SPRITES:
+    for name, _placed in wanted:
         source = os.path.join(SPRITE_SOURCE_DIR, name + ".png")
         if not os.path.isfile(source):
             fail("{0} is missing from {1}. Re-run Scripts/slice-ui-assets.py.".format(name, SPRITE_SOURCE_DIR))
@@ -645,7 +657,7 @@ def import_sprites():
     else:
         unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks(tasks)
 
-    for name, _placed in SPRITES:
+    for name, _placed in wanted:
         path = "{0}/{1}".format(ART_DIR, name)
         texture = unreal.EditorAssetLibrary.load_asset(path)
         if texture is None:
@@ -1396,6 +1408,21 @@ def main():
     log("Trace - spec v19 section 5: the title screen, built from the artist's sheet")
     log("Sprites: {0}      Widgets: {1}".format(ART_DIR, MENU_DIR))
     log("=" * 70)
+
+    if IMPORT_ONLY:
+        log("TRACE_IMPORT_ONLY={0}: re-importing only those sprites; no font, no widget.".format(
+            ",".join(IMPORT_ONLY)))
+        import_sprites()
+        for name in IMPORT_ONLY:
+            if Textures.get(name) is None:
+                fail("{0} did not re-import.".format(name))
+        if Failures:
+            for message in Failures:
+                unreal.log_error("[MenuWidgets] FAILED: {0}".format(message))
+            unreal.log_error("[MenuWidgets] VERDICT: {0} failure(s) re-importing.".format(len(Failures)))
+            return 1
+        log("VERDICT: re-imported {0} sprite(s).".format(len(IMPORT_ONLY)))
+        return 0
 
     global MENU_FONT
 

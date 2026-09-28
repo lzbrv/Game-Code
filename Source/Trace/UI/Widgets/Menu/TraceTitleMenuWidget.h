@@ -86,13 +86,14 @@ namespace TraceTitleLayout
 	static constexpr float SwooshClearOfTagline = 16.f;
 
 	/**
-	 * The swoosh's opacity, down from the authored 0.78.
+	 * The swoosh's opacity: the kit's own, full strength.
 	 *
-	 * It is a backdrop for the title. Even after the WP8.3 re-tone onto the plate palette, a
-	 * flourish at full strength competes with the six things on this screen a player actually has
-	 * to read.
+	 * It was 0.55 while the swoosh was re-toned navy (release UI plan WP8.3), which left a dim dark
+	 * blade that all but vanished on black. The handmade image has it as the brightest thing on the
+	 * sheet — white metal under the navy mark — and the slicer now ships that render verbatim
+	 * (Scripts/slice-ui-assets.py note 7), so it is drawn as the artist drew it.
 	 */
-	static constexpr float SwooshOpacity = 0.55f;
+	static constexpr float SwooshOpacity = 1.0f;
 
 	/** Where the tagline is authored on the root canvas, reference px. The widget MEASURES the live
 	 *  slot and uses this only as the first-frame fallback; the Canvas path draws at it directly. */
@@ -330,28 +331,10 @@ private:
 	// that already owns "where the cursor goes" and "how wide the console is", and each one states
 	// the number it is enforcing so the asset and this file cannot drift silently.
 
-	/**
-	 * DEFECT 1 — the doubled, mis-coloured wordmark, fixed at its actual cause.
-	 *
-	 * The mark is NOT drawn twice; it is drawn once, and the sprite itself is two-tone. The artist's
-	 * TRACE is a NAVY glyph — RGB(29,41,81), byte-identical to the button plates — inside an AMBER
-	 * outer glow, and the slicer shipped that crop verbatim onto a pure-black backdrop. On black the
-	 * body sits at luminance 45 while the glow reaches 199, so the eye reads the glow as one word and
-	 * the dark body as a second, offset one. A Slate tint cannot repair it: a tint MULTIPLIES, so
-	 * every colour it can produce is darker than the navy already is.
-	 *
-	 * So the sprite's own ALPHA is lifted into a new texture: the glyph body becomes ink-white, the
-	 * glow keeps the artist's amber at full strength, and the letterforms — which are the part that
-	 * is actually the artist's work — are untouched. The result is one mark, in the artist's own
-	 * hand, that reads on black.
-	 *
-	 * SELF-DISABLING. If the sprite ever arrives already legible (a re-slice that lifts the word the
-	 * way build_word() lifts PLAY and SETTINGS), the peak-luminance test below finds it and this does
-	 * nothing at all. And if the pixels cannot be read — a cooked build that dropped its CPU copy —
-	 * it leaves the authored brush alone and says so in the log. Neither case can make the screen
-	 * worse than it is today.
-	 */
-	void LiftWordmarkFromSprite();
+	// DEFECT 1 used to be repaired here at runtime (LiftWordmarkFromSprite re-toned the navy TRACE to
+	// white). It is gone: the owner asked for the handmade image, where the mark is navy in an amber
+	// glow, and Scripts/slice-ui-assets.py now ships exactly that (its note 6). What is imported is what
+	// is drawn, on this widget, the Canvas title and the travel card.
 
 	/**
 	 * DEFECT 2 — the swoosh cutting through the lettering.
@@ -467,15 +450,4 @@ private:
 	 */
 	UWidget* LiveText(UTextBlock* Block) const { return TraceAtlasTextSwap::Live(AtlasLabels, Block); }
 
-	/**
-	 * The recoloured mark from LiftWordmarkFromSprite(), kept alive by being a UPROPERTY.
-	 *
-	 * It is a transient texture in the transient package: nothing else in the reference graph holds
-	 * it, so a raw pointer would be collected out from under the title screen on the first GC.
-	 */
-	UPROPERTY(Transient)
-	TObjectPtr<UTexture2D> LiftedWordmark;
-
-	/** LiftWordmarkFromSprite() has run. It runs once, whatever its outcome was. */
-	bool bWordmarkLiftAttempted = false;
 };

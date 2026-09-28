@@ -10,7 +10,6 @@
 #include "Components/Image.h"
 #include "Components/TextBlock.h"
 #include "Engine/Texture2D.h"
-#include "TextureResource.h"
 
 #include "Trace.h"   // LogTraceGame
 #include "UI/TraceHardwareCursor.h"
@@ -44,111 +43,6 @@ namespace TraceTitleMenuWidgetLocal
 
 	/** The last line keeps at least this much air under it, whatever the console did. */
 	static constexpr float FooterBottomMargin = 16.f;
-
-	// ---- The lifted wordmark ---------------------------------------------------------------------
-
-	/**
-	 * Peak over-black luminance, 0..1, at or above which the sprite is left completely alone.
-	 *
-	 * THE SELF-DISABLING TEST. Today's crop peaks at 0.28 — that is the defect. A word lifted the way
-	 * build_word() lifts PLAY and SETTINGS peaks at 1.0. Anything at 0.62 or brighter already reads
-	 * on black and does not want a second opinion from this file.
-	 */
-	static constexpr float WordmarkLiftThreshold = 0.62f;
-
-	/** The glyph body. Near-white, very slightly cool, matching the tagline's ink. */
-	static const FColor WordmarkInk(242, 246, 255, 255);
-
-	/**
-	 * The glow the artist drew the mark with: TraceMenuArtStyle::Amber, at a strength that shows.
-	 *
-	 * SPEC v24 §0, applied here, and this one was not merely a stale literal — it was a WRONG one
-	 * wearing a correct comment. The line read `FColor(255, 140, 40)` and claimed to be the artist's
-	 * amber lifted, but sRGB(116,58,0) does not normalise to 255:140:40; it normalises to 255:128:0.
-	 * The mark's halo had drifted a visible step toward yellow and no diff could ever have shown it,
-	 * because the number and the sentence beside it were independent.
-	 *
-	 * It is now the derivation itself, shared with the menu row's selection rail — one expression of
-	 * "the artist's amber, lifted", in TraceMenuArtStyle, so both follow if the sheet's amber is ever
-	 * re-sampled. THE VISIBLE CHANGE IS SMALL AND IT IS REAL: the TRACE wordmark's outer glow moves
-	 * from sRGB(255,140,40) to sRGB(255,128,0), i.e. back onto the artist's own hue.
-	 *
-	 * Function-local static for the static-initialisation-order reason spelled out at
-	 * TraceMenuRowWidgetLocal::SelectionMarkColor: losing that race would be silent.
-	 */
-	static const FColor& WordmarkGlow()
-	{
-		static const FColor Color = TraceMenuArtStyle::AmberLifted().ToFColor(/*bSRGB=*/true);
-		return Color;
-	}
-
-	/** Rec. 709 luminance of an sRGB byte triple, 0..1. Perceptual weighting, not an average. */
-	static float ByteLuminance(const FColor& InColor)
-	{
-		return (0.2126f * InColor.R + 0.7152f * InColor.G + 0.0722f * InColor.B) / 255.f;
-	}
-
-	/**
-	 * A BGRA8 copy of @p InTexture's top mip, or false if this build cannot reach the pixels.
-	 *
-	 * Two sources, in the order of how much they can be trusted:
-	 *   1. the imported SOURCE art, which the editor keeps and which has never been compressed,
-	 *      mip-dropped or thrown away after upload. This is the path that runs in-editor and in
-	 *      -game off the editor binary, which is every way this screen is looked at today;
-	 *   2. the cooked platform data, for a packaged build — present only while the CPU copy has not
-	 *      been discarded, which is why the caller must treat failure as normal and fall back.
-	 */
-	static bool ReadTexturePixels(UTexture2D* InTexture, TArray<FColor>& OutPixels, int32& OutWidth, int32& OutHeight)
-	{
-		if (InTexture == nullptr)
-		{
-			return false;
-		}
-
-#if WITH_EDITORONLY_DATA
-		if (InTexture->Source.IsValid() && InTexture->Source.GetFormat() == TSF_BGRA8)
-		{
-			TArray64<uint8> Raw;
-			if (InTexture->Source.GetMipData(Raw, 0))
-			{
-				OutWidth = static_cast<int32>(InTexture->Source.GetSizeX());
-				OutHeight = static_cast<int32>(InTexture->Source.GetSizeY());
-				const int64 Expected = static_cast<int64>(OutWidth) * OutHeight * 4;
-				if (OutWidth > 0 && OutHeight > 0 && Raw.Num() == Expected)
-				{
-					OutPixels.SetNumUninitialized(OutWidth * OutHeight);
-					FMemory::Memcpy(OutPixels.GetData(), Raw.GetData(), Expected);
-					return true;
-				}
-			}
-		}
-#endif
-
-		FTexturePlatformData* PlatformData = InTexture->GetPlatformData();
-		if (PlatformData == nullptr || PlatformData->Mips.Num() == 0 || PlatformData->PixelFormat != PF_B8G8R8A8)
-		{
-			return false;
-		}
-
-		FTexture2DMipMap& Mip = PlatformData->Mips[0];
-		const int64 Expected = static_cast<int64>(Mip.SizeX) * Mip.SizeY * 4;
-		if (Expected <= 0 || Mip.BulkData.GetBulkDataSize() != Expected)
-		{
-			return false;
-		}
-
-		bool bRead = false;
-		if (const void* Data = Mip.BulkData.LockReadOnly())
-		{
-			OutWidth = Mip.SizeX;
-			OutHeight = Mip.SizeY;
-			OutPixels.SetNumUninitialized(OutWidth * OutHeight);
-			FMemory::Memcpy(OutPixels.GetData(), Data, Expected);
-			bRead = true;
-		}
-		Mip.BulkData.Unlock();
-		return bRead;
-	}
 
 	/**
 	 * One horizontal edge of @p InWidget in @p InRoot's local (reference-pixel) space.
@@ -228,10 +122,6 @@ void UTraceTitleMenuWidget::NativeOnInitialized()
 	OrderedRows.Add(RowDifficulty);
 	OrderedRows.Add(RowSettings);
 	OrderedRows.Add(RowQuit);
-
-	// Once, here rather than in ApplyView: it reads a texture and builds another one, and the answer
-	// cannot change while the game is running. See the header for why it is done in code at all.
-	LiftWordmarkFromSprite();
 
 	// Spec v23 §A1. Here rather than in ApplyView because NativeOnInitialized runs BEFORE the Slate
 	// tree is built (UUserWidget::Initialize duplicates the tree and binds the widgets, then calls
@@ -687,115 +577,6 @@ void UTraceTitleMenuWidget::SyncConsoleWidth()
 		PanelSize.X = PanelWidth;
 		PanelSlot->SetSize(PanelSize);
 	}
-}
-
-void UTraceTitleMenuWidget::LiftWordmarkFromSprite()
-{
-	using namespace TraceTitleMenuWidgetLocal;
-
-	if (bWordmarkLiftAttempted)
-	{
-		return;
-	}
-	bWordmarkLiftAttempted = true;
-
-	UTexture2D* Source = (Wordmark != nullptr)
-		? Cast<UTexture2D>(Wordmark->GetBrush().GetResourceObject()) : nullptr;
-	if (Source == nullptr)
-	{
-		// No sprite at all is somebody else's failure — CountResolvedArt already reports it, and
-		// `Trace.UI.VerifyMenuArt` already fails on it. Nothing to lift, nothing to say twice.
-		return;
-	}
-
-	TArray<FColor> Pixels;
-	int32 Width = 0;
-	int32 Height = 0;
-	if (!ReadTexturePixels(Source, Pixels, Width, Height))
-	{
-		UE_LOG(LogTraceGame, Warning,
-			TEXT("[MenuArt] The TRACE wordmark could not be read back (%s), so it is drawn as the artist's ")
-			TEXT("crop: a navy glyph in an amber glow on black, which reads as two offset words. ")
-			TEXT("Re-cut the sprite in Scripts/slice-ui-assets.py to fix it at the source."),
-			*Source->GetName());
-		return;
-	}
-
-	// THE SELF-DISABLING TEST, and the measurement the fix is justified by. Composited over the black
-	// backdrop a pixel contributes colour * alpha, so this is literally how bright the brightest part
-	// of the mark can get on this screen.
-	float PeakLuminance = 0.f;
-	for (const FColor& Pixel : Pixels)
-	{
-		PeakLuminance = FMath::Max(PeakLuminance, ByteLuminance(Pixel) * (Pixel.A / 255.f));
-	}
-
-	if (PeakLuminance >= WordmarkLiftThreshold)
-	{
-		UE_LOG(LogTraceGame, Display,
-			TEXT("[MenuArt] The TRACE wordmark already peaks at luminance %.2f over black, so it is drawn ")
-			TEXT("exactly as it was cut. Nothing was recoloured."), PeakLuminance);
-		return;
-	}
-
-	// The lift itself. The artist's two tones are unambiguous — the glyph body is navy (B > R) and the
-	// glow is amber (R >= B) — so the split needs no threshold to tune and no letterform is moved,
-	// re-cut or re-shaped. ALPHA IS COPIED UNTOUCHED, which is what keeps the artist's stroke weights,
-	// their antialiasing and the soft fall-off of their glow exactly as drawn.
-	int32 BodyPixels = 0;
-	int32 GlowPixels = 0;
-	for (FColor& Pixel : Pixels)
-	{
-		if (Pixel.A == 0)
-		{
-			continue;
-		}
-		const bool bGlyphBody = Pixel.B > Pixel.R;
-		const FColor Replacement = bGlyphBody ? WordmarkInk : WordmarkGlow();
-		Pixel.R = Replacement.R;
-		Pixel.G = Replacement.G;
-		Pixel.B = Replacement.B;
-		(bGlyphBody ? BodyPixels : GlowPixels) += 1;
-	}
-
-	UTexture2D* Lifted = UTexture2D::CreateTransient(Width, Height, PF_B8G8R8A8, TEXT("T_TraceWordmark_Lifted"));
-	if (Lifted == nullptr)
-	{
-		UE_LOG(LogTraceGame, Warning, TEXT("[MenuArt] Could not create the lifted TRACE wordmark; drawing the crop."));
-		return;
-	}
-
-	Lifted->SRGB = Source->SRGB;
-	Lifted->Filter = Source->Filter;
-	Lifted->AddressX = TA_Clamp;
-	Lifted->AddressY = TA_Clamp;
-	Lifted->NeverStream = true;
-
-	FTexture2DMipMap& Mip = Lifted->GetPlatformData()->Mips[0];
-	if (void* Destination = Mip.BulkData.Lock(LOCK_READ_WRITE))
-	{
-		FMemory::Memcpy(Destination, Pixels.GetData(), static_cast<int64>(Width) * Height * 4);
-	}
-	Mip.BulkData.Unlock();
-	Lifted->UpdateResource();
-
-	LiftedWordmark = Lifted;
-
-	// BOTH places the mark is drawn. The travel overlay uses the same sprite at 420 px and 55%
-	// opacity, and it is on screen for exactly as long as a join takes — i.e. the one screen a
-	// title-screen screenshot can never catch. Leaving it on the old crop would have shipped the
-	// defect somewhere nobody looks.
-	Wordmark->SetBrushResourceObject(LiftedWordmark);
-	if (TravelWordmark != nullptr && TravelWordmark->GetBrush().GetResourceObject() == Source)
-	{
-		TravelWordmark->SetBrushResourceObject(LiftedWordmark);
-	}
-
-	UE_LOG(LogTraceGame, Display,
-		TEXT("[MenuArt] TRACE wordmark lifted: the crop peaked at luminance %.2f over black (navy glyph, ")
-		TEXT("amber glow), which reads as two words. %d glyph pixels are now ink and %d glow pixels are ")
-		TEXT("the artist's amber; the alpha, and so every letterform, is untouched."),
-		PeakLuminance, BodyPixels, GlowPixels);
 }
 
 void UTraceTitleMenuWidget::ComposeTitleBlock()

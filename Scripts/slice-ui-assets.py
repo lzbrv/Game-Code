@@ -86,27 +86,25 @@
 #    a standard deviation of 0.34 counts over 4000 columns), so a clean column of
 #    it is an exact substitution. See build_slider_track.
 #
-# 6. IT LIFTS THE TRACE WORDMARK, WHICH IS DRAWN DARK ON BLACK. Every other mark
-#    on this sheet is a bright core with a halo, so black-keying it (note 1) is
-#    the whole job. The wordmark is the exception: the artist drew the letters as
-#    a flat NAVY stroke, RGB(29,41,81), and put the bright part - an amber rim at
-#    up to luminance 129 - AROUND them. Black-keyed verbatim the rim therefore
-#    comes out brighter than the letters and the mark reads as two offset words,
-#    which is precisely what shipped. build_wordmark() lifts it the way
-#    build_word() lifts PLAY off its plate: the stroke's OWN luminance is the
-#    ceiling for alpha, the stroke is white and the rim keeps the artist's amber.
-#    The letterforms are never re-cut, re-shaped or moved - only re-toned.
+# 6. IT SHIPS THE TRACE WORDMARK AS THE ARTIST DREW IT: NAVY, IN AN AMBER GLOW.
+#    The letters are a flat NAVY stroke, RGB(29,41,81) - the button plates' own
+#    fill - and the bright part is an amber rim AROUND them, peaking at
+#    RGB(128,64,0) on black. An earlier pass decided that read as "two offset
+#    words" and re-toned the stroke to white; the owner asked for the handmade
+#    image back, and on the sheet the mark is navy. So build_wordmark() keeps the
+#    navy stroke to the byte and does one thing to the rim: it keeps the
+#    artist's amber HUE, AmberLifted RGB(255,128,0), and lifts its LEVEL from
+#    the sheet's half strength to WORDMARK_RIM_LEVEL. At the title's size (the
+#    14480-px-wide crop drawn about 660 px wide) the rim is three or four screen
+#    pixels deep, and at the sheet's level it all but disappears.
+#    The letterforms are never re-cut, re-shaped or moved.
 #
-# 7. IT RE-TONES THE SWOOSH ONTO THE PLATE PALETTE (release UI plan WP8.3). The
-#    render on the sheet is a flat mid-grey blade - the second-biggest element on
-#    the title and the one thing on it wearing a colour the artist's palette does
-#    not contain. Same move as the wordmark: the SHAPE (alpha) is the artist's
-#    and stays; the TONE is remapped at the source. Luminance runs a two-stop
-#    ramp from PlateFill sRGB(29,41,81) to lifted plate sRGB(46,66,130)
-#    (PlateFill x 1.6 in bytes, saturating at 0.75 of full luminance), and the
-#    top 8% of the luminance histogram - the render's specular ridge - takes the
-#    palette's AmberLifted sRGB(255,128,0) at 60% strength, so the blade's
-#    highlight becomes a neon glint instead of a grey shine. See build_swoosh.
+# 7. IT SHIPS THE SWOOSH AS THE ARTIST RENDERED IT: WHITE METAL. The render on
+#    the sheet is a white/silver blade (a 255 core shading down through ~149
+#    grey), black-keyed verbatim by note 1. An earlier pass (release UI plan
+#    WP8.3) re-toned it onto the navy plate ramp with an amber glint, which put
+#    a dark blade under a white word - the sheet's two tones swapped. The owner
+#    asked for the handmade image, so the re-tone is gone. See build_swoosh.
 #
 # -----------------------------------------------------------------------------
 # SIZES - and why each one
@@ -173,12 +171,19 @@ BAND_FADE = 40
 # span fades back into the artist's own rail. See build_slider_track.
 TRACK_FADE = 30
 
-# Peak luminance over black at which the TRACE wordmark counts as legible, i.e. as
-# a white word rather than a navy one inside an amber rim. It is not a number this
-# script gets to choose: it is UTraceTitleMenuWidget's own runtime threshold
-# (TraceTitleMenuWidgetLocal::WordmarkLiftThreshold), and a sprite that clears it
-# is a sprite whose runtime repair stands down. Change one and change both.
-WORDMARK_LEGIBLE = 0.62
+# The TRACE wordmark's two tones, in sRGB bytes. NAVY is the stroke, measured
+# off the sheet (every one of its 6.5 million stroke pixels is this value); it is
+# TraceMenuArtStyle::PlateFill. RIM is the glow's hue at full level:
+# TraceMenuArtStyle::AmberLifted(), the sheet's RGB(116,58,0)/(128,64,0) amber
+# normalised to its brightest channel. See note 6.
+WORDMARK_NAVY = (29.0, 41.0, 81.0)
+WORDMARK_RIM = (255.0, 128.0, 0.0)
+
+# How strong the rim is at its brightest, as coverage of WORDMARK_RIM. The sheet's
+# rim tops out at about half level (its 99.9th percentile is ~95 of 255); 0.75
+# lifts it enough to survive the 22x reduction to title size without turning the
+# artist's soft glow into an outline. Measured side by side at 660 px wide.
+WORDMARK_RIM_LEVEL = 0.75
 
 Failures = []
 
@@ -601,163 +606,102 @@ def build_slider_track(sheet):
 
 
 def build_wordmark(sheet):
-    """TRACE, lifted off the black the way build_word lifts PLAY off its plate.
+    """TRACE as the artist drew it: a navy stroke inside an amber glow. See note 6.
 
-    See note 6 in the header. The artist drew this word DARK - a flat navy stroke -
-    with the bright part, an amber rim, around it. Black-keying it verbatim makes
-    the rim the brightest thing in the sprite and the mark reads as two offset
-    words. build_word's lift does not transfer unchanged, because it keys UP from a
-    fill toward white and this word is the other way round; what transfers is the
-    idea, which is that ALPHA carries the letterform and COLOUR carries the state.
+    The two tones are unambiguous and need no threshold to tune: the stroke is
+    navy (blue leads red) and the rim is amber (red leads blue).
 
-    So: alpha ramps from the black ground to the stroke's own luminance, the stroke
-    is white, and the rim keeps the artist's amber at the hue they drew it. No
-    letterform is re-cut, re-shaped or moved.
+      * STROKE - the artist's navy, to the byte, opaque; its anti-aliased edge
+        keeps the artist's own coverage (luminance over the stroke's).
+      * RIM    - the artist's amber HUE at full level (WORDMARK_RIM), with its
+        coverage taken from the rim's luminance over the rim's own peak times
+        WORDMARK_RIM_LEVEL, so the fall-off keeps the artist's shape.
 
-    This is the ROOT of the repair UTraceTitleMenuWidget::LiftWordmarkFromSprite
-    used to do at runtime, on the already-downscaled texture. That code measures
-    the sprite's peak luminance over black and stands down at 0.62; this sprite
-    ships at 1.00, so it stands down, and the lift now happens once at sheet
-    resolution instead of every launch at a sixteenth of it."""
+    UTraceTitleMenuWidget used to re-tone this at runtime (LiftWordmarkFromSprite)
+    and this script used to do it at the source; both turned the stroke white.
+    The runtime repair is deleted with this change, so what is cut here is what
+    is drawn, on both title renderers and the travel card."""
     rgb = np.asarray(sheet.crop(MARKS["wordmark"])).astype(np.float32)
     lum = rgb.max(axis=2)
 
-    # The two tones are unambiguous and need no threshold to tune: the stroke is
-    # navy (blue leads red) and the rim is amber (red leads blue).
     body = rgb[:, :, 2] > rgb[:, :, 0]
+    ground = float(np.median(lum[lum < 16.0])) if (lum < 16.0).any() else 0.0
 
-    ground = float(np.median(lum))                       # the black the mark sits on
     lit = body & (lum > ground + 20.0)
     if not lit.any():
         fail("T_TraceWordmark: no navy lettering found in the crop - the sheet or MARKS['wordmark'] "
-             "changed, and this would ship the mark inverted.")
+             "changed.")
         return None
     stroke = float(np.median(lum[lit]))                   # the flat fill of the letters
 
-    # The artist's amber, sampled off the brightest part of their own rim and
-    # normalised to full brightness - the same move build_word makes when it writes
-    # the letters as pure white. Un-normalised it would ship at the sheet's 84/255
-    # and the glow would stay the dim brown it is on a dark sheet.
-    halo = (~body) & (lum > ground + 8.0)
-    bright = halo & (lum > 0.6 * float(lum[halo].max()))
-    amber = np.median(rgb[bright], axis=0)
-    amber = amber * 255.0 / max(1.0, float(amber.max()))
+    halo = (~body) & (lum > ground + 2.0)
+    if not halo.any():
+        fail("T_TraceWordmark: no amber rim found around the lettering.")
+        return None
+    rim_peak = float(np.percentile(lum[halo], 99.9))
 
-    alpha = np.clip((lum - ground) / max(1.0, stroke - ground), 0.0, 1.0)
+    body_alpha = np.clip((lum - ground) / max(1.0, stroke - ground), 0.0, 1.0)
+    rim_alpha = np.clip((lum - ground) / max(1.0, rim_peak - ground), 0.0, 1.0) * WORDMARK_RIM_LEVEL
 
     out = np.zeros((rgb.shape[0], rgb.shape[1], 4), dtype=np.uint8)
     out[:, :, :3] = np.where(body[:, :, None],
-                             np.array([255.0, 255.0, 255.0], dtype=np.float32),
-                             amber[None, None, :]).astype(np.uint8)
-    out[:, :, 3] = (alpha * 255.0).astype(np.uint8)
+                             np.array(WORDMARK_NAVY, dtype=np.float32)[None, None, :],
+                             np.array(WORDMARK_RIM, dtype=np.float32)[None, None, :]).astype(np.uint8)
+    out[:, :, 3] = (np.where(body, body_alpha, rim_alpha) * 255.0).astype(np.uint8)
 
-    # RED ARM: the defect was measurable - the crop peaked at 0.28 over black and the
-    # widget's own threshold for "legible" is 0.62.
-    #
-    # IT MUST BE THE WIDGET'S OWN FORMULA, not a convenient stand-in. UTraceTitleMenuWidget's
-    # ByteLuminance is REC. 709 WEIGHTED - 0.2126 R + 0.7152 G + 0.0722 B - and an earlier
-    # version of this check used max(R,G,B) instead. On this sprite the two agree, because
-    # the lifted stroke is pure white and every formula returns 1.00 for white; on an
-    # AMBER-dominant mark they do not, and that is the case that matters here, because the
-    # thing this function is guarding against is precisely a mark whose brightest pixels are
-    # the artist's amber rim. A flat RGB(255,127,0) scores 1.00 under max() and 0.57 under
-    # Rec. 709 - so the old check would have passed a sprite the widget would then have gone
-    # on to repair at runtime anyway, i.e. a green arm that could not fail. Rec. 709 it is,
-    # and the agreement is checkable: this measures the shipped crop at 0.28 and
-    # TraceTitleMenuWidgetLocal::WordmarkLiftThreshold's own comment records 0.28.
-    grey = (0.2126 * out[:, :, 0].astype(np.float32)
-            + 0.7152 * out[:, :, 1].astype(np.float32)
-            + 0.0722 * out[:, :, 2].astype(np.float32))
-    peak_over_black = float((grey * (out[:, :, 3].astype(np.float32) / 255.0)).max() / 255.0)
-    if peak_over_black < WORDMARK_LEGIBLE:
-        fail("T_TraceWordmark: the lifted mark still peaks at only {0:.2f} over black; "
-             "UTraceTitleMenuWidget wants {1:.2f} and would repair it at runtime again."
-             .format(peak_over_black, WORDMARK_LEGIBLE))
+    # RED ARM: the defect this replaces was a WHITE stroke. Re-measure the written
+    # pixels: every opaque stroke pixel must be the artist's navy, never brighter,
+    # and the rim must be amber (red leads blue) at the lifted level.
+    solid = out[:, :, 3] >= 250
+    stroke_px = out[solid & body]
+    if stroke_px.size == 0:
+        fail("T_TraceWordmark: no opaque stroke pixels were written.")
+        return None
+    if int(stroke_px[:, :3].max()) > int(max(WORDMARK_NAVY)) or int((stroke_px[:, 2] - stroke_px[:, 0]).min()) <= 0:
+        fail("T_TraceWordmark: a stroke pixel is not the artist's navy - the mark would ship "
+             "re-toned again.")
+        return None
+    rim_px = out[(~body) & (out[:, :, 3] > 0)]
+    if rim_px.size == 0 or int((rim_px[:, 0].astype(np.int32) - rim_px[:, 2].astype(np.int32)).min()) <= 0:
+        fail("T_TraceWordmark: a rim pixel is not amber.")
         return None
 
-    log("    T_TraceWordmark: stroke fill luminance {0:.0f} on a ground of {1:.0f}; {2} px of navy "
-        "stroke are now white, {3} px of rim keep the artist's amber RGB({4}). Peak over black "
-        "{5:.2f}, Rec. 709 (the verbatim crop was 0.28; legible at {6:.2f})".format(
-            stroke, ground, int(lit.sum()), int(halo.sum()),
-            ",".join(str(int(round(c))) for c in amber),
-            peak_over_black, WORDMARK_LEGIBLE))
+    log("    T_TraceWordmark: {0} px of navy stroke kept at RGB({1}); {2} px of rim at the artist's "
+        "amber hue RGB({3}), peak coverage {4:.2f} (the sheet's rim peaked at luminance {5:.0f}).".format(
+            int(lit.sum()), ",".join(str(int(c)) for c in WORDMARK_NAVY), int(halo.sum()),
+            ",".join(str(int(c)) for c in WORDMARK_RIM), WORDMARK_RIM_LEVEL, rim_peak))
     return out
 
 
 def build_swoosh(sheet):
-    """The sweep behind the title, re-toned from render grey onto the plate palette.
+    """The sweep under the title, as the artist rendered it: white metal. See note 7.
 
-    See note 7 in the header. The blade is the second-biggest element on the title
-    screen and the sheet ships it as a flat mid-grey 3D render - the one mark in
-    the set wearing a colour the artist's palette does not contain. The re-tone
-    happens HERE, at the source, exactly the way build_wordmark repairs the mark:
-    alpha (the artist's shape) is untouched, colour is replaced.
+    Black-keyed verbatim (note 1), so over black it is the sheet to the byte: a
+    255 white core shading down through ~149 grey. The runtime tint stays
+    FLinearColor::White and TraceTitleLayout::SwooshOpacity is the kit's ~1.0."""
+    rgb = np.asarray(sheet.crop(MARKS["swoosh"]))
+    out = to_rgba(rgb)
 
-    The mapping, stated rather than tuned:
-      * BODY - luminance runs a two-stop ramp in sRGB bytes, 0 -> PlateFill
-        RGB(29,41,81) and 0.75-of-full -> RGB(46,66,130) (PlateFill x 1.6 in
-        bytes), clamped above the second stop. Those are TraceMenuArtStyle's
-        PlateFill and its stated lift, so the swoosh sits in the same family as
-        the button plates instead of beside it.
-      * GLINT - the top 8% of the luminance histogram over the blade's own inked
-        pixels (its specular ridge) blends 60% toward AmberLifted RGB(255,128,0),
-        the palette's one stated bright accent, so the highlight reads as a neon
-        glint rather than a grey shine.
-
-    The runtime tint stays FLinearColor::White (SwooshOpacity 0.55 is an opacity,
-    not a colour) - the art carries the colour, per the sheet-fidelity rule of
-    TraceMenuArtStyle.h."""
-    rgb = np.asarray(sheet.crop(MARKS["swoosh"])).astype(np.float32)
-    rgba = to_rgba(rgb.astype(np.uint8)).astype(np.float32)
-
-    lum = rgb.max(axis=2) / 255.0
-    inked = rgba[:, :, 3] > 0
-
-    # The two stops, in sRGB bytes. 0.75 is where the body ramp saturates: the
-    # blade's diffuse shading lives below it and only the specular ridge above.
-    lo = np.array([29.0, 41.0, 81.0], dtype=np.float32)
-    hi = np.array([46.0, 66.0, 130.0], dtype=np.float32)
-    amber = np.array([255.0, 128.0, 0.0], dtype=np.float32)
-
-    t = np.clip(lum / 0.75, 0.0, 1.0)[:, :, None]
-    body = lo[None, None, :] * (1.0 - t) + hi[None, None, :] * t
-
-    # The specular ridge, measured off the histogram rather than a fixed level so
-    # a re-export at a different exposure keeps the same 8% of glint.
-    if inked.any():
-        ridge = float(np.percentile(lum[inked], 92.0))
-    else:
-        ridge = 2.0   # nothing inked: no glint, and the fail() below fires
-    glint = inked & (lum >= ridge)
-
-    out = rgba.copy()
-    out[:, :, :3] = body
-    out[glint, 0:3] = body[glint] * 0.4 + amber[None, :] * 0.6
-
-    # RED ARM: the point is that the grey is GONE and the glint is amber, not
-    # white. Re-measure the written pixels rather than trust the maths above.
-    if not inked.any() or not glint.any():
-        fail("T_MenuSwoosh: no inked pixels ({0}) or no specular ridge ({1}) found - the sheet or "
-             "MARKS['swoosh'] changed and the re-tone did nothing.".format(
-                 int(inked.sum()), int(glint.sum())))
+    # RED ARM: the defect this replaces was a NAVY blade with an amber glint.
+    # The written blade must be neutral grey-to-white (no channel leads another)
+    # and its core must reach full white.
+    inked = out[:, :, 3] > 0
+    if not inked.any():
+        fail("T_MenuSwoosh: nothing inked in the crop - the sheet or MARKS['swoosh'] changed.")
         return None
-    body_px = out[inked & ~glint]
-    if body_px.size and float((body_px[:, 2] - body_px[:, 0]).min()) <= 0.0:
-        fail("T_MenuSwoosh: a body pixel came out with red >= blue - the ramp is off the plate "
-             "palette and the blade would ship warm-grey again.")
+    px = out[inked].astype(np.int32)
+    spread = int((px[:, :3].max(axis=1) - px[:, :3].min(axis=1)).max())
+    if spread > 12:
+        fail("T_MenuSwoosh: a blade pixel is tinted (channel spread {0}); the swoosh must be the "
+             "artist's neutral metal.".format(spread))
         return None
-    glint_px = out[glint]
-    if float((glint_px[:, 0] - glint_px[:, 2]).min()) <= 0.0:
-        fail("T_MenuSwoosh: a glint pixel came out with blue >= red - that is not the amber lift.")
+    if int(px[:, :3].max()) < 250:
+        fail("T_MenuSwoosh: the blade's core never reaches white.")
         return None
 
-    log("    T_MenuSwoosh: {0} px re-toned onto the plate ramp RGB(29,41,81)->RGB(46,66,130); "
-        "{1} px of specular ridge (luminance >= {2:.2f}, the top 8%) took AmberLifted at 60%. "
-        "Alpha untouched.".format(int(inked.sum()), int(glint.sum()), ridge))
-    out8 = np.zeros(out.shape, dtype=np.uint8)
-    out8[:, :, :3] = np.clip(out[:, :, :3], 0.0, 255.0).astype(np.uint8)
-    out8[:, :, 3] = rgba[:, :, 3].astype(np.uint8)
-    return out8
+    log("    T_MenuSwoosh: {0} px of the artist's white metal, black-keyed verbatim (core 255, "
+        "max channel spread {1}).".format(int(inked.sum()), spread))
+    return out
 
 
 def build_slider_handle(sheet):
