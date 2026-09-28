@@ -58,6 +58,10 @@
 #     frame by UTraceTitleMenuWidget::ApplyView from state ATraceMenuHUD owns.
 #   * the WIDTH of ConsolePanel. UTraceTitleMenuWidget::SyncConsoleWidth
 #     reproduces the shipped min(viewport * 0.52, 720) clamp every frame.
+#   * the row label's SLOT on a row with a right-hand readout (JOIN, DIFFICULTY).
+#     The asset authors the kit's centred label; UTraceMenuRow::PlaceLabel moves
+#     it to the leading edge on those rows, and lifts every label so its caps,
+#     not its line box, sit on the plate's centre line.
 #
 # RE-RUNNING IS SAFE and rewrites both assets in place. It does NOT delete and
 # recreate them - delete_asset() + create_asset() in one editor session returns
@@ -380,9 +384,78 @@ PANEL_HEIGHT = (PANEL_PAD_T
                 + PANEL_PAD_B
                 + BLURB_BLOCK)
 
-# Font sizes, in the 1080 design space. Unchanged from the v17 pass, which set
-# them against a 1280x720 capture of both renderers side by side.
-FS_ROW_LABEL   = 25
+# =============================================================================
+# THE ROW LABEL'S SIZE IS THE KIT'S - DERIVED, NOT CHOSEN  (UI QA finding F2)
+#
+# Every kit screen sets a button's label with its CAPS at
+# TraceMenuKit::LabelCapFraction of the plate (0.37 - the sheet's 450/1230), and
+# TraceMenuKit::LabelSize() turns that into a text size through the face's own
+# cap height (TraceText::SizeForCapHeight). The pause menu, the settings page and
+# the loadout screen all size their labels that way.
+#
+# The title row did not: it was a literal 25 from the v17 pass, set against the
+# Lato stand-in before the rows typed in Sofachrome. In Sofachrome ExtraLight 25
+# is a cap of 17 px on a 60 px plate (0.28 H), so the same button read about 30%
+# smaller on the title than in the pause menu one Escape away.
+#
+# So the size is now COMPUTED from the three numbers the C++ computes it from,
+# read out of the C++ headers rather than copied (the font block below explains
+# why a copy here is worse than a parse):
+#     LabelCapFraction                  Source/Trace/UI/Widgets/Menu/TraceMenuKit.h
+#     EmSize, the Light face's cap      Source/Trace/UI/Text/TraceFontAtlasMetrics.h
+#     size = (plate_h * LabelCapFraction) * EmSize / CapHeight
+# Light because every title label is Light (TraceAtlasTextSwap::Install's default,
+# the owner's v23 choice). A header that does not parse FAILS the run - a silent
+# default here is exactly the drift this replaces.
+#
+# ONLY THE LABEL. The DIFFICULTY value keeps 25 (FS_ROW_VALUE): it sits in the
+# 34 px value chip, not on the 60 px plate, and at the label's size its caps
+# would fill two thirds of that chip.
+# =============================================================================
+
+KIT_HEADER = os.path.join(PROJECT_DIR, "Source", "Trace", "UI", "Widgets", "Menu", "TraceMenuKit.h")
+ATLAS_METRICS_HEADER = os.path.join(PROJECT_DIR, "Source", "Trace", "UI", "Text", "TraceFontAtlasMetrics.h")
+
+
+def header_number(path, pattern, what):
+    """The first capture of @pattern in @path, as a float. None (and a recorded failure) if absent."""
+    try:
+        with open(path, "r") as handle:
+            text = handle.read()
+    except IOError as error:
+        fail("could not read {0} for {1}: {2}".format(path, what, error))
+        return None
+    match = re.search(pattern, text)
+    if match is None:
+        fail("{0} no longer declares {1} in the form this script parses ({2}). The title row's label "
+             "size is derived from it; fix the pattern here rather than typing a number in.".format(
+                 path, what, pattern))
+        return None
+    return float(match.group(1))
+
+
+def kit_label_size(plate_h):
+    """TraceMenuKit::LabelSize(plate_h, Light): the size whose Light caps are 0.37 of @plate_h."""
+    number = r"([0-9]+\.?[0-9]*)f?"   # 0.37f, 96.f, 65.f
+    cap_fraction = header_number(KIT_HEADER, r"\bLabelCapFraction\s*=\s*" + number + r"\s*;",
+                                 "TraceMenuKit::LabelCapFraction")
+    em_size = header_number(ATLAS_METRICS_HEADER, r"\bEmSize\s*=\s*" + number + r"\s*;",
+                            "TraceFontAtlasMetrics::EmSize")
+    # Faces[] row: { Name, Source, TextureAsset, Erosion, AtlasW, AtlasH, Ascent, Descent, CapHeight, Cells }
+    face_cap = header_number(
+        ATLAS_METRICS_HEADER,
+        r"\{\s*TEXT\(\"Light\"\)\s*,\s*TEXT\(\"[^\"]*\"\)\s*,\s*TEXT\(\"[^\"]*\"\)\s*,"
+        r"\s*[0-9.]+f?\s*,\s*\d+\s*,\s*\d+\s*,\s*[0-9.]+f?\s*,\s*[0-9.]+f?\s*,\s*" + number + r"\s*,",
+        "the Light face's CapHeight (TraceFontAtlasMetrics::Faces[0])")
+    if cap_fraction is None or em_size is None or not face_cap:
+        return None
+    return round(plate_h * cap_fraction * em_size / face_cap, 2)
+
+
+# Font sizes, in the 1080 design space. All but the row label unchanged from the
+# v17 pass, which set them against a 1280x720 capture of both renderers side by side.
+FS_ROW_LABEL   = kit_label_size(ROW_HEIGHT)   # 32.79 today: caps 22.2 px on the 60 px plate
+FS_ROW_VALUE   = 25        # the DIFFICULTY value, in its 34 px chip - see the block above
 FS_ROW_STATUS  = 13
 FS_ROW_ARROW   = 20
 FS_TAGLINE     = 15
@@ -390,7 +463,7 @@ FS_CHIP_CAP    = 12
 FS_CHIP_VALUE  = 18
 FS_BLURB       = 15
 FS_FOOTER      = 13
-FS_BANNER_HEAD = 25        # caps 0.37 of the 44-tall plate, as every kit label (the row label's size)
+FS_BANNER_HEAD = 25        # caps 0.38 of the 44-tall plate, about the kit's 0.37
 FS_BANNER_BODY = 15
 
 # The failure banner's plate: a kit button's height, the one line at the kit's label size on it.
@@ -1058,9 +1131,15 @@ def build_menu_row():
     slot_on_canvas(canvas, word, anchors(0.0, 0.5), (ROW_PAD_X, 0.0, 0.0, 0.0),
                    alignment=(0.0, 0.5), auto_size=True, z_order=4)
 
-    label = make_text(tree, "LabelText", "PLAY", FS_ROW_LABEL, INK, unreal.TextJustify.LEFT)
-    slot_on_canvas(canvas, label, anchors(0.0, 0.5), (ROW_PAD_X, 0.0, 0.0, 0.0),
-                   alignment=(0.0, 0.5), auto_size=True, z_order=4)
+    # CENTRED ON THE PLATE, as the kit sets every label (UI QA F2). It was left-aligned 30 px in, the
+    # one kit button in the game whose word did not sit in the middle of it. The authored slot is the
+    # kit's case; UTraceMenuRow::PlaceLabel moves the word to the leading edge (ROW_PAD_X in, the same
+    # TraceMenuStyle::RowPadX) on a row that carries a right-hand readout - JOIN's address, the
+    # DIFFICULTY value chip - where a centred word would run into it. The Canvas twin,
+    # ATraceMenuHUD::DrawRow, makes the same call from the same row view.
+    label = make_text(tree, "LabelText", "PLAY", FS_ROW_LABEL, INK, unreal.TextJustify.CENTER)
+    slot_on_canvas(canvas, label, anchors(0.5, 0.5), (0.0, 0.0, 0.0, 0.0),
+                   alignment=(0.5, 0.5), auto_size=True, z_order=4)
 
     status = make_text(tree, "StatusText", "HOST  0.0.0.0:7777", FS_ROW_STATUS, INK_DIM,
                        unreal.TextJustify.RIGHT)
@@ -1090,7 +1169,7 @@ def build_menu_row():
 
     hbox_slot(value_box, make_text(tree, "LeftArrowText", "<", FS_ROW_ARROW, INK),
               padding=(0.0, 0.0, 14.0, 0.0))
-    hbox_slot(value_box, make_text(tree, "ValueText", "NORMAL", FS_ROW_LABEL, INK,
+    hbox_slot(value_box, make_text(tree, "ValueText", "NORMAL", FS_ROW_VALUE, INK,
                                    unreal.TextJustify.RIGHT))
     hbox_slot(value_box, make_text(tree, "RightArrowText", ">", FS_ROW_ARROW, INK),
               padding=(14.0, 0.0, 0.0, 0.0))
@@ -1466,6 +1545,15 @@ def main():
     if len(got) != len(placed):
         fail("only {0} of the {1} sprites the title screen places are importable. The screen would "
              "draw white boxes where the missing ones are.".format(len(got), len(placed)))
+
+    if FS_ROW_LABEL is None:
+        fail("the row label's size could not be derived from the C++ headers (see the failure above). "
+             "Refusing to author the rows at a guessed size.")
+        for message in Failures:
+            unreal.log_error("[MenuWidgets] FAILED: {0}".format(message))
+        return 1
+    log("Row label size {0} = TraceMenuKit::LabelSize({1:.0f}) in Light, parsed from the C++ headers."
+        .format(FS_ROW_LABEL, ROW_HEIGHT))
 
     row_asset = build_menu_row()
     title_asset = build_title_menu(row_asset)

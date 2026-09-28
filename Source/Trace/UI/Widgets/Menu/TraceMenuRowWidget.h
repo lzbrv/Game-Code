@@ -296,6 +296,20 @@ private:
 	/** Install the five swaps. Idempotent; a failure leaves the authored text blocks drawing. */
 	void InstallAtlasLabels();
 
+	// ---- UI QA F2 — WHERE THE WORD SITS ------------------------------------------------------------
+
+	/** What PlaceLabel last wrote: -1 nothing yet, 0 the leading edge, 1 centred. */
+	int8 PlacedLabelMode = -1;
+
+	/**
+	 * Puts the label where the kit puts a label: CENTRED on the plate, or on the leading edge
+	 * (TraceMenuStyle::RowPadX in) on a row with a right-hand readout, per
+	 * TraceMenuStyle::RowLabelIsCentred — the rule ATraceMenuHUD::DrawRow follows on the Canvas. Either
+	 * way the word is lifted so its CAPS, not its line box, sit on the plate's centre line, as
+	 * TraceMenuKit::DrawLabel sets it. Writes the slot only when the answer changes.
+	 */
+	void PlaceLabel(bool bCentred);
+
 	// ---- SPEC v26 §7 / v28 §1 ----------------------------------------------------------------------
 	//
 	// NOT a BindWidget, and it cannot be one: BindWidget properties are bound BY NAME to widgets that

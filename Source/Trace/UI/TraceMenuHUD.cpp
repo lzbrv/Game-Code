@@ -3969,9 +3969,26 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 
 	// The word colour, from the same switch as the plate above: the hover olive on the selected row,
 	// the sheet's white on every other.
+	//
+	// UI QA F2: the word is the KIT's label now — caps LabelCapFraction of the plate, centred on it by
+	// the caps — and on a row with a readout on its right it sits on the leading edge instead, PadX in.
+	// Same rule, same size and same shrink-to-fit bound as the UMG row (UTraceMenuRow::PlaceLabel), so
+	// the title does not change its type when a modal hands the screen to this renderer. It was the
+	// engine's medium font at 1.55, left-aligned on every row.
+	const float LabelMaxW = TraceMenuStyle::RowLabelMaxWidth * UIScale;
+	if (TraceMenuStyle::RowLabelIsCentred(!RowView.Status.IsEmpty(), !RowView.Value.IsEmpty()))
+	{
+		TraceMenuKit::DrawLabel(this, RowView.Label, CenterX, Y + RowH * 0.5f, RowH, RowVisuals.Label, LabelMaxW);
+	}
+	else
+	{
+		TraceMenuKit::DrawCapText(this, RowView.Label, X + PadX, Y + RowH * 0.5f,
+			RowH * TraceMenuKit::LabelCapFraction, RowVisuals.Label, ETraceTextWeight::Light,
+			TraceText::EHAlign::Left, LabelMaxW);
+	}
+
+	// The value keeps the size it had (the UMG row's 25 in its 34 px chip); only the word moved to the kit.
 	const float LabelScale = 1.55f * UIScale;
-	const float LabelY = Y + (RowH - MeasureHeight(RowView.Label, FontMedium, LabelScale)) * 0.5f;
-	TraceMenuHUDType::Draw(this, RowView.Label, RowVisuals.Label, X + PadX, LabelY, FontMedium, LabelScale);
 
 	// The row's own FURNITURE (the JOIN readout, the DIFFICULTY value's arrows) in the kit's furniture
 	// colour, as on the UMG row — white on the selected row, 0.85 white otherwise. Never cyan.

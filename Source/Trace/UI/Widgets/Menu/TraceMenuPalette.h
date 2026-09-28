@@ -59,6 +59,34 @@ namespace TraceMenuStyle
 	static constexpr float PanelMaxWidth      = 720.f;
 
 	/**
+	 * WHERE A TITLE ROW'S WORD SITS — one rule for both title renderers (UI QA F2).
+	 *
+	 * The kit centres a label on its plate, caps at TraceMenuKit::LabelCapFraction of the plate
+	 * (TraceMenuKit::LabelSize), and so now do the four title rows that carry nothing else: PLAY,
+	 * PRACTICE, SETTINGS, QUIT. The title used to set every row's word left-aligned 30 px in at caps
+	 * 0.28 of the plate, so the same button read ~30% smaller on the title than in the pause menu.
+	 *
+	 * A row with a READOUT on its right — JOIN's address, DIFFICULTY's value in its chip — keeps its
+	 * word on the leading edge, RowPadX in: at the kit's size a centred DIFFICULTY would end at about
+	 * x 498 of 720 and the value chip starts at about 470. Whether those two stay left is the owner's
+	 * call; this is the one line that decides it.
+	 *
+	 * The UMG row (UTraceMenuRow::PlaceLabel) and the Canvas row (ATraceMenuHUD::DrawRow) both ask
+	 * this from the same FTraceMenuRowView, so the two renderers cannot put one word in two places.
+	 */
+	static constexpr bool RowLabelIsCentred(bool bHasStatus, bool bHasValue)
+	{
+		return !bHasStatus && !bHasValue;
+	}
+
+	/**
+	 * The widest a row's word may draw before it is shrunk to fit, in reference px: from the leading
+	 * pad to where the value chip starts, about 60% across (720 * 0.6 - 30 = 402). Shared because the
+	 * Canvas row sizes its word by the kit now too and needs the same bound as the UMG row.
+	 */
+	static constexpr float RowLabelMaxWidth = PanelMaxWidth * 0.60f - RowPadX;
+
+	/**
 	 * Where the grid floor meets the dark. Shared by the backdrop glow and the grid itself so the
 	 * glow can never end somewhere the horizon line is not.
 	 */

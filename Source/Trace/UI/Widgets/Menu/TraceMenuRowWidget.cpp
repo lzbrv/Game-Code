@@ -13,6 +13,8 @@
 #include "HAL/IConsoleManager.h"
 
 #include "Trace.h"                              // LogTraceGame
+#include "UI/Text/TraceAtlasTextWidget.h"       // UTraceAtlasText::Weight - PlaceLabel's cap lift
+#include "UI/Text/TraceText.h"                  // LineHeight / Ascent / CapHeight - the same
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 #include "UI/Widgets/Menu/TraceMenuKit.h"       // the kit's one state switch, shared with the Canvas screens
 #include "UI/Widgets/Menu/TraceMenuPalette.h"   // TraceMenuStyle::RowHeight / RowPadX / PanelMaxWidth
@@ -557,19 +559,64 @@ void UTraceMenuRow::InstallAtlasLabels()
 	// around 60% across — i.e. a number DERIVED from three constants that live in TraceMenuStyle and
 	// then written down as a literal, which stops being true the moment any of the three moves. It is
 	// now the arithmetic itself: 720 * 0.6 - 30 = 402, two pixels from the literal it replaces and
-	// now attached to the things it was always a function of.
-	constexpr float ValueChipStartFraction = 0.60f;
-	constexpr float LabelMaxWidth =
-		TraceMenuStyle::PanelMaxWidth * ValueChipStartFraction - TraceMenuStyle::RowPadX;
-
+	// now attached to the things it was always a function of. (UI QA F2 moved the arithmetic into
+	// TraceMenuStyle::RowLabelMaxWidth, because the Canvas row now sizes its word by the kit too and
+	// needs the same bound.)
 	AtlasLabels.Reset();
-	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, LabelText, LabelMaxWidth));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, LabelText, TraceMenuStyle::RowLabelMaxWidth));
 	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, StatusText));
 	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, ValueText));
 	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, LeftArrowText));
 	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, RightArrowText));
 
 	AtlasLabels.RemoveAll([](const FTraceAtlasLabel& Label) { return !Label.IsValid(); });
+}
+
+void UTraceMenuRow::PlaceLabel(bool bCentred)
+{
+	// UI QA F2. The asset authors the kit's case — the word centred on the plate — and this is what
+	// moves it to the leading edge on the two rows that carry a readout on the right (JOIN's address,
+	// the DIFFICULTY value chip). The rule itself is TraceMenuStyle::RowLabelIsCentred, which the
+	// Canvas row asks too; this function is only the UMG half of carrying it out.
+	const int8 WantedMode = bCentred ? 1 : 0;
+	if (PlacedLabelMode == WantedMode)
+	{
+		return;
+	}
+
+	// The widget that is actually in the canvas: the atlas label, once InstallAtlasLabels has swapped
+	// it in. Its slot is the authored text block's slot, copied property for property.
+	const FTraceAtlasLabel* const Record = AtlasLabels.FindByPredicate([this](const FTraceAtlasLabel& Each)
+	{
+		return Each.Source == LabelText && Each.Atlas != nullptr;
+	});
+	UWidget* const LiveLabel = TraceAtlasTextSwap::Live(AtlasLabels, LabelText);
+	UCanvasPanelSlot* const LabelSlot = (LiveLabel != nullptr) ? Cast<UCanvasPanelSlot>(LiveLabel->Slot) : nullptr;
+	if (LabelSlot == nullptr)
+	{
+		// Not the tree this expects (an older asset, or the swap failed). Leave the authored slot alone
+		// rather than guess; the row still draws its word, just where the asset put it.
+		return;
+	}
+
+	// CENTRED BY THE CAPS, as TraceMenuKit::DrawLabel sets every kit label. The slot centres the
+	// label's LINE BOX, and Sofachrome's caps sit below that box's middle (ascent 95 of a 116 em-px
+	// line, caps 65), so the word would ride about 1.5 px low on the plate at the kit's size. The
+	// lift is the gap between the two centres, at the size the asset authored.
+	const float LabelBaseSize = (Record != nullptr) ? Record->BaseSize : 0.f;
+	const ETraceTextWeight LabelWeight = (Record != nullptr) ? Record->Atlas->Weight : ETraceTextWeight::Light;
+	const float CapLift = (LabelBaseSize > 0.f)
+		? TraceText::LineHeight(LabelBaseSize) * 0.5f
+			- (TraceText::Ascent(LabelBaseSize, LabelWeight) - TraceText::CapHeight(LabelBaseSize, LabelWeight) * 0.5f)
+		: 0.f;
+
+	const float AnchorX = bCentred ? 0.5f : 0.f;
+	LabelSlot->SetAnchors(FAnchors(AnchorX, 0.5f));
+	LabelSlot->SetAlignment(FVector2D(AnchorX, 0.5f));
+	LabelSlot->SetPosition(FVector2D(bCentred ? 0.f : TraceMenuStyle::RowPadX, CapLift));
+	LabelSlot->SetAutoSize(true);
+
+	PlacedLabelMode = WantedMode;
 }
 
 float UTraceMenuRow::LayoutScale() const
@@ -919,6 +966,9 @@ void UTraceMenuRow::ApplyView(const FTraceMenuRowView& InView, float InNow)
 		LabelText->SetText(FText::FromString(InView.Label));
 		LabelText->SetColorAndOpacity(FSlateColor(WordColor));
 	}
+
+	// UI QA F2: centred on the plate like every kit label, unless this row has a readout on its right.
+	PlaceLabel(TraceMenuStyle::RowLabelIsCentred(!InView.Status.IsEmpty(), !InView.Value.IsEmpty()));
 
 	if (StatusText != nullptr)
 	{
