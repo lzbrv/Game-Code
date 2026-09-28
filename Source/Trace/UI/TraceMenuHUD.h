@@ -509,9 +509,13 @@ protected:
 	/**
 	 * True when the footer and the JOIN panel should print pad captions.
 	 *
-	 * Gated on a pad having been SEEN, never on one being usable: a keyboard-only player is not told
-	 * about buttons they do not have, and the caption appears the moment a controller is touched.
+	 * Gated on a pad having been SEEN, never on one being plugged in: a keyboard-only player is not
+	 * told about buttons they do not have, and the caption appears the moment a controller is touched.
 	 * Input itself is never gated this way — the first press has to work.
+	 *
+	 * AND ON CONTROLLER INPUT BEING ON (TracePadMenu::IsEnabled). Switched off, the pad does nothing
+	 * on this screen (every pad read goes through that gate), so a caption saying what B does would be
+	 * a lie; the options pages drop their pad line for the same reason.
 	 */
 	bool ShouldShowPadHints() const;
 

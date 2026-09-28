@@ -2268,6 +2268,26 @@ void ATraceMenuHUD::TickJoinVerify()
 				!bQuitArmed && QuitView.Label.Equals(TRACE_TEXT("MENU.ROW_QUIT", "QUIT")) && DebugQuitCalls == 1,
 				FString::Printf(TEXT("asking=%d quitRowSays='%s' quitCalls=%d"), bQuitArmed ? 1 : 0, *QuitView.Label, DebugQuitCalls));
 		}
+
+		// The pad legend is only drawn while the pad can act: with CONTROLLER INPUT off B does nothing
+		// here, so a line saying what B does would be false. Flipped in memory, never saved, and put
+		// back before this step returns.
+		if (TracePadMenu::HasSeenPad(this))
+		{
+			UTraceUserSettings& PadSettings = UTraceUserSettings::Get();
+			const bool bPadWasEnabled = PadSettings.bPadEnabled;
+			PadSettings.bPadEnabled = true;
+			const FString LegendPadOn = BuildPadLegend();
+			PadSettings.bPadEnabled = false;
+			const FString LegendPadOff = BuildPadLegend();
+			PadSettings.bPadEnabled = bPadWasEnabled;
+			Check(TEXT("a pad legend with CONTROLLER INPUT on, none with it off"), !LegendPadOn.IsEmpty() && LegendPadOff.IsEmpty(),
+				FString::Printf(TEXT("on='%s' off='%s'"), *LegendPadOn, *LegendPadOff));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify]   skip the pad-legend check: no pad has been seen on this machine."));
+		}
 		bDebugInterceptQuit = false;
 		Selected = ETraceMenuRow::Play;
 		JoinVerifyStep = JoinVerifyNextPart(49);
@@ -2500,7 +2520,7 @@ void ATraceMenuHUD::LogMenuState(const TCHAR* Why) const
 
 bool ATraceMenuHUD::ShouldShowPadHints() const
 {
-	return TracePadMenu::HasSeenPad(this);
+	return TracePadMenu::IsEnabled() && TracePadMenu::HasSeenPad(this);
 }
 
 FString ATraceMenuHUD::BuildPadLegend() const
