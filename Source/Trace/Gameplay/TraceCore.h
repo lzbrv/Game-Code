@@ -528,8 +528,9 @@ public:
 	 *                        ETraceTeam::None at a half start, where both teams may contest it.
 	 * @param FavouredTeam    The backstop when nobody contests the kickoff: see
 	 *                        TraceCoreTuning::ContestedKickoffBackstopSeconds. NOT named FallbackTeam:
-	 *                        ATraceCore already has a member of that name and MSVC C4458 makes the
-	 *                        shadow a hard error on Windows, which macOS cannot even warn about.
+	 *                        ATraceCore already has a member of that name, and a parameter hiding
+	 *                        its own class's field is a hard error on both machines (MSVC C4458,
+	 *                        clang -Wshadow).
 	 */
 	void KickoffContested(const FVector& SurfacePoint, ETraceTeam LockedOutTeam,
 		ETraceTeam FavouredTeam, const TCHAR* Why);

@@ -22,12 +22,16 @@
 #
 # which is an ERROR under Unreal's warnings-as-errors.
 #
-# AND MACOS CANNOT SEE IT. Trace.Build.cs sets ShadowVariableWarningLevel to
-# Error and carries a long comment explaining that the setting is a NO-OP on
-# this toolchain: UBT forces shadow warnings off for any clang in
-# [17, 18.1.3), and Apple clang is 17.0.0. So a clean Mac build proves nothing
-# about this class of mistake, and it has now cost two Windows builds - once as
-# C4458 (a member named Slot), once as C4459 (this).
+# AND A MAC BUILD MOSTLY CANNOT SEE IT. The Mac does compile with -Wshadow as
+# an error (Source/Trace/Trace.Build.cs has the details), and clang does report
+# a local that hides a name a using-directive exposed - but only when the
+# directive and the local sit in the same translation unit ON THE MAC. Which
+# files share a unity blob depends on the file set and on which files git
+# reports as modified (adaptive unity compiles those on their own), so it
+# differs between the two machines: two files can share a blob on Windows and
+# not here. A clean Mac build therefore proves nothing about this mistake, and
+# this class has cost two Windows builds - once as C4458 (a member named Slot),
+# once as C4459 (this).
 #
 # This check is the part of that gap a Mac CAN close: it is mechanical, it needs
 # no compiler, and it runs in the pre-commit hook on both machines.
@@ -217,7 +221,8 @@ def main():
     print("")
     print("Unity builds concatenate .cpp files, so a using-directive at namespace scope")
     print("leaks every name it imports into the files compiled AFTER it. MSVC then raises")
-    print("C4459 'hides global declaration' as an ERROR; clang on macOS says nothing, so a")
+    print("C4459 'hides global declaration' as an ERROR. clang on macOS reports it only when")
+    print("both files share a unity blob ON THE MAC, and the grouping differs from Windows, so a")
     print("clean Mac build is not evidence. This has broken the Windows build twice.")
     print("")
     for line in new_ones:

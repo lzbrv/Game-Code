@@ -998,9 +998,11 @@ namespace TraceMovementV18
 			[State](float Delta) -> bool
 		{
 			// Named apart from RunInputLatency's own Pawn/PC on purpose. The lambda captures neither,
-			// so this is not shadowing today — but MSVC's C4457/C4459 family is exactly the class of
-			// warning macOS cannot raise (UBT hard-disables shadow warnings on the clang this project
-			// builds with), so the safe convention is applied rather than reasoned about.
+			// so this is not shadowing today — but a lambda local named after an UNCAPTURED local of
+			// the enclosing function is a case clang's -Wshadow does not report (that is
+			// -Wshadow-uncaptured-local, outside -Wshadow), so the Mac build cannot vouch for what
+			// MSVC's C4456/C4457 family makes of it. The safe convention is applied rather than
+			// reasoned about.
 			ATraceCharacter* TickPawn = State->Pawn.Get();
 			APlayerController* TickPC = LatencyController();
 			UTraceCharacterMovementComponent* TickMove =

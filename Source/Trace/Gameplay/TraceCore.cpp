@@ -7897,9 +7897,9 @@ void ATraceCorePullRelay::ServerSetPullInput_Implementation(bool bPressed)
 	// on a mechanic that hands out the Core is the single most valuable thing in the game to lie
 	// about — the same policy the throw's aim direction and its hold length already have.
 	// NOT named `Owner`: AActor::Owner is a member of every class here, and MSVC treats the shadow
-	// as an ERROR (C4458) while Apple clang cannot even warn about it — UBT hard-disables shadow
-	// warnings for clang 17-18.1.3 and Apple clang reports 17.0.0. So this compiles on macOS and
-	// stops every Windows developer. Scripts/check-engine-member-shadowing.py now gates on it.
+	// as an ERROR (C4458) while clang cannot warn about it — the Mac build has -Wshadow on, but
+	// clang's -Wshadow never looks at members INHERITED from a base class. So this compiles on
+	// macOS and stops every Windows developer. Scripts/check-engine-member-shadowing.py gates on it.
 	const AController* OwningController = Cast<AController>(GetOwner());
 	ATraceCharacter* Pawn = (OwningController != nullptr)
 		? Cast<ATraceCharacter>(OwningController->GetPawn()) : nullptr;

@@ -8,23 +8,47 @@ public class Trace : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 
-		// Shadowing: WANTED as an error, but READ THE WARNING BELOW - on macOS this line does nothing.
+		// Shadowing: an ERROR on both machines - but the two compilers do NOT catch the same cases,
+		// and the gap between them is where every Windows-only break in this project has come from.
 		//
-		// MSVC enables C4458 (local hides class member) and C4459 (local hides global) as part of
-		// Unreal's warnings-as-errors set; clang does not by default. That asymmetry meant a clean
-		// Mac build shipped code that failed outright on Windows - locals named Character, Mesh,
-		// bHidden, Bounds and LogInput shadowing ACharacter::Mesh, AActor::bHidden,
-		// UPrimitiveComponent::Bounds and the engine's LogInput category.
+		// ON WINDOWS this setting makes MSVC's C4456 (local hides local), C4458 (local or parameter
+		// hides a class member, INCLUDING one inherited from a base class) and C4459 (local hides a
+		// global or namespace-scope name) errors. Past breaks: locals named Owner, Role, Player, Mesh,
+		// bHidden, Bounds and Slot hiding members INHERITED from AActor, APlayerController,
+		// ACharacter, USceneComponent and UTraceCharacterAbilitySet, and a local LogInput hiding the
+		// engine's log category.
 		//
-		// *** THIS SETTING IS A NO-OP ON THIS TOOLCHAIN, AND THE COMMENT HERE USED TO CLAIM
-		// *** OTHERWISE, WHICH IS WORSE THAN HAVING NO SETTING AT ALL BECAUSE IT READS AS COVER.
-		// UBT's ShadowVariableWarningsClangToolChainAttribute forces the OFF arguments for any clang
-		// in [17, 18.1.3) REGARDLESS of this value - see
-		//   Engine/Source/Programs/UnrealBuildTool/Configuration/CompileWarnings/ApplyWarningsAttribute.cs
-		//   "No matter what our ShadowVariableWarningLevel is, in the clang 17-18.1.3 range we always disable."
-		// Apple clang is 17.0.0, squarely inside that range. So macOS CANNOT catch shadowing for us
-		// and the only real gates are (a) a Windows build and (b) code review. Left set so it starts
-		// working the day the toolchain moves past 18.1.3.
+		// ON THIS MAC (checked 2026-09-28: UE 5.8, Xcode 26.1.1) this setting adds -Wshadow, and the
+		// build's -Werror makes that an error too. It is NOT a no-op. An earlier version of this
+		// comment said it was, because UBT switches shadow warnings off for clang 17..18.1.3
+		// (ApplyWarningsAttribute.cs) and `clang --version` prints "Apple clang 17.0.0". But UBT does
+		// not compare that number: it maps the XCODE version to an LLVM version through
+		// Engine/Config/Apple/Apple_SDK.json ("26.0.0-19.1.5"), so this toolchain counts as LLVM
+		// 19.1.5, past the exemption - UBT's own log prints "Using Clang compiler 19.1.5" right
+		// above "Apple clang version 17.0.0". See -Wshadow in any
+		// Intermediate/Build/Mac/arm64/*/*/Trace/Module.Trace.*.cpp.o.rsp.
+		//
+		// So a Mac build DOES stop on: a local hiding another local; a local or method parameter
+		// hiding a field declared in the SAME class; a local hiding a namespace-scope or global
+		// variable that is visible in the same translation unit (an anonymous-namespace one, one a
+		// `using namespace` exposed, or an engine global such as LogInput).
+		//
+		// IT DOES NOT STOP ON THESE, AND WINDOWS DOES - this is where the risk is:
+		//   1. A member INHERITED from a base class (AActor::Owner, AActor::bHidden, ACharacter::Mesh,
+		//      AHUD::Canvas). clang's -Wshadow never looks at base classes. Every C4458 break this
+		//      project has had was this case. (-Wshadow-field catches a PARAMETER hiding an
+		//      inherited member; no clang flag catches a LOCAL doing it.)
+		//      Scripts/check-engine-member-shadowing.py (run by Scripts/build.sh) gates the AActor
+		//      names; anything else is down to review.
+		//   2. A CONSTRUCTOR parameter hiding a field. clang files that under
+		//      -Wshadow-field-in-constructor, which -Wshadow does not include.
+		//   3. A name from ANOTHER .cpp in the same unity blob. Blobs are grouped differently on each
+		//      machine - adaptive unity compiles the files git reports as modified on their own - so a
+		//      C4459 against a neighbouring file's namespace-scope name can exist on Windows only.
+		//      Scripts/unity-hygiene.py (pre-commit) stops the `using namespace` form. Nothing
+		//      gates a local named after another file's GLOBAL or ANONYMOUS-namespace variable,
+		//      which is why file-local helpers go in NAMED namespaces: those names are not visible
+		//      to the next file in the blob, so there is nothing for its locals to hide.
 		//
 		// Module-scoped deliberately: setting this on the Target would modify the shared build
 		// environment, which an installed (launcher) engine refuses with "modifies the values of

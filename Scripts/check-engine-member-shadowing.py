@@ -9,19 +9,23 @@
 #
 # inside an AActor subclass, where AActor::Owner already exists.
 #
-# WHY THIS EXISTS — AND WHY WE CANNOT JUST TURN THE COMPILER WARNING ON
+# WHY THIS EXISTS — THE COMPILER WARNING IS ON, AND IT STILL CANNOT SEE THIS
 #   MSVC treats this as an ERROR in this project's warning configuration:
 #
 #     error C4458: declaration of 'Owner' hides class member
 #     note: see declaration of 'AActor::Owner'
 #
-#   macOS CANNOT catch it, structurally. UnrealBuildTool hard-disables shadow
-#   warnings across the clang 17-18.1.3 range regardless of the project's
-#   ShadowVariableWarningLevel — see ApplyWarningsAttribute.cs, "No matter what
-#   our ShadowVariableWarningLevel is, in the clang 17-18.1.3 range we always
-#   disable" — and Apple clang reports itself as 17.0.0. So the setting in
-#   Trace.Build.cs is a documented no-op here, this compiles clean, and every
-#   Windows developer is stopped.
+#   The Mac build DOES compile with -Wshadow as an error (UBT maps Xcode 26 to
+#   LLVM 19.1.5, past its clang 17-18.1.3 shadow exemption; Trace.Build.cs has
+#   the details). An older version of this comment said the setting was a no-op
+#   here; it is not. But clang's -Wshadow only compares a local with the
+#   fields of the class it is in, NEVER with a base class's. AActor::Owner is
+#   inherited by every actor in this project, so `AController* Owner` compiles
+#   clean on the Mac and stops every Windows developer. Measured with the
+#   project's own compile flags: locals named Owner, bHidden and (in an AHUD)
+#   Canvas give no diagnostic at all, while a local named after a field of the
+#   SAME class is an error. So this list is the only Mac-side gate for the
+#   inherited case, which is the case every past C4458 break was.
 #
 #   This is the FOURTH Windows-only break in this project, and like the other
 #   three it was found by a collaborator rather than by us.
@@ -246,9 +250,9 @@ def main():
     print("check-engine-member-shadowing: FAILED — {0} local(s) shadowing an engine "
           "member.".format(len(findings)))
     print()
-    print("MSVC makes these ERRORS (C4458). Apple clang cannot warn about them at all —")
-    print("UBT hard-disables shadow warnings for clang 17-18.1.3 and Apple clang is 17.0.0 —")
-    print("so this compiles here and stops every Windows developer.")
+    print("MSVC makes these ERRORS (C4458). The Mac build has -Wshadow on, but clang's")
+    print("-Wshadow never compares a local with a BASE class's members, so this compiles")
+    print("here and stops every Windows developer.")
     print()
     for rel, num, ident, text in findings:
         print("  {0}:{1}: local '{2}' shadows the engine member".format(rel, num, ident))

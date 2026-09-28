@@ -2042,7 +2042,7 @@ void FTraceCharacterSelect::PollInput(APlayerController* PC, ATracePlayerState* 
 	// bNavUp / bNavDown rather than bUp / bDown: `bDown` is already the LEFT MOUSE BUTTON further down
 	// this same function, and clang caught the collision as a redefinition. Worth the ugly prefix —
 	// had the mouse's line come FIRST this would have been a shadow in a nested scope instead, which
-	// MSVC reports as C4458/C4459 and this platform structurally cannot see.
+	// MSVC reports as C4456 and this Mac build's -Wshadow reports too - both as errors.
 	const bool bNavUp   = PC->IsInputKeyDown(EKeys::Up)   || PC->IsInputKeyDown(EKeys::W);
 	const bool bNavDown = PC->IsInputKeyDown(EKeys::Down) || PC->IsInputKeyDown(EKeys::S);
 
