@@ -87,6 +87,24 @@ public:
 		const FWidgetStyle& InWidgetStyle, bool bParentEnabled) const override;
 	//~ End SWidget interface
 
+	/**
+	 * THE glyph loop, for any Slate paint that sets a string in the atlas: this leaf's OnPaint and the
+	 * loading card's (UI/TraceLoadingScreen.cpp) both call it, so there is one Slate blitter.
+	 *
+	 * @p InOrigin is the draw origin in @p InGeometry's local space, and @p InStyle's HAlign/VAlign say
+	 * which point of the block it is — exactly what TraceCanvasText::Draw's X/Y mean on a canvas, so a
+	 * Slate card and a Canvas card given the same numbers put every letter in the same place.
+	 * @p InTint is the FINAL colour (the style's colour is not applied again). Atlas quads when the
+	 * atlas is live, the Lato fallback through MakeText otherwise.
+	 *
+	 * Safe on the Slate LOADING thread only after the game thread has resolved the atlas and the menu
+	 * font (TraceText::AtlasTexture, TraceMenuArtStyle::MenuFont): every call below is then a read of
+	 * tables that no longer change. Returns the layer above the one it drew on.
+	 */
+	static int32 PaintString(const FString& InText, const TraceText::FStyle& InStyle,
+		const FVector2f& InOrigin, const FGeometry& InGeometry, FSlateWindowElementList& OutDrawElements,
+		int32 InLayerId, const FLinearColor& InTint);
+
 private:
 	FTraceAtlasTextParams Params;
 };

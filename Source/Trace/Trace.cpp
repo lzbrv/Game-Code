@@ -4,7 +4,8 @@
 
 #include "Modules/ModuleManager.h"
 
-#include "UI/TraceNetworking.h"   // TraceNet::InstallNetVersionOverride
+#include "UI/TraceLoadingScreen.h"   // P12 — the studio card and the travel card
+#include "UI/TraceNetworking.h"      // TraceNet::InstallNetVersionOverride
 
 DEFINE_LOG_CATEGORY(LogTraceGame);
 
@@ -38,6 +39,20 @@ public:
 		// See the long block on TraceNet::NetProtocolVersion for what it is made of and why the
 		// engine's own default is not good enough for a cross-platform playtest.
 		TraceNet::InstallNetVersionOverride();
+
+		// P12 — THE STUDIO CARD, AND A CARD ON EVERY TRAVEL. Here for the same reason as the line
+		// above: this is the first moment any Trace code runs. The movie player has had the game
+		// window open (and empty) since PreInit; from this call it shows the studio's name instead,
+		// painted on its own thread through engine init and the first map load. A no-op wherever the
+		// engine's movie player is off (editor, PIE, commandlets, dedicated server, -nullrhi,
+		// -NoLoadingScreen). See UI/TraceLoadingScreen.h.
+		TraceLoadingScreen::Startup();
+	}
+
+	virtual void ShutdownModule() override
+	{
+		TraceLoadingScreen::Shutdown();
+		FDefaultGameModuleImpl::ShutdownModule();
 	}
 };
 

@@ -801,6 +801,19 @@ UTraceKnifeViewSubsystem* UTraceKnifeViewSubsystem::Get(const UObject* WorldCont
 	return World != nullptr ? World->GetSubsystem<UTraceKnifeViewSubsystem>() : nullptr;
 }
 
+void UTraceKnifeViewSubsystem::AppendWarmAssetPaths(TArray<FSoftObjectPath>& OutPaths)
+{
+	if (TraceKnifeViewFile::ArtDisabledOnCommandLine())
+	{
+		return;
+	}
+	for (const TCHAR* Path : { TraceKnifeViewFile::MeshPath, TraceKnifeViewFile::IdlePath,
+		TraceKnifeViewFile::DrawPath, TraceKnifeViewFile::StabPath, TraceKnifeViewFile::InspectPath })
+	{
+		OutPaths.Emplace(Path);
+	}
+}
+
 void UTraceKnifeViewSubsystem::ResolveAssets()
 {
 	if (bAssetsResolved)

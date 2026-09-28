@@ -16,6 +16,7 @@
 #include "UI/TraceHardwareCursor.h"
 #include "UI/Text/TraceCanvasText.h"
 #include "UI/Text/TraceText.h"
+#include "UI/Widgets/Menu/TraceTitleMenuWidget.h"   // TraceTitleLayout — the travel card's spinner
 
 // Named after the file, not anonymous: UBT builds this module as a unity build, and two anonymous
 // namespaces merged into one translation unit is MSVC C2084 on Windows only.
@@ -995,6 +996,25 @@ void TraceMenuKit::DrawScrim(AHUD* HUD, float ViewW, float ViewH, float Alpha)
 	{
 		TraceMenuKitFile::FadedRect(HUD, FLinearColor(0.f, 0.f, 0.f, FMath::Clamp(Alpha, 0.f, 1.f)), 0.f, 0.f, ViewW, ViewH);
 	}
+}
+
+bool TraceMenuKit::DrawTravelSpinner(AHUD* HUD, float ViewW, float ViewH, float UIScale, double PlatformSeconds)
+{
+	UTexture2D* Crescent = Sprite(ETraceKitSprite::Chevron);
+	if (HUD == nullptr || Crescent == nullptr || Crescent->GetSizeX() <= 0 || Crescent->GetSizeY() <= 0)
+	{
+		return false;
+	}
+
+	// The same box, the same pivot and the same clock as the Slate card (UI/TraceLoadingScreen.cpp):
+	// the sprite's own rect, centred at the pivot, rotated about its middle.
+	const float SpinH = TraceTitleLayout::SpinnerHeight * UIScale;
+	const float SpinW = SpinH * (static_cast<float>(Crescent->GetSizeX()) / static_cast<float>(Crescent->GetSizeY()));
+	const float Inset = TraceTitleLayout::SpinnerInset * UIScale;
+	HUD->DrawTexture(Crescent, ViewW - Inset - SpinW, ViewH - Inset - SpinH, SpinW, SpinH,
+		0.f, 0.f, 1.f, 1.f, Faded(FLinearColor::White), BLEND_Translucent, 1.f, false,
+		TraceTitleLayout::SpinnerAngleDegrees(PlatformSeconds), FVector2D(0.5f, 0.5f));
+	return true;
 }
 
 // =================================================================================================

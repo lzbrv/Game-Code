@@ -93,9 +93,16 @@ public class Trace : ModuleRules
 			// which are Engine. UMG is absent for the same reason (contract 7: Canvas only).
 		});
 
-		// Nothing private yet. UMG is intentionally absent: the HUD is pure Canvas (contract 7).
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
+			// P12 — the studio card and the travel card (UI/TraceLoadingScreen.cpp) go through the
+			// engine's loading-screen player: GetMoviePlayer, IsMoviePlayerEnabled and
+			// FLoadingScreenAttributes are MOVIEPLAYER_API, so without this the module COMPILES (the
+			// header resolves) and then fails to LINK. An engine Runtime module that the Launch module
+			// already links into every game on Mac and Win64 — it adds no plugin, no binary and no
+			// .uproject entry. NOT "PreLoadScreen": that route needs a second module loaded before the
+			// window exists, and the studio card gets nearly the same coverage from StartupModule.
+			"MoviePlayer"
 		});
 	}
 }

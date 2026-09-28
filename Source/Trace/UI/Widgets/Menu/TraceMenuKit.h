@@ -529,6 +529,15 @@ namespace TraceMenuKit
 	/** A modal scrim over the whole view: black at @p Alpha. */
 	TRACE_API void DrawScrim(AHUD* HUD, float ViewW, float ViewH, float Alpha = ScrimAlpha);
 
+	/**
+	 * The travel card's "still working" sign (P12): the kit's crescent (ETraceKitSprite::Chevron,
+	 * T_MenuBack) in the bottom-right corner, turning once per TraceTitleLayout::SpinnerPeriodSeconds on
+	 * the PLATFORM clock (@p PlatformSeconds = FPlatformTime::Seconds()), so it is at the same angle as
+	 * the Slate loading card that takes over from this one. Honours the current opacity. Draws nothing
+	 * until the sprite is drawable; returns whether it drew.
+	 */
+	TRACE_API bool DrawTravelSpinner(AHUD* HUD, float ViewW, float ViewH, float UIScale, double PlatformSeconds);
+
 	// =============================================================================================
 	// THE POINTER — owned by UI/TraceHardwareCursor.h; these are the kit's names for it
 	// =============================================================================================

@@ -93,15 +93,30 @@ int32 STraceAtlasText::OnPaint(const FPaintArgs& Args, const FGeometry& Allotted
 
 	const FLinearColor Tint = Params.Style.Color * InWidgetStyle.GetColorAndOpacityTint();
 
+	return PaintString(Params.Text, Params.Style, FVector2f(OriginX, OriginY), AllottedGeometry,
+		OutDrawElements, LayerId, Tint);
+}
+
+int32 STraceAtlasText::PaintString(const FString& InText, const TraceText::FStyle& InStyle,
+	const FVector2f& InOrigin, const FGeometry& InGeometry, FSlateWindowElementList& OutDrawElements,
+	int32 InLayerId, const FLinearColor& InTint)
+{
+	if (InText.IsEmpty() || InStyle.Size <= 0.f)
+	{
+		return InLayerId;
+	}
+
 	// ---------------------------------------------------------------------------------------------
 	// THE ATLAS PATH — one MakeBox per glyph, which is what bypasses FSlateFontInfo entirely.
 	// ---------------------------------------------------------------------------------------------
+	// A local array, never a shared one: this runs on the game thread for a widget and on the Slate
+	// loading thread for the loading card, and TraceCanvasText's reusable array is game-thread only.
 	TArray<TraceText::FGlyphQuad> Quads;
 	// The sheet for THIS STYLE'S WEIGHT — see the same line in TraceCanvasText.cpp. The layout pass
 	// below uses the same Style, so the cells it returns and this texture are always the same cut.
-	UTexture2D* Atlas = TraceText::AtlasTexture(Params.Style.Weight);
+	UTexture2D* Atlas = TraceText::AtlasTexture(InStyle.Weight);
 
-	if (Atlas != nullptr && TraceText::LayoutString(Params.Text, Params.Style, Quads))
+	if (Atlas != nullptr && TraceText::LayoutString(InText, InStyle, Quads))
 	{
 		// ONE brush, re-pointed per glyph. FSlateBoxPayload::SetBrush copies the margin, the UV
 		// region and the resource proxy out of the brush at submission time and explicitly does NOT
@@ -123,7 +138,7 @@ int32 STraceAtlasText::OnPaint(const FPaintArgs& Args, const FGeometry& Allotted
 
 		for (const TraceText::FGlyphQuad& Quad : Quads)
 		{
-			UTexture2D* Sheet = TraceText::QuadTexture(Quad, Params.Style.Weight);
+			UTexture2D* Sheet = TraceText::QuadTexture(Quad, InStyle.Weight);
 			if (Sheet == nullptr)
 			{
 				continue;
@@ -141,35 +156,36 @@ int32 STraceAtlasText::OnPaint(const FPaintArgs& Args, const FGeometry& Allotted
 
 			FSlateDrawElement::MakeBox(
 				OutDrawElements,
-				LayerId,
-				AllottedGeometry.ToPaintGeometry(
+				InLayerId,
+				InGeometry.ToPaintGeometry(
 					FVector2f(Quad.Size.X, Quad.Size.Y),
-					FSlateLayoutTransform(FVector2f(OriginX + Quad.Pos.X, OriginY + Quad.Pos.Y))),
+					FSlateLayoutTransform(FVector2f(InOrigin.X + Quad.Pos.X, InOrigin.Y + Quad.Pos.Y))),
 				&Brush,
 				ESlateDrawEffect::None,
-				Tint);
+				InTint);
 		}
 
-		return LayerId + 1;
+		return InLayerId + 1;
 	}
 
 	// ---------------------------------------------------------------------------------------------
 	// THE FALLBACK — Lato, through the ordinary Slate text path. Same string, same size, same place.
 	// ---------------------------------------------------------------------------------------------
-	const FVector2f Offset = TraceText::AlignOffset(Block, Params.Style, Params.Style.Size);
+	const FVector2f Block = TraceText::Measure(InText, InStyle);
+	const FVector2f Offset = TraceText::AlignOffset(Block, InStyle, InStyle.Size);
 
 	FSlateDrawElement::MakeText(
 		OutDrawElements,
-		LayerId,
-		AllottedGeometry.ToPaintGeometry(
+		InLayerId,
+		InGeometry.ToPaintGeometry(
 			FVector2f(Block.X, Block.Y),
-			FSlateLayoutTransform(FVector2f(OriginX + Offset.X, OriginY + Offset.Y))),
-		Params.Text,
-		TraceMenuArtStyle::MenuFont(Params.Style.Size),
+			FSlateLayoutTransform(FVector2f(InOrigin.X + Offset.X, InOrigin.Y + Offset.Y))),
+		InText,
+		TraceMenuArtStyle::MenuFont(InStyle.Size),
 		ESlateDrawEffect::None,
-		Tint);
+		InTint);
 
-	return LayerId + 1;
+	return InLayerId + 1;
 }
 
 // =================================================================================================

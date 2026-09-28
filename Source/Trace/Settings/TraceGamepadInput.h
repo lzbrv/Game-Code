@@ -69,6 +69,7 @@
 #include "Containers/Ticker.h"
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "UObject/ObjectPtr.h"
+#include "UObject/SoftObjectPath.h"
 
 #include "TraceGamepadInput.generated.h"
 
@@ -143,6 +144,14 @@ public:
 
 	/** The one accessor. Null on a dedicated server, or before the game instance is up. */
 	static UTraceGamepadInputSubsystem* Get(const UObject* WorldContext);
+
+	/**
+	 * Appends the object path of every IA_ asset the pad context can resolve by name — the same list
+	 * the resolver walks. P12: the loading screen loads and holds these behind the studio card, so the
+	 * title's first frame (when this subsystem builds the pad context) finds them in memory instead of
+	 * flushing async loading for them.
+	 */
+	static void AppendWarmAssetPaths(TArray<FSoftObjectPath>& OutPaths);
 
 private:
 	/**

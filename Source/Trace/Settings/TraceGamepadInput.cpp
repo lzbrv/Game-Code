@@ -38,6 +38,26 @@ namespace TraceGamepadInputImpl
 	const TCHAR* const AssetDirectory = TEXT("/Game/Trace/Input");
 
 	/**
+	 * Every action the pad context may need BY NAME (source 2 of the resolver below), in one list so
+	 * the resolver and UTraceGamepadInputSubsystem::AppendWarmAssetPaths (P12's boot warm-up) cannot
+	 * disagree about it.
+	 */
+	const TCHAR* const PadActionAssets[] =
+	{
+		TEXT("IA_Move"), TEXT("IA_Look"), TEXT("IA_Jump"), TEXT("IA_Crouch"), TEXT("IA_Fire"),
+		TEXT("IA_Pass"), TEXT("IA_Dash"), TEXT("IA_Parry"), TEXT("IA_Scoreboard"),
+		TEXT("IA_EquipKnife"), TEXT("IA_EquipGun"), TEXT("IA_EquipSmg"), TEXT("IA_Ability"),
+		TEXT("IA_AbilitySecondary"), TEXT("IA_Reload"), TEXT("IA_PullCore"), TEXT("IA_Melee"),
+		TEXT("IA_Inspect"),
+	};
+
+	/** "/Game/Trace/Input/IA_Move.IA_Move" for "IA_Move". */
+	static FString PadActionObjectPath(const TCHAR* Name)
+	{
+		return FString::Printf(TEXT("%s/%s.%s"), AssetDirectory, Name, Name);
+	}
+
+	/**
 	 * The two sticks, and the ONLY two mappings in this file that are not a per-action button.
 	 *
 	 * Named constants rather than literals at the two use sites because Trace.Pad.Verify asserts
@@ -246,6 +266,14 @@ UTraceGamepadInputSubsystem* UTraceGamepadInputSubsystem::Get(const UObject* Wor
 	return (GameInstance != nullptr) ? GameInstance->GetSubsystem<UTraceGamepadInputSubsystem>() : nullptr;
 }
 
+void UTraceGamepadInputSubsystem::AppendWarmAssetPaths(TArray<FSoftObjectPath>& OutPaths)
+{
+	for (const TCHAR* Name : TraceGamepadInputImpl::PadActionAssets)
+	{
+		OutPaths.Emplace(TraceGamepadInputImpl::PadActionObjectPath(Name));
+	}
+}
+
 void UTraceGamepadInputSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 {
 	Super::Initialize(Collection);
@@ -340,17 +368,8 @@ bool UTraceGamepadInputSubsystem::ResolveInputActions()
 	// One action reaches this every time on a default install: THROW / PASS CORE ships unbound on the
 	// keyboard (spec v25 §7), so IA_Pass has no mapping and cannot appear above. It still needs
 	// resolving, because a player is free to put it on a pad button.
-	const TCHAR* const Wanted[] =
-	{
-		TEXT("IA_Move"), TEXT("IA_Look"), TEXT("IA_Jump"), TEXT("IA_Crouch"), TEXT("IA_Fire"),
-		TEXT("IA_Pass"), TEXT("IA_Dash"), TEXT("IA_Parry"), TEXT("IA_Scoreboard"),
-		TEXT("IA_EquipKnife"), TEXT("IA_EquipGun"), TEXT("IA_EquipSmg"), TEXT("IA_Ability"),
-		TEXT("IA_AbilitySecondary"), TEXT("IA_Reload"), TEXT("IA_PullCore"), TEXT("IA_Melee"),
-		TEXT("IA_Inspect"),
-	};
-
 	int32 FromAssets = 0;
-	for (const TCHAR* Name : Wanted)
+	for (const TCHAR* Name : TraceGamepadInputImpl::PadActionAssets)
 	{
 		if (Actions.Contains(FName(Name)))
 		{
@@ -359,8 +378,7 @@ bool UTraceGamepadInputSubsystem::ResolveInputActions()
 
 		// LOAD_NoWarn | LOAD_Quiet for the reason ATracePlayerController gives: "the assets have not
 		// been generated yet" is the ordinary state of a fresh clone, not an error.
-		const FString Path = FString::Printf(TEXT("%s/%s.%s"),
-			TraceGamepadInputImpl::AssetDirectory, Name, Name);
+		const FString Path = TraceGamepadInputImpl::PadActionObjectPath(Name);
 
 		if (UInputAction* Loaded = LoadObject<UInputAction>(nullptr, *Path, nullptr, LOAD_NoWarn | LOAD_Quiet))
 		{

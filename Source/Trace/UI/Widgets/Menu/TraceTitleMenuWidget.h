@@ -114,6 +114,88 @@ namespace TraceTitleLayout
 
 	/** Reference px between the blurb's last line and the plate's glow. */
 	static constexpr float FailureGapBelowBlurb = 22.f;
+
+	// ---- The travel card (P12): the title's lockup on black, one caption, the kit's crescent turning ----
+	//
+	// TWO RENDERERS DRAW IT AND ONE HANDS OVER TO THE OTHER, so both read these numbers: the Canvas card
+	// the title screen draws while a travel is starting or a JOIN is dialling (ATraceMenuHUD::
+	// DrawTravelOverlay), and the Slate card the movie player paints on its own thread while the map
+	// loads (UI/TraceLoadingScreen.cpp). Same numbers, same letters, same angle on the crescent — the
+	// swap from one to the other is not supposed to be visible.
+
+	/** The caption's cap height, reference px: white Sofachrome Light. */
+	static constexpr float TravelCaptionCap = 22.f;
+
+	/** Where the caption's cap centre sits, as a fraction of the view height. */
+	static constexpr float TravelCaptionY = 0.47f;
+
+	/** Reference px the caption keeps clear of each side edge (it shrinks to fit inside them). */
+	static constexpr float TravelCaptionSideClear = 80.f;
+
+	/**
+	 * The crescent (T_MenuBack, the kit's bottom-right mark on the artist's sheet) as the "still working"
+	 * sign: its height and its inset from the right and bottom edges, reference px, and one turn's period.
+	 * 56 px keeps the 96x125 sprite at or under its own resolution up to 2160p (UIScale 2 -> 112 px).
+	 */
+	static constexpr float SpinnerHeight = 56.f;
+	static constexpr float SpinnerInset = 44.f;
+	static constexpr double SpinnerPeriodSeconds = 1.2;
+
+	/**
+	 * The crescent's angle, in degrees, at @p InRealSeconds on the PLATFORM clock (FPlatformTime::Seconds).
+	 * Both renderers read the same clock, which is what keeps the turn continuous across the hand-over.
+	 */
+	inline float SpinnerAngleDegrees(double InRealSeconds)
+	{
+		const double Turns = InRealSeconds / SpinnerPeriodSeconds;
+		return static_cast<float>((Turns - FMath::FloorToDouble(Turns)) * 360.0);
+	}
+
+	/** Where the wordmark and the swoosh land. Rects are in the caller's units (Canvas px or Slate local). */
+	struct FTitleBlockRects
+	{
+		FVector2f MarkPos = FVector2f::ZeroVector;
+		FVector2f MarkSize = FVector2f::ZeroVector;
+		FVector2f SwooshPos = FVector2f::ZeroVector;
+		FVector2f SwooshSize = FVector2f::ZeroVector;
+		bool bSwoosh = false;
+	};
+
+	/**
+	 * THE title lockup, for any renderer that places it by hand: @p InViewW is the view's width and
+	 * @p InRefPx one 1080-reference pixel, both in the caller's units; the aspects are height / width of
+	 * the two sprites (@p InSwooshAspect <= 0 means no swoosh). ATraceMenuHUD::DrawTitleBlock and the
+	 * loading card both call it. (The UMG title lays the same numbers out in its widget tree.)
+	 */
+	inline FTitleBlockRects ComputeTitleBlock(float InViewW, float InRefPx, float InMarkAspect, float InSwooshAspect)
+	{
+		FTitleBlockRects Out;
+		const float CentreX = InViewW * 0.5f;
+		const float MarkW = FMath::Min(MarkWidth * InRefPx, InViewW * MarkMaxWidthFraction);
+		const float MarkH = MarkW * InMarkAspect;
+		const float MarkTop = MarkTopY * InRefPx;
+		Out.MarkPos = FVector2f(CentreX - MarkW * 0.5f, MarkTop);
+		Out.MarkSize = FVector2f(MarkW, MarkH);
+
+		if (InSwooshAspect > 0.f)
+		{
+			float SwooshW = MarkW * SwooshWidthOfMark;
+			const float SwooshTop = MarkTop + MarkH + MarkW * SwooshGapOfMark;
+
+			// Whatever the sheet says, the flourish stops short of the tagline.
+			const float TaglineTop = TaglineY * InRefPx;
+			const float MaxSwooshH = FMath::Max(1.f, TaglineTop - SwooshClearOfTagline * InRefPx - SwooshTop);
+			if (SwooshW * InSwooshAspect > MaxSwooshH)
+			{
+				SwooshW = MaxSwooshH / FMath::Max(InSwooshAspect, KINDA_SMALL_NUMBER);
+			}
+
+			Out.SwooshPos = FVector2f(CentreX - MarkW * SwooshLeftOfMark - SwooshW * 0.5f, SwooshTop);
+			Out.SwooshSize = FVector2f(SwooshW, SwooshW * InSwooshAspect);
+			Out.bSwoosh = true;
+		}
+		return Out;
+	}
 }
 
 #if !UE_BUILD_SHIPPING

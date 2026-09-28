@@ -41,6 +41,7 @@
 #include "UI/Widgets/Menu/TraceMenuKit.h"        // ...through the shared, guarded kit renderer
 #include "UI/Widgets/Menu/TraceMenuPalette.h"
 #include "UI/Widgets/Menu/TraceTitleMenuWidget.h"
+#include "UI/TraceLoadingScreen.h"
 
 // The palette and the layout constants used to live here. They moved to
 // UI/Widgets/Menu/TraceMenuPalette.h in spec v17 §4, because there are now two renderers for this
@@ -389,8 +390,10 @@ namespace TraceMenuHUDPointer
 
 namespace TraceMenuHUDTravel
 {
-	static constexpr float CaptionCap   = 22.f;    // white, Sofachrome
-	static constexpr float CaptionY     = 0.47f;   // of the view height, the caption's cap centre
+	// The caption's size and place are TraceTitleLayout's since P12: the loading card that takes over
+	// from this card while the map loads (UI/TraceLoadingScreen.cpp) reads the same two numbers.
+	static constexpr float CaptionCap   = TraceTitleLayout::TravelCaptionCap;   // white, Sofachrome
+	static constexpr float CaptionY     = TraceTitleLayout::TravelCaptionY;     // of the view height, the caption's cap centre
 	static constexpr float ElapsedGap   = 40.f;    // caption to the elapsed line's cap centre
 	static constexpr float ElapsedCap   = 13.f;
 	static constexpr float LegendGap    = 34.f;    // elapsed line to the legend's chips
@@ -754,6 +757,14 @@ void ATraceMenuHUD::BeginPlay()
 	// loaded mid-draw stalls that frame and draws its flat fallback until its render resource lands.
 	// See TraceMenuKit::Prime.
 	TraceMenuKit::Prime();
+
+	// P12: the title widget's class, here and not on the first drawn frame. BeginPlay runs inside
+	// LoadMap, under the loading card (the studio card at boot, the travel card coming back from a
+	// match), so the load is hidden; TryAdoptMenuWidget's LoadClass then finds it already in memory.
+	if (TraceMenuHUDFile::WantsUMG())
+	{
+		PreloadedTitleWidgetClass = LoadClass<UTraceTitleMenuWidget>(nullptr, TraceMenuHUDFile::TitleWidgetPath);
+	}
 
 	UE_LOG(LogTraceGame, Log, TEXT("Title screen up. Difficulty %s."),
 		*TraceDifficulty::ToDisplayName(Difficulty));
@@ -2369,8 +2380,51 @@ void ATraceMenuHUD::AdjustSelection(int32 Delta)
 	// the only row that answers a left/right key.
 }
 
+float ATraceMenuHUD::UpdateIntroFade()
+{
+	using TraceLoadingScreen::ECard;
+
+	// Decided on the first call, which can come while the studio card is STILL UP: LoadMap redraws the
+	// viewport once (unpresented) after the map loads, and the boot's LoadMap runs under the card.
+	if (!bIntroFadeDecided)
+	{
+		bIntroFadeDecided = true;
+		const bool bStudioNow = TraceLoadingScreen::CurrentCardKind() == ECard::Studio;
+		const bool bStudioJustLifted = TraceLoadingScreen::LastCardKind() == ECard::Studio
+			&& TraceLoadingScreen::LastCardEndSeconds() > 0.0
+			&& FPlatformTime::Seconds() - TraceLoadingScreen::LastCardEndSeconds() < 1.0;
+		bIntroFadeArmed = bStudioNow || bStudioJustLifted;
+		IntroFade.Snap(!bIntroFadeArmed);
+		if (bIntroFadeArmed)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[LoadingCard] The title fades in from the studio card's black over %.2fs."),
+				TraceLoadingScreen::TitleFadeInSeconds);
+		}
+	}
+
+	// Held at black for as long as a card is up (nothing is presented then anyway), so the fade's
+	// clock starts on the first frame the player can actually see.
+	if (TraceLoadingScreen::IsCardUp())
+	{
+		IntroFade.Snap(!bIntroFadeArmed);
+		return IntroFade.Alpha();
+	}
+	return IntroFade.Update(true, TraceLoadingScreen::TitleFadeInSeconds);
+}
+
 bool ATraceMenuHUD::AcceptsActivation() const
 {
+	// P12: a loading card changes what this grace can see. BeginPlay runs UNDER the card (inside
+	// LoadMap), world time is frozen while the card is up, and the first frame after it advances world
+	// time by the 0.4 s frame clamp, so the world-time deadline below expired on the title's first
+	// frame — before the viewport had focus, and before the key or click that skipped the card had
+	// been let go. So the same grace is also counted on the PLATFORM clock from the moment the card
+	// lifted, and nothing is accepted while one is up.
+	if (TraceLoadingScreen::IsWithinCardGrace(TraceMenuStyle::ActivationGraceSeconds))
+	{
+		return false;
+	}
+
 	const UWorld* World = GetWorld();
 	return (World == nullptr) || (World->GetTimeSeconds() >= AcceptUnlockTime);
 }
@@ -2798,6 +2852,8 @@ void ATraceMenuHUD::StartMatch()
 		TraceMaps::Arena, *Options,
 		*TraceNet::GetHostEndpoint(), bPortFree ? TEXT("free") : TEXT("IN USE"));
 
+	// P12: the loading card that takes over from DrawTravelOverlay says the same line.
+	TraceLoadingScreen::SetNextTravelCaption(TravelCaption);
 	UGameplayStatics::OpenLevel(this, FName(TraceMaps::Arena), /*bAbsolute=*/true, Options);
 }
 
@@ -2871,6 +2927,9 @@ void ATraceMenuHUD::ConfirmJoin()
 
 	UE_LOG(LogTraceGame, Display, TEXT("Title screen: JOIN -> ClientTravel('%s', TRAVEL_Absolute)."), *Address);
 
+	// P12: the map load only starts once the connection is up; its loading card says the same line.
+	TraceLoadingScreen::SetNextTravelCaption(TravelCaption);
+
 	// TRAVEL_Absolute: a join is not relative to the map we are standing on. With TRAVEL_Relative the
 	// engine would resolve the address against the menu map's package path and produce nonsense.
 	PC->ClientTravel(Address, TRAVEL_Absolute);
@@ -2933,6 +2992,7 @@ void ATraceMenuHUD::StartPracticeRange()
 
 	UE_LOG(LogTraceGame, Display, TEXT("Title screen: PRACTICE -> %s?%s"), TraceMaps::Arena, *Options);
 
+	TraceLoadingScreen::SetNextTravelCaption(TravelCaption);   // P12: the loading card's line
 	UGameplayStatics::OpenLevel(this, FName(TraceMaps::Arena), /*bAbsolute=*/true, Options);
 }
 
@@ -2990,6 +3050,7 @@ void ATraceMenuHUD::CancelJoin()
 	bTravelling = false;
 	TravelKind = ETraceMenuTravel::None;
 	TravelCaption.Reset();
+	TraceLoadingScreen::SetNextTravelCaption(FString());   // P12: a called-off join names no later load
 	TravelCancelRect = FBox2D(ForceInit);
 	bTravelCancelArmed = false;
 
@@ -3046,6 +3107,18 @@ void ATraceMenuHUD::DrawHUD()
 
 	UIScale = FMath::Clamp(ViewH / TraceMenuStyle::ReferenceHeight, 0.5f, 2.0f);
 	Now = World->GetTimeSeconds();
+
+	// P12 — out of the studio card's black. The kit's opaque black first, at full strength, so both
+	// renderers fade FROM black whatever the empty map behind them renders; then everything this
+	// frame draws on the Canvas is scoped to the fade, and the UMG title takes it as its render
+	// opacity below. 1 (no scope effect) once the fade is done, and on every title that did not
+	// follow the studio card.
+	const float IntroAlpha = UpdateIntroFade();
+	if (IntroAlpha < 1.f)
+	{
+		TraceMenuKit::DrawBackground(this, ViewW, ViewH);
+	}
+	TraceMenuKit::FScopedOpacity IntroScope(IntroAlpha);
 
 	// Sampled once per drawn frame so a mouse-down can ask "was the window already ours before this
 	// click?". See MousePressed.
@@ -3218,6 +3291,11 @@ void ATraceMenuHUD::DrawHUD()
 	if (bUseWidgetThisFrame)
 	{
 		MenuWidget->SetVisibility(ESlateVisibility::HitTestInvisible);
+		if (MenuWidgetOpacity != IntroAlpha)
+		{
+			MenuWidgetOpacity = IntroAlpha;
+			MenuWidget->SetRenderOpacity(IntroAlpha);
+		}
 
 		FTraceTitleMenuView View;
 		BuildMenuView(View);
@@ -3311,50 +3389,33 @@ float ATraceMenuHUD::DrawTitleBlock()
 	// artist's navy wordmark in its amber glow, their white metal swoosh under it at the measured
 	// offsets. White tint — the sprites carry their own colour, cut by Scripts/slice-ui-assets.py
 	// notes 6 and 7 exactly as the artist drew them.
-	const float CX = ViewW * 0.5f;
-	const float MarkW = FMath::Min(TraceTitleLayout::MarkWidth * UIScale, ViewW * TraceTitleLayout::MarkMaxWidthFraction);
-	const float MarkH = MarkW * (static_cast<float>(Mark->GetSizeY()) / static_cast<float>(Mark->GetSizeX()));
-	const float MarkTop = TraceTitleLayout::MarkTopY * UIScale;
-	const float TaglineTop = TraceTitleLayout::TaglineY * UIScale;
+	//
+	// P12: placed by TraceTitleLayout::ComputeTitleBlock, which the loading card calls too — the card
+	// that takes over from DrawTravelOverlay while a map loads must put the mark exactly here.
+	UTexture2D* SwooshTex = TraceMenuKit::Sprite(ETraceKitSprite::Swoosh);
+	const bool bSwoosh = SwooshTex != nullptr && SwooshTex->GetSizeX() > 0 && SwooshTex->GetSizeY() > 0;
+	const TraceTitleLayout::FTitleBlockRects Block = TraceTitleLayout::ComputeTitleBlock(ViewW, UIScale,
+		static_cast<float>(Mark->GetSizeY()) / static_cast<float>(Mark->GetSizeX()),
+		bSwoosh ? static_cast<float>(SwooshTex->GetSizeY()) / static_cast<float>(SwooshTex->GetSizeX()) : 0.f);
 
-	DrawTexture(Mark, CX - MarkW * 0.5f, MarkTop, MarkW, MarkH,
+	DrawTexture(Mark, Block.MarkPos.X, Block.MarkPos.Y, Block.MarkSize.X, Block.MarkSize.Y,
 		0.f, 0.f, 1.f, 1.f, FLinearColor::White, BLEND_Translucent);
 #if !UE_BUILD_SHIPPING
-	DebugCanvasMarkRect = FBox2D(FVector2D(CX - MarkW * 0.5f, MarkTop), FVector2D(CX + MarkW * 0.5f, MarkTop + MarkH));
+	DebugCanvasMarkRect = FBox2D(FVector2D(Block.MarkPos), FVector2D(Block.MarkPos + Block.MarkSize));
 #endif
 
-	float Bottom = MarkTop + MarkH;
+	float Bottom = Block.MarkPos.Y + Block.MarkSize.Y;
 
-	UTexture2D* SwooshTex = TraceMenuKit::Sprite(ETraceKitSprite::Swoosh);
-	if (SwooshTex != nullptr && SwooshTex->GetSizeX() > 0 && SwooshTex->GetSizeY() > 0)
+	if (Block.bSwoosh)
 	{
-		const float SwooshAspect =
-			static_cast<float>(SwooshTex->GetSizeY()) / static_cast<float>(SwooshTex->GetSizeX());
-		float SwooshW = MarkW * TraceTitleLayout::SwooshWidthOfMark;
-		const float SwooshTop = MarkTop + MarkH + MarkW * TraceTitleLayout::SwooshGapOfMark;
-
-		// The same clamp the widget applies: whatever the sheet says, the flourish stops short of the
-		// tagline.
-		const float MaxSwooshH = FMath::Max(1.f, TaglineTop - TraceTitleLayout::SwooshClearOfTagline * UIScale - SwooshTop);
-		if (SwooshW * SwooshAspect > MaxSwooshH)
-		{
-			SwooshW = MaxSwooshH / FMath::Max(SwooshAspect, KINDA_SMALL_NUMBER);
-		}
-
-		DrawTexture(SwooshTex,
-			CX - MarkW * TraceTitleLayout::SwooshLeftOfMark - SwooshW * 0.5f, SwooshTop,
-			SwooshW, SwooshW * SwooshAspect,
+		DrawTexture(SwooshTex, Block.SwooshPos.X, Block.SwooshPos.Y, Block.SwooshSize.X, Block.SwooshSize.Y,
 			0.f, 0.f, 1.f, 1.f,
 			FLinearColor(1.f, 1.f, 1.f, TraceTitleLayout::SwooshOpacity), BLEND_Translucent);
 #if !UE_BUILD_SHIPPING
-		{
-			const float SwooshLeft = CX - MarkW * TraceTitleLayout::SwooshLeftOfMark - SwooshW * 0.5f;
-			DebugCanvasSwooshRect = FBox2D(FVector2D(SwooshLeft, SwooshTop),
-				FVector2D(SwooshLeft + SwooshW, SwooshTop + SwooshW * SwooshAspect));
-		}
+		DebugCanvasSwooshRect = FBox2D(FVector2D(Block.SwooshPos), FVector2D(Block.SwooshPos + Block.SwooshSize));
 #endif
 
-		Bottom = SwooshTop + SwooshW * SwooshAspect;
+		Bottom = Block.SwooshPos.Y + Block.SwooshSize.Y;
 	}
 
 	return Bottom;
@@ -4169,7 +4230,12 @@ void ATraceMenuHUD::DrawTravelOverlay()
 	const FString Caption = TravelCaption.IsEmpty() ? FString(TRACE_TEXT("MENU.TRAVEL_ENTERING_ARENA", "ENTERING THE ARENA")) : TravelCaption;
 	const float CaptionMid = ViewH * MT::CaptionY;
 	TraceMenuKit::DrawCapText(this, Caption, CX, CaptionMid, MT::CaptionCap * S, TraceMenuArtStyle::WordDefault,
-		ETraceTextWeight::Light, TraceText::EHAlign::Center, ViewW - 160.f * S);
+		ETraceTextWeight::Light, TraceText::EHAlign::Center, ViewW - 2.f * TraceTitleLayout::TravelCaptionSideClear * S);
+
+	// P12: the crescent in the corner, turning on the platform clock. The loading card that replaces
+	// this one when LoadMap starts draws it in the same place at the same angle, so the hand-over does
+	// not stop it; and a JOIN that sits here dialling shows it is alive between ticks of the counter.
+	TraceMenuKit::DrawTravelSpinner(this, ViewW, ViewH, UIScale, FPlatformTime::Seconds());
 
 	// ---- ONLY A JOIN WAITS, AND ONLY A JOIN CAN BE CALLED OFF --------------------------------------
 	//

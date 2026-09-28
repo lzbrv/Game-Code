@@ -47,6 +47,7 @@
 #include "UI/TraceMatchOptions.h"   // ETraceBotDifficulty, TraceScoring
 #include "UI/TraceNetworking.h"      // FTraceTextEntry, TraceNet
 #include "UI/TraceOptionsMenu.h"     // FTraceOptionsMenu
+#include "UI/Widgets/Menu/TraceKitMotion.h"   // FTraceKitFade — the title's fade-in after the studio card (P12)
 
 #include "TraceMenuHUD.generated.h"
 
@@ -276,6 +277,13 @@ public:
 	 * PLAY to JOIN, exactly once", which is the whole claim of this tranche. Reads only.
 	 */
 	void LogMenuState(const TCHAR* Why) const;
+
+	/** Trace.UI.LoadingCard.Verify: the activation gate, exactly as ActivateSelection asks it. */
+	bool DebugAcceptsActivation() const { return AcceptsActivation(); }
+
+	/** Trace.UI.LoadingCard.Verify: the title's fade-in from black after the studio card (P12). */
+	float DebugIntroAlpha() const { return IntroFade.Alpha(); }
+	bool DebugIntroFadeArmed() const { return bIntroFadeArmed; }
 #endif
 
 protected:
@@ -642,6 +650,26 @@ private:
 	float TitleShownTime = 0.f;
 
 	/**
+	 * P12 — THE TITLE FADES IN FROM BLACK AFTER THE STUDIO CARD, instead of cutting in.
+	 *
+	 * The studio card ends on black (its name fades out); this carries on from there, over
+	 * TraceLoadingScreen::TitleFadeInSeconds of real time, on both renderers: the Canvas title through
+	 * a TraceMenuKit::FScopedOpacity, the UMG title through its render opacity, both over the kit's
+	 * opaque black. Decided once, on the first drawn frame: armed only when the card that just lifted
+	 * was the STUDIO card. After a TRAVEL card (returning from a match) the title comes in with no
+	 * fade, because that card already showed the wordmark exactly where the title draws it.
+	 */
+	FTraceKitFade IntroFade;
+	bool bIntroFadeDecided = false;
+	bool bIntroFadeArmed = false;
+
+	/** The render opacity last handed to the UMG title, so it is only set when it changes. */
+	float MenuWidgetOpacity = -1.f;
+
+	/** This frame's intro alpha (1 once the fade is done or when none was armed). */
+	float UpdateIntroFade();
+
+	/**
 	 * Whether the cursor has moved since the title screen appeared. A click is ignored until it has.
 	 *
 	 * Defence in depth behind the capture-mode fix in ATraceMenuPlayerController::BeginPlay.
@@ -709,6 +737,14 @@ private:
 	 */
 	UPROPERTY(Transient)
 	TObjectPtr<UTraceTitleMenuWidget> MenuWidget;
+
+	/**
+	 * P12: WBP_TitleMenu's class, loaded in BeginPlay — which runs inside LoadMap, under the loading
+	 * card — so the LoadClass in TryAdoptMenuWidget on the first drawn frame finds it in memory. Held
+	 * only by this HUD: on the arena nothing keeps the title's widget (or the font it uses) alive.
+	 */
+	UPROPERTY(Transient)
+	TObjectPtr<UClass> PreloadedTitleWidgetClass;
 
 	/**
 	 * Loads the widget class, creates the widget and adds it to the viewport, ONCE.

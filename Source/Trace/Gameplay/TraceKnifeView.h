@@ -103,6 +103,7 @@
 #include "Subsystems/WorldSubsystem.h"
 #include "UObject/ObjectMacros.h"
 #include "UObject/ObjectPtr.h"
+#include "UObject/SoftObjectPath.h"
 #include "UObject/WeakObjectPtr.h"
 
 // [SPEC v32 §4] ETraceFxBlend is stored per rig, by value, so it has to be a complete type here. It
@@ -240,6 +241,13 @@ public:
 
 	/** The driver for @p WorldContext's world, or null. Null is legal everywhere. */
 	static UTraceKnifeViewSubsystem* Get(const UObject* WorldContext);
+
+	/**
+	 * Appends the pack blade's mesh and four clips — what ResolveAssets loads on the first tick of EVERY
+	 * world, the title included. P12: the loading screen loads and holds them behind the studio card, so
+	 * that tick (and the arena's) finds them in memory. Nothing when -TraceNoCharacterArt refuses the art.
+	 */
+	static void AppendWarmAssetPaths(TArray<FSoftObjectPath>& OutPaths);
 
 	/** See TraceKnifeView::RequestInspect. */
 	bool RequestInspect(ATraceCharacter* Pawn);
