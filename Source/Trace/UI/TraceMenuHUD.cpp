@@ -3521,6 +3521,8 @@ void ATraceMenuHUD::DrawFailureBanner()
 	DebugCanvasBannerRect = Plate;
 	DebugCanvasBannerText = Headline;
 	DebugCanvasBannerColor = Words;
+#else
+	(void)bKitPlate;   // read only by the dev record above; Shipping has none
 #endif
 }
 
