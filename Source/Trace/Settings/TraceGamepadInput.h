@@ -67,6 +67,7 @@
 
 #include "CoreMinimal.h"
 #include "Containers/Ticker.h"
+#include "InputCoreTypes.h"             // FKey (ConfirmKey / BackKey / AltKey / RisingEdge)
 #include "Subsystems/GameInstanceSubsystem.h"
 #include "UObject/ObjectPtr.h"
 #include "UObject/SoftObjectPath.h"

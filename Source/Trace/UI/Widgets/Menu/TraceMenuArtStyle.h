@@ -82,6 +82,7 @@
 
 #include "CoreMinimal.h"
 #include "Fonts/SlateFontInfo.h"
+#include "Layout/Margin.h"              // FMargin (BrushMargin, the plate brush's 9-slice)
 #include "Math/Vector2D.h"
 #include "UObject/WeakObjectPtrTemplates.h"
 
