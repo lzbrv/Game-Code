@@ -3190,6 +3190,13 @@ void ATraceGameMode::UpdatePreMatchHold()
 		return;
 	}
 
+	// A MOVE THE PLAYER CAN SEE (the countdown jumping) is logged; the sub-second settling is not.
+	if (bHold && FMath::Abs(Desired - CurrentDeadline) >= 1.0)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[Warmup] %d player(s) still choosing; the match now starts in %.0fs at the latest."),
+			Choosing, Desired - NowServer);
+	}
+
 	// The replicated deadline is what every HUD counts down and what the bot-fill hold reads
 	// (UTraceAbilityComponent::IsBotFillHeldForWarmup); the timer is merely what fires on it here.
 	TraceGameState->MatchEndServerTime = static_cast<float>(Desired);

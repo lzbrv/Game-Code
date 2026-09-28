@@ -277,7 +277,7 @@ Excellent for A/B-testing a feel change across two server instances.
 | `PlayersPerTeam` | int32 | `5` | Team cap used when auto-balancing joiners. Set to 2 if you're testing 2v2. |
 | `MinPlayersToStart` | int32 | `2` | Below this, the match stays in `WaitingForPlayers`. **Set to 1 if you want to run around solo** while iterating. |
 | `RespawnDelay` | float | `3` | Seconds dead before respawn. The dead player's model is removed **immediately** on death — this delay is the wait, not a corpse timer. **The biggest pacing lever in the game.** Short = constant pressure and no space for a carrier run; long = deaths matter and a broken defence stays broken long enough to score through. |
-| `WarmupDuration` | float | `5` | Countdown before the match goes `InProgress`. Set to 0 to skip while testing. |
+| `WarmupDuration` | float | `5` | Countdown before the match goes `InProgress`. It runs once every player is out of team select and the loadout page: while anybody is still choosing, the match clock waits (bounded by those screens' own timeouts, and at most 90 s). Set to 0 to skip while testing. |
 
 **Half length is not on this page.** The match is two halves; the enforced length of each is
 `ATraceGameMode::HalfDuration` (default **600 s**), which is `config = Game` on the *game mode* and
