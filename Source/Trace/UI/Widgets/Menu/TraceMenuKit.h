@@ -211,6 +211,18 @@ namespace TraceMenuKit
 	 */
 	TRACE_API UTexture2D* PeekSprite(ETraceKitSprite Which);
 
+	/**
+	 * Loads (and roots) every kit sprite NOW, so their render resources exist long before any screen
+	 * asks for them. Call it from a HUD's BeginPlay.
+	 *
+	 * Without it a screen's first frame loads the sprites synchronously inside a draw pass: the load
+	 * stalls that frame, and because a freshly loaded texture has no RHI texture yet, every plate on
+	 * it draws its flat fallback for a frame before the art appears (measured on the settings overlay:
+	 * all 8 sprites not drawable on its first frame, and a 93 ms frame). Idempotent and cheap after
+	 * the first call. Returns how many sprites are loaded.
+	 */
+	TRACE_API int32 Prime();
+
 	// =============================================================================================
 	// STATES (stylespec §5) — the switch lifted out of the UMG title row, shared by both renderers
 	// =============================================================================================
@@ -283,16 +295,20 @@ namespace TraceMenuKit
 	// TEXT ON THE KIT
 	// =============================================================================================
 
-	/** The text size whose caps are LabelCapFraction of @p PlateH (Sofachrome Light). */
-	TRACE_API float LabelSize(float PlateH);
+	/**
+	 * The text size whose caps are LabelCapFraction of @p PlateH in @p Weight. Caps differ by face
+	 * (Erbaum's are taller than Sofachrome's at one size), so the weight is part of the answer.
+	 */
+	TRACE_API float LabelSize(float PlateH, ETraceTextWeight Weight = ETraceTextWeight::Light);
 
 	/**
 	 * @p Text centred on (CenterX, CenterY) by its CAPS, sized for a @p PlateH plate, shrunk to fit
-	 * @p MaxWidth if it would not (MaxWidth <= 0: no limit). Light weight (owner's choice, v23).
+	 * @p MaxWidth if it would not (MaxWidth <= 0: no limit). Light weight by default (owner's choice,
+	 * v23); the settings submenus pass ETraceTextWeight::Hud for their body (Erbaum Bold, spec v26 §2).
 	 * Draws nothing for an empty string. Returns the width drawn.
 	 */
 	TRACE_API float DrawLabel(AHUD* HUD, const FString& Text, float CenterX, float CenterY, float PlateH,
-		const FLinearColor& Color, float MaxWidth = 0.f);
+		const FLinearColor& Color, float MaxWidth = 0.f, ETraceTextWeight Weight = ETraceTextWeight::Light);
 
 	// =============================================================================================
 	// CONTROLS

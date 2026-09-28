@@ -66,6 +66,7 @@
 #include "UI/TraceAutoShot.h"
 #include "UI/TraceMatchOptions.h"         // TraceMatchFlow::PostMatchDuration, TraceMaps
 #include "UI/TraceNetworking.h"           // TraceNet — host address, connection state, failures
+#include "UI/Widgets/Menu/TraceMenuKit.h" // TraceMenuKit::Prime, from BeginPlay
 // v17 §4 (step 4b) — the bottom-right corner's second presenter. UMG is linked by Trace.Build.cs,
 // which retired "contract 7: Canvas only" in this same pass; nothing else on this HUD uses it.
 #include "Blueprint/UserWidget.h"         // CreateWidget
@@ -820,6 +821,11 @@ void ATraceHUD::BeginPlay()
 	// callbacks were wired lazily at the moment it opened there would be a window in which the screen
 	// was up and gameplay input was still live — the player would be walking around behind it.
 	WireCharacterSelect();
+
+	// The handmade kit's sprites, loaded NOW rather than by the first menu that draws them: a sprite
+	// loaded inside a draw pass stalls that frame and has no render resource for a frame or two, so
+	// the pause menu's first frame used to show flat fallback plates. See TraceMenuKit::Prime.
+	TraceMenuKit::Prime();
 
 	// ---- FX/AUDIO plan §5.7 — THE MATCH AMBIENCE ------------------------------------------------
 	//

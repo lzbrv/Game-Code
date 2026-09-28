@@ -147,6 +147,21 @@ UTexture2D* TraceMenuKit::Sprite(ETraceKitSprite Which)
 	return Loaded;
 }
 
+int32 TraceMenuKit::Prime()
+{
+	int32 Loaded = 0;
+	for (int32 Slot = 0; Slot < TraceMenuKitFile::SpriteCount; ++Slot)
+	{
+		const ETraceKitSprite Which = static_cast<ETraceKitSprite>(Slot);
+		// Sprite() loads and roots on first use; whether it is DRAWABLE yet does not matter here —
+		// the point is that the render thread gets its frames to create the resource before a screen
+		// needs it.
+		Sprite(Which);
+		Loaded += (PeekSprite(Which) != nullptr) ? 1 : 0;
+	}
+	return Loaded;
+}
+
 // =================================================================================================
 // STATES
 // =================================================================================================
@@ -348,20 +363,20 @@ void TraceMenuKit::DrawStatePlate(AHUD* HUD, ETraceKitState State, float X, floa
 // TEXT
 // =================================================================================================
 
-float TraceMenuKit::LabelSize(float PlateH)
+float TraceMenuKit::LabelSize(float PlateH, ETraceTextWeight Weight)
 {
-	return TraceText::SizeForCapHeight(FMath::Max(0.f, PlateH) * LabelCapFraction, ETraceTextWeight::Light);
+	return TraceText::SizeForCapHeight(FMath::Max(0.f, PlateH) * LabelCapFraction, Weight);
 }
 
 float TraceMenuKit::DrawLabel(AHUD* HUD, const FString& Text, float CenterX, float CenterY, float PlateH,
-	const FLinearColor& Color, float MaxWidth)
+	const FLinearColor& Color, float MaxWidth, ETraceTextWeight Weight)
 {
 	if (HUD == nullptr || Text.IsEmpty() || PlateH <= 0.f)
 	{
 		return 0.f;
 	}
 
-	TraceText::FStyle Style(LabelSize(PlateH), Color, ETraceTextWeight::Light);
+	TraceText::FStyle Style(LabelSize(PlateH, Weight), Color, Weight);
 	if (MaxWidth > 0.f)
 	{
 		const float Natural = TraceText::MeasureWidth(Text, Style);
@@ -1140,6 +1155,21 @@ namespace TraceMenuKitFile
 					&& TraceMenuKit::KeyLegendFit(32.f, At32 * 2.f, { At32 }) == 32.f,
 				TEXT(""));
 		}
+
+		// ---- 7. A LABEL IN ANOTHER FACE (added for the settings submenus, Erbaum Bold body) ----------
+		{
+			const float LightCaps = TraceText::CapHeight(TraceMenuKit::LabelSize(60.f), ETraceTextWeight::Light);
+			const float HudCaps = TraceText::CapHeight(TraceMenuKit::LabelSize(60.f, ETraceTextWeight::Hud),
+				ETraceTextWeight::Hud);
+			Check(TEXT("a label's caps are 0.37 of its plate in either face"),
+				FMath::IsNearlyEqual(LightCaps, 60.f * TraceMenuKit::LabelCapFraction, 0.05f)
+					&& FMath::IsNearlyEqual(HudCaps, 60.f * TraceMenuKit::LabelCapFraction, 0.05f),
+				FString::Printf(TEXT("light %.2f px, hud %.2f px on a 60 px plate"), LightCaps, HudCaps));
+		}
+
+		// ---- 8. PRIME LOADS EVERY SPRITE ---------------------------------------------------------
+		Check(TEXT("Prime() loads every kit sprite"), TraceMenuKit::Prime() == SpriteCount,
+			FString::Printf(TEXT("%d/%d"), TraceMenuKit::Prime(), SpriteCount));
 
 		if (Failures == 0)
 		{

@@ -647,6 +647,11 @@ void ATraceMenuHUD::BeginPlay()
 	// exactly when the prompt falls back to showing an example instead.
 	LastJoinAddress = TraceNet::LoadLastJoinAddress();
 
+	// The handmade kit's sprites, loaded now rather than inside the first frame of SETTINGS: a sprite
+	// loaded mid-draw stalls that frame and draws its flat fallback until its render resource lands.
+	// See TraceMenuKit::Prime.
+	TraceMenuKit::Prime();
+
 	UE_LOG(LogTraceGame, Log, TEXT("Title screen up. Difficulty %s."),
 		*TraceDifficulty::ToDisplayName(Difficulty));
 
