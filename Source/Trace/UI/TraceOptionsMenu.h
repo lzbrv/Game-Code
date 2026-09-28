@@ -42,8 +42,9 @@ class AHUD;
 class APawn;
 class APlayerController;
 class UCameraComponent;
-class UFont;
 class UTraceGameUserSettings;
+
+enum class ETraceKitState : uint8;   // UI/Widgets/Menu/TraceMenuKit.h — the kit's four plate states
 
 // =================================================================================================
 // SPEC v25 §1 — THE FOREGROUND-CANVAS ELEVATION IS GONE. *** THIS IS THE SETTINGS CRASH. ***
@@ -195,7 +196,18 @@ public:
 		 * buttons alongside the arrow keys — and why UTraceGamepadInputSubsystem turns MENU/START into
 		 * the Escape that opens the pause root in the first place.
 		 */
-		Controller
+		Controller,
+
+		/**
+		 * THE KEYBOARD BINDS — every action's two key chips, reached from SETTINGS like CONTROLLER.
+		 *
+		 * They used to be the bottom twenty-one rows of the SETTINGS page itself, which took that page to
+		 * forty-three rows with no scrolling: the pitch clamped to ~19 px at 1080p and the labels shrank
+		 * to 6-7 px caps (about 4 px at 720p). Moving them to their own page is the same argument VIDEO,
+		 * CROSSHAIR, AUDIO and CONTROLLER each made, with the biggest number of the five; SETTINGS is now
+		 * a short page at a readable pitch, and this page is the twin of the controller page.
+		 */
+		Keyboard
 	};
 
 	// ---- Host callbacks -------------------------------------------------------------------------
@@ -251,6 +263,9 @@ public:
 	 * page nobody can photograph is a page nobody can be shown to have checked.
 	 */
 	void OpenController();
+
+	/** Opens straight on the KEYBOARD binds page, with BACK closing the overlay. Twin of OpenController. */
+	void OpenKeyboard();
 
 #if !UE_BUILD_SHIPPING
 	/** Trace.Menu.Loadout <n>: the LOADOUTS page with slot n's editor open, for a headless capture. */
@@ -309,6 +324,14 @@ public:
 	 * can reach it, exactly as DebugNudge is public for Trace.Menu.Nudge.
 	 */
 	void DebugBeginRebindProof();
+
+	/**
+	 * `Trace.Menu.Verify` — the frame-driven checks for this overlay's own behaviour (the pointer not
+	 * stealing the selection on open, BACK keeping the player's place, the two-step RESET and slot
+	 * CLEAR, the choice arrows as click targets, and the menu clock running while the world is
+	 * paused). Public only so the console command can reach it. See TickVerify.
+	 */
+	void DebugBeginVerify();
 #endif
 
 private:
@@ -368,6 +391,40 @@ private:
 
 	/** `-TraceRebindProof=<draws>` arms once per process, never once per page opening. */
 	bool bRebindProofArmedFromCommandLine = false;
+
+	// ---- Trace.Menu.Verify ----------------------------------------------------------------------
+	//
+	// Driven one DRAWN FRAME at a time from Tick, like the rebind proof, because two of its checks run
+	// in a paused world (every world timer is frozen there) and every check needs the page to have
+	// been drawn at least once so its rects exist.
+
+	/** Which step of TickVerify runs next; 0 is idle. */
+	int32 VerifyStep = 0;
+	/** Drawn frames to wait before the next step. */
+	int32 VerifyWait = 0;
+	int32 VerifyFailures = 0;
+	int32 VerifyChecks = 0;
+	/** Scratch the steps hand each other. */
+	int32 VerifyIndex = INDEX_NONE;
+	int32 VerifyIndexB = INDEX_NONE;
+	double VerifyRealStart = 0.0;
+	float VerifyMenuStart = 0.f;
+	double VerifyWorldStart = 0.0;
+	FTraceLoadout VerifySavedLoadout;
+	FString VerifySavedLoadoutName;
+	int32 VerifySavedColour = 0;
+	float VerifySavedVolume = 1.f;
+
+	/**
+	 * While set, PollMouse reads THIS position and button instead of the OS pointer's. The harness's
+	 * pointer, so a headless run neither depends on nor moves the real mouse. Never set in play.
+	 */
+	bool bDebugPointer = false;
+	FVector2D DebugPointerPos = FVector2D::ZeroVector;
+	bool bDebugPointerDown = false;
+
+	void TickVerify(APlayerController* PC);
+	void VerifyCheck(const TCHAR* Label, bool bPass, const FString& Detail);
 #endif
 
 private:
@@ -380,12 +437,10 @@ private:
 		/** Section caption. Never selectable; navigation skips it. */
 		Header,
 		/**
-		 * A line of explanatory prose under the row above it. Never selectable.
+		 * A line of prose under the row above it, in the quiet grey, with no plate. Never selectable.
 		 *
-		 * Exists for exactly one row — RESOLUTION SCALE — and that is the point. Spec v11 §0 says the
-		 * frame is GPU-bound per pixel, so that one slider is worth more than every other control on
-		 * the page put together, and a player who does not know that will slide it back to 100 and
-		 * work through the quality groups instead. A control that needs a sentence gets a sentence.
+		 * Rare on purpose (the co-developer's text pass removed most of them): today the CALL SIGN
+		 * row's length cap and what switching ABILITIES off does. An emptied line adds no row.
 		 */
 		Note,
 		/** Continuous value with a draggable track. */
@@ -431,15 +486,27 @@ private:
 		OpenLoadouts,
 		/** Edit saved loadout slot N. The slot index rides in the row's Index field. */
 		EditLoadoutSlot,
-		/** Forget saved loadout slot N, so a player can undo a mistake without rebuilding it. */
+		/**
+		 * Forget saved loadout slot N. NO ROW CARRIES IT: it is BKSP / DEL / pad Y on a slot row, and it
+		 * is what the two-step confirm arms (ArmedAction) between the first press and the second.
+		 */
 		ClearLoadoutSlot,
 		/** UI PLAN WP3 — the AUDIO row on the settings page. */
 		OpenAudio,
 		/** D31-PAD — the CONTROLLER row on the settings page. */
 		OpenController,
+		/** The KEYBOARD row on the settings page. */
+		OpenKeyboard,
 		ReturnToTitle,
 		Quit,
+		/**
+		 * The SETTINGS page's own reset: the three mouse rows. Since the key binds moved to their own
+		 * page it no longer touches them (that is ResetKeyboardDefaults), for the rule the four resets
+		 * below state: a reset row belongs to the page it is drawn on.
+		 */
 		ResetDefaults,
+		/** The KEYBOARD page's reset: every action's keyboard keys, and nothing else. */
+		ResetKeyboardDefaults,
 		/** Runs the engine's hardware benchmark and applies what it decides. Spec v11 §2.8. */
 		AutoDetectQuality,
 		/**
@@ -649,6 +716,17 @@ private:
 		FBox2D Track = FBox2D(ForceInit);
 
 		/**
+		 * The '<' and '>' of a Choice or Toggle row, as of the last draw. A click on one steps the value
+		 * down or up by one; a click anywhere else on the row still steps forward (and wraps), so the
+		 * mouse can reach every value in both directions. Invalid when that end of the range is reached.
+		 */
+		FBox2D ArrowLeft = FBox2D(ForceInit);
+		FBox2D ArrowRight = FBox2D(ForceInit);
+
+		/** A Header that captions the KEYBIND / KEY columns of the rows under it instead of a word. */
+		bool bColumnCaptions = false;
+
+		/**
 		 * SPEC v28 §3c — screen rect of each key chip on a Binding row, as of the last draw.
 		 *
 		 * "Both editable in the settings page" is a HIT TEST as much as it is a data model: with two
@@ -666,8 +744,43 @@ private:
 	TArray<FRow> Rows;
 	int32 Selected = 0;
 
-	/** Rebuilds Rows for the current page and puts the selection on the first selectable row. */
-	void RebuildRows();
+	/**
+	 * Rebuilds Rows for the current page and puts the selection on the row whose action is
+	 * @p SelectAction (and whose SlotIndex is @p SelectSlot, when given) — which is how BACK lands the
+	 * player on the door they came through rather than at the top of the page. With no match, or
+	 * EAction::None, the first selectable row.
+	 */
+	void RebuildRows(EAction SelectAction = EAction::None, int32 SelectSlot = INDEX_NONE);
+
+	/** Index of the row carrying @p Action (and @p SlotIndex, when not INDEX_NONE), or INDEX_NONE. */
+	int32 FindActionRow(EAction Action, int32 SlotIndex = INDEX_NONE) const;
+
+	/** The door on the parent page that opens @p Child: OpenVideo for Video, and so on. */
+	static EAction DoorFor(EPage Child);
+
+	// ---- The two-step confirm ------------------------------------------------------------------
+	//
+	// RESET and a saved-slot CLEAR throw work away with no undo, and each sat one keystroke from a
+	// harmless neighbour (RESET directly above BACK). So the first press ARMS the row — its label turns
+	// into the question — and only a second press on the same row, within ArmWindowSeconds of REAL
+	// time, does it. Moving off the row, leaving the page or waiting it out disarms.
+
+	/** What the next press confirms, or None. ClearLoadoutSlot for a slot clear. */
+	EAction ArmedAction = EAction::None;
+	int32 ArmedSlot = INDEX_NONE;
+	double ArmedUntilReal = 0.0;
+	static constexpr double ArmWindowSeconds = 3.0;
+
+	/** True, and disarmed, when this press is the confirming second one; otherwise arms and returns false. */
+	bool ArmOrConfirm(EAction Action, int32 Slot);
+	void Disarm() { ArmedAction = EAction::None; ArmedSlot = INDEX_NONE; }
+	bool IsArmedRow(const FRow& Row) const;
+
+	/** BKSP / DEL / pad Y: unbind a key, or (two-step) clear a saved loadout slot. */
+	void HandleClearPressed();
+
+	/** Empties saved slot @p SlotIndex (contents AND name) and keeps the highlight on its row. */
+	void ClearLoadoutSlot(int32 SlotIndex);
 
 	/**
 	 * Re-evaluates FRow::bEnabled and pulls the selection off any row that just became unselectable.
@@ -839,35 +952,28 @@ private:
 
 	// ---- Draw -----------------------------------------------------------------------------------
 
-	void Draw(AHUD* HUD);
+	void Draw(AHUD* HUD, APlayerController* PC);
 
 	void DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W, float H, bool bSelected);
-	void DrawFrame(AHUD* HUD, float X, float Y, float W, float H);
-	void DrawCursor(AHUD* HUD);
+	void DrawCursor(AHUD* HUD, APlayerController* PC);
 
-	/**
-	 * The artist's value chip (T_MenuValueBox), landed so its PLATE is exactly (X, Y, W, H).
-	 *
-	 * Spec v20 §0.6. Two callers want it — the key chip on a Binding row and the value column beside
-	 * a Slider — and both of them already computed that rectangle for the plain cyan rect they used
-	 * to draw, so nothing about the layout moves.
-	 *
-	 * @return false when the sprite is unavailable (missing, uncooked, or Trace.Menu.Art 0) and
-	 *         NOTHING was drawn, which is the caller's cue to draw what it drew before. Every sprite
-	 *         on this screen is optional in exactly this way; see the art block in the .cpp.
-	 */
-	bool DrawValueChip(AHUD* HUD, float X, float Y, float W, float H) const;
+	/** The page's footer: [KEY] VERB chips for the keyboard, and a second line for a pad. Returns its height. */
+	float LegendHeight(APlayerController* PC) const;
+	void DrawLegend(AHUD* HUD, APlayerController* PC, float CenterX, float Y, float MaxW);
+
+	/** The label plate's share of a value row on this page. */
+	float LabelColumnFraction() const;
+
+	/** The kit's plate for @p State, or the value box, honouring Trace.Menu.Art 0 (the flat fallback arm). */
+	void DrawPlateFor(AHUD* HUD, ETraceKitState State, float X, float Y, float W, float H) const;
+	void DrawValueBoxFor(AHUD* HUD, float X, float Y, float W, float H, bool bEnabled) const;
 
 	// ---- Text ------------------------------------------------------------------------------------
 	//
-	// SPEC v26 §2 — @p Weight is which FACE the string is set in, and it has NO DEFAULT.
-	//
-	// This page draws headers in Sofachrome and its body in Erbaum Bold, and the three faces share no
-	// advances (Erbaum measures the alphabet a third narrower than Sofachrome ExtraLight). A defaulted
-	// face would therefore let a future call site measure in one face and draw in another and produce a
-	// layout that is wrong by a third — silently, in a screenshot, rather than in a compile. Making it
-	// explicit costs one argument per call and makes that class of mistake unexpressible. The names to
-	// pass are TraceOptionsMenuType::HeaderFace / ::BodyFace, in the .cpp beside the reasoning.
+	// SPEC v26 §2 — which FACE a string is set in is always stated: Sofachrome (HeaderFace) for the
+	// page title, the section captions and the pause root's rows; Erbaum Bold (BodyFace) for every
+	// row a player reads, adjusts or binds on a submenu. Text is sized by CAP HEIGHT in the face it
+	// is drawn in (the kit's rule), so a measurement and a draw can never disagree about the face.
 
 	/**
 	 * Which face an ACTION row's label is set in — the one place §2's split needed a judgement.
@@ -876,16 +982,6 @@ private:
 	 * pages (they are submenus). The whole argument is at the definition in the .cpp.
 	 */
 	ETraceTextWeight FaceForAction() const;
-
-	/** Centred text helper; AHUD::DrawText is top-left anchored and has no measure-and-centre form. */
-	void DrawTextCentered(AHUD* HUD, const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale,
-		ETraceTextWeight Weight);
-	void DrawTextRight(AHUD* HUD, const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale,
-		ETraceTextWeight Weight);
-	float MeasureWidth(AHUD* HUD, const FString& Text, UFont* Font, float Scale, ETraceTextWeight Weight);
-
-	/** The line box. Face-independent by construction — every atlas shares it — so it takes no weight. */
-	float MeasureHeight(AHUD* HUD, const FString& Text, UFont* Font, float Scale);
 
 	// ---- State ----------------------------------------------------------------------------------
 
@@ -929,6 +1025,30 @@ private:
 
 	/** D31-PAD — twin of the three above. See OpenController for why the direct entry sets Closed. */
 	EPage ControllerReturnPage = EPage::Settings;
+
+	/** Twin of ControllerReturnPage for the KEYBOARD page. */
+	EPage KeyboardReturnPage = EPage::Settings;
+
+	/**
+	 * True on the frame before, while the loadout editor was open. Its falling edge is how this menu
+	 * notices the editor closed — by ENTER, BACK, a click on its back mark, or anything else — and
+	 * rebuilds with the highlight on the slot that was being edited.
+	 */
+	bool bLoadoutEditorWasOpen = false;
+	int32 LoadoutEditorSlot = INDEX_NONE;
+
+	/**
+	 * RETURN TO TITLE / QUIT was pressed and the host's callback has run. The overlay stays up, input
+	 * off, with the pressed row drawn pressed, until the travel or the exit takes the HUD away — so the
+	 * frame on screen through the blocking load is this menu, not a frozen frame of live match. If the
+	 * travel has not happened after LeaveTimeoutSeconds of real time it gives up and closes normally.
+	 */
+	bool bLeaving = false;
+	double LeavingSinceReal = 0.0;
+	static constexpr double LeaveTimeoutSeconds = 8.0;
+
+	/** The world is really paused this frame (standalone). Decides PAUSED against MENU on the root. */
+	bool bWorldPaused = false;
 
 	/**
 	 * UI PLAN WP2.2 — the CALL SIGN field.
@@ -1051,11 +1171,20 @@ private:
 	float ViewW = 0.f;
 	float ViewH = 0.f;
 	float UIScale = 1.f;
-	float Now = 0.f;
 
-	UFont* FontSmall = nullptr;
-	UFont* FontMedium = nullptr;
-	UFont* FontLarge = nullptr;
+	/**
+	 * THE MENU'S CLOCK, and it is NOT the host's `Now`.
+	 *
+	 * Both hosts pass UWorld::GetTimeSeconds, which STOPS while the world is paused — and the in-match
+	 * pause menu pauses the world in standalone (the solo-with-bots case every playtest runs). Held-key
+	 * repeat, the RESOLUTION / WINDOW MODE coalesce, the hover breath, the PRESS A KEY blink, the call
+	 * sign caret and the loadout editor all measured against it, so in a paused match holding DOWN
+	 * moved one row, a resolution change never applied until the page was left, and every pulse froze.
+	 * Tick sets this from UWorld::GetRealTimeSeconds instead: world-relative (so it stays small enough
+	 * for a float), undilated, and still running while paused. Trace.Menu.Verify's paused-repeat
+	 * check is the proof.
+	 */
+	float Now = 0.f;
 
 	// ---- Held-key repeat ------------------------------------------------------------------------
 	//

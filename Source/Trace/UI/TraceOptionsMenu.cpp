@@ -25,6 +25,7 @@
 #include "Misc/Parse.h"
 #include "Scalability.h"
 #include "Settings/TraceGameUserSettings.h"
+#include "Settings/TraceGamepadInput.h"      // TracePadMenu::HasSeenPad — the legend's pad line
 #include "Trace.h"                       // LogTraceGame
 #include "UI/TraceMatchOptions.h"        // TraceCharacters - the spec v14 §3 toggle's storage
 #include "UI/Text/TraceCanvasText.h" // spec v22 §A1 - this page types in the artist's face
@@ -60,43 +61,10 @@
 // =================================================================================================
 
 // =================================================================================================
-// Palette
-//
-// The same two hues as the title screen — a cyan that carries the interface and an amber that only
-// ever means "danger, or something is waiting on you" — over near-black. Restated here rather than
-// shared with TraceMenuHUD.cpp's TraceMenuStyle because this overlay also draws over the MATCH,
-// where the title screen's palette namespace is not in scope, and a header shared between them
-// would exist purely to hold six colours.
-// =================================================================================================
-
-// =================================================================================================
-// SPEC v22 §A1 — THIS PAGE IS ONE TYPEFACE, AND IT IS THE ARTIST'S
-// =================================================================================================
-//
-// The settings page had exactly the defect the spec calls the headline, one screen further in than
-// anybody looked. Its CONTROLS header drew the artist's baked KEYBIND and KEY word sprites, and
-// every other string on the page — SETTINGS, DISPLAY, MOUSE, MOVE FORWARD, the key names, the
-// numbers — came out of AHUD::DrawText in the engine's stand-in font, in the same column, four
-// pixels apart. Photographed at 1920x1080 in v22integ_03_settings_open.png before this change.
-//
-// Now every one of them goes through UI/Text: TraceCanvasText blits one atlas quad per glyph, and
-// the word sprites are retired the same way the title row's PLAY and SETTINGS were.
-//
-// ---- THE ONE THING THAT IS NOT OBVIOUS: THE UNITS ------------------------------------------------
-//
-// This page's whole layout is expressed as (UFont*, Scale) pairs, where Scale is a MULTIPLIER on a
-// bitmap font's natural size — `FontMedium, 1.5f * UIScale`. TraceText wants a point size in
-// pixels. Converting with a constant would have been a guess, so SizeFor() measures instead: it
-// asks the engine what line height that font at that scale actually produces, and returns the point
-// size whose line height matches. TraceText::LineHeight is linear in size, so that inverse is exact.
-//
-// The consequence is the one that matters for a page this dense: every row keeps the height it had.
-// MeasureHeight() below returns the same number it returned before this change, so the vertical
-// rhythm of nineteen rows, their plates and their hit rects are all untouched. Only the letterforms
-// and the WIDTHS move — and the widths are measured, not assumed, by the same call that draws.
-//
-// The fallback needs no branch here. With no atlas, TraceCanvasText types Lato at the same size and
-// TraceText measures Lato, so this page degrades to "the wrong face, laid out correctly".
+// TYPE — every string on this page goes through UI/Text (spec v22 §A1): TraceCanvasText blits one
+// atlas quad per glyph in the artist's faces. With no atlas it types Lato at the same size and
+// TraceText measures Lato, so the page degrades to "the wrong face, laid out correctly". Sizes are
+// CAP HEIGHTS in the face being drawn (see TraceOptionsMenuText below), the kit's rule.
 // =================================================================================================
 
 // =================================================================================================
@@ -142,9 +110,9 @@
 //   CONTROLS / DISPLAY / MOUSE (section captions) SOFACHROME. Same object as the title, one level
 //                                                 down — a caption with a rule through it, not a
 //                                                 control. It is what "HEADERS anywhere" means.
-//   KEYBIND / KEY (the two column captions)       SOFACHROME. They are drawn INSTEAD of the word
-//                                                 CONTROLS, on the header row, and they are headers
-//                                                 for the two columns of every Binding row below.
+//   KEYBIND / KEY (the two column captions)       SOFACHROME. The KEYBOARD page's first row, over
+//                                                 the two columns every Binding row below is laid out
+//                                                 in.
 //   Row labels, values, key names, ON/OFF, the    ERBAUM BOLD. "settings / submenu body text, keybind
 //   < > arrows, the resolution-scale note, the    rows, values" — this is the body of the page, and
 //   footer key hints, the video perf readout      the arrows and the readout are furniture attached
@@ -162,103 +130,125 @@
 //                                                 one line — FaceForAction() below — so an owner who
 //                                                 disagrees changes it there and nowhere else.
 //
-// ---- THE UNITS DID NOT MOVE, AND THAT IS LOAD-BEARING --------------------------------------------
+// ---- WIDTHS DIFFER BY FACE --------------------------------------------------------------------------
 //
-// Every face shares the 116 px line box (Scripts/import_font_atlas.py refuses to emit a metrics
-// header whose sheets disagree about it), so SizeFor() and Height() are face-INDEPENDENT and the
-// vertical rhythm of nineteen rows, their plates and their hit rects are all exactly what they were.
-// WIDTHS are not: Erbaum measures the alphabet at 1823 px against Sofachrome's 2634 at em 96, so
-// anything that measures a string MUST be handed the face it will be drawn in. That is why Width()
-// and MeasureWidth() below take a weight and why it has no default — the four call sites that measure
-// (the two header rules, the key chip's width, the arrow gutter) each state their face, and the
-// compiler will not let a fifth forget.
+// Erbaum measures the alphabet at 1823 px against Sofachrome's 2634 at em 96, so anything that
+// measures a string MUST be handed the face it will be drawn in. TraceOptionsMenuText's measure and
+// draw both take the face, and every call states it.
 // =================================================================================================
 
 namespace TraceOptionsMenuType
 {
 	/**
-	 * The face a HEADER is set in: Sofachrome ExtraLight, the same sheet the title screen uses.
-	 *
-	 * Named rather than written as ETraceTextWeight::Light at eleven call sites, because the reason a
-	 * call passes it is "this is a header", not "this is the light weight". Re-pointing every header
-	 * on this page at another sheet is then one edit here.
+	 * The face a HEADER is set in: Sofachrome ExtraLight, the same sheet the title screen uses — the
+	 * page title, the section captions, the KEYBIND / KEY column captions and the pause root's rows.
 	 */
 	static constexpr ETraceTextWeight HeaderFace = ETraceTextWeight::Light;
 
-	/** The face BODY is set in: Erbaum Bold, the face the in-match HUD already uses (spec v25 §4). */
+	/** The face BODY is set in: Erbaum Bold, the face the in-match HUD already uses (spec v26 §2). */
 	static constexpr ETraceTextWeight BodyFace = ETraceTextWeight::Hud;
-
-	/** The point size whose line height equals what @p Font at @p Scale draws. See the block above. */
-	static float SizeFor(AHUD* HUD, UFont* Font, float Scale)
-	{
-		float MeasuredW = 0.f;
-		float MeasuredH = 0.f;
-		if (HUD != nullptr)
-		{
-			HUD->GetTextSize(TEXT("Ag"), MeasuredW, MeasuredH, Font, Scale);
-		}
-
-		const float UnitLine = TraceText::LineHeight(1.f);
-		if (MeasuredH > 1.f && UnitLine > KINDA_SMALL_NUMBER)
-		{
-			return MeasuredH / UnitLine;
-		}
-
-		// Only reachable with no HUD or a font the engine could not measure. 16 px is the engine's own
-		// medium font line box, so the page comes out readable rather than microscopic.
-		return FMath::Max(1.f, 16.f * Scale);
-	}
-
-	/**
-	 * Width @p Text occupies IN @p Weight.
-	 *
-	 * The weight is not optional and must be the one the caller is about to DRAW in: the three faces
-	 * share no advances at all (see the §2 block above), so measuring in one and drawing in another
-	 * puts a rule through a word or leaves a chip a third too wide.
-	 */
-	static float Width(AHUD* HUD, const FString& Text, UFont* Font, float Scale, ETraceTextWeight Weight)
-	{
-		TraceText::FStyle Style(SizeFor(HUD, Font, Scale));
-		Style.Weight = Weight;
-		return TraceText::MeasureWidth(Text, Style);
-	}
-
-	/**
-	 * The LINE BOX, which is what every caller on this page uses it for.
-	 *
-	 * NO WEIGHT, deliberately, and it is not an oversight: the line box is identical in all three
-	 * faces by construction — Scripts/import_font_atlas.py refuses to emit a metrics header whose
-	 * sheets disagree about it — so this answer cannot depend on the face. That is exactly why §2's
-	 * face split moves no row on this page.
-	 */
-	static float Height(AHUD* HUD, UFont* Font, float Scale)
-	{
-		return TraceText::LineHeight(SizeFor(HUD, Font, Scale));
-	}
-
-	static void Draw(AHUD* HUD, const FString& Text, const FLinearColor& Color,
-		float X, float Y, UFont* Font, float Scale, ETraceTextWeight Weight,
-		TraceText::EHAlign HAlign = TraceText::EHAlign::Left)
-	{
-		TraceText::FStyle Style(SizeFor(HUD, Font, Scale), Color);
-		Style.Weight = Weight;
-		Style.HAlign = HAlign;
-		TraceCanvasText::Draw(HUD, Text, X, Y, Style);
-	}
 }
 
-namespace TraceOptionsStyle
-{
-	static const FLinearColor Cyan     (0.16f, 0.88f, 1.00f, 1.00f);
-	static const FLinearColor Amber    (1.00f, 0.46f, 0.08f, 1.00f);
-	static const FLinearColor Ink      (0.90f, 0.97f, 1.00f, 1.00f);
-	static const FLinearColor InkDim   (0.42f, 0.58f, 0.66f, 1.00f);
-	static const FLinearColor Panel    (0.004f, 0.014f, 0.026f, 0.96f);
-	static const FLinearColor Trough   (0.03f, 0.06f, 0.08f, 0.90f);
+// =================================================================================================
+// THE HANDMADE KIT, ON THIS SCREEN
+//
+// Every page of this overlay is built from the artist's kit through UI/Widgets/Menu/TraceMenuKit.h,
+// the one Canvas renderer every other menu screen uses:
+//
+//   * a black scrim over whatever is behind (the match, or the title), and a borderless black panel
+//     under the list — no cyan bezel, no corner ticks, no cyan anything (stylespec §0: cyan is the
+//     pre-kit palette and is not a kit colour);
+//   * the page title in white Sofachrome; section captions in white at half strength with a faint
+//     hairline;
+//   * every row is the artist's button plate in one of the kit's four states — DEFAULT navy with a
+//     white word, HOVER (keyboard selection too) with the baked amber ring and the lifted olive word,
+//     PRESSED while the mouse is down on it, DISABLED near-black with a grey ring;
+//   * a value row is a label plate (the sheet's wide KEYBIND plate) with its control beside it: KEY
+//     chips for a binding, the gold-edged value box for a choice or a toggle (with the '<' '>' that
+//     step it), and for a slider the sheet's navy trough, its white blade handle and the value box;
+//   * the footer is the kit's KEY legend — a [KEY] chip and its verb — the same one the loadout and
+//     team pages draw;
+//   * the pointer is the kit's white blade, drawn through TraceMenuKit::ShowCursor.
+//
+// The title screen's white plate outline and amber selection rail are owner-requested extras for the
+// TITLE only and are deliberately not drawn here (TraceMenuKit::VisualsFor leaves them out too).
+// =================================================================================================
 
-	static FLinearColor WithAlpha(const FLinearColor& C, float A)
+/** Layout, in 1080p reference pixels: multiply by UIScale. */
+namespace TraceOptionsMenuLayout
+{
+	static constexpr float TitleCap       = 30.f;    // the page title's cap height
+	static constexpr float TitleTop       = 30.f;    // panel top to the title's cap top
+	static constexpr float TitleBlock     = 90.f;    // panel top to the first row
+	static constexpr float PreferredPitch = 46.f;    // row pitch when the page fits
+	static constexpr float MinPitch       = 20.f;    // the floor it shrinks to when it does not
+	static constexpr float RowFill        = 0.82f;   // plate height / pitch
+	static constexpr float SideGutter     = 40.f;    // panel edge to the plates
+	static constexpr float BottomPad      = 24.f;
+	static constexpr float ColumnGap      = 18.f;    // label plate to its control
+	static constexpr float BodyCap        = 0.34f;   // body caps / plate height (Erbaum Bold)
+	static constexpr float HeaderCap      = 12.f;
+	static constexpr float NoteCap        = 0.30f;   // note caps / row height
+	static constexpr float ValueBoxFill   = 0.80f;   // value box height / row height
+	static constexpr float SliderValueW   = 116.f;   // the slider's value box
+	static constexpr float ValueMaxW      = 330.f;   // a choice / toggle / name box
+	static constexpr float ChipMaxW       = 200.f;   // one KEY chip
+	static constexpr float ChipGap        = 12.f;
+	static constexpr float LegendChipH    = 28.f;
+	static constexpr float LegendTopGap   = 18.f;
+	static constexpr float LegendLineGap  = 38.f;
+	static constexpr float RootRowW       = 520.f;   // the pause root: the title screen's row metrics
+	static constexpr float RootRowH       = 60.f;
+	static constexpr float RootPitch      = 71.f;
+	static constexpr float PanelAlpha     = 0.90f;   // the black panel, over the kit's 0.82 scrim
+	static constexpr float PanelMaxH      = 0.95f;   // of the view
+}
+
+/** The colours this page uses that the kit's state table does not already decide. */
+namespace TraceOptionsMenuPalette
+{
+	static const FLinearColor Caption(1.f, 1.f, 1.f, 0.55f);
+	static const FLinearColor Rule(1.f, 1.f, 1.f, 0.12f);
+	/** Notes and inert furniture: the kit's disabled word grey. */
+	static const FLinearColor Note(0.55f, 0.55f, 0.55f, 1.f);
+	static const FLinearColor PanelFill(0.f, 0.f, 0.f, TraceOptionsMenuLayout::PanelAlpha);
+}
+
+/**
+ * Text on this page, sized by CAP HEIGHT in the face it is drawn in (the kit's rule), with its caps
+ * centred on a line. One measure and one draw, so a width and a draw can never disagree about the face.
+ */
+namespace TraceOptionsMenuText
+{
+	static TraceText::FStyle MakeStyle(float CapH, const FLinearColor& Color, ETraceTextWeight Weight)
 	{
-		return FLinearColor(C.R, C.G, C.B, A);
+		return TraceText::FStyle(TraceText::SizeForCapHeight(FMath::Max(1.f, CapH), Weight), Color, Weight);
+	}
+
+	static float Width(const FString& Text, float CapH, ETraceTextWeight Weight)
+	{
+		return Text.IsEmpty() ? 0.f : TraceText::MeasureWidth(Text, MakeStyle(CapH, FLinearColor::White, Weight));
+	}
+
+	/** @p Text with its caps centred on @p CapCenterY, X per @p HAlign, shrunk to @p MaxW (0: no limit). */
+	static float Draw(AHUD* HUD, const FString& Text, float X, float CapCenterY, float CapH,
+		const FLinearColor& Color, ETraceTextWeight Weight, TraceText::EHAlign HAlign, float MaxW = 0.f)
+	{
+		if (HUD == nullptr || Text.IsEmpty())
+		{
+			return 0.f;
+		}
+		TraceText::FStyle Drawn = MakeStyle(CapH, Color, Weight);
+		Drawn.HAlign = HAlign;
+		if (MaxW > 0.f)
+		{
+			const float Natural = TraceText::MeasureWidth(Text, Drawn);
+			if (Natural > MaxW && Natural > 0.f)
+			{
+				Drawn.Size *= MaxW / Natural;
+			}
+		}
+		return TraceMenuKit::DrawTextCapCentered(HUD, Text, X, CapCenterY, Drawn);
 	}
 }
 
@@ -327,15 +317,24 @@ namespace TraceOptionsMenuArt
 		ECVF_Default);
 #endif
 
-	/** The kit sprites this page draws: three button plates, the slider trough and the value chip. */
+	/** The kit sprites this page draws: three button plates, the slider trough and blade, the value box. */
 	static const ETraceKitSprite UsedSprites[] =
 	{
 		ETraceKitSprite::BtnDefault,
 		ETraceKitSprite::BtnHover,
 		ETraceKitSprite::BtnDisabled,
 		ETraceKitSprite::SliderTrack,
+		ETraceKitSprite::SliderHandle,
 		ETraceKitSprite::ValueBox,
 	};
+
+	/**
+	 * The overlay's FIRST drawn frame in this process: how many of UsedSprites were not drawable. -1
+	 * until it has been drawn. Anything above zero is a frame of flat fallback plates in front of the
+	 * player (TraceMenuKit::Prime in both HUDs' BeginPlay is what keeps it at zero); Trace.Menu.Verify
+	 * reports it.
+	 */
+	static int32 GFirstDrawUnready = -1;
 
 	/**
 	 * The texture, or null — which every caller treats as "draw the rectangle you drew before".
@@ -378,6 +377,19 @@ namespace TraceOptionsMenuArt
 	 */
 	static void LogReadiness(int32 DrawsSinceOpen)
 	{
+		if (GFirstDrawUnready < 0)
+		{
+			GFirstDrawUnready = 0;
+			for (const ETraceKitSprite Which : UsedSprites)
+			{
+				GFirstDrawUnready += TraceMenuKit::IsDrawable(TraceMenuKit::PeekSprite(Which)) ? 0 : 1;
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("[Options] First frame this process: %d of %d sprites %s."),
+				int32(UE_ARRAY_COUNT(UsedSprites)) - GFirstDrawUnready, int32(UE_ARRAY_COUNT(UsedSprites)),
+				GFirstDrawUnready == 0 ? TEXT("drawable - no fallback frame")
+					: TEXT("drawable - the rest drew their flat fallback plates this frame"));
+		}
+
 		if (DrawsSinceOpen > 4)
 		{
 			return;
@@ -455,7 +467,7 @@ namespace TraceOptionsMenuArt
 	}
 }
 
-namespace
+namespace TraceOptionsMenuFile
 {
 	/**
 	 * Every key the KEYBIND page is allowed to capture, built once.
@@ -543,6 +555,43 @@ namespace
 			|| PC->WasInputKeyJustPressed(A) || PC->WasInputKeyJustPressed(B);
 	}
 
+	/**
+	 * An action's row label on the KEYBOARD and CONTROLLER pages, THROUGH THE TEXT DOCUMENT.
+	 *
+	 * The table's DisplayName is a `const TCHAR*` in a table built once (TraceInputActions::All), so it
+	 * cannot hold an editable string; its own comment names the place that can — where the label is
+	 * COPIED into a row, once per rebuild. One literal key per action, so the document's scanner finds
+	 * all twenty (Scripts/dump-game-text.py) and Config/TraceGameText.ini gets a line for each. The
+	 * defaults ARE the table's DisplayNames; an action added to the table without a line here shows its
+	 * DisplayName.
+	 */
+	FString ActionLabel(const FTraceInputActionInfo& Info)
+	{
+		switch (Info.Action)
+		{
+		case ETraceInputAction::MoveForward:      return TRACE_TEXT("OPTIONS.ACTION.MOVE_FORWARD", "MOVE FORWARD");
+		case ETraceInputAction::MoveBack:         return TRACE_TEXT("OPTIONS.ACTION.MOVE_BACK", "MOVE BACK");
+		case ETraceInputAction::MoveLeft:         return TRACE_TEXT("OPTIONS.ACTION.STRAFE_LEFT", "STRAFE LEFT");
+		case ETraceInputAction::MoveRight:        return TRACE_TEXT("OPTIONS.ACTION.STRAFE_RIGHT", "STRAFE RIGHT");
+		case ETraceInputAction::Jump:             return TRACE_TEXT("OPTIONS.ACTION.JUMP", "JUMP");
+		case ETraceInputAction::Crouch:           return TRACE_TEXT("OPTIONS.ACTION.CROUCH_SLIDE", "CROUCH / SLIDE");
+		case ETraceInputAction::Dash:             return TRACE_TEXT("OPTIONS.ACTION.DASH", "DASH");
+		case ETraceInputAction::Parry:            return TRACE_TEXT("OPTIONS.ACTION.PARRY", "PARRY");
+		case ETraceInputAction::Fire:             return TRACE_TEXT("OPTIONS.ACTION.FIRE", "FIRE");
+		case ETraceInputAction::Pass:             return TRACE_TEXT("OPTIONS.ACTION.THROW_PASS_CORE", "THROW / PASS CORE");
+		case ETraceInputAction::Scoreboard:       return TRACE_TEXT("OPTIONS.ACTION.SCOREBOARD", "SCOREBOARD");
+		case ETraceInputAction::EquipKnife:       return TRACE_TEXT("OPTIONS.ACTION.KNIFE", "KNIFE");
+		case ETraceInputAction::EquipGun:         return TRACE_TEXT("OPTIONS.ACTION.PISTOL", "PISTOL");
+		case ETraceInputAction::Ability:          return TRACE_TEXT("OPTIONS.ACTION.ABILITY", "ABILITY");
+		case ETraceInputAction::AbilitySecondary: return TRACE_TEXT("OPTIONS.ACTION.ABILITY_SECONDARY", "ABILITY (SECONDARY)");
+		case ETraceInputAction::Reload:           return TRACE_TEXT("OPTIONS.ACTION.RELOAD", "RELOAD");
+		case ETraceInputAction::PullCore:         return TRACE_TEXT("OPTIONS.ACTION.PULL_CORE", "PULL CORE");
+		case ETraceInputAction::Melee:            return TRACE_TEXT("OPTIONS.ACTION.MELEE", "MELEE");
+		case ETraceInputAction::EquipSmg:         return TRACE_TEXT("OPTIONS.ACTION.SMG", "SMG");
+		case ETraceInputAction::Inspect:          return TRACE_TEXT("OPTIONS.ACTION.INSPECT_KNIFE", "INSPECT KNIFE");
+		default:                                  return FString(Info.DisplayName);
+		}
+	}
 }
 
 // =================================================================================================
@@ -563,7 +612,7 @@ namespace
 // =================================================================================================
 
 #if !UE_BUILD_SHIPPING
-namespace
+namespace TraceOptionsMenuFile
 {
 	FTraceOptionsMenu* GActiveOptionsMenu = nullptr;
 
@@ -655,6 +704,42 @@ namespace
 			}
 		}));
 
+	FAutoConsoleCommand CmdMenuKeyboard(
+		TEXT("Trace.Menu.Keyboard"),
+		TEXT("Opens the KEYBOARD binds page on whichever HUD is up. Works on the title screen and in a ")
+		TEXT("match. The Trace.Menu.* family's reason: a headless run has no keyboard, so without it there ")
+		TEXT("is no way to photograph this page. -TraceExec=Trace.Menu.Keyboard."),
+		FConsoleCommandDelegate::CreateLambda([]()
+		{
+			if (GActiveOptionsMenu != nullptr)
+			{
+				GActiveOptionsMenu->OpenKeyboard();
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Options] Trace.Menu.Keyboard: no HUD is drawing an overlay yet."));
+			}
+		}));
+
+	FAutoConsoleCommand CmdMenuVerify(
+		TEXT("Trace.Menu.Verify"),
+		TEXT("Checks the settings / pause overlay's own behaviour, driving it one drawn frame at a time: ")
+		TEXT("a pointer resting over a row does not take the selection when a page opens; BACK lands on ")
+		TEXT("the door the player came through; RESET and a saved-slot CLEAR need a second press; a click ")
+		TEXT("on a choice row's '<' steps it DOWN; and with the world PAUSED the menu clock still runs, so a ")
+		TEXT("held DOWN repeats. Uses its own pointer, restores everything it changes. Title screen or match."),
+		FConsoleCommandDelegate::CreateLambda([]()
+		{
+			if (GActiveOptionsMenu != nullptr)
+			{
+				GActiveOptionsMenu->DebugBeginVerify();
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[MenuVerify] No HUD is drawing an overlay yet."));
+			}
+		}));
+
 	FAutoConsoleCommand CmdMenuLoadout(
 		TEXT("Trace.Menu.Loadout"),
 		TEXT("Trace.Menu.Loadout <1-5>. Opens SETTINGS > LOADOUTS with that slot's editor up, on whichever ")
@@ -721,9 +806,9 @@ FTraceOptionsMenu::~FTraceOptionsMenu()
 	SetPressDeliveryOverride(false);
 
 #if !UE_BUILD_SHIPPING
-	if (GActiveOptionsMenu == this)
+	if (TraceOptionsMenuFile::GActiveOptionsMenu == this)
 	{
-		GActiveOptionsMenu = nullptr;
+		TraceOptionsMenuFile::GActiveOptionsMenu = nullptr;
 	}
 #endif
 }
@@ -1029,9 +1114,10 @@ void FTraceOptionsMenu::TickRebindProof(APlayerController* PC)
 	{
 	case ERebindProofStage::WaitForPage:
 	{
-		if (Page != EPage::Settings)
+		// The KEYBOARD page since the binds moved off SETTINGS (they made that page 43 rows long).
+		if (Page != EPage::Keyboard)
 		{
-			OpenSettings();
+			OpenKeyboard();
 			RebindProofWait = 3;
 			return;
 		}
@@ -1375,6 +1461,15 @@ void FTraceOptionsMenu::OpenRoot()
 	DrawsSinceOpen = 0;
 	bAutoActivateDone = false;
 #endif
+	// THE POINTER'S FIRST SAMPLE ON THIS PAGE IS NOT A MOVE. Forget where it was on the last visit,
+	// so a pointer RESTING over some row cannot take the highlight off the row RebuildRows chose — see
+	// PollMouse. (Escape then Enter used to "resume" into RETURN TO TITLE or QUIT this way.)
+	bHasHoverCursorPos = false;
+	PressedRow = INDEX_NONE;
+	bDraggingSlider = false;
+	bLeaving = false;
+	Disarm();
+
 	// SPEC v28 §3a — before the first frame the player can click on. See SetPressDeliveryOverride.
 	SetPressDeliveryOverride(true);
 
@@ -1394,6 +1489,15 @@ void FTraceOptionsMenu::OpenSettings()
 	DrawsSinceOpen = 0;
 	bAutoActivateDone = false;
 #endif
+	// THE POINTER'S FIRST SAMPLE ON THIS PAGE IS NOT A MOVE. Forget where it was on the last visit,
+	// so a pointer RESTING over some row cannot take the highlight off the row RebuildRows chose — see
+	// PollMouse. (Escape then Enter used to "resume" into RETURN TO TITLE or QUIT this way.)
+	bHasHoverCursorPos = false;
+	PressedRow = INDEX_NONE;
+	bDraggingSlider = false;
+	bLeaving = false;
+	Disarm();
+
 	// SPEC v28 §3a — before the first frame the player can click on. See SetPressDeliveryOverride.
 	SetPressDeliveryOverride(true);
 
@@ -1416,6 +1520,15 @@ void FTraceOptionsMenu::OpenVideo()
 	DrawsSinceOpen = 0;
 	bAutoActivateDone = false;
 #endif
+	// THE POINTER'S FIRST SAMPLE ON THIS PAGE IS NOT A MOVE. Forget where it was on the last visit,
+	// so a pointer RESTING over some row cannot take the highlight off the row RebuildRows chose — see
+	// PollMouse. (Escape then Enter used to "resume" into RETURN TO TITLE or QUIT this way.)
+	bHasHoverCursorPos = false;
+	PressedRow = INDEX_NONE;
+	bDraggingSlider = false;
+	bLeaving = false;
+	Disarm();
+
 	// SPEC v28 §3a — before the first frame the player can click on. See SetPressDeliveryOverride.
 	SetPressDeliveryOverride(true);
 
@@ -1438,6 +1551,15 @@ void FTraceOptionsMenu::OpenCrosshair()
 	DrawsSinceOpen = 0;
 	bAutoActivateDone = false;
 #endif
+	// THE POINTER'S FIRST SAMPLE ON THIS PAGE IS NOT A MOVE. Forget where it was on the last visit,
+	// so a pointer RESTING over some row cannot take the highlight off the row RebuildRows chose — see
+	// PollMouse. (Escape then Enter used to "resume" into RETURN TO TITLE or QUIT this way.)
+	bHasHoverCursorPos = false;
+	PressedRow = INDEX_NONE;
+	bDraggingSlider = false;
+	bLeaving = false;
+	Disarm();
+
 	// SPEC v28 §3a — before the first frame the player can click on. See SetPressDeliveryOverride.
 	SetPressDeliveryOverride(true);
 
@@ -1460,6 +1582,15 @@ void FTraceOptionsMenu::OpenAudio()
 	DrawsSinceOpen = 0;
 	bAutoActivateDone = false;
 #endif
+	// THE POINTER'S FIRST SAMPLE ON THIS PAGE IS NOT A MOVE. Forget where it was on the last visit,
+	// so a pointer RESTING over some row cannot take the highlight off the row RebuildRows chose — see
+	// PollMouse. (Escape then Enter used to "resume" into RETURN TO TITLE or QUIT this way.)
+	bHasHoverCursorPos = false;
+	PressedRow = INDEX_NONE;
+	bDraggingSlider = false;
+	bLeaving = false;
+	Disarm();
+
 	// SPEC v28 §3a — before the first frame the player can click on. See SetPressDeliveryOverride.
 	SetPressDeliveryOverride(true);
 
@@ -1495,11 +1626,45 @@ void FTraceOptionsMenu::OpenController()
 	DrawsSinceOpen = 0;
 	bAutoActivateDone = false;
 #endif
+	// THE POINTER'S FIRST SAMPLE ON THIS PAGE IS NOT A MOVE. Forget where it was on the last visit,
+	// so a pointer RESTING over some row cannot take the highlight off the row RebuildRows chose — see
+	// PollMouse. (Escape then Enter used to "resume" into RETURN TO TITLE or QUIT this way.)
+	bHasHoverCursorPos = false;
+	PressedRow = INDEX_NONE;
+	bDraggingSlider = false;
+	bLeaving = false;
+	Disarm();
+
 	// SPEC v28 §3a — before the first frame the player can click on. See SetPressDeliveryOverride.
 	SetPressDeliveryOverride(true);
 
 	RebuildRows();
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Controller settings opened."));
+}
+
+void FTraceOptionsMenu::OpenKeyboard()
+{
+	Page = EPage::Keyboard;
+	bCapturingKey = false;
+	bCapturingPadKey = false;
+
+	// Closed, not Settings: this entry point IS the top of the stack. Same contract as OpenController.
+	KeyboardReturnPage = EPage::Closed;
+	IgnoreInputBeforeFrame = GFrameCounter + 1;
+
+#if !UE_BUILD_SHIPPING
+	DrawsSinceOpen = 0;
+	bAutoActivateDone = false;
+#endif
+	bHasHoverCursorPos = false;
+	PressedRow = INDEX_NONE;
+	bDraggingSlider = false;
+	bLeaving = false;
+	Disarm();
+	SetPressDeliveryOverride(true);
+
+	RebuildRows();
+	UE_LOG(LogTraceGame, Display, TEXT("[Options] Keyboard binds opened."));
 }
 
 void FTraceOptionsMenu::Close()
@@ -1538,6 +1703,17 @@ void FTraceOptionsMenu::Close()
 	bAutoDetectPending = false;
 	LastAdjustDir = 0;
 	LastNavDir = 0;
+	bHasHoverCursorPos = false;
+	bLeaving = false;
+	Disarm();
+
+	// The loadout editor is part of this overlay: whatever closed the overlay closes it too, or it would
+	// still be "open" (and drawing, and reading keys) the next time a page is.
+	if (LoadoutEditor.IsLibraryOpen())
+	{
+		LoadoutEditor.CloseLibrary();
+	}
+	bLoadoutEditorWasOpen = false;
 
 	// SPEC v28 §3a — the viewport goes back exactly as it was, BEFORE OnClosed fires. The host's own
 	// callback can put a whole new input mode on (ATraceHUD's does), and it must be the one that wins.
@@ -1580,9 +1756,12 @@ void FTraceOptionsMenu::Close()
 // pass claimed the 1 key still selects the blade and that "STOW GUNS (KNIFE ONLY)" describes it —
 // both were false the moment the switch was flipped, and neither was load-bearing.)
 
-void FTraceOptionsMenu::RebuildRows()
+void FTraceOptionsMenu::RebuildRows(EAction SelectAction, int32 SelectSlot)
 {
 	Rows.Reset();
+
+	// A new page, or the same page rebuilt: nothing stays armed across it.
+	Disarm();
 
 	// A HEADER OR A NOTE WHOSE WORDS THE DOCUMENT REMOVED IS NOT A ROW. "KEY =" is how a line is
 	// taken off the screen (TraceGameText.h), and a note row with no words in it is still a full row
@@ -1694,8 +1873,8 @@ void FTraceOptionsMenu::RebuildRows()
 		// FIVE ROWS, ONE PER SAVED SLOT, and each says what it holds rather than just its number — a
 		// library where every row reads "LOADOUT 3" is a library the player has to open five times to
 		// read. A filled slot shows its three abilities; an empty one says so.
-		AddHeader(*TRACE_TEXT("OPTIONS.LOADOUTS.HEADER", "YOUR SAVED LOADOUTS"));
-
+		// NO "YOUR SAVED LOADOUTS" CAPTION: it sat directly under the page title LOADOUTS and said it
+		// again.
 		const UTraceUserSettings& Settings = UTraceUserSettings::Get();
 		for (int32 Index = 0; Index < UTraceUserSettings::SavedLoadoutCount; ++Index)
 		{
@@ -1792,7 +1971,7 @@ void FTraceOptionsMenu::RebuildRows()
 		// buttons, and there is nothing to rebind about them but the numbers immediately below — the
 		// LOOK STICK / MOVE STICK headers say which is which. (A note spelling that out, and one
 		// explaining the dead zone, were removed by the co-developer's text pass.)
-		AddHeader(*TRACE_TEXT("OPTIONS.CONTROLLER.HDR_CONTROLLER", "CONTROLLER"));
+		// No CONTROLLER caption over this first row: the page is titled CONTROLLER directly above it.
 		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_CONTROLLER_INPUT", "CONTROLLER INPUT"), ESetting::PadEnabled);
 
 		AddHeader(*TRACE_TEXT("OPTIONS.CONTROLLER.HDR_LOOK_STICK", "LOOK STICK"));
@@ -1819,7 +1998,7 @@ void FTraceOptionsMenu::RebuildRows()
 
 			FRow Row;
 			Row.Kind = ERowKind::PadBinding;
-			Row.Label = Info.DisplayName;   // one display name per verb, shared with the keyboard page
+			Row.Label = TraceOptionsMenuFile::ActionLabel(Info);   // one label per verb, shared with the keyboard page
 			Row.Binding = Info.Action;
 			Rows.Add(MoveTemp(Row));
 		}
@@ -1828,102 +2007,73 @@ void FTraceOptionsMenu::RebuildRows()
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetControllerDefaults);
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
 	}
-	else if (Page == EPage::Settings)
+	else if (Page == EPage::Keyboard)
 	{
-		// ---- UI PLAN WP2 — THE PLAYER'S OWN NAME, FIRST ON THE PAGE -----------------------------
-		//
-		// ABOVE DISPLAY, and that placement is the argument. Until this row existed the scoreboard
-		// called the human "Mac-3249D6BCCE489DF8" — the engine's fallback, because only bots ever got
-		// a SetPlayerName. The first thing a player opening SETTINGS for the first time should be
-		// able to fix is the thing with their name on it, and a row buried under two display doors and
-		// a match toggle is a row nobody finds before their first match.
-		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_PLAYER", "PLAYER"));
-		AddValue(ERowKind::TextEntry, *TRACE_TEXT("OPTIONS.SETTINGS.ROW_CALL_SIGN", "CALL SIGN"), ESetting::CallSign);
-
-		// The note is not decoration: this row is the only control on any of these pages that takes
-		// free text, so it is the only one where a player can be refused a character and not know why.
-		// It names the alphabet AND the cap, which are the two refusals the field can make.
-		AddNote(*TRACE_TEXT("OPTIONS.SETTINGS.NOTE_CALL_SIGN",
-			"SHOWN ON THE SCOREBOARD AND IN THE KILL FEED. A-Z, 0-9, SPACE, - _ . MAX 16."));
-
-		// First row on the page, above the mouse. Same reasoning as the pause root's VIDEO entry —
-		// and this is the ONLY route to the video page from the title screen, where there is no
-		// pause root at all, so it cannot be buried at the bottom next to RESET.
-		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_DISPLAY", "DISPLAY"));
-		AddAction(*TRACE_TEXT("OPTIONS.SETTINGS.ROW_VIDEO_SETTINGS", "VIDEO SETTINGS"), EAction::OpenVideo);
-
-		// SPEC v29 §3. Beside VIDEO SETTINGS rather than in a section of its own: both rows are doors
-		// to a page about how the game LOOKS, and this is the only route the title screen has to
-		// either of them — there is no pause root there to hang a shortcut on.
-		AddAction(*TRACE_TEXT("OPTIONS.SETTINGS.ROW_CROSSHAIR", "CROSSHAIR"), EAction::OpenCrosshair);
-		AddAction(*TRACE_TEXT("OPTIONS.SETTINGS.ROW_LOADOUTS", "LOADOUTS"), EAction::OpenLoadouts);
-
-		// UI PLAN WP3. Its own header rather than a third door under DISPLAY, because it is not one:
-		// DISPLAY is how the game LOOKS and this is how it SOUNDS, and a page about the crosshair and
-		// a page about the master volume have nothing to say to each other.
-		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_SOUND", "SOUND"));
-		AddAction(*TRACE_TEXT("OPTIONS.SETTINGS.ROW_AUDIO", "AUDIO"), EAction::OpenAudio);
-
-		// D31-PAD. Its own header for the same reason SOUND has one — a page about a controller is
-		// neither how the game looks nor how it sounds — and ABOVE the MOUSE and CONTROLS blocks
-		// rather than below them, which is the placement decision on this page. A player who has just
-		// paired a pad and opened SETTINGS is looking for the word CONTROLLER, and twenty-one keybind
-		// rows between them and it is the burial spec v11 §0 already argued against once. It is also
-		// the only route the title screen has to the page.
-		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_CONTROLLER", "CONTROLLER"));
-		AddAction(*TRACE_TEXT("OPTIONS.SETTINGS.ROW_CONTROLLER_SETTINGS", "CONTROLLER SETTINGS"), EAction::OpenController);
-
-		// ---- Match rules (spec v14 §3) ----------------------------------------------------------
-		//
-		// Above MOUSE and above CONTROLS, because it is the only row on this page that changes what
-		// the GAME is rather than how it is driven, and because the one thing a player is looking for
-		// when they come here about characters is the switch that turns them off.
-		//
-		// It is a HOST setting and it lands on the NEXT match: it cannot retro-apply to a match already
-		// being served. A second note used to say so ("APPLIES TO MATCHES YOU HOST, FROM THE NEXT
-		// MATCH. GOALS MODE ONLY."); the co-developer's text pass removed it and kept the OFF note.
-		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_MATCH", "MATCH"));
-		// LABELLED "ABILITIES" NOW. The setting is unchanged and its key is unchanged — it is still the
-		// mode A switch — but what it turns off is abilities, and there are no characters left to name.
-		// A row called CHARACTERS would be asking about something the game no longer has.
-		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.SETTINGS.ROW_CHARACTERS", "ABILITIES"), ESetting::CharactersEnabled);
-		AddNote(*TRACE_TEXT("OPTIONS.SETTINGS.NOTE_CHARACTERS_OFF",
-			"OFF: EVERYONE PLAYS THE DEFAULT MANNEQUIN, NO ABILITIES, NO LOADOUT SCREEN."));
-
-		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_MOUSE", "MOUSE"));
-
+		// EVERY ACTION, TWO KEY CHIPS EACH — the rows that used to fill the bottom half of SETTINGS.
+		// Walking the shared table rather than a hand-written list, so an action added to
+		// ETraceInputAction gets a row here for free. The first row captions the two columns (KEYBIND
+		// over the labels, KEY over the chips) instead of carrying a word of its own.
 		{
-			FRow Row;
-			Row.Kind = ERowKind::Slider;
-			Row.Label = TRACE_TEXT("OPTIONS.SETTINGS.ROW_SENSITIVITY", "SENSITIVITY");
-			Row.Setting = ESetting::Sensitivity;
-			Rows.Add(MoveTemp(Row));
+			FRow Captions;
+			Captions.Kind = ERowKind::Header;
+			Captions.Label = TRACE_TEXT("OPTIONS.SETTINGS.COL_KEYBIND", "KEYBIND");
+			Captions.bColumnCaptions = true;
+			Rows.Add(MoveTemp(Captions));
 		}
-		{
-			FRow Row;
-			Row.Kind = ERowKind::Slider;
-			Row.Label = TRACE_TEXT("OPTIONS.SETTINGS.ROW_VERTICAL_SENSITIVITY", "VERTICAL SENSITIVITY");
-			Row.Setting = ESetting::SensitivityY;
-			Rows.Add(MoveTemp(Row));
-		}
-		{
-			FRow Row;
-			Row.Kind = ERowKind::Toggle;
-			Row.Label = TRACE_TEXT("OPTIONS.SETTINGS.ROW_INVERT_MOUSE_Y", "INVERT MOUSE Y");
-			Row.Setting = ESetting::InvertY;
-			Rows.Add(MoveTemp(Row));
-		}
-
-		AddHeader(TEXT("CONTROLS"));
 
 		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
 		{
 			FRow Row;
 			Row.Kind = ERowKind::Binding;
-			Row.Label = Info.DisplayName;   // spec v29 §5: straight from the table, no override
+			Row.Label = TraceOptionsMenuFile::ActionLabel(Info);
 			Row.Binding = Info.Action;
 			Rows.Add(MoveTemp(Row));
 		}
+
+		AddSpacer();
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetKeyboardDefaults);
+		AddAction(*TRACE_TEXT("OPTIONS.ROW.BACK", "BACK"), EAction::Back);
+	}
+	else if (Page == EPage::Settings)
+	{
+		// ---- A SHORT PAGE: WHO YOU ARE, WHERE TO GO, THE MATCH SWITCH, THE MOUSE --------------------
+		//
+		// It was forty-three rows — five one-row section captions, six doors, three notes, the mouse and
+		// all twenty keybinds — with no scrolling, so the pitch clamped to ~19 px at 1080p and the labels
+		// shrank to 6-7 px caps (4-5 px at 720p). The keybinds are their own KEYBOARD page now, the six
+		// doors are one uncaptioned group, and every door is labelled with the title of the page it
+		// opens (the same text key, so a door and its page can never be called two different things).
+		//
+		// THE CALL SIGN FIRST, for the reason UI plan WP2 gave: the first thing a player opening
+		// SETTINGS should be able to fix is the thing with their name on it. Its note names the cap,
+		// the one refusal the field makes that a player could not otherwise see.
+		AddValue(ERowKind::TextEntry, *TRACE_TEXT("OPTIONS.SETTINGS.ROW_CALL_SIGN", "CALL SIGN"), ESetting::CallSign);
+		AddNote(*TRACE_TEXT("OPTIONS.SETTINGS.NOTE_CALL_SIGN",
+			"SHOWN ON THE SCOREBOARD AND IN THE KILL FEED. A-Z, 0-9, SPACE, - _ . MAX 16."));
+
+		// THE DOORS. VIDEO first (spec v11 §0: the player whose frame rate collapsed must not walk past
+		// anything to reach it), and this is the ONLY route the title screen has to any of these pages.
+		AddAction(*TRACE_TEXT("OPTIONS.TITLE.VIDEO", "VIDEO"), EAction::OpenVideo);
+		AddAction(*TRACE_TEXT("OPTIONS.TITLE.AUDIO", "AUDIO"), EAction::OpenAudio);
+		AddAction(*TRACE_TEXT("OPTIONS.TITLE.CROSSHAIR", "CROSSHAIR"), EAction::OpenCrosshair);
+		AddAction(*TRACE_TEXT("OPTIONS.TITLE.KEYBOARD", "KEYBOARD"), EAction::OpenKeyboard);
+		AddAction(*TRACE_TEXT("OPTIONS.TITLE.CONTROLLER", "CONTROLLER"), EAction::OpenController);
+		AddAction(*TRACE_TEXT("OPTIONS.TITLE.LOADOUTS", "LOADOUTS"), EAction::OpenLoadouts);
+
+		// ---- Match rules (spec v14 §3) ----------------------------------------------------------
+		//
+		// The one row on this page that changes what the GAME is rather than how it is driven. A HOST
+		// setting, landing on the NEXT match. Labelled ABILITIES: the setting and its key are the old
+		// characters switch, and there are no characters left to name.
+		AddSpacer();
+		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.SETTINGS.ROW_CHARACTERS", "ABILITIES"), ESetting::CharactersEnabled);
+		AddNote(*TRACE_TEXT("OPTIONS.SETTINGS.NOTE_CHARACTERS_OFF",
+			"OFF: EVERYONE PLAYS THE DEFAULT MANNEQUIN, NO ABILITIES, NO LOADOUT SCREEN."));
+
+		AddHeader(*TRACE_TEXT("OPTIONS.SETTINGS.HDR_MOUSE", "MOUSE"));
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.SETTINGS.ROW_SENSITIVITY", "SENSITIVITY"), ESetting::Sensitivity);
+		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.SETTINGS.ROW_VERTICAL_SENSITIVITY", "VERTICAL SENSITIVITY"), ESetting::SensitivityY);
+		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.SETTINGS.ROW_INVERT_MOUSE_Y", "INVERT MOUSE Y"), ESetting::InvertY);
 
 		AddSpacer();
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetDefaults);
@@ -1935,10 +2085,16 @@ void FTraceOptionsMenu::RebuildRows()
 	// block whenever the window mode is not windowed fullscreen.
 	RefreshRowStates();
 
-	// Land on the first thing that can actually be selected, so a page never opens with the
-	// highlight sitting on a caption.
+	// Land on the row the caller asked for — the door the player came back through — or else on the
+	// first thing that can actually be selected, so a page never opens with the highlight on a caption.
 	Selected = 0;
 	SelectedBindingSlot = 0;   // spec v28 §3c — and on its first chip
+	const int32 Wanted = (SelectAction != EAction::None) ? FindActionRow(SelectAction, SelectSlot) : INDEX_NONE;
+	if (Wanted != INDEX_NONE && Rows[Wanted].IsSelectable())
+	{
+		Selected = Wanted;
+		return;
+	}
 	for (int32 Index = 0; Index < Rows.Num(); ++Index)
 	{
 		if (Rows[Index].IsSelectable())
@@ -1946,6 +2102,35 @@ void FTraceOptionsMenu::RebuildRows()
 			Selected = Index;
 			break;
 		}
+	}
+}
+
+int32 FTraceOptionsMenu::FindActionRow(EAction Action, int32 SlotIndex) const
+{
+	for (int32 Index = 0; Index < Rows.Num(); ++Index)
+	{
+		const FRow& Row = Rows[Index];
+		if (Row.Kind == ERowKind::Action && Row.Action == Action
+			&& (SlotIndex == INDEX_NONE || Row.SlotIndex == SlotIndex))
+		{
+			return Index;
+		}
+	}
+	return INDEX_NONE;
+}
+
+FTraceOptionsMenu::EAction FTraceOptionsMenu::DoorFor(EPage Child)
+{
+	switch (Child)
+	{
+	case EPage::Settings:   return EAction::OpenSettings;
+	case EPage::Video:      return EAction::OpenVideo;
+	case EPage::Crosshair:  return EAction::OpenCrosshair;
+	case EPage::Loadouts:   return EAction::OpenLoadouts;
+	case EPage::Audio:      return EAction::OpenAudio;
+	case EPage::Controller: return EAction::OpenController;
+	case EPage::Keyboard:   return EAction::OpenKeyboard;
+	default:                return EAction::None;
 	}
 }
 
@@ -1990,7 +2175,7 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 #if !UE_BUILD_SHIPPING
 	// Claimed every frame, open or not, so Trace.Menu.Video always reaches the overlay the player is
 	// actually looking at. See GActiveOptionsMenu.
-	GActiveOptionsMenu = this;
+	TraceOptionsMenuFile::GActiveOptionsMenu = this;
 #endif
 
 	// ---- Runs even while the overlay is CLOSED ---------------------------------------------------
@@ -2004,11 +2189,27 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	// appearing to persist until the player next dies.
 	MaintainFieldOfView(PC);
 
+	// ---- THE MENU'S OWN CLOCK — see Now in the header -----------------------------------------------
+	//
+	// NOT InNow. Both hosts pass UWorld::GetTimeSeconds, which stops dead while the world is paused,
+	// and the in-match pause menu pauses the world in standalone. RealTimeSeconds keeps running through
+	// a pause, is undilated, and is world-relative, so it stays small enough for the float timers
+	// below. (FPlatformTime::Seconds is NOT a substitute: on this platform it carries a deliberately
+	// large offset, and narrowed to float it would round every timer and pulse to whole seconds.)
+	{
+		const UWorld* ClockWorld = (PC != nullptr) ? PC->GetWorld() : nullptr;
+		Now = (ClockWorld != nullptr) ? static_cast<float>(ClockWorld->GetRealTimeSeconds()) : InNow;
+		bWorldPaused = (ClockWorld != nullptr) && ClockWorld->IsPaused();
+	}
+
 #if !UE_BUILD_SHIPPING
 	// SPEC v28 §3a. BEFORE the closed-page early-out, because its first job is to OPEN the settings
 	// page, and before PollInput below, because an edge it injects must not be read by the same frame
 	// that queued it — see the block comment on TickRebindProof. Inert until armed.
 	TickRebindProof(PC);
+
+	// Trace.Menu.Verify: the same shape, for the same reasons. Inert until armed.
+	TickVerify(PC);
 #endif
 
 	if (Page == EPage::Closed || HUD == nullptr || InViewW <= 0.f || InViewH <= 0.f)
@@ -2016,26 +2217,61 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 		return;
 	}
 
+	ViewW = InViewW;
+	ViewH = InViewH;
+	UIScale = InUIScale;
+
 	// *** THE LOADOUT EDITOR OWNS THE FRAME WHILE IT IS OPEN. ***
 	//
 	// BEFORE everything below, and it returns rather than falling through: the editor reads arrows and
 	// ENTER, and so does this menu's own row list. Both running would move the selection behind the
-	// editor while the player builds a loadout, and they would come back to a different row than they
-	// left. One screen reads the keys at a time.
-	//
-	// When it closes it returns false, and the rows are rebuilt so the slot they just saved shows its
-	// new contents rather than the summary it had when they opened it.
+	// editor while the player builds a loadout. One screen reads the keys at a time. It runs on this
+	// menu's clock, so its hover breath and its key repeat keep going in a paused match too.
 	if (LoadoutEditor.IsLibraryOpen())
 	{
-		if (!LoadoutEditor.TickLibrary(HUD, PC, InViewW, InViewH, InUIScale, InNow,
-			/*bInputAllowed=*/GFrameCounter >= IgnoreInputBeforeFrame))
+		bLoadoutEditorWasOpen = true;
+		LoadoutEditorSlot = LoadoutEditor.GetLibrarySlot();
+		LoadoutEditor.TickLibrary(HUD, PC, InViewW, InViewH, InUIScale, Now,
+			/*bInputAllowed=*/GFrameCounter >= IgnoreInputBeforeFrame);
+		if (LoadoutEditor.IsLibraryOpen())
 		{
-			// TWO frames, not one: the editor now leaves on pad B, and TracePadMenu documents that one
-			// physical press can be reported on two consecutive frames. A B seen again here would run
-			// GoBack and take the player off the LOADOUTS page as well.
-			IgnoreInputBeforeFrame = GFrameCounter + 2;
-			RebuildRows();
+			return;
 		}
+	}
+
+	// THE EDITOR JUST CLOSED — by ENTER, by BACK (key, pad B or a click on its back mark), or by code.
+	// Watched as an EDGE rather than read off TickLibrary's return, so no way out of the editor can
+	// skip it. The rows are rebuilt so the slot shows what was just saved, with the highlight back on
+	// THAT slot (it used to land on slot 1), and the page is drawn this same frame rather than leaving
+	// one frame with nothing on screen.
+	if (bLoadoutEditorWasOpen)
+	{
+		bLoadoutEditorWasOpen = false;
+
+		// TWO frames, not one: the editor leaves on pad B, and TracePadMenu documents that one physical
+		// press can be reported on two consecutive frames. A B seen again here would run GoBack and take
+		// the player off the LOADOUTS page as well.
+		IgnoreInputBeforeFrame = GFrameCounter + 2;
+		RebuildRows(EAction::EditLoadoutSlot, LoadoutEditorSlot);
+
+		// ...and the pointer, which may be resting over another slot, must not take the highlight back.
+		bHasHoverCursorPos = false;
+	}
+
+	// RETURN TO TITLE / QUIT has been pressed and the host is taking the HUD away. No input; the page
+	// stays on screen with the pressed row pressed. See bLeaving.
+	if (bLeaving)
+	{
+		if (FPlatformTime::Seconds() - LeavingSinceReal > LeaveTimeoutSeconds)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Options] Still here %.0fs after leaving was requested; closing the overlay normally."),
+				LeaveTimeoutSeconds);
+			bLeaving = false;
+			Close();
+			return;
+		}
+		Draw(HUD, PC);
 		return;
 	}
 
@@ -2049,18 +2285,6 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	{
 		bAutoDetectPending = false;
 		RunAutoDetect();
-	}
-
-	ViewW = InViewW;
-	ViewH = InViewH;
-	UIScale = InUIScale;
-	Now = InNow;
-
-	if (GEngine != nullptr)
-	{
-		FontSmall  = GEngine->GetSmallFont();
-		FontMedium = GEngine->GetMediumFont();
-		FontLarge  = GEngine->GetLargeFont();
 	}
 
 	// Before input, so a click cannot land on a row that stopped being meaningful last frame.
@@ -2083,11 +2307,18 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 		PollInput(PC);
 	}
 
-	// PollInput can close us (Escape, RESUME, QUIT). Drawing a closed overlay would leave a frame of
-	// dimmed screen over a game that has already resumed.
+	// PollInput can close us (Escape, RESUME). Drawing a closed overlay would leave a frame of dimmed
+	// screen over a game that has already resumed.
 	if (Page == EPage::Closed)
 	{
 		return;
+	}
+
+	// An armed RESET / CLEAR lasts while the highlight stays on its row and the window is open.
+	if (ArmedAction != EAction::None
+		&& (FPlatformTime::Seconds() > ArmedUntilReal || !Rows.IsValidIndex(Selected) || !IsArmedRow(Rows[Selected])))
+	{
+		Disarm();
 	}
 
 	// The coalesced window resize, once the player has stopped moving through the list.
@@ -2104,29 +2335,14 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	TickAutoActivate();
 
 	// It presses a real row, and a real row can be BACK or QUIT. Same guard, same reason, as the one
-	// after PollInput above: drawing a closed overlay leaves a frame of dimmed screen over a game
-	// that has already resumed.
+	// after PollInput above.
 	if (Page == EPage::Closed)
 	{
 		return;
 	}
 #endif
 
-	// ---- SPEC v23 §A2 — IN FRONT OF SLATE, ON BOTH HOSTS -----------------------------------------
-	//
-	// Held for the draw only, never across the input poll above: PollInput can close the page, and a
-	// scope that outlived it would leave the game's canvas pointer swapped on a frame that drew
-	// nothing.
-	//
-	// This one line is what reaches the IN-MATCH pause menu as well, without a line changing in
-	// TraceHUD.cpp. Both hosts call this Tick, so both of them get a panel that draws over their UMG
-	// screens instead of under them — the title screen's over WBP_TitleMenu, the pause menu's over
-	// the in-match corner widgets. The owner asked for the art to reach the in-game menus; this is
-	// the same requirement one layer down, and it would have been wrong to fix it only on the way in.
-	//
-	// Nothing below branches on the answer. When it is false the panel draws precisely where it drew
-	// before, and it is the HOST that adapts (see ATraceMenuHUD::DrawHUD).
-	Draw(HUD);
+	Draw(HUD, PC);
 }
 
 #if !UE_BUILD_SHIPPING
@@ -2262,7 +2478,8 @@ void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 	// PadBindableKeys() holds nothing else, so a keyboard key pressed over a pad row is ignored and
 	// a pad button pressed over a keybind row is ignored. That partition is what stops one physical
 	// button from landing in both tables and therefore in both mapping contexts.
-	const TArray<FKey>& CaptureList = bCapturingPadKey ? PadBindableKeys() : BindableKeys();
+	const TArray<FKey>& CaptureList = bCapturingPadKey ? TraceOptionsMenuFile::PadBindableKeys()
+		: TraceOptionsMenuFile::BindableKeys();
 
 	// First poll of a fresh capture: record what was already down. A key that was held before the
 	// capture existed was never a choice made inside it.
@@ -2370,8 +2587,8 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 
 	// ---- Vertical: move the selection -----------------------------------------------------------
 	int32 NavDir = 0;
-	if (AnyDown(PC, EKeys::Down, EKeys::S)) { NavDir += 1; }
-	if (AnyDown(PC, EKeys::Up,   EKeys::W)) { NavDir -= 1; }
+	if (TraceOptionsMenuFile::AnyDown(PC, EKeys::Down, EKeys::S)) { NavDir += 1; }
+	if (TraceOptionsMenuFile::AnyDown(PC, EKeys::Up,   EKeys::W)) { NavDir -= 1; }
 	if (PadDown(EKeys::Gamepad_DPad_Down, EKeys::Gamepad_LeftStick_Down)) { NavDir += 1; }
 	if (PadDown(EKeys::Gamepad_DPad_Up,   EKeys::Gamepad_LeftStick_Up))   { NavDir -= 1; }
 	NavDir = FMath::Clamp(NavDir, -1, 1);
@@ -2394,8 +2611,8 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 
 	// ---- Horizontal: adjust the selected row ----------------------------------------------------
 	int32 AdjustDir = 0;
-	if (AnyDown(PC, EKeys::Right, EKeys::D)) { AdjustDir += 1; }
-	if (AnyDown(PC, EKeys::Left,  EKeys::A)) { AdjustDir -= 1; }
+	if (TraceOptionsMenuFile::AnyDown(PC, EKeys::Right, EKeys::D)) { AdjustDir += 1; }
+	if (TraceOptionsMenuFile::AnyDown(PC, EKeys::Left,  EKeys::A)) { AdjustDir -= 1; }
 	if (PadDown(EKeys::Gamepad_DPad_Right, EKeys::Gamepad_LeftStick_Right)) { AdjustDir += 1; }
 	if (PadDown(EKeys::Gamepad_DPad_Left,  EKeys::Gamepad_LeftStick_Left))  { AdjustDir -= 1; }
 	AdjustDir = FMath::Clamp(AdjustDir, -1, 1);
@@ -2437,39 +2654,113 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 		return;
 	}
 
-	// Explicit unbind. Every options screen that lets you bind should let you UNbind, and without it
-	// there is no way to express "I do not want a parry key" short of hiding it under some other one.
-	// D31-PAD — Y unbinds on a pad, because BKSP is not on a controller. It is the face button the
-	// layout leaves free of any MENU meaning, and it only does anything on a row that has something
-	// to unbind.
+	// Explicit unbind (and, on the LOADOUTS page, clear a saved slot). D31-PAD — Y does it on a pad,
+	// because BKSP is not on a controller. See HandleClearPressed.
 	if (PC->WasInputKeyJustPressed(EKeys::BackSpace) || PC->WasInputKeyJustPressed(EKeys::Delete)
 		|| PC->WasInputKeyJustPressed(EKeys::Gamepad_FaceButton_Top))
 	{
-		if (Rows.IsValidIndex(Selected) && Rows[Selected].Kind == ERowKind::PadBinding)
+		HandleClearPressed();
+	}
+}
+
+void FTraceOptionsMenu::HandleClearPressed()
+{
+	if (!Rows.IsValidIndex(Selected))
+	{
+		return;
+	}
+	const FRow& Row = Rows[Selected];
+
+	// Every options screen that lets you bind should let you UNbind, and without it there is no way to
+	// express "I do not want a parry key" short of hiding it under some other one.
+	if (Row.Kind == ERowKind::PadBinding)
+	{
+		// ClearPadKey, not SetPadKey(invalid): SetPadKey refuses an invalid key on purpose, because
+		// "invalid" is also what an unparseable .ini line produces and a load path must never be able
+		// to wipe a binding. Unbinding is a separate, explicit intent.
+		//
+		// THE WHOLE ROW, not a slot: MaxPadKeysPerAction is 1, so there is exactly one button.
+		UTraceUserSettings::Get().ClearPadKey(Row.Binding);
+		return;
+	}
+
+	if (Row.Kind == ERowKind::Binding)
+	{
+		// ClearKey, not SetKey: same reason. SPEC v28 §3c — ONE SLOT, the one the highlight is on.
+		// Clearing both from a single Backspace would make the second bind impossible to remove on its
+		// own, and would delete a key the player could not see themselves selecting.
+		UTraceUserSettings::Get().ClearKey(Row.Binding, ActiveBindingSlot());
+		return;
+	}
+
+	// A SAVED LOADOUT SLOT. It used to be impossible to empty one again: the case that clears a slot
+	// existed and no row or key ever reached it. Two presses, because it cannot be undone — the first
+	// turns the row into the question, the second answers it. An empty slot has nothing to clear.
+	if (Row.Kind == ERowKind::Action && Row.Action == EAction::EditLoadoutSlot && Row.SlotIndex != INDEX_NONE
+		&& !UTraceUserSettings::Get().GetSavedLoadout(Row.SlotIndex).IsEmpty())
+	{
+		if (ArmOrConfirm(EAction::ClearLoadoutSlot, Row.SlotIndex))
 		{
-			// ClearPadKey, not SetPadKey(invalid): SetPadKey refuses an invalid key on purpose,
-			// because "invalid" is also what an unparseable .ini line produces and a load path must
-			// never be able to wipe a binding. Unbinding is a separate, explicit intent.
-			//
-			// THE WHOLE ROW, not a slot: MaxPadKeysPerAction is 1, so there is exactly one button.
-			UTraceUserSettings::Get().ClearPadKey(Rows[Selected].Binding);
-		}
-		else if (Rows.IsValidIndex(Selected) && Rows[Selected].Kind == ERowKind::Binding)
-		{
-			// ClearKey, not SetKey: SetKey refuses an invalid key on purpose, because "invalid" is
-			// what an unparseable .ini entry looks like and it must never be able to wipe a binding.
-			// Unbinding is a separate, explicit intent.
-			//
-			// SPEC v28 §3c — ONE SLOT, the one the highlight is on. Clearing both from a single
-			// Backspace would make the second bind impossible to remove on its own, and would delete a
-			// key the player could not see themselves selecting.
-			UTraceUserSettings::Get().ClearKey(Rows[Selected].Binding, ActiveBindingSlot());
+			TraceAudio::PlayLocal2D(GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr,
+				TraceSoundEvents::ButtonPress);
+			ClearLoadoutSlot(Row.SlotIndex);
 		}
 	}
 }
 
+bool FTraceOptionsMenu::ArmOrConfirm(EAction Action, int32 Slot)
+{
+	const double RealNow = FPlatformTime::Seconds();
+	if (ArmedAction == Action && ArmedSlot == Slot && RealNow <= ArmedUntilReal)
+	{
+		Disarm();
+		return true;
+	}
+
+	ArmedAction = Action;
+	ArmedSlot = Slot;
+	ArmedUntilReal = RealNow + ArmWindowSeconds;
+	UE_LOG(LogTraceGame, Display, TEXT("[Options] Armed %s%s: press again within %.0fs to confirm."),
+		(Action == EAction::ClearLoadoutSlot) ? TEXT("CLEAR slot ") : TEXT("RESET"),
+		(Action == EAction::ClearLoadoutSlot) ? *FString::FromInt(Slot + 1) : TEXT(""), ArmWindowSeconds);
+	return false;
+}
+
+bool FTraceOptionsMenu::IsArmedRow(const FRow& Row) const
+{
+	if (ArmedAction == EAction::None || Row.Kind != ERowKind::Action)
+	{
+		return false;
+	}
+	if (ArmedAction == EAction::ClearLoadoutSlot)
+	{
+		return Row.Action == EAction::EditLoadoutSlot && Row.SlotIndex == ArmedSlot;
+	}
+	return Row.Action == ArmedAction;
+}
+
+void FTraceOptionsMenu::ClearLoadoutSlot(int32 SlotIndex)
+{
+	UTraceUserSettings& Settings = UTraceUserSettings::Get();
+	if (SlotIndex < 0 || SlotIndex >= UTraceUserSettings::SavedLoadoutCount)
+	{
+		return;
+	}
+
+	// The name goes with the contents, the way DiscardSavedLoadoutsIfStale keeps the two in step: a
+	// name left behind would label an empty slot with a loadout it no longer holds.
+	Settings.SetSavedLoadout(SlotIndex, FTraceLoadout());
+	Settings.SetSavedLoadoutName(SlotIndex, FString());
+	UE_LOG(LogTraceGame, Display, TEXT("[Options] Saved loadout %d cleared."), SlotIndex + 1);
+
+	// The row now reads EMPTY; the highlight stays on it.
+	RebuildRows(EAction::EditLoadoutSlot, SlotIndex);
+}
+
 void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 {
+	bool bDown = PC->IsInputKeyDown(EKeys::LeftMouseButton);
+
 	float MouseX = 0.f;
 	float MouseY = 0.f;
 	if (PC->GetMousePosition(MouseX, MouseY))
@@ -2478,7 +2769,16 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 		bHasCursor = true;
 	}
 
-	const bool bDown = PC->IsInputKeyDown(EKeys::LeftMouseButton);
+#if !UE_BUILD_SHIPPING
+	// Trace.Menu.Verify's own pointer: the whole function below runs on it exactly as on a real one.
+	if (bDebugPointer)
+	{
+		CursorPos = DebugPointerPos;
+		bHasCursor = true;
+		bDown = bDebugPointerDown;
+	}
+#endif
+
 	const bool bJustPressed = bDown && !bMouseWasDown;
 	const bool bJustReleased = !bDown && bMouseWasDown;
 	bMouseWasDown = bDown;
@@ -2490,15 +2790,19 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 
 	// Hover follows the pointer, but ONLY when the pointer actually moved.
 	//
-	// The guard is not about window-activation clicks (an earlier comment here claimed that and used
-	// it to justify having no guard). It is about the keyboard: this runs AFTER PollNavigation, so
-	// without it an arrow key moved Selected and the very same frame a STATIONARY cursor resting
-	// over a row dragged it straight back. The measured symptom was that the arrow keys did nothing
-	// whatsoever whenever the pointer happened to be over the list — and it is also why the
-	// -TraceAutoSettings script landed on different rows depending on viewport size.
+	// It runs AFTER PollNavigation, so without this an arrow key moved Selected and the very same frame
+	// a STATIONARY pointer resting over a row dragged it straight back.
+	//
+	// *** AND THE FIRST SAMPLE ON A PAGE IS NEVER A MOVE. *** Every Open*() forgets the last position
+	// (bHasHoverCursorPos = false), so the first poll only RECORDS where the pointer is. It used to count
+	// as a move — on the first opening because there was no previous sample, and on later ones because
+	// the previous sample was from the last visit — so whatever row lay under the resting pointer took
+	// the highlight the moment the menu appeared: Escape then Enter "resumed" into VIDEO, RETURN TO
+	// TITLE or QUIT (photographed: the pause menu opened with no key pressed, RETURN TO TITLE lit).
+	// Team select and the loadout page made the same rule; now this screen does too.
 	const float CursorMoveThresholdSq = 4.f;   // 2 px; below that it is jitter, not intent
-	const bool bCursorMoved = !bHasHoverCursorPos
-		|| FVector2D::DistSquared(CursorPos, LastHoverCursorPos) > CursorMoveThresholdSq;
+	const bool bCursorMoved = bHasHoverCursorPos
+		&& FVector2D::DistSquared(CursorPos, LastHoverCursorPos) > CursorMoveThresholdSq;
 	LastHoverCursorPos = CursorPos;
 	bHasHoverCursorPos = true;
 
@@ -2512,8 +2816,6 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 		}
 	}
 
-	// bCursorMoved, or the keyboard cannot win an argument with a resting pointer. A click still
-	// selects regardless — that path reads HoverRow directly below.
 	if (HoverRow != INDEX_NONE && !bDraggingSlider && bCursorMoved)
 	{
 		// FX_AUDIO_PLAN §5.1 — the pointer's half of "menu row focus change". Guarded on the row
@@ -2522,6 +2824,7 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 		{
 			TraceAudio::PlayLocal2D(GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr,
 				TraceSoundEvents::UIHover);
+			SelectedBindingSlot = 0;
 		}
 
 		Selected = HoverRow;
@@ -2531,6 +2834,15 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 	{
 		PressedRow = HoverRow;
 		bDraggingSlider = false;
+
+		// A press SELECTS the row it lands on, moved or not. With the stricter move test above a click
+		// on a row the pointer was already resting over would otherwise act on the keyboard's row: a
+		// slider drag below reads Rows[Selected], and would have dragged the wrong slider.
+		if (HoverRow != INDEX_NONE && Selected != HoverRow)
+		{
+			Selected = HoverRow;
+			SelectedBindingSlot = 0;
+		}
 
 		// SPEC v28 §3c — WHICH CHIP DID THE PLAYER CLICK? "Both editable in the settings page" is a
 		// hit test as much as a data model. The rects come from the last DrawRow, which is the right
@@ -2558,8 +2870,9 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 		if (HoverRow != INDEX_NONE && Rows[HoverRow].Kind == ERowKind::Slider && Rows[HoverRow].Track.bIsValid)
 		{
 			const FBox2D& Track = Rows[HoverRow].Track;
-			// Generous vertical tolerance: the track is a few pixels tall and the row is not.
-			if (CursorPos.X >= Track.Min.X - 4.f && CursorPos.X <= Track.Max.X + 4.f)
+			// Generous horizontal tolerance: the blade's half-width sits either side of the track.
+			const float Slack = 12.f * UIScale;
+			if (CursorPos.X >= Track.Min.X - Slack && CursorPos.X <= Track.Max.X + Slack)
 			{
 				bDraggingSlider = true;
 			}
@@ -2601,6 +2914,29 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 		if (Armed != INDEX_NONE && Armed == HoverRow)
 		{
 			Selected = Armed;
+
+			// THE ARROWS ARE BUTTONS. A choice (or toggle) row's '<' steps it DOWN and its '>' steps it
+			// UP. Everywhere else on the row a click still steps forward and wraps at the top — which
+			// used to be the ONLY thing a click could do, so stepping back from EPIC to HIGH took a
+			// trip round every option.
+			const FRow& Clicked = Rows[Armed];
+			if ((Clicked.Kind == ERowKind::Choice || Clicked.Kind == ERowKind::Toggle)
+				&& Clicked.ArrowLeft.bIsValid && Clicked.ArrowLeft.IsInside(CursorPos))
+			{
+				TraceAudio::PlayLocal2D(GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr,
+					TraceSoundEvents::ButtonPress);
+				AdjustSelected(-1);
+				return;
+			}
+			if ((Clicked.Kind == ERowKind::Choice || Clicked.Kind == ERowKind::Toggle)
+				&& Clicked.ArrowRight.bIsValid && Clicked.ArrowRight.IsInside(CursorPos))
+			{
+				TraceAudio::PlayLocal2D(GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr,
+					TraceSoundEvents::ButtonPress);
+				AdjustSelected(+1);
+				return;
+			}
+
 			ActivateSelected();
 		}
 	}
@@ -3500,6 +3836,27 @@ void FTraceOptionsMenu::ActivateSelected()
 		break;
 	}
 
+	// THE RESETS ARE TWO PRESSES. Each throws away a page of the player's choices with no undo, and
+	// the settings page's sat directly above BACK: one Enter or one misclick too many wiped the mouse
+	// and all forty key slots. The first press turns the row into the question (DrawRow reads
+	// IsArmedRow); only a second press on it, within ArmWindowSeconds, answers it.
+	switch (Row.Action)
+	{
+	case EAction::ResetDefaults:
+	case EAction::ResetKeyboardDefaults:
+	case EAction::ResetVideoDefaults:
+	case EAction::ResetCrosshairDefaults:
+	case EAction::ResetAudioDefaults:
+	case EAction::ResetControllerDefaults:
+		if (!ArmOrConfirm(Row.Action, INDEX_NONE))
+		{
+			return;
+		}
+		break;
+	default:
+		break;
+	}
+
 	switch (Row.Action)
 	{
 	case EAction::Resume:
@@ -3541,13 +3898,6 @@ void FTraceOptionsMenu::ActivateSelected()
 		}
 		break;
 
-	case EAction::ClearLoadoutSlot:
-		if (Rows.IsValidIndex(Selected) && Rows[Selected].SlotIndex != INDEX_NONE)
-		{
-			UTraceUserSettings::Get().SetSavedLoadout(Rows[Selected].SlotIndex, FTraceLoadout());
-			RebuildRows();
-		}
-		break;
 
 	case EAction::OpenCrosshair:
 		// Remember where we came from, exactly as OpenVideo does. Only the settings page carries this
@@ -3594,6 +3944,20 @@ void FTraceOptionsMenu::ActivateSelected()
 		RebuildRows();
 		break;
 
+	case EAction::OpenKeyboard:
+		// Remember where we came from, exactly as the doors above do.
+		KeyboardReturnPage = Page;
+		Page = EPage::Keyboard;
+		IgnoreInputBeforeFrame = GFrameCounter + 1;
+		RebuildRows();
+		break;
+
+	case EAction::ResetKeyboardDefaults:
+		// Every action's keyboard keys and NOTHING else — not the mouse, not the pad.
+		UTraceUserSettings::Get().ResetKeyboardToDefaults();
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] Keyboard binds reset to defaults."));
+		break;
+
 	case EAction::ResetControllerDefaults:
 		// The pad table and the five analog values, and NOTHING else — not the mouse, not a single
 		// keyboard bind, not the crosshair. See EAction::ResetControllerDefaults in the header, and
@@ -3621,18 +3985,34 @@ void FTraceOptionsMenu::ActivateSelected()
 		break;
 
 	case EAction::ReturnToTitle:
-		Close();
-		if (OnReturnToTitle) { OnReturnToTitle(); }
-		break;
-
 	case EAction::Quit:
-		Close();
-		if (OnQuit) { OnQuit(); }
+	{
+		// *** NOT Close() FIRST. *** Closing ran OnClosed — gameplay input back, the world unpaused,
+		// the mouse recaptured — and the next frame began the blocking level load or the exit, so the
+		// frame that stayed on screen through the whole load was a frozen frame of LIVE match with the
+		// HUD and no menu, which reads as a hang. Now the overlay stays up, input off, the pressed row
+		// drawn pressed, until the HUD is taken away; bLeaving's timeout closes it normally if the
+		// travel never happens.
+		const TFunction<void()>& Leave = (Row.Action == EAction::Quit) ? OnQuit : OnReturnToTitle;
+		if (!Leave)
+		{
+			Close();
+			break;
+		}
+		bLeaving = true;
+		LeavingSinceReal = FPlatformTime::Seconds();
+		PressedRow = Selected;
+		Leave();
 		break;
+	}
 
 	case EAction::ResetDefaults:
-		UTraceUserSettings::Get().ResetToDefaults();
-		UE_LOG(LogTraceGame, Display, TEXT("[Options] Reset to defaults."));
+		// SETTINGS' own adjustable rows: the mouse. Not the key binds (their page has its own reset),
+		// not the call sign (a name is not a setting) and not ABILITIES (a host rule with no single
+		// shipped answer — its fallback is the project's config — which a player resetting their mouse
+		// did not ask to change).
+		UTraceUserSettings::Get().ResetMouseToDefaults();
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] Mouse reset to defaults."));
 		break;
 
 	case EAction::Back:
@@ -3658,23 +4038,33 @@ void FTraceOptionsMenu::GoBack()
 	TraceAudio::PlayLocal2D(GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr,
 		TraceSoundEvents::UIBack);
 
+	// BACK LANDS ON THE DOOR THE PLAYER CAME THROUGH. Every return below rebuilds the parent page with
+	// the highlight on the row that opened this one (DoorFor), not on the parent's first row: coming
+	// back from CONTROLLER used to put a keyboard or pad player on CALL SIGN at the top of SETTINGS, and
+	// VIDEO -> BACK on RESUME, so they walked back down every time.
+	const EPage LeftPage = Page;
+	auto ReturnTo = [this, LeftPage](EPage Destination) -> bool
+	{
+		if (Destination != EPage::Root && Destination != EPage::Settings)
+		{
+			return false;
+		}
+		Page = Destination;
+		IgnoreInputBeforeFrame = GFrameCounter + 1;
+		RebuildRows(DoorFor(LeftPage));
+		return true;
+	};
+
 	if (Page == EPage::Audio)
 	{
 		// UI PLAN WP3 — "Save() on page close, same as every other page." The keyboard path already
 		// saves per press and the mouse path saves per release, so this is the belt-and-braces for a
-		// value changed by any route this class grows later. It is cheap and it is the difference
-		// between a fader that persists and one that persists usually.
+		// value changed by any route this class grows later.
 		UTraceUserSettings::Get().Save();
-
-		if (AudioReturnPage == EPage::Root || AudioReturnPage == EPage::Settings)
+		if (!ReturnTo(AudioReturnPage))
 		{
-			Page = AudioReturnPage;
-			IgnoreInputBeforeFrame = GFrameCounter + 1;
-			RebuildRows();
-			return;
+			Close();
 		}
-
-		Close();
 		return;
 	}
 
@@ -3687,64 +4077,27 @@ void FTraceOptionsMenu::GoBack()
 		{
 			ApplyVideo(/*bResolutionAffecting=*/true, /*bPersist=*/true);
 		}
-
-		if (VideoReturnPage == EPage::Root || VideoReturnPage == EPage::Settings)
+		if (!ReturnTo(VideoReturnPage))
 		{
-			Page = VideoReturnPage;
-			IgnoreInputBeforeFrame = GFrameCounter + 1;
-			RebuildRows();
-			return;
+			Close();
 		}
-
-		Close();
 		return;
 	}
 
-	if (Page == EPage::Controller)
+	// No queued apply to flush on any of these: every row on them is written and saved on the press or
+	// the mouse-up that made it (and the pad / key saves re-apply the mapping contexts through
+	// UTraceUserSettings::OnChanged); the loadout editor saves on the ENTER that made the slot.
+	if (Page == EPage::Controller || Page == EPage::Keyboard || Page == EPage::Loadouts || Page == EPage::Crosshair)
 	{
-		// No queued apply to flush, unlike the video page: every row on this page is written and saved
-		// on the press or the mouse-up that made it, and each of those saves already re-applied the
-		// pad's mapping context through UTraceUserSettings::OnChanged.
-		if (ControllerReturnPage == EPage::Root || ControllerReturnPage == EPage::Settings)
+		const EPage ParentPage =
+			(Page == EPage::Controller) ? ControllerReturnPage :
+			(Page == EPage::Keyboard)   ? KeyboardReturnPage :
+			(Page == EPage::Loadouts)   ? LoadoutsReturnPage :
+			                              CrosshairReturnPage;
+		if (!ReturnTo(ParentPage))
 		{
-			Page = ControllerReturnPage;
-			IgnoreInputBeforeFrame = GFrameCounter + 1;
-			RebuildRows();
-			return;
+			Close();
 		}
-
-		Close();
-		return;
-	}
-
-	if (Page == EPage::Loadouts)
-	{
-		// Nothing to flush: every slot is written and saved by the editor on the ENTER that made it.
-		if (LoadoutsReturnPage == EPage::Root || LoadoutsReturnPage == EPage::Settings)
-		{
-			Page = LoadoutsReturnPage;
-			IgnoreInputBeforeFrame = GFrameCounter + 1;
-			RebuildRows();
-			return;
-		}
-
-		Close();
-		return;
-	}
-
-	if (Page == EPage::Crosshair)
-	{
-		// No queued apply to flush, unlike the video page: every crosshair row is written and saved on
-		// the press or the mouse-up that made it, because none of them re-creates a swap chain.
-		if (CrosshairReturnPage == EPage::Root || CrosshairReturnPage == EPage::Settings)
-		{
-			Page = CrosshairReturnPage;
-			IgnoreInputBeforeFrame = GFrameCounter + 1;
-			RebuildRows();
-			return;
-		}
-
-		Close();
 		return;
 	}
 
@@ -3752,9 +4105,7 @@ void FTraceOptionsMenu::GoBack()
 	{
 		// Came in through the pause menu: step back to it rather than dropping the player straight
 		// into a firefight they did not ask to return to.
-		Page = EPage::Root;
-		IgnoreInputBeforeFrame = GFrameCounter + 1;
-		RebuildRows();
+		ReturnTo(EPage::Root);
 		return;
 	}
 
@@ -3994,11 +4345,11 @@ void FTraceOptionsMenu::DrawPerfReadout(AHUD* HUD, float RightX, float Y)
 		return;
 	}
 
-	// Amber below 45 fps, cyan above. The threshold is a judgement, not a measurement: this is a
+	// Amber below 45 fps, white above. The threshold is a judgement, not a measurement: this is a
 	// shooter, and the collaborator's report was about a build that was unplayable rather than one
 	// that was merely not smooth. It exists so the player can tell at a glance whether a change they
-	// just made moved them across the line, which is the entire point of putting this here.
-	const FLinearColor Color = (PerfFps < 45.f) ? TraceOptionsStyle::Amber : TraceOptionsStyle::Cyan;
+	// just made moved them across the line.
+	const FLinearColor Color = (PerfFps < 45.f) ? TraceMenuArtStyle::AmberLifted() : TraceMenuArtStyle::WordDefault;
 
 	const FString Line = (PerfGpuMs > 0.01f)
 		? TRACE_TEXTF("OPTIONS.VIDEO.PERF_READOUT_GPU", "{0} FPS    {1} MS    GPU {2} MS",
@@ -4007,21 +4358,185 @@ void FTraceOptionsMenu::DrawPerfReadout(AHUD* HUD, float RightX, float Y)
 		: TRACE_TEXTF("OPTIONS.VIDEO.PERF_READOUT", "{0} FPS    {1} MS",
 			{ FString::Printf(TEXT("%.0f"), PerfFps), FString::Printf(TEXT("%.2f"), PerfFrameMs) });
 
-	// BODY, not a header (spec v26 §2): this is a live READOUT of the page's own effect — the same
-	// class of thing as a row's value, and it is set in the same face the in-match HUD reports numbers
-	// in, which is the face a player is already reading frame times in during a match.
-	DrawTextRight(HUD, Line, Color, RightX, Y, FontSmall, 1.1f * UIScale, TraceOptionsMenuType::BodyFace);
+	// BODY, not a header (spec v26 §2): a live READOUT of the page's own effect, in the face the
+	// in-match HUD reports numbers in. @p Y is the title's cap centre line: it shares the title's line.
+	TraceOptionsMenuText::Draw(HUD, Line, RightX, Y, 12.f * UIScale, Color, TraceOptionsMenuType::BodyFace,
+		TraceText::EHAlign::Right);
 }
 
 // =================================================================================================
 // Draw
 // =================================================================================================
 
-void FTraceOptionsMenu::Draw(AHUD* HUD)
+namespace TraceOptionsMenuFile
 {
-	// Once per process, and on the first frame the panel is up rather than at module load: it forces
-	// the ten UI textures resident before the player can move a selection, and it puts a line in the
-	// log that says whether this screen is wearing the art or its fallbacks.
+	/** What the footer legend has to say, decided by the page and what it is doing right now. */
+	struct FLegendAsk
+	{
+		bool bNone = false;          // the pause root (D30: its legend is blank on purpose)
+		bool bKeyCapture = false;    // waiting for a key
+		bool bPadCapture = false;    // waiting for a pad button
+		bool bCallSign = false;      // typing a name
+		bool bUnbind = false;        // BKSP / Y unbinds on this page
+		bool bClear = false;         // BKSP / Y clears a saved slot on this page
+		bool bEdit = false;          // ENTER opens an editor rather than selecting
+		bool bPadLine = false;       // show the pad's line too
+	};
+
+	/** The legend's [KEY] VERB pairs, one list per device. Every word is the owner's to edit. */
+	static void BuildLegend(const FLegendAsk& Ask, TArray<FTraceKitLegendItem>& OutKeys,
+		TArray<FTraceKitLegendItem>& OutPad)
+	{
+		OutKeys.Reset();
+		OutPad.Reset();
+		if (Ask.bNone)
+		{
+			return;
+		}
+
+		const FString Cancel = TRACE_TEXT("OPTIONS.LEGEND.CANCEL", "CANCEL");
+		if (Ask.bKeyCapture || Ask.bPadCapture)
+		{
+			OutKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_BACK", "ESC"), Cancel });
+			if (Ask.bPadCapture)
+			{
+				// MENU/START is the one pad button the layout leaves unclaimed, so it is the pad's cancel.
+				OutPad.Add({ TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_CANCEL", "MENU"), Cancel });
+			}
+			return;
+		}
+
+		if (Ask.bCallSign)
+		{
+			OutKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_SELECT", "ENTER"), TRACE_TEXT("OPTIONS.LEGEND.SAVE", "SAVE") });
+			OutKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_BACK", "ESC"), Cancel });
+			return;
+		}
+
+		const FString Move = TRACE_TEXT("OPTIONS.LEGEND.MOVE", "MOVE");
+		const FString Select = Ask.bEdit ? TRACE_TEXT("OPTIONS.LEGEND.EDIT", "EDIT") : TRACE_TEXT("OPTIONS.LEGEND.SELECT", "SELECT");
+		const FString Back = TRACE_TEXT("OPTIONS.LEGEND.BACK", "BACK");
+		const FString ClearWord = Ask.bUnbind ? TRACE_TEXT("OPTIONS.LEGEND.UNBIND", "UNBIND")
+			: (Ask.bClear ? TRACE_TEXT("OPTIONS.LEGEND.CLEAR", "CLEAR") : FString());
+
+		OutKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_MOVE", "ARROWS"), Move });
+		OutKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_SELECT", "ENTER"), Select });
+		if (!ClearWord.IsEmpty())
+		{
+			OutKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_CLEAR", "BKSP"), ClearWord });
+		}
+		OutKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_BACK", "ESC"), Back });
+
+		if (Ask.bPadLine)
+		{
+			OutPad.Add({ TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_MOVE", "D-PAD"), Move });
+			OutPad.Add({ TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_SELECT", "A"), Select });
+			if (!ClearWord.IsEmpty())
+			{
+				OutPad.Add({ TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_CLEAR", "Y"), ClearWord });
+			}
+			OutPad.Add({ TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_BACK", "B"), Back });
+		}
+	}
+}
+
+namespace TraceOptionsMenuFile
+{
+	static FLegendAsk AskFor(bool bRoot, bool bKeyCapture, bool bPadCapture, bool bCallSign, bool bKeyboardPage,
+		bool bControllerPage, bool bLoadoutsPage, bool bSeenPad)
+	{
+		FLegendAsk Ask;
+		Ask.bNone = bRoot && !bKeyCapture && !bPadCapture;
+		Ask.bKeyCapture = bKeyCapture && !bPadCapture;
+		Ask.bPadCapture = bPadCapture;
+		Ask.bCallSign = bCallSign;
+		Ask.bUnbind = bKeyboardPage || bControllerPage;
+		Ask.bClear = bLoadoutsPage;
+		Ask.bEdit = bLoadoutsPage;
+		// The pad's line: always on the controller page (a player may have reached it with no keyboard),
+		// elsewhere once a pad has been seen on this machine — the loadout page's rule.
+		Ask.bPadLine = bControllerPage || bSeenPad;
+		return Ask;
+	}
+}
+
+float FTraceOptionsMenu::LegendHeight(APlayerController* PC) const
+{
+	namespace OL = TraceOptionsMenuLayout;
+
+	TArray<FTraceKitLegendItem> Keys;
+	TArray<FTraceKitLegendItem> PadKeys;
+	TraceOptionsMenuFile::BuildLegend(TraceOptionsMenuFile::AskFor(Page == EPage::Root, bCapturingKey,
+		bCapturingKey && bCapturingPadKey, CallSignEntry.IsActive(), Page == EPage::Keyboard,
+		Page == EPage::Controller, Page == EPage::Loadouts, TracePadMenu::HasSeenPad(PC)), Keys, PadKeys);
+
+	if (Keys.Num() == 0 && PadKeys.Num() == 0)
+	{
+		return 0.f;
+	}
+	const float Lines = OL::LegendChipH + ((Keys.Num() > 0 && PadKeys.Num() > 0) ? OL::LegendLineGap : 0.f);
+	return (OL::LegendTopGap + Lines) * UIScale;
+}
+
+void FTraceOptionsMenu::DrawLegend(AHUD* HUD, APlayerController* PC, float CenterX, float Y, float MaxW)
+{
+	namespace OL = TraceOptionsMenuLayout;
+
+	TArray<FTraceKitLegendItem> Keys;
+	TArray<FTraceKitLegendItem> PadKeys;
+	TraceOptionsMenuFile::BuildLegend(TraceOptionsMenuFile::AskFor(Page == EPage::Root, bCapturingKey,
+		bCapturingKey && bCapturingPadKey, CallSignEntry.IsActive(), Page == EPage::Keyboard,
+		Page == EPage::Controller, Page == EPage::Loadouts, TracePadMenu::HasSeenPad(PC)), Keys, PadKeys);
+
+	// ONE SCALE FOR BOTH LINES, the loadout page's rule: two legends at two sizes would read as a mistake.
+	const float FullChipH = OL::LegendChipH * UIScale;
+	const float ChipH = TraceMenuKit::KeyLegendFit(FullChipH, MaxW,
+		{ TraceMenuKit::KeyLegendWidth(Keys, FullChipH), TraceMenuKit::KeyLegendWidth(PadKeys, FullChipH) });
+
+	float LineY = Y;
+	if (Keys.Num() > 0)
+	{
+		TraceMenuKit::DrawKeyLegend(HUD, Keys, CenterX, LineY, ChipH, Now);
+		LineY += OL::LegendLineGap * UIScale;
+	}
+	TraceMenuKit::DrawKeyLegend(HUD, PadKeys, CenterX, LineY, ChipH, Now);
+}
+
+float FTraceOptionsMenu::LabelColumnFraction() const
+{
+	// The narrow pages give the label a little more of the row, so a two-word label still sits at
+	// its full size beside a slider.
+	return (Page == EPage::Crosshair || Page == EPage::Audio) ? 0.42f : 0.40f;
+}
+
+void FTraceOptionsMenu::DrawPlateFor(AHUD* HUD, ETraceKitState State, float X, float Y, float W, float H) const
+{
+	// Trace.Menu.Art 0 is the flat-fallback arm: the kit's own stand-in plate, every control still there.
+	if (TraceOptionsMenuArt::GEnabled == 0)
+	{
+		TraceMenuKit::DrawFallbackPlate(HUD, State, X, Y, W, H);
+		return;
+	}
+	TraceMenuKit::DrawStatePlate(HUD, State, X, Y, W, H, Now);
+}
+
+void FTraceOptionsMenu::DrawValueBoxFor(AHUD* HUD, float X, float Y, float W, float H, bool bEnabled) const
+{
+	const FLinearColor Tint = bEnabled ? FLinearColor::White : FLinearColor(0.45f, 0.45f, 0.45f, 1.f);
+	if (TraceOptionsMenuArt::GEnabled == 0)
+	{
+		HUD->DrawRect(TraceMenuArtStyle::PlateFill * Tint, X, Y, W, H);
+		return;
+	}
+	TraceMenuKit::DrawValueBoxPlate(HUD, X, Y, W, H, Tint);
+}
+
+void FTraceOptionsMenu::Draw(AHUD* HUD, APlayerController* PC)
+{
+	namespace OL = TraceOptionsMenuLayout;
+
+	// Once per process, and on the first frame the panel is up: a line in the log that says whether
+	// this screen is wearing the art or its fallbacks.
 	TraceOptionsMenuArt::LogOnce();
 
 #if !UE_BUILD_SHIPPING
@@ -4029,890 +4544,531 @@ void FTraceOptionsMenu::Draw(AHUD* HUD)
 	TraceOptionsMenuArt::LogReadiness(DrawsSinceOpen);
 #endif
 
-	// Dim whatever is behind us. In a match that is the arena; on the title screen it is the grid.
-	// Either way the panel has to be the only thing the eye can land on, and the arena in particular
-	// is a field of bright emissive strips that a translucent panel loses to.
-	HUD->DrawRect(FLinearColor(0.f, 0.008f, 0.018f, 0.88f), 0.f, 0.f, ViewW, ViewH);
+	const float S = UIScale;
+	const bool bRoot = (Page == EPage::Root);
+
+	// THE KIT'S SCRIM: black, over the match or the title. The arena is a field of bright emissive
+	// strips and the panel has to be the only thing the eye can land on.
+	TraceMenuKit::DrawScrim(HUD, ViewW, ViewH);
 
 	// ---- Panel geometry -------------------------------------------------------------------------
 	//
-	// The panel is sized to its CONTENT, not to the screen. Both pages share this class, and they are
-	// wildly different shapes: the settings page has sixteen rows, the pause root has four. A fixed
-	// 88%-of-height panel fitted the settings page and left the pause menu as four buttons stranded
-	// at the top of an enormous empty box — which is exactly what the first capture showed.
-	//
-	// So: ask for a comfortable row pitch, add it up, and only then clamp to the screen. The clamp
-	// bites on the settings page at 720p and nowhere else, and when it bites the pitch shrinks to fit
-	// rather than the last rows falling off the bottom.
-	const float TitleBlockH = 82.f * UIScale;      // title + rule + the gap under it
-	const float FooterH     = 44.f * UIScale;      // the key-hint line
-	const float PadY        = 14.f * UIScale;
-
+	// Sized to its CONTENT, then clamped to the screen: ask for a comfortable pitch, add it up, and
+	// only then shrink the pitch if it does not fit. The legend's height is part of the sum, and is
+	// zero on the pause root, which has no legend (D30) — so no dead band under QUIT.
+	const float LegendH = LegendHeight(PC);
+	const float TitleBlockH = OL::TitleBlock * S;
+	const float BottomH = OL::BottomPad * S + LegendH;
 	const int32 RowCount = FMath::Max(1, Rows.Num());
-	const float PreferredPitch = 44.f * UIScale;
+	const float PreferredPitch = (bRoot ? OL::RootPitch : OL::PreferredPitch) * S;
 
-	const float MaxPanelH = ViewH * 0.90f;
-	const float PanelH = FMath::Min(MaxPanelH, TitleBlockH + RowCount * PreferredPitch + FooterH + PadY);
+	const float PanelH = FMath::Min(ViewH * OL::PanelMaxH, TitleBlockH + RowCount * PreferredPitch + BottomH);
+	const float RowsRegion = FMath::Max(1.f, PanelH - TitleBlockH - BottomH);
+	const float Pitch = FMath::Clamp(RowsRegion / RowCount, OL::MinPitch * S, PreferredPitch);
+	const float RowH = bRoot ? FMath::Min(OL::RootRowH * S, Pitch * 0.85f) : Pitch * OL::RowFill;
 
-	// Whatever height survived the clamp is what the rows get to share.
-	const float RowsRegion = FMath::Max(1.f, PanelH - TitleBlockH - FooterH - PadY);
-	const float Pitch = FMath::Clamp(RowsRegion / RowCount, 18.f * UIScale, PreferredPitch);
-	const float RowH = Pitch * 0.86f;
-
-	// A page of four buttons does not want to be as wide as a page of sixteen labelled settings — and
-	// the video page is wider still, because its values are words rather than numbers: "WINDOWED
-	// FULLSCREEN" and "GLOBAL ILLUMINATION" have to fit on one line at 720p without the label and
-	// the value colliding in the middle.
-	float PanelW = FMath::Min(ViewW * 0.74f, 880.f * UIScale);
-	if (Page == EPage::Root)
+	// The pause root is the in-match MAIN MENU and wears the title screen's row metrics (60 tall on a
+	// 71 pitch). The pages are as wide as their longest label-and-value pair needs at 720p.
+	float PanelW = FMath::Min(ViewW * 0.74f, 880.f * S);
+	if (bRoot)
 	{
-		PanelW = FMath::Min(ViewW * 0.46f, 520.f * UIScale);
+		PanelW = FMath::Min(ViewW * 0.90f, (OL::RootRowW + OL::SideGutter * 2.f) * S);
 	}
 	else if (Page == EPage::Video)
 	{
-		PanelW = FMath::Min(ViewW * 0.86f, 1020.f * UIScale);
+		PanelW = FMath::Min(ViewW * 0.86f, 1020.f * S);
 	}
 	else if (Page == EPage::Crosshair)
 	{
-		// NARROWER THAN THE SETTINGS PAGE, to buy the room the preview sits in. Nine rows of short
-		// labels and short values ("SIZE  11 PX") do not need 880 px, and the preview is worth more
-		// than the whitespace it costs.
-		PanelW = FMath::Min(ViewW * 0.50f, 560.f * UIScale);
-	}
-	else if (Page == EPage::Controller)
-	{
-		// D31-PAD — WIDER THAN THE CROSSHAIR PAGE and as wide as the settings page. Its value column
-		// carries "D-PAD RIGHT" and "A  (DOWN)" against labels as long as "ABILITY (SECONDARY)", and
-		// at 720p those two meet in the middle of a 560px panel. Measured against the longest pair on
-		// the page rather than eyeballed, which is the same test the video page's width states.
-		PanelW = FMath::Min(ViewW * 0.74f, 880.f * UIScale);
+		// NARROWER, to buy the room the preview sits in beside it.
+		PanelW = FMath::Min(ViewW * 0.52f, 620.f * S);
 	}
 	else if (Page == EPage::Audio)
 	{
-		// UI PLAN WP3 — six rows of short labels and percentages. Same width as the crosshair page
-		// minus its preview allowance: wide enough that "SOUND EFFECTS" and "100%" cannot meet in the
-		// middle at 720p, narrow enough that three sliders do not read as three stranded lines.
-		PanelW = FMath::Min(ViewW * 0.56f, 620.f * UIScale);
+		PanelW = FMath::Min(ViewW * 0.60f, 680.f * S);
 	}
 
-	// ---- SPEC v29 §3 — the live preview, BESIDE the panel ---------------------------------------
+	// ---- SPEC v29 §3 — the crosshair's live preview, BESIDE the panel ----------------------------
 	//
-	// Beside and not inside, because the panel is sized to its ROWS: its height is RowCount * Pitch,
-	// and there is no row shape that can be four times its neighbours' height without breaking the
-	// pitch every hit rect on the page is computed from. A box to the right of the list needs none of
-	// that machinery and gets a preview big enough to judge a crosshair in.
-	//
-	// THE PAIR IS CENTRED, NOT THE PANEL. Otherwise the list stays put and the preview hangs off one
-	// side, which reads as an element that escaped its layout rather than as a two-column page.
-	//
-	// AND IT IS CONDITIONAL. At a small window the pair does not fit, and a preview that overlapped
-	// the panel would be worse than none — so the fit is tested and the page falls back to exactly
-	// the single centred panel every other page draws. Measured: it fits at 1280x720 (UIScale 0.667:
-	// 373 + 13 + 213 = 599 of 1229 available) and at 1920x1080 (560 + 20 + 320 = 900 of 1843).
+	// Beside and not inside, because the panel is sized to its rows. The PAIR is centred, and the
+	// preview is dropped when the pair does not fit (a preview overlapping the panel would be worse
+	// than none).
 	const bool bWantPreview = (Page == EPage::Crosshair);
-	const float PreviewGap = 20.f * UIScale;
-	const float PreviewW = FMath::Min(ViewW * 0.28f, 320.f * UIScale);
+	const float PreviewGap = 20.f * S;
+	const float PreviewW = FMath::Min(ViewW * 0.28f, 320.f * S);
 	const float PreviewH = FMath::Min(PreviewW, PanelH);
-
-	const bool bDrawPreview = bWantPreview
-		&& (PanelW + PreviewGap + PreviewW) <= (ViewW * 0.96f);
+	const bool bDrawPreview = bWantPreview && (PanelW + PreviewGap + PreviewW) <= (ViewW * 0.96f);
 
 	const float GroupW = bDrawPreview ? (PanelW + PreviewGap + PreviewW) : PanelW;
 	const float PanelX = (ViewW - GroupW) * 0.5f;
 	const float PanelY = (ViewH - PanelH) * 0.5f;
-
-	// The panel's own centre, not the screen's. Everything centred below — the title, the footer hint
-	// — belongs to the PANEL, and on the crosshair page the two are no longer the same pixel.
 	const float CX = PanelX + PanelW * 0.5f;
 
-	HUD->DrawRect(TraceOptionsStyle::Panel, PanelX, PanelY, PanelW, PanelH);
-	DrawFrame(HUD, PanelX, PanelY, PanelW, PanelH);
+	// A borderless black panel under the list, over the scrim. No bezel and no corner ticks: the kit
+	// has none, and a flat rect with a coloured edge is exactly what stylespec §0 rules out.
+	HUD->DrawRect(TraceOptionsMenuPalette::PanelFill, PanelX, PanelY, PanelW, PanelH);
 
 	if (bDrawPreview)
 	{
-		// After the panel, so the preview's own frame is never drawn under it, and before the rows so
-		// nothing about it can move a row rect. See DrawCrosshairPreview.
-		DrawCrosshairPreview(HUD, PanelX + PanelW + PreviewGap,
-			PanelY + (PanelH - PreviewH) * 0.5f, PreviewW, PreviewH);
+		DrawCrosshairPreview(HUD, PanelX + PanelW + PreviewGap, PanelY + (PanelH - PreviewH) * 0.5f, PreviewW, PreviewH);
 	}
 
 	// ---- Title ---------------------------------------------------------------------------------
+	//
+	// PAUSED only when the world really is paused. On a client, on a host with anybody connected, and
+	// over the team or loadout screen (which keep the world running for their auto-pick clock) the
+	// match goes on behind this panel, and a player reading PAUSED stands still while being shot.
 	FString Title = TRACE_TEXT("OPTIONS.TITLE.SETTINGS", "SETTINGS");
-	if (Page == EPage::Root)            { Title = TRACE_TEXT("OPTIONS.TITLE.PAUSED", "PAUSED"); }
-	else if (Page == EPage::Video)      { Title = TRACE_TEXT("OPTIONS.TITLE.VIDEO", "VIDEO"); }
-	else if (Page == EPage::Crosshair)  { Title = TRACE_TEXT("OPTIONS.TITLE.CROSSHAIR", "CROSSHAIR"); }
-	else if (Page == EPage::Loadouts)   { Title = TRACE_TEXT("OPTIONS.TITLE.LOADOUTS", "LOADOUTS"); }
-	else if (Page == EPage::Audio)      { Title = TRACE_TEXT("OPTIONS.TITLE.AUDIO", "AUDIO"); }
-	else if (Page == EPage::Controller) { Title = TRACE_TEXT("OPTIONS.TITLE.CONTROLLER", "CONTROLLER"); }
-
-	// SOFACHROME, and the spec names this string: "the word SETTINGS at the top of the settings page
-	// stays Sofachrome while the rows beneath it become Erbaum" (v26 §2). PAUSED and VIDEO are the
-	// same object on the other two pages.
-	const float TitleY = PanelY + (22.f * UIScale);
-	DrawTextCentered(HUD, Title, TraceOptionsStyle::Cyan, CX, TitleY, FontLarge, 1.9f * UIScale,
-		TraceOptionsMenuType::HeaderFace);
-
-	// The live readout, on the title line and only on the video page. Spec v11 §2: the collaborator
-	// could tell the build was slow and had no way to measure it, so every row on this page is a
-	// control whose effect is visible in the number sitting three inches above it. It is drawn last
-	// in reading order but first in importance, which is why it shares the title's line rather than
-	// being another row at the bottom of twenty-two.
-	if (Page == EPage::Video)
+	switch (Page)
 	{
-		DrawPerfReadout(HUD, PanelX + PanelW - (28.f * UIScale), TitleY + (14.f * UIScale));
+	case EPage::Root:
+		Title = bWorldPaused ? TRACE_TEXT("OPTIONS.TITLE.PAUSED", "PAUSED") : TRACE_TEXT("OPTIONS.TITLE.MENU", "MENU");
+		break;
+	case EPage::Video:      Title = TRACE_TEXT("OPTIONS.TITLE.VIDEO", "VIDEO"); break;
+	case EPage::Crosshair:  Title = TRACE_TEXT("OPTIONS.TITLE.CROSSHAIR", "CROSSHAIR"); break;
+	case EPage::Loadouts:   Title = TRACE_TEXT("OPTIONS.TITLE.LOADOUTS", "LOADOUTS"); break;
+	case EPage::Audio:      Title = TRACE_TEXT("OPTIONS.TITLE.AUDIO", "AUDIO"); break;
+	case EPage::Controller: Title = TRACE_TEXT("OPTIONS.TITLE.CONTROLLER", "CONTROLLER"); break;
+	case EPage::Keyboard:   Title = TRACE_TEXT("OPTIONS.TITLE.KEYBOARD", "KEYBOARD"); break;
+	default: break;
 	}
 
-	const float RuleY = TitleY + (46.f * UIScale);
-	HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.45f),
-		PanelX + (28.f * UIScale), RuleY, PanelW - (56.f * UIScale), FMath::Max(1.f, 1.5f * UIScale));
+	// SOFACHROME, white — "the word SETTINGS at the top of the settings page stays Sofachrome while the
+	// rows beneath it become Erbaum" (v26 §2).
+	const float TitleCapH = OL::TitleCap * S;
+	const float TitleMid = PanelY + OL::TitleTop * S + TitleCapH * 0.5f;
+	TraceOptionsMenuText::Draw(HUD, Title, CX, TitleMid, TitleCapH, TraceMenuArtStyle::WordDefault,
+		TraceOptionsMenuType::HeaderFace, TraceText::EHAlign::Center, PanelW - OL::SideGutter * 2.f * S);
+
+	// The live readout, on the title line and only on the video page (spec v11 §2): every row there
+	// is a control whose effect is visible in this number.
+	if (Page == EPage::Video)
+	{
+		DrawPerfReadout(HUD, PanelX + PanelW - OL::SideGutter * S, TitleMid);
+	}
 
 	// ---- Rows ----------------------------------------------------------------------------------
-	const float RowsTop = RuleY + (14.f * UIScale);
-	const float RowX = PanelX + (28.f * UIScale);
-	const float RowW = PanelW - (56.f * UIScale);
+	const float RowsTop = PanelY + TitleBlockH;
+	const float RowX = PanelX + OL::SideGutter * S;
+	const float RowW = PanelW - OL::SideGutter * 2.f * S;
 
 	for (int32 Index = 0; Index < Rows.Num(); ++Index)
 	{
-		DrawRow(HUD, Rows[Index], RowX, RowsTop + Index * Pitch, RowW, RowH, Index == Selected);
+		DrawRow(HUD, Rows[Index], RowX, RowsTop + Index * Pitch + (Pitch - RowH) * 0.5f, RowW, RowH, Index == Selected);
 	}
 
-	// ---- Footer --------------------------------------------------------------------------------
-	FString Hint;
-	if (bCapturingKey && bCapturingPadKey)
+	// ---- Footer: the kit's KEY legend ----------------------------------------------------------
+	if (LegendH > 0.f)
 	{
-		// D31-PAD — a different sentence, because a different thing is being asked for and a
-		// different key cancels. A player at this prompt may have no keyboard in reach at all, so the
-		// legend has to name the pad's own cancel.
-		Hint = TRACE_TEXT("OPTIONS.HINT.CAPTURE_PAD_BUTTON",
-			"PRESS A CONTROLLER BUTTON          MENU / ESC   CANCEL");
-	}
-	else if (bCapturingKey)
-	{
-		Hint = TRACE_TEXT("OPTIONS.HINT.CAPTURE_KEY", "PRESS ANY KEY TO BIND          ESC   CANCEL");
-	}
-	else if (Page == EPage::Root)
-	{
-		// D30 — BLANK ON PURPOSE, and only on this page. The owner asked for "the text at the bottom:
-		// close trace, w/s..." to go, and the PAUSED root's legend was the same sentence in the same
-		// place as the title screen's: "W / S OR ARROWS MOVE   ENTER SELECT   ESC RESUME". Arrow keys
-		// moving a highlight and Esc closing a pause menu are the two things a player will try first.
-		//
-		// THE OTHER FOUR BRANCHES STAY, and that is a distinction rather than an oversight. Each of
-		// them names a key the screen would otherwise never mention: BKSP unbinds, ESC cancels an
-		// in-progress rebind instead of leaving the page, ENTER commits a call sign. A player cannot
-		// discover any of those by pressing something and watching what happens.
-		Hint = FString();
-	}
-	else if (CallSignEntry.IsActive())
-	{
-		// UI PLAN WP2.2 — while the field owns the keyboard the page's own legend is a lie: ESC is
-		// cancel-the-edit rather than back-a-page, and the arrows move a caret rather than a
-		// selection. The footer says what the keys do RIGHT NOW, exactly as the rebind capture's does
-		// three branches up.
-		Hint = TRACE_TEXT("OPTIONS.HINT.CALL_SIGN_ENTRY",
-			"TYPE YOUR CALL SIGN          ENTER   SAVE          ESC   CANCEL");
-	}
-	else if (Page == EPage::Controller)
-	{
-		// D31-PAD — the pad's own legend, in the pad's own vocabulary. A player who reached this page
-		// with a controller cannot use a legend that names ARROWS, ENTER and BKSP; a player who
-		// reached it with a keyboard still has all three, and PollNavigation accepts both sets.
-		Hint = TRACE_TEXT("OPTIONS.HINT.CONTROLLER_PAGE",
-			"D-PAD  MOVE / ADJUST      A  SELECT      Y  UNBIND      B  BACK");
-	}
-	else if (Page == EPage::Video || Page == EPage::Crosshair || Page == EPage::Audio)
-	{
-		// No BKSP/UNBIND on any of these three — there is nothing to unbind — and the hint says so
-		// rather than offering a key that does nothing.
-		Hint = TRACE_TEXT("OPTIONS.HINT.NO_UNBIND_PAGES",
-			"ARROWS  MOVE / ADJUST          ENTER  SELECT          ESC  BACK");
-	}
-	else
-	{
-		Hint = TRACE_TEXT("OPTIONS.HINT.SETTINGS_PAGE",
-			"ARROWS  MOVE / ADJUST      ENTER  SELECT      BKSP  UNBIND      ESC  BACK");
+		DrawLegend(HUD, PC, CX, PanelY + PanelH - OL::BottomPad * S - LegendH + OL::LegendTopGap * S,
+			PanelW - OL::SideGutter * 2.f * S);
 	}
 
-	// BODY (spec v26 §2). The footer is a key legend — "BKSP UNBIND" is the same kind of string as the
-	// key names in the rows above it, and it is read at a glance rather than scanned as a heading.
-	//
-	// Guarded since D30 emptied the PAUSED page's legend: TraceText would lay an empty string out as
-	// one blank line box, which costs nothing to look at but does put a draw call and an atlas
-	// measure on every frame of the pause menu for a string with no glyphs in it.
-	if (!Hint.IsEmpty())
-	{
-		DrawTextCentered(HUD, Hint, TraceOptionsStyle::InkDim, CX,
-			PanelY + PanelH - (30.f * UIScale), FontSmall, 1.0f * UIScale, TraceOptionsMenuType::BodyFace);
-	}
-
-	DrawCursor(HUD);
+	DrawCursor(HUD, PC);
 }
 
 void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W, float H, bool bSelected)
 {
+	namespace OL = TraceOptionsMenuLayout;
+
+	// Every rect this row owns is rewritten by this draw, or left invalid — a stale rect from another
+	// page's layout is a click target with nothing under it.
 	Row.Rect = FBox2D(FVector2D(X, Y), FVector2D(X + W, Y + H));
 	Row.Track = FBox2D(ForceInit);
+	Row.ArrowLeft = FBox2D(ForceInit);
+	Row.ArrowRight = FBox2D(ForceInit);
+	for (int32 Chip = 0; Chip < UTraceUserSettings::MaxKeysPerAction; ++Chip)
+	{
+		Row.KeyChip[Chip] = FBox2D(ForceInit);
+	}
 
-	const float PadX = 16.f * UIScale;
-	const float LabelScale = FMath::Min(1.15f, H / (26.f * UIScale)) * UIScale;
-	const float TextY = Y + (H - MeasureHeight(HUD, TEXT("X"), FontMedium, LabelScale)) * 0.5f;
+	const float S = UIScale;
+	const float MidY = Y + H * 0.5f;
+	const ETraceTextWeight Body = TraceOptionsMenuType::BodyFace;
+	const float BodyCapH = H * OL::BodyCap;
+
+	// DrawLabel sizes a word by its PLATE (caps = 0.37 of it); this is the plate height whose caps are
+	// the body's 0.34 of the row, so every body word on the page shares one cap height.
+	const float BodyPlateH = H * (OL::BodyCap / TraceMenuKit::LabelCapFraction);
+
+	// A value row's two halves: the label plate (the sheet's wide KEYBIND plate), then its control.
+	const float LabelW = W * LabelColumnFraction();
+	const float ControlX = X + LabelW + OL::ColumnGap * S;
+	const float ControlRight = X + W;
+	const float ControlW = FMath::Max(0.f, ControlRight - ControlX);
+
+	// The KEY chip columns: two, both ALWAYS reserved, so a row gaining its "+" chip when it is hovered
+	// moves nothing (the primary chip used to jump ~90 px left and shrink under a sweeping pointer).
+	const float ChipGapPx = OL::ChipGap * S;
+	const float ChipW = FMath::Max(1.f, FMath::Min(OL::ChipMaxW * S, (ControlW - ChipGapPx) * 0.5f));
+	const float ChipRightX = ControlRight - ChipW;             // slot 1
+	const float ChipLeftX = ChipRightX - ChipGapPx - ChipW;    // slot 0, and the pad page's one chip
 
 	// ---- Header --------------------------------------------------------------------------------
+	//
+	// A caption, not a control: Sofachrome in white at half strength, with a faint hairline running
+	// to the edge. The KEYBOARD page's first row captions its two columns instead (KEYBIND over the
+	// labels, KEY over the chips) — the sheet's own two words, which is where they came from.
 	if (Row.Kind == ERowKind::Header)
 	{
-		if (Row.Label.IsEmpty())
+		const float CapH = FMath::Min(OL::HeaderCap * S, H * 0.42f);
+		const float CapMid = Y + H * 0.62f;
+
+		if (Row.bColumnCaptions)
 		{
+			TraceOptionsMenuText::Draw(HUD, Row.Label, X + LabelW * 0.5f, CapMid, CapH,
+				TraceOptionsMenuPalette::Caption, TraceOptionsMenuType::HeaderFace, TraceText::EHAlign::Center);
+			TraceOptionsMenuText::Draw(HUD, TRACE_TEXT("OPTIONS.SETTINGS.COL_KEY", "KEY"),
+				ChipLeftX + (ChipRightX + ChipW - ChipLeftX) * 0.5f, CapMid, CapH,
+				TraceOptionsMenuPalette::Caption, TraceOptionsMenuType::HeaderFace, TraceText::EHAlign::Center);
 			return;
 		}
 
-		const float Gap = 10.f * UIScale;
-		float RuleLeft = 0.f;
-		float RuleRight = X + W;
-		bool bWordsDrawn = false;
-
-		// THE CONTROLS HEADER IS WHERE THE ARTIST'S LETTERING BELONGS. KEYBIND and KEY were cut off
-		// the sheet as a left/right pair on one row — a wide label plate beside a narrow key chip —
-		// which is exactly the two columns every Binding row underneath this one is laid out in. They
-		// are drawn INSTEAD of the word "CONTROLS", not beside it: at a 24px row there is no room for
-		// three labels, and "KEYBIND ......... KEY" is what those columns actually are.
-		//
-		// FRow::Label is untouched. DebugGetRowRect and the click harness match on it, and nothing
-		// about this is allowed to be a contract change.
-		// SPEC v22 §A1 RETIRED THE SPRITES HERE TOO. This branch used to blit the artist's baked
-		// T_MenuWord_Keybind and T_MenuWord_Key, which is why the shipped settings page had TWO faces
-		// on it: those two words in the artist's squared lettering and the nineteen rows under them in
-		// the engine's stand-in font, four pixels apart. The page can type in the artist's face now,
-		// so the header is typed like everything else and the two-column KEYBIND / KEY layout — which
-		// is the part that was actually worth keeping — survives unchanged.
-		//
-		// The sprites stay in the repo and stay loadable, exactly as A1 asks. Nothing draws them.
-		if (Row.Label.Equals(TEXT("CONTROLS"), ESearchCase::IgnoreCase))
+		if (Row.Label.IsEmpty())
 		{
-			const FLinearColor WordTint = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.80f);
-			const float ValueRightHdr = X + W - PadX;
-
-			// SOFACHROME (spec v26 §2). These two are HEADERS in the strongest sense available on this
-			// page: they are drawn instead of the word CONTROLS, and they name the two COLUMNS that
-			// every Binding row below them is laid out in. The key names under KEY are Erbaum; the
-			// word KEY is not.
-			TraceOptionsMenuType::Draw(HUD, TRACE_TEXT("OPTIONS.SETTINGS.COL_KEYBIND", "KEYBIND"), WordTint, X, TextY, FontSmall, 1.0f * UIScale,
-				TraceOptionsMenuType::HeaderFace);
-			TraceOptionsMenuType::Draw(HUD, TRACE_TEXT("OPTIONS.SETTINGS.COL_KEY", "KEY"), WordTint, ValueRightHdr, TextY, FontSmall,
-				1.0f * UIScale, TraceOptionsMenuType::HeaderFace, TraceText::EHAlign::Right);
-
-			// The rule has to stop short at BOTH ends, or it strikes straight through KEY. Measured in
-			// the face the words were just DRAWN in — Erbaum is a third narrower than Sofachrome, so
-			// measuring in the wrong one is exactly the strike-through this line exists to avoid.
-			RuleLeft = X + MeasureWidth(HUD, TRACE_TEXT("OPTIONS.SETTINGS.COL_KEYBIND", "KEYBIND"), FontSmall, 1.0f * UIScale,
-				TraceOptionsMenuType::HeaderFace) + Gap;
-			RuleRight = ValueRightHdr - MeasureWidth(HUD, TRACE_TEXT("OPTIONS.SETTINGS.COL_KEY", "KEY"), FontSmall, 1.0f * UIScale,
-				TraceOptionsMenuType::HeaderFace) - Gap;
-			bWordsDrawn = true;
+			return;   // AddSpacer: a deliberate blank row
 		}
 
-		if (!bWordsDrawn)
+		const float Drawn = TraceOptionsMenuText::Draw(HUD, Row.Label, X, CapMid, CapH,
+			TraceOptionsMenuPalette::Caption, TraceOptionsMenuType::HeaderFace, TraceText::EHAlign::Left);
+		const float RuleLeft = X + Drawn + 12.f * S;
+		if (ControlRight > RuleLeft)
 		{
-			// DISPLAY, MOUSE, GAMEPLAY... — "HEADERS anywhere" (spec v26 §2). Same treatment as the
-			// panel title one level up, and measured in the same face for the same reason.
-			TraceOptionsMenuType::Draw(HUD, Row.Label,
-				TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.75f),
-				X, TextY, FontSmall, 1.0f * UIScale, TraceOptionsMenuType::HeaderFace);
-
-			RuleLeft = X + MeasureWidth(HUD, Row.Label, FontSmall, 1.0f * UIScale,
-				TraceOptionsMenuType::HeaderFace) + Gap;
-		}
-
-		if (RuleRight > RuleLeft)
-		{
-			HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.20f),
-				RuleLeft, Y + H * 0.5f, RuleRight - RuleLeft, FMath::Max(1.f, 1.f * UIScale));
+			HUD->DrawRect(TraceOptionsMenuPalette::Rule, RuleLeft, CapMid, ControlRight - RuleLeft, FMath::Max(1.f, S));
 		}
 		return;
 	}
 
 	// ---- Note ----------------------------------------------------------------------------------
 	//
-	// Amber, indented under the row it belongs to, with no plate. Amber is the palette's "this is
-	// the one you want" colour and it is spent here deliberately: on a page of nineteen controls
-	// the eye needs to be told which one is worth more than the other eighteen.
+	// A line of prose under the row it belongs to, in the kit's quiet grey and the body face, with no
+	// plate. Not amber: amber is the hover ring's colour on this kit, and a note is not selectable.
 	if (Row.Kind == ERowKind::Note)
 	{
-		// BODY (spec v26 §2). A Note is a SENTENCE about the control above it — prose, indented under
-		// its row, the least heading-like string on the page.
-		TraceOptionsMenuType::Draw(HUD, Row.Label,
-			TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, 0.78f),
-			X + PadX, TextY, FontSmall, 1.0f * UIScale, TraceOptionsMenuType::BodyFace);
+		TraceOptionsMenuText::Draw(HUD, Row.Label, X + 4.f * S, MidY, H * OL::NoteCap,
+			TraceOptionsMenuPalette::Note, Body, TraceText::EHAlign::Left, W - 8.f * S);
 		return;
 	}
 
-	// ---- Plate ---------------------------------------------------------------------------------
+	// ---- The row's state: the kit's switch -------------------------------------------------------
 	//
-	// The artist's own button plate, one sprite per state, landed exactly on the row rect the mouse
-	// already hit-tests. This is what makes a row here the same object as a row on the title screen —
-	// and because the pause root is nothing but Action rows, it is also what puts the art in front of
-	// a player who pressed Escape mid-match.
-	//
-	// The three states are the sheet's three states and they differ in the PLATE, not in the word:
-	// default is a bare navy plate, hover adds the amber ring, disabled is near-black with a grey one.
-	// So the selected row is marked by its ring and by a BRIGHTER label, never by a dimmer one — spec
-	// v20 §0.5 is what happens when a decorative hover tint gets promoted to a selection indicator.
-	bool bPlateDrawn = false;
-	{
-		// The plate from the kit's one state switch. The TINT below is still this page's own (it knocks
-		// unselected rows back); converting that onto the kit's is a visual change, and not this one.
-		const FTraceKitVisuals RowVisuals = TraceMenuKit::VisualsFor(TraceMenuKit::StateFor(Row.bEnabled, bSelected));
+	// PRESSED while the mouse button is down on this row, and on the row that was pressed to leave
+	// (RETURN TO TITLE / QUIT) for as long as the overlay waits for the travel.
+	const bool bPressed = bSelected && ((PressedRow != INDEX_NONE && Rows.IsValidIndex(PressedRow)
+		&& &Rows[PressedRow] == &Row && bMouseWasDown && !bDraggingSlider) || bLeaving);
+	const ETraceKitState State = TraceMenuKit::StateFor(Row.bEnabled, bSelected, bPressed);
+	const FTraceKitVisuals Visuals = TraceMenuKit::VisualsFor(State);
 
-		if (UTexture2D* Plate = TraceOptionsMenuArt::Sprite(RowVisuals.Plate))
-		{
-			// Unselected rows are knocked back rather than the selected row being knocked forward: a
-			// page of thirty plates all at full strength is a wall, and the eye needs the selected one
-			// to be the brightest thing in the list.
-			const FLinearColor Tint = !Row.bEnabled
-				? FLinearColor(0.80f, 0.80f, 0.80f, 0.75f)
-				: (bSelected ? FLinearColor::White : FLinearColor(0.78f, 0.78f, 0.78f, 0.90f));
-
-			bPlateDrawn = TraceMenuKit::DrawPlate(HUD, Plate, TraceMenuArtStyle::ButtonFrame, X, Y, W, H, H, Tint);
-		}
-	}
-	if (!bPlateDrawn)
-	{
-		HUD->DrawRect(FLinearColor(0.f, 0.02f, 0.04f, bSelected ? 0.85f : 0.45f), X, Y, W, H);
-	}
-
-	if (bSelected)
-	{
-		const float Pulse = 0.72f + 0.28f * FMath::Sin(Now * 4.5f);
-
-		// A wash, never a dim: this only ever ADDS light to the selected plate. The pulse rides on the
-		// wash and on the marker, not on the plate itself, so a before/after capture of the selected
-		// row cannot be moved by more than a few percent by the phase it was caught at.
-		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.10f * Pulse), X, Y, W, H);
-
-		// A SOLID RAIL ON THE LEADING EDGE — the same mark, in the same place, as the UMG title row
-		// (spec v22 §A4, UI/Widgets/Menu/TraceMenuRowWidget.cpp), and for the same reason.
-		//
-		// This slot drew the artist's T_MenuBack crescent until this pass. A4 replaced it on the title
-		// screen because a tapered stroke at ~20 px stops reading as a pointer and starts reading as a
-		// stray ")" — and then left this page still drawing it, so pressing SETTINGS swapped the mark
-		// for the thing A4 had just removed. Photographed at 1920x1080 beside VIDEO SETTINGS in
-		// v22integ_03_settings_open.png before this change.
-		//
-		// A filled bar has no small-size failure mode; this is a rectangle rather than the title row's
-		// rounded capsule only because there is no Slate brush on a Canvas and a 9-px-wide rounded end
-		// is under one pixel of difference at this size. Height is tied to the row, not to a constant,
-		// so it tracks the 18px row this page clamps to at 720p as well as the full-height one.
-		const float MarkW = FMath::Max(3.f, 5.f * UIScale);
-		const float MarkH = H * 0.66f;
-		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, Pulse),
-			X - MarkW - (6.f * UIScale), Y + (H - MarkH) * 0.5f, MarkW, MarkH);
-	}
-
-	// A greyed row is not a selected row and cannot be, so this collapses to two states, not four.
-	const FLinearColor LabelColor = !Row.bEnabled
-		? TraceOptionsStyle::WithAlpha(TraceOptionsStyle::InkDim, 0.45f)
-		: (bSelected ? TraceOptionsStyle::Ink : TraceOptionsStyle::InkDim);
-
-	// Action rows are buttons; centring their label is what makes them read as one.
+	// ---- Action rows: a whole kit button ---------------------------------------------------------
 	if (Row.Kind == ERowKind::Action)
 	{
-		// Sofachrome on the pause ROOT, Erbaum on the settings and video pages. See FaceForAction().
-		const ETraceTextWeight ActionFace = FaceForAction();
+		DrawPlateFor(HUD, State, X, Y, W, H);
 
-		// AUTO-DETECT is the row a confused player on a weak machine should press, so it is the only
-		// button on the page drawn in amber with a plate behind it — everything else here is a list.
-		if (Row.Action == EAction::AutoDetectQuality)
+		FString Text = Row.Label;
+		if (IsArmedRow(Row))
 		{
-			const bool bMeasuring = bAutoDetectPending;
-			HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, bSelected ? 0.30f : 0.16f), X, Y, W, H);
-
-			const FString Text = bMeasuring
-				? TRACE_TEXT("OPTIONS.VIDEO.AUTO_DETECT_MEASURING", "MEASURING THIS MACHINE...")
-				: Row.Label;
-			DrawTextCentered(HUD, Text, bMeasuring ? FLinearColor::White : TraceOptionsStyle::Amber,
-				X + W * 0.5f, TextY, FontMedium, LabelScale, ActionFace);
-			return;
+			// The two-step confirm: the row IS the question until it is answered or abandoned.
+			Text = (ArmedAction == EAction::ClearLoadoutSlot)
+				? TRACE_TEXTF("OPTIONS.LOADOUTS.CONFIRM_CLEAR", "CLEAR {0}?", { Row.SlotIndex + 1 })
+				: FString(TRACE_TEXT("OPTIONS.ROW.RESET_CONFIRM", "CONFIRM RESET"));
+		}
+		else if (Row.Action == EAction::AutoDetectQuality && bAutoDetectPending)
+		{
+			// Swapped for the one frame before the benchmark blocks, so the stall is explained.
+			Text = TRACE_TEXT("OPTIONS.VIDEO.AUTO_DETECT_MEASURING", "MEASURING THIS MACHINE...");
 		}
 
-		DrawTextCentered(HUD, Row.Label, LabelColor, X + W * 0.5f, TextY, FontMedium, LabelScale, ActionFace);
+		// Sofachrome at the kit's own size on the pause root (the in-match main menu); the body face
+		// at the page's body size on the submenus. See FaceForAction.
+		const ETraceTextWeight Face = FaceForAction();
+		const float WordPlateH = (Face == TraceOptionsMenuType::HeaderFace) ? H : BodyPlateH;
+		TraceMenuKit::DrawLabel(HUD, Text, X + W * 0.5f, MidY, WordPlateH, Visuals.Label, W - H * 0.6f, Face);
 		return;
 	}
 
-	// THE ROW LABEL — MOUSE SENSITIVITY, MOVE FORWARD, RESOLUTION SCALE. Erbaum Bold: this is the
-	// "settings / submenu body text, keybind rows" the owner asked for, and it is the string that
-	// makes the change visible (spec v26 §2).
-	TraceOptionsMenuType::Draw(HUD, Row.Label, LabelColor, X + PadX, TextY, FontMedium, LabelScale,
-		TraceOptionsMenuType::BodyFace);
+	// ---- Value rows: the label plate ---------------------------------------------------------------
+	DrawPlateFor(HUD, State, X, Y, LabelW, H);
+	TraceMenuKit::DrawLabel(HUD, Row.Label, X + LabelW * 0.5f, MidY, BodyPlateH, Visuals.Label, LabelW - H * 0.6f, Body);
 
-	// ---- Value ---------------------------------------------------------------------------------
-	const float ValueRight = X + W - PadX;
-	const float ValueColW = 96.f * UIScale;
+	// The value's own word: white, the lifted olive on the selected row (never cyan), grey when greyed.
+	const FLinearColor ValueColor = !Row.bEnabled ? TraceMenuArtStyle::WordDisabled
+		: (bSelected ? TraceMenuArtStyle::WordHoverLifted() : TraceMenuArtStyle::WordDefault);
+	const float BoxH = H * OL::ValueBoxFill;
+	const float BoxY = MidY - BoxH * 0.5f;
 
+	// ---- KEY chips (the keyboard page) ------------------------------------------------------------
+	//
+	// SPEC v28 §3c — "up to TWO keybinds per action, both editable": two chips, the primary on the
+	// left. A chip is the button plate at the sheet's KEY size: HOVER when it is the chip ENTER and
+	// BKSP will act on (the active chip of the selected row) or the one waiting for a key; DEFAULT
+	// holding a key; the dark DISABLED plate when it is empty (UNBOUND, or the "+" where a second
+	// bind would go) — empty is what that plate says.
 	if (Row.Kind == ERowKind::Binding)
 	{
-		// ---- SPEC v28 §3c — TWO CHIPS, LAID OUT RIGHT TO LEFT ------------------------------------
-		//
-		// "Up to TWO keybinds per action, both editable in the settings page." Two chips is what makes
-		// the second bind a thing the player can SEE; without it a slot they cannot point at is a slot
-		// that does not exist as far as the page is concerned.
-		//
-		// SLOT 1 IS DRAWN ONLY WHEN IT HAS SOMETHING TO SAY: it holds a key, or the row is selected (so
-		// the player can see where a second bind would go and aim at it), or it is the slot being
-		// captured right now. Seventeen rows each carrying a permanent empty box would make the page read
-		// as half-broken, and sixteen of the seventeen ship with one key.
 		const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
-		const int32 ActiveSlot = bSelected ? ActiveBindingSlot() : 0;
+		const int32 ActiveSlot = bSelected ? ActiveBindingSlot() : INDEX_NONE;
 
-		const float ChipGap = 6.f * UIScale;
-		const float ChipY = Y + H * 0.14f;
-		const float ChipH = H * 0.72f;
-
-		// Right to left, so slot 1 keeps the position the single chip has always had when there is no
-		// second bind — nothing on this page moves for a player who never uses the feature.
-		float NextRight = ValueRight;
-
-		for (int32 Slot = UTraceUserSettings::MaxKeysPerAction - 1; Slot >= 0; --Slot)
+		for (int32 Chip = 0; Chip < UTraceUserSettings::MaxKeysPerAction; ++Chip)
 		{
-			Row.KeyChip[Slot] = FBox2D(ForceInit);
+			const float ChipX = (Chip == 0) ? ChipLeftX : ChipRightX;
+			const bool bWaiting = bCapturingKey && !bCapturingPadKey && CapturingAction == Row.Binding
+				&& CapturingSlot == Chip;
+			const FKey Key = UserSettings.GetKey(Row.Binding, Chip);
+			const bool bActive = (Chip == ActiveSlot);
+			const FBox2D ChipRect(FVector2D(ChipX, Y), FVector2D(ChipX + ChipW, Y + H));
 
-			const bool bWaiting = bCapturingKey && CapturingAction == Row.Binding && CapturingSlot == Slot;
-			const FKey Key = UserSettings.GetKey(Row.Binding, Slot);
+			// UI PLAN WP6.3 — THE THROW ROW IS NOT UNBOUND WHILE FIRE HAS A KEY: fire throws (at a goal)
+			// and passes (in an endzone) while carrying the Core, so this row is an optional second
+			// route. Said as a note in the chip's column rather than as a chip — a sentence is not a key
+			// — and it names FIRE's actual key rather than assuming LMB. With fire unbound too, the row
+			// really is unbound and gets the normal UNBOUND chip.
+			const bool bPassNote = (Chip == 0 && !bWaiting && !Key.IsValid() && Row.Binding == ETraceInputAction::Pass
+				&& UserSettings.GetKey(ETraceInputAction::Fire, 0).IsValid());
+			if (bPassNote)
+			{
+				// The note may run on into the second column while that column has nothing in it.
+				const bool bSecondInUse = UserSettings.GetKey(Row.Binding, 1).IsValid() || ActiveSlot == 1
+					|| (bCapturingKey && CapturingAction == Row.Binding);
+				TraceOptionsMenuText::Draw(HUD,
+					TRACE_TEXTF("OPTIONS.KEYBIND.PASS_VIA_FIRE", "{0}  (WHILE CARRYING)",
+						{ UTraceUserSettings::DescribeKey(UserSettings.GetKey(ETraceInputAction::Fire, 0)) }),
+					ChipX + H * 0.25f, MidY, BodyCapH * 0.85f,
+					bActive ? TraceMenuArtStyle::WordHoverLifted() : TraceOptionsMenuPalette::Note,
+					Body, TraceText::EHAlign::Left, (bSecondInUse ? ChipW : ChipW * 2.f + ChipGapPx) - H * 0.25f);
+				Row.KeyChip[Chip] = ChipRect;   // still a live target: the row IS bindable
+				continue;
+			}
 
-			const bool bShow = (Slot == 0) || bWaiting || Key.IsValid() || bSelected;
-			if (!bShow)
+			// SLOT 1 IS DRAWN ONLY WHEN IT HAS SOMETHING TO SAY: a key, the capture, or the selected
+			// row's "+" invitation (on the THROW row, only once the highlight is on it — its note uses
+			// that column). The column is reserved either way, so nothing else on the row moves.
+			const bool bInvite = bSelected && (Row.Binding != ETraceInputAction::Pass || bActive);
+			if (Chip > 0 && !bWaiting && !Key.IsValid() && !bInvite)
 			{
 				continue;
 			}
 
-			FString ValueText;
-			FLinearColor ValueColor;
-
-			/**
-			 * WP6.3 — set for the ONE case that is a sentence rather than a key: the PASS row's empty
-			 * first slot. A sentence does not go in a key chip. See the branch below.
-			 */
-			bool bPassNote = false;
-
+			FString ChipText;
+			ETraceKitState ChipState = ETraceKitState::Default;
+			FLinearColor ChipColor = FLinearColor::White;
 			if (bWaiting)
 			{
-				ValueText = TRACE_TEXT("OPTIONS.KEYBIND.PRESS_A_KEY", "PRESS A KEY");
-				ValueColor = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, 0.6f + 0.4f * FMath::Sin(Now * 9.f));
-			}
-			else if (Key.IsValid())
-			{
-				ValueText = UTraceUserSettings::DescribeKey(Key);
-				ValueColor = TraceOptionsStyle::Ink;
-			}
-			else if (Slot == 0 && Row.Binding == ETraceInputAction::Pass)
-			{
-				// ---- UI PLAN WP6.3 — THE PASS ROW IS NOT UNBOUND, IT IS ALREADY BOUND -------------
-				//
-				// Spec v25 §7 deliberately left this action with no default key, because mouse 1
-				// ALREADY throws (at a goal) and passes (in an endzone) while you are carrying the
-				// Core — see ETraceInputAction::Pass in Settings/TraceUserSettings.h. This row is the
-				// OPTIONAL second route to a verb the player already has.
-				//
-				// Drawn as amber UNBOUND, that read as "the central mechanic of this game is broken",
-				// which is precisely what the release audit reported (§4.3). So the row states the
-				// truth instead, in INK-DIM: informational, not alarm. The second slot's "+" is
-				// untouched below, so an optional extra bind is still one click away.
-				//
-				// EVERY OTHER unbound action keeps the amber UNBOUND, because there it really is a
-				// problem — this is one action's fact, not a change to what "unbound" means.
-				//
-				// AND IT IS NOT PUT IN A CHIP. A key chip is a plate around a KEY NAME, sized to it;
-				// this string is four times the width of "LEFT SHIFT" and a chip stretched to hold it
-				// would eat the row's label at 720p — and would also make the sentence look like a
-				// bindable thing, which is the opposite of what it says. It is set as right-aligned
-				// prose, in the same column, at the same baseline.
-				ValueText = TRACE_TEXT("OPTIONS.KEYBIND.PASS_ALREADY_BOUND", "LMB  (WHILE CARRYING)");
-				ValueColor = TraceOptionsStyle::InkDim;
-				bPassNote = true;
-			}
-			else if (Slot == 0)
-			{
-				// Amber for UNBOUND: it is not an error, but the player should not be able to miss it.
-				ValueText = UTraceUserSettings::DescribeKey(Key);
-				ValueColor = TraceOptionsStyle::Amber;
+				ChipText = TRACE_TEXT("OPTIONS.KEYBIND.PRESS_A_KEY", "PRESS A KEY");
+				ChipState = ETraceKitState::Hover;
+				ChipColor = TraceMenuArtStyle::WordHoverLifted();
+				ChipColor.A = 0.55f + 0.45f * FMath::Abs(FMath::Sin(Now * 4.5f));
 			}
 			else
 			{
-				// An empty SECOND slot on the selected row. "+" and not "UNBOUND": the first chip already
-				// says whether the action works at all, and this one is an invitation rather than a state.
-				ValueText = TRACE_TEXT("OPTIONS.KEYBIND.ADD_SECOND", "+");
-				ValueColor = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::InkDim, 0.55f);
+				ChipText = Key.IsValid() ? UTraceUserSettings::DescribeKey(Key)
+					: ((Chip == 0) ? UTraceUserSettings::DescribeKey(Key) : FString(TRACE_TEXT("OPTIONS.KEYBIND.ADD_SECOND", "+")));
+				ChipState = bActive ? ETraceKitState::Hover
+					: (Key.IsValid() ? ETraceKitState::Default : ETraceKitState::Disabled);
+				ChipColor = TraceMenuKit::VisualsFor(ChipState).Label;
 			}
 
-			// UNCHANGED ARITHMETIC for the primary chip when it is alone. The chip rect this screen has
-			// always drawn is exactly the shape of T_MenuValueBox, so the sprite is a one-for-one swap onto
-			// a rectangle that already existed. The minimum width is the only number that moved: 120px was
-			// chosen for one chip in the column, and two of those would not fit the column at 720p, so the
-			// FLOOR drops to 84 and the text still sizes the box whenever it needs more.
-			//
-			// MEASURED IN THE FACE IT IS DRAWN IN (spec v26 §2): the chip is sized to its key name, so
-			// measuring "LEFT SHIFT" in Sofachrome and setting it in Erbaum would leave a chip a third
-			// wider than the word inside it on every keybind row on the page.
-			const float MinChipW = (Slot == 0 && !Row.KeyChip[1].bIsValid) ? (120.f * UIScale) : (84.f * UIScale);
-			const float TextW = MeasureWidth(HUD, ValueText, FontMedium, LabelScale,
-				TraceOptionsMenuType::BodyFace);
-
-			// WP6.3: the note is sized to its own text with no plate padding and no floor, because it
-			// is not a plate. Everything else keeps the arithmetic it has always had.
-			const float PlateW = bPassNote ? TextW : FMath::Max(TextW + (16.f * UIScale), MinChipW);
-			const float ChipX = NextRight - PlateW;
-
-			const bool bChipDrawn = !bPassNote && DrawValueChip(HUD, ChipX, ChipY, PlateW, ChipH);
-
-			// The cyan wash the chip used to BE, kept on top of the sprite at a whisper. The artist's chip
-			// is the same navy as the plate it sits on — its amber ring is what separates them, and a
-			// little light inside it is what stops the key name reading as a hole in the row.
-			//
-			// SPEC v28 §3c: the ACTIVE chip on a selected row is washed harder than its neighbour. That
-			// difference is the only thing telling the player which of the two Enter and Backspace are
-			// about, so it is not decoration.
-			const bool bActiveChip = bSelected && (Slot == ActiveSlot);
-			if (!bPassNote)
-			{
-				const float Wash = bWaiting ? 0.22f : (bActiveChip ? 0.16f : (bChipDrawn ? 0.05f : 0.10f));
-				HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, Wash), ChipX, ChipY, PlateW, ChipH);
-			}
-
-			// THE KEYBIND ROW'S KEY NAME. Erbaum Bold — "keybind rows" is one of the three surfaces §2
-			// names, and this is the string on them a player actually reads. The WP6.3 note is set in
-			// the same face at the same baseline, measured by the same call that draws it.
-			DrawTextCentered(HUD, ValueText, ValueColor, ChipX + PlateW * 0.5f, TextY, FontMedium, LabelScale,
-				TraceOptionsMenuType::BodyFace);
-
-			// The rect PollMouse hit-tests against. Written after the draw so it is exactly what was
-			// drawn — including for the WP6.3 note, which is still a live target: clicking it opens
-			// the rebind capture, because the row IS bindable and the note only says it does not have
-			// to be.
-			Row.KeyChip[Slot] = FBox2D(FVector2D(ChipX, ChipY), FVector2D(ChipX + PlateW, ChipY + ChipH));
-
-			NextRight = ChipX - ChipGap;
+			DrawPlateFor(HUD, ChipState, ChipX, Y, ChipW, H);
+			TraceMenuKit::DrawLabel(HUD, ChipText, ChipX + ChipW * 0.5f, MidY, BodyPlateH, ChipColor, ChipW - H * 0.5f, Body);
+			Row.KeyChip[Chip] = ChipRect;
 		}
 		return;
 	}
 
-	// ---- D31-PAD — the CONTROLLER page's bind row ----------------------------------------------
-	//
-	// ONE CHIP, and everything else is the Binding branch above with the loop taken out:
-	// MaxPadKeysPerAction is 1, so there is no slot to point at, no "+" invitation and no active-chip
-	// wash to distinguish two of them. The chip geometry, the minimum width, the wash and the face
-	// are deliberately the SAME numbers, because the two pages are read one after the other and a pad
-	// chip a different size from a key chip would read as a different control.
+	// ---- D31-PAD — the controller page's one chip ---------------------------------------------------
 	if (Row.Kind == ERowKind::PadBinding)
 	{
 		const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
 		const bool bWaiting = bCapturingKey && bCapturingPadKey && CapturingAction == Row.Binding;
 		const FKey Key = UserSettings.GetPadKey(Row.Binding);
+		// In the PRIMARY chip column — the one the keyboard page's first key sits in — so the two pages
+		// read as one layout.
+		const FBox2D ChipRect(FVector2D(ChipLeftX, Y), FVector2D(ChipLeftX + ChipW, Y + H));
 
-		const float ChipY = Y + H * 0.14f;
-		const float ChipH = H * 0.72f;
+		// The THROW row, on a pad: already reachable through FIRE's button while carrying — but only
+		// if FIRE has one. Otherwise it used to read "UNBOUND (WHILE CARRYING)", which contradicts
+		// itself, in grey prose that hid that this row was unbound as well.
+		const FKey FirePad = UserSettings.GetPadKey(ETraceInputAction::Fire);
+		if (!bWaiting && !Key.IsValid() && Row.Binding == ETraceInputAction::Pass && FirePad.IsValid())
+		{
+			TraceOptionsMenuText::Draw(HUD,
+				TRACE_TEXTF("OPTIONS.PADBIND.PASS_ALREADY_BOUND", "{0}  (WHILE CARRYING)",
+					{ UTraceUserSettings::DescribePadKey(FirePad) }),
+				ChipLeftX + H * 0.25f, MidY, BodyCapH * 0.85f,
+				bSelected ? TraceMenuArtStyle::WordHoverLifted() : TraceOptionsMenuPalette::Note,
+				Body, TraceText::EHAlign::Left, ChipW * 2.f + ChipGapPx - H * 0.25f);
+			Row.KeyChip[0] = ChipRect;
+			return;
+		}
 
-		FString ValueText;
-		FLinearColor ValueColor;
-
-		// The THROW / PASS CORE row is not unbound, it is already bound — the same fact the keyboard
-		// page states as "LMB (WHILE CARRYING)" (UI plan WP6.3), and it is just as true on a pad: the
-		// fire trigger throws at a goal and passes in an endzone while you are carrying the Core, so a
-		// second mapping on it would dispatch one press twice. Amber UNBOUND here would read as "the
-		// central mechanic of this game is broken on a controller", which is precisely the misreading
-		// WP6.3 was written to fix.
-		bool bPassNote = false;
-
+		FString ChipText;
+		ETraceKitState ChipState = ETraceKitState::Default;
+		FLinearColor ChipColor = FLinearColor::White;
 		if (bWaiting)
 		{
-			ValueText = TRACE_TEXT("OPTIONS.PADBIND.PRESS_A_BUTTON", "PRESS A BUTTON");
-			ValueColor = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Amber, 0.6f + 0.4f * FMath::Sin(Now * 9.f));
-		}
-		else if (Key.IsValid())
-		{
-			ValueText = UTraceUserSettings::DescribePadKey(Key);
-			ValueColor = TraceOptionsStyle::Ink;
-		}
-		else if (Row.Binding == ETraceInputAction::Pass)
-		{
-			ValueText = TRACE_TEXTF("OPTIONS.PADBIND.PASS_ALREADY_BOUND", "{0}  (WHILE CARRYING)",
-				{ UTraceUserSettings::DescribePadKey(UserSettings.GetPadKey(ETraceInputAction::Fire)) });
-			ValueColor = TraceOptionsStyle::InkDim;
-			bPassNote = true;
+			ChipText = TRACE_TEXT("OPTIONS.PADBIND.PRESS_A_BUTTON", "PRESS A BUTTON");
+			ChipState = ETraceKitState::Hover;
+			ChipColor = TraceMenuArtStyle::WordHoverLifted();
+			ChipColor.A = 0.55f + 0.45f * FMath::Abs(FMath::Sin(Now * 4.5f));
 		}
 		else
 		{
-			ValueText = TRACE_TEXT("OPTIONS.PADBIND.UNBOUND", "UNBOUND");
-			ValueColor = TraceOptionsStyle::Amber;
+			ChipText = Key.IsValid() ? UTraceUserSettings::DescribePadKey(Key)
+				: FString(TRACE_TEXT("OPTIONS.PADBIND.UNBOUND", "UNBOUND"));
+			ChipState = bSelected ? ETraceKitState::Hover : (Key.IsValid() ? ETraceKitState::Default : ETraceKitState::Disabled);
+			ChipColor = TraceMenuKit::VisualsFor(ChipState).Label;
 		}
 
-		const float TextW = MeasureWidth(HUD, ValueText, FontMedium, LabelScale, TraceOptionsMenuType::BodyFace);
-		const float PlateW = bPassNote ? TextW : FMath::Max(TextW + (16.f * UIScale), 120.f * UIScale);
-		const float ChipX = ValueRight - PlateW;
-
-		const bool bChipDrawn = !bPassNote && DrawValueChip(HUD, ChipX, ChipY, PlateW, ChipH);
-		if (!bPassNote)
-		{
-			const float Wash = bWaiting ? 0.22f : (bSelected ? 0.16f : (bChipDrawn ? 0.05f : 0.10f));
-			HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, Wash), ChipX, ChipY, PlateW, ChipH);
-		}
-
-		DrawTextCentered(HUD, ValueText, ValueColor, ChipX + PlateW * 0.5f, TextY, FontMedium, LabelScale,
-			TraceOptionsMenuType::BodyFace);
-
-		// Slot 0's rect, so the hover/click path finds the same target it does on a keybind row. Slot 1
-		// stays invalid: there is no second chip and a stale rect would be a click target with nothing
-		// under it.
-		Row.KeyChip[0] = FBox2D(FVector2D(ChipX, ChipY), FVector2D(ChipX + PlateW, ChipY + ChipH));
+		DrawPlateFor(HUD, ChipState, ChipLeftX, Y, ChipW, H);
+		TraceMenuKit::DrawLabel(HUD, ChipText, ChipLeftX + ChipW * 0.5f, MidY, BodyPlateH, ChipColor, ChipW - H * 0.5f, Body);
+		Row.KeyChip[0] = ChipRect;
 		return;
 	}
 
-	// ---- UI PLAN WP2.2 — the CALL SIGN row -----------------------------------------------------
+	// ---- UI PLAN WP2.2 — the CALL SIGN row: a value box you type into ----------------------------
 	//
-	// Two states in one branch, because they are one row: the value the game is using, and — while
-	// the player is typing — the live text with a caret in it. The field itself is drawn as the JOIN
-	// prompt draws its own (ATraceMenuHUD::DrawJoinPrompt): a chip, the text left-aligned inside it,
-	// and a caret measured off the SUBSTRING LEFT OF THE CARET rather than off a fixed advance —
-	// these faces are proportional, and a caret that drifts off the character it is editing is worse
-	// than no caret at all.
+	// The field is drawn as the JOIN prompt draws its own: the text left-aligned inside the box and a
+	// caret measured off the SUBSTRING LEFT OF THE CARET (the faces are proportional). Wide enough for
+	// all sixteen characters — a name the player cannot read back is one they cannot check.
 	if (Row.Kind == ERowKind::TextEntry)
 	{
 		const bool bEditing = CallSignEntry.IsActive() && bSelected;
-
-		// A WIDER CHIP THAN A VALUE COLUMN. Sixteen characters is the cap (WP2.1) and the row has to
-		// be able to show all sixteen without eliding — a name the player cannot read back is a name
-		// they cannot check they typed correctly. Measured in the face it is drawn in (v26 §2), with
-		// the SLIDER's chip width as the floor so the column lines up with the rows above and below.
 		const FString Shown = bEditing ? CallSignEntry.GetText() : FormatSettingValue(Row.Setting, 0.f);
-		const float PadInside = 18.f * UIScale;
-		const float ChipW = FMath::Max(ValueColW * 1.6f,
-			MeasureWidth(HUD, Shown, FontMedium, LabelScale, TraceOptionsMenuType::BodyFace) + PadInside * 2.f);
-		const float ChipX = ValueRight - ChipW;
-		const float ChipY = Y + H * 0.14f;
-		const float ChipH = H * 0.72f;
+		const float InsidePad = BoxH * 0.45f;
+		const float BoxW = FMath::Min(ControlW,
+			FMath::Max(OL::ValueMaxW * S, TraceOptionsMenuText::Width(Shown, BodyCapH, Body) + InsidePad * 2.f));
+		const float BoxX = ControlRight - BoxW;
+		DrawValueBoxFor(HUD, BoxX, BoxY, BoxW, BoxH, /*bEnabled=*/true);
 
-		const bool bChipDrawn = DrawValueChip(HUD, ChipX, ChipY, ChipW, ChipH);
-
-		// Washed HARDER while editing, exactly as a rebind capture's chip is (spec v28 §3c): the
-		// difference is the only thing on screen telling the player the keyboard now belongs to this
-		// field rather than to the list.
-		const float Wash = bEditing ? 0.22f : (bSelected ? 0.16f : (bChipDrawn ? 0.05f : 0.10f));
-		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, Wash), ChipX, ChipY, ChipW, ChipH);
-
-		const float TextX = ChipX + PadInside;
-
+		const float TextX = BoxX + InsidePad;
 		if (bEditing && Shown.IsEmpty())
 		{
-			// Ghost text, dim enough that nobody mistakes it for a value they can press Enter on —
-			// the JOIN prompt's own answer to the same empty-field problem.
-			TraceOptionsMenuType::Draw(HUD, FString(UTraceUserSettings::DefaultCallSign),
-				TraceOptionsStyle::WithAlpha(TraceOptionsStyle::InkDim, 0.35f),
-				TextX, TextY, FontMedium, LabelScale, TraceOptionsMenuType::BodyFace);
+			// Ghost text, dim enough that nobody mistakes it for a value they can press Enter on.
+			FLinearColor Ghost = TraceOptionsMenuPalette::Note;
+			Ghost.A = 0.5f;
+			TraceOptionsMenuText::Draw(HUD, FString(UTraceUserSettings::DefaultCallSign), TextX, MidY, BodyCapH,
+				Ghost, Body, TraceText::EHAlign::Left);
 		}
 		else
 		{
-			TraceOptionsMenuType::Draw(HUD, Shown,
-				bSelected ? TraceOptionsStyle::Ink : TraceOptionsStyle::InkDim,
-				TextX, TextY, FontMedium, LabelScale, TraceOptionsMenuType::BodyFace);
+			TraceOptionsMenuText::Draw(HUD, Shown, TextX, MidY, BodyCapH,
+				bEditing ? TraceMenuArtStyle::WordDefault : ValueColor, Body, TraceText::EHAlign::Left, BoxW - InsidePad * 2.f);
 		}
 
 		if (bEditing && CallSignEntry.IsCaretVisible(Now))
 		{
-			const FString LeftOfCaret = Shown.Left(CallSignEntry.GetCaret());
-			const float CaretX = TextX + MeasureWidth(HUD, LeftOfCaret, FontMedium, LabelScale,
-				TraceOptionsMenuType::BodyFace);
-			HUD->DrawRect(TraceOptionsStyle::Cyan, CaretX, ChipY + (4.f * UIScale),
-				FMath::Max(2.f, 2.f * UIScale), ChipH - (8.f * UIScale));
+			const float CaretX = TextX + TraceOptionsMenuText::Width(Shown.Left(CallSignEntry.GetCaret()), BodyCapH, Body);
+			HUD->DrawRect(TraceMenuArtStyle::WordDefault, CaretX + 1.f * S, MidY - BodyCapH * 0.75f,
+				FMath::Max(2.f, 2.f * S), BodyCapH * 1.5f);
 		}
-
-		// NO Row.Track. A TextEntry row has nothing to drag, and Track is the SLIDER's rect — writing
-		// one here would be a rectangle no code reads and the next reader has to prove is dead. The
-		// click target is Row.Rect, set at the top of this function, which is how every non-slider row
-		// on this page is already hit-tested.
 		return;
 	}
 
-	// Every remaining kind reads its value the same way, which is what lets one Toggle path serve
-	// INVERT MOUSE Y and VSYNC and one Choice path serve all thirteen enumerated video rows.
+	// Every remaining kind reads its value the same way, which is what lets one path serve INVERT
+	// MOUSE Y and VSYNC and another serve all thirteen enumerated video rows.
 	float Value = 0.f;
 	float Min = 0.f;
 	float Max = 1.f;
 	float Step = 1.f;
 	GetSettingValue(Row.Setting, Value, Min, Max, Step);
 
-	if (Row.Kind == ERowKind::Toggle)
+	// ---- Choice and Toggle: the value box, with '<' '>' at its ends ---------------------------------
+	//
+	// The title's DIFFICULTY row is the same control, and it is a chip with the arrows inside it. They
+	// are drawn on every live row (dim when it is not selected) and only toward an end that has
+	// somewhere to go, and each is a CLICK TARGET: '<' steps down, '>' steps up (see PollMouse). The
+	// box is a fixed column, so the lists do not twitch sideways as their values change length.
+	if (Row.Kind == ERowKind::Toggle || Row.Kind == ERowKind::Choice)
 	{
-		const bool bOn = (Value >= 0.5f);
-		DrawTextRight(HUD, FormatSettingValue(Row.Setting, Value),
-			bOn ? TraceOptionsStyle::Amber : TraceOptionsStyle::InkDim,
-			ValueRight, TextY, FontMedium, LabelScale, TraceOptionsMenuType::BodyFace);
-		return;
-	}
+		const float BoxW = FMath::Min(ControlW, OL::ValueMaxW * S);
+		const float BoxX = ControlRight - BoxW;
+		DrawValueBoxFor(HUD, BoxX, BoxY, BoxW, BoxH, Row.bEnabled);
 
-	if (Row.Kind == ERowKind::Choice)
-	{
-		const FString ValueText = FormatSettingValue(Row.Setting, Value);
-
-		// Arrow glyphs, drawn only on the selected row and only on the side there is somewhere to go.
-		// This is the one affordance that tells a player a row is a LIST rather than a label, and
-		// without it the quality groups look like readouts.
-		const FLinearColor ValueColor = !Row.bEnabled
-			? TraceOptionsStyle::WithAlpha(TraceOptionsStyle::InkDim, 0.45f)
-			: (bSelected ? TraceOptionsStyle::Ink : TraceOptionsStyle::InkDim);
-
-		// The arrow columns are reserved WHETHER OR NOT an arrow is drawn in them. If the value moved
-		// right every time it hit the end of its range, every list on the page would twitch sideways
-		// as the player walked it, which reads as a layout bug rather than as an end stop.
-		// The value and both arrows are BODY (spec v26 §2), and ValueW is measured in that same face —
-		// it is what positions the '<', so a measurement in the wrong face parks the left arrow inside
-		// the word it is supposed to sit outside.
-		const float ArrowColW = 20.f * UIScale;
-		const float ValueW = MeasureWidth(HUD, ValueText, FontMedium, LabelScale,
-			TraceOptionsMenuType::BodyFace);
-		const float ValueTextRight = ValueRight - ArrowColW;
-
-		DrawTextRight(HUD, ValueText, ValueColor, ValueTextRight, TextY, FontMedium, LabelScale,
-			TraceOptionsMenuType::BodyFace);
-
-		if (bSelected && Row.bEnabled)
+		const float ArrowW = BoxH;
+		FLinearColor ArrowColor = bSelected ? TraceMenuKit::FurnitureSelected : TraceMenuKit::FurnitureUnselected;
+		ArrowColor.A = bSelected ? 1.f : 0.45f;
+		if (Row.bEnabled && Value > Min + UE_KINDA_SMALL_NUMBER)
 		{
-			const FLinearColor ArrowColor = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.9f);
-			if (Value > Min + UE_KINDA_SMALL_NUMBER)
-			{
-				DrawTextRight(HUD, TEXT("<"), ArrowColor, ValueTextRight - ValueW - (6.f * UIScale),
-					TextY, FontMedium, LabelScale, TraceOptionsMenuType::BodyFace);
-			}
-			if (Value < Max - UE_KINDA_SMALL_NUMBER)
-			{
-				DrawTextRight(HUD, TEXT(">"), ArrowColor, ValueRight, TextY, FontMedium, LabelScale,
-					TraceOptionsMenuType::BodyFace);
-			}
+			TraceMenuKit::DrawLabel(HUD, TEXT("<"), BoxX + ArrowW * 0.5f, MidY, BodyPlateH, ArrowColor, 0.f, Body);
+			Row.ArrowLeft = FBox2D(FVector2D(BoxX, Y), FVector2D(BoxX + ArrowW, Y + H));
 		}
+		if (Row.bEnabled && Value < Max - UE_KINDA_SMALL_NUMBER)
+		{
+			TraceMenuKit::DrawLabel(HUD, TEXT(">"), BoxX + BoxW - ArrowW * 0.5f, MidY, BodyPlateH, ArrowColor, 0.f, Body);
+			Row.ArrowRight = FBox2D(FVector2D(BoxX + BoxW - ArrowW, Y), FVector2D(BoxX + BoxW, Y + H));
+		}
+
+		// ON is white like every other value — it used to be amber, which on this kit is the hover
+		// colour, so an ON switch read as a selected one.
+		TraceMenuKit::DrawLabel(HUD, FormatSettingValue(Row.Setting, Value), BoxX + BoxW * 0.5f, MidY, BodyPlateH,
+			ValueColor, BoxW - ArrowW * 2.f, Body);
 		return;
 	}
 
-	// ---- Slider --------------------------------------------------------------------------------
+	// ---- Slider: the sheet's trough, its white blade, and the value box -------------------------------
+	//
+	// On the sheet the slider is a thin navy rail with a gold halo, a white blade handle riding it, and
+	// a gold-edged value box to its right holding the number. The box is ValuePlateToTrack times the
+	// trough's height and the blade SliderHandleToTrack times it, all on one centre line.
+	//
+	// THE BLADE IS THE SAME PICTURE AS THE POINTER (UI QA finding 6b), which is why this page drew a
+	// fader cap for a while. It is the kit's thumb (stylespec §3) and the package that brought this
+	// page onto the kit was asked for it by name; what keeps the two apart is that the thumb is always
+	// ON a trough and centred on the value's point, where the pointer is wherever the mouse is.
 	const float Alpha = FMath::Clamp((Value - Min) / FMath::Max(UE_KINDA_SMALL_NUMBER, Max - Min), 0.f, 1.f);
 
-	const FString ValueText = FormatSettingValue(Row.Setting, Value);
-	const FLinearColor SliderValueColor = bSelected ? TraceOptionsStyle::Ink : TraceOptionsStyle::InkDim;
+	const float SliderBoxW = FMath::Min(ControlW * 0.5f, OL::SliderValueW * S);
+	const float SliderBoxX = ControlRight - SliderBoxW;
+	DrawValueBoxFor(HUD, SliderBoxX, BoxY, SliderBoxW, BoxH, /*bEnabled=*/true);
+	TraceMenuKit::DrawLabel(HUD, FormatSettingValue(Row.Setting, Value), SliderBoxX + SliderBoxW * 0.5f, MidY, BodyPlateH,
+		ValueColor, SliderBoxW - BoxH * 0.5f, Body);
 
-	// The sheet drew this control as a slider WITH a numbered chip beside it — the slicer erased the
-	// "13" that was in it and kept the chip. So the chip goes back where the artist put it, behind the
-	// value, in the column the track already stops short of (TrackRight below is its left edge).
-	if (DrawValueChip(HUD, ValueRight - ValueColW, Y + H * 0.14f, ValueColW, H * 0.72f))
+	const float TrackH = BoxH / TraceMenuKit::ValuePlateToTrack;
+	const float HandleW = static_cast<float>(TraceMenuKit::SliderHandleRect(0.f, 0.f, TrackH).GetSize().X);
+	const float TrackLeft = ControlX;
+	const float TrackRight = SliderBoxX - OL::ColumnGap * S;
+	const float TrackW = FMath::Max(HandleW * 2.f, TrackRight - TrackLeft);
+
+	// The blade travels between half its width in from each end, so at 0 % and 100 % it still sits
+	// wholly on the trough and never over the value box (the old cap straddled the box at 100 %).
+	const float RailLeft = TrackLeft + HandleW * 0.5f;
+	const float RailW = FMath::Max(1.f, TrackW - HandleW);
+	const float HandleX = RailLeft + RailW * Alpha;
+	const float TrackY = MidY - TrackH * 0.5f;
+
+	if (TraceOptionsMenuArt::GEnabled == 0)
 	{
-		// Centred in the chip rather than right-aligned to the panel, because it now sits inside a
-		// box and a number pinned to one wall of its box looks like a mistake.
-		DrawTextCentered(HUD, ValueText, SliderValueColor, ValueRight - ValueColW * 0.5f, TextY, FontMedium, LabelScale,
-			TraceOptionsMenuType::BodyFace);
+		HUD->DrawRect(TraceMenuArtStyle::PlateFill, TrackLeft, TrackY + TrackH * TraceMenuKit::TrackRailTopV,
+			TrackW, FMath::Max(2.f, TrackH * TraceMenuKit::TrackRailV));
 	}
 	else
 	{
-		DrawTextRight(HUD, ValueText, SliderValueColor, ValueRight, TextY, FontMedium, LabelScale,
-			TraceOptionsMenuType::BodyFace);
+		TraceMenuKit::DrawSliderTrack(HUD, TrackLeft, TrackY, TrackW, TrackH);
 	}
 
-	const float TrackRight = ValueRight - ValueColW;
-	const float TrackLeft = X + W * 0.48f;
-	const float TrackW = FMath::Max(20.f * UIScale, TrackRight - TrackLeft);
-	const float TrackH = FMath::Max(3.f, 6.f * UIScale);
-	const float TrackY = Y + (H - TrackH) * 0.5f;
-
-	bool bTrackDrawn = false;
-	if (TraceOptionsMenuArt::Sprite(ETraceKitSprite::SliderTrack) != nullptr)
+	// THE FILL: a thin gold line along the trough's own rail band, up to the blade. Gold because that is
+	// this control's accent on the sheet (the trough's halo and the value box's edge); thin, because the
+	// thick cyan bar it replaces hid the artist's trough entirely.
 	{
-		// The sprite is a TROUGH — 23 rows with the solid rail occupying its middle eleven and a halo
-		// above and below — so drawing it at the 6px the plain bar used would throw the shape away. It
-		// takes the height the row can spare instead. TrackLeft and TrackW are untouched, which is the
-		// only thing that matters: Row.Track is still computed from them at the bottom of this
-		// function, and that rect is what a drag maps the pointer across.
-		const float SpriteH = FMath::Clamp(H * 0.60f, TrackH, 21.f * UIScale);
-		const float SpriteY = Y + (H - SpriteH) * 0.5f;
-		TraceMenuKit::DrawSliderTrack(HUD, TrackLeft, SpriteY, TrackW, SpriteH, FLinearColor::White);
-
-		// THE FILL IS STILL A PLAIN BAR, deliberately. The sheet has no filled-track sprite (the
-		// slicer's own note says the artist drew an empty trough), and tinting this one cannot make a
-		// fill: a Canvas tint MULTIPLIES, so a navy trough times cyan is a darker navy trough. So the
-		// rail is drawn INSIDE the artist's trough, inset to the sprite's own solid band, and the
-		// artist's lip and halo frame it.
-		const float RailTop = SpriteY + SpriteH * TraceMenuKit::TrackRailTopV;
-		const float RailH = FMath::Max(2.f, SpriteH * TraceMenuKit::TrackRailV);
-		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, bSelected ? 0.95f : 0.55f),
-			TrackLeft, RailTop, TrackW * Alpha, RailH);
-
-		bTrackDrawn = true;
+		FLinearColor Fill = TraceMenuArtStyle::ValueGlowLifted();
+		Fill.A = bSelected ? 1.f : 0.7f;
+		const float FillH = FMath::Max(2.f, TrackH * TraceMenuKit::TrackRailV * 0.45f);
+		HUD->DrawRect(Fill, RailLeft, MidY - FillH * 0.5f, FMath::Max(0.f, HandleX - RailLeft), FillH);
 	}
-	if (!bTrackDrawn)
+
+	if (TraceOptionsMenuArt::GEnabled == 0)
 	{
-		HUD->DrawRect(TraceOptionsStyle::Trough, TrackLeft, TrackY, TrackW, TrackH);
-		HUD->DrawRect(TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, bSelected ? 0.95f : 0.55f),
-			TrackLeft, TrackY, TrackW * Alpha, TrackH);
+		const FBox2D Blade = TraceMenuKit::SliderHandleRect(HandleX, MidY, TrackH);
+		HUD->DrawRect(FLinearColor::White, HandleX - 1.5f * S, static_cast<float>(Blade.Min.Y), 3.f * S,
+			static_cast<float>(Blade.GetSize().Y));
 	}
-
-	// ---- THE THUMB — A FADER CAP, NOT THE POINTER SPRITE (UI QA finding 6b) ---------------------
-	//
-	// WHAT THIS REPLACES, AND WHY RE-TINTING WAS NOT ENOUGH.
-	//
-	// The release audit read the thumb as "a stray mouse cursor stuck on the bar". WP11.1 answered
-	// that by tinting it — amber when the row is selected, cyan otherwise — on the argument that
-	// "nothing was wrong with the sprite; what was wrong was that it wore the CURSOR's colour". The
-	// QA pass re-photographed it and disagreed, and the pixels are with the QA pass: T_MenuSliderHandle
-	// and T_MenuCursor are the SAME PICTURE. Both are 64x87, both are a diagonal blade running from
-	// upper-left to lower-right, and the slider one is the cursor with the rail subtracted from under
-	// it. Colour cannot separate two objects that are the same shape at the same angle — move the real
-	// pointer onto a slider and you still get two identical blades on one bar, which is exactly what
-	// `crop_cursor_vs_sliderthumb.png` shows.
-	//
-	// So the thumb is now a real thumb: a vertical fader cap, drawn from rectangles, which is a shape
-	// no pointer in this project has. Three properties do the work, and none of them is the colour:
-	//
-	//   * IT IS VERTICAL AND THE POINTER IS DIAGONAL. That difference survives at 12 px, in
-	//     peripheral vision, and in a screenshot at 720p.
-	//   * IT CROSSES THE RAIL SQUARELY, so it reads as riding the track rather than lying on top of
-	//     it. The blade's tip pointed off the bar; a cap's edges are parallel to the trough's.
-	//   * IT HAS A GRIP NOTCH. One dark band across its waist is what every physical fader has and
-	//     what says "drag me" without a word. It is also the detail that stops the cap reading as a
-	//     plain bright rectangle, which is what a progress bar's end cap looks like.
-	//
-	// The keyline underneath it is not decoration either: the cap sits on the rail's own cyan at 0.95
-	// when the row is selected, and without a dark edge a cyan cap on a cyan rail is invisible at the
-	// one value that matters most (100 %, where the fill reaches the cap).
-	//
-	// COLOURS ARE WP11.1's, UNCHANGED AND FOR ITS REASONS: AmberLifted() when the row is selected,
-	// because the selection language on this page is amber (the plate's hover ring, the row rail) and
-	// the sheet's flat amber ships as a dim brown smear; cyan at 0.85 otherwise.
-	//
-	// T_MenuSliderHandle IS NO LONGER DRAWN ANYWHERE. It is left in Content as the artist's record. If
-	// a re-cut ever produces a vertical thumb sprite, this block becomes one Draw call again.
+	else
 	{
-		const float T = FMath::Max(1.f, 1.f * UIScale);
-		const float CapW = FMath::Max(6.f, 12.f * UIScale);
-		const float CapH = FMath::Clamp(H * 0.68f, 12.f, 40.f * UIScale);
-		const float CapX = FMath::RoundToFloat(TrackLeft + TrackW * Alpha - CapW * 0.5f);
-		const float CapY = FMath::RoundToFloat(Y + (H - CapH) * 0.5f);
-
-		const FLinearColor Face = bSelected
-			? TraceMenuArtStyle::AmberLifted()
-			: TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.85f);
-
-		// The keyline, one pixel proud on every side. Drawn as a full rectangle so the chamfer below
-		// leaves it showing at the four corners, which is what cuts them.
-		HUD->DrawRect(FLinearColor(0.01f, 0.02f, 0.04f, 0.92f),
-			CapX - T, CapY - T, CapW + T * 2.f, CapH + T * 2.f);
-
-		// The cap: a middle band at full width with a narrower row top and bottom. Three rectangles,
-		// and the one-pixel step at each end is the chamfer.
-		HUD->DrawRect(Face, CapX + T, CapY, CapW - T * 2.f, T);
-		HUD->DrawRect(Face, CapX, CapY + T, CapW, CapH - T * 2.f);
-		HUD->DrawRect(Face, CapX + T, CapY + CapH - T, CapW - T * 2.f, T);
-
-		// The grip notch across its waist.
-		HUD->DrawRect(FLinearColor(0.01f, 0.02f, 0.04f, 0.72f),
-			CapX + T * 2.f, FMath::RoundToFloat(CapY + (CapH - T * 2.f) * 0.5f), CapW - T * 4.f, T * 2.f);
+		TraceMenuKit::DrawSliderHandle(HUD, HandleX, MidY, TrackH, FLinearColor::White);
 	}
 
-	// Stored AFTER drawing so the poll on the next frame drags against exactly what was on screen.
-	// UNCHANGED BY SPEC v20: the sprite above is fitted to TrackLeft/TrackW, never the other way
-	// round, so this is the same rectangle it has always been and a drag lands where it always did.
-	Row.Track = FBox2D(FVector2D(TrackLeft, TrackY - H * 0.4f), FVector2D(TrackLeft + TrackW, TrackY + H * 0.4f));
+	// Stored AFTER drawing so the poll on the next frame drags against exactly what was on screen: the
+	// blade's travel, so the pointer and the blade's centre agree at every value.
+	Row.Track = FBox2D(FVector2D(RailLeft, Y), FVector2D(RailLeft + RailW, Y + H));
 }
 
 void FTraceOptionsMenu::DrawCrosshairPreview(AHUD* HUD, float X, float Y, float W, float H)
@@ -4924,11 +5080,10 @@ void FTraceOptionsMenu::DrawCrosshairPreview(AHUD* HUD, float X, float Y, float 
 	// Split down the middle, and both colours are taken from the thing they stand for rather than
 	// invented: the left is the arena's black floor and the right is (193, 252, 253) — the lit cyan
 	// surface named in ATraceHUD::DrawAimReticle's own note as the one a white reticle disappeared
-	// against. That failure is the reason the outline exists at all, so it is the exact case a
-	// crosshair preview has to be able to show.
+	// against. A crosshair legible over one and invisible over the other is the failure this exists
+	// to show. (That cyan is the ARENA's, shown as a sample, not a colour of this menu.)
 	//
-	// Integer-snapped like everything else that has to be pixel-crisp; a half-pixel seam under the
-	// crosshair would be a grey band that looks like part of the crosshair.
+	// Integer-snapped; a half-pixel seam under the crosshair would read as part of it.
 	const float BoxX = FMath::RoundToFloat(X);
 	const float BoxY = FMath::RoundToFloat(Y);
 	const float BoxW = FMath::RoundToFloat(W);
@@ -4938,16 +5093,10 @@ void FTraceOptionsMenu::DrawCrosshairPreview(AHUD* HUD, float X, float Y, float 
 	HUD->DrawRect(FLinearColor(0.004f, 0.014f, 0.026f, 1.f), BoxX, BoxY, HalfW, BoxH);
 	HUD->DrawRect(FLinearColor(0.757f, 0.988f, 0.992f, 1.f), BoxX + HalfW, BoxY, BoxW - HalfW, BoxH);
 
-	// The same instrument-panel bezel the settings panel wears, so the preview reads as part of the
-	// page rather than as a texture dropped onto it.
-	DrawFrame(HUD, BoxX, BoxY, BoxW, BoxH);
-
 	// ---- The crosshair, from the SAME geometry the HUD draws -----------------------------------
 	//
-	// UTraceUserSettings::BuildCrosshairBars, not a copy of it. PixelScale is UIScale and nothing
-	// else: scale 1.0 is the FIRST-PERSON crosshair, which is the one the player is aiming a gun
-	// with and therefore the one this page is about. The third-person carry view multiplies it by
-	// UTraceSettings::ThirdPersonCrosshairScale, which is a designer's knob and not on this page.
+	// UTraceUserSettings::BuildCrosshairBars, not a copy of it, at the first-person scale (UIScale and
+	// nothing else) — the crosshair the player aims a gun with.
 	const float CenterX = BoxX + HalfW;
 	const float CenterY = BoxY + FMath::RoundToFloat(BoxH * 0.5f);
 
@@ -4957,10 +5106,8 @@ void FTraceOptionsMenu::DrawCrosshairPreview(AHUD* HUD, float X, float Y, float 
 	const FLinearColor Ink = Settings.GetCrosshairColor();
 	const FLinearColor Outline = Settings.GetCrosshairOutlineColor();
 
-	// *** DrawRect AND NEVER DrawLine. *** AHUD::DrawLine goes through the batched-element path,
-	// which DISCARDS the alpha it is handed — every line comes out fully opaque. The OPACITY row on
-	// this very page would then be a control whose effect could not be seen in the preview beside it,
-	// and the OUTLINE row's "off" (an alpha of zero) would draw a solid black box. Rects carry alpha.
+	// *** DrawRect AND NEVER DrawLine. *** AHUD::DrawLine discards alpha, so the OPACITY row would have
+	// no visible effect here and the OUTLINE row's "off" (alpha zero) would draw a solid black box.
 	if (Outline.A > UE_KINDA_SMALL_NUMBER)
 	{
 		for (int32 Index = 0; Index < NumBars; ++Index)
@@ -4977,41 +5124,12 @@ void FTraceOptionsMenu::DrawCrosshairPreview(AHUD* HUD, float X, float Y, float 
 
 	// ---- Caption -------------------------------------------------------------------------------
 	//
-	// BODY (spec v26 §2): this is a label on a control, on a submenu, in the same rhythm as the rows
-	// to its left. Erbaum Bold, like every other string on this page that is not a heading.
-	//
-	// Drawn on the DARK half so it is legible whatever the preview's own colours are doing, and
-	// pinned to the bottom of the box rather than under it, because it belongs to the box.
-	const float CaptionScale = 0.95f * UIScale;
-	TraceOptionsMenuType::Draw(HUD, TRACE_TEXT("OPTIONS.CROSSHAIR.PREVIEW_CAPTION", "PREVIEW"),
-		TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.85f),
-		BoxX + (10.f * UIScale), BoxY + (8.f * UIScale), FontSmall, CaptionScale,
-		TraceOptionsMenuType::BodyFace);
-
-	// The live numbers, so the preview is readable as evidence in a screenshot and not only by eye.
-	// One line, in the same face, derived from the same accessors the crosshair above was built from.
-	//
-	// ON ITS OWN DARK STRIP, spanning the full width. The line is longer than the dark half of the
-	// box, so without the strip its tail would be near-white ink on the lit cyan surface — invisible,
-	// which is the exact defect the cyan half is here to demonstrate. A caption that fell into it
-	// would be an unintentional demonstration.
-	const FString Readout = TRACE_TEXTF("OPTIONS.CROSSHAIR.PREVIEW_READOUT", "{0} / {1} / {2}  {3}  {4}%",
-		{ FMath::RoundToInt(Settings.GetCrosshairSize()),
-		  FString::Printf(TEXT("%.1f"), Settings.GetCrosshairThickness()),
-		  FMath::RoundToInt(Settings.GetCrosshairGap()),
-		  UTraceUserSettings::DescribeCrosshairColor(Settings.CrosshairColorIndex),
-		  FMath::RoundToInt(Settings.GetCrosshairOpacity() * 100.f) });
-
-	const float ReadoutH = TraceOptionsMenuType::Height(HUD, FontSmall, CaptionScale);
-	const float StripH = ReadoutH + (10.f * UIScale);
-	const float StripY = BoxY + BoxH - StripH;
-
-	HUD->DrawRect(FLinearColor(0.f, 0.02f, 0.04f, 0.88f), BoxX, StripY, BoxW, StripH);
-
-	TraceOptionsMenuType::Draw(HUD, Readout,
-		TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Ink, 0.90f),
-		BoxX + (10.f * UIScale), StripY + (5.f * UIScale),
-		FontSmall, CaptionScale, TraceOptionsMenuType::BodyFace);
+	// One word, on the DARK half so it is legible whatever the preview's own colours are doing. The
+	// strip of numbers that used to run along the bottom repeated the rows beside it and is gone.
+	const float CapH = 10.f * UIScale;
+	TraceOptionsMenuText::Draw(HUD, TRACE_TEXT("OPTIONS.CROSSHAIR.PREVIEW_CAPTION", "PREVIEW"),
+		BoxX + 12.f * UIScale, BoxY + 12.f * UIScale + CapH * 0.5f, CapH, TraceOptionsMenuPalette::Caption,
+		TraceOptionsMenuType::HeaderFace, TraceText::EHAlign::Left);
 }
 
 // =================================================================================================
@@ -5143,89 +5261,33 @@ void FTraceOptionsMenu::PreviewAudioChange(ESetting Setting)
 	}
 }
 
-bool FTraceOptionsMenu::DrawValueChip(AHUD* HUD, float X, float Y, float W, float H) const
-{
-	return TraceMenuKit::DrawPlate(HUD, TraceOptionsMenuArt::Sprite(ETraceKitSprite::ValueBox),
-		TraceMenuArtStyle::ValueFrame, X, Y, W, H, H, FLinearColor::White);
-}
-
-void FTraceOptionsMenu::DrawFrame(AHUD* HUD, float X, float Y, float W, float H)
-{
-	// Same instrument-panel frame as the title screen's bezel, at panel scale, so the overlay reads
-	// as part of the same machine rather than as a dialog box dropped on top of it.
-	const float Thin = FMath::Max(1.f, 1.f * UIScale);
-	const FLinearColor Frame = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.30f);
-
-	HUD->DrawRect(Frame, X, Y, W, Thin);
-	HUD->DrawRect(Frame, X, Y + H - Thin, W, Thin);
-	HUD->DrawRect(Frame, X, Y, Thin, H);
-	HUD->DrawRect(Frame, X + W - Thin, Y, Thin, H);
-
-	const float Tick = 24.f * UIScale;
-	const float TickT = FMath::Max(1.f, 2.f * UIScale);
-	const FLinearColor Bright = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.9f);
-
-	HUD->DrawRect(Bright, X, Y, Tick, TickT);
-	HUD->DrawRect(Bright, X, Y, TickT, Tick);
-	HUD->DrawRect(Bright, X + W - Tick, Y, Tick, TickT);
-	HUD->DrawRect(Bright, X + W - TickT, Y, TickT, Tick);
-	HUD->DrawRect(Bright, X, Y + H - TickT, Tick, TickT);
-	HUD->DrawRect(Bright, X, Y + H - Tick, TickT, Tick);
-	HUD->DrawRect(Bright, X + W - Tick, Y + H - TickT, Tick, TickT);
-	HUD->DrawRect(Bright, X + W - TickT, Y + H - Tick, TickT, Tick);
-}
-
-void FTraceOptionsMenu::DrawCursor(AHUD* HUD)
+void FTraceOptionsMenu::DrawCursor(AHUD* HUD, APlayerController* PC)
 {
 	// The OS cursor does not appear in captured frames, and in the match it is hidden outright until
-	// this overlay releases it — so the overlay draws its own. Same shape as the title screen's.
+	// this overlay releases it — so the overlay draws its own: the kit's white blade, TIP-ANCHORED on
+	// the point PollMouse hit-tests, through TraceMenuKit::ShowCursor (which also keeps the OS arrow
+	// hidden for as long as ours is drawn — stylespec §9, the pointer rule every kit screen follows).
 	if (!bHasCursor)
 	{
 		return;
 	}
 
-	// The artist's pointer, everywhere this overlay is — which is the title screen's SETTINGS page AND
-	// the in-match pause menu. Spec v20 §0.8: until now it existed only on the UMG title screen.
-	//
-	// DRAWN THROUGH TraceHardwareCursor, not here, since the UI QA pass. This function used to load
-	// the sprite out of this page's own table and carry its own copy of the geometry —
-	// `CursorAspect = 64.f / 87.f`, `CursorTipU = 0.180f`, `CursorTipV = 0.075f` — which is a third
-	// copy of numbers TraceMenuArtStyle already derives from the sprite's own dimensions, and which
-	// disagreed with character select's copy in the fourth decimal place. Worse, the Canvas title
-	// screen underneath this overlay was drawing a completely different picture. One function draws
-	// the pointer now and decides its colour; see UI/TraceHardwareCursor.h.
-	//
-	// Still TIP-ANCHORED, NOT CENTRED — that is DrawPointer's contract. PollMouse hit-tests at
-	// CursorPos, so an arrow whose middle sat on the hit point would draw its point about eleven
-	// pixels away from the pixel it is about to click, and every click in every screenshot would look
-	// like it landed on the wrong row.
-	if (TraceHardwareCursor::DrawPointer(HUD, CursorPos, UIScale))
+	if (TraceMenuKit::ShowCursor(HUD, PC, TEXT("settings overlay"), CursorPos, UIScale))
 	{
 		return;
 	}
 
-	const float S = 9.f * UIScale;
-	const float T = FMath::Max(1.f, 1.5f * UIScale);
-	const FLinearColor Color = TraceOptionsStyle::WithAlpha(TraceOptionsStyle::Cyan, 0.95f);
+	// The fallback every Canvas surface keeps, for a build with no menu art or the frame or two before
+	// the sprite's texture lands.
+	const float Size = 9.f * UIScale;
+	const float Thick = FMath::Max(1.f, 1.5f * UIScale);
+	const FLinearColor Color = TraceMenuArtStyle::WordDefault;
 
-	HUD->DrawLine(CursorPos.X - S, CursorPos.Y, CursorPos.X - S * 0.35f, CursorPos.Y, Color, T);
-	HUD->DrawLine(CursorPos.X + S * 0.35f, CursorPos.Y, CursorPos.X + S, CursorPos.Y, Color, T);
-	HUD->DrawLine(CursorPos.X, CursorPos.Y - S, CursorPos.X, CursorPos.Y - S * 0.35f, Color, T);
-	HUD->DrawLine(CursorPos.X, CursorPos.Y + S * 0.35f, CursorPos.X, CursorPos.Y + S, Color, T);
+	HUD->DrawLine(CursorPos.X - Size, CursorPos.Y, CursorPos.X - Size * 0.35f, CursorPos.Y, Color, Thick);
+	HUD->DrawLine(CursorPos.X + Size * 0.35f, CursorPos.Y, CursorPos.X + Size, CursorPos.Y, Color, Thick);
+	HUD->DrawLine(CursorPos.X, CursorPos.Y - Size, CursorPos.X, CursorPos.Y - Size * 0.35f, Color, Thick);
+	HUD->DrawLine(CursorPos.X, CursorPos.Y + Size * 0.35f, CursorPos.X, CursorPos.Y + Size, Color, Thick);
 }
-
-// =================================================================================================
-// Text helpers
-// =================================================================================================
-
-// ALL FOUR go through UI/Text now — spec v22 §A1. The (UFont*, Scale) signatures stay because they
-// are this page's layout vocabulary and forty call sites speak it; TraceOptionsMenuType::SizeFor
-// translates. See the block at the top of this file for why the translation is a measurement.
-
-// SPEC v26 §2 added the FACE to three of the four. It is a required argument rather than a defaulted
-// one on purpose: a default would let a new call site measure Sofachrome and draw Erbaum — a third
-// narrower — and the symptom of that is a rule struck through a header or a key chip that no longer
-// fits its key, which is a bug you find in a screenshot rather than in a compile.
 
 ETraceTextWeight FTraceOptionsMenu::FaceForAction() const
 {
@@ -5235,43 +5297,400 @@ ETraceTextWeight FTraceOptionsMenu::FaceForAction() const
 	//
 	//   * the PAUSE ROOT — RESUME / SETTINGS / VIDEO / RETURN TO TITLE / QUIT. That is not a settings
 	//     page; it is the in-match MAIN MENU, the same list of destinations the title screen puts on
-	//     screen through UTraceMenuRow. §2 keeps "main menu rows" in Sofachrome, so these stay in it:
-	//     setting them in Erbaum would give the game's two top-level menus two different faces, and a
-	//     player who opened the pause menu would see a screen that did not match the one they had
-	//     launched from thirty seconds earlier;
+	//     screen through UTraceMenuRow. §2 keeps "main menu rows" in Sofachrome, so these stay in it;
 	//
-	//   * SETTINGS and VIDEO — BACK, RESET DEFAULTS, AUTO-DETECT. These are controls on a submenu, in
-	//     the same column and the same rhythm as the rows above them, and they get the body face like
-	//     everything else on those pages.
+	//   * the submenus — BACK, RESET, the doors, the loadout slots. Controls on a submenu, in the same
+	//     column and rhythm as the rows around them; they get the body face like everything else there.
 	//
 	// An owner who reads it the other way changes this one return.
 	return (Page == EPage::Root) ? TraceOptionsMenuType::HeaderFace : TraceOptionsMenuType::BodyFace;
 }
 
-float FTraceOptionsMenu::MeasureWidth(AHUD* HUD, const FString& Text, UFont* Font, float Scale,
-	ETraceTextWeight Weight)
+#if !UE_BUILD_SHIPPING
+// =================================================================================================
+// Trace.Menu.Verify — this overlay's own behaviour, one drawn frame at a time
+// =================================================================================================
+//
+// Every check drives the REAL path: the real PollMouse (fed its own pointer, so a headless run
+// neither needs nor moves the OS mouse), real key edges injected through Slate for BKSP and the held
+// DOWN (the route a keyboard takes), and ActivateSelected / GoBack — the functions Enter, a click and
+// Escape all end in. It restores every setting it touches.
+//
+// Each check was seen to FAIL against the code it replaced before it was trusted (the commit that
+// added it says how).
+
+void FTraceOptionsMenu::DebugBeginVerify()
 {
-	return TraceOptionsMenuType::Width(HUD, Text, Font, Scale, Weight);
+	if (VerifyStep != 0)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[MenuVerify] Already running."));
+		return;
+	}
+	VerifyStep = 1;
+	VerifyWait = 0;
+	VerifyFailures = 0;
+	VerifyChecks = 0;
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[MenuVerify] ===== the settings / pause overlay: pointer on open, BACK, confirms, arrows, paused clock ====="));
 }
 
-float FTraceOptionsMenu::MeasureHeight(AHUD* HUD, const FString& Text, UFont* Font, float Scale)
+void FTraceOptionsMenu::VerifyCheck(const TCHAR* Label, bool bPass, const FString& Detail)
 {
-	// The LINE BOX, deliberately independent of @p Text — every caller on this page uses it to sit a
-	// row's baseline, and a row whose height depended on whether its label happened to contain a
-	// descender would jitter as the value changed. Measured to equal what the old bitmap path
-	// returned, which is what keeps nineteen rows in exactly the places they were.
-	(void)Text;
-	return TraceOptionsMenuType::Height(HUD, Font, Scale);
+	++VerifyChecks;
+	VerifyFailures += bPass ? 0 : 1;
+	UE_LOG(LogTraceGame, Display, TEXT("[MenuVerify]   %-4s %-70s %s"), bPass ? TEXT("ok") : TEXT("FAIL"), Label, *Detail);
 }
 
-void FTraceOptionsMenu::DrawTextCentered(AHUD* HUD, const FString& Text, const FLinearColor& Color, float CenterX, float Y, UFont* Font, float Scale,
-	ETraceTextWeight Weight)
+void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 {
-	TraceOptionsMenuType::Draw(HUD, Text, Color, CenterX, Y, Font, Scale, Weight, TraceText::EHAlign::Center);
-}
+	if (VerifyStep == 0 || PC == nullptr)
+	{
+		return;
+	}
+	if (VerifyWait > 0)
+	{
+		--VerifyWait;
+		return;
+	}
 
-void FTraceOptionsMenu::DrawTextRight(AHUD* HUD, const FString& Text, const FLinearColor& Color, float RightX, float Y, UFont* Font, float Scale,
-	ETraceTextWeight Weight)
-{
-	TraceOptionsMenuType::Draw(HUD, Text, Color, RightX, Y, Font, Scale, Weight, TraceText::EHAlign::Right);
+	UTraceUserSettings& Settings = UTraceUserSettings::Get();
+	UWorld* VerifyWorld = PC->GetWorld();
+
+	auto FirstSelectable = [this]() -> int32
+	{
+		for (int32 Index = 0; Index < Rows.Num(); ++Index)
+		{
+			if (Rows[Index].IsSelectable())
+			{
+				return Index;
+			}
+		}
+		return INDEX_NONE;
+	};
+	auto RowName = [this](int32 Index) -> FString
+	{
+		return Rows.IsValidIndex(Index) ? FString::Printf(TEXT("'%s'"), *Rows[Index].Label) : FString(TEXT("<none>"));
+	};
+	auto Next = [this](int32 Step, int32 Wait)
+	{
+		VerifyStep = Step;
+		VerifyWait = Wait;
+	};
+
+	switch (VerifyStep)
+	{
+	// ---- A. A POINTER RESTING OVER A ROW DOES NOT TAKE THE SELECTION WHEN A PAGE OPENS --------------
+	case 1:
+		bDebugPointer = true;
+		bDebugPointerDown = false;
+		DebugPointerPos = FVector2D(2.f, 2.f);   // off every row
+		OpenSettings();
+		Next(2, 3);
+		return;
+
+	case 2:
+		VerifyIndex = FindActionRow(EAction::Back);
+		if (VerifyIndex == INDEX_NONE || !Rows[VerifyIndex].Rect.bIsValid)
+		{
+			VerifyCheck(TEXT("the settings page drew its rows"), false, TEXT("no BACK rect"));
+			Next(30, 0);
+			return;
+		}
+		// Park the pointer on BACK while the overlay is CLOSED, then open it again: the pointer is at
+		// rest over a row the moment the page appears — the pause menu's Escape-then-Enter case.
+		DebugPointerPos = Rows[VerifyIndex].Rect.GetCenter();
+		Close();
+		Next(3, 2);
+		return;
+
+	case 3:
+		OpenSettings();
+		Next(4, 4);
+		return;
+
+	case 4:
+	{
+		const int32 First = FirstSelectable();
+		VerifyCheck(TEXT("A. a pointer resting on a row does not take the selection on open"),
+			Selected == First,
+			FString::Printf(TEXT("selected %s; the page opens on %s; the pointer rests on %s"),
+				*RowName(Selected), *RowName(First), *RowName(VerifyIndex)));
+
+		// ...and a pointer that really moves still hovers — a fix that switched hover off would pass
+		// the check above.
+		VerifyIndexB = FindActionRow(EAction::OpenAudio);
+		if (Rows.IsValidIndex(VerifyIndexB))
+		{
+			DebugPointerPos = Rows[VerifyIndexB].Rect.GetCenter();
+		}
+		Next(5, 2);
+		return;
+	}
+
+	case 5:
+		VerifyCheck(TEXT("A. ...and a pointer that moves onto a row still selects it"),
+			Selected == VerifyIndexB && VerifyIndexB != INDEX_NONE,
+			FString::Printf(TEXT("selected %s, pointer on %s"), *RowName(Selected), *RowName(VerifyIndexB)));
+
+		// Through the door, the way Enter goes.
+		ActivateSelected();
+		Next(6, 3);
+		return;
+
+	// ---- E. RESET IS TWO PRESSES ------------------------------------------------------------------
+	case 6:
+	{
+		VerifyCheck(TEXT("the AUDIO door opens the AUDIO page"), Page == EPage::Audio, TEXT(""));
+
+		VerifySavedVolume = Settings.AudioMasterVolume;
+		Settings.AudioMasterVolume = 0.40f;
+
+		const int32 ResetRow = FindActionRow(EAction::ResetAudioDefaults);
+		if (ResetRow == INDEX_NONE)
+		{
+			VerifyCheck(TEXT("E. the AUDIO page has its RESET row"), false, TEXT(""));
+		}
+		else
+		{
+			Selected = ResetRow;
+			ActivateSelected();
+			const bool bAsked = FMath::IsNearlyEqual(Settings.AudioMasterVolume, 0.40f) && IsArmedRow(Rows[Selected]);
+			VerifyCheck(TEXT("E. RESET: the first press only asks (row armed, nothing reset)"), bAsked,
+				FString::Printf(TEXT("master %.2f, armed %d"), Settings.AudioMasterVolume, IsArmedRow(Rows[Selected]) ? 1 : 0));
+
+			ActivateSelected();
+			VerifyCheck(TEXT("E. RESET: the second press resets"),
+				!FMath::IsNearlyEqual(Settings.AudioMasterVolume, 0.40f) && ArmedAction == EAction::None,
+				FString::Printf(TEXT("master %.2f"), Settings.AudioMasterVolume));
+		}
+
+		Settings.AudioMasterVolume = VerifySavedVolume;
+		Settings.Save();
+
+		// ---- B. BACK LANDS ON THE DOOR --------------------------------------------------------------
+		GoBack();
+		Next(7, 2);
+		return;
+	}
+
+	case 7:
+		VerifyCheck(TEXT("B. BACK from AUDIO lands on the AUDIO door, not the top of the page"),
+			Page == EPage::Settings && Rows.IsValidIndex(Selected) && Rows[Selected].Action == EAction::OpenAudio,
+			FString::Printf(TEXT("page %d, selected %s"), int32(Page), *RowName(Selected)));
+
+		// ---- G. THE CHOICE ARROWS ARE CLICK TARGETS -----------------------------------------------
+		Selected = FindActionRow(EAction::OpenCrosshair);
+		ActivateSelected();
+		Next(8, 3);
+		return;
+
+	case 8:
+		VerifyIndex = INDEX_NONE;
+		for (int32 Index = 0; Index < Rows.Num(); ++Index)
+		{
+			if (Rows[Index].Kind == ERowKind::Choice && Rows[Index].Setting == ESetting::CrosshairColor)
+			{
+				VerifyIndex = Index;
+			}
+		}
+		VerifySavedColour = Settings.CrosshairColorIndex;
+		if (VerifyIndex == INDEX_NONE || UTraceUserSettings::NumCrosshairColors() < 3)
+		{
+			VerifyCheck(TEXT("G. the CROSSHAIR page has a COLOUR choice with three colours"), false, TEXT(""));
+			Next(16, 0);
+			return;
+		}
+		Settings.CrosshairColorIndex = 2;   // both ends have somewhere to go, so both arrows are drawn
+		Next(9, 2);
+		return;
+
+	case 9:
+		if (!Rows[VerifyIndex].ArrowLeft.bIsValid || !Rows[VerifyIndex].ArrowRight.bIsValid)
+		{
+			VerifyCheck(TEXT("G. COLOUR draws a '<' and a '>'"), false, TEXT("an arrow rect is missing"));
+			Next(16, 0);
+			return;
+		}
+		DebugPointerPos = Rows[VerifyIndex].ArrowLeft.GetCenter();
+		Next(10, 1);
+		return;
+
+	case 10: bDebugPointerDown = true;  Next(11, 1); return;
+	case 11: bDebugPointerDown = false; Next(12, 2); return;
+
+	case 12:
+		VerifyCheck(TEXT("G. a click on COLOUR's '<' steps it DOWN (it used to go forward)"),
+			Settings.CrosshairColorIndex == 1, FString::Printf(TEXT("colour index 2 -> %d"), Settings.CrosshairColorIndex));
+		DebugPointerPos = Rows[VerifyIndex].ArrowRight.GetCenter();
+		Next(13, 2);
+		return;
+
+	case 13: bDebugPointerDown = true;  Next(14, 1); return;
+	case 14: bDebugPointerDown = false; Next(15, 2); return;
+
+	case 15:
+		VerifyCheck(TEXT("G. ...and its '>' steps it UP"), Settings.CrosshairColorIndex == 2,
+			FString::Printf(TEXT("colour index 1 -> %d"), Settings.CrosshairColorIndex));
+		Next(16, 0);
+		return;
+
+	// ---- D. A SAVED SLOT CAN BE CLEARED, IN TWO PRESSES --------------------------------------------
+	case 16:
+		Settings.CrosshairColorIndex = VerifySavedColour;
+		Settings.Save();
+		DebugPointerPos = FVector2D(2.f, 2.f);
+		if (Page != EPage::Settings)
+		{
+			GoBack();
+		}
+		Selected = FindActionRow(EAction::OpenLoadouts);
+		ActivateSelected();
+		Next(17, 3);
+		return;
+
+	case 17:
+	{
+		constexpr int32 SlotUnderTest = UTraceUserSettings::SavedLoadoutCount - 1;
+		VerifySavedLoadout = Settings.GetSavedLoadout(SlotUnderTest);
+		VerifySavedLoadoutName = Settings.GetSavedLoadoutName(SlotUnderTest);
+		Settings.SetSavedLoadout(SlotUnderTest, FTraceLoadout::Uniform(ETraceCharacterId::Rocco));
+		RebuildRows(EAction::EditLoadoutSlot, SlotUnderTest);
+		VerifyIndex = Selected;
+
+		TraceOptionsRebindProof::InjectKey(EKeys::BackSpace, /*bPressed=*/true);
+		Next(18, 1);
+		return;
+	}
+
+	case 18: TraceOptionsRebindProof::InjectKey(EKeys::BackSpace, false); Next(19, 1); return;
+
+	case 19:
+	{
+		constexpr int32 SlotUnderTest = UTraceUserSettings::SavedLoadoutCount - 1;
+		const bool bAsked = !Settings.GetSavedLoadout(SlotUnderTest).IsEmpty() && Rows.IsValidIndex(Selected)
+			&& IsArmedRow(Rows[Selected]) && Rows[Selected].SlotIndex == SlotUnderTest;
+		VerifyCheck(TEXT("D. CLEAR: the first BKSP on a saved slot asks (it used to do nothing)"), bAsked,
+			FString::Printf(TEXT("slot %d %s, row %s armed %d"), SlotUnderTest + 1,
+				Settings.GetSavedLoadout(SlotUnderTest).IsEmpty() ? TEXT("EMPTY") : TEXT("filled"), *RowName(Selected),
+				(Rows.IsValidIndex(Selected) && IsArmedRow(Rows[Selected])) ? 1 : 0));
+		TraceOptionsRebindProof::InjectKey(EKeys::BackSpace, true);
+		Next(20, 1);
+		return;
+	}
+
+	case 20: TraceOptionsRebindProof::InjectKey(EKeys::BackSpace, false); Next(21, 1); return;
+
+	case 21:
+	{
+		constexpr int32 SlotUnderTest = UTraceUserSettings::SavedLoadoutCount - 1;
+		VerifyCheck(TEXT("D. CLEAR: the second BKSP empties it, and the highlight stays on it"),
+			Settings.GetSavedLoadout(SlotUnderTest).IsEmpty() && Rows.IsValidIndex(Selected)
+				&& Rows[Selected].SlotIndex == SlotUnderTest,
+			FString::Printf(TEXT("slot %d %s, selected %s"), SlotUnderTest + 1,
+				Settings.GetSavedLoadout(SlotUnderTest).IsEmpty() ? TEXT("EMPTY") : TEXT("still filled"), *RowName(Selected)));
+
+		Settings.SetSavedLoadout(SlotUnderTest, VerifySavedLoadout);
+		Settings.SetSavedLoadoutName(SlotUnderTest, VerifySavedLoadoutName);
+
+		// ---- B. CLOSING THE LOADOUT EDITOR LANDS ON THE SLOT IT EDITED -----------------------------
+		Selected = FindActionRow(EAction::EditLoadoutSlot, 2);
+		ActivateSelected();
+		Next(22, 3);
+		return;
+	}
+
+	case 22:
+		VerifyCheck(TEXT("the loadout editor opens on slot 3"),
+			LoadoutEditor.IsLibraryOpen() && LoadoutEditor.GetLibrarySlot() == 2, TEXT(""));
+		LoadoutEditor.CloseLibrary();
+		Next(23, 3);
+		return;
+
+	case 23:
+		VerifyCheck(TEXT("B. closing the editor lands back on slot 3 (it used to land on slot 1)"),
+			Page == EPage::Loadouts && Rows.IsValidIndex(Selected) && Rows[Selected].SlotIndex == 2,
+			FString::Printf(TEXT("selected %s"), *RowName(Selected)));
+
+		// ---- F. A PAUSED WORLD DOES NOT FREEZE THE MENU ---------------------------------------------
+		Close();
+		PC->SetPause(true);
+		OpenVideo();
+		Next(24, 3);
+		return;
+
+	case 24:
+		VerifyIndex = Selected;
+		VerifyRealStart = FPlatformTime::Seconds();
+		VerifyMenuStart = Now;
+		VerifyWorldStart = (VerifyWorld != nullptr) ? VerifyWorld->GetTimeSeconds() : 0.0;
+		TraceOptionsRebindProof::InjectKey(EKeys::Down, true);
+		Next(25, 0);
+		return;
+
+	case 25:
+		// HELD for 1.3 s of REAL time: the repeat delay is 0.38 s and the interval 0.12 s, so a running
+		// clock moves about eight rows. A frozen one moves exactly one.
+		if (FPlatformTime::Seconds() - VerifyRealStart < 1.3)
+		{
+			return;
+		}
+		TraceOptionsRebindProof::InjectKey(EKeys::Down, false);
+		Next(26, 2);
+		return;
+
+	case 26:
+	{
+		int32 Moves = 0;
+		for (int32 Index = VerifyIndex + 1; Index <= Selected && Rows.IsValidIndex(Index); ++Index)
+		{
+			Moves += Rows[Index].IsSelectable() ? 1 : 0;
+		}
+		const bool bPaused = VerifyWorld != nullptr && VerifyWorld->IsPaused()
+			&& FMath::IsNearlyEqual(VerifyWorld->GetTimeSeconds(), VerifyWorldStart);
+		VerifyCheck(TEXT("F. the world is really paused (its clock did not move)"), bPaused,
+			bPaused ? TEXT("") : TEXT("INCONCLUSIVE: this world would not pause, so F proves nothing here"));
+		VerifyCheck(TEXT("F. ...and the menu's clock kept running"), Now - VerifyMenuStart >= 1.0f,
+			FString::Printf(TEXT("menu clock +%.2fs over %.2fs real"), Now - VerifyMenuStart,
+				FPlatformTime::Seconds() - VerifyRealStart));
+		VerifyCheck(TEXT("F. ...so a held DOWN repeats (it used to move one row)"), Moves >= 3,
+			FString::Printf(TEXT("%d row(s) in 1.3 s, %s -> %s"), Moves, *RowName(VerifyIndex), *RowName(Selected)));
+		VerifyCheck(TEXT("F. ...and the root is titled PAUSED only while paused"), bWorldPaused == bPaused, TEXT(""));
+
+		PC->SetPause(false);
+		Close();
+		Next(30, 1);
+		return;
+	}
+
+	case 30:
+	default:
+	{
+		bDebugPointer = false;
+		bDebugPointerDown = false;
+		if (IsOpen())
+		{
+			Close();
+		}
+
+		VerifyCheck(TEXT("the overlay's first frame had every sprite drawable (TraceMenuKit::Prime)"),
+			TraceOptionsMenuArt::GFirstDrawUnready == 0,
+			FString::Printf(TEXT("%d not drawable on the first frame"), TraceOptionsMenuArt::GFirstDrawUnready));
+
+		VerifyStep = 0;
+		if (VerifyFailures == 0)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MenuVerify] ===== PASS — %d checks: the pointer waits to be moved, BACK keeps your place, ")
+				TEXT("RESET and CLEAR ask first, the arrows step both ways, and a paused world does not freeze the menu ====="),
+				VerifyChecks);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[MenuVerify] ===== *** FAIL *** %d of %d check(s) — see above ====="),
+				VerifyFailures, VerifyChecks);
+		}
+		return;
+	}
+	}
 }
+#endif

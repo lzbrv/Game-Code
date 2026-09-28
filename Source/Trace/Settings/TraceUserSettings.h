@@ -787,6 +787,16 @@ public:
 	/** Restores the shipped default for every action AND for the mouse. */
 	void ResetToDefaults();
 
+	/**
+	 * Restores the shipped KEYBOARD binding of every action (both slots), and saves. Nothing else —
+	 * not the mouse, not the pad. The KEYBOARD page's own reset: a reset row belongs to the page it is
+	 * drawn on (see EAction::ResetVideoDefaults in UI/TraceOptionsMenu.h).
+	 */
+	void ResetKeyboardToDefaults();
+
+	/** Restores the three mouse values (sensitivity, vertical scale, invert Y), and saves. Nothing else. */
+	void ResetMouseToDefaults();
+
 	/** True when nothing has been changed from the shipped defaults. Drives the reset row's dimming. */
 	bool IsAtDefaults() const;
 

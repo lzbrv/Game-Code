@@ -387,11 +387,11 @@ const TArray<FTraceInputActionInfo>& TraceInputActions::All()
 	// pointers into storage that a reload may move: stale labels at best, a read of freed characters at
 	// worst. Re-resolving on every call is no better — this function is walked from HUD draw code.
 	//
-	// THE PLACE THAT WORKS is where the label is COPIED, once per rebuild, into a row:
-	// FTraceOptionsMenu::RebuildRows in UI/TraceOptionsMenu.cpp does `Row.Label = Info.DisplayName;`
-	// twice (keyboard page and pad page). A TraceGameText::Get(<key>, Info.DisplayName) there is
-	// re-read on every rebuild, holds no pointer, and costs nothing per frame. The same shape the
-	// character roster uses for its cards (Core/TraceCharacterRoster.cpp, ApplyEditableText).
+	// THE PLACE THAT WORKS is where the label is COPIED, once per rebuild, into a row — and that is
+	// where it is done: UI/TraceOptionsMenu.cpp's TraceOptionsMenuFile::ActionLabel looks every action
+	// up as OPTIONS.ACTION.<NAME> (one literal TRACE_TEXT per action, so the document's scanner finds
+	// them) with these DisplayNames as the defaults, for both the KEYBOARD and CONTROLLER pages. An
+	// action added here without a line there shows its DisplayName.
 	//
 	// Function-local static: built on first use, after EKeys is up, and never rebuilt.
 	static const TArray<FTraceInputActionInfo> Table =
@@ -1798,6 +1798,25 @@ void UTraceUserSettings::ResetToDefaults()
 
 	KeyBindings.Reset();
 	RefreshFromConfig();      // repopulates Bindings straight from the defaults table
+	Save();
+}
+
+void UTraceUserSettings::ResetKeyboardToDefaults()
+{
+	// The keyboard half of ResetToDefaults and nothing more. Emptying the persisted list and
+	// re-parsing is the same route ResetToDefaults takes: RefreshFromConfig seeds every action it
+	// finds no line for from the defaults table, both slots. The pad table is a separate list and is
+	// not touched.
+	KeyBindings.Reset();
+	RefreshFromConfig();
+	Save();
+}
+
+void UTraceUserSettings::ResetMouseToDefaults()
+{
+	MouseSensitivity = DefaultSensitivity;
+	MouseSensitivityYScale = DefaultSensitivityYScale;
+	bInvertMouseY = false;
 	Save();
 }
 

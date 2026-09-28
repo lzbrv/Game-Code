@@ -744,24 +744,16 @@ namespace
 	 * had been landing on CROSSHAIR and calling it CHARACTERS ever since), and WP2/WP3 have now added
 	 * a PLAYER section above the whole page plus a SOUND door in the middle of it.
 	 *
-	 * FTraceOptionsMenu::RebuildRows now lays the settings page out as
+	 * FTraceOptionsMenu::RebuildRows lays the settings page out as (the options-page kit pass moved
+	 * the twenty key binds to a KEYBOARD page of their own and dropped the one-row captions)
 	 *
-	 *    0 header PLAYER    1 CALL SIGN       <- the selection starts here (first selectable row)
-	 *    2 note
-	 *    3 header DISPLAY   4 VIDEO SETTINGS  5 CROSSHAIR
-	 *    6 header SOUND     7 AUDIO
-	 *    8 header MATCH     9 CHARACTERS     10 note  11 note
-	 *   12 header MOUSE    13 SENSITIVITY    14 VERTICAL SENSITIVITY   15 INVERT MOUSE Y
-	 *   16 header CONTROLS 17 MOVE FORWARD   18..  the rest of TraceInputActions::All(), in order
+	 *    0 CALL SIGN  <- the selection starts here     1 note
+	 *    2 VIDEO  3 AUDIO  4 CROSSHAIR  5 KEYBOARD  6 CONTROLLER  7 LOADOUTS
+	 *    8 spacer  9 ABILITIES  10 note  11 header MOUSE
+	 *   12 SENSITIVITY  13 VERTICAL SENSITIVITY  14 INVERT MOUSE Y  15 spacer  16 RESET  17 BACK
 	 *
-	 * MoveSelection skips headers and notes, so the SELECTABLE walk from the top is
-	 *
-	 *    1 CALL SIGN -> 4 VIDEO SETTINGS -> 5 CROSSHAIR -> 7 AUDIO -> 9 CHARACTERS
-	 *      -> 13 SENSITIVITY -> 14 VERTICAL -> 15 INVERT MOUSE Y -> 17 MOVE FORWARD
-	 *
-	 * i.e. reaching CHARACTERS now costs FOUR Downs where it used to cost one, and every later step
-	 * keeps its own relative distance (CHARACTERS -> SENSITIVITY is still one Down, and so on). The
-	 * leading step below is therefore four Downs and nothing else in the list moves.
+	 * MoveSelection skips headers and notes, so ABILITIES is seven Downs from CALL SIGN, and MOVE
+	 * FORWARD is the first row of the KEYBOARD page, six Ups from INVERT MOUSE Y and an Enter.
 	 *
 	 * *** THE CALL SIGN ROW IS NOT ACTIVATED BY THIS SCRIPT, DELIBERATELY. *** Enter on it hands the
 	 * keyboard to FTraceTextEntry for the rest of the run (FTraceOptionsMenu::TickCallSignEntry), so
@@ -769,6 +761,11 @@ namespace
 	 * would still "pass" while proving nothing. The call sign has its own headless driver,
 	 * Trace.CallSign.Set, which goes through the same storage and the same ServerChangeName the row's
 	 * submit path uses.
+	 *
+	 * ---- FIXED SINCE: the options-page kit pass made the first pointer sample on a page a RECORD, not
+	 * a move (FTraceOptionsMenu::PollMouse), and with the counts below the verdict now reads PASS on a
+	 * headless run (slider moved, toggle returned, K landed). The history is kept below because it is
+	 * the reason the fix exists.
 	 *
 	 * ---- MEASURED, AND IT IS WHY THE RE-WALK ALONE DOES NOT MAKE THE DONE LINE PASS ---------------
 	 *
@@ -806,24 +803,19 @@ namespace
 	{
 		static const TArray<FAutoSettingsKey> Script =
 		{
-			// FIVE Downs: CALL SIGN -> VIDEO SETTINGS -> CROSSHAIR -> AUDIO -> CONTROLLER SETTINGS ->
-			// CHARACTERS. The count is the number of SELECTABLE rows between the page's opening
-			// selection and this one.
-			//
-			// *** IT WAS FOUR, AND FOUR HAD SILENTLY STOPPED WORKING. *** D31-PAD added the
-			// CONTROLLER SETTINGS door to this page (FTraceOptionsMenu::BuildRows, EPage::Settings)
-			// and did not move this number, so every step after it walked one row early: the four
-			// "sensitivity +" presses landed on the CHARACTERS toggle, the invert-Y red arm landed on
-			// VERTICAL SENSITIVITY and did nothing, and the rebind capture was armed on INVERT MOUSE Y
-			// instead. The run still printed a DONE line full of numbers, and the numbers were the
-			// UNTOUCHED DEFAULTS — sensitivity 1.50 is UTraceUserSettings::DefaultSensitivity, not
-			// four steps of anything. Nothing read that line, so nothing complained for a whole demo.
-			// The verdict below is the fix for THAT, and this count is the fix for the walk.
-			{ []{ return EKeys::Down;  }, TEXT("-> video settings (from call sign)") },
-			{ []{ return EKeys::Down;  }, TEXT("-> crosshair") },
+			// *** RE-WALKED AGAIN (the options-page kit pass): THE KEY BINDS ARE THEIR OWN PAGE NOW. ***
+			// SETTINGS is CALL SIGN, then six doors with no captions (VIDEO, AUDIO, CROSSHAIR, KEYBOARD,
+			// CONTROLLER, LOADOUTS), then ABILITIES, then the MOUSE block — so reaching ABILITIES costs
+			// SEVEN Downs, and MOVE FORWARD is reached through the KEYBOARD door: six Ups from INVERT
+			// MOUSE Y, Enter, and the page opens on MOVE FORWARD (its first row). The page no longer
+			// lets a resting pointer take the selection when it opens, so these counts hold headlessly.
+			{ []{ return EKeys::Down;  }, TEXT("-> video (from call sign)") },
 			{ []{ return EKeys::Down;  }, TEXT("-> audio") },
-			{ []{ return EKeys::Down;  }, TEXT("-> controller settings (D31-PAD added this door)") },
-			{ []{ return EKeys::Down;  }, TEXT("-> characters (spec v14 3)") },
+			{ []{ return EKeys::Down;  }, TEXT("-> crosshair") },
+			{ []{ return EKeys::Down;  }, TEXT("-> keyboard") },
+			{ []{ return EKeys::Down;  }, TEXT("-> controller") },
+			{ []{ return EKeys::Down;  }, TEXT("-> loadouts") },
+			{ []{ return EKeys::Down;  }, TEXT("-> abilities (spec v14 3)") },
 
 			// LEFT/RIGHT rather than ENTER. This is now belt-and-braces: ActivateSelected on a
 			// Toggle USED to route through AdjustSelected(+1), which clamps, so ENTER could turn a
@@ -834,8 +826,8 @@ namespace
 			// a player as "the button to uninvert the mouse didn't work". ActivateSelected now
 			// flips, so ENTER would work here too; these stay LEFT/RIGHT because a step that
 			// asserts a specific end state is clearer than one that asserts a transition.
-			{ []{ return EKeys::Left;  }, TEXT("characters -> OFF") },
-			{ []{ return EKeys::Right; }, TEXT("characters -> ON (put back)") },
+			{ []{ return EKeys::Left;  }, TEXT("abilities -> OFF") },
+			{ []{ return EKeys::Right; }, TEXT("abilities -> ON (put back)") },
 			{ []{ return EKeys::Down;  }, TEXT("-> sensitivity") },
 			{ []{ return EKeys::Right; }, TEXT("sensitivity +") },
 			{ []{ return EKeys::Right; }, TEXT("sensitivity +") },
@@ -850,7 +842,13 @@ namespace
 			// so the DONE line below printed invertY=1 — which is the failure, and is what a player
 			// actually hit when they could not turn the inverted mouse off again.
 			{ []{ return EKeys::Enter; }, TEXT("toggle invert y OFF again (must actually flip)") },
-			{ []{ return EKeys::Down;  }, TEXT("-> move forward (across the CONTROLS header)") },
+			{ []{ return EKeys::Up;    }, TEXT("-> vertical sensitivity") },
+			{ []{ return EKeys::Up;    }, TEXT("-> sensitivity") },
+			{ []{ return EKeys::Up;    }, TEXT("-> abilities (across the MOUSE caption)") },
+			{ []{ return EKeys::Up;    }, TEXT("-> loadouts") },
+			{ []{ return EKeys::Up;    }, TEXT("-> controller") },
+			{ []{ return EKeys::Up;    }, TEXT("-> keyboard") },
+			{ []{ return EKeys::Enter; }, TEXT("open KEYBOARD (lands on move forward)") },
 			{ []{ return EKeys::Enter; }, TEXT("arm rebind capture") },
 			{ []{ return EKeys::K;     }, TEXT("bind move forward to K") },
 		};
