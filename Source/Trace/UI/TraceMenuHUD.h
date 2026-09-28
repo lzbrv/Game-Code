@@ -206,8 +206,12 @@ public:
 	 * WHILE A JOIN IS CONNECTING it cancels the join and puts the prompt back — see CancelJoin. While
 	 * PLAY or PRACTICE is loading it does nothing. It can NEVER reach QuitGame during a travel: that
 	 * was the stuck state where Esc on the CONNECTING card walked a hidden highlight to QUIT and the
-	 * second press closed the game. On the title rows: moves the highlight to QUIT, and quits if it is
-	 * already there.
+	 * second press closed the game.
+	 *
+	 * ON THE TITLE ROWS IT NEVER QUITS AT ALL. It moves the highlight to QUIT and turns the row into
+	 * the question (QUIT GAME?); pressed again while the question is up, it answers NO. Only A, Enter,
+	 * Space or a click on the question closes the game — the pause menu's two-step (see ArmQuit). It
+	 * used to quit on the second press, so START pressed twice closed the game with nothing asked.
 	 */
 	void CancelPressed();
 
@@ -253,12 +257,16 @@ public:
 
 #if !UE_BUILD_SHIPPING
 	/**
-	 * `Trace.Menu.JoinVerify` — the JOIN prompt and the connecting card, driven one frame at a time
-	 * through the real entry points (a real Escape key edge, a real pad B edge), with a PASS/FAIL
-	 * verdict. It dials an unroutable address, so nothing is ever joined, and it puts the player's
-	 * remembered JOIN address back afterwards. See TickJoinVerify.
+	 * `Trace.Menu.JoinVerify [join|quit|click]` — the title screen's harness, driven one frame at a
+	 * time through the real entry points (real Escape, Enter and pad B edges, real mouse clicks), with
+	 * a PASS/FAIL verdict. Three parts, all three when @p Parts is empty:
+	 *   join   the JOIN prompt and the connecting card. It dials an unroutable address, so nothing is
+	 *          ever joined, and puts the player's remembered JOIN address back afterwards.
+	 *   quit   QUIT asks first, and Escape / pad B never close the game (QuitGame is intercepted).
+	 *   click  a click at a pointer that has not moved since the title came up.
+	 * See TickJoinVerify.
 	 */
-	void BeginJoinVerify();
+	void BeginJoinVerify(const FString& Parts = FString());
 
 	/** Trace.Menu.JoinOnce: JOIN @p Address through the real prompt and ConfirmJoin. Dev only. */
 	void DebugJoin(const FString& Address);
@@ -376,6 +384,12 @@ protected:
 	/** The line of plain English under the rows, describing whichever row is selected. */
 	FString BuildBlurb() const;
 
+	/**
+	 * The pad legend under the rows (MENU.FOOTER_PAD_KEYS), or empty when no pad has been seen. What
+	 * B does is part of it, so it changes while QUIT is asking: B answers the question there.
+	 */
+	FString BuildPadLegend() const;
+
 	// ---- Actions ---------------------------------------------------------------------------------
 
 	/**
@@ -409,6 +423,26 @@ protected:
 	void StartPracticeRange();
 
 	void QuitGame();
+
+	// ---- QUIT ASKS FIRST — the pause menu's two-step -------------------------------------------
+	//
+	// The first press on QUIT (A, Enter, Space, a click — or Escape / pad B from any row) turns the row
+	// into the question, QUIT GAME? (the pause menu's own OPTIONS.PAUSE.CONFIRM_QUIT); only a second
+	// A / Enter / Space / click on it within QuitArmSeconds of REAL time closes the game. Moving off
+	// the row, opening a modal, a travel, Escape / pad B, or waiting it out drops the question. This is
+	// FTraceOptionsMenu's ArmOrConfirm contract for its QUIT row, on the title's one destructive row.
+
+	/** Turns QUIT into its question. @p Why is for the log. */
+	void ArmQuit(const TCHAR* Why);
+
+	/** Drops the question, if it is up. @p Why is for the log. */
+	void DisarmQuit(const TCHAR* Why);
+
+	/** True while QUIT is asking and the answer window is still open. */
+	bool IsQuitAsking() const;
+
+	/** Once per frame: drops the question when the reason for it has gone (see the block above). */
+	void UpdateQuitQuestion();
 
 	/** Sets, applies and SAVES the bot difficulty (TraceDifficulty::SetSavedSetting). */
 	void SetDifficulty(ETraceBotDifficulty InDifficulty);
@@ -688,8 +722,42 @@ private:
 	 *
 	 * The keyboard is deliberately unaffected: someone who genuinely never touches the mouse can
 	 * still drive the whole menu with the arrows and Enter.
+	 *
+	 * WHAT IT COST, AND THE TWO WAYS A PLAYER NOW GETS PAST IT (title-click-after-return). Coming back
+	 * from a match the pointer sits wherever the match's capture left it, and a player who clicked the
+	 * row under it — or nudged it onto a row by less than the 30 px the settling window needs — saw
+	 * nothing happen at all; only the log knew the click was dropped. Now:
+	 *   * once the screen has SETTLED (the 0.75 s window, and the loading card's grace), ANY real move
+	 *     of more than 2 px from where the pointer then sat counts (see SettledCursorPos). The replayed
+	 *     press never moved at all, so this keeps the discriminator, only without the jitter margin
+	 *     the opening frames needed;
+	 *   * a click at a pointer that has not moved is still not acted on, but it is not silent either:
+	 *     it lights the row under the pointer, drawn PRESSED while the button is held, and a SECOND
+	 *     click on that row counts (see RestingClickRow). The replay was one press-and-release pair.
 	 */
 	bool bCursorHasMoved = false;
+
+	/**
+	 * Where the pointer sat on the first sample after the screen settled (bHasSettledCursor), for the
+	 * "any real move" half of bCursorHasMoved above.
+	 */
+	FVector2D SettledCursorPos = FVector2D::ZeroVector;
+	bool bHasSettledCursor = false;
+
+	/**
+	 * The row a click at an unmoved pointer lit, or INDEX_NONE. The next click that lands on it is
+	 * acted on. See bCursorHasMoved.
+	 */
+	int32 RestingClickRow = INDEX_NONE;
+
+	/** That click's row while its button is still down, so the row draws PRESSED under it. */
+	int32 RestingPressRow = INDEX_NONE;
+
+	/** True while QUIT reads QUIT GAME? — see ArmQuit. */
+	bool bQuitArmed = false;
+
+	/** FPlatformTime::Seconds() after which an unanswered QUIT GAME? lapses. */
+	double QuitArmedUntilReal = 0.0;
 
 	/**
 	 * Bottom of the tagline as of the last DrawWordmark(), so DrawAddressChip() can sit under it
@@ -938,6 +1006,9 @@ private:
 	/** One step of the harness, run at the end of every DrawHUD while it is armed. */
 	void TickJoinVerify();
 
+	/** The first step of the next part the run asked for after @p FinishedStep's part, or 100 (done). */
+	int32 JoinVerifyNextPart(int32 FinishedStep) const;
+
 	/** 0 = not running; otherwise the step the harness is on. */
 	int32 JoinVerifyStep = 0;
 
@@ -946,8 +1017,30 @@ private:
 
 	int32 JoinVerifyFailures = 0;
 
+	/** Which parts this run covers: bit 0 join, bit 1 quit, bit 2 click. */
+	int32 JoinVerifyParts = 0;
+
 	/** The player's remembered JOIN address, put back when the harness finishes. */
 	FString JoinVerifySavedAddress;
+
+	/** The difficulty the click part found, put back after each click that cycles it. */
+	ETraceBotDifficulty JoinVerifySavedDifficulty = TraceDifficulty::Default;
+
+	/** Where the click part parked the pointer (DIFFICULTY's centre), in viewport pixels. */
+	FVector2D JoinVerifyRestPoint = FVector2D::ZeroVector;
+
+	/**
+	 * The quit part's safety net: while true QuitGame logs and counts instead of closing the game, so
+	 * a build where Escape still quits FAILS the harness instead of ending it.
+	 */
+	bool bDebugInterceptQuit = false;
+	int32 DebugQuitCalls = 0;
+
+	/**
+	 * The click part's premise: "the title just came up with the pointer resting HERE, and the screen
+	 * has settled". Resets the pointer guard to that state at the pointer's current position.
+	 */
+	void DebugRestPointerHere();
 
 	// ---- The Canvas title's draw record for Trace.Menu.FailureVerify (plate rects, glow excluded) --
 	FBox2D DebugCanvasMarkRect = FBox2D(ForceInit);

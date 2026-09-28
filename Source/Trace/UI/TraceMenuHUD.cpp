@@ -388,6 +388,27 @@ namespace TraceMenuHUDPointer
 	}
 }
 
+namespace TraceMenuHUDQuit
+{
+	/**
+	 * How long QUIT GAME? waits for its answer, in real seconds. The pause menu's own window
+	 * (FTraceOptionsMenu::ArmWindowSeconds, private to that class), so the two QUITs ask alike.
+	 */
+	static constexpr double AnswerSeconds = 3.0;
+}
+
+namespace TraceMenuHUDPointerGuard
+{
+	/** World seconds after the title appears before any pointer sample counts as a move. */
+	static constexpr float SettleSeconds = 0.75f;
+
+	/** Movement from the FIRST sample that counts, for a pointer moved inside the settling window. */
+	static constexpr float FirstSampleMovePx = 30.f;
+
+	/** Movement from the first SETTLED sample that counts: any real move (title-click-after-return). */
+	static constexpr float SettledMovePx = 2.f;
+}
+
 namespace TraceMenuHUDTravel
 {
 	// The caption's size and place are TraceTitleLayout's since P12: the loading card that takes over
@@ -591,9 +612,7 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 	// cannot discover by pressing something, and vanishes again on a keyboard-only machine. The slot
 	// it uses is the one the deletion deliberately left in the asset — see the paragraph above — so
 	// no layout moves and the Canvas twin (DrawFooter) prints the same string in the same place.
-	OutView.FooterKeys = ShouldShowPadHints()
-		? FString(TRACE_TEXT("MENU.FOOTER_PAD_KEYS", "D-PAD   MOVE          A   SELECT          B   BACK"))
-		: FString();
+	OutView.FooterKeys = BuildPadLegend();
 
 	// THE HINT LINE IS EMPTY, and stays in the view rather than being deleted. It read "PLAY ALSO
 	// HOSTS - EVERY MATCH IS JOINABLE", which the PLAY blurb directly above it already says; the
@@ -1643,54 +1662,72 @@ void ATraceMenuHUD::ClickTestStep()
 // Against the pre-fix CancelPressed, step 4 fails ("still travelling, highlight on QUIT") and the
 // harness stops there rather than pressing Escape a second time, which would have quit the game.
 
+// NAMED, not anonymous and not the global namespace (msvc-hazards W4): this module is a unity build,
+// and a file-scope name that a later file reuses is a redefinition in the Windows unity blob.
 namespace TraceMenuJoinVerify
 {
 	static const TCHAR* const DeadAddress = TEXT("10.255.255.1:7777");
+
+	/** Bits of ATraceMenuHUD::JoinVerifyParts, and the first step of each part. */
+	static constexpr int32 PartJoin  = 1 << 0;
+	static constexpr int32 PartQuit  = 1 << 1;
+	static constexpr int32 PartClick = 1 << 2;
+	static constexpr int32 FirstJoinStep  = 1;
+	static constexpr int32 FirstQuitStep  = 20;
+	static constexpr int32 FirstClickStep = 50;
+	static constexpr int32 DoneStep       = 100;
+
+	/** The pointer moves the click part makes once the screen has settled: under and over the 2 px rule. */
+	static constexpr float TwitchPx = 1.f;
+	static constexpr float NudgePx  = 6.f;
+
+	static FAutoConsoleCommandWithWorldAndArgs CmdMenuJoinVerify(
+		TEXT("Trace.Menu.JoinVerify"),
+		TEXT("Dev only. Trace.Menu.JoinVerify [join|quit|click] - the title screen's harness, all three parts ")
+		TEXT("with no argument. join: the JOIN prompt and connecting card (Escape cancels a join, never quits; ")
+		TEXT("the pending connection is really dropped; CONNECT / BACK / CANCEL take a click). quit: QUIT asks ")
+		TEXT("QUIT GAME? first, and Escape / pad B never close the game (QuitGame is intercepted for the run). ")
+		TEXT("click: a click at a pointer that has not moved lights its row and the second click acts; a 6 px ")
+		TEXT("move once settled makes the first click act. Prints a VERDICT. Run on the title map."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+			[](const TArray<FString>& Args, UWorld* World)
+			{
+				APlayerController* const PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+				ATraceMenuHUD* const MenuHUD = (PC != nullptr) ? Cast<ATraceMenuHUD>(PC->GetHUD()) : nullptr;
+				if (MenuHUD == nullptr)
+				{
+					UE_LOG(LogTraceGame, Warning, TEXT("[JoinVerify] No title-screen HUD here — run this on the menu map."));
+					return;
+				}
+				MenuHUD->BeginJoinVerify((Args.Num() > 0) ? Args[0] : FString());
+			}));
+
+	/**
+	 * `Trace.Menu.JoinOnce <address>` — JOIN through the real prompt ONCE PER PROCESS, for a headless
+	 * capture of what a failed join comes back to. -TraceExec re-arms on every title screen, and a failed
+	 * join reloads the title, so a plain command would join again on the reloaded screen and hide the
+	 * very prompt the capture is for. Dev only.
+	 */
+	static FAutoConsoleCommandWithWorldAndArgs CmdMenuJoinOnce(
+		TEXT("Trace.Menu.JoinOnce"),
+		TEXT("Dev only. Trace.Menu.JoinOnce <address> - open the title's JOIN prompt on <address> and CONNECT, ")
+		TEXT("once per process (a failed join reloads the title; the reloaded title does not join again)."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+			[](const TArray<FString>& Args, UWorld* World)
+			{
+				static bool bJoinedOnce = false;
+				APlayerController* const PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+				ATraceMenuHUD* const MenuHUD = (PC != nullptr) ? Cast<ATraceMenuHUD>(PC->GetHUD()) : nullptr;
+				if (MenuHUD == nullptr || Args.Num() < 1 || bJoinedOnce)
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("[Menu] Trace.Menu.JoinOnce: %s."),
+						bJoinedOnce ? TEXT("already joined once this process") : TEXT("needs the title map and an address"));
+					return;
+				}
+				bJoinedOnce = true;
+				MenuHUD->DebugJoin(Args[0]);
+			}));
 }
-
-static FAutoConsoleCommandWithWorldAndArgs CmdMenuJoinVerify(
-	TEXT("Trace.Menu.JoinVerify"),
-	TEXT("Dev only. Drives the title screen's JOIN prompt and connecting card (Escape cancels a join, never ")
-	TEXT("quits; the pending connection is really dropped; CONNECT / BACK / CANCEL take a click) and prints ")
-	TEXT("a VERDICT. Run on the title map."),
-	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
-		[](const TArray<FString>& /*Args*/, UWorld* World)
-		{
-			APlayerController* const PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
-			ATraceMenuHUD* const MenuHUD = (PC != nullptr) ? Cast<ATraceMenuHUD>(PC->GetHUD()) : nullptr;
-			if (MenuHUD == nullptr)
-			{
-				UE_LOG(LogTraceGame, Warning, TEXT("[JoinVerify] No title-screen HUD here — run this on the menu map."));
-				return;
-			}
-			MenuHUD->BeginJoinVerify();
-		}));
-
-/**
- * `Trace.Menu.JoinOnce <address>` — JOIN through the real prompt ONCE PER PROCESS, for a headless
- * capture of what a failed join comes back to. -TraceExec re-arms on every title screen, and a failed
- * join reloads the title, so a plain command would join again on the reloaded screen and hide the
- * very prompt the capture is for. Dev only.
- */
-static FAutoConsoleCommandWithWorldAndArgs CmdMenuJoinOnce(
-	TEXT("Trace.Menu.JoinOnce"),
-	TEXT("Dev only. Trace.Menu.JoinOnce <address> - open the title's JOIN prompt on <address> and CONNECT, ")
-	TEXT("once per process (a failed join reloads the title; the reloaded title does not join again)."),
-	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
-		[](const TArray<FString>& Args, UWorld* World)
-		{
-			static bool bJoinedOnce = false;
-			APlayerController* const PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
-			ATraceMenuHUD* const MenuHUD = (PC != nullptr) ? Cast<ATraceMenuHUD>(PC->GetHUD()) : nullptr;
-			if (MenuHUD == nullptr || Args.Num() < 1 || bJoinedOnce)
-			{
-				UE_LOG(LogTraceGame, Display, TEXT("[Menu] Trace.Menu.JoinOnce: %s."),
-					bJoinedOnce ? TEXT("already joined once this process") : TEXT("needs the title map and an address"));
-				return;
-			}
-			bJoinedOnce = true;
-			MenuHUD->DebugJoin(Args[0]);
-		}));
 
 void ATraceMenuHUD::DebugJoin(const FString& Address)
 {
@@ -1739,106 +1776,106 @@ namespace TraceMenuFailureVerify
 			? FString::Printf(TEXT("(%.0f,%.0f)-(%.0f,%.0f)"), Box.Min.X, Box.Min.Y, Box.Max.X, Box.Max.Y)
 			: FString(TEXT("(none)"));
 	}
-}
 
-/**
- * `Trace.Menu.FailureVerify` — the title's network-failure banner, on whichever renderer is live (UMG,
- * or the Canvas with -TraceNoMenuUMG). Raises a client timeout through the engine's own delegate, waits
- * for the banner to draw, and asserts that it is the kit's HOVER plate with its line in white, inside
- * the screen, clear of the TRACE wordmark, the swoosh, the address chip and the rows. Dev only; clears
- * the failure afterwards.
- */
-static FAutoConsoleCommandWithWorldAndArgs CmdMenuFailureVerify(
-	TEXT("Trace.Menu.FailureVerify"),
-	TEXT("Dev only. The title's failure banner: raises a client timeout, then checks the banner is the kit's ")
-	TEXT("hover plate, white, on screen and clear of the wordmark, swoosh, address chip and rows. Title map."),
-	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
-		[](const TArray<FString>& /*Args*/, UWorld* World)
-		{
-			APlayerController* const PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
-			ATraceMenuHUD* const MenuHUD = (PC != nullptr) ? Cast<ATraceMenuHUD>(PC->GetHUD()) : nullptr;
-			if (MenuHUD == nullptr || GEngine == nullptr)
+	/**
+	 * `Trace.Menu.FailureVerify` — the title's network-failure banner, on whichever renderer is live (UMG,
+	 * or the Canvas with -TraceNoMenuUMG). Raises a client timeout through the engine's own delegate, waits
+	 * for the banner to draw, and asserts that it is the kit's HOVER plate with its line in white, inside
+	 * the screen, clear of the TRACE wordmark, the swoosh, the address chip and the rows. Dev only; clears
+	 * the failure afterwards. In this named namespace rather than at file scope (msvc-hazards W4).
+	 */
+	static FAutoConsoleCommandWithWorldAndArgs CmdMenuFailureVerify(
+		TEXT("Trace.Menu.FailureVerify"),
+		TEXT("Dev only. The title's failure banner: raises a client timeout, then checks the banner is the kit's ")
+		TEXT("hover plate, white, on screen and clear of the wordmark, swoosh, address chip and rows. Title map."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+			[](const TArray<FString>& /*Args*/, UWorld* World)
 			{
-				UE_LOG(LogTraceGame, Warning, TEXT("[FailureBanner] No title-screen HUD here — run this on the menu map."));
-				return;
-			}
-
-			TraceNet::ClearFailure();
-			GEngine->BroadcastNetworkFailure(World, nullptr, ENetworkFailure::ConnectionTimeout,
-				TraceMenuFailureVerify::EngineText);
-			UE_LOG(LogTraceGame, Display, TEXT("[FailureBanner] ===== the title's failure banner (%s) ====="),
-				MenuHUD->IsMenuUmgActive() ? TEXT("UMG") : TEXT("Canvas"));
-
-			const TWeakObjectPtr<ATraceMenuHUD> WeakHud(MenuHUD);
-			const double StartedAt = FPlatformTime::Seconds();
-			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakHud, StartedAt](float) -> bool
-			{
-				const ATraceMenuHUD* const Hud = WeakHud.Get();
-				if (Hud == nullptr)
+				APlayerController* const PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+				ATraceMenuHUD* const MenuHUD = (PC != nullptr) ? Cast<ATraceMenuHUD>(PC->GetHUD()) : nullptr;
+				if (MenuHUD == nullptr || GEngine == nullptr)
 				{
-					return false;
+					UE_LOG(LogTraceGame, Warning, TEXT("[FailureBanner] No title-screen HUD here — run this on the menu map."));
+					return;
 				}
-				if (FPlatformTime::Seconds() - StartedAt < 1.0)
-				{
-					return true;   // a few frames, so Slate has laid the banner out where it flowed it
-				}
-
-				FTraceTitleFailureLayout Layout;
-				Hud->DebugDescribeFailure(Layout);
-
-				int32 Failures = 0;
-				const auto Check = [&Failures](bool bPass, const TCHAR* Claim, const FString& Detail)
-				{
-					Failures += bPass ? 0 : 1;
-					UE_LOG(LogTraceGame, Display, TEXT("[FailureBanner]   %-4s %s  %s"), bPass ? TEXT("ok") : TEXT("FAIL"), Claim, *Detail);
-				};
-
-				FString Expected;
-				double AgeSeconds = 0.0;
-				TraceNet::GetLastFailure(Expected, AgeSeconds);
-
-				Check(Layout.bVisible && Layout.Headline == Expected && !Layout.Headline.IsEmpty(),
-					TEXT("the banner is up, saying the player's line"),
-					FString::Printf(TEXT("%s renderer, \"%s\" (expected \"%s\")"), Layout.bUmg ? TEXT("UMG") : TEXT("Canvas"),
-						*Layout.Headline, *Expected));
-				Check(Layout.bKitHoverPlate, TEXT("*** it is the handmade kit's HOVER plate, not the brown bar ***"), TEXT(""));
-				Check(Layout.HeadlineColor.R > 0.9f && Layout.HeadlineColor.G > 0.9f && Layout.HeadlineColor.B > 0.9f,
-					TEXT("*** its line is white (the kit's word), not the pre-kit amber ***"),
-					Layout.HeadlineColor.ToString());
-				Check(Layout.Banner.bIsValid && Layout.Banner.Min.X >= 0.0 && Layout.Banner.Min.Y >= 0.0
-						&& Layout.Banner.Max.X <= Layout.ViewSize.X && Layout.Banner.Max.Y <= Layout.ViewSize.Y
-						&& Layout.Banner.GetSize().X < Layout.ViewSize.X * 0.95,
-					TEXT("it is a centred plate inside the screen, not a full-width strip"),
-					FString::Printf(TEXT("%s in %.0fx%.0f"), *TraceMenuFailureVerify::Describe(Layout.Banner),
-						Layout.ViewSize.X, Layout.ViewSize.Y));
-				Check(!TraceMenuFailureVerify::Overlaps(Layout.Banner, Layout.Wordmark),
-					TEXT("*** it does not cover the TRACE wordmark ***"),
-					FString::Printf(TEXT("banner %s, wordmark %s"), *TraceMenuFailureVerify::Describe(Layout.Banner),
-						*TraceMenuFailureVerify::Describe(Layout.Wordmark)));
-				Check(!TraceMenuFailureVerify::Overlaps(Layout.Banner, Layout.Swoosh)
-						&& !TraceMenuFailureVerify::Overlaps(Layout.Banner, Layout.AddressChip)
-						&& !TraceMenuFailureVerify::Overlaps(Layout.Banner, Layout.LastRow)
-						&& (!Layout.LastRow.bIsValid || Layout.Banner.Min.Y >= Layout.LastRow.Max.Y),
-					TEXT("it sits under the menu, clear of the swoosh, the address chip and the rows"),
-					FString::Printf(TEXT("swoosh %s, chip %s, last row %s"), *TraceMenuFailureVerify::Describe(Layout.Swoosh),
-						*TraceMenuFailureVerify::Describe(Layout.AddressChip), *TraceMenuFailureVerify::Describe(Layout.LastRow)));
-				Check(!Layout.Headline.Contains(TEXT("UNETCONNECTION"), ESearchCase::IgnoreCase),
-					TEXT("no engine text on screen"), TEXT(""));
 
 				TraceNet::ClearFailure();
-				if (Failures == 0)
-				{
-					UE_LOG(LogTraceGame, Display, TEXT("[FailureBanner] VERDICT: ===== PASS ====="));
-				}
-				else
-				{
-					UE_LOG(LogTraceGame, Error, TEXT("[FailureBanner] VERDICT: ===== *** FAIL *** %d check(s) ====="), Failures);
-				}
-				return false;
-			}), 0.f);
-		}));
+				GEngine->BroadcastNetworkFailure(World, nullptr, ENetworkFailure::ConnectionTimeout,
+					TraceMenuFailureVerify::EngineText);
+				UE_LOG(LogTraceGame, Display, TEXT("[FailureBanner] ===== the title's failure banner (%s) ====="),
+					MenuHUD->IsMenuUmgActive() ? TEXT("UMG") : TEXT("Canvas"));
 
-void ATraceMenuHUD::BeginJoinVerify()
+				const TWeakObjectPtr<ATraceMenuHUD> WeakHud(MenuHUD);
+				const double StartedAt = FPlatformTime::Seconds();
+				FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakHud, StartedAt](float) -> bool
+				{
+					const ATraceMenuHUD* const Hud = WeakHud.Get();
+					if (Hud == nullptr)
+					{
+						return false;
+					}
+					if (FPlatformTime::Seconds() - StartedAt < 1.0)
+					{
+						return true;   // a few frames, so Slate has laid the banner out where it flowed it
+					}
+
+					FTraceTitleFailureLayout Layout;
+					Hud->DebugDescribeFailure(Layout);
+
+					int32 Failures = 0;
+					const auto Check = [&Failures](bool bPass, const TCHAR* Claim, const FString& Detail)
+					{
+						Failures += bPass ? 0 : 1;
+						UE_LOG(LogTraceGame, Display, TEXT("[FailureBanner]   %-4s %s  %s"), bPass ? TEXT("ok") : TEXT("FAIL"), Claim, *Detail);
+					};
+
+					FString Expected;
+					double AgeSeconds = 0.0;
+					TraceNet::GetLastFailure(Expected, AgeSeconds);
+
+					Check(Layout.bVisible && Layout.Headline == Expected && !Layout.Headline.IsEmpty(),
+						TEXT("the banner is up, saying the player's line"),
+						FString::Printf(TEXT("%s renderer, \"%s\" (expected \"%s\")"), Layout.bUmg ? TEXT("UMG") : TEXT("Canvas"),
+							*Layout.Headline, *Expected));
+					Check(Layout.bKitHoverPlate, TEXT("*** it is the handmade kit's HOVER plate, not the brown bar ***"), TEXT(""));
+					Check(Layout.HeadlineColor.R > 0.9f && Layout.HeadlineColor.G > 0.9f && Layout.HeadlineColor.B > 0.9f,
+						TEXT("*** its line is white (the kit's word), not the pre-kit amber ***"),
+						Layout.HeadlineColor.ToString());
+					Check(Layout.Banner.bIsValid && Layout.Banner.Min.X >= 0.0 && Layout.Banner.Min.Y >= 0.0
+							&& Layout.Banner.Max.X <= Layout.ViewSize.X && Layout.Banner.Max.Y <= Layout.ViewSize.Y
+							&& Layout.Banner.GetSize().X < Layout.ViewSize.X * 0.95,
+						TEXT("it is a centred plate inside the screen, not a full-width strip"),
+						FString::Printf(TEXT("%s in %.0fx%.0f"), *TraceMenuFailureVerify::Describe(Layout.Banner),
+							Layout.ViewSize.X, Layout.ViewSize.Y));
+					Check(!TraceMenuFailureVerify::Overlaps(Layout.Banner, Layout.Wordmark),
+						TEXT("*** it does not cover the TRACE wordmark ***"),
+						FString::Printf(TEXT("banner %s, wordmark %s"), *TraceMenuFailureVerify::Describe(Layout.Banner),
+							*TraceMenuFailureVerify::Describe(Layout.Wordmark)));
+					Check(!TraceMenuFailureVerify::Overlaps(Layout.Banner, Layout.Swoosh)
+							&& !TraceMenuFailureVerify::Overlaps(Layout.Banner, Layout.AddressChip)
+							&& !TraceMenuFailureVerify::Overlaps(Layout.Banner, Layout.LastRow)
+							&& (!Layout.LastRow.bIsValid || Layout.Banner.Min.Y >= Layout.LastRow.Max.Y),
+						TEXT("it sits under the menu, clear of the swoosh, the address chip and the rows"),
+						FString::Printf(TEXT("swoosh %s, chip %s, last row %s"), *TraceMenuFailureVerify::Describe(Layout.Swoosh),
+							*TraceMenuFailureVerify::Describe(Layout.AddressChip), *TraceMenuFailureVerify::Describe(Layout.LastRow)));
+					Check(!Layout.Headline.Contains(TEXT("UNETCONNECTION"), ESearchCase::IgnoreCase),
+						TEXT("no engine text on screen"), TEXT(""));
+
+					TraceNet::ClearFailure();
+					if (Failures == 0)
+					{
+						UE_LOG(LogTraceGame, Display, TEXT("[FailureBanner] VERDICT: ===== PASS ====="));
+					}
+					else
+					{
+						UE_LOG(LogTraceGame, Error, TEXT("[FailureBanner] VERDICT: ===== *** FAIL *** %d check(s) ====="), Failures);
+					}
+					return false;
+				}), 0.f);
+			}));
+}
+
+void ATraceMenuHUD::BeginJoinVerify(const FString& Parts)
 {
 	if (JoinVerifyStep != 0)
 	{
@@ -1851,12 +1888,59 @@ void ATraceMenuHUD::BeginJoinVerify()
 		return;
 	}
 
+	namespace MV = TraceMenuJoinVerify;
+	const FString Wanted = Parts.TrimStartAndEnd().ToLower();
+	JoinVerifyParts = Wanted.IsEmpty() ? (MV::PartJoin | MV::PartQuit | MV::PartClick)
+		: (Wanted == TEXT("join")) ? MV::PartJoin
+		: (Wanted == TEXT("quit")) ? MV::PartQuit
+		: (Wanted == TEXT("click")) ? MV::PartClick
+		: 0;
+	if (JoinVerifyParts == 0)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[JoinVerify] '%s' is not a part: join, quit or click (or nothing for all three)."), *Parts);
+		return;
+	}
+
 	JoinVerifySavedAddress = LastJoinAddress;
+	JoinVerifySavedDifficulty = Difficulty;
 	JoinVerifyFailures = 0;
-	JoinVerifyStep = 1;
+	JoinVerifyStep = JoinVerifyNextPart(0);
 	JoinVerifyStepTime = (GetWorld() != nullptr) ? GetWorld()->GetRealTimeSeconds() : 0.f;
-	UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] ===== JOIN prompt and connecting card (dialling %s) ====="),
-		TraceMenuJoinVerify::DeadAddress);
+	UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] ===== the title screen: %s%s%s ====="),
+		(JoinVerifyParts & MV::PartJoin) ? TEXT("[join: the JOIN prompt and connecting card] ") : TEXT(""),
+		(JoinVerifyParts & MV::PartQuit) ? TEXT("[quit: QUIT asks, Escape and pad B never quit] ") : TEXT(""),
+		(JoinVerifyParts & MV::PartClick) ? TEXT("[click: a click at a resting pointer]") : TEXT(""));
+}
+
+int32 ATraceMenuHUD::JoinVerifyNextPart(int32 FinishedStep) const
+{
+	namespace MV = TraceMenuJoinVerify;
+	if (FinishedStep < MV::FirstJoinStep && (JoinVerifyParts & MV::PartJoin))
+	{
+		return MV::FirstJoinStep;
+	}
+	if (FinishedStep < MV::FirstQuitStep && (JoinVerifyParts & MV::PartQuit))
+	{
+		return MV::FirstQuitStep;
+	}
+	if (FinishedStep < MV::FirstClickStep && (JoinVerifyParts & MV::PartClick))
+	{
+		return MV::FirstClickStep;
+	}
+	return MV::DoneStep;
+}
+
+void ATraceMenuHUD::DebugRestPointerHere()
+{
+	// Exactly the state BeginPlay leaves a title in whose pointer has not moved, with the settling
+	// window already behind it: the first sample and the settled sample are both HERE.
+	bCursorHasMoved = false;
+	FirstCursorPos = LastCursorPos;
+	SettledCursorPos = LastCursorPos;
+	bHasSettledCursor = true;
+	RestingClickRow = INDEX_NONE;
+	RestingPressRow = INDEX_NONE;
+	TitleShownTime = Now - 10.f;
 }
 
 void ATraceMenuHUD::TickJoinVerify()
@@ -2068,14 +2152,273 @@ void ATraceMenuHUD::TickJoinVerify()
 		}
 		Check(TEXT("a click on BACK closes the prompt, highlight on JOIN"),
 			!IsJoinPromptOpen() && !bTravelling && Selected == ETraceMenuRow::Join, DescribeState());
-		JoinVerifyStep = 100;
+		JoinVerifyStep = JoinVerifyNextPart(17);
+		JoinVerifyStepTime = RealNow;
+		break;
+
+	// =============================================================================================
+	// THE QUIT PART — QUIT asks first; Escape and pad B never close the game
+	// =============================================================================================
+	//
+	// QuitGame is INTERCEPTED for this part (bDebugInterceptQuit): it logs and counts rather than
+	// closing the process, so a build in which Escape still quits reports "quit=1" and FAILS instead
+	// of ending the run. Each tap below is three steps — key down, key up, judge — through the real
+	// entry points: Escape and Enter reach ATraceMenuPlayerController's binds, pad B reaches
+	// PollPadTitle through TracePadMenu::RisingEdge, exactly as a physical pad does.
+	case 20:
+		if (IsJoinPromptOpen())
+		{
+			CloseJoinPrompt(TEXT("JoinVerify quit part"));
+		}
+		bDebugInterceptQuit = true;
+		DebugQuitCalls = 0;
+		DisarmQuit(TEXT("JoinVerify quit part"));
+		Selected = ETraceMenuRow::Play;
+		UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] ----- quit: QUIT asks first; Escape and pad B never quit (QuitGame intercepted) -----"));
+		Advance();
+		break;
+
+	case 21: case 24: case 27: case 30: case 33: case 36: case 39: case 42: case 45:
+	{
+		// Key DOWN for tap (step - 21) / 3. Pad taps are skipped, not failed, with CONTROLLER INPUT off.
+		const int32 Tap = (JoinVerifyStep - 21) / 3;
+		const FKey TapKeys[] = { EKeys::Escape, EKeys::Escape, TracePadMenu::BackKey(), TracePadMenu::BackKey(),
+			EKeys::Enter, EKeys::Enter, EKeys::Enter, EKeys::Up, EKeys::Down };
+		if (StepAge < 0.2f)
+		{
+			break;
+		}
+		if (TapKeys[Tap].IsGamepadKey() && !TracePadMenu::IsEnabled())
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify]   skip pad tap %d: CONTROLLER INPUT is OFF on this machine."), Tap);
+			JoinVerifyStep += 3;
+			JoinVerifyStepTime = RealNow;
+			break;
+		}
+		InjectKey(PC, TapKeys[Tap], /*bPressed=*/true);
+		Advance();
+		break;
+	}
+
+	case 22: case 25: case 28: case 31: case 34: case 37: case 40: case 43: case 46:
+	{
+		// Held for a few frames, as a finger would, so the pad's polled edge is certain to see it.
+		const int32 Tap = (JoinVerifyStep - 22) / 3;
+		const FKey TapKeys[] = { EKeys::Escape, EKeys::Escape, TracePadMenu::BackKey(), TracePadMenu::BackKey(),
+			EKeys::Enter, EKeys::Enter, EKeys::Enter, EKeys::Up, EKeys::Down };
+		if (StepAge < 0.12f)
+		{
+			break;
+		}
+		InjectKey(PC, TapKeys[Tap], /*bPressed=*/false);
+		Advance();
+		break;
+	}
+
+	case 23: case 26: case 29: case 32: case 35: case 38: case 41: case 44: case 47:
+	{
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		FTraceMenuRowView QuitView;
+		BuildRowView(ETraceMenuRow::Quit, Selected == ETraceMenuRow::Quit, QuitView);
+		const FString QuitWords = TRACE_TEXT("MENU.ROW_QUIT", "QUIT");
+		const bool bOnQuit = Selected == ETraceMenuRow::Quit;
+		const bool bAsking = IsQuitAsking() && !QuitView.Label.Equals(QuitWords);
+		const FString QuitState = FString::Printf(TEXT("row=%d asking=%d quitRowSays='%s' quitCalls=%d"),
+			static_cast<int32>(Selected), bQuitArmed ? 1 : 0, *QuitView.Label, DebugQuitCalls);
+
+		switch ((JoinVerifyStep - 23) / 3)
+		{
+		case 0: Check(TEXT("ESCAPE on PLAY: highlight to QUIT, and QUIT asks"), bOnQuit && bAsking && DebugQuitCalls == 0, QuitState); break;
+		case 1: Check(TEXT("a second ESCAPE answers no: nothing quits (START x2 too)"), bOnQuit && !bQuitArmed && DebugQuitCalls == 0, QuitState); break;
+		case 2: Check(TEXT("pad B on QUIT asks"), bOnQuit && bAsking && DebugQuitCalls == 0, QuitState); break;
+		case 3: Check(TEXT("a second pad B answers no: nothing quits"), bOnQuit && !bQuitArmed && DebugQuitCalls == 0, QuitState); break;
+		case 4: Check(TEXT("ENTER on QUIT asks first, as the pause menu's QUIT does"), bOnQuit && bAsking && DebugQuitCalls == 0, QuitState); break;
+		case 5: Check(TEXT("ENTER on the question quits (intercepted here)"), DebugQuitCalls == 1 && !bQuitArmed, QuitState); break;
+		case 6: Check(TEXT("ENTER asks again"), bOnQuit && bAsking && DebugQuitCalls == 1, QuitState); break;
+		case 7: Check(TEXT("moving off QUIT drops the question"), !bOnQuit && !bQuitArmed && DebugQuitCalls == 1, QuitState); break;
+		default:
+			Check(TEXT("back on QUIT it reads QUIT again, not the question"),
+				bOnQuit && !bQuitArmed && QuitView.Label.Equals(QuitWords) && DebugQuitCalls == 1, QuitState);
+			break;
+		}
+		Advance();
+		break;
+	}
+
+	case 48:
+		// The last tap left the highlight on QUIT. Ask, then wait the answer window out.
+		ActivateSelection();
+		Check(TEXT("ENTER asks (for the lapse check)"), IsQuitAsking() && DebugQuitCalls == 1,
+			FString::Printf(TEXT("asking=%d quitCalls=%d"), bQuitArmed ? 1 : 0, DebugQuitCalls));
+		Advance();
+		break;
+
+	case 49:
+		if (StepAge < 3.5f)
+		{
+			break;
+		}
+		{
+			FTraceMenuRowView QuitView;
+			BuildRowView(ETraceMenuRow::Quit, Selected == ETraceMenuRow::Quit, QuitView);
+			Check(TEXT("an unanswered QUIT GAME? lapses after 3 s"),
+				!bQuitArmed && QuitView.Label.Equals(TRACE_TEXT("MENU.ROW_QUIT", "QUIT")) && DebugQuitCalls == 1,
+				FString::Printf(TEXT("asking=%d quitRowSays='%s' quitCalls=%d"), bQuitArmed ? 1 : 0, *QuitView.Label, DebugQuitCalls));
+		}
+		bDebugInterceptQuit = false;
+		Selected = ETraceMenuRow::Play;
+		JoinVerifyStep = JoinVerifyNextPart(49);
+		JoinVerifyStepTime = RealNow;
+		break;
+
+	// =============================================================================================
+	// THE CLICK PART — a click at a pointer that has not moved since the title came up
+	// =============================================================================================
+	//
+	// The premise is the return from a match: the pointer rests over a row and the player clicks it.
+	// DebugRestPointerHere puts the pointer guard in exactly the state a fresh, settled title leaves
+	// it in with the pointer HERE. The row is DIFFICULTY because a click on it CYCLES the difficulty,
+	// which can be read back and put back (PLAY would travel and end the run).
+	case 50:
+	{
+		const int32 DiffRow = static_cast<int32>(ETraceMenuRow::Difficulty);
+		if (!bRowRectsValid || !RowRects[DiffRow].bIsValid)
+		{
+			break;   // not laid out yet
+		}
+		UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] ----- click: a click at a pointer that has not moved -----"));
+		JoinVerifySavedDifficulty = Difficulty;
+		JoinVerifyRestPoint = RowRects[DiffRow].GetCenter();
+		ClickAt(RowRects[DiffRow]);
+		Advance();
+		break;
+	}
+
+	case 51:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		if (RowAtPoint(LastCursorPos) != static_cast<int32>(ETraceMenuRow::Difficulty))
+		{
+			Check(TEXT("harness: the pointer rests on DIFFICULTY"), false,
+				FString::Printf(TEXT("pointer (%.0f, %.0f), row %d; parked at (%.0f, %.0f)"), LastCursorPos.X, LastCursorPos.Y,
+					RowAtPoint(LastCursorPos), JoinVerifyRestPoint.X, JoinVerifyRestPoint.Y));
+			JoinVerifyStep = JoinVerifyNextPart(63);
+			JoinVerifyStepTime = RealNow;
+			break;
+		}
+		DebugRestPointerHere();
+		Selected = ETraceMenuRow::Play;
+		Advance();
+		break;
+
+	case 52: case 55: case 58: case 61:
+		if (StepAge < 0.2f)
+		{
+			break;
+		}
+		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/true);
+		Advance();
+		break;
+
+	case 53:
+		if (StepAge < 0.1f)
+		{
+			break;
+		}
+		{
+			// The first click's feedback, while the button is still down.
+			FTraceMenuRowView DiffView;
+			BuildRowView(ETraceMenuRow::Difficulty, Selected == ETraceMenuRow::Difficulty, DiffView);
+			Check(TEXT("...the row under a resting pointer draws PRESSED while held"), DiffView.bPressed,
+				FString::Printf(TEXT("pressed=%d row=%d"), DiffView.bPressed ? 1 : 0, static_cast<int32>(Selected)));
+		}
+		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/false);
+		Advance();
+		break;
+
+	case 56: case 59: case 62:
+		if (StepAge < 0.1f)
+		{
+			break;
+		}
+		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/false);
+		Advance();
+		break;
+
+	case 54:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		Check(TEXT("a click at a resting pointer does not act (the guard)"), Difficulty == JoinVerifySavedDifficulty,
+			FString::Printf(TEXT("difficulty %s (was %s)"), *TraceDifficulty::ToDisplayName(Difficulty),
+				*TraceDifficulty::ToDisplayName(JoinVerifySavedDifficulty)));
+		Check(TEXT("...but it is not silent: it lights the row under the pointer"), Selected == ETraceMenuRow::Difficulty,
+			FString::Printf(TEXT("row=%d"), static_cast<int32>(Selected)));
+		Advance();
+		break;
+
+	case 57:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		Check(TEXT("a second click on the lit row acts"), Difficulty != JoinVerifySavedDifficulty,
+			FString::Printf(TEXT("difficulty %s (was %s)"), *TraceDifficulty::ToDisplayName(Difficulty),
+				*TraceDifficulty::ToDisplayName(JoinVerifySavedDifficulty)));
+		SetDifficulty(JoinVerifySavedDifficulty);
+
+		// Rest again, then TWITCH: under the 2 px a settled pointer must travel. The negative control.
+		DebugRestPointerHere();
+		Selected = ETraceMenuRow::Play;
+		PC->SetMouseLocation(FMath::RoundToInt(LastCursorPos.X + TraceMenuJoinVerify::TwitchPx), FMath::RoundToInt(LastCursorPos.Y));
+		Advance();
+		break;
+
+	case 60:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		Check(TEXT("a 1 px twitch is not a move: that click does not act"), Difficulty == JoinVerifySavedDifficulty,
+			FString::Printf(TEXT("moved %.1f px, difficulty %s"), FVector2D::Distance(LastCursorPos, SettledCursorPos),
+				*TraceDifficulty::ToDisplayName(Difficulty)));
+
+		// Rest here, then NUDGE: well under the 30 px the settling window asks for, well over 2.
+		DebugRestPointerHere();
+		Selected = ETraceMenuRow::Play;
+		PC->SetMouseLocation(FMath::RoundToInt(LastCursorPos.X + TraceMenuJoinVerify::NudgePx), FMath::RoundToInt(LastCursorPos.Y));
+		Advance();
+		break;
+
+	case 63:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		{
+			const float Moved = FVector2D::Distance(LastCursorPos, SettledCursorPos);
+			Check(TEXT("a small real move once settled: the FIRST click acts"),
+				Difficulty != JoinVerifySavedDifficulty && Moved > 2.f && Moved < 30.f,
+				FString::Printf(TEXT("moved %.1f px, difficulty %s (was %s)"), Moved,
+					*TraceDifficulty::ToDisplayName(Difficulty), *TraceDifficulty::ToDisplayName(JoinVerifySavedDifficulty)));
+		}
+		SetDifficulty(JoinVerifySavedDifficulty);
+		Selected = ETraceMenuRow::Play;
+		JoinVerifyStep = JoinVerifyNextPart(63);
+		JoinVerifyStepTime = RealNow;
 		break;
 
 	default:
 		break;
 	}
 
-	if (JoinVerifyStep < 100)
+	if (JoinVerifyStep < TraceMenuJoinVerify::DoneStep)
 	{
 		return;
 	}
@@ -2093,11 +2436,20 @@ void ATraceMenuHUD::TickJoinVerify()
 	TraceNet::SaveLastJoinAddress(JoinVerifySavedAddress);
 	TraceNet::ForgetJoinAttempt();
 	TraceNet::ClearFailure();
+	bDebugInterceptQuit = false;
+	DisarmQuit(TEXT("JoinVerify done"));
+	if (Difficulty != JoinVerifySavedDifficulty)
+	{
+		SetDifficulty(JoinVerifySavedDifficulty);
+	}
 	JoinVerifyStep = 0;
 
 	if (JoinVerifyFailures == 0)
 	{
-		UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] VERDICT: PASS — Escape and CANCEL call a join off (the engine's pending connection is dropped), the prompt comes back, and nothing walks to QUIT."));
+		UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] VERDICT: PASS — %s%s%s"),
+			(JoinVerifyParts & TraceMenuJoinVerify::PartJoin) ? TEXT("Escape and CANCEL call a join off (the engine's pending connection is dropped) and the prompt comes back. ") : TEXT(""),
+			(JoinVerifyParts & TraceMenuJoinVerify::PartQuit) ? TEXT("QUIT asks first; Escape and pad B never quit. ") : TEXT(""),
+			(JoinVerifyParts & TraceMenuJoinVerify::PartClick) ? TEXT("A click at a resting pointer lights its row, and the next one (or one after a small move) acts.") : TEXT(""));
 	}
 	else
 	{
@@ -2131,22 +2483,40 @@ void ATraceMenuHUD::LogMenuState(const TCHAR* Why) const
 	BuildRowView(Selected, true, RowView);
 
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[Menu.Report] %s | row=%s (%d/%d) difficulty=%s | options=%d join=%d travelling=%d | ")
-		TEXT("renderer=%s | pad: enabled=%d seenOnThisMachine=%d hints=%d | joinText='%s'"),
+		TEXT("[Menu.Report] %s | row=%s (%d/%d) difficulty=%s quitAsking=%d | options=%d join=%d travelling=%d | ")
+		TEXT("renderer=%s | pad: enabled=%d seenOnThisMachine=%d hints=%d legend='%s' | joinText='%s' | blurb='%s'"),
 		Why, *RowView.Label, static_cast<int32>(Selected) + 1, static_cast<int32>(ETraceMenuRow::Count),
-		*TraceDifficulty::ToDisplayName(Difficulty),
+		*TraceDifficulty::ToDisplayName(Difficulty), IsQuitAsking() ? 1 : 0,
 		OptionsMenu.IsOpen() ? 1 : 0, IsJoinPromptOpen() ? 1 : 0, bTravelling ? 1 : 0,
 		bMenuUmgActive ? TEXT("UMG") : TEXT("Canvas"),
 		TracePadMenu::IsEnabled() ? 1 : 0,
 		TracePadMenu::HasSeenPad(this) ? 1 : 0,
 		ShouldShowPadHints() ? 1 : 0,
-		*JoinEntry.GetText());
+		*BuildPadLegend(),
+		*JoinEntry.GetText(),
+		*BuildBlurb());
 }
 #endif
 
 bool ATraceMenuHUD::ShouldShowPadHints() const
 {
 	return TracePadMenu::HasSeenPad(this);
+}
+
+FString ATraceMenuHUD::BuildPadLegend() const
+{
+	if (!ShouldShowPadHints())
+	{
+		return FString();
+	}
+
+	// B SAYS WHAT B DOES HERE. It read "B BACK" on a screen with nothing to go back to, where B walked
+	// the highlight to QUIT and a second B closed the game. B now brings up QUIT GAME? (CancelPressed),
+	// so the legend says QUIT; while the question is up, A answers yes and B answers no, and the legend
+	// says that instead. An emptied line (Ranen's "KEY =") draws no legend at all.
+	return bQuitArmed
+		? TRACE_TEXT("MENU.FOOTER_PAD_KEYS_QUIT", "A   QUIT          B   CANCEL")
+		: TRACE_TEXT("MENU.FOOTER_PAD_KEYS", "D-PAD   MOVE          A   SELECT          B   QUIT");
 }
 
 void ATraceMenuHUD::PollPadInput()
@@ -2240,8 +2610,9 @@ void ATraceMenuHUD::PollPadTitle(APlayerController* PC, bool bConfirm, bool bBac
 	// ---- B: back ----------------------------------------------------------------------------------
 	//
 	// CancelPressed, which is Escape's handler — so B does on this screen exactly what Escape does:
-	// move the highlight to QUIT, and quit only if it was already there. That two-step is deliberate
-	// (see CancelPressed) and a pad gets the same protection rather than a shortcut out of the game.
+	// move the highlight to QUIT and ask QUIT GAME?, and answer NO if the question is already up. B
+	// never closes the game (see CancelPressed); only A on the question does. The legend says so
+	// (BuildPadLegend).
 	//
 	// MENU/START also arrives here, as an Escape, because UTraceGamepadInputSubsystem::TickMenuButton
 	// synthesises one and ATraceMenuPlayerController binds Escape to CancelPressed. So a pad has two
@@ -2480,11 +2851,64 @@ void ATraceMenuHUD::ActivateSelection()
 		break;
 
 	case ETraceMenuRow::Quit:
+		// THE PAUSE MENU'S TWO-STEP. The first press asks (the row reads QUIT GAME?); only a press on
+		// the question closes the game. One stray Enter or click on the last row used to do it.
+		if (!IsQuitAsking())
+		{
+			ArmQuit(TEXT("QUIT pressed"));
+			break;
+		}
+		DisarmQuit(TEXT("answered yes"));
 		QuitGame();
 		break;
 
 	default:
 		break;
+	}
+}
+
+bool ATraceMenuHUD::IsQuitAsking() const
+{
+	return bQuitArmed && FPlatformTime::Seconds() <= QuitArmedUntilReal;
+}
+
+void ATraceMenuHUD::ArmQuit(const TCHAR* Why)
+{
+	// FTraceOptionsMenu::ArmWindowSeconds: the same three seconds the pause menu's QUIT waits.
+	bQuitArmed = true;
+	QuitArmedUntilReal = FPlatformTime::Seconds() + TraceMenuHUDQuit::AnswerSeconds;
+	UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] QUIT asks (%s): A / Enter / a click on it within %.0fs quits; Escape / B, or moving off it, does not."),
+		Why, TraceMenuHUDQuit::AnswerSeconds);
+}
+
+void ATraceMenuHUD::DisarmQuit(const TCHAR* Why)
+{
+	if (!bQuitArmed)
+	{
+		return;
+	}
+	bQuitArmed = false;
+	QuitArmedUntilReal = 0.0;
+	UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] QUIT GAME? dropped (%s)."), Why);
+}
+
+void ATraceMenuHUD::UpdateQuitQuestion()
+{
+	if (!bQuitArmed)
+	{
+		return;
+	}
+	if (Selected != ETraceMenuRow::Quit)
+	{
+		DisarmQuit(TEXT("the highlight moved off QUIT"));
+	}
+	else if (OptionsMenu.IsOpen() || IsJoinPromptOpen() || bTravelling)
+	{
+		DisarmQuit(TEXT("a modal or a travel took the screen"));
+	}
+	else if (FPlatformTime::Seconds() > QuitArmedUntilReal)
+	{
+		DisarmQuit(TEXT("not answered in time"));
 	}
 }
 
@@ -2516,15 +2940,30 @@ void ATraceMenuHUD::CancelPressed()
 		return;
 	}
 
-	// Escape on the row it already highlights would be a trap, so move the highlight first: the
-	// player sees what they are about to confirm.
-	if (Selected != ETraceMenuRow::Quit)
+	// ---- ON THE TITLE ROWS ESCAPE / B NEVER QUITS (title-pad-b-quits) --------------------------------
+	//
+	// It used to move the highlight to QUIT and, pressed again, CLOSE THE GAME: a pad player who
+	// scrolled to QUIT and pressed B, or pressed START twice (MENU arrives here as Escape), was out of
+	// the game with nothing asked — while the pause menu's QUIT asks first.
+	//
+	// Now it only ever ASKS or answers NO. Pressed with no question up, it moves the highlight to QUIT
+	// and turns the row into QUIT GAME? (the player sees what they are being asked); pressed while the
+	// question is up, it drops it and the highlight stays on QUIT. Closing the game takes A, Enter,
+	// Space or a click ON the question (ActivateSelection) — so START pressed twice asks and then
+	// un-asks, and no run of Escapes can quit.
+	if (IsQuitAsking())
 	{
-		Selected = ETraceMenuRow::Quit;
+		DisarmQuit(TEXT("Escape / pad B answered no"));
 		return;
 	}
 
-	QuitGame();
+	if (Selected != ETraceMenuRow::Quit)
+	{
+		// The same focus-change sound every other move of the highlight makes (MoveSelection).
+		TraceAudio::PlayLocal2D(this, TraceSoundEvents::UIHover);
+		Selected = ETraceMenuRow::Quit;
+	}
+	ArmQuit(TEXT("Escape / pad B"));
 }
 
 bool ATraceMenuHUD::GetCursorPoint(FVector2D& OutPoint) const
@@ -2588,6 +3027,7 @@ void ATraceMenuHUD::UpdateWindowFocus()
 void ATraceMenuHUD::MousePressed()
 {
 	PressedRow = INDEX_NONE;
+	RestingPressRow = INDEX_NONE;
 	JoinPressedButton = INDEX_NONE;
 	bTravelCancelArmed = false;
 
@@ -2669,12 +3109,38 @@ void ATraceMenuHUD::MousePressed()
 	// THE DEFENCE THAT ACTUALLY WORKS is next. See bCursorHasMoved: the spurious pair lands at a
 	// pointer that has not moved since the title screen appeared, and a player always moves the
 	// mouse onto a button before pressing it.
+	//
+	// ...EXCEPT THE PLAYER WHO COMES BACK FROM A MATCH WITH THE POINTER ALREADY ON A ROW, and clicks it.
+	// That click used to vanish with only this log line to say so. It is still not ACTED on — the
+	// replay is one press-and-release pair at exactly such a pointer — but it is seen: the row under
+	// the pointer takes the highlight and draws PRESSED while the button is held, and a second click
+	// on that row is taken as meant.
 	if (!bCursorHasMoved)
 	{
-		UE_LOG(LogTraceGame, Display,
-			TEXT("[MenuInput] Ignored a click at (%.0f, %.0f): the cursor has not moved since the title screen appeared."),
-			LastCursorPos.X, LastCursorPos.Y);
-		return;
+		FVector2D RestPoint = FVector2D::ZeroVector;
+		const int32 RestRow = GetCursorPoint(RestPoint) ? RowAtPoint(RestPoint) : INDEX_NONE;
+		if (RestRow == INDEX_NONE || RestRow != RestingClickRow)
+		{
+			if (RestRow != INDEX_NONE)
+			{
+				if (Selected != static_cast<ETraceMenuRow>(RestRow))
+				{
+					TraceAudio::PlayLocal2D(this, TraceSoundEvents::UIHover);
+				}
+				Selected = static_cast<ETraceMenuRow>(RestRow);
+				RestingPressRow = RestRow;
+			}
+			RestingClickRow = RestRow;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MenuInput] Did not act on a click at (%.0f, %.0f): the pointer has not moved since the title screen appeared. %s"),
+				RestPoint.X, RestPoint.Y,
+				(RestRow != INDEX_NONE) ? TEXT("Its row is lit; a second click on it acts.") : TEXT("No row under it."));
+			return;
+		}
+
+		// The second click on the row the first one lit.
+		bCursorHasMoved = true;
+		UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] A second click on row %d at a resting pointer: taken as meant."), RestRow);
 	}
 
 	FVector2D Point = FVector2D::ZeroVector;
@@ -2703,6 +3169,7 @@ void ATraceMenuHUD::MouseReleased()
 {
 	const int32 Armed = PressedRow;
 	PressedRow = INDEX_NONE;
+	RestingPressRow = INDEX_NONE;
 	const int32 ArmedButton = JoinPressedButton;
 	JoinPressedButton = INDEX_NONE;
 	const bool bCancelArmed = bTravelCancelArmed;
@@ -2998,6 +3465,18 @@ void ATraceMenuHUD::StartPracticeRange()
 
 void ATraceMenuHUD::QuitGame()
 {
+#if !UE_BUILD_SHIPPING
+	// Trace.Menu.JoinVerify's quit part: counted, not acted on, so a build that quits when it must not
+	// FAILS the harness instead of ending the run that would have reported it.
+	if (bDebugInterceptQuit)
+	{
+		++DebugQuitCalls;
+		UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] QuitGame reached (intercepted, call %d); the game stays open for the harness."),
+			DebugQuitCalls);
+		return;
+	}
+#endif
+
 	UE_LOG(LogTraceGame, Log, TEXT("Title screen: QUIT."));
 	UKismetSystemLibrary::QuitGame(this, GetOwningPlayerController(), EQuitPreference::Quit, /*bIgnorePlatformRestrictions=*/false);
 }
@@ -3164,11 +3643,33 @@ void ATraceMenuHUD::DrawHUD()
 			// viewport is still resizing early on, so the same physical pointer reports several
 			// different viewport coordinates in the opening frames. A 4px threshold with no settling
 			// window was satisfied by that jitter alone and let two launches in ten through.
-			if (bHasCursor
-				&& (Now - TitleShownTime) > 0.75f
-				&& FVector2D::Distance(Position, FirstCursorPos) > 30.f)
+			namespace PG = TraceMenuHUDPointerGuard;
+			const bool bPastSettleWindow = bHasCursor && (Now - TitleShownTime) > PG::SettleSeconds;
+			if (bPastSettleWindow && FVector2D::Distance(Position, FirstCursorPos) > PG::FirstSampleMovePx)
 			{
 				bCursorHasMoved = true;
+			}
+
+			// ...AND ONCE THE SCREEN HAS SETTLED, ANY REAL MOVE (title-click-after-return). The jitter
+			// above belongs to the opening frames, and the 30 px margin it forced cost a player who came
+			// back from a match and nudged the pointer onto PLAY their click, silently. So the first
+			// sample after the settling window — and after the loading card's grace, which runs on the
+			// platform clock because world time jumps when the card lifts — is a second baseline, and
+			// more than 2 px from it is a move. The replayed press this guards against never moved.
+			if (bPastSettleWindow && !bCursorHasMoved
+				&& !TraceLoadingScreen::IsWithinCardGrace(PG::SettleSeconds))
+			{
+				if (!bHasSettledCursor)
+				{
+					SettledCursorPos = Position;
+					bHasSettledCursor = true;
+				}
+				else if (FVector2D::Distance(Position, SettledCursorPos) > PG::SettledMovePx)
+				{
+					bCursorHasMoved = true;
+					UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] The pointer moved %.1f px after the title settled; clicks count now."),
+						FVector2D::Distance(Position, SettledCursorPos));
+				}
 			}
 
 			if (!bHasCursor || FVector2D::Distance(Position, LastCursorPos) > 2.f)
@@ -3237,6 +3738,10 @@ void ATraceMenuHUD::DrawHUD()
 			JoinErrorText.Reset();
 		}
 	}
+
+	// After every input of this frame (keys, pad, pointer) and before either renderer builds the QUIT
+	// row: a question whose reason has gone is dropped here, so the row never draws a stale one.
+	UpdateQuitQuestion();
 
 	// ---- Which renderer draws this frame (spec v17 §4; spec v23 §A2 REVERTED by spec v25 §1) -------
 	//
@@ -3832,10 +4337,12 @@ FString ATraceMenuHUD::BuildBlurb() const
 		return TRACE_TEXT("MENU.BLURB_PLAY", "HOSTS A GAME ON YOUR ADDRESS ABOVE.  OTHERS PICK JOIN AND TYPE IT.");
 
 	case ETraceMenuRow::Join:
+		// The remembered half is a LABEL, not an instruction. It read "ENTER RECONNECTS TO {0}", which
+		// was not true: Enter opens the prompt pre-filled with {0}, and it is the SECOND Enter that dials.
 		return LastJoinAddress.IsEmpty()
 			? FString(TRACE_TEXT("MENU.BLURB_JOIN_NO_ADDRESS", "CONNECT TO SOMEBODY ELSE'S GAME.  YOU WILL NEED THEIR ADDRESS."))
 			: TRACE_TEXTF("MENU.BLURB_JOIN_REMEMBERED",
-				"CONNECT TO SOMEBODY ELSE'S GAME.  ENTER RECONNECTS TO {0}.", { LastJoinAddress });
+				"CONNECT TO SOMEBODY ELSE'S GAME.  LAST ADDRESS {0}", { LastJoinAddress });
 
 	// PRACTICE, SETTINGS AND QUIT SAY NOTHING.
 	//
@@ -3883,7 +4390,10 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 	// near-black DISABLED plate and then popped to navy: the whole menu blinked grey to blue. The grace
 	// period still swallows an early Enter (ActivateSelection) — it just is not DRAWN, because it is a
 	// guard against a stray key, not a state the player needs to see.
-	OutView.bPressed = (PressedRow == static_cast<int32>(Row));
+	//
+	// A click the pointer guard did not act on (RestingPressRow) draws PRESSED too while it is held:
+	// the button went down under the player's finger, even though it did not fire (bCursorHasMoved).
+	OutView.bPressed = (PressedRow == static_cast<int32>(Row)) || (RestingPressRow == static_cast<int32>(Row));
 	OutView.bEnabled = !bTravelling;
 
 	switch (Row)
@@ -3893,7 +4403,14 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 	case ETraceMenuRow::Practice:   OutView.Label = TRACE_TEXT("MENU.ROW_PRACTICE", "PRACTICE");     break;
 	case ETraceMenuRow::Difficulty: OutView.Label = TRACE_TEXT("MENU.ROW_DIFFICULTY", "DIFFICULTY");   break;
 	case ETraceMenuRow::Settings:   OutView.Label = TRACE_TEXT("MENU.ROW_SETTINGS", "SETTINGS");     break;
-	case ETraceMenuRow::Quit:       OutView.Label = TRACE_TEXT("MENU.ROW_QUIT", "QUIT");         break;
+
+	// While it is asking, the row IS the question — the pause menu's own words, one key for both QUITs.
+	case ETraceMenuRow::Quit:
+		OutView.Label = bQuitArmed
+			? TRACE_TEXT("OPTIONS.PAUSE.CONFIRM_QUIT", "QUIT GAME?")
+			: TRACE_TEXT("MENU.ROW_QUIT", "QUIT");
+		break;
+
 	default:                        OutView.Label = TEXT("");             break;
 	}
 
@@ -4124,9 +4641,8 @@ void ATraceMenuHUD::DrawFooter()
 	// only for the pad legend — a dark band with nothing in it would be exactly the empty chrome a
 	// removed line must not leave behind — and on a keyboard-only machine this footer draws nothing,
 	// like the UMG twin, which never had a band.
-	const FString& PadLegend = TRACE_TEXT("MENU.FOOTER_PAD_KEYS", "D-PAD   MOVE          A   SELECT          B   BACK");
-	const bool bPadLegend = ShouldShowPadHints() && !PadLegend.IsEmpty();
-	if (!bPadLegend)
+	const FString PadLegend = BuildPadLegend();
+	if (PadLegend.IsEmpty())
 	{
 		return;
 	}
