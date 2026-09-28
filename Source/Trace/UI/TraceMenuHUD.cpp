@@ -5,6 +5,7 @@
 #include "Audio/TraceAudio.h"         // spec v26 §9 — ButtonPress, client-side
 #include "Audio/TraceMusicPlayer.h"   // FX/audio plan §5.7 — the title loop, started in BeginPlay
 #include "Blueprint/UserWidget.h"
+#include "Containers/Ticker.h"        // Trace.Menu.FailureVerify waits a few frames
 #include "Engine/Canvas.h"
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
@@ -605,21 +606,12 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 	// ---- Failure banner ---------------------------------------------------------------------------
 	{
 		FString Headline;
-		double AgeSeconds = 0.0;
-		if (TraceNet::GetLastFailure(Headline, AgeSeconds) && !Headline.IsEmpty())
+		float Fade = 1.f;
+		if (!bModalOwnsScreen && GetShownFailure(Headline, Fade))
 		{
-			// A minute is a long time for a banner, and it is deliberate: the failure that matters
-			// happens while the player is looking at a DIFFERENT screen.
-			//
-			// The headline only. The engine's error string is in the log and nowhere else (see
-			// TraceNet::GetLastFailure); an emptied line (Ranen's "KEY =") shows no banner at all.
-			constexpr double VisibleSeconds = 60.0;
-			if (AgeSeconds <= VisibleSeconds && !bModalOwnsScreen)
-			{
-				OutView.bFailureVisible = true;
-				OutView.FailureHeadline = Headline;
-				OutView.FailureFade = static_cast<float>(FMath::Clamp((VisibleSeconds - AgeSeconds) / 6.0, 0.0, 1.0));
-			}
+			OutView.bFailureVisible = true;
+			OutView.FailureHeadline = Headline;
+			OutView.FailureFade = Fade;
 		}
 	}
 
@@ -1695,6 +1687,144 @@ void ATraceMenuHUD::DebugJoin(const FString& Address)
 	JoinEntry.SetText(Address);
 	ConfirmJoin();
 }
+
+void ATraceMenuHUD::DebugDescribeFailure(FTraceTitleFailureLayout& Out) const
+{
+	if (bMenuUmgActive && MenuWidget != nullptr)
+	{
+		MenuWidget->DebugDescribeFailure(Out);
+		return;
+	}
+
+	Out = FTraceTitleFailureLayout();
+	Out.bUmg = false;
+	Out.bVisible = bDebugCanvasBannerDrawn;
+	Out.bKitHoverPlate = bDebugCanvasBannerKitPlate;
+	Out.Headline = DebugCanvasBannerText;
+	Out.HeadlineColor = DebugCanvasBannerColor;
+	Out.Banner = bDebugCanvasBannerDrawn ? DebugCanvasBannerRect : FBox2D(ForceInit);
+	Out.Wordmark = DebugCanvasMarkRect;
+	Out.Swoosh = DebugCanvasSwooshRect;
+	Out.AddressChip = DebugCanvasChipRect;
+	GetCanvasRowRect(static_cast<int32>(ETraceMenuRow::Count) - 1, Out.LastRow);
+	Out.ViewSize = FVector2D(ViewW, ViewH);
+}
+
+// NAMED, not anonymous: the unity build (Scripts/check-jumbo-build-collisions.py).
+namespace TraceMenuFailureVerify
+{
+	/** The engine's own shape of timeout text, which must never reach the banner. */
+	static const TCHAR* const EngineText = TEXT("UNetConnection::Tick: Connection TIMED OUT. Closing connection..");
+
+	static bool Overlaps(const FBox2D& A, const FBox2D& B)
+	{
+		return A.bIsValid && B.bIsValid && A.Min.X < B.Max.X && B.Min.X < A.Max.X && A.Min.Y < B.Max.Y && B.Min.Y < A.Max.Y;
+	}
+
+	static FString Describe(const FBox2D& Box)
+	{
+		return Box.bIsValid
+			? FString::Printf(TEXT("(%.0f,%.0f)-(%.0f,%.0f)"), Box.Min.X, Box.Min.Y, Box.Max.X, Box.Max.Y)
+			: FString(TEXT("(none)"));
+	}
+}
+
+/**
+ * `Trace.Menu.FailureVerify` — the title's network-failure banner, on whichever renderer is live (UMG,
+ * or the Canvas with -TraceNoMenuUMG). Raises a client timeout through the engine's own delegate, waits
+ * for the banner to draw, and asserts that it is the kit's HOVER plate with its line in white, inside
+ * the screen, clear of the TRACE wordmark, the swoosh, the address chip and the rows. Dev only; clears
+ * the failure afterwards.
+ */
+static FAutoConsoleCommandWithWorldAndArgs CmdMenuFailureVerify(
+	TEXT("Trace.Menu.FailureVerify"),
+	TEXT("Dev only. The title's failure banner: raises a client timeout, then checks the banner is the kit's ")
+	TEXT("hover plate, white, on screen and clear of the wordmark, swoosh, address chip and rows. Title map."),
+	FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+		[](const TArray<FString>& /*Args*/, UWorld* World)
+		{
+			APlayerController* const PC = (World != nullptr) ? World->GetFirstPlayerController() : nullptr;
+			ATraceMenuHUD* const MenuHUD = (PC != nullptr) ? Cast<ATraceMenuHUD>(PC->GetHUD()) : nullptr;
+			if (MenuHUD == nullptr || GEngine == nullptr)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[FailureBanner] No title-screen HUD here — run this on the menu map."));
+				return;
+			}
+
+			TraceNet::ClearFailure();
+			GEngine->BroadcastNetworkFailure(World, nullptr, ENetworkFailure::ConnectionTimeout,
+				TraceMenuFailureVerify::EngineText);
+			UE_LOG(LogTraceGame, Display, TEXT("[FailureBanner] ===== the title's failure banner (%s) ====="),
+				MenuHUD->IsMenuUmgActive() ? TEXT("UMG") : TEXT("Canvas"));
+
+			const TWeakObjectPtr<ATraceMenuHUD> WeakHud(MenuHUD);
+			const double StartedAt = FPlatformTime::Seconds();
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakHud, StartedAt](float) -> bool
+			{
+				const ATraceMenuHUD* const Hud = WeakHud.Get();
+				if (Hud == nullptr)
+				{
+					return false;
+				}
+				if (FPlatformTime::Seconds() - StartedAt < 1.0)
+				{
+					return true;   // a few frames, so Slate has laid the banner out where it flowed it
+				}
+
+				FTraceTitleFailureLayout Layout;
+				Hud->DebugDescribeFailure(Layout);
+
+				int32 Failures = 0;
+				const auto Check = [&Failures](bool bPass, const TCHAR* Claim, const FString& Detail)
+				{
+					Failures += bPass ? 0 : 1;
+					UE_LOG(LogTraceGame, Display, TEXT("[FailureBanner]   %-4s %s  %s"), bPass ? TEXT("ok") : TEXT("FAIL"), Claim, *Detail);
+				};
+
+				FString Expected;
+				double AgeSeconds = 0.0;
+				TraceNet::GetLastFailure(Expected, AgeSeconds);
+
+				Check(Layout.bVisible && Layout.Headline == Expected && !Layout.Headline.IsEmpty(),
+					TEXT("the banner is up, saying the player's line"),
+					FString::Printf(TEXT("%s renderer, \"%s\" (expected \"%s\")"), Layout.bUmg ? TEXT("UMG") : TEXT("Canvas"),
+						*Layout.Headline, *Expected));
+				Check(Layout.bKitHoverPlate, TEXT("*** it is the handmade kit's HOVER plate, not the brown bar ***"), TEXT(""));
+				Check(Layout.HeadlineColor.R > 0.9f && Layout.HeadlineColor.G > 0.9f && Layout.HeadlineColor.B > 0.9f,
+					TEXT("*** its line is white (the kit's word), not the pre-kit amber ***"),
+					Layout.HeadlineColor.ToString());
+				Check(Layout.Banner.bIsValid && Layout.Banner.Min.X >= 0.0 && Layout.Banner.Min.Y >= 0.0
+						&& Layout.Banner.Max.X <= Layout.ViewSize.X && Layout.Banner.Max.Y <= Layout.ViewSize.Y
+						&& Layout.Banner.GetSize().X < Layout.ViewSize.X * 0.95,
+					TEXT("it is a centred plate inside the screen, not a full-width strip"),
+					FString::Printf(TEXT("%s in %.0fx%.0f"), *TraceMenuFailureVerify::Describe(Layout.Banner),
+						Layout.ViewSize.X, Layout.ViewSize.Y));
+				Check(!TraceMenuFailureVerify::Overlaps(Layout.Banner, Layout.Wordmark),
+					TEXT("*** it does not cover the TRACE wordmark ***"),
+					FString::Printf(TEXT("banner %s, wordmark %s"), *TraceMenuFailureVerify::Describe(Layout.Banner),
+						*TraceMenuFailureVerify::Describe(Layout.Wordmark)));
+				Check(!TraceMenuFailureVerify::Overlaps(Layout.Banner, Layout.Swoosh)
+						&& !TraceMenuFailureVerify::Overlaps(Layout.Banner, Layout.AddressChip)
+						&& !TraceMenuFailureVerify::Overlaps(Layout.Banner, Layout.LastRow)
+						&& (!Layout.LastRow.bIsValid || Layout.Banner.Min.Y >= Layout.LastRow.Max.Y),
+					TEXT("it sits under the menu, clear of the swoosh, the address chip and the rows"),
+					FString::Printf(TEXT("swoosh %s, chip %s, last row %s"), *TraceMenuFailureVerify::Describe(Layout.Swoosh),
+						*TraceMenuFailureVerify::Describe(Layout.AddressChip), *TraceMenuFailureVerify::Describe(Layout.LastRow)));
+				Check(!Layout.Headline.Contains(TEXT("UNETCONNECTION"), ESearchCase::IgnoreCase),
+					TEXT("no engine text on screen"), TEXT(""));
+
+				TraceNet::ClearFailure();
+				if (Failures == 0)
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("[FailureBanner] VERDICT: ===== PASS ====="));
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Error, TEXT("[FailureBanner] VERDICT: ===== *** FAIL *** %d check(s) ====="), Failures);
+				}
+				return false;
+			}), 0.f);
+		}));
 
 void ATraceMenuHUD::BeginJoinVerify()
 {
@@ -3097,6 +3227,10 @@ void ATraceMenuHUD::DrawHUD()
 			MenuWidget->SetVisibility(ESlateVisibility::Collapsed);
 		}
 
+#if !UE_BUILD_SHIPPING
+		bDebugCanvasBannerDrawn = false;
+#endif
+
 		// No grid floor and no bezel any more: both were the pre-kit cyan Tron screen, and this is the
 		// screen every SETTINGS / JOIN modal shows through. Black, like the kit (stylespec §1).
 		DrawBackdrop();
@@ -3178,6 +3312,9 @@ float ATraceMenuHUD::DrawTitleBlock()
 
 	DrawTexture(Mark, CX - MarkW * 0.5f, MarkTop, MarkW, MarkH,
 		0.f, 0.f, 1.f, 1.f, FLinearColor::White, BLEND_Translucent);
+#if !UE_BUILD_SHIPPING
+	DebugCanvasMarkRect = FBox2D(FVector2D(CX - MarkW * 0.5f, MarkTop), FVector2D(CX + MarkW * 0.5f, MarkTop + MarkH));
+#endif
 
 	float Bottom = MarkTop + MarkH;
 
@@ -3202,6 +3339,13 @@ float ATraceMenuHUD::DrawTitleBlock()
 			SwooshW, SwooshW * SwooshAspect,
 			0.f, 0.f, 1.f, 1.f,
 			FLinearColor(1.f, 1.f, 1.f, TraceTitleLayout::SwooshOpacity), BLEND_Translucent);
+#if !UE_BUILD_SHIPPING
+		{
+			const float SwooshLeft = CX - MarkW * TraceTitleLayout::SwooshLeftOfMark - SwooshW * 0.5f;
+			DebugCanvasSwooshRect = FBox2D(FVector2D(SwooshLeft, SwooshTop),
+				FVector2D(SwooshLeft + SwooshW, SwooshTop + SwooshW * SwooshAspect));
+		}
+#endif
 
 		Bottom = SwooshTop + SwooshW * SwooshAspect;
 	}
@@ -3272,6 +3416,9 @@ void ATraceMenuHUD::DrawAddressChip()
 	const float ChipH = ValueH + PadY * 2.f;
 	const float ChipX = CX - ChipW * 0.5f;
 	const float ChipY = TaglineBottomY + (14.f * UIScale);
+#if !UE_BUILD_SHIPPING
+	DebugCanvasChipRect = FBox2D(FVector2D(ChipX, ChipY), FVector2D(ChipX + ChipW, ChipY + ChipH));
+#endif
 
 	// The artist's plate, as on the UMG chip (a button frame at chip height), not the flat
 	// cyan-edged box it used to be. The kit's fallback when the texture is not drawable yet.
@@ -3299,13 +3446,12 @@ void ATraceMenuHUD::DrawAddressChip()
 	}
 }
 
-void ATraceMenuHUD::DrawFailureBanner()
+bool ATraceMenuHUD::GetShownFailure(FString& OutHeadline, float& OutFade) const
 {
-	FString Headline;
 	double AgeSeconds = 0.0;
-	if (!TraceNet::GetLastFailure(Headline, AgeSeconds) || Headline.IsEmpty())
+	if (!TraceNet::GetLastFailure(OutHeadline, AgeSeconds) || OutHeadline.IsEmpty())
 	{
-		return;
+		return false;   // nothing failed, or Ranen emptied the line ("KEY ="): no banner at all
 	}
 
 	// A minute is a long time for a banner, and it is deliberate. The failure that matters here
@@ -3315,33 +3461,67 @@ void ATraceMenuHUD::DrawFailureBanner()
 	constexpr double VisibleSeconds = 60.0;
 	if (AgeSeconds > VisibleSeconds)
 	{
+		return false;
+	}
+	OutFade = static_cast<float>(FMath::Clamp((VisibleSeconds - AgeSeconds) / 6.0, 0.0, 1.0));
+	return true;
+}
+
+bool ATraceMenuHUD::GetCanvasFailurePlate(const FString& Headline, FBox2D& OutPlate) const
+{
+	if (Headline.IsEmpty() || BlurbBottomY <= 0.f)
+	{
+		return false;
+	}
+
+	// The same three numbers the UMG plate is authored from (TraceTitleLayout), so the two renderers
+	// put it in the same place: FailureGapBelowBlurb under the blurb to the glow, a kit button tall.
+	const float PlateH = TraceTitleLayout::FailurePlateH * UIScale;
+	const float Glow = PlateH * TraceMenuArtStyle::ButtonFrame.Glow / TraceMenuArtStyle::ButtonFrame.PlateH;
+	const float CapH = TraceMenuKit::LabelCapFraction * PlateH;
+	const float PlateW = FMath::Min(TraceMenuKit::CapTextWidth(Headline, CapH) + 2.f * TraceTitleLayout::FailurePadX * UIScale,
+		ViewW * 0.9f);
+	const float PlateY = BlurbBottomY + TraceTitleLayout::FailureGapBelowBlurb * UIScale + Glow;
+	OutPlate = FBox2D(FVector2D(ViewW * 0.5f - PlateW * 0.5f, PlateY), FVector2D(ViewW * 0.5f + PlateW * 0.5f, PlateY + PlateH));
+	return true;
+}
+
+void ATraceMenuHUD::DrawFailureBanner()
+{
+	FString Headline;
+	float Fade = 1.f;
+	FBox2D Plate(ForceInit);
+	if (!GetShownFailure(Headline, Fade) || !GetCanvasFailurePlate(Headline, Plate))
+	{
 		return;
 	}
 
-	const float Fade = static_cast<float>(FMath::Clamp((VisibleSeconds - AgeSeconds) / 6.0, 0.0, 1.0));
-
-	// Amber, not a new red. This screen has exactly two hues and amber is already the one that means
-	// danger (see the palette note at the top of this file); introducing a third would cost more than
-	// the extra half-step of urgency is worth.
-	// Scale raised from 1.15 after reading a capture at 1280x720: the headline was a 9px strip. This
-	// is the one message on the screen that has to survive being photographed and pasted into a chat.
+	// ON THE HANDMADE KIT (P09). This was a full-width brown strip with two amber rails and amber type,
+	// pinned at 5% of the height — straight across the TRACE wordmark — in the pre-kit palette. It is now
+	// the artist's HOVER plate (the amber ring is the kit's "this is about you", as the match HUD's own
+	// failure panel wears it), centred under the menu with the one line in white, where it covers
+	// nothing. It fades with its words over the last six seconds of its minute.
 	//
-	// ONE LINE. The engine's own code and message used to be drawn under the headline, upper-cased and
-	// cut at 140 characters ("CONNECTIONTIMEOUT: UNETCONNECTION::TICK: ..."), edge to edge. It is in
-	// the log (TraceNet::ReportFailure), which is where the person a player sends it to will look.
-	const float HeadScale = 1.45f * UIScale;
+	// ONE LINE. The engine's own code and message used to be drawn under the headline; it is in the log
+	// (TraceNet::ReportFailure), which is where the person a player sends it to will look.
+	const float PlateH = static_cast<float>(Plate.GetSize().Y);
+	const bool bKitPlate = TraceMenuKit::DrawPanelPlate(this, ETraceKitState::Hover,
+		static_cast<float>(Plate.Min.X), static_cast<float>(Plate.Min.Y),
+		static_cast<float>(Plate.GetSize().X), PlateH, 0.f, Fade);
 
-	const float BannerY = ViewH * 0.05f;
-	const float PadY = 11.f * UIScale;
-	const float HeadH = MeasureHeight(Headline, FontMedium, HeadScale);
-	const float BannerH = HeadH + PadY * 2.f;
+	const FLinearColor Words(TraceMenuArtStyle::WordDefault.R, TraceMenuArtStyle::WordDefault.G,
+		TraceMenuArtStyle::WordDefault.B, Fade);
+	TraceMenuKit::DrawCapText(this, Headline, ViewW * 0.5f, static_cast<float>(Plate.GetCenter().Y),
+		TraceMenuKit::LabelCapFraction * PlateH, Words, ETraceTextWeight::Light, TraceText::EHAlign::Center,
+		static_cast<float>(Plate.GetSize().X) - 2.f * TraceTitleLayout::FailurePadX * UIScale);
 
-	DrawRect(FLinearColor(0.18f, 0.05f, 0.00f, 0.90f * Fade), 0.f, BannerY, ViewW, BannerH);
-	DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Amber, 0.85f * Fade), 0.f, BannerY, ViewW, FMath::Max(1.f, 2.f * UIScale));
-	DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Amber, 0.85f * Fade), 0.f, BannerY + BannerH - FMath::Max(1.f, 2.f * UIScale), ViewW, FMath::Max(1.f, 2.f * UIScale));
-
-	DrawTextCentered(Headline, TraceMenuStyle::WithAlpha(TraceMenuStyle::Amber, Fade),
-		ViewW * 0.5f, BannerY + PadY, FontMedium, HeadScale);
+#if !UE_BUILD_SHIPPING
+	bDebugCanvasBannerDrawn = true;
+	bDebugCanvasBannerKitPlate = bKitPlate;
+	DebugCanvasBannerRect = Plate;
+	DebugCanvasBannerText = Headline;
+	DebugCanvasBannerColor = Words;
+#endif
 }
 
 void ATraceMenuHUD::DrawJoinPrompt()
@@ -3823,6 +4003,17 @@ void ATraceMenuHUD::DrawFooter()
 	if (BlurbBottomY > 0.f)
 	{
 		Y = FMath::Max(Y, BlurbBottomY + MinGap);
+	}
+
+	// ...AND THE FAILURE BANNER, which sits under the blurb when one is up (DrawFailureBanner).
+	{
+		FString ShownHeadline;
+		float ShownFade = 1.f;
+		FBox2D ShownPlate(ForceInit);
+		if (GetShownFailure(ShownHeadline, ShownFade) && GetCanvasFailurePlate(ShownHeadline, ShownPlate))
+		{
+			Y = FMath::Max(Y, static_cast<float>(ShownPlate.Max.Y) + MinGap);
+		}
 	}
 
 	// Never off the bottom edge. The 46px floor was sized for the hint line that sat 24px under Y and

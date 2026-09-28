@@ -338,7 +338,6 @@ INK_FAINT = C(0.38, 0.40, 0.46, 1.00)
 AMBER     = C(1.00, 0.46, 0.08, 1.00)
 CLEAR     = C(0.0, 0.0, 0.0, 0.0)
 SCRIM     = C(0.0, 0.0, 0.0, 0.86)
-BANNER    = C(0.18, 0.05, 0.00, 0.95)
 
 # Reference pixels. The design space is 1080 tall; UMG's default DPI curve is
 # (shortest side / 1080), which is exactly ATraceMenuHUD::UIScale.
@@ -391,8 +390,13 @@ FS_CHIP_CAP    = 12
 FS_CHIP_VALUE  = 18
 FS_BLURB       = 15
 FS_FOOTER      = 13
-FS_BANNER_HEAD = 23
+FS_BANNER_HEAD = 25        # caps 0.37 of the 44-tall plate, as every kit label (the row label's size)
 FS_BANNER_BODY = 15
+
+# The failure banner's plate: a kit button's height, the one line at the kit's label size on it.
+BANNER_PLATE_H = 44.0
+BANNER_PAD_X   = 22.0
+BANNER_PAD_Y   = 7.0
 FS_TRAVEL_CAP  = 22
 FS_TRAVEL_HINT = 13
 FS_WARNING     = 13
@@ -1144,7 +1148,6 @@ def build_title_menu(row_asset):
         return None
 
     full = anchors(0.0, 0.0, 1.0, 1.0)
-    top_span = anchors(0.0, 0.0, 1.0, 0.0)
 
     # ---- 0. Black. The brief's words, not an interpretation ---------------------------------------
     slot_on_canvas(root, make_image(tree, "Backdrop", color=BLACK), full, (0, 0, 0, 0), z_order=0)
@@ -1297,27 +1300,35 @@ def build_title_menu(row_asset):
     slot_on_canvas(travel_canvas, travel_hint, anchors(0.5, 0.55), (0.0, 34.0, 0.0, 0.0),
                    alignment=(0.5, 0.0), auto_size=True, z_order=1)
 
-    # ---- 7. Failure banner, over absolutely everything ---------------------------------------------
+    # ---- 7. Failure banner, on the handmade kit --------------------------------------------------
     #
     # A minute is a long time for a banner and it is deliberate: the failure that matters happens while
-    # the player is looking at a DIFFERENT screen. It has to outrank every modal, which is why it is
-    # last in the tree.
-    banner = make_border(tree, "FailureBanner", AMBER, (0.0, 2.0, 0.0, 2.0))
+    # the player is looking at a DIFFERENT screen.
+    #
+    # ON THE KIT (P09): the artist's HOVER plate - the amber ring is the kit's "this one is about you" -
+    # centred, with the one line in white. It used to be a full-width brown bar with pre-kit amber rails
+    # and amber type, pinned at y 54 straight across the TRACE wordmark. It now sits UNDER the menu, in
+    # the bottom stack UTraceTitleMenuWidget::PlaceFooterBelowBlurb flows below the blurb, clear of the
+    # wordmark, the swoosh, the address chip and the rows; the authored y below is only the first-frame
+    # fallback. ATraceMenuHUD::DrawFailureBanner draws the same plate at the same place on the Canvas.
+    banner_inset = frame_glow_inset(BANNER_PLATE_H, BTN_GLOW, BTN_PLATE_H)
+    banner = make_border(tree, "FailureBanner", C(1, 1, 1, 1),
+                         (BANNER_PAD_X + banner_inset, BANNER_PAD_Y + banner_inset,
+                          BANNER_PAD_X + banner_inset, BANNER_PAD_Y + banner_inset),
+                         background=button_brush("T_MenuBtn_Hover", BANNER_PLATE_H))
     banner.set_editor_property("visibility", unreal.SlateVisibility.COLLAPSED)
-    slot_on_canvas(root, banner, top_span, (0.0, 54.0, 0.0, 0.0), auto_size=True, z_order=10)
-
-    banner_fill = make_border(tree, "FailureFill", BANNER, (0.0, 11.0, 0.0, 11.0))
-    banner.add_child(banner_fill)
+    slot_on_canvas(root, banner, anchors(0.5, 0.0), (0.0, 930.0, 0.0, 0.0),
+                   alignment=(0.5, 0.0), auto_size=True, z_order=10)
 
     banner_box = mk(tree, unreal.VerticalBox, "FailureBox")
-    banner_fill.add_child(banner_box)
-    vbox_slot(banner_box, make_text(tree, "FailureHeadlineText", "COULD NOT CONNECT",
-                                    FS_BANNER_HEAD, AMBER),
+    banner.add_child(banner_box)
+    vbox_slot(banner_box, make_text(tree, "FailureHeadlineText", "NO RESPONSE FROM HOST",
+                                    FS_BANNER_HEAD, INK),
               h_align=unreal.HorizontalAlignment.H_ALIGN_CENTER)
-    vbox_slot(banner_box, make_text(tree, "FailureDetailText", " ", FS_BANNER_BODY,
-                                    C(0.90, 0.97, 1.00, 0.8)),
-              padding=(0.0, 4.0, 0.0, 0.0),
-              h_align=unreal.HorizontalAlignment.H_ALIGN_CENTER)
+    # Bound but never shown: the engine's own error text is log-only (TraceNet::GetLastFailure).
+    detail = make_text(tree, "FailureDetailText", " ", FS_BANNER_BODY, INK_DIM)
+    detail.set_editor_property("visibility", unreal.SlateVisibility.COLLAPSED)
+    vbox_slot(banner_box, detail, h_align=unreal.HorizontalAlignment.H_ALIGN_CENTER)
 
     finish(asset, "WBP_TitleMenu")
     return asset

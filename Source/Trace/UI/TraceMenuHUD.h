@@ -53,6 +53,9 @@
 class APlayerController;
 class UFont;
 class UTraceTitleMenuWidget;
+#if !UE_BUILD_SHIPPING
+struct FTraceTitleFailureLayout;
+#endif
 struct FTraceMenuRowView;
 struct FTraceTitleMenuView;
 
@@ -260,6 +263,12 @@ public:
 	void DebugJoin(const FString& Address);
 
 	/**
+	 * Trace.Menu.FailureVerify: where the failure banner and its neighbours landed on the last frame,
+	 * from whichever renderer drew it (the widget's Slate layout, or this Canvas's own draw record).
+	 */
+	void DebugDescribeFailure(FTraceTitleFailureLayout& Out) const;
+
+	/**
 	 * D32-PADMENU — prints which row is highlighted and what state the screen is in, in one line.
 	 *
 	 * Exists because a synthetic pad press has to be checkable. Every other verification surface on
@@ -295,8 +304,20 @@ protected:
 	 */
 	void DrawAddressChip();
 
-	/** Red strip across the top when a connection or travel attempt failed. See TraceNet. */
+	/**
+	 * The last network failure's one line, on the kit's HOVER plate under the menu (P09). It used to be
+	 * a brown strip with amber rails pinned across the TRACE wordmark. See TraceNet.
+	 */
 	void DrawFailureBanner();
+
+	/**
+	 * The failure the title shows right now: the last one, for a minute, and only if its line is not
+	 * empty. ONE answer for both renderers (BuildMenuView and the Canvas banner).
+	 */
+	bool GetShownFailure(FString& OutHeadline, float& OutFade) const;
+
+	/** Where the Canvas banner's PLATE goes this frame (under the blurb), or false when none shows. */
+	bool GetCanvasFailurePlate(const FString& Headline, FBox2D& OutPlate) const;
 
 	void DrawMenuRows();
 	void DrawFooter();
@@ -890,5 +911,15 @@ private:
 
 	/** The player's remembered JOIN address, put back when the harness finishes. */
 	FString JoinVerifySavedAddress;
+
+	// ---- The Canvas title's draw record for Trace.Menu.FailureVerify (plate rects, glow excluded) --
+	FBox2D DebugCanvasMarkRect = FBox2D(ForceInit);
+	FBox2D DebugCanvasSwooshRect = FBox2D(ForceInit);
+	FBox2D DebugCanvasChipRect = FBox2D(ForceInit);
+	FBox2D DebugCanvasBannerRect = FBox2D(ForceInit);
+	bool bDebugCanvasBannerDrawn = false;
+	bool bDebugCanvasBannerKitPlate = false;
+	FString DebugCanvasBannerText;
+	FLinearColor DebugCanvasBannerColor = FLinearColor::Transparent;
 #endif
 };

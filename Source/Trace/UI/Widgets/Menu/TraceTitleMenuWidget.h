@@ -98,7 +98,48 @@ namespace TraceTitleLayout
 	/** Where the tagline is authored on the root canvas, reference px. The widget MEASURES the live
 	 *  slot and uses this only as the first-frame fallback; the Canvas path draws at it directly. */
 	static constexpr float TaglineY = 359.f;
+
+	// ---- The network-failure banner (P09): a kit plate UNDER the menu, never over the wordmark -------
+	//
+	// Both renderers put it in the bottom stack, FailureGapBelowBlurb under the blurb's last line, as
+	// the artist's HOVER plate (amber ring) FailurePlateH tall with the one line in white at the kit's
+	// label size. Scripts/generate-menu-widgets.py authors the UMG plate from the same three numbers
+	// (BANNER_PLATE_H / BANNER_PAD_X there).
+
+	/** The plate's height, reference px: a kit button's. */
+	static constexpr float FailurePlateH = 44.f;
+
+	/** Air either side of the line inside the plate, reference px. */
+	static constexpr float FailurePadX = 22.f;
+
+	/** Reference px between the blurb's last line and the plate's glow. */
+	static constexpr float FailureGapBelowBlurb = 22.f;
 }
+
+#if !UE_BUILD_SHIPPING
+/**
+ * Where the title's failure banner landed this frame, and what it landed near, in VIEWPORT PIXELS
+ * (plate rects, glow excluded). Filled by whichever renderer drew the frame, for `Trace.Menu.FailureVerify`.
+ */
+struct FTraceTitleFailureLayout
+{
+	bool bVisible = false;
+	bool bUmg = false;
+
+	/** The plate is the artist's HOVER sprite (not a flat rect, not the pre-kit brown bar). */
+	bool bKitHoverPlate = false;
+
+	FString Headline;
+	FLinearColor HeadlineColor = FLinearColor::Transparent;
+
+	FBox2D Banner = FBox2D(ForceInit);
+	FBox2D Wordmark = FBox2D(ForceInit);
+	FBox2D Swoosh = FBox2D(ForceInit);
+	FBox2D AddressChip = FBox2D(ForceInit);
+	FBox2D LastRow = FBox2D(ForceInit);
+	FVector2D ViewSize = FVector2D::ZeroVector;
+};
+#endif
 
 /** One frame of the title screen, as ATraceMenuHUD sees it. */
 struct FTraceTitleMenuView
@@ -182,6 +223,11 @@ public:
 	 * @return the number of sprite slots that resolved; @p OutTotal is how many there are.
 	 */
 	int32 CountResolvedArt(int32& OutTotal, TArray<FString>& OutMissing, bool bIncludeBackdrop = false) const;
+
+#if !UE_BUILD_SHIPPING
+	/** The failure banner and its neighbours as Slate laid them out last frame. For Trace.Menu.FailureVerify. */
+	void DebugDescribeFailure(FTraceTitleFailureLayout& Out) const;
+#endif
 
 	//~ Begin UUserWidget interface
 	virtual void NativeOnInitialized() override;

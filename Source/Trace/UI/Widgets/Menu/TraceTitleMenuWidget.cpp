@@ -505,6 +505,27 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 			? ESlateVisibility::Collapsed : ESlateVisibility::HitTestInvisible);
 	}
 
+	// ---- Failure ---------------------------------------------------------------------------------
+	//
+	// BEFORE PlaceFooterBelowBlurb, which flows the banner into the bottom stack under the blurb: it
+	// has to know whether the banner is up this frame.
+	if (FailureBanner != nullptr)
+	{
+		FailureBanner->SetVisibility(InView.bFailureVisible ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
+		if (InView.bFailureVisible)
+		{
+			// One render opacity on the whole banner: the kit plate and its line fade together.
+			FailureBanner->SetRenderOpacity(InView.FailureFade);
+			SetTextOn(FailureHeadlineText, InView.FailureHeadline);
+		}
+	}
+	if (FailureDetailText != nullptr && FailureDetailText->GetVisibility() != ESlateVisibility::Collapsed)
+	{
+		// One line only: see FailureDetailText in the header. MirrorAll below carries the collapse to
+		// the atlas twin that actually draws.
+		FailureDetailText->SetVisibility(ESlateVisibility::Collapsed);
+	}
+
 	// AFTER the three strings are set, because it measures where the blurb ended up. Spec v20 §0.4.
 	PlaceFooterBelowBlurb();
 
@@ -525,26 +546,6 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 				TravelHintText->SetText(FText::FromString(InView.TravelHint));
 			}
 		}
-	}
-
-	// ---- Failure ---------------------------------------------------------------------------------
-	if (FailureBanner != nullptr)
-	{
-		FailureBanner->SetVisibility(InView.bFailureVisible ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
-		if (InView.bFailureVisible)
-		{
-			// One render opacity on the whole banner rather than a fade baked into four colours: the
-			// banner's fill, its two rails and both lines of type all fade together, which is what the
-			// Canvas path spends five multiplications achieving.
-			FailureBanner->SetRenderOpacity(InView.FailureFade);
-			SetTextOn(FailureHeadlineText, InView.FailureHeadline);
-		}
-	}
-	if (FailureDetailText != nullptr && FailureDetailText->GetVisibility() != ESlateVisibility::Collapsed)
-	{
-		// One line only: see FailureDetailText in the header. MirrorAll below carries the collapse to
-		// the atlas twin that actually draws.
-		FailureDetailText->SetVisibility(ESlateVisibility::Collapsed);
 	}
 
 	// LAST. Every SetTextOn above wrote to a model; this is the line that puts the frame on screen in
@@ -715,6 +716,20 @@ void UTraceTitleMenuWidget::PlaceFooterBelowBlurb()
 		}
 	}
 
+	// THE NETWORK-FAILURE BANNER (P09) flows here too, as a kit plate under the menu. It used to be a
+	// full-width brown bar pinned at y 54, straight across the TRACE wordmark. The slot is the
+	// border's whole rect, glow included, so the gap is measured to the glow's edge.
+	if (FailureBanner != nullptr && FailureBanner->GetVisibility() != ESlateVisibility::Collapsed)
+	{
+		if (UCanvasPanelSlot* BannerSlot = Cast<UCanvasPanelSlot>(FailureBanner->Slot))
+		{
+			const float BannerTop = KeysY - FooterGapBelowBlurb + TraceTitleLayout::FailureGapBelowBlurb;
+			SetSlotRect(BannerSlot, FVector2D(0.0, BannerTop), FVector2D(-1.0, -1.0));
+			const float BannerH = static_cast<float>(FailureBanner->GetCachedGeometry().GetLocalSize().Y);
+			KeysY = BannerTop + ((BannerH > 1.f) ? BannerH : TraceTitleLayout::FailurePlateH * 1.25f) + FooterGapAfterWarning;
+		}
+	}
+
 	const float LastLineHeight = (HintSlot != nullptr && LiveText(FooterHintText)->GetCachedGeometry().GetLocalSize().Y > 1.0)
 		? static_cast<float>(LiveText(FooterHintText)->GetCachedGeometry().GetLocalSize().Y) : 17.f;
 
@@ -773,6 +788,66 @@ int32 UTraceTitleMenuWidget::CountResolvedArt(int32& OutTotal, TArray<FString>& 
 
 	return Resolved;
 }
+
+#if !UE_BUILD_SHIPPING
+void UTraceTitleMenuWidget::DebugDescribeFailure(FTraceTitleFailureLayout& Out) const
+{
+	Out = FTraceTitleFailureLayout();
+	Out.bUmg = true;
+
+	// Viewport PIXELS, the space GetRowViewportRect answers in (and for the same reason: see there).
+	const auto RectOf = [this](const UWidget* InWidget, float InInsetFraction) -> FBox2D
+	{
+		if (InWidget == nullptr || InWidget->GetVisibility() == ESlateVisibility::Collapsed)
+		{
+			return FBox2D(ForceInit);
+		}
+		const FGeometry& Geometry = InWidget->GetCachedGeometry();
+		const FVector2D Size = Geometry.GetLocalSize();
+		if (Size.X <= 1.0 || Size.Y <= 1.0)
+		{
+			return FBox2D(ForceInit);
+		}
+		// A kit-plate border is drawn glow and all into its rect: the PLATE is inset by the glow.
+		const double Inset = Size.Y * InInsetFraction;
+		FVector2D TopLeftPixel, TopLeftViewport, BottomRightPixel, BottomRightViewport;
+		USlateBlueprintLibrary::LocalToViewport(this, Geometry, FVector2D(Inset, Inset), TopLeftPixel, TopLeftViewport);
+		USlateBlueprintLibrary::LocalToViewport(this, Geometry, Size - FVector2D(Inset, Inset), BottomRightPixel, BottomRightViewport);
+		return FBox2D(TopLeftPixel, BottomRightPixel);
+	};
+	const FGeometry& RootGeometry = GetCachedGeometry();
+
+	// The plate sprite carries TraceMenuArtStyle::ButtonFrame's glow outside the plate: 128 of 1486.
+	const float BannerGlowFraction = TraceMenuArtStyle::ButtonFrame.Glow
+		/ (TraceMenuArtStyle::ButtonFrame.PlateH + 2.f * TraceMenuArtStyle::ButtonFrame.Glow);
+
+	Out.bVisible = FailureBanner != nullptr && FailureBanner->GetVisibility() != ESlateVisibility::Collapsed;
+	Out.Banner = RectOf(FailureBanner, BannerGlowFraction);
+	Out.Wordmark = RectOf(Wordmark, 0.f);
+	Out.Swoosh = RectOf(SwooshImage, 0.f);
+	Out.AddressChip = RectOf(AddressChip, BannerGlowFraction);
+	if (OrderedRows.Num() > 0)
+	{
+		GetRowViewportRect(OrderedRows.Num() - 1, Out.LastRow);
+	}
+	{
+		FVector2D RootPixel, RootViewport;
+		USlateBlueprintLibrary::LocalToViewport(this, RootGeometry, RootGeometry.GetLocalSize(), RootPixel, RootViewport);
+		Out.ViewSize = RootPixel;
+	}
+
+	if (FailureBanner != nullptr)
+	{
+		const UObject* const PlateTexture = FailureBanner->Background.GetResourceObject();
+		Out.bKitHoverPlate = PlateTexture != nullptr && PlateTexture->GetName() == TEXT("T_MenuBtn_Hover");
+	}
+	if (FailureHeadlineText != nullptr)
+	{
+		Out.Headline = FailureHeadlineText->GetText().ToString();
+		Out.HeadlineColor = FailureHeadlineText->GetColorAndOpacity().GetSpecifiedColor();
+	}
+}
+#endif
 
 bool UTraceTitleMenuWidget::GetRowViewportRect(int32 InRowIndex, FBox2D& OutRect) const
 {
