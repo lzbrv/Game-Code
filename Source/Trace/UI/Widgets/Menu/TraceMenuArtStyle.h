@@ -83,6 +83,7 @@
 #include "CoreMinimal.h"
 #include "Fonts/SlateFontInfo.h"
 #include "Math/Vector2D.h"
+#include "UObject/WeakObjectPtrTemplates.h"
 
 namespace TraceMenuArtStyle
 {
@@ -157,6 +158,15 @@ namespace TraceMenuArtStyle
 
 	/** One line naming what is actually being drawn with, for the verifier and the log. */
 	TRACE_API FString DescribeMenuFont();
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * The UFont MenuFont() resolved, WEAKLY — null-and-explicit before it resolves or when it is the
+	 * engine fallback. Trace.UI.LoadingCard.Verify asks it whether the font survived a garbage
+	 * collection without dereferencing a pointer that may have been freed.
+	 */
+	TRACE_API TWeakObjectPtr<const UObject> DebugResolvedFont();
+#endif
 
 	// =============================================================================================
 	// Sprite paths. /Game/Trace/UI/Art, written by Scripts/generate-menu-widgets.py.

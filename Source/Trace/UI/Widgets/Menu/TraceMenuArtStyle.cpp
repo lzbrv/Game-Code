@@ -4,6 +4,7 @@
 
 #include "Engine/Font.h"
 #include "Fonts/CompositeFont.h"
+#include "UObject/GCObject.h"
 #include "UObject/UObjectGlobals.h"
 
 #include "Trace.h"   // LogTraceGame
@@ -14,14 +15,17 @@
 namespace TraceMenuArtStyleFile
 {
 	/**
-	 * Resolved once, on first use.
+	 * Resolved once, on first use, and KEPT ALIVE BY THIS FILE (FFontRef below).
 	 *
-	 * Not a UPROPERTY and it does not need to be: an FSlateFontInfo holds a soft path plus a weak
-	 * object rather than a raw UFont*, and this file keeps no strong reference across a GC. The
-	 * interim face is a /Game asset rather than an engine one, so it is NOT rooted for the life of
-	 * the process the way /Engine/EngineFonts/Roboto is — but every consumer (the UMG text blocks
-	 * and the Canvas screens) holds its own reference for as long as it is drawing with it, which is
-	 * exactly the lifetime that matters.
+	 * This comment used to say an FSlateFontInfo "holds a soft path plus a weak object" and that every
+	 * consumer keeps the font alive while it draws. Both were false, and together they were a
+	 * use-after-free (P12, finding menufont-unrooted-ufont): FSlateFontInfo::FontObject is a STRONG
+	 * TObjectPtr that the garbage collector only sees if somebody reports it, a static nobody reports
+	 * is invisible to it, and the only assets that reference F_TraceMenu are the TITLE's widgets. So in
+	 * a match the first MenuFont() call loaded the font, the next GC freed it, and every later fallback
+	 * draw (-TraceNoFontAtlas, `Trace.Text.Atlas 0`, an atlas that failed its staleness guard) handed
+	 * Slate a freed UFont. The loading card resolves it at boot, which would have hit the same thing.
+	 * `Trace.UI.LoadingCard.Verify` collects garbage on the arena and checks the font is still there.
 	 */
 	static bool bResolved = false;
 	static bool bFontFound = false;
@@ -30,6 +34,38 @@ namespace TraceMenuArtStyleFile
 	static FString ResolvedAsset;
 	static FString ResolvedTypeface;
 	static FSlateFontInfo Resolved;
+
+#if !UE_BUILD_SHIPPING
+	/** The same font, weakly, for Trace.UI.LoadingCard.Verify (see DebugResolvedFont). */
+	static TWeakObjectPtr<const UObject> ResolvedWeak;
+#endif
+
+	/**
+	 * Reports Resolved to the garbage collector, so the UFont it names (and any font or outline
+	 * material in it) lives for the process. The same function-local-static FGCObject pattern as
+	 * TraceText's FAtlasRef; it reports the struct itself rather than a copy of the pointer, so there is
+	 * one source of truth. About 0.7 MB (F_TraceMenu plus its face), which is the price of the fallback
+	 * being usable at all.
+	 */
+	class FFontRef : public FGCObject
+	{
+	public:
+		virtual void AddReferencedObjects(FReferenceCollector& Collector) override
+		{
+			Resolved.AddReferencedObjects(Collector);
+		}
+
+		virtual FString GetReferencerName() const override
+		{
+			return TEXT("TraceMenuArtStyle::MenuFont");
+		}
+	};
+
+	static FFontRef& FontRef()
+	{
+		static FFontRef Instance;
+		return Instance;
+	}
 
 	static UFont* LoadFont(const TCHAR* Path)
 	{
@@ -122,7 +158,17 @@ namespace TraceMenuArtStyleFile
 		}
 		ResolvedTypeface = Face.ToString();
 
+		// Registered BEFORE the pointer is stored, so there is no window in which the font is held
+		// only by a static the collector cannot see. Game thread: this is the first MenuFont() call,
+		// which the loading screen makes at module startup before any other thread could paint.
+		FontRef();
 		Resolved = FSlateFontInfo(Font, 24, Face);
+#if !UE_BUILD_SHIPPING
+		if (!ResolvedAsset.StartsWith(TEXT("/Engine/")))
+		{
+			ResolvedWeak = Font;
+		}
+#endif
 	}
 }
 
@@ -314,6 +360,15 @@ bool TraceMenuArtStyle::IsMenuFontResolved()
 		&& TraceMenuArtStyleFile::bTypefaceFound
 		&& !TraceMenuArtStyleFile::bUsingFallback;
 }
+
+#if !UE_BUILD_SHIPPING
+TWeakObjectPtr<const UObject> TraceMenuArtStyle::DebugResolvedFont()
+{
+	// Deliberately NOT through Resolve(): the harness asks this after a travel, and the question is
+	// whether the font resolved EARLIER is still alive — resolving here would answer a different one.
+	return TraceMenuArtStyleFile::ResolvedWeak;
+}
+#endif
 
 FString TraceMenuArtStyle::DescribeMenuFont()
 {
