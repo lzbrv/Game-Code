@@ -7120,7 +7120,9 @@ void ATraceHUD::DrawMatchResult()
 	// first); on a client it takes only that player home. Not while the pause menu is up — that is its
 	// own Enter.
 	{
-		const bool bPad = TracePadMenu::HasSeenPad(TracePC.Get());
+		// Pad A obeys CONTROLLER INPUT like every menu (TracePadMenu::IsEnabled), and the legend says
+		// ENTER when the pad is off, rather than naming a button that does nothing.
+		const bool bPad = TracePadMenu::IsEnabled() && TracePadMenu::HasSeenPad(TracePC.Get());
 		const TArray<FTraceKitLegendItem> Legend = {
 			{ bPad ? TRACE_TEXT("HUD.RESULT_PAD_KEY_CONTINUE", "A") : TRACE_TEXT("HUD.RESULT_KEY_CONTINUE", "ENTER"),
 			  TRACE_TEXT("HUD.RESULT_CONTINUE", "CONTINUE") },
@@ -7128,8 +7130,7 @@ void ATraceHUD::DrawMatchResult()
 		TraceMenuKit::DrawKeyLegend(this, Legend, CX, StripY + StripH + (12.f * UIScale), 30.f * UIScale, Now);
 
 		if (TracePC != nullptr && !PauseMenu.IsOpen()
-			&& (TracePC->WasInputKeyJustPressed(EKeys::Enter)
-				|| TracePC->WasInputKeyJustPressed(EKeys::Gamepad_FaceButton_Bottom)))
+			&& (TracePC->WasInputKeyJustPressed(EKeys::Enter) || TracePadMenu::ConfirmPressed(TracePC.Get())))
 		{
 			ContinueFromResults();
 		}

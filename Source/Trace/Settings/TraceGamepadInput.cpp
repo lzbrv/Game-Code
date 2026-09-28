@@ -172,8 +172,8 @@ namespace TracePadMenu
 	/**
 	 * "Is this direction being asked for", over a D-pad key and its left-stick twin.
 	 *
-	 * Byte-for-byte the predicate FTraceOptionsMenu::PollNavigation's local `PadDown` lambda uses,
-	 * and Trace.Pad.MenuVerify asserts the two key LISTS still agree. See the header.
+	 * FTraceOptionsMenu::PollNavigation reads its pad directions through NavX/NavY as well (it once had
+	 * its own un-gated copy of this predicate). See the header.
 	 */
 	static bool DirDown(const APlayerController* PC, const FKey& DPad, const FKey& Stick)
 	{

@@ -26,7 +26,7 @@
 #include "Misc/Parse.h"
 #include "Scalability.h"
 #include "Settings/TraceGameUserSettings.h"
-#include "Settings/TraceGamepadInput.h"      // TracePadMenu::HasSeenPad — the legend's pad line
+#include "Settings/TraceGamepadInput.h"      // TracePadMenu — the pad's menu keys and the CONTROLLER INPUT gate
 #include "Trace.h"                       // LogTraceGame
 #include "UI/TraceMatchOptions.h"        // TraceCharacters - the spec v14 §3 toggle's storage
 #include "UI/Text/TraceCanvasText.h" // spec v22 §A1 - this page types in the artist's face
@@ -156,9 +156,13 @@ namespace TraceOptionsMenuType
 // Every page of this overlay is built from the artist's kit through UI/Widgets/Menu/TraceMenuKit.h,
 // the one Canvas renderer every other menu screen uses:
 //
-//   * a black scrim over whatever is behind (the match, or the title), and a borderless black panel
-//     under the list — no cyan bezel, no corner ticks, no cyan anything (stylespec §0: cyan is the
-//     pre-kit palette and is not a kit colour);
+//   * the kit's black, full screen — the modal scrim over the match, opaque over the title — and
+//     NOTHING between it and the plates: no panel, no bezel, no corner ticks, no cyan anything
+//     (stylespec §0: cyan is the pre-kit palette and is not a kit colour). A second, darker square box
+//     used to sit under the list; over the match it read as a hard-cornered black rectangle, and over
+//     the title its edges cut the ghosted title rows into half-plates;
+//   * a page taller than the screen scrolls, with a thin bar at its right, rather than shrinking its
+//     rows (see UpdateScroll);
 //   * the page title in white Sofachrome; section captions in white at half strength with a faint
 //     hairline;
 //   * every row is the artist's button plate in one of the kit's four states — DEFAULT navy with a
@@ -181,9 +185,14 @@ namespace TraceOptionsMenuLayout
 	static constexpr float TitleCap       = 30.f;    // the page title's cap height
 	static constexpr float TitleTop       = 30.f;    // panel top to the title's cap top
 	static constexpr float TitleBlock     = 90.f;    // panel top to the first row
-	static constexpr float PreferredPitch = 46.f;    // row pitch when the page fits
-	static constexpr float MinPitch       = 20.f;    // the floor it shrinks to when it does not
-	static constexpr float RowFill        = 0.82f;   // plate height / pitch
+	// ONE PITCH ON EVERY PAGE, and a page taller than the screen scrolls. It used to shrink to fit,
+	// down to 20 px, which drew CONTROLLER's plates 25 px tall with 8 px caps. 46 x 0.845 is a 39 px
+	// plate with a 13 px cap, and 0.845 is the title's own plate-to-pitch ratio (60 on 71).
+	static constexpr float RowPitch       = 46.f;
+	static constexpr float RowFill        = 0.845f;  // plate height / pitch
+	static constexpr float ScrollBarInset = 16.f;    // the plates' right edge to the scroll bar
+	static constexpr float ScrollBarW     = 4.f;
+	static constexpr float ScrollBarSlack = 12.f;    // extra grab width either side of the bar
 	static constexpr float SideGutter     = 40.f;    // panel edge to the plates
 	static constexpr float BottomPad      = 24.f;
 	static constexpr float ColumnGap      = 18.f;    // label plate to its control
@@ -201,7 +210,6 @@ namespace TraceOptionsMenuLayout
 	static constexpr float RootRowW       = 520.f;   // the pause root: the title screen's row metrics
 	static constexpr float RootRowH       = 60.f;
 	static constexpr float RootPitch      = 71.f;
-	static constexpr float PanelAlpha     = 0.90f;   // the black panel, over the kit's 0.82 scrim
 	static constexpr float PanelMaxH      = 0.95f;   // of the view
 }
 
@@ -212,7 +220,6 @@ namespace TraceOptionsMenuPalette
 	static const FLinearColor Rule(1.f, 1.f, 1.f, 0.12f);
 	/** Notes and inert furniture: the kit's disabled word grey. */
 	static const FLinearColor Note(0.55f, 0.55f, 0.55f, 1.f);
-	static const FLinearColor PanelFill(0.f, 0.f, 0.f, TraceOptionsMenuLayout::PanelAlpha);
 }
 
 /**
@@ -1007,6 +1014,26 @@ namespace TraceOptionsRebindProof
 	}
 }
 
+namespace TraceOptionsRebindProof
+{
+	/**
+	 * One pad-button or mouse-wheel edge, in at UGameViewportClient::InputKey — the call
+	 * FSceneViewport makes for both, and the route Trace.Pad.Menu uses. NOT through Slate like
+	 * InjectKey: Slate's own navigation can take a pad key, and a wheel event is routed by a hit test
+	 * a headless window may not pass. Neither is the gate InjectKey exists to measure.
+	 */
+	void InjectViewportKey(const FKey& Key, EInputEvent Event)
+	{
+		if (GEngine == nullptr || GEngine->GameViewport == nullptr)
+		{
+			return;
+		}
+		const FInputKeyEventArgs Args(GEngine->GameViewport->Viewport, FInputDeviceId::CreateFromInternalId(0), Key,
+			Event, (Event == IE_Pressed) ? 1.f : 0.f, /*bIsTouchEvent*/ false, FPlatformTime::Cycles64());
+		GEngine->GameViewport->InputKey(Args);
+	}
+}
+
 void FTraceOptionsMenu::DebugBeginRebindProof()
 {
 	if (RebindProofStage != ERebindProofStage::Idle)
@@ -1767,6 +1794,12 @@ void FTraceOptionsMenu::RebuildRows(EAction SelectAction, int32 SelectSlot)
 {
 	Rows.Reset();
 
+	// A rebuilt page starts at its top and scrolls to wherever the selection lands below (the next
+	// draw follows it — see UpdateScroll).
+	ScrollFirst = 0;
+	ScrollFollowedRow = INDEX_NONE;
+	bDraggingScrollBar = false;
+
 	// A new page, or the same page rebuilt: nothing stays armed across it.
 	Disarm();
 
@@ -1980,6 +2013,11 @@ void FTraceOptionsMenu::RebuildRows(EAction SelectAction, int32 SelectSlot)
 		// explaining the dead zone, were removed by the co-developer's text pass.)
 		// No CONTROLLER caption over this first row: the page is titled CONTROLLER directly above it.
 		AddValue(ERowKind::Toggle, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_CONTROLLER_INPUT", "CONTROLLER INPUT"), ESetting::PadEnabled);
+
+		// OFF SILENCES THE PAD IN MENUS TOO, this page included (TracePadMenu::IsEnabled is the one
+		// rule every screen follows), so the row says so: a player who switches it off with the pad in
+		// their hands needs the keyboard or the mouse to switch it back on.
+		AddNote(*TRACE_TEXT("OPTIONS.CONTROLLER.NOTE_CONTROLLER_INPUT_OFF", "OFF: PAD IGNORED, MENUS TOO."));
 
 		AddHeader(*TRACE_TEXT("OPTIONS.CONTROLLER.HDR_LOOK_STICK", "LOOK STICK"));
 		AddValue(ERowKind::Slider, *TRACE_TEXT("OPTIONS.CONTROLLER.ROW_LOOK_SPEED", "LOOK SPEED"),          ESetting::PadLookRate);
@@ -2324,7 +2362,13 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	//
 	// It returns true for the whole edit, including the frame that ends it, so the Enter that
 	// committed the name cannot also activate the row underneath it.
-	if (!TickCallSignEntry(PC))
+	//
+	// The pad's A and B are read here as REMEMBERED edges and handed to the field, which reads only
+	// the keyboard itself. Sampled every frame a page is up, so the A that opened the field is
+	// already "down" the frame after and cannot also submit it.
+	const bool bPadConfirm = TracePadMenu::RisingEdge(PC, TracePadMenu::ConfirmKey(), bPadConfirmWasDown);
+	const bool bPadBack = TracePadMenu::RisingEdge(PC, TracePadMenu::BackKey(), bPadBackWasDown);
+	if (!TickCallSignEntry(PC, bPadConfirm, bPadBack))
 	{
 		// Input first, then draw, so a value changed this frame is the value the player sees this
 		// frame. The row rects the mouse tests against are from the PREVIOUS draw, which is correct:
@@ -2613,18 +2657,17 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 	// handler early-return while this overlay is open, which is exactly what ETraceInputStates::Menu's
 	// comment in Settings/TraceUserSettings.h says: a match action and the menu can never contend. So
 	// the A button being both "select" here and JUMP in a match is not an overload.
-	auto PadDown = [PC](const FKey& A, const FKey& B)
-	{
-		return PC->IsInputKeyDown(A) || PC->IsInputKeyDown(B)
-			|| PC->WasInputKeyJustPressed(A) || PC->WasInputKeyJustPressed(B);
-	};
+	//
+	// THROUGH TracePadMenu, like the title, team and loadout screens, so CONTROLLER INPUT OFF silences
+	// the pad here too. It used to be read raw on this one screen: a player who switched it OFF saw the
+	// pad keep working on the very page they did it on, then found it dead on the title.
+	const bool bPadOn = TracePadMenu::IsEnabled();
 
 	// ---- Vertical: move the selection -----------------------------------------------------------
 	int32 NavDir = 0;
 	if (TraceOptionsMenuFile::AnyDown(PC, EKeys::Down, EKeys::S)) { NavDir += 1; }
 	if (TraceOptionsMenuFile::AnyDown(PC, EKeys::Up,   EKeys::W)) { NavDir -= 1; }
-	if (PadDown(EKeys::Gamepad_DPad_Down, EKeys::Gamepad_LeftStick_Down)) { NavDir += 1; }
-	if (PadDown(EKeys::Gamepad_DPad_Up,   EKeys::Gamepad_LeftStick_Up))   { NavDir -= 1; }
+	NavDir += TracePadMenu::NavY(PC);
 	NavDir = FMath::Clamp(NavDir, -1, 1);
 
 	if (NavDir != 0)
@@ -2647,8 +2690,7 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 	int32 AdjustDir = 0;
 	if (TraceOptionsMenuFile::AnyDown(PC, EKeys::Right, EKeys::D)) { AdjustDir += 1; }
 	if (TraceOptionsMenuFile::AnyDown(PC, EKeys::Left,  EKeys::A)) { AdjustDir -= 1; }
-	if (PadDown(EKeys::Gamepad_DPad_Right, EKeys::Gamepad_LeftStick_Right)) { AdjustDir += 1; }
-	if (PadDown(EKeys::Gamepad_DPad_Left,  EKeys::Gamepad_LeftStick_Left))  { AdjustDir -= 1; }
+	AdjustDir += TracePadMenu::NavX(PC);
 	AdjustDir = FMath::Clamp(AdjustDir, -1, 1);
 
 	if (AdjustDir != 0)
@@ -2671,7 +2713,7 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 	// comment in ActivateSelected has claimed "the gamepad face button" funnels here since spec v26
 	// §9, and as of D31-PAD that is finally true rather than aspirational.
 	if (PC->WasInputKeyJustPressed(EKeys::Enter) || PC->WasInputKeyJustPressed(EKeys::SpaceBar)
-		|| PC->WasInputKeyJustPressed(EKeys::Gamepad_FaceButton_Bottom))
+		|| TracePadMenu::ConfirmPressed(PC))
 	{
 		ActivateSelected();
 		return;
@@ -2681,8 +2723,7 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 	// synthetic Escape UTraceGamepadInputSubsystem injects — so a pad has two ways back, which is
 	// right: B is what a player's thumb reaches for, and MENU is what closes the whole overlay from
 	// the pause root.
-	if (PC->WasInputKeyJustPressed(EKeys::Escape)
-		|| PC->WasInputKeyJustPressed(EKeys::Gamepad_FaceButton_Right))
+	if (PC->WasInputKeyJustPressed(EKeys::Escape) || TracePadMenu::BackPressed(PC))
 	{
 		GoBack();
 		return;
@@ -2691,7 +2732,7 @@ void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 	// Explicit unbind (and, on the LOADOUTS page, clear a saved slot). D31-PAD — Y does it on a pad,
 	// because BKSP is not on a controller. See HandleClearPressed.
 	if (PC->WasInputKeyJustPressed(EKeys::BackSpace) || PC->WasInputKeyJustPressed(EKeys::Delete)
-		|| PC->WasInputKeyJustPressed(EKeys::Gamepad_FaceButton_Top))
+		|| (bPadOn && PC->WasInputKeyJustPressed(EKeys::Gamepad_FaceButton_Top)))
 	{
 		HandleClearPressed();
 	}
@@ -2792,8 +2833,13 @@ void FTraceOptionsMenu::ClearLoadoutSlot(int32 SlotIndex)
 	RebuildRows(EAction::EditLoadoutSlot, SlotIndex);
 }
 
-void FTraceOptionsMenu::PollMouse(APlayerController* PC)
+bool FTraceOptionsMenu::SamplePointer(APlayerController* PC)
 {
+	if (PC == nullptr)
+	{
+		return false;
+	}
+
 	bool bDown = PC->IsInputKeyDown(EKeys::LeftMouseButton);
 
 	float MouseX = 0.f;
@@ -2805,7 +2851,7 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 	}
 
 #if !UE_BUILD_SHIPPING
-	// Trace.Menu.Verify's own pointer: the whole function below runs on it exactly as on a real one.
+	// Trace.Menu.Verify's own pointer: everything downstream runs on it exactly as on a real one.
 	if (bDebugPointer)
 	{
 		CursorPos = DebugPointerPos;
@@ -2814,6 +2860,13 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 	}
 #endif
 
+	return bDown;
+}
+
+void FTraceOptionsMenu::PollMouse(APlayerController* PC)
+{
+	const bool bDown = SamplePointer(PC);
+
 	const bool bJustPressed = bDown && !bMouseWasDown;
 	const bool bJustReleased = !bDown && bMouseWasDown;
 	bMouseWasDown = bDown;
@@ -2821,6 +2874,17 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 	if (!bHasCursor)
 	{
 		return;
+	}
+
+	// THE WHEEL SCROLLS THE VIEW, one row a notch, on a page too tall for the screen. The selection
+	// stays where it is; the next arrow or D-pad press brings the view back to it (UpdateScroll).
+	const int32 MaxScrollFirst = Rows.Num() - ScrollWindowRows;
+	if (ScrollWindowRows > 0 && MaxScrollFirst > 0)
+	{
+		int32 Wheel = 0;
+		if (PC->WasInputKeyJustPressed(EKeys::MouseScrollDown)) { Wheel += 1; }
+		if (PC->WasInputKeyJustPressed(EKeys::MouseScrollUp))   { Wheel -= 1; }
+		ScrollFirst = FMath::Clamp(ScrollFirst + Wheel, 0, MaxScrollFirst);
 	}
 
 	// Hover follows the pointer, but ONLY when the pointer actually moved.
@@ -2851,7 +2915,7 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 		}
 	}
 
-	if (HoverRow != INDEX_NONE && !bDraggingSlider && bCursorMoved)
+	if (HoverRow != INDEX_NONE && !bDraggingSlider && !bDraggingScrollBar && bCursorMoved)
 	{
 		// FX_AUDIO_PLAN §5.1 — the pointer's half of "menu row focus change". Guarded on the row
 		// ACTUALLY changing, or every 2 px of mouse travel across one row would re-announce it.
@@ -2869,6 +2933,13 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 	{
 		PressedRow = HoverRow;
 		bDraggingSlider = false;
+
+		// The scroll bar sits in the gutter, clear of every row: a press on it (with a little grab
+		// room either side of a 4 px bar) drags the view, and arms no row.
+		const float BarSlack = TraceOptionsMenuLayout::ScrollBarSlack * UIScale;
+		bDraggingScrollBar = HoverRow == INDEX_NONE && ScrollBarRect.bIsValid
+			&& CursorPos.X >= ScrollBarRect.Min.X - BarSlack && CursorPos.X <= ScrollBarRect.Max.X + BarSlack
+			&& CursorPos.Y >= ScrollBarRect.Min.Y && CursorPos.Y <= ScrollBarRect.Max.Y;
 
 		// A press SELECTS the row it lands on, moved or not. With the stricter move test above a click
 		// on a row the pointer was already resting over would otherwise act on the keyboard's row: a
@@ -2914,6 +2985,14 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 		}
 	}
 
+	// Dragging the scroll bar: the view centres on the pointer's place along the bar, so a click jumps
+	// there and a drag follows.
+	if (bDown && bDraggingScrollBar && ScrollBarRect.bIsValid && MaxScrollFirst > 0)
+	{
+		const float Along = (CursorPos.Y - ScrollBarRect.Min.Y) / FMath::Max(1.f, ScrollBarRect.Max.Y - ScrollBarRect.Min.Y);
+		ScrollFirst = FMath::Clamp(FMath::RoundToInt(Along * Rows.Num() - ScrollWindowRows * 0.5f), 0, MaxScrollFirst);
+	}
+
 	if (bDown && bDraggingSlider && Rows.IsValidIndex(Selected) && Rows[Selected].Track.bIsValid)
 	{
 		const FBox2D& Track = Rows[Selected].Track;
@@ -2925,6 +3004,7 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 	{
 		const int32 Armed = PressedRow;
 		PressedRow = INDEX_NONE;
+		bDraggingScrollBar = false;
 
 		if (bDraggingSlider)
 		{
@@ -2974,6 +3054,50 @@ void FTraceOptionsMenu::PollMouse(APlayerController* PC)
 
 			ActivateSelected();
 		}
+	}
+}
+
+void FTraceOptionsMenu::UpdateScroll(int32 WindowRows)
+{
+	ScrollWindowRows = FMath::Max(1, WindowRows);
+	const int32 MaxScrollFirst = FMath::Max(0, Rows.Num() - ScrollWindowRows);
+
+	// FOLLOW THE SELECTION ONLY WHEN IT MOVED, so the wheel and the scroll bar can look elsewhere
+	// without the view snapping back every frame.
+	if (Selected != ScrollFollowedRow && Rows.IsValidIndex(Selected))
+	{
+		ScrollFollowedRow = Selected;
+
+		// One row of context past the selection — the caption over the block it starts, or the row that
+		// shows the list goes on — for a move made with the keys or the pad. NOT for the pointer: the row
+		// it lands on is already in view under it, and scrolling there would slide the next row under a
+		// resting pointer.
+		const FRow& Row = Rows[Selected];
+		const bool bUnderPointer = bHasCursor && Row.Rect.bIsValid && Row.Rect.IsInside(CursorPos);
+		const int32 ContextRows = (!bUnderPointer && ScrollWindowRows >= 5) ? 1 : 0;
+
+		if (Selected - ContextRows < ScrollFirst)
+		{
+			ScrollFirst = Selected - ContextRows;
+		}
+		else if (Selected + ContextRows > ScrollFirst + ScrollWindowRows - 1)
+		{
+			ScrollFirst = Selected + ContextRows - (ScrollWindowRows - 1);
+		}
+	}
+
+	ScrollFirst = FMath::Clamp(ScrollFirst, 0, MaxScrollFirst);
+}
+
+void FTraceOptionsMenu::ClearRowRects(FRow& Row)
+{
+	Row.Rect = FBox2D(ForceInit);
+	Row.Track = FBox2D(ForceInit);
+	Row.ArrowLeft = FBox2D(ForceInit);
+	Row.ArrowRight = FBox2D(ForceInit);
+	for (int32 Chip = 0; Chip < UTraceUserSettings::MaxKeysPerAction; ++Chip)
+	{
+		Row.KeyChip[Chip] = FBox2D(ForceInit);
 	}
 }
 
@@ -4447,8 +4571,15 @@ namespace TraceOptionsMenuFile
 
 		if (Ask.bCallSign)
 		{
-			OutKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_SELECT", "ENTER"), TRACE_TEXT("OPTIONS.LEGEND.SAVE", "SAVE") });
+			const FString SaveWord = TRACE_TEXT("OPTIONS.LEGEND.SAVE", "SAVE");
+			OutKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_SELECT", "ENTER"), SaveWord });
 			OutKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_BACK", "ESC"), Cancel });
+			// The pad's way out of the field, on the same rule as every other page's pad line.
+			if (Ask.bPadLine)
+			{
+				OutPad.Add({ TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_SELECT", "A"), SaveWord });
+				OutPad.Add({ TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_BACK", "B"), Cancel });
+			}
 			return;
 		}
 
@@ -4482,7 +4613,7 @@ namespace TraceOptionsMenuFile
 namespace TraceOptionsMenuFile
 {
 	static FLegendAsk AskFor(bool bRoot, bool bKeyCapture, bool bPadCapture, bool bCallSign, bool bKeyboardPage,
-		bool bControllerPage, bool bLoadoutsPage, bool bSeenPad)
+		bool bControllerPage, bool bLoadoutsPage, bool bSeenPad, bool bPadEnabled)
 	{
 		FLegendAsk Ask;
 		Ask.bNone = bRoot && !bKeyCapture && !bPadCapture;
@@ -4493,8 +4624,9 @@ namespace TraceOptionsMenuFile
 		Ask.bClear = bLoadoutsPage;
 		Ask.bEdit = bLoadoutsPage;
 		// The pad's line: always on the controller page (a player may have reached it with no keyboard),
-		// elsewhere once a pad has been seen on this machine — the loadout page's rule.
-		Ask.bPadLine = bControllerPage || bSeenPad;
+		// elsewhere once a pad has been seen on this machine — the loadout page's rule. Never while
+		// CONTROLLER INPUT is off: the menus ignore the pad then, and a line of pad buttons would lie.
+		Ask.bPadLine = bPadEnabled && (bControllerPage || bSeenPad);
 		return Ask;
 	}
 }
@@ -4507,7 +4639,8 @@ float FTraceOptionsMenu::LegendHeight(APlayerController* PC) const
 	TArray<FTraceKitLegendItem> PadKeys;
 	TraceOptionsMenuFile::BuildLegend(TraceOptionsMenuFile::AskFor(Page == EPage::Root, bCapturingKey,
 		bCapturingKey && bCapturingPadKey, CallSignEntry.IsActive(), Page == EPage::Keyboard,
-		Page == EPage::Controller, Page == EPage::Loadouts, TracePadMenu::HasSeenPad(PC)), Keys, PadKeys);
+		Page == EPage::Controller, Page == EPage::Loadouts, TracePadMenu::HasSeenPad(PC), TracePadMenu::IsEnabled()),
+		Keys, PadKeys);
 
 	if (Keys.Num() == 0 && PadKeys.Num() == 0)
 	{
@@ -4525,7 +4658,8 @@ void FTraceOptionsMenu::DrawLegend(AHUD* HUD, APlayerController* PC, float Cente
 	TArray<FTraceKitLegendItem> PadKeys;
 	TraceOptionsMenuFile::BuildLegend(TraceOptionsMenuFile::AskFor(Page == EPage::Root, bCapturingKey,
 		bCapturingKey && bCapturingPadKey, CallSignEntry.IsActive(), Page == EPage::Keyboard,
-		Page == EPage::Controller, Page == EPage::Loadouts, TracePadMenu::HasSeenPad(PC)), Keys, PadKeys);
+		Page == EPage::Controller, Page == EPage::Loadouts, TracePadMenu::HasSeenPad(PC), TracePadMenu::IsEnabled()),
+		Keys, PadKeys);
 
 	// ONE SCALE FOR BOTH LINES, the loadout page's rule: two legends at two sizes would read as a mistake.
 	const float FullChipH = OL::LegendChipH * UIScale;
@@ -4586,24 +4720,37 @@ void FTraceOptionsMenu::Draw(AHUD* HUD, APlayerController* PC)
 	const float S = UIScale;
 	const bool bRoot = (Page == EPage::Root);
 
-	// THE KIT'S SCRIM: black, over the match or the title. The arena is a field of bright emissive
-	// strips and the panel has to be the only thing the eye can land on.
-	TraceMenuKit::DrawScrim(HUD, ViewW, ViewH);
-
-	// ---- Panel geometry -------------------------------------------------------------------------
+	// THE KIT'S BLACK, FULL SCREEN, AND NOTHING ELSE UNDER THE PLATES (stylespec §1). The page's own
+	// square black box that used to sit on the scrim is gone: over the match it was a hard-cornered
+	// rectangle no kit screen has, and over the title its edges sliced the ghosted title rows into
+	// half-plates.
 	//
-	// Sized to its CONTENT, then clamped to the screen: ask for a comfortable pitch, add it up, and
-	// only then shrink the pitch if it does not fit. The legend's height is part of the sum, and is
-	// zero on the pause root, which has no legend (D30) — so no dead band under QUIT.
+	//   * OVER THE MATCH (the host gave us a RESUME — see OnResume) it is the kit's modal scrim, so the
+	//     match stays faintly visible behind the pause menu and its pages.
+	//   * OVER THE TITLE it is opaque: a title sub-page is a kit screen of its own, on the kit's black
+	//     background. At the modal's 18% the title's rows, words and wordmark showed through between
+	//     these rows (PLAY under LOOK SPEED, QUIT under a note) once the box stopped hiding them.
+	const bool bOverMatch = static_cast<bool>(OnResume);
+	TraceMenuKit::DrawScrim(HUD, ViewW, ViewH, bOverMatch ? TraceMenuKit::ScrimAlpha : 1.f);
+
+	// ---- Page geometry --------------------------------------------------------------------------
+	//
+	// ONE PITCH, and the page SCROLLS when it is taller than the screen. It used to shrink the pitch
+	// to fit instead — to 20 px, drawing CONTROLLER's plates 25 px tall with 8 px caps. Now the page
+	// is as tall as its rows up to 95% of the view, and holds as many whole rows as fit there. The
+	// legend's height is part of the sum, and is zero on the pause root, which has no legend (D30) —
+	// so no dead band under QUIT.
 	const float LegendH = LegendHeight(PC);
 	const float TitleBlockH = OL::TitleBlock * S;
 	const float BottomH = OL::BottomPad * S + LegendH;
 	const int32 RowCount = FMath::Max(1, Rows.Num());
-	const float PreferredPitch = (bRoot ? OL::RootPitch : OL::PreferredPitch) * S;
+	const float Pitch = (bRoot ? OL::RootPitch : OL::RowPitch) * S;
 
-	const float PanelH = FMath::Min(ViewH * OL::PanelMaxH, TitleBlockH + RowCount * PreferredPitch + BottomH);
-	const float RowsRegion = FMath::Max(1.f, PanelH - TitleBlockH - BottomH);
-	const float Pitch = FMath::Clamp(RowsRegion / RowCount, OL::MinPitch * S, PreferredPitch);
+	const float RoomForRows = ViewH * OL::PanelMaxH - TitleBlockH - BottomH;
+	const int32 WindowRows = FMath::Clamp(FMath::FloorToInt((RoomForRows + 0.5f) / FMath::Max(1.f, Pitch)), 1, RowCount);
+	UpdateScroll(WindowRows);
+
+	const float PanelH = TitleBlockH + WindowRows * Pitch + BottomH;
 	const float RowH = bRoot ? FMath::Min(OL::RootRowH * S, Pitch * 0.85f) : Pitch * OL::RowFill;
 
 	// The pause root is the in-match MAIN MENU and wears the title screen's row metrics (60 tall on a
@@ -4642,10 +4789,6 @@ void FTraceOptionsMenu::Draw(AHUD* HUD, APlayerController* PC)
 	const float PanelX = (ViewW - GroupW) * 0.5f;
 	const float PanelY = (ViewH - PanelH) * 0.5f;
 	const float CX = PanelX + PanelW * 0.5f;
-
-	// A borderless black panel under the list, over the scrim. No bezel and no corner ticks: the kit
-	// has none, and a flat rect with a coloured edge is exactly what stylespec §0 rules out.
-	HUD->DrawRect(TraceMenuKit::Faded(TraceOptionsMenuPalette::PanelFill), PanelX, PanelY, PanelW, PanelH);
 
 	if (bDrawPreview)
 	{
@@ -4691,9 +4834,39 @@ void FTraceOptionsMenu::Draw(AHUD* HUD, APlayerController* PC)
 	const float RowX = PanelX + OL::SideGutter * S;
 	const float RowW = PanelW - OL::SideGutter * 2.f * S;
 
+	// Only the rows in the window are drawn, and only they keep hit rects: a row scrolled out of view
+	// must not take a click or a hover.
 	for (int32 Index = 0; Index < Rows.Num(); ++Index)
 	{
-		DrawRow(HUD, Rows[Index], RowX, RowsTop + Index * Pitch + (Pitch - RowH) * 0.5f, RowW, RowH, Index == Selected);
+		const int32 WindowSlot = Index - ScrollFirst;
+		if (WindowSlot < 0 || WindowSlot >= WindowRows)
+		{
+			ClearRowRects(Rows[Index]);
+			continue;
+		}
+		DrawRow(HUD, Rows[Index], RowX, RowsTop + WindowSlot * Pitch + (Pitch - RowH) * 0.5f, RowW, RowH,
+			Index == Selected);
+	}
+
+	// ---- The scroll bar, only on a page that scrolls -------------------------------------------
+	//
+	// A hairline track in the caption rule's white and a thumb in the caption's, in the gutter to the
+	// right of the plates: the same furniture the section captions already use, so it adds no colour
+	// the kit does not have. The mouse wheel scrolls; a click or drag on the bar moves the view there.
+	ScrollBarRect = FBox2D(ForceInit);
+	if (Rows.Num() > WindowRows)
+	{
+		const float BarX = RowX + RowW + OL::ScrollBarInset * S;
+		const float BarW = FMath::Max(1.f, OL::ScrollBarW * S);
+		const float BarTop = RowsTop + (Pitch - RowH) * 0.5f;
+		const float BarH = WindowRows * Pitch - (Pitch - RowH);
+		const float ThumbH = FMath::Max(BarW * 3.f, BarH * WindowRows / Rows.Num());
+		const int32 MaxFirst = Rows.Num() - WindowRows;
+		const float ThumbY = BarTop + (BarH - ThumbH) * (MaxFirst > 0 ? float(ScrollFirst) / MaxFirst : 0.f);
+
+		HUD->DrawRect(TraceMenuKit::Faded(TraceOptionsMenuPalette::Rule), BarX, BarTop, BarW, BarH);
+		HUD->DrawRect(TraceMenuKit::Faded(TraceOptionsMenuPalette::Caption), BarX, ThumbY, BarW, ThumbH);
+		ScrollBarRect = FBox2D(FVector2D(BarX, BarTop), FVector2D(BarX + BarW, BarTop + BarH));
 	}
 
 	// ---- Footer: the kit's KEY legend ----------------------------------------------------------
@@ -4737,14 +4910,8 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 
 	// Every rect this row owns is rewritten by this draw, or left invalid — a stale rect from another
 	// page's layout is a click target with nothing under it.
+	ClearRowRects(Row);
 	Row.Rect = FBox2D(FVector2D(X, Y), FVector2D(X + W, Y + H));
-	Row.Track = FBox2D(ForceInit);
-	Row.ArrowLeft = FBox2D(ForceInit);
-	Row.ArrowRight = FBox2D(ForceInit);
-	for (int32 Chip = 0; Chip < UTraceUserSettings::MaxKeysPerAction; ++Chip)
-	{
-		Row.KeyChip[Chip] = FBox2D(ForceInit);
-	}
 
 	const float S = UIScale;
 	const float MidY = Y + H * 0.5f;
@@ -5230,7 +5397,7 @@ void FTraceOptionsMenu::BeginCallSignEntry()
 		*Settings.GetCallSignOrDefault());
 }
 
-bool FTraceOptionsMenu::TickCallSignEntry(APlayerController* PC)
+bool FTraceOptionsMenu::TickCallSignEntry(APlayerController* PC, bool bPadConfirm, bool bPadBack)
 {
 	if (!CallSignEntry.IsActive())
 	{
@@ -5242,10 +5409,36 @@ bool FTraceOptionsMenu::TickCallSignEntry(APlayerController* PC)
 	// ATraceMenuHUD does exactly this with its JOIN field, one line of its DrawHUD.
 	CallSignEntry.Poll(PC, Now);
 
-	if (CallSignEntry.ConsumeSubmit())
+	// The pointer is sampled on every frame of the edit, not only the frame that ends it: that keeps
+	// the drawn pointer live, and keeps bMouseWasDown true to the button, so PollMouse cannot invent a
+	// press edge on the first frame after the field closes (the stale-edge trap PollInput describes).
+	const bool bMouseDown = SamplePointer(PC);
+	const bool bMousePressed = bMouseDown && !bMouseWasDown;
+
+	// ---- THE PAD. The field reads only keys, and a pad-only player who pressed A on CALL SIGN — the
+	// first row of SETTINGS, highlighted on arrival — used to be shut in it: B, A, the D-pad and the
+	// mouse all did nothing, and only MENU got out. B is the way out and is checked first. Both end
+	// the edit with two frames of ignored input, because one physical press can be reported on two
+	// consecutive frames (TracePadMenu) and a second B would leave the page, a second A re-open the
+	// field.
+	if (bPadBack)
+	{
+		CallSignEntry.End();
+		bMouseWasDown = bMouseDown;
+		IgnoreInputBeforeFrame = GFrameCounter + 2;
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] Call sign entry cancelled (pad B)."));
+		return true;
+	}
+
+	if (CallSignEntry.ConsumeSubmit() || bPadConfirm)
 	{
 		CommitCallSign();
 		CallSignEntry.End();
+		bMouseWasDown = bMouseDown;
+		if (bPadConfirm)
+		{
+			IgnoreInputBeforeFrame = GFrameCounter + 2;
+		}
 		return true;
 	}
 
@@ -5255,9 +5448,29 @@ bool FTraceOptionsMenu::TickCallSignEntry(APlayerController* PC)
 		// (a rebind capture, a page), and a field that saved on Escape would be the one control here
 		// where it meant the opposite.
 		CallSignEntry.End();
+		bMouseWasDown = bMouseDown;
 		UE_LOG(LogTraceGame, Display, TEXT("[Options] Call sign entry cancelled."));
 		return true;
 	}
+
+	// ---- A CLICK OFF THE FIELD SAVES IT, and then does what it landed on — the way a text field
+	// behaves everywhere else. Clicks used to be ignored for the whole edit, BACK included. A click on
+	// the CALL SIGN row itself keeps editing. Returning false lets PollInput run this frame with the
+	// press edge still unread (bMouseWasDown is deliberately not updated), so PollMouse arms the row
+	// under the pointer exactly as for any other click.
+	if (bMousePressed)
+	{
+		const bool bOnField = bHasCursor && Rows.IsValidIndex(Selected) && Rows[Selected].Kind == ERowKind::TextEntry
+			&& Rows[Selected].Rect.bIsValid && Rows[Selected].Rect.IsInside(CursorPos);
+		if (!bOnField)
+		{
+			CommitCallSign();
+			CallSignEntry.End();
+			UE_LOG(LogTraceGame, Display, TEXT("[Options] Call sign saved by a click off the field."));
+			return false;
+		}
+	}
+	bMouseWasDown = bMouseDown;
 
 	// STILL ACTIVE: this class must not route its own bindings this frame. The arrow keys are the
 	// caret's, Enter is submit, Escape is cancel and Backspace is a deletion — every one of them is
@@ -5738,9 +5951,176 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 
 		PC->SetPause(false);
 		Close();
-		Next(30, 1);
+		Next(40, 1);
 		return;
 	}
+
+	// ---- H. A PAGE TALLER THAN THE SCREEN SCROLLS; IT DOES NOT SHRINK ITS ROWS ----------------------
+	//
+	// CONTROLLER is the longest page. Its plates used to be squeezed to 25 px with 8 px caps to fit.
+	case 40:
+		OpenController();
+		Next(41, 3);
+		return;
+
+	case 41:
+	{
+		VerifyIndex = FindActionRow(EAction::Back);
+		const int32 First = FirstSelectable();
+		const float PlateRef = (Rows.IsValidIndex(First) && Rows[First].Rect.bIsValid)
+			? Rows[First].Rect.GetSize().Y / FMath::Max(UIScale, 0.01f) : 0.f;
+		const bool bScrolls = ScrollWindowRows > 0 && Rows.Num() > ScrollWindowRows;
+		VerifyCheck(TEXT("H. CONTROLLER is taller than the screen here, so it scrolls"), bScrolls,
+			FString::Printf(TEXT("%d rows, %d in view at %.0f px tall"), Rows.Num(), ScrollWindowRows, ViewH));
+		VerifyCheck(TEXT("H. ...and its plates keep the kit's size (they used to shrink to 25 px)"), PlateRef >= 38.f,
+			FString::Printf(TEXT("plate %.1f px at 1080p"), PlateRef));
+		VerifyCheck(TEXT("H. BACK starts out of view, and takes no click there"),
+			Rows.IsValidIndex(VerifyIndex) && !Rows[VerifyIndex].Rect.bIsValid, RowName(VerifyIndex));
+
+		// One wheel notch, down.
+		VerifyIndexB = ScrollFirst;
+		TraceOptionsRebindProof::InjectViewportKey(EKeys::MouseScrollDown, IE_Pressed);
+		TraceOptionsRebindProof::InjectViewportKey(EKeys::MouseScrollDown, IE_Released);
+		Next(42, 2);
+		return;
+	}
+
+	case 42:
+		VerifyCheck(TEXT("H. a wheel notch scrolls the view one row, and leaves the selection"),
+			ScrollFirst == VerifyIndexB + 1 && Selected == FirstSelectable(),
+			FString::Printf(TEXT("first row in view %d -> %d, selected %s"), VerifyIndexB, ScrollFirst, *RowName(Selected)));
+
+		// Down to BACK the way a key or the pad walks there: one MoveSelection at a time.
+		for (int32 Guard = 0; Guard < Rows.Num() && Selected != VerifyIndex; ++Guard)
+		{
+			MoveSelection(1);
+		}
+		Next(43, 2);
+		return;
+
+	case 43:
+		VerifyCheck(TEXT("H. moving the selection to BACK scrolls it into view"),
+			Selected == VerifyIndex && Rows[VerifyIndex].Rect.bIsValid && Rows[VerifyIndex].Rect.Max.Y <= ViewH,
+			FString::Printf(TEXT("selected %s, first row in view %d of %d"), *RowName(Selected), ScrollFirst,
+				Rows.Num() - ScrollWindowRows));
+		VerifyCheck(TEXT("H. ...and the top row, scrolled away, takes no click"), !Rows[0].Rect.bIsValid,
+			RowName(0));
+
+		// ---- P. CONTROLLER INPUT OFF SILENCES THE PAD HERE TOO ------------------------------------
+		//
+		// In memory only, like Trace.Pad.Enable: no Save() is reached, because nothing may respond.
+		bVerifySavedPadEnabled = Settings.bPadEnabled;
+		Settings.bPadEnabled = false;
+		RebuildRows();
+		VerifyIndexB = Selected;
+		TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_DPad_Down, IE_Pressed);
+		Next(44, 2);
+		return;
+
+	case 44: TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_DPad_Down, IE_Released); Next(45, 2); return;
+
+	case 45:
+		VerifyCheck(TEXT("P. with CONTROLLER INPUT off, the D-pad moves nothing on this page (it used to)"),
+			Selected == VerifyIndexB, FString::Printf(TEXT("selected %s -> %s"), *RowName(VerifyIndexB), *RowName(Selected)));
+
+		// The positive half: the same press with it back on.
+		Settings.bPadEnabled = bVerifySavedPadEnabled;
+		TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_DPad_Down, IE_Pressed);
+		Next(46, 2);
+		return;
+
+	case 46: TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_DPad_Down, IE_Released); Next(47, 2); return;
+
+	case 47:
+		VerifyCheck(TEXT("P. ...and with it on, the same press moves the highlight"),
+			!Settings.bPadEnabled || Selected > VerifyIndexB,
+			FString::Printf(TEXT("selected %s -> %s%s"), *RowName(VerifyIndexB), *RowName(Selected),
+				Settings.bPadEnabled ? TEXT("") : TEXT(" (CONTROLLER INPUT is off on this machine; not measurable)")));
+
+		// ---- C. THE CALL SIGN FIELD LETS A PAD, AND A CLICK, OUT ------------------------------------
+		OpenSettings();
+		Next(48, 3);
+		return;
+
+	case 48:
+		VerifySavedCallSign = Settings.CallSign;
+		VerifyIndex = INDEX_NONE;
+		for (int32 Index = 0; Index < Rows.Num(); ++Index)
+		{
+			if (Rows[Index].Kind == ERowKind::TextEntry)
+			{
+				VerifyIndex = Index;
+				break;
+			}
+		}
+		if (VerifyIndex == INDEX_NONE)
+		{
+			VerifyCheck(TEXT("C. SETTINGS has its CALL SIGN row"), false, TEXT(""));
+			Next(30, 0);
+			return;
+		}
+		Selected = VerifyIndex;
+		ActivateSelected();
+		Next(49, 2);
+		return;
+
+	case 49:
+		VerifyCheck(TEXT("C. the CALL SIGN field opens"), CallSignEntry.IsActive(), TEXT(""));
+		TraceOptionsRebindProof::InjectViewportKey(TracePadMenu::BackKey(), IE_Pressed);
+		Next(50, 2);
+		return;
+
+	case 50: TraceOptionsRebindProof::InjectViewportKey(TracePadMenu::BackKey(), IE_Released); Next(51, 4); return;
+
+	case 51:
+		VerifyCheck(TEXT("C. pad B closes the field (it used to be ignored: only MENU got out)"),
+			!CallSignEntry.IsActive() || !Settings.bPadEnabled, Settings.bPadEnabled ? TEXT("") : TEXT("(pad off here)"));
+		VerifyCheck(TEXT("C. ...and the same B does not also leave SETTINGS"), Page == EPage::Settings,
+			FString::Printf(TEXT("page %d"), int32(Page)));
+		CallSignEntry.End();
+		Selected = VerifyIndex;
+		ActivateSelected();
+		Next(52, 2);
+		return;
+
+	case 52: TraceOptionsRebindProof::InjectViewportKey(TracePadMenu::ConfirmKey(), IE_Pressed); Next(53, 2); return;
+	case 53: TraceOptionsRebindProof::InjectViewportKey(TracePadMenu::ConfirmKey(), IE_Released); Next(54, 4); return;
+
+	case 54:
+		VerifyCheck(TEXT("C. pad A saves and closes the field, and does not re-open it"),
+			(!CallSignEntry.IsActive() || !Settings.bPadEnabled) && Page == EPage::Settings,
+			FString::Printf(TEXT("field %s, page %d"), CallSignEntry.IsActive() ? TEXT("open") : TEXT("closed"), int32(Page)));
+		CallSignEntry.End();
+
+		// A click on the AUDIO door while the field is open: saves, and opens AUDIO.
+		Selected = VerifyIndex;
+		ActivateSelected();
+		VerifyIndexB = FindActionRow(EAction::OpenAudio);
+		if (Rows.IsValidIndex(VerifyIndexB) && Rows[VerifyIndexB].Rect.bIsValid)
+		{
+			DebugPointerPos = Rows[VerifyIndexB].Rect.GetCenter();
+		}
+		Next(55, 2);
+		return;
+
+	case 55: bDebugPointerDown = true;  Next(56, 1); return;
+	case 56: bDebugPointerDown = false; Next(57, 3); return;
+
+	case 57:
+		VerifyCheck(TEXT("C. a click off the field saves it and goes on to what it landed on (clicks were ignored)"),
+			!CallSignEntry.IsActive() && Page == EPage::Audio,
+			FString::Printf(TEXT("field %s, page %d (AUDIO is %d)"), CallSignEntry.IsActive() ? TEXT("open") : TEXT("closed"),
+				int32(Page), int32(EPage::Audio)));
+		DebugPointerPos = FVector2D(2.f, 2.f);
+		CallSignEntry.End();
+		if (Settings.CallSign != VerifySavedCallSign)
+		{
+			Settings.CallSign = VerifySavedCallSign;
+			Settings.Save();
+		}
+		Close();
+		Next(30, 1);
+		return;
 
 	case 30:
 	default:
@@ -5761,7 +6141,9 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 		{
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[MenuVerify] ===== PASS — %d checks: the pointer waits to be moved, BACK keeps your place, ")
-				TEXT("RESET and CLEAR ask first, the arrows step both ways, and a paused world does not freeze the menu ====="),
+				TEXT("RESET and CLEAR ask first, the arrows step both ways, a paused world does not freeze the menu, ")
+				TEXT("a long page scrolls at full size, CONTROLLER INPUT OFF silences the pad here, and the call sign ")
+				TEXT("field lets a pad and a click out ====="),
 				VerifyChecks);
 		}
 		else

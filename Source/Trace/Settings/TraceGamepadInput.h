@@ -237,11 +237,10 @@ private:
 //     D-pad / left stick              MOVE the highlight
 //     MENU/START                      already an Escape, synthesised by TickMenuButton above
 //
-// *** FTraceOptionsMenu IS NOT ROUTED THROUGH HERE, AND THAT IS A SCHEDULING FACT, NOT A DESIGN. ***
-// UI/TraceOptionsMenu.cpp is another tranche's file this pass. Its inline keys are the SAME keys —
-// A select, B back, D-pad+stick move — which is why the four screens agree today; the check
-// `Trace.Pad.MenuVerify` asserts the agreement rather than trusting this paragraph, so the day
-// somebody edits one of the two, a run says so. When that file next comes free it should call these.
+// FTraceOptionsMenu IS ROUTED THROUGH HERE TOO. It used to read the same keys inline, un-gated, which
+// meant CONTROLLER INPUT OFF silenced every screen but the one the player switched it off on. Its
+// D-pad/stick, A and B now come from NavX/NavY and Confirm/BackPressed, its call sign field from
+// RisingEdge, and its Y (unbind) checks IsEnabled — so all five screens obey the one gate.
 //
 // -------------------------------------------------------------------------------------------------
 // WHY IT IS POLLED AND NOT BOUND, ON A SCREEN WHOSE KEYBOARD *IS* BOUND

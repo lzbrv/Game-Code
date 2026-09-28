@@ -434,6 +434,8 @@ private:
 	FString VerifySavedLoadoutName;
 	int32 VerifySavedColour = 0;
 	float VerifySavedVolume = 1.f;
+	bool bVerifySavedPadEnabled = true;
+	FString VerifySavedCallSign;
 
 	/**
 	 * While set, PollMouse reads THIS position and button instead of the OS pointer's. The harness's
@@ -821,6 +823,28 @@ private:
 	void PollMouse(APlayerController* PC);
 	void PollKeyCapture(APlayerController* PC);
 
+	/**
+	 * Updates CursorPos from the OS pointer (or Trace.Menu.Verify's own) and returns whether the left
+	 * button is down. PollMouse and the CALL SIGN field both read the pointer through this, so the
+	 * pointer never freezes while the field is open.
+	 */
+	bool SamplePointer(APlayerController* PC);
+
+	// ---- Scrolling ------------------------------------------------------------------------------
+	//
+	// A page taller than the screen SCROLLS instead of squeezing its rows. The pitch used to shrink to
+	// fit (down to 20 px), which drew the CONTROLLER page's plates 25 px tall with 8 px caps: thin bars,
+	// not the kit's button. Now every page keeps the same pitch and shows as many rows as fit.
+
+	/**
+	 * Clamps ScrollFirst for a window of @p WindowRows rows and, when the selection has moved since
+	 * the last draw, scrolls just far enough to show it with one row of context either side.
+	 */
+	void UpdateScroll(int32 WindowRows);
+
+	/** Invalidates every hit rect on @p Row. Rows scrolled out of view are not click targets. */
+	static void ClearRowRects(FRow& Row);
+
 	/** The slot a Binding row is currently editing, clamped to the row and to MaxKeysPerAction. */
 	int32 ActiveBindingSlot() const;
 
@@ -934,8 +958,14 @@ private:
 	 * is the "the host must not route its own bindings while IsActive()" rule FTraceTextEntry's header
 	 * states, applied one level down: this class is the host, and its own arrow keys, Enter, Escape
 	 * and Backspace would otherwise fight the player's typing for every one of those keys.
+	 *
+	 * The field reads only the keyboard, so the pad and the mouse are handled here: pad A saves and
+	 * pad B cancels (@p bPadConfirm / @p bPadBack are this frame's remembered rising edges, sampled
+	 * in Tick), and a click anywhere off the CALL SIGN row saves and then goes on to what it landed
+	 * on. Without these, a pad-only player who pressed A on CALL SIGN (the first row of SETTINGS)
+	 * had no way out but MENU.
 	 */
-	bool TickCallSignEntry(APlayerController* PC);
+	bool TickCallSignEntry(APlayerController* PC, bool bPadConfirm, bool bPadBack);
 
 	/** Writes, saves and pushes the typed name at the live match. The submit half of WP2.4. */
 	void CommitCallSign();
@@ -1272,6 +1302,31 @@ private:
 
 	/** Set when the mouse-down landed on a slider track: every subsequent frame drags the value. */
 	bool bDraggingSlider = false;
+
+	/** Set when the mouse-down landed on the scroll bar: every subsequent frame drags the view. */
+	bool bDraggingScrollBar = false;
+
+	// ---- Scroll state (see UpdateScroll) ----------------------------------------------------------
+
+	/** Index of the first row drawn. Zero on a page that fits. */
+	int32 ScrollFirst = 0;
+
+	/** How many rows the last draw had room for. Zero before the first draw of a page. */
+	int32 ScrollWindowRows = 0;
+
+	/** The selection the view last scrolled to show. A different Selected is what makes it follow. */
+	int32 ScrollFollowedRow = INDEX_NONE;
+
+	/** The scroll bar's track as of the last draw; invalid on a page that fits. */
+	FBox2D ScrollBarRect = FBox2D(ForceInit);
+
+	// ---- Pad buttons, as REMEMBERED edges (TracePadMenu::RisingEdge) ---------------------------------
+	//
+	// Sampled every frame a page is up, so the A that OPENED the call sign field is already "down"
+	// on the frame after and cannot also submit it. See Tick.
+
+	bool bPadConfirmWasDown = false;
+	bool bPadBackWasDown = false;
 
 	// ---- Video state ----------------------------------------------------------------------------
 	//
