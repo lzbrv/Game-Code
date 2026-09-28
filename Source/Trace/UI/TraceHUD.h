@@ -45,6 +45,7 @@ class ATraceCharacter;
 class ATraceGameState;
 class ATracePlayerController;
 class ATracePlayerState;
+class ATracePracticePad;
 class UFont;
 class UTraceHudCornerWidget;
 
@@ -207,6 +208,21 @@ public:
 
 		/** Each kill-feed row's words as drawn, newest first ("KILLER > VICTIM", or "NAME LEFT"). */
 		TArray<FString> KillFeedTexts;
+
+		/** One practice-range pad label, as drawn over its pad (ATraceHUD::DrawPracticePadLabels). */
+		struct FPadLabel
+		{
+			/** ETracePracticePadRole, as an integer so this header needs no practice include. */
+			int32 PadRoleIndex = -1;
+			FString Text;
+			/** The plate's screen rect. The label's reading direction is left to right by construction. */
+			FBox2D Rect = FBox2D(ForceInit);
+			float Alpha = 0.f;
+			/** The amber-ringed (hover) plate: the pad's switch is ON. */
+			bool bLit = false;
+		};
+		TArray<FPadLabel> PadLabels;
+		FVector2D ViewSize = FVector2D::ZeroVector;
 	};
 	const FHudKitRecord& GetHudKitRecord() const { return HudKitRecord; }
 #endif
@@ -536,6 +552,16 @@ protected:
 	 * bind failed says OFFLINE rather than repeating a promise the process did not keep.
 	 */
 	void DrawNetworkStatus();
+
+	/**
+	 * The practice range's pad labels (CORE RACK, INFINITE ABILITIES ON / OFF, LOADOUT): each a kit
+	 * plate with the pad's words, projected over the pad's label anchor and drawn in screen space, so
+	 * it faces the player from every side — the world-space text it replaces read mirrored from the
+	 * range's own spawn line. Sized by distance like a sign in the world, faded out far away, hidden
+	 * behind walls, and never under an overlay. A lit pad (INFINITE ABILITIES ON) wears the amber-ringed
+	 * plate. Draws nothing outside the range (no pads exist) or for a label emptied in the text file.
+	 */
+	void DrawPracticePadLabels();
 
 	/**
 	 * The last connection or travel failure, if recent (12 s): its one-line headline on the kit's
@@ -900,6 +926,12 @@ private:
 	 */
 	FString LastConnectionAnswer;
 	float LastRoleChangeTime = -1000.f;
+
+	// ---- Practice range pad labels --------------------------------------------------------------
+
+	/** The range's pads, re-found every PracticePadPollSeconds (empty in every real match). */
+	TArray<TWeakObjectPtr<ATracePracticePad>> PracticePads;
+	float LastPracticePadPollTime = -1000.f;
 
 	// ---- Kill feed (spec v8 §6) ----------------------------------------------------------------
 

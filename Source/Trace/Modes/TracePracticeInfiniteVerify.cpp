@@ -657,8 +657,13 @@ namespace TracePracticeInfiniteVerify
 					Run->bToggleBeforePad ? TEXT("ON") : TEXT("OFF"),
 					Run->bToggleAfterPad ? TEXT("ON") : TEXT("OFF")));
 
+			// Against the pad's own words for that state (ATracePracticePad::LabelFor), not against the
+			// literals "ON" / "OFF": the words are editable text, and the claim is that the pad shows
+			// the state's line and not the other one.
+			const FString SaysNow = ATracePracticePad::LabelFor(ETracePracticePadRole::InfiniteAbilities, Run->bToggleAfterPad);
+			const FString SaysOther = ATracePracticePad::LabelFor(ETracePracticePadRole::InfiniteAbilities, !Run->bToggleAfterPad);
 			Run->Tally.Report(
-				Run->PadLabelAfterTouch.Contains(Run->bToggleAfterPad ? TEXT("ON") : TEXT("OFF"))
+				Run->PadLabelAfterTouch == SaysNow && SaysNow != SaysOther
 					&& Run->bPadLitAfterTouch == Run->bToggleAfterPad,
 				*FString::Printf(TEXT("...and the pad SAYS what it now is: label '%s', lit=%s."),
 					*Run->PadLabelAfterTouch, Run->bPadLitAfterTouch ? TEXT("yes") : TEXT("no")));
@@ -754,13 +759,13 @@ namespace TracePracticeInfiniteVerify
 		}
 
 		// -----------------------------------------------------------------------------------------
-		case 13:  // THE OTHER PAD NOBODY HAD EVER WALKED ON: CHANGE CHARACTER. Done last — it opens a
+		case 13:  // THE OTHER PAD NOBODY HAD EVER WALKED ON: LOADOUT. Done last — it opens a
 		          // screen, and a screen can pause the world.
 		{
 			ATracePracticePad* const Pad = FindPad(WorldPtr, ETracePracticePadRole::CharacterSwap);
 			if (Pad == nullptr || PlayerPawn == nullptr)
 			{
-				Run->Tally.Report(false, TEXT("the range has a CHANGE CHARACTER pad to walk onto."));
+				Run->Tally.Report(false, TEXT("the range has a LOADOUT pad to walk onto."));
 				GoToStep(*Run, 90);
 				return true;
 			}
@@ -786,7 +791,7 @@ namespace TracePracticeInfiniteVerify
 			Run->bSelectOpenAfterSwapPad = (TraceState != nullptr) && TraceState->IsCharacterSelectOpen();
 
 			Run->Tally.Report(Run->bSelectOpenAfterSwapPad,
-				TEXT("WALKING ONTO the CHANGE CHARACTER pad reopened the shipped select screen."));
+				TEXT("WALKING ONTO the LOADOUT pad reopened the shipped select screen."));
 
 			GoToStep(*Run, 90);
 			return true;
@@ -849,7 +854,7 @@ namespace TracePracticeInfiniteVerify
 		TEXT("Trace.Practice.InfiniteVerify"),
 		TEXT("SPEC v24 §5. Presses E for real with the range's infinite-abilities toggle OFF and then "
 		     "ON, and reports both arms' numbers. Also walks the player onto the INFINITE ABILITIES "
-		     "and CHANGE CHARACTER pads, which is the only interface a player has to either. Red-arm "
+		     "and LOADOUT pads, which is the only interface a player has to either. Red-arm "
 		     "it with Trace.Practice.PollOnlyInfinite 1."),
 		FConsoleCommandDelegate::CreateStatic(&RunInfiniteVerify));
 }

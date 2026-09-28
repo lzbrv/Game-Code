@@ -58,7 +58,6 @@ class ATraceCharacter;
 class UPrimitiveComponent;
 class USphereComponent;
 class UStaticMeshComponent;
-class UTextRenderComponent;
 
 /**
  * What a pad does when a player walks onto it.
@@ -83,7 +82,11 @@ enum class ETracePracticePadRole : uint8
 	/** Toggles the range's infinite-abilities switch. Off when the range opens. */
 	InfiniteAbilities = 1,
 
-	/** Reopens the character select screen so you can change character without leaving the range. */
+	/**
+	 * Reopens the pre-match pick so you can change what you play without leaving the range: the
+	 * LOADOUT page (or character select, when Trace.UI.LoadoutScreen 0 re-arms it). The name is from
+	 * the character era and is only ever read by code; the pad is labelled LOADOUT.
+	 */
 	CharacterSwap = 2
 };
 
@@ -93,6 +96,13 @@ enum class ETracePracticePadRole : uint8
  * The pad reports the ENTRY EDGE only and never the dwell, which is what makes "walk on to put the
  * Core down, walk off and back on to pick it up again" work with no second input: after a deposit
  * you are still standing on the rack, and a dwell-driven pad would immediately hand the Core back.
+ *
+ * ITS LABEL IS DRAWN BY THE HUD, NOT BY THE PAD (ATraceHUD::DrawPracticePadLabels): a kit plate
+ * with the pad's name, projected over GetLabelAnchor() and always facing the player. It used to be
+ * a UTextRenderComponent spawned with the pad's zero rotation, and an engine text render reads
+ * correctly only from its +X side — so from the spawn line, which looks down +X, the two toggle
+ * pads' labels read MIRRORED, in the engine's default font, with a lower-case "walk on to..." note
+ * under each. A HUD label cannot face away from anyone, and it is set in the menus' own typeface.
  */
 UCLASS(NotBlueprintable)
 class TRACE_API ATracePracticePad : public AActor
@@ -103,26 +113,32 @@ public:
 	ATracePracticePad();
 
 	/** Server-side setup, called by the subsystem immediately after SpawnActor. */
-	void ConfigurePad(ETracePracticePadRole InRole, const FString& InLabel);
+	void ConfigurePad(ETracePracticePadRole InRole);
 
 	ETracePracticePadRole GetPadRole() const { return PadRole; }
 
-	/** Repaints the label without respawning the pad — the infinite-abilities pad flips ON/OFF. */
-	void SetPadLabel(const FString& InLabel);
-
-	/** Amber while armed, dim while idle. Purely cosmetic; never read by a rule. */
+	/** Brighter while armed, dim while idle. Purely cosmetic; never read by a rule. */
 	void SetPadLit(bool bLit);
 
 	/**
-	 * What the pad currently SAYS, and whether it is lit.
-	 *
-	 * Read by Trace.Practice.InfiniteVerify and by nothing else. The label is the only thing that
-	 * tells a player which way the infinite-abilities toggle is currently set, so "the toggle flipped"
-	 * and "the pad says it flipped" are two separate claims and the second one needs a reader. Never
-	 * consulted by a rule — see SetPadLit.
+	 * What a pad of @p InRole says, lit or not: the editable words (Config/TraceGameText.ini,
+	 * [PRACTICE]). The infinite-abilities pad says ON or OFF; the others do not change.
 	 */
-	FString GetPadLabel() const;
+	static FString LabelFor(ETracePracticePadRole InRole, bool bLit);
+
+	/**
+	 * What this pad currently SAYS (LabelFor its role and lit state), and whether it is lit.
+	 *
+	 * The HUD draws exactly this, and Trace.Practice.InfiniteVerify reads it. The label is the only
+	 * thing that tells a player which way the infinite-abilities toggle is currently set, so "the
+	 * toggle flipped" and "the pad says it flipped" are two separate claims and the second one needs
+	 * a reader. Never consulted by a rule — see SetPadLit.
+	 */
+	FString GetPadLabel() const { return LabelFor(PadRole, bPadLit); }
 	bool IsPadLit() const { return bPadLit; }
+
+	/** The world point the HUD hangs the label on: above the disc, at head height. */
+	FVector GetLabelAnchor() const;
 
 protected:
 	virtual void BeginPlay() override;
@@ -137,9 +153,6 @@ protected:
 
 	UPROPERTY(VisibleAnywhere, Category = "Trace|Practice")
 	TObjectPtr<UStaticMeshComponent> Disc;
-
-	UPROPERTY(VisibleAnywhere, Category = "Trace|Practice")
-	TObjectPtr<UTextRenderComponent> Label;
 
 	UPROPERTY(Replicated)
 	ETracePracticePadRole PadRole = ETracePracticePadRole::CoreRack;

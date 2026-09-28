@@ -44,7 +44,7 @@ namespace TracePracticeRangeLocal
 	// 15600 uu from the centre circle — while the target row sat at 0.18 of the field length on the
 	// FAR side of centre, i.e. +6048. That is a 21600 uu walk, over 200 metres, before the first
 	// shot, repeated after every death. The three pads then sat 900 uu behind centre, another 7000 uu
-	// back from the targets, so using the CHANGE CHARACTER pad and then shooting was a round trip of
+	// back from the targets, so using the LOADOUT pad and then shooting was a round trip of
 	// nearly 15000 uu.
 	//
 	// WHAT SMALL MEANS HERE, and why these numbers. The range keeps the arena (see the header: spec
@@ -553,7 +553,8 @@ void UTracePracticeRangeSubsystem::BuildRange()
 		RackPoint = TheCore->GetHomeLocation();
 	}
 
-	SpawnPad(ETracePracticePadRole::CoreRack, RackPoint, TEXT("CORE RACK\nwalk on to drop / collect"));
+	// No labels here: each pad's words are ATracePracticePad::LabelFor its role, and the HUD draws them.
+	SpawnPad(ETracePracticePadRole::CoreRack, RackPoint);
 
 	const float PadX = bOldSize
 		? (FieldCentre.X - TracePracticeRangeLocal::OldTogglePadBackX)
@@ -563,12 +564,10 @@ void UTracePracticeRangeSubsystem::BuildRange()
 		: TracePracticeRangeLocal::TogglePadOutY;
 
 	SpawnPad(ETracePracticePadRole::InfiniteAbilities,
-		FVector(PadX, FieldCentre.Y - PadOutY, FieldCentre.Z),
-		TEXT("INFINITE ABILITIES: OFF"));
+		FVector(PadX, FieldCentre.Y - PadOutY, FieldCentre.Z));
 
 	SpawnPad(ETracePracticePadRole::CharacterSwap,
-		FVector(PadX, FieldCentre.Y + PadOutY, FieldCentre.Z),
-		TEXT("CHANGE CHARACTER\nwalk on to reopen select"));
+		FVector(PadX, FieldCentre.Y + PadOutY, FieldCentre.Z));
 
 	// ---- where the player stands ------------------------------------------------------------------
 	//
@@ -870,8 +869,7 @@ ATracePracticeDummyController* UTracePracticeRangeSubsystem::SpawnDummy(const FV
 }
 
 ATracePracticePad* UTracePracticeRangeSubsystem::SpawnPad(ETracePracticePadRole InRole,
-                                                          const FVector& DesiredPoint,
-                                                          const FString& InLabel)
+                                                          const FVector& DesiredPoint)
 {
 	UWorld* const WorldPtr = GetWorld();
 	if (WorldPtr == nullptr)
@@ -896,7 +894,7 @@ ATracePracticePad* UTracePracticeRangeSubsystem::SpawnPad(ETracePracticePadRole 
 		return nullptr;
 	}
 
-	PadActor->ConfigurePad(InRole, InLabel);
+	PadActor->ConfigurePad(InRole);
 	Pads.Add(PadActor);
 	return PadActor;
 }
@@ -1286,8 +1284,7 @@ void UTracePracticeRangeSubsystem::RefreshInfiniteAbilitiesPad()
 		ATracePracticePad* const PadActor = EachPad.Get();
 		if (PadActor != nullptr && PadActor->GetPadRole() == ETracePracticePadRole::InfiniteAbilities)
 		{
-			PadActor->SetPadLabel(bInfiniteAbilities
-				? TEXT("INFINITE ABILITIES: ON") : TEXT("INFINITE ABILITIES: OFF"));
+			// Lit is also what the pad SAYS: its label is LabelFor(role, lit), ON or OFF.
 			PadActor->SetPadLit(bInfiniteAbilities);
 		}
 	}

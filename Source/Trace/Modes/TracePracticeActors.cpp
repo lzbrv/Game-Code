@@ -4,7 +4,6 @@
 
 #include "Components/SphereComponent.h"
 #include "Components/StaticMeshComponent.h"
-#include "Components/TextRenderComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
@@ -19,6 +18,7 @@
 #include "Modes/TracePracticeRange.h"
 #include "Trace.h"                              // LogTraceGame
 #include "TraceTypes.h"                         // ETraceTeam
+#include "UI/Text/TraceGameText.h"              // TRACE_TEXT — the pads' words are editable text
 
 // NAMED, not anonymous. Scripts/check-jumbo-build-collisions.py gates the build on this: two files
 // that each define an anonymous-namespace symbol of the same name are one namespace with two
@@ -35,7 +35,7 @@ namespace TracePracticeActors
 	constexpr float PadDiscScaleXY = 2.6f;
 	constexpr float PadDiscScaleZ = 0.14f;
 
-	/** Height the floating label sits at, above the disc. */
+	/** Height the label hangs at, above the disc: about head height, so it reads straight on. */
 	constexpr float PadLabelHeight = 210.f;
 
 	FLinearColor ColourForRole(ETracePracticePadRole InRole, bool bLit)
@@ -98,13 +98,7 @@ ATracePracticePad::ATracePracticePad()
 		Disc->SetMaterial(0, PadMaterialFinder.Object);
 	}
 
-	Label = CreateDefaultSubobject<UTextRenderComponent>(TEXT("Label"));
-	Label->SetupAttachment(Trigger);
-	Label->SetRelativeLocation(FVector(0.f, 0.f, TracePracticeActors::PadLabelHeight));
-	Label->SetHorizontalAlignment(EHTA_Center);
-	Label->SetVerticalAlignment(EVRTA_TextCenter);
-	Label->SetWorldSize(46.f);
-	Label->SetCanEverAffectNavigation(false);
+	// No text component: the HUD draws the label (see the class comment in the header).
 }
 
 void ATracePracticePad::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -123,24 +117,35 @@ void ATracePracticePad::BeginPlay()
 	}
 }
 
-void ATracePracticePad::ConfigurePad(ETracePracticePadRole InRole, const FString& InLabel)
+void ATracePracticePad::ConfigurePad(ETracePracticePadRole InRole)
 {
 	PadRole = InRole;
-	SetPadLabel(InLabel);
 	SetPadLit(false);
 }
 
-void ATracePracticePad::SetPadLabel(const FString& InLabel)
+FString ATracePracticePad::LabelFor(ETracePracticePadRole InRole, bool bLit)
 {
-	if (Label != nullptr)
+	// Labels, not instructions: the pad is a thing you walk onto, and what it does is its name. The
+	// lower-case "walk on to drop / collect" / "walk on to reopen select" second lines are gone, and
+	// the third pad is LOADOUT (the word the team screen's [C] uses for the same page), because what
+	// walking onto it opens now is the loadout page, not a character select.
+	switch (InRole)
 	{
-		Label->SetText(FText::FromString(InLabel));
+	case ETracePracticePadRole::CoreRack:
+		return TRACE_TEXT("PRACTICE.PAD_CORE_RACK", "CORE RACK");
+	case ETracePracticePadRole::InfiniteAbilities:
+		return bLit
+			? TRACE_TEXT("PRACTICE.PAD_INFINITE_ON", "INFINITE ABILITIES ON")
+			: TRACE_TEXT("PRACTICE.PAD_INFINITE_OFF", "INFINITE ABILITIES OFF");
+	case ETracePracticePadRole::CharacterSwap:
+	default:
+		return TRACE_TEXT("PRACTICE.PAD_LOADOUT", "LOADOUT");
 	}
 }
 
-FString ATracePracticePad::GetPadLabel() const
+FVector ATracePracticePad::GetLabelAnchor() const
 {
-	return (Label != nullptr) ? Label->Text.ToString() : FString();
+	return GetActorLocation() + FVector(0.f, 0.f, TracePracticeActors::PadLabelHeight);
 }
 
 void ATracePracticePad::SetPadLit(bool bLit)
@@ -164,11 +169,6 @@ void ATracePracticePad::SetPadLit(bool bLit)
 		PadMaterial->SetVectorParameterValue(TEXT("Color"), PadColour);
 		PadMaterial->SetVectorParameterValue(TEXT("BaseColor"), PadColour);
 		PadMaterial->SetVectorParameterValue(TEXT("Emissive"), PadColour * (bLit ? 3.0f : 0.6f));
-	}
-
-	if (Label != nullptr)
-	{
-		Label->SetTextRenderColor(PadColour.ToFColor(/*bSRGB=*/true));
 	}
 }
 

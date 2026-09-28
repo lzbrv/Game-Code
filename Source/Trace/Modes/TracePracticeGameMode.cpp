@@ -67,7 +67,7 @@ ATracePracticeGameMode::ATracePracticeGameMode()
 	// eject you from the practice range.
 	WipeBonusPoints = 0;
 
-	// No auto-assign timer nagging a player who is standing on the CHANGE CHARACTER pad reading the
+	// No auto-assign timer nagging a player who is standing on the LOADOUT pad reading the
 	// cards. The range has no match to stall, so the one reason the timeout exists does not apply.
 	CharacterSelectTimeout = 0.f;
 }

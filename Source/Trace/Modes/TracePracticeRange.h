@@ -212,7 +212,8 @@ public:
 	bool IsInfiniteAbilitiesOn() const { return bInfiniteAbilities; }
 
 	/**
-	 * Reopens the character select screen for @p Player without them leaving the range.
+	 * Reopens the pre-match pick for @p Player without them leaving the range: the LOADOUT page, or
+	 * character select when Trace.UI.LoadoutScreen 0 re-arms it. The LOADOUT pad calls this.
 	 *
 	 * Does it by clearing their character and unlocking them, then letting ATraceGameMode::
 	 * PollCharacterSelect open the screen on its own next pass — the shipped screen, the shipped
@@ -321,7 +322,7 @@ private:
 	ATracePracticeDummyController* SpawnDummy(const FVector& DesiredXY);
 
 	/** Places one pad on the floor under @p DesiredPoint. Null on failure. */
-	ATracePracticePad* SpawnPad(ETracePracticePadRole InRole, const FVector& DesiredPoint, const FString& InLabel);
+	ATracePracticePad* SpawnPad(ETracePracticePadRole InRole, const FVector& DesiredPoint);
 
 	/**
 	 * Places the HUMAN's spawn line post on the floor under @p DesiredPoint (demo 19 item 1).

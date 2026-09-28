@@ -50,6 +50,7 @@
 #include "Containers/Ticker.h"                          // FTSTicker — the v16 §2 shot sequence
 #include "HAL/PlatformFileManager.h"                    // the screenshot directory
 #include "Modes/TracePracticeRange.h"     // WP1 — THE practice predicate; never ask the game-mode class
+#include "Modes/TracePracticeActors.h"    // ATracePracticePad — the range's pad labels are drawn here
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Core/TraceCharacterRoster.h"    // v14 §3 — the accent colour and the ability's name
 #include "Settings/TraceUserSettings.h"   // v14 §5 — the ability's bound key, if the input slice has one
@@ -1252,6 +1253,7 @@ void ATraceHUD::DrawHUD()
 #if !UE_BUILD_SHIPPING
 	HudKitRecord = FHudKitRecord();
 	HudKitRecord.bOverlayUp = bOverlayUp;
+	HudKitRecord.ViewSize = FVector2D(ViewW, ViewH);
 #endif
 
 	if (!bPostMatch && !bOverlayUp)
@@ -1260,6 +1262,10 @@ void ATraceHUD::DrawHUD()
 		// play area at all: Canvas is immediate mode, so the band goes down before the crosshair,
 		// the reticle and every panel, and none of them is tinted by it. FX plan §2.5/§2.6.
 		DrawOwnerVignettes();
+
+		// The practice range's pad signs belong to the world, so they go under every piece of the
+		// HUD. Nothing at all outside the range.
+		DrawPracticePadLabels();
 
 		// Before any pass draws: the crosshair and the pass ring have to sit on the same pixel, and
 		// the pass-target probe has to run exactly once per frame.
@@ -5456,6 +5462,139 @@ void ATraceHUD::DrawNetworkFailureBanner()
 	HudKitRecord.bNetFailurePanel = true;
 	HudKitRecord.NetFailureLines.Add(Headline);
 #endif
+}
+
+// -------------------------------------------------------------------------------------------
+// Practice range pad labels
+// -------------------------------------------------------------------------------------------
+
+// Named, not anonymous: this module is a unity build (Scripts/check-jumbo-build-collisions.py).
+namespace TraceHUDPadLabels
+{
+	/** How often the HUD looks for pads. They are spawned once when the range opens. */
+	static constexpr float PollSeconds = 0.5f;
+
+	/**
+	 * The plate's height IN THE WORLD, uu. The sign is sized like a thing hanging over the pad: about
+	 * 55 px tall at 1080p from the spawn line (~770 uu from either toggle pad), smaller further away.
+	 */
+	static constexpr float PlateWorldHeight = 44.f;
+
+	/** Clamps on the drawn plate height, 1080p px: legible far away, not a wall of plate up close. */
+	static constexpr float MinPlatePx = 26.f;
+	static constexpr float MaxPlatePx = 72.f;
+
+	/** Distance fade, uu: whole to FadeStart, gone by FadeEnd. The range fits inside FadeStart. */
+	static constexpr float FadeStart = 3000.f;
+	static constexpr float FadeEnd = 4000.f;
+}
+
+void ATraceHUD::DrawPracticePadLabels()
+{
+	UWorld* const World = GetWorld();
+	APlayerController* const PC = PlayerOwner.Get();
+	if (World == nullptr || PC == nullptr || Canvas == nullptr)
+	{
+		return;
+	}
+
+	if ((Now - LastPracticePadPollTime) >= TraceHUDPadLabels::PollSeconds || Now < LastPracticePadPollTime)
+	{
+		LastPracticePadPollTime = Now;
+		PracticePads.Reset();
+		for (TActorIterator<ATracePracticePad> It(World); It; ++It)
+		{
+			PracticePads.Add(*It);
+		}
+	}
+	if (PracticePads.Num() == 0)
+	{
+		return;
+	}
+
+	FVector ViewLocation = FVector::ZeroVector;
+	FRotator ViewRotation = FRotator::ZeroRotator;
+	PC->GetPlayerViewPoint(ViewLocation, ViewRotation);
+	const FVector CameraUp = FRotationMatrix(ViewRotation).GetUnitAxis(EAxis::Z);
+
+	FCollisionQueryParams SightParams(SCENE_QUERY_STAT(TracePadLabelSight), /*bTraceComplex=*/false);
+	if (APawn* const ViewPawn = PC->GetPawn())
+	{
+		SightParams.AddIgnoredActor(ViewPawn);
+	}
+
+	for (const TWeakObjectPtr<ATracePracticePad>& WeakPad : PracticePads)
+	{
+		const ATracePracticePad* const Pad = WeakPad.Get();
+		if (Pad == nullptr)
+		{
+			continue;
+		}
+
+		// An emptied line (Ranen's "KEY =") takes its plate with it.
+		const FString Text = Pad->GetPadLabel();
+		if (Text.IsEmpty())
+		{
+			continue;
+		}
+
+		const FVector Anchor = Pad->GetLabelAnchor();
+		const float Distance = static_cast<float>(FVector::Dist(ViewLocation, Anchor));
+		const float Alpha = 1.f - FMath::SmoothStep(TraceHUDPadLabels::FadeStart, TraceHUDPadLabels::FadeEnd, Distance);
+		if (Alpha <= 0.f)
+		{
+			continue;
+		}
+
+		// bClampToZeroPlane = false, so a pad BEHIND the camera reports a negative depth instead of a
+		// plausible-looking point on screen (the pull ring's rule).
+		const FVector Projected = Canvas->Project(Anchor, /*bClampToZeroPlane=*/false);
+		if (Projected.Z <= 0.f)
+		{
+			continue;
+		}
+
+		// A sign does not show through a wall. World geometry only: a target dummy or another player
+		// standing in front of the pad must not make its name blink.
+		FCollisionQueryParams PadParams = SightParams;
+		PadParams.AddIgnoredActor(Pad);
+		if (World->LineTraceTestByObjectType(ViewLocation, Anchor, FCollisionObjectQueryParams(ECC_WorldStatic), PadParams))
+		{
+			continue;
+		}
+
+		// The plate's height off the world: one plate-height up the camera's own up axis, projected, is
+		// the perspective answer at any distance and field of view.
+		const FVector ProjectedTop = Canvas->Project(Anchor + CameraUp * TraceHUDPadLabels::PlateWorldHeight,
+			/*bClampToZeroPlane=*/false);
+		const float PlateH = FMath::Clamp(
+			static_cast<float>(FVector2D(Projected.X - ProjectedTop.X, Projected.Y - ProjectedTop.Y).Size()),
+			TraceHUDPadLabels::MinPlatePx * UIScale, TraceHUDPadLabels::MaxPlatePx * UIScale);
+
+		const bool bLit = Pad->IsPadLit();
+		const ETraceKitState State = bLit ? ETraceKitState::Hover : ETraceKitState::Default;
+		const FTraceKitVisuals Visuals = TraceMenuKit::VisualsFor(State);
+
+		const float TextW = TraceMenuKit::CapTextWidth(Text, PlateH * TraceMenuKit::LabelCapFraction);
+		const float PlateW = TextW + PlateH;   // half a plate-height of room each side
+		const float CX = static_cast<float>(Projected.X);
+		const float CY = static_cast<float>(Projected.Y);
+		const float PlateX = CX - PlateW * 0.5f;
+		const float PlateY = CY - PlateH * 0.5f;
+
+		TraceMenuKit::DrawPanelPlate(this, State, PlateX, PlateY, PlateW, PlateH, 0.f, TraceHUDStyle::PanelAlpha * Alpha);
+		TraceMenuKit::DrawLabel(this, Text, CX, CY, PlateH, TraceHUDStyle::WithAlpha(Visuals.Label, Alpha),
+			PlateW - PlateH * TraceMenuKit::LabelPadFraction * 2.f);
+
+#if !UE_BUILD_SHIPPING
+		ATraceHUD::FHudKitRecord::FPadLabel& Drawn = HudKitRecord.PadLabels.AddDefaulted_GetRef();
+		Drawn.PadRoleIndex = static_cast<int32>(Pad->GetPadRole());
+		Drawn.Text = Text;
+		Drawn.Rect = FBox2D(FVector2D(PlateX, PlateY), FVector2D(PlateX + PlateW, PlateY + PlateH));
+		Drawn.Alpha = Alpha;
+		Drawn.bLit = bLit;
+#endif
+	}
 }
 
 // -------------------------------------------------------------------------------------------

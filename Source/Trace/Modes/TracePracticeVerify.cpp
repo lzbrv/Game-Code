@@ -1053,7 +1053,7 @@ namespace TracePracticeVerify
 		}
 
 		// -----------------------------------------------------------------------------------------
-		case 11:  // the CHANGE CHARACTER affordance is accepted
+		case 11:  // the LOADOUT pad's affordance (ReopenCharacterSelect) is accepted
 		{
 			ATracePlayerState* const TraceState = LocalTraceState(WorldPtr);
 			if (TraceState == nullptr)
