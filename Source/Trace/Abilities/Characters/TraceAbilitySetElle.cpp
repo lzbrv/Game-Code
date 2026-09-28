@@ -37,6 +37,8 @@
 #include "Gameplay/TraceFxShapes.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "UI/Text/TraceGameText.h"   // refusal toasts: HUD.TOAST_*
+#include "UI/TraceAbilityNames.h"      // the toast names SNAP from the ability table
 
 // =================================================================================================
 // THE RED ARMS.
@@ -961,8 +963,10 @@ bool UTraceAbilitySetElle::CanActivate(FText& OutReason) const
 				FVector::Dist(MyPawn->GetActorLocation(), FVector(State().AuxLocation)));
 			if (Separation < MinSeparation)
 			{
-				OutReason = FText::FromString(FString::Printf(
-					TEXT("SNAP: move %.0f uu further from the first gate"), MinSeparation - Separation));
+				// Two words, through the text document. It used to be "SNAP: move 340 uu further from the
+				// first gate": engine units and mixed case on the HUD, and nothing Ranen could edit. The
+				// distance is in the log line below, which is where a number like that is any use.
+				OutReason = FText::FromString(TRACE_TEXT("HUD.TOAST_TOO_CLOSE", "TOO CLOSE"));
 
 				// SAID OUT LOUD, once per press, on the authority. "I pressed E and the second gate did
 				// not appear" is otherwise unanswerable from a log — and nothing surfaces OutReason on
@@ -994,7 +998,8 @@ bool UTraceAbilitySetElle::CanActivate(FText& OutReason) const
 		// UTraceAbilityComponent::GetActivatedCooldownRemaining() folds into the number the ring draws.
 		// The ring counts the same seconds this refusal counts. OutReason is still written, for
 		// whatever eventually surfaces a refusal in words.
-		OutReason = FText::FromString(FString::Printf(TEXT("SNAP recharging (%.0fs)"), FMath::CeilToFloat(Remaining)));
+		OutReason = FText::FromString(TRACE_TEXTF("HUD.TOAST_COOLDOWN", "{0} IN {1}S",
+			{ TraceAbilityNames::Get(ETraceAbilityId::Snap), FString::Printf(TEXT("%.0f"), FMath::CeilToFloat(Remaining)) }));
 		return false;
 	}
 

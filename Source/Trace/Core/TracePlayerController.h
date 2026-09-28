@@ -924,8 +924,17 @@ protected:
 	 * Puts the viewport into game-only input with the initial mouse-down NOT consumed, so the click
 	 * that recaptures a window also registers as a shot. Re-applied on every possession; see the
 	 * implementation for why the default FInputModeGameOnly is wrong for a shooter.
+	 *
+	 * WHILE A MENU OWNS THE SCREEN (bGameInputSuppressed) it applies the menu mode instead: a respawn
+	 * or a late-replicating pawn under an open overlay must not take the mouse away from it.
 	 */
 	void ApplyGameInputMode();
+
+	/**
+	 * The input mode every overlay runs in: game-and-UI, mouse never locked or captured, cursor shown.
+	 * ONE definition, used by SetGameInputSuppressed(true) and by ApplyGameInputMode while suppressed.
+	 */
+	void ApplyMenuInputMode();
 
 	/**
 	 * UI PLAN WP2.4 — pushes the player's stored CALL SIGN at the server, once, on the owning client.

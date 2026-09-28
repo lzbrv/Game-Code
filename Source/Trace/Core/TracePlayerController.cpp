@@ -449,6 +449,21 @@ void ATracePlayerController::ApplyGameInputMode()
 		return;
 	}
 
+	// *** NOT WHILE A MENU OWNS THE SCREEN. ***
+	//
+	// OnPossess and AcknowledgePossession re-assert the game mode on every possession, and a RESPAWN
+	// is a possession. The pre-match loadout page, team select and the pause menu can all be open when
+	// one lands (the pawn behind the page can be killed; a remote client's pawn can replicate a frame
+	// after its team screen opened), and this used to capture the mouse under the open menu: the
+	// pointer froze for the rest of the page. Nothing put it back — SetGameInputSuppressed(true) is a
+	// no-op while already suppressed. The menu mode is re-applied instead; SetGameInputSuppressed(false)
+	// clears the flag before it calls this, so closing the last menu still takes the mouse back.
+	if (bGameInputSuppressed)
+	{
+		ApplyMenuInputMode();
+		return;
+	}
+
 	// Mouse-look shooter: the viewport swallows the cursor and nothing else wants input.
 	//
 	// SetConsumeCaptureMouseDown(false) is load-bearing. FInputModeGameOnly defaults it to true,
@@ -475,6 +490,23 @@ void ATracePlayerController::ApplyGameInputMode()
 	{
 		IgnoreLookUntilTime = World->GetTimeSeconds() + LookSuppressAfterCapture;
 	}
+}
+
+void ATracePlayerController::ApplyMenuInputMode()
+{
+	if (!IsLocalController())
+	{
+		return;
+	}
+
+	// GameAndUI rather than UIOnly, and for the same reason the title screen uses it: every overlay
+	// is drawn on a Canvas and owns no Slate widget to focus, so UIOnly would route key presses at a
+	// widget that does not exist and the overlay would see nothing.
+	FInputModeGameAndUI InputMode;
+	InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
+	InputMode.SetHideCursorDuringCapture(false);
+	SetInputMode(InputMode);
+	bShowMouseCursor = true;
 }
 
 // -------------------------------------------------------------------------------------------
@@ -1336,14 +1368,7 @@ void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
 
 	if (bSuppressed)
 	{
-		// GameAndUI rather than UIOnly, and for the same reason the title screen uses it: this menu
-		// is drawn on a Canvas and owns no Slate widget to focus, so UIOnly would route key presses
-		// at a widget that does not exist and the overlay would see nothing.
-		FInputModeGameAndUI InputMode;
-		InputMode.SetLockMouseToViewportBehavior(EMouseLockMode::DoNotLock);
-		InputMode.SetHideCursorDuringCapture(false);
-		SetInputMode(InputMode);
-		bShowMouseCursor = true;
+		ApplyMenuInputMode();
 
 		// Release any held gameplay input before the handlers go quiet. Without this a player who
 		// opens the menu mid-burst comes back still firing, and one who opens it while walking keeps

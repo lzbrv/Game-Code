@@ -35,6 +35,7 @@
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "UI/Text/TraceGameText.h"   // refusal toasts: HUD.TOAST_*
 
 // =================================================================================================
 // FX_AUDIO_PLAN §2.4 — the two WHILE-ACTIVE tells. Numbers here, mechanism at the bottom of the file.
@@ -421,7 +422,7 @@ bool UTraceAbilitySetMace::CanActivate(FText& OutReason) const
 {
 	if (bPulling)
 	{
-		OutReason = NSLOCTEXT("Trace", "MaceAlreadyPulling", "PULLING");
+		OutReason = FText::FromString(TRACE_TEXT("HUD.TOAST_PULLING", "PULLING"));
 		return false;
 	}
 	return true;

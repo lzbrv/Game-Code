@@ -652,6 +652,25 @@ protected:
 	void BeginMatch();
 
 	/**
+	 * THE PRE-MATCH HOLD. The match clock does not start while a human is still in the pre-match
+	 * menus (team select, then the loadout page): the warm-up deadline is stretched to the latest
+	 * moment any of them can still be choosing (their own screens' auto-close / auto-pick clocks) plus
+	 * the warm-up, and dropped to "warm-up from now" the moment the last one is done. Capped at
+	 * PreMatchHoldCapSeconds from the start of the warm-up, so nobody can hold a match forever.
+	 *
+	 * Run from StartWarmup and from every select poll while the warm-up is counting. Does nothing
+	 * when the mode has no warm-up (the practice range) or no warm-up is running.
+	 */
+	void UpdatePreMatchHold();
+
+	/**
+	 * Humans still in the pre-match menus: team select open, or (characters on) not yet locked into a
+	 * loadout. @p OutLatestResolve is the latest server time at which any of them is resolved by their
+	 * own screen's clock, or +infinity when a clock is off. Bots and spectators never count.
+	 */
+	int32 CountHumansStillChoosing(double NowServer, double& OutLatestResolve) const;
+
+	/**
 	 * Ends the match, records WHY, and starts the results-screen countdown.
 	 *
 	 * @param WinningTeam ETraceTeam::None is a genuine draw (only reachable on a clock finish).
@@ -939,6 +958,14 @@ public:
 	 */
 	void PollCharacterSelectNow() { PollCharacterSelect(); }
 
+	/** True while the warm-up is stretched for somebody still in the pre-match menus. See UpdatePreMatchHold. */
+	bool IsPreMatchHeldForMenus() const { return bPreMatchHeldForMenus; }
+
+#if !UE_BUILD_SHIPPING
+	/** Test seam: blow the full-time whistle now, through the shipped FinishMatch (Trace.Flow.Verify). */
+	void DebugFinishMatch(ETraceTeam WinningTeam, ETraceMatchEndReason Reason) { FinishMatch(WinningTeam, Reason); }
+#endif
+
 #if !UE_BUILD_SHIPPING
 	/**
 	 * Test seam: run one select poll now, instead of waiting up to a quarter second for the timer.
@@ -1089,6 +1116,12 @@ private:
 	FTimerHandle WarmupTimerHandle;
 	FTimerHandle MatchTimerHandle;
 	FTimerHandle HalfTimeTimerHandle;
+
+	/** Server time the running warm-up began. The pre-match hold's cap is measured from it. */
+	double WarmupStartedServerTime = 0.0;
+
+	/** True while the warm-up countdown is stretched because somebody is still in the pre-match menus. */
+	bool bPreMatchHeldForMenus = false;
 
 	/** Spec v9 §11. Looping while a whistle is pending; drives PollPendingPeriodEnd(). */
 	FTimerHandle PendingPeriodEndPollHandle;

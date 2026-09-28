@@ -32,6 +32,7 @@
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "UI/Text/TraceGameText.h"   // refusal toasts: HUD.TOAST_*
 #include "Abilities/Characters/TraceVerifyLock.h"   // one character fixture at a time
 
 #define LOCTEXT_NAMESPACE "TraceMortimer"
@@ -1474,16 +1475,16 @@ bool UTraceAbilitySetMortimer::CanActivate(FText& OutReason) const
 	case ETraceMortimerBlastRefusal::NotCarryingCore:
 		// Phrased as an instruction rather than as a state, because it is one a player can act on —
 		// see the UI note in the report: today this sentence exists only in the server log.
-		OutReason = LOCTEXT("MortimerNoCore", "QUAKE NEEDS THE CORE");
+		OutReason = FText::FromString(TRACE_TEXT("HUD.TOAST_NEED_CORE", "NEED THE CORE"));
 		return false;
 
 	case ETraceMortimerBlastRefusal::Airborne:
-		OutReason = LOCTEXT("MortimerAirborne", "QUAKE NEEDS SOLID GROUND");
+		OutReason = FText::FromString(TRACE_TEXT("HUD.TOAST_NEED_GROUND", "NEED GROUND"));
 		return false;
 
 	case ETraceMortimerBlastRefusal::NoPawn:
 	default:
-		OutReason = LOCTEXT("MortimerNoPawn", "NOT READY");
+		OutReason = FText::FromString(TRACE_TEXT("HUD.TOAST_NOT_READY", "NOT READY"));
 		return false;
 	}
 }

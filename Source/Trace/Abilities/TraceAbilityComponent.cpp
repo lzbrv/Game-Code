@@ -42,6 +42,7 @@
 // file only produces it, at the three places a press is refused. See TraceAbilityToast below.
 #include "Core/TracePlayerController.h"
 #include "UI/TraceHUD.h"
+#include "UI/Text/TraceGameText.h"   // refusal toasts: HUD.TOAST_*
 #include "Abilities/Characters/TraceAbilitySetRoxie.h"   // the §7.2 capture fixture only — see the arm
 
 namespace
@@ -1138,9 +1139,12 @@ bool UTraceAbilityComponent::TryActivate()
 		// FX plan §7.1, producer 1. The key is read from the player's OWN binding rather than
 		// hardcoded to E, for the same reason the ability row's label is: a toast that says "E IN
 		// 4.2S" to somebody who rebound the ability is a HUD lying about their own keyboard.
+		//
+		// Through the text document (HUD.TOAST_COOLDOWN), so the wording is Ranen's; the same line
+		// words V's cooldown and SNAP's own recharge.
 		TraceAbilityToast::Show(this,
-			FText::FromString(FString::Printf(TEXT("%s IN %.1fS"),
-				*ATraceHUD::ActionKeyLabel(TEXT("Ability"), TEXT("E")), CoolingFor)),
+			FText::FromString(TRACE_TEXTF("HUD.TOAST_COOLDOWN", "{0} IN {1}S",
+				{ ATraceHUD::ActionKeyLabel(TEXT("Ability"), TEXT("E")), FString::Printf(TEXT("%.1f"), CoolingFor) })),
 			TraceAbilityToast::Cooling);
 		return false;
 	}
@@ -1224,7 +1228,7 @@ void UTraceAbilityComponent::ClientActivateRejected_Implementation(float Authori
 	// One word, deliberately: this is the arm that must NOT guess. The server does not send a reason
 	// (that would be a new RPC payload for a rare event) and inventing one here would be worse than
 	// the silence it replaces.
-	TraceAbilityToast::Show(this, NSLOCTEXT("Trace", "AbilityRefused", "REFUSED"),
+	TraceAbilityToast::Show(this, FText::FromString(TRACE_TEXT("HUD.TOAST_REFUSED", "REFUSED")),
 		TraceAbilityToast::Refused);
 }
 
@@ -2624,7 +2628,8 @@ bool UTraceAbilityComponent::HandleSecondaryPressed()
 		// half-minute wait is noise the player cannot act on. The E toast keeps its tenth because
 		// E's cooldowns are short enough for one to matter.
 		TraceAbilityToast::Show(this,
-			FText::FromString(FString::Printf(TEXT("%s IN %.0fS"), *Label, Remaining)),
+			FText::FromString(TRACE_TEXTF("HUD.TOAST_COOLDOWN", "{0} IN {1}S",
+				{ Label, FString::Printf(TEXT("%.0f"), Remaining) })),
 			TraceAbilityToast::Cooling);
 	}
 

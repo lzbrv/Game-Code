@@ -5799,9 +5799,11 @@ namespace TraceKillFeedArt
 	/** How often a client with no relay yet may re-run the actor search, in seconds. */
 	static constexpr float RelayPollInterval = 0.5f;
 
+	/** Clipped to MaxNameChars and UPPER CASE, like every other word on the HUD (a machine name is not). */
 	static FString Shorten(const FString& Name)
 	{
-		return (Name.Len() <= MaxNameChars) ? Name : (Name.Left(MaxNameChars - 1) + TEXT("."));
+		const FString Upper = Name.ToUpper();
+		return (Upper.Len() <= MaxNameChars) ? Upper : (Upper.Left(MaxNameChars - 1) + TEXT("."));
 	}
 }
 
@@ -6334,7 +6336,7 @@ void ATraceHUD::DrawDeathPanel()
 	{
 		Cause = TracePC->GetLastDeathCause();
 		KillerLine = TRACE_TEXTF("HUD.DEATH_KILLER_LINE", "by {0}{1}",
-			{ TracePC->GetLastKillerName(), FString() });
+			{ TracePC->GetLastKillerName().ToUpper(), FString() });
 
 		const UWorld* const World = GetWorld();
 		const int32 RawLocalId = (LocalPS != nullptr) ? LocalPS->GetPlayerId() : INDEX_NONE;
@@ -7001,7 +7003,8 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 			DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.14f), X, RowY - (2.f * UIScale), Width, RowH);
 		}
 
-		FString Name = Member->GetPlayerName();
+		// Upper case, as the team screen already draws it: an engine-made machine name arrives mixed-case.
+		FString Name = Member->GetPlayerName().ToUpper();
 		if (Member->bIsCarrier)
 		{
 			// ASCII only: the engine's built-in fonts carry no glyph for anything fancier.
@@ -8962,7 +8965,7 @@ namespace TraceFxHudShots
 		case 7:
 		{
 			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("toast_POSTURE"));
-			Expect(*Run, Rec.ToastText.Contains(TEXT("QUAKE")),
+			Expect(*Run, Rec.ToastText.Equals(TRACE_TEXT("HUD.TOAST_NEED_CORE", "NEED THE CORE")),
 				FString::Printf(TEXT("7.1: Mortimer's OWN posture reason drew as a toast ('%s')"),
 					*Rec.ToastText));
 			NextDelay = 0.8f;
@@ -8981,7 +8984,7 @@ namespace TraceFxHudShots
 		case 9:
 		{
 			const ATraceHUD::FFxHudDrawRecord Rec = Shot(*Run, TEXT("toast_REJECTED"));
-			Expect(*Run, Rec.ToastText.Equals(TEXT("REFUSED")),
+			Expect(*Run, Rec.ToastText.Equals(TRACE_TEXT("HUD.TOAST_REFUSED", "REFUSED")),
 				FString::Printf(TEXT("7.1: the server-rejection toast drew ('%s')"), *Rec.ToastText));
 			NextDelay = 0.8f;
 			break;

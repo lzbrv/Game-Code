@@ -34,6 +34,7 @@
 #include "Trace.h"
 #include "TraceSettings.h"
 #include "TraceTypes.h"
+#include "UI/Text/TraceGameText.h"   // MATCH.BOT_NAME
 #include "UI/TraceHUD.h"
 #include "UI/TraceKillFeed.h"      // ServerAnnounceLeave — "<NAME> LEFT" from Logout
 #include "UI/TraceMatchOptions.h"
@@ -162,6 +163,15 @@ namespace TraceGameModeConstants
 	 * 5.4 through 5.8.
 	 */
 	static constexpr float ZeroDurationEpsilon = 0.001f;
+
+	/**
+	 * The longest the pre-match menus may hold the match clock, from the start of the warm-up (see
+	 * ATraceGameMode::UpdatePreMatchHold). The menus' own clocks resolve an idle player in
+	 * TeamSelectTimeout + CharacterSelectTimeout = 45 s, so this only bites when a server has switched
+	 * one of those clocks off, or a stream of joiners keeps arriving. "One idle player cannot stall
+	 * the match" (spec v14 §3) holds either way.
+	 */
+	static constexpr double PreMatchHoldCapSeconds = 90.0;
 
 	/** Seconds between -TraceBotDebug roster dumps. */
 	static constexpr float BotDebugInterval = 3.f;
@@ -1077,6 +1087,19 @@ ETraceTeamChangeResult ATraceGameMode::RequestTeamChange(ATracePlayerState* Requ
 	if (Requester->Team == DesiredTeam)
 	{
 		return ETraceTeamChangeResult::AlreadyOnTeam;
+	}
+
+	// NOT AFTER FULL TIME. FinishMatch shuts every team screen, so this is the server's own answer to
+	// a request that was already in flight at the whistle (or one no screen sent): granting it would
+	// respawn the player into a finished match and could flip whose win the results screen shows them.
+	if (const ATraceGameState* const EndedGS = GetTraceGameState())
+	{
+		if (EndedGS->TraceMatchState == ETraceMatchState::PostMatch)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[TeamSelect] REFUSED '%s' -> %s: the match is over."),
+				*Requester->GetPlayerName(), *TraceTeamName(DesiredTeam).ToString());
+			return ETraceTeamChangeResult::NotAllowed;
+		}
 	}
 
 	// THE RULE, re-asked on the server. The client already asked it to grey the option out; that
@@ -2460,7 +2483,11 @@ ATraceBotController* ATraceGameMode::SpawnBotForTeam(ETraceTeam Team)
 	// not exist, which is why the answer is replicated rather than derived from it.
 	BotState->SetIsABot(true);
 
-	Bot->SetBotDisplayName(FString::Printf(TEXT("BOT %s %d"), *TraceTeamName(Team).ToString(), NextBotNumber++));
+	// UPPER CASE, like every other word on the HUD, and through the text document so the word BOT is
+	// Ranen's. It used to be "BOT Blue 3": a mixed-case team word beside "PLAYER" in every kill-feed row
+	// and scoreboard line. The number is the bot's own, so it stays a number.
+	Bot->SetBotDisplayName(TRACE_TEXTF("MATCH.BOT_NAME", "BOT {0} {1}",
+		{ TraceTeamName(Team).ToString().ToUpper(), NextBotNumber++ }));
 
 	Bots.Add(Bot);
 
@@ -3022,6 +3049,12 @@ void ATraceGameMode::StartWarmup()
 
 	UE_LOG(LogTraceGame, Log, TEXT("Enough players; warm-up started (%.1fs)."), WarmupSeconds);
 	GetWorldTimerManager().SetTimer(WarmupTimerHandle, this, &ATraceGameMode::BeginMatch, WarmupSeconds, false);
+
+	// The countdown may not be the whole story: anybody still in team select or on the loadout page
+	// holds the match clock until they are done. See UpdatePreMatchHold.
+	WarmupStartedServerTime = TraceGameState->GetServerWorldTimeSeconds();
+	bPreMatchHeldForMenus = false;
+	UpdatePreMatchHold();
 }
 
 void ATraceGameMode::CancelWarmup()
@@ -3032,6 +3065,7 @@ void ATraceGameMode::CancelWarmup()
 	}
 
 	GetWorldTimerManager().ClearTimer(WarmupTimerHandle);
+	bPreMatchHeldForMenus = false;
 
 	if (ATraceGameState* TraceGameState = GetTraceGameState())
 	{
@@ -3040,6 +3074,128 @@ void ATraceGameMode::CancelWarmup()
 	}
 
 	UE_LOG(LogTraceGame, Log, TEXT("Not enough players; warm-up cancelled."));
+}
+
+int32 ATraceGameMode::CountHumansStillChoosing(double NowServer, double& OutLatestResolve) const
+{
+	OutLatestResolve = 0.0;
+	const AGameStateBase* const BaseGameState = GameState;
+	if (BaseGameState == nullptr)
+	{
+		return 0;
+	}
+
+	const bool bCharactersOn = AreCharactersEnabled();
+	const double Unbounded = TNumericLimits<double>::Max();
+	int32 Choosing = 0;
+
+	for (const APlayerState* const EachState : BaseGameState->PlayerArray)
+	{
+		const ATracePlayerState* const Human = Cast<ATracePlayerState>(EachState);
+		if (Human == nullptr || Human->IsABot() || Human->IsOnlyASpectator() || Human->Team == ETraceTeam::None)
+		{
+			continue;   // bots never see a menu; a teamless player is not offered one yet
+		}
+		const ATracePlayerController* const HumanPC = Cast<ATracePlayerController>(Human->GetOwningController());
+		if (HumanPC == nullptr)
+		{
+			continue;
+		}
+
+		// When this player is done at the LATEST: each screen closes itself on its own clock, and the
+		// loadout auto-picks at its deadline. A clock switched off (<= 0) has no latest.
+		double ResolvedBy = -1.0;
+		if (HumanPC->IsTeamSelectOpen())
+		{
+			const double TeamBy = (HumanPC->TeamSelectDeadlineServerTime > 0.f)
+				? static_cast<double>(HumanPC->TeamSelectDeadlineServerTime) : Unbounded;
+			const double LoadoutAfter = !bCharactersOn ? 0.0
+				: (CharacterSelectTimeout > 0.f ? static_cast<double>(CharacterSelectTimeout) : Unbounded);
+			ResolvedBy = (TeamBy >= Unbounded || LoadoutAfter >= Unbounded) ? Unbounded : TeamBy + LoadoutAfter;
+		}
+		else if (bCharactersOn && !Human->HasCharacter() && !Human->IsCharacterLocked())
+		{
+			if (Human->IsCharacterSelectOpen())
+			{
+				ResolvedBy = (Human->CharacterSelectDeadlineServerTime > 0.f)
+					? static_cast<double>(Human->CharacterSelectDeadlineServerTime) : Unbounded;
+			}
+			else
+			{
+				// Between the two screens: the select poll opens the page on its next pass.
+				ResolvedBy = (CharacterSelectTimeout > 0.f) ? NowServer + CharacterSelectTimeout : Unbounded;
+			}
+		}
+
+		if (ResolvedBy >= 0.0)
+		{
+			++Choosing;
+			OutLatestResolve = FMath::Max(OutLatestResolve, ResolvedBy);
+		}
+	}
+
+	return Choosing;
+}
+
+void ATraceGameMode::UpdatePreMatchHold()
+{
+	ATraceGameState* const TraceGameState = GetTraceGameState();
+	if (!HasAuthority() || TraceGameState == nullptr
+		|| TraceGameState->TraceMatchState != ETraceMatchState::WaitingForPlayers
+		|| !GetWorldTimerManager().IsTimerActive(WarmupTimerHandle))
+	{
+		return;   // no warm-up counting down: nothing to hold (or the whistle has gone)
+	}
+
+	const double WarmupSeconds = static_cast<double>(GetWarmupSeconds());
+	if (WarmupSeconds <= TraceGameModeConstants::ZeroDurationEpsilon)
+	{
+		return;   // a mode with no warm-up (the practice range) is live the instant it can be
+	}
+
+	const double NowServer = TraceGameState->GetServerWorldTimeSeconds();
+	const double CurrentDeadline = static_cast<double>(TraceGameState->MatchEndServerTime);
+	const double HoldCap = WarmupStartedServerTime + TraceGameModeConstants::PreMatchHoldCapSeconds;
+
+	double LatestResolve = 0.0;
+	const int32 Choosing = CountHumansStillChoosing(NowServer, LatestResolve);
+	const bool bHold = (Choosing > 0) && (NowServer < HoldCap);
+
+	// HOLDING: the countdown reads the latest moment anybody can still be choosing, plus the warm-up —
+	// an honest "starts by", which only ever comes down. NOT HOLDING: warm-up from now, but never later
+	// than the countdown already promised (a warm-up that began with nobody in a menu runs untouched).
+	const double Desired = bHold
+		? FMath::Max(FMath::Min(LatestResolve, HoldCap), NowServer) + WarmupSeconds
+		: FMath::Min(CurrentDeadline, NowServer + WarmupSeconds);
+
+	if (bHold != bPreMatchHeldForMenus)
+	{
+		bPreMatchHeldForMenus = bHold;
+		if (bHold)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Warmup] HELD: %d player(s) still in team select or the loadout page; the match starts "
+				     "%.0fs after the last one is done (at the latest in %.0fs)."),
+				Choosing, WarmupSeconds, Desired - NowServer);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[Warmup] Everyone is ready%s; the match starts in %.1fs."),
+				(Choosing > 0) ? TEXT(" (hold cap reached)") : TEXT(""), Desired - NowServer);
+		}
+	}
+
+	if (FMath::Abs(Desired - CurrentDeadline) < 0.05)
+	{
+		return;
+	}
+
+	// The replicated deadline is what every HUD counts down and what the bot-fill hold reads
+	// (UTraceAbilityComponent::IsBotFillHeldForWarmup); the timer is merely what fires on it here.
+	TraceGameState->MatchEndServerTime = static_cast<float>(Desired);
+	TraceGameState->ForceNetUpdate();
+	GetWorldTimerManager().SetTimer(WarmupTimerHandle, this, &ATraceGameMode::BeginMatch,
+		static_cast<float>(FMath::Max(Desired - NowServer, 0.01)), false);
 }
 
 void ATraceGameMode::BeginMatch()
@@ -3058,6 +3214,23 @@ void ATraceGameMode::BeginMatch()
 	TraceGameState->BlueScore = 0;
 	TraceGameState->OrangeScore = 0;
 	TraceGameState->OnRep_Scores();
+
+	// ...AND NEITHER DO WARM-UP KILLS. The warm-up now lasts as long as somebody is still in the
+	// pre-match menus (UpdatePreMatchHold), and a player on the loadout page stands idle in the arena
+	// while bots roam: a death taken while reading a menu must not open their scoreboard line.
+	for (APlayerState* const EachState : TraceGameState->PlayerArray)
+	{
+		if (ATracePlayerState* const EachPlayer = Cast<ATracePlayerState>(EachState))
+		{
+			if (EachPlayer->Kills != 0 || EachPlayer->Deaths != 0)
+			{
+				EachPlayer->Kills = 0;
+				EachPlayer->Deaths = 0;
+				EachPlayer->ForceNetUpdate();
+			}
+		}
+	}
+	bPreMatchHeldForMenus = false;
 
 	// A match that is starting has not ended. Cleared for the same reason the scores are: nothing
 	// guarantees this GameState is fresh, and a stale "MERCY RULE" on the results screen of the next
@@ -3922,6 +4095,42 @@ void ATraceGameMode::FinishMatch(ETraceTeam WinningTeam, ETraceMatchEndReason Re
 	// results screen, and the reset that follows a goal would fight the post-match state.
 	ReleaseCore();
 
+	// *** EVERY SELECT WINDOW SHUTS WITH THE WHISTLE. ***
+	//
+	// Nothing used to close them. A player who had team select up (H) or the loadout page open at full
+	// time — or anybody at all when a mercy win ended the match inside the half-time break, whose own
+	// close is on a timer this function has just cleared — kept that page drawn OVER THE RESULTS, and
+	// the team page still worked: a pick was granted, the player respawned into a finished match, and
+	// the results stinger could flip to the other team's. After the PostMatch flip above, so the
+	// select poll these closes run (ServerSetTeamSelectOpen) already sees the match as over and opens
+	// nothing in their place. Closing is what hands each client's input back (the HUD's one OnClosed).
+	int32 ClosedWindows = 0;
+	for (APlayerState* const EachState : TraceGameState->PlayerArray)
+	{
+		ATracePlayerState* const EachPlayer = Cast<ATracePlayerState>(EachState);
+		if (EachPlayer == nullptr)
+		{
+			continue;
+		}
+		if (EachPlayer->IsCharacterSelectOpen())
+		{
+			EachPlayer->ServerSetCharacterSelectOpen(/*bOpen=*/false, 0.f);
+			++ClosedWindows;
+		}
+		if (ATracePlayerController* const PlayerPC = Cast<ATracePlayerController>(EachPlayer->GetOwningController()))
+		{
+			if (PlayerPC->IsTeamSelectOpen())
+			{
+				PlayerPC->ServerSetTeamSelectOpen(/*bOpen=*/false, 0.f);
+				++ClosedWindows;
+			}
+		}
+	}
+	if (ClosedWindows > 0)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[Match] Full time closed %d open select window(s)."), ClosedWindows);
+	}
+
 	// Players keep their pawns and keep respawning after the whistle — the HUD switches to the FINAL
 	// banner, and leaving everyone alive means nobody is staring at a corpse on the results screen.
 	UE_LOG(LogTraceGame, Display, TEXT("Match over by %s. Winner: %s (Blue %d - Orange %d)"),
@@ -4264,12 +4473,14 @@ void ATraceGameMode::PollCharacterSelect()
 	// Standing off entirely for the duration is right rather than merely convenient: everything this
 	// poll exists to do — offer a screen to somebody who has not picked, auto-assign a player who ran
 	// out of clock, fill bots — is about getting a match STARTED, and the interval is not that.
+	bool bPostMatch = false;
 	if (const ATraceGameState* const TraceState = GetTraceGameState())
 	{
 		if (TraceState->IsHalfTimeBreak())
 		{
 			return;
 		}
+		bPostMatch = (TraceState->TraceMatchState == ETraceMatchState::PostMatch);
 	}
 
 	for (APlayerState* const EachState : BaseGameState->PlayerArray)
@@ -4502,6 +4713,15 @@ void ATraceGameMode::PollCharacterSelect()
 		}
 
 		// ---- Open the screen -------------------------------------------------------------------
+		//
+		// NEVER AFTER FULL TIME. The results screen owns the display, and there is no match left to
+		// pick for. Only the OPEN is skipped: closing and the auto-assign below still run, so a window
+		// somehow left open is still resolved rather than stranded.
+		if (bPostMatch && !Candidate->IsCharacterSelectOpen())
+		{
+			continue;
+		}
+
 		if (!Candidate->IsCharacterSelectOpen())
 		{
 			const float Deadline = (CharacterSelectTimeout > 0.f)
@@ -4577,6 +4797,10 @@ void ATraceGameMode::PollCharacterSelect()
 				*Candidate->GetPlayerName(), *TraceCharacterRoster::NameFor(AutoPick));
 		}
 	}
+
+	// Last, so it reads the windows exactly as this pass left them: a lock-in or an auto-pick above
+	// is what lets the warm-up countdown drop to its last few seconds.
+	UpdatePreMatchHold();
 }
 
 void ATraceGameMode::ResetAbilityCooldownsForHalfTime()

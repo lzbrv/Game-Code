@@ -34,6 +34,7 @@
 #include "Materials/MaterialInterface.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "UI/Text/TraceGameText.h"   // refusal toasts: HUD.TOAST_*
 #include "UObject/ConstructorHelpers.h"
 
 // *** THE RED ARM FOR §2.7's STING-LOAD CONVERGE. ***
@@ -244,7 +245,7 @@ bool UTraceAbilitySetX::CanActivate(FText& OutReason) const
 {
 	if (IsStingLoaded())
 	{
-		OutReason = NSLOCTEXT("Trace", "XStingAlreadyLoaded", "BEES ALREADY LOADED");
+		OutReason = FText::FromString(TRACE_TEXT("HUD.TOAST_ALREADY_LOADED", "ALREADY LOADED"));
 		return false;
 	}
 	return true;

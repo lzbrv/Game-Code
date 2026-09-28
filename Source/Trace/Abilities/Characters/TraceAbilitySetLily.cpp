@@ -35,6 +35,7 @@
 #include "Settings/TraceUserSettings.h"                   // the player's Jump / Crouch binds
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "UI/Text/TraceGameText.h"   // refusal toasts: HUD.TOAST_*
 #include "Abilities/Characters/TraceVerifyLock.h"   // one character fixture at a time
 
 #define LOCTEXT_NAMESPACE "TraceLily"
@@ -470,7 +471,7 @@ bool UTraceAbilitySetLily::CanActivate(FText& OutReason) const
 	const ATraceCharacter* MyPawn = GetCharacter();
 	if (MyPawn == nullptr || !MyPawn->IsAlive())
 	{
-		OutReason = LOCTEXT("LilyNoPawn", "NOT READY");
+		OutReason = FText::FromString(TRACE_TEXT("HUD.TOAST_NOT_READY", "NOT READY"));
 		return false;
 	}
 
@@ -481,7 +482,7 @@ bool UTraceAbilitySetLily::CanActivate(FText& OutReason) const
 	{
 		// Re-casting mid-flight would refresh the duration for free, which is not what a 30 s
 		// cooldown ability is. Refused rather than refreshed.
-		OutReason = LOCTEXT("LilyAlreadyZipping", "ALREADY FLYING");
+		OutReason = FText::FromString(TRACE_TEXT("HUD.TOAST_ALREADY_FLYING", "ALREADY FLYING"));
 		return false;
 	}
 

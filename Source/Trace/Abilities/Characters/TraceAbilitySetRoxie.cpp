@@ -32,6 +32,7 @@
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "UI/Text/TraceGameText.h"          // refusal toasts: HUD.TOAST_*
 
 #if !UE_BUILD_SHIPPING
 // Trace.Roxie.RocketShot only — a camera and a screenshot, exactly the pieces
@@ -678,7 +679,7 @@ bool UTraceAbilitySetRoxie::CanActivate(FText& OutReason) const
 {
 	if (IsModdedActive())
 	{
-		OutReason = NSLOCTEXT("Trace", "RoxieModdedAlreadyIn", "MODDED CLIP ALREADY IN");
+		OutReason = FText::FromString(TRACE_TEXT("HUD.TOAST_ALREADY_LOADED", "ALREADY LOADED"));
 		return false;
 	}
 	return true;

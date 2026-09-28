@@ -97,6 +97,9 @@ public:
 	 */
 	void ShowAbilityToast(const FText& Text, const FLinearColor& Tint, float Seconds = 1.6f);
 
+	/** The words of the latest toast (empty when none was ever raised). Read by Trace.Flow.Verify. */
+	const FText& GetLastAbilityToastText() const { return ToastText; }
+
 	/**
 	 * The player's OWN binding for the input action with config id @p ConfigId, upper case, or
 	 * @p Fallback when the input slice has no such action or nothing is bound.
