@@ -49,6 +49,7 @@
 #include "CoreMinimal.h"
 #include "Math/Box2D.h"
 
+#include "UI/Text/TraceText.h"
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 
 class AHUD;
@@ -100,6 +101,13 @@ struct FTraceKitVisuals
 
 	/** The row's own furniture (readouts, values, arrows): white selected, 0.85 white otherwise. */
 	FLinearColor Furniture = FLinearColor::White;
+};
+
+/** One [KEY] VERB pair of a key legend. Either string empty drops the pair, chip and all. */
+struct FTraceKitLegendItem
+{
+	FString Key;
+	FString Label;
 };
 
 /** One textured quad of a plate: screen rect, then UV origin and UV size. */
@@ -341,6 +349,34 @@ namespace TraceMenuKit
 	 */
 	TRACE_API float DrawKeyChip(AHUD* HUD, ETraceKitState State, float X, float Y, float H,
 		const FString& Key, float NowSeconds);
+
+	/**
+	 * @p Text with its CAPS centred on @p CapCenterY — the way the kit sits every word on a plate —
+	 * and X read per @p Style's HAlign. Returns the width drawn; nothing for an empty string.
+	 */
+	TRACE_API float DrawTextCapCentered(AHUD* HUD, const FString& Text, float X, float CapCenterY,
+		const TraceText::FStyle& Style);
+
+	// ---- A KEY LEGEND: [KEY] VERB   [KEY] VERB ... ----------------------------------------------
+	//
+	// A footer of KEY chips, each followed by the verb it does, in the light face at the chip's own
+	// label size and the unselected furniture colour. Everything scales with the chip height, so a
+	// width measured at one height scales linearly to any other: two legends on one page (keyboard and
+	// pad) fit to ONE scale by measuring both with KeyLegendWidth and drawing both at the fitted height.
+
+	/** The width DrawKeyLegend takes at chip height @p ChipH. Pairs with an empty key or verb are skipped. */
+	TRACE_API float KeyLegendWidth(const TArray<FTraceKitLegendItem>& Items, float ChipH);
+
+	/** The legend, centred on @p CenterX with the chips' tops at @p Y. Returns the width drawn. */
+	TRACE_API float DrawKeyLegend(AHUD* HUD, const TArray<FTraceKitLegendItem>& Items, float CenterX, float Y,
+		float ChipH, float NowSeconds);
+
+	/**
+	 * The chip height that makes the widest of @p Widths (each measured at @p ChipH) fit @p MaxW —
+	 * never below 70 % of @p ChipH, where the type stops being readable and clipping is the better
+	 * failure.
+	 */
+	TRACE_API float KeyLegendFit(float ChipH, float MaxW, std::initializer_list<float> Widths);
 
 	/** Opaque black over the whole view (stylespec §1). */
 	TRACE_API void DrawBackground(AHUD* HUD, float ViewW, float ViewH);

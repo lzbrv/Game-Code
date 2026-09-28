@@ -533,6 +533,98 @@ float TraceMenuKit::DrawKeyChip(AHUD* HUD, ETraceKitState State, float X, float 
 	return W;
 }
 
+float TraceMenuKit::DrawTextCapCentered(AHUD* HUD, const FString& Text, float X, float CapCenterY,
+	const TraceText::FStyle& Style)
+{
+	if (HUD == nullptr || Text.IsEmpty())
+	{
+		return 0.f;
+	}
+	TraceText::FStyle CapStyle = Style;
+	CapStyle.VAlign = TraceText::EVAlign::CapTop;
+	const float Caps = TraceText::CapHeight(CapStyle.Size, CapStyle.Weight);
+	return TraceCanvasText::Draw(HUD, Text, X, CapCenterY - Caps * 0.5f, CapStyle);
+}
+
+namespace TraceMenuKitFile
+{
+	/** A legend's two gaps, as fractions of the chip height: chip to its verb, and pair to pair. */
+	static constexpr float LegendVerbGap = 0.31f;
+	static constexpr float LegendPairGap = 1.06f;
+
+	static TraceText::FStyle LegendVerbStyle(float ChipH)
+	{
+		return TraceText::FStyle(TraceMenuKit::LabelSize(ChipH), TraceMenuKit::FurnitureUnselected,
+			ETraceTextWeight::Light);
+	}
+}
+
+float TraceMenuKit::KeyLegendWidth(const TArray<FTraceKitLegendItem>& Items, float ChipH)
+{
+	if (ChipH <= 0.f)
+	{
+		return 0.f;
+	}
+	const TraceText::FStyle VerbStyle = TraceMenuKitFile::LegendVerbStyle(ChipH);
+	float Total = 0.f;
+	int32 Pairs = 0;
+	for (const FTraceKitLegendItem& Item : Items)
+	{
+		if (Item.Key.IsEmpty() || Item.Label.IsEmpty())
+		{
+			continue;
+		}
+		Total += KeyChipWidth(Item.Key, ChipH) + ChipH * TraceMenuKitFile::LegendVerbGap
+			+ TraceText::MeasureWidth(Item.Label, VerbStyle);
+		++Pairs;
+	}
+	return Total + ChipH * TraceMenuKitFile::LegendPairGap * FMath::Max(0, Pairs - 1);
+}
+
+float TraceMenuKit::DrawKeyLegend(AHUD* HUD, const TArray<FTraceKitLegendItem>& Items, float CenterX, float Y,
+	float ChipH, float NowSeconds)
+{
+	const float Total = KeyLegendWidth(Items, ChipH);
+	if (HUD == nullptr || Total <= 0.f)
+	{
+		return 0.f;
+	}
+
+	const TraceText::FStyle VerbStyle = TraceMenuKitFile::LegendVerbStyle(ChipH);
+	float PenX = CenterX - Total * 0.5f;
+	bool bFirst = true;
+	for (const FTraceKitLegendItem& Item : Items)
+	{
+		if (Item.Key.IsEmpty() || Item.Label.IsEmpty())
+		{
+			continue;
+		}
+		if (!bFirst)
+		{
+			PenX += ChipH * TraceMenuKitFile::LegendPairGap;
+		}
+		bFirst = false;
+		PenX += DrawKeyChip(HUD, ETraceKitState::Default, PenX, Y, ChipH, Item.Key, NowSeconds);
+		PenX += ChipH * TraceMenuKitFile::LegendVerbGap;
+		PenX += DrawTextCapCentered(HUD, Item.Label, PenX, Y + ChipH * 0.5f, VerbStyle);
+	}
+	return Total;
+}
+
+float TraceMenuKit::KeyLegendFit(float ChipH, float MaxW, std::initializer_list<float> Widths)
+{
+	float Widest = 0.f;
+	for (const float Each : Widths)
+	{
+		Widest = FMath::Max(Widest, Each);
+	}
+	if (MaxW <= 0.f || Widest <= MaxW)
+	{
+		return ChipH;
+	}
+	return ChipH * FMath::Max(0.7f, MaxW / Widest);
+}
+
 void TraceMenuKit::DrawBackground(AHUD* HUD, float ViewW, float ViewH)
 {
 	if (HUD != nullptr)
@@ -1029,6 +1121,24 @@ namespace TraceMenuKitFile
 			Check(TEXT("every kit sprite loads"), Loaded == SpriteCount,
 				FString::Printf(TEXT("%d/%d loaded, %d drawable this frame %s"), Loaded, SpriteCount,
 					DrawableNow, *Missing));
+		}
+
+		// ---- 6. THE KEY LEGEND (added for the pre-match screens) ---------------------------------
+		{
+			const TArray<FTraceKitLegendItem> Legend = { { TEXT("ENTER"), TEXT("EQUIP") }, { TEXT("Q / E"), TEXT("TAB") } };
+			const TArray<FTraceKitLegendItem> Removed = { { TEXT("ENTER"), TEXT("") }, { TEXT(""), TEXT("TAB") } };
+			const float At32 = TraceMenuKit::KeyLegendWidth(Legend, 32.f);
+			const float At64 = TraceMenuKit::KeyLegendWidth(Legend, 64.f);
+			Check(TEXT("a legend's width scales with its chip (one fit serves two rows)"),
+				At32 > 0.f && FMath::IsNearlyEqual(At64, At32 * 2.f, At32 * 0.02f),
+				FString::Printf(TEXT("%.1f at 32, %.1f at 64"), At32, At64));
+			Check(TEXT("a pair with an emptied key or verb draws nothing at all"),
+				TraceMenuKit::KeyLegendWidth(Removed, 32.f) == 0.f, TEXT("the text contract: no chip round a removed word"));
+			Check(TEXT("KeyLegendFit shrinks to fit, never below 70 %"),
+				FMath::IsNearlyEqual(TraceMenuKit::KeyLegendFit(32.f, At32 * 0.5f, { At32 }), 32.f * 0.7f)
+					&& FMath::IsNearlyEqual(TraceMenuKit::KeyLegendFit(32.f, At32 * 0.9f, { At32, At32 * 0.5f }), 32.f * 0.9f, 1e-3f)
+					&& TraceMenuKit::KeyLegendFit(32.f, At32 * 2.f, { At32 }) == 32.f,
+				TEXT(""));
 		}
 
 		if (Failures == 0)
