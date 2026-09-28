@@ -5068,6 +5068,21 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 			// only candidate mechanism, so it has to be countable. Observation only.
 			++WallJumpBufferedLaunches;
 #endif
+
+			// A REAL JUMP THAT ACharacter::OnJumped NEVER REPORTS. The press that armed this buffer was
+			// refused by DoJump, so CheckJumpInput fired no OnJumped for it, and this launch is not a
+			// DoJump at all. Without this line a wall jump made "right as you hit the wall" would be
+			// the one jump the abilities never heard of (Oyster's dash cloak, first). Server only, for
+			// the reason UTraceAbilityComponent::NotifyJumpPerformed gives; it is a no-op elsewhere,
+			// and the bClientUpdating test keeps it off a correction replay regardless.
+			if (CharacterOwner != nullptr && !CharacterOwner->bClientUpdating
+				&& CharacterOwner->HasAuthority() && TraceAbilityIntegration::IsEnabled())
+			{
+				if (UTraceAbilityComponent* JumpAbilities = UTraceAbilityComponent::Get(CharacterOwner))
+				{
+					JumpAbilities->NotifyJumpPerformed();
+				}
+			}
 		}
 		else
 		{

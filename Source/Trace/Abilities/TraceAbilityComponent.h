@@ -116,6 +116,8 @@ namespace TraceAbility
  *   ATraceGameMode::RestartPlayerFresh               OnPawnSpawned
  *   ATracePlayerController::OnJumpStarted /          Rocco's second jump, Oyster's jar jump,
  *     OnAbilityStarted / OnAbilitySecondary*         every activated ability, Mace's V
+ *   ATraceCharacter::OnJumped_Implementation /       Oyster's dash cloak (NotifyJumpPerformed)
+ *     the buffered wall jump in OnMovementUpdated
  *
  * THIS NAMESPACE EXISTS SO THAT SET OF CALLS CAN BE SHOWN FAILING. Every one of them is guarded by
  * IsEnabled(), and Trace.Ability.Integration 0 removes all of them at once — which is precisely the
@@ -143,6 +145,8 @@ namespace TraceAbilityIntegration
 		int32 PawnSpawned = 0;
 		int32 PawnDied = 0;
 		int32 JumpConsumed = 0;
+		/** Server-side jumps delivered to the kits by NotifyJumpPerformed (ground, air and kit-owned). */
+		int32 JumpPerformed = 0;
 		int32 ActivatePressed = 0;
 		int32 SecondaryEdges = 0;
 		/** Frames on which a candidate's magnet radius was widened by a character passive. */
@@ -789,9 +793,36 @@ public:
 	bool HandleSecondaryPressed();
 	void HandleSecondaryReleased();
 
-	/** Jump pressed. Returns TRUE if a character consumed it and the normal jump must not run. */
+	/**
+	 * Jump pressed. Returns TRUE if a character consumed it and the normal jump must not run.
+	 *
+	 * A consumed press is also a JUMP, and on the server this reports it through NotifyJumpPerformed
+	 * — the kit that took the key launched the player instead of the engine doing it.
+	 */
 	bool HandleJumpPressed();
 	void HandleJumpReleased();
+
+	/**
+	 * SERVER ONLY (a no-op anywhere else). A jump really happened; tells EVERY equipped kit, through
+	 * UTraceCharacterAbilitySet::OnJumpPerformed. Never consumes and never refuses anything.
+	 *
+	 * THE THREE CALLERS, which between them are every jump the server sees, from any client:
+	 *
+	 *   ATraceCharacter::OnJumped_Implementation   the movement component committed a jump — ground,
+	 *                                              slide-jump, wall jump. For a REMOTE client this is
+	 *                                              the only thing that reaches the server: an ordinary
+	 *                                              press never calls ServerHandleJumpPressed, it rides
+	 *                                              the saved move as FLAG_JumpPressed and the server
+	 *                                              replays it in MoveAutonomous.
+	 *   UTraceCharacterMovementComponent           the buffered wall jump, the one launch that does not
+	 *     (OnMovementUpdated)                      go through ACharacter::CheckJumpInput / OnJumped.
+	 *   HandleJumpPressed, above                   a kit consumed the press (JET BOOTS, the sticky
+	 *                                              gloves kick, Zip's climb), so no engine jump ran.
+	 *
+	 * The three cannot double up for one press: a consumed press stops the controller before
+	 * ACharacter::Jump, and the buffered wall jump is by construction a press OnJumped refused.
+	 */
+	void NotifyJumpPerformed();
 
 	// =============================================================================================
 	// Movement / combat notifications — called by the slices that own each event
@@ -968,6 +999,10 @@ public:
 	 *
 	 * Re-runs the same HandleJumpPressed() the client ran, so every latch inside a character's hook
 	 * (Rocco's bSecondJumpUsed, Oyster's broken jar) applies on the server too.
+	 *
+	 * *** NOT SENT FOR AN ORDINARY JUMP, so nothing that must hear EVERY jump may hang off it. *** A
+	 * press no kit consumed reaches the server only as the saved move's jump flag; see
+	 * NotifyJumpPerformed for where those are delivered.
 	 */
 	UFUNCTION(Server, Reliable)
 	void ServerHandleJumpPressed();

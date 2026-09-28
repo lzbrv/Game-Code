@@ -26,7 +26,8 @@
 //   GOO      UTraceSlimeStickSubsystem     STICKY GLOVES with no character id gets its goo component.
 //   HUD      the corner's draw record      SPEED BOOST (Rocco passive) and SUSPENDED (Mace movement)
 //                                          under Chut's E; CLOAKED + the owner band from SHIMMER
-//                                          (Elle passive) and from Oyster's DASH CLOAK under Rocco's E.
+//                                          (Elle passive) and from Oyster's DASH CLOAK under Rocco's E
+//                                          (JET BOOTS on movement, through a real jump).
 //
 // THE RED RUN. Every starred assertion was run against the code as it was before this fix (the
 // production files reverted, this file kept), and every one of them failed there. The commit message
@@ -486,22 +487,28 @@ namespace TraceLoadoutMixedKitsVerify
 
 		case 6:
 			// ---- HUD: CLOAKED from Oyster's DASH CLOAK (passive) under Rocco's E ------------------
-			// Through the shipped hooks: a dash ends, then a jump, which is what the passive answers.
+			// Through the shipped hooks: a dash ends, then a REAL jump through the jump binding —
+			// the passive answers a jump that happened (OnJumpPerformed), not a key that went down.
 			//
-			// BLINK on movement, not JET BOOTS, on purpose. Jump presses are offered to the kits in
-			// turn and the first one to USE the press ends the offer, so a movement kit that spends
-			// the jump (Rocco's second jump in the air) keeps it from ever reaching the passive. That
-			// is a real limit of the dash cloak in mixed loadouts and is reported separately; this
-			// check is about the HUD, so it uses a movement ability that never takes the jump.
-			Equip(*Run, Make(ETraceAbilityId::Blink, ETraceAbilityId::DashCloak, ETraceAbilityId::Ripple));
+			// JET BOOTS on movement, and it is the robust choice rather than the risky one now. The
+			// pawn may still be in the air from the SUSPEND scene: there a plain movement kit's press
+			// would be no jump at all (no wall, no second jump) and correctly no cloak, while JET
+			// BOOTS' second jump is a jump, and since the cloak listens to jumps rather than to the
+			// first-consumer press offer, Rocco spending the press no longer hides it from the
+			// passive. On the ground the engine's own jump does the same. Trace.Oyster.DashCloakVerify
+			// is where each of those routes is proven separately.
+			Equip(*Run, Make(ETraceAbilityId::JetBoots, ETraceAbilityId::DashCloak, ETraceAbilityId::Ripple));
 			Abilities->NotifyDashEnded(/*bReachedFullDistance=*/true);
-			Abilities->HandleJumpPressed();
+			if (!Controller->DebugPressJump())
+			{
+				Check(*Run, false, TEXT("DASH CLOAK scene: the jump press reached the pawn (input not suppressed)"));
+			}
 			NextDelay = 0.2f;
 			break;
 
 		case 7:
 		{
-			const ATraceHUD::FFxHudDrawRecord Record = Shot(*HudPtr, TEXT("dashcloak_blink_ripple"));
+			const ATraceHUD::FFxHudDrawRecord Record = Shot(*HudPtr, TEXT("dashcloak_jetboots_ripple"));
 			Check(*Run, Record.ChipText.Contains(TEXT("CLOAKED")),
 				TEXT("*** HUD: Oyster's DASH CLOAK draws the CLOAKED chip ***"));
 			Check(*Run, Record.Vignettes.Contains(TEXT("CLOAK")),

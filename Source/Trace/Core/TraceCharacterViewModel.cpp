@@ -3007,6 +3007,20 @@ void ATraceCharacter::OnJumped_Implementation()
 	// ordering lives in exactly one place; setting the pose from an event handler would put a second
 	// writer on the same clock.
 	bHandsJumpPending = true;
+
+	// THE ABILITIES HEAR THE JUMP HERE, ON THE SERVER, and this is the only place a REMOTE client's
+	// ordinary jump exists there. The owning client's press never calls ServerHandleJumpPressed
+	// unless a kit consumed it — it becomes FLAG_JumpPressed in the saved move, and the server's
+	// MoveAutonomous replays it through ACharacter::CheckJumpInput, which fires this. Hanging "the
+	// player jumped" off the jump KEY instead is what left Oyster's dash cloak working only for the
+	// listen host. Authority only: on the owning client this also fires on correction replays.
+	if (HasAuthority() && TraceAbilityIntegration::IsEnabled())
+	{
+		if (UTraceAbilityComponent* JumpAbilities = UTraceAbilityComponent::Get(this))
+		{
+			JumpAbilities->NotifyJumpPerformed();
+		}
+	}
 }
 
 bool ATraceCharacter::DebugGetHandsState(FString& OutClipName, float& OutTimeSeconds,

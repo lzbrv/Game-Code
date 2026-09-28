@@ -281,10 +281,13 @@ ATraceOysterJar* UTraceAbilitySetOyster::FindOwnJarNear(const FVector& Location)
 bool UTraceAbilitySetOyster::OnDashStarted(const FVector& DashDirection)
 {
 
-	// SLOT GUARD — "every dash leaves a poison jar" is Oyster's PASSIVE line — a different slot from his jar-jump, and both can be equipped at once.
-	// Equipped in another slot, this kit must not run this body: an ability you did not pick
-	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
-	if (!IsSlot(ETraceLoadoutSlot::Passive))
+	// ABILITY GUARD — "every dash leaves a poison jar" is PICKLE JAR, and since Demo 35 it is not the
+	// only Oyster passive: DASH CLOAK shares the slot. IsSlot(Passive) was TRUE for either, so a
+	// player who picked the cloak got the jar trail too — free power nobody chose — and the jar
+	// dropped at his feet as the dash ended was then broken by the jump that should have cloaked
+	// him (TickAbilities' jar-jump poll), whose PublishState wiped the cloak's flag. Only the ability
+	// id can say which passive this is; NoteDashBegan carries the same guard for the poll's route.
+	if (!IsAbility(ETraceAbilityId::PickleJar))
 	{
 		return false;
 	}
@@ -300,10 +303,9 @@ void UTraceAbilitySetOyster::OnDashEnded(bool bReachedFullDistance)
 	DashEndedMatchTime = MatchTimeNow();
 
 
-	// SLOT GUARD — same PASSIVE jar trail as OnDashStarted.
-	// Equipped in another slot, this kit must not run this body: an ability you did not pick
-	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
-	if (!IsSlot(ETraceLoadoutSlot::Passive))
+	// ABILITY GUARD — the same PICKLE JAR trail as OnDashStarted, and the same reason it is not
+	// IsSlot(Passive): DASH CLOAK is a passive too.
+	if (!IsAbility(ETraceAbilityId::PickleJar))
 	{
 		return;
 	}
@@ -316,7 +318,12 @@ void UTraceAbilitySetOyster::NoteDashBegan()
 	// The hook and the poll both call this and either may be first, so a dash already being tracked
 	// is not a second dash. Without this the two routes would arm the debt twice on the frame they
 	// overlap, and the red arm below would drop two jars for one dash.
-	if (!HasAuthority() || bDashTracked)
+	//
+	// AND ONLY FOR PICKLE JAR. This is the one door both routes use to owe a jar, so the ability
+	// guard lives here as well as on the hook: the poll in TickAbilities runs for ANY Oyster kit —
+	// one equipped only for PICKLER on E, or only for DASH CLOAK — and without this it armed the debt
+	// and dropped a jar at the end of every dash for players who never picked the jar trail.
+	if (!HasAuthority() || bDashTracked || !IsAbility(ETraceAbilityId::PickleJar))
 	{
 		return;
 	}
@@ -371,11 +378,11 @@ ATraceOysterJar* UTraceAbilitySetOyster::DebugDropDashJar()
 
 bool UTraceAbilitySetOyster::OnJumpPressed()
 {
-	// THE DASH CLOAK IS A PASSIVE, so it runs BEFORE the movement guard below and never consumes
-	// the press: cloaking is not "using your jump", it is something that happens because you
-	// jumped. Returning true here would eat the jump itself.
-	TryDashCloak();
-
+	// THE DASH CLOAK IS NOT HERE ANY MORE, and it must not come back. This hook is an OFFER that
+	// stops at the first kit to use the press, and it only runs on the server when the owning client
+	// says a kit consumed it — so a cloak hung off it never heard JET BOOTS' second jump (Rocco's
+	// movement kit is offered first and spends it) and never heard a remote client's ordinary jump at
+	// all. It lives in OnJumpPerformed now, which every equipped kit hears for every real jump.
 
 	// SLOT GUARD — "jumping while stood on one of your own jars breaks it and boosts you upward" is Oyster's MOVEMENT line.
 	// Equipped in another slot, this kit must not run this body: an ability you did not pick
@@ -564,6 +571,15 @@ ATraceOysterJar* UTraceAbilitySetOyster::DebugSpawnJarAt(const FVector& Location
 // pick this rework has been unpicking. This one needs nothing but a dash.
 // =================================================================================================
 
+void UTraceAbilitySetOyster::OnJumpPerformed()
+{
+	// "JUMPING directly following a dash" — a jump that HAPPENED, on the server, whichever kit (or
+	// the engine) performed it and whichever machine the player is on. See the base class for what
+	// counts. Nothing is consumed and nothing is refused: the cloak is something that happens because
+	// you jumped, not a use of the jump.
+	TryDashCloak();
+}
+
 void UTraceAbilitySetOyster::TryDashCloak()
 {
 	if (!IsAbility(ETraceAbilityId::DashCloak))
@@ -595,6 +611,18 @@ void UTraceAbilitySetOyster::TryDashCloak()
 	Writable.Flags |= TraceAbilityFlags::EffectActive;
 	Writable.EffectEndMatchTime = CloakEndMatchTime;
 	MarkStateDirty();
+
+	// AND PUSHED NOW. This state rides the PlayerState, which the engine replicates once a second, so
+	// a one-second cloak could reach the other machines anywhere from at once to not at all —
+	// measured on loopback, a remote client saw its own cloak 0.36 s and 0.43 s after the jump, and
+	// the players it is meant to hide him from are on the same clock. At most once per dash, so the
+	// forced update costs nothing; the end needs no push, because every reader compares the
+	// replicated deadline against the match clock.
+	if (APlayerState* CloakOwnerState = (GetAbilityComponent() != nullptr)
+		? GetAbilityComponent()->GetOwningPlayerState() : nullptr)
+	{
+		CloakOwnerState->ForceNetUpdate();
+	}
 
 	// ONE DASH, ONE CLOAK. Without this a player could jump repeatedly inside the window and keep
 	// re-arming it, which turns a one second cloak into a permanent one at no cost.
@@ -714,9 +742,14 @@ void UTraceAbilitySetOyster::PublishState()
 		return;
 	}
 
+	// ONLY THE JAR BIT IS THIS FUNCTION'S. It used to assign the whole byte, which was harmless while
+	// jars were the only thing Oyster published — but EffectActive in the same byte is the DASH
+	// CLOAK now, and every jar spawned, broken or cleared while he was cloaked switched the cloak off
+	// on every machine a fraction of a second after it went up.
 	FTraceAbilityNetState& NetState = MutableState();
 	NetState.Stacks = static_cast<uint8>(FMath::Clamp(GetLiveJarCount(), 0, 255));
-	NetState.Flags = (NetState.Stacks > 0) ? TraceAbilityFlags::AuxActive : 0;
+	NetState.Flags = static_cast<uint8>((NetState.Flags & ~TraceAbilityFlags::AuxActive)
+		| ((NetState.Stacks > 0) ? TraceAbilityFlags::AuxActive : 0));
 	MarkStateDirty();
 }
 

@@ -96,6 +96,10 @@ public:
 	 * backstop for any dash that ends without the hook firing, e.g. the clock being cleared out from
 	 * under it) cannot between them produce two jars for one dash.
 	 *
+	 * PICKLE JAR ONLY, by ability id: since Demo 35 DASH CLOAK is an Oyster passive too, so "am I in
+	 * the passive slot" no longer means "did the player pick the jar trail". NoteDashBegan carries
+	 * the same guard, because the poll reaches it for any Oyster kit.
+	 *
 	 * "including WHILE CARRYING THE CORE" — there is deliberately no carrier test on Oyster's own
 	 * side of this. The choke point governs what a jar does to other players, never what Oyster is
 	 * allowed to do while holding the Core.
@@ -114,6 +118,15 @@ public:
 	 * applies the boost on the way up, and the two share one latch so a press cannot boost twice.
 	 */
 	virtual bool OnJumpPressed() override;
+
+	// --- PASSIVE: the dash cloak -------------------------------------------------------------------
+
+	/**
+	 * SERVER. A jump happened (UTraceAbilityComponent::NotifyJumpPerformed) — ground or air, the
+	 * engine's or a kit's, from any client. Starts the dash cloak if it followed a dash closely enough.
+	 * NOT OnJumpPressed: see the note at the top of that function for the two ways that lost jumps.
+	 */
+	virtual void OnJumpPerformed() override;
 
 	// --- ACTIVATED: Pickler ----------------------------------------------------------------------------
 
@@ -242,7 +255,7 @@ private:
 	/** What the cloak look was last set to, so the material work happens on edges only. */
 	bool bCloakVisualApplied = false;
 
-	/** Starts the cloak if this jump followed a dash closely enough. Called from OnJumpPressed. */
+	/** Starts the cloak if this jump followed a dash closely enough. Called from OnJumpPerformed. */
 	void TryDashCloak();
 
 	/** Expires the cloak and keeps the visual in step. Called from TickAbilities. */

@@ -1745,6 +1745,12 @@ void ATracePlayerController::OnJumpStarted()
 		// report), so the local write alone would be corrected away within a round trip; running the
 		// identical hook on both ends is what makes it survive. This is a documented limitation, not
 		// a claim of prediction correctness.
+		//
+		// *** ONLY A CONSUMED PRESS IS SENT. *** An ordinary jump reaches the server as the saved
+		// move's jump flag and nothing else, so an ability that must hear EVERY jump cannot listen
+		// here — it listens to UTraceCharacterAbilitySet::OnJumpPerformed, which the server raises
+		// from ATraceCharacter::OnJumped (and from HandleJumpPressed for a consumed press). Oyster's
+		// dash cloak listened here, and worked only for the listen host because of it.
 		UTraceAbilityComponent* Abilities = TraceAbilityIntegration::IsEnabled()
 			? UTraceAbilityComponent::Get(TraceChar) : nullptr;
 		if (Abilities != nullptr)
@@ -1766,6 +1772,17 @@ void ATracePlayerController::OnJumpStarted()
 		TraceChar->Jump();
 	}
 }
+
+#if !UE_BUILD_SHIPPING
+bool ATracePlayerController::DebugPressJump()
+{
+	// Answered BEFORE the press, from the same two gates OnJumpStarted applies, so a harness can tell
+	// "the press was swallowed" from "the press reached the pawn and nothing came of it".
+	const bool bReachesPawn = !bGameInputSuppressed && (GetLivingCharacter() != nullptr);
+	OnJumpStarted();
+	return bReachesPawn;
+}
+#endif
 
 void ATracePlayerController::OnJumpCompleted()
 {

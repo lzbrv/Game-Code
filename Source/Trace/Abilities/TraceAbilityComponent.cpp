@@ -2650,7 +2650,36 @@ bool UTraceAbilityComponent::HandleJumpPressed()
 	// why Activated outranks Movement here. Before this, only the Activated kit was asked, so a
 	// player who picked Rocco for his second jump and anyone else for their E simply could not
 	// double jump: the press went to a kit that had no opinion and stopped there.
-	return OfferUntilConsumed(*this, [](UTraceCharacterAbilitySet* Set) { return Set->OnJumpPressed(); });
+	const bool bConsumed =
+		OfferUntilConsumed(*this, [](UTraceCharacterAbilitySet* Set) { return Set->OnJumpPressed(); });
+
+	// A CONSUMED PRESS IS A JUMP THE ENGINE NEVER SEES. The controller stops before ACharacter::Jump
+	// when this returns true, so ATraceCharacter::OnJumped — where every other jump is reported —
+	// cannot fire for it, and the kits further down the offer (the passive, always) have not been
+	// asked. This is the report for that jump. On a remote client's machine it is a no-op; the same
+	// press re-runs here on the server through ServerHandleJumpPressed and reports there.
+	if (bConsumed)
+	{
+		NotifyJumpPerformed();
+	}
+	return bConsumed;
+}
+
+void UTraceAbilityComponent::NotifyJumpPerformed()
+{
+	// SERVER ONLY. On the owning client the engine's jump runs again on every correction replay, and
+	// a remote client's own copy is not the fact anyway — the server's replay of its saved move is.
+	if (!HasAuthorityOwner())
+	{
+		return;
+	}
+
+	++TraceAbilityIntegration::Counters().JumpPerformed;
+
+	// EVERY KIT, and nothing can stop the fan-out: this is a notification, not an offer. The one
+	// shipped listener is Oyster's dash cloak (a PASSIVE), which is exactly the slot the first-consumer
+	// offer in HandleJumpPressed reaches last and a movement kit's jump never let it reach at all.
+	ForEachEquipped(EquippedSets, [](UTraceCharacterAbilitySet* Set) { Set->OnJumpPerformed(); });
 }
 
 void UTraceAbilityComponent::HandleJumpReleased()

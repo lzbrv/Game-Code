@@ -620,6 +620,19 @@ public:
 
 	int32 GetDebugReloadPressCount() const { return DebugReloadPressCount; }
 
+#if !UE_BUILD_SHIPPING
+	/**
+	 * HARNESS. Presses jump through the bound handler itself (OnJumpStarted) — the ability offer, the
+	 * Server RPC for a consumed press and ACharacter::Jump, exactly as the key does. Trace.Oyster.
+	 * DashCloakVerify needs the whole path, because the bug it guards lived in how that handler
+	 * decides what the SERVER hears.
+	 *
+	 * Returns false when the press could not reach a pawn (input suppressed by a menu, or no living
+	 * pawn): a swallowed press must fail a run loudly rather than look like a jump that did nothing.
+	 */
+	bool DebugPressJump();
+#endif
+
 	FVector2D DebugLastMoveValue = FVector2D::ZeroVector;
 	FVector2D DebugLastLookValue = FVector2D::ZeroVector;
 

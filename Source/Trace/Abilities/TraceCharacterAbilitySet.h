@@ -366,6 +366,28 @@ public:
 	virtual void OnJumpReleased() {}
 
 	/**
+	 * SERVER ONLY. A jump HAPPENED — not "the key went down", and not "a kit claimed the key".
+	 *
+	 * *** A NOTIFICATION, NOT A CLAIM. *** It returns nothing and EVERY equipped kit hears it, which
+	 * is the difference from OnJumpPressed above. OnJumpPressed is an offer that stops at the first
+	 * kit to use the press, so a passive that hung off it (Oyster's dash cloak, until this existed)
+	 * never heard a jump that a movement kit had spent — JET BOOTS' second jump — and, because the
+	 * server only re-runs OnJumpPressed when the owning client says a kit CONSUMED the press, it
+	 * never heard a remote client's ordinary jump at all. Anything that wants "the player jumped"
+	 * belongs here.
+	 *
+	 * WHAT COUNTS, delivered by UTraceAbilityComponent::NotifyJumpPerformed: every jump the movement
+	 * component committed (ground, slide-jump, wall jump — ACharacter::OnJumped, plus the buffered
+	 * wall jump that bypasses it), and every press a kit consumed on the server (JET BOOTS, the
+	 * sticky-gloves kick, Zip's climb). A press that produced nothing — mid-air, no wall, no kit —
+	 * is not a jump and is not delivered.
+	 *
+	 * Server only because the movement jump is only a FACT on the server: a client's own copy runs
+	 * again on every correction replay, and a remote client's press never runs on the server at all.
+	 */
+	virtual void OnJumpPerformed() {}
+
+	/**
 	 * A dash is starting, in @p DashDirection (normalised, world space). Oyster drops a jar here —
 	 * "at the start of every dash, including while carrying the Core". Chut arms his bash here.
 	 * Return true to CANCEL the dash (nothing needs to today).
