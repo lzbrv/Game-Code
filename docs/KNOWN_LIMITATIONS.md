@@ -423,6 +423,15 @@ with a deliberately nonexistent path, which cooked to `Success - 0 error(s), 6 w
 the log. So this line is safe on a clone that never ran the import. And **whoever builds the artefact
 must still run `Scripts/import-mannequin.sh` first**, because the art is gitignored.
 
+**A FIFTH, found 2026-09-28: every package built before then is silent and carries a cube for a
+knife.** `/Game/Trace/Audio` and `/Game/Trace/Art/Pack/Knife` are loaded by path as well, and neither
+was in `DirectoriesToAlwaysCook`, so the game ran its no-sound and procedural-knife fallbacks. Fixed in
+`Config/DefaultGame.ini`, together with `Config/Mac/MacEngine.ini`, which stops a packaged Mac build
+killing itself with `SIGUSR2` once it has sound. **This class is now gated:** `Scripts/package.sh`
+fails any package whose staged manifest is missing a directory the game loads by path, or any package
+in one (gate 4; `Scripts/package.sh --verify-cook` checks the last build on its own). That covers
+`/Game/Characters` on a clone that never ran the import, too.
+
 **What is still true, and worth keeping:** `Scripts/build.sh --prove-shipping` on its own still proves
 only that the target links. Linking is not shipping. Use `Scripts/package.sh` for the artefact, and
 read `docs/PLAYTEST.md` before sending it to anybody.

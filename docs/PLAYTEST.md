@@ -708,7 +708,27 @@ deliberately absent needle at 0 in both, so neither result is an artefact of the
 **If you still see that banner in a build you made**, you did not run `Scripts/import-mannequin.sh`
 before packaging. The art is gitignored, so a fresh clone has none of it.
 
-### 8.5 Things about a packaged build that will confuse you
+### 8.5 Sound and the knife were not in the package until 2026-09-28
+
+**Every Mac package built before 2026-09-28 (commit `dbddf7c`) is silent and carries a cube instead of
+the knife.** Nothing a player does fixes that build; send a new one. The quick check on an old build: the knife in
+your hand is a plain cube, and firing makes no sound. (`Scripts\package.bat` has never been run, so there
+are no Windows packages to worry about; one built from an older tree would have the same defect.)
+
+Same cause as §8.4. `/Game/Trace/Audio` (the sound bank and every sound) and
+`/Game/Trace/Art/Pack/Knife` (the knife mesh and its animations) are loaded by path, the cooker cannot
+see a load by path, and neither directory was in `DirectoriesToAlwaysCook`. The game noticed, logged
+it and ran its fallbacks, so nothing failed. Fixed in `Config/DefaultGame.ini`; the comment above
+`DirectoriesToAlwaysCook` has the measurements. Shipping sound then exposed an engine trap that killed
+a packaged Mac build 10-15 s after launch whenever its audio thread stalled; `Config/Mac/MacEngine.ini`
+stops that. Do not remove that file.
+
+**`Scripts/package.sh` now refuses a build like that.** Gate 4 compares the staged manifest with the
+disk for every directory the game loads by path and fails the package, with no zip, if one is missing
+or incomplete. That includes `/Game/Characters` when `Scripts/import-mannequin.sh` was not run. To
+check the last build without packaging again: `Scripts/package.sh --verify-cook`.
+
+### 8.6 Things about a packaged build that will confuse you
 
 * **A Shipping build ignores a map or a server address on the command line.** That is the engine, not
   this project: `UGameInstance::StartGameInstance` blanks the command line in Shipping unless

@@ -44,6 +44,8 @@ DO_COOK=1
 DO_BUILD=1
 DO_ITERATE=0
 DO_DIST=1
+DO_VERIFY_COOK_ONLY=0
+MANIFEST=""
 EXTRA_ARGS=()
 
 # Default output lives outside the repo tree's committed paths. Saved/ is already
@@ -77,12 +79,19 @@ OPTIONS
       --no-dist           Do not build the sendable zip afterwards. The bare .app
                           is then all you get, and the .app ON ITS OWN IS NOT
                           SENDABLE — see Scripts/package-mac-dist.sh for why.
+      --verify-cook       Run nothing. Only check that the LAST staged build holds
+                          every directory the game loads by path (gate 4 below),
+                          and exit 0 or 1.
+      --manifest <file>   The staged manifest gate 4 reads. Default:
+                          Saved/StagedBuilds/<Platform>/Manifest_UFSFiles_<Platform>.txt
   -n, --dry-run           Print the command that would run; run nothing
   -h, --help              This text
 
 ENVIRONMENT
   UE_ROOT                 Engine install to use. Default on macOS:
                           /Users/Shared/Epic Games/UE_${TRACE_ENGINE_VERSION}
+  TRACE_SKIP_COOK_CHECK=1 Skip gate 4. Only if you MEAN to ship without sound,
+                          the knife or the character art.
 
 WHAT COMES OUT
   macOS:  <output>/Mac/${TRACE_PROJECT_NAME}-Mac-<Config>.app   — double-clickable bundle
@@ -93,7 +102,7 @@ WHAT COMES OUT
   does not read anything out of your engine install or this repository.
 
 HOW IT DECIDES IT WORKED
-  Three gates, all of which must pass, because none of them is sufficient alone:
+  Four gates, all of which must pass, because none of them is sufficient alone:
     1. RunUAT exits 0.
     2. RunUAT printed the literal string "BUILD SUCCESSFUL". UnrealBuildTool has
        been observed exiting 0 after a segfault with no verdict line at all (see
@@ -101,6 +110,11 @@ HOW IT DECIDES IT WORKED
     3. The finished bundle exists AND contains cooked content. This is the gate
        that matters: gates 1 and 2 both passed historically on builds that
        produced no cooked content whatsoever and therefore could not start.
+    4. Every directory the game loads BY PATH is in the staged build, every
+       package of it. The cooker cannot see a load by path, so a directory
+       missing from DirectoriesToAlwaysCook ships nothing and the game quietly
+       runs its C++ fallback. Packages built before 2026-09-28 were silent and
+       drew a cube for a knife because of exactly this.
 
 EXAMPLES
   Scripts/package.sh                                # Shipping Mac build, default output
@@ -130,6 +144,8 @@ while [ $# -gt 0 ]; do
         --skip-build)  DO_BUILD=0; shift ;;
         --iterate)     DO_ITERATE=1; shift ;;
         --no-dist)     DO_DIST=0; shift ;;
+        --verify-cook) DO_VERIFY_COOK_ONLY=1; shift ;;
+        --manifest)    [ $# -ge 2 ] || trace_die "--manifest needs a value"; MANIFEST="$2"; shift 2 ;;
         -n|--dry-run)  TRACE_DRY_RUN=1; shift ;;
         -h|--help)     usage; exit 0 ;;
         --)            shift; while [ $# -gt 0 ]; do EXTRA_ARGS+=("$1"); shift; done ;;
@@ -173,8 +189,127 @@ if [ "$PLATFORM" != "$TRACE_HOST_PLATFORM" ]; then
     exit 2
 fi
 
+# ------------------------------------------------------------------------------
+# GATE 4 — EVERY DIRECTORY THE GAME LOADS BY PATH IS IN THE PACKAGE.
+#
+# Gate 3 proves the bundle holds SOME cooked content. It passed on every package
+# built before 2026-09-28, and every one of them was SILENT and drew a CUBE where
+# the knife should be: /Game/Trace/Audio and /Game/Trace/Art/Pack/Knife are
+# only ever loaded by PATH (LoadObject / TryLoad / soft references), the cooker
+# cannot see a load by path, and neither directory was in DirectoriesToAlwaysCook.
+# The game noticed, logged it and ran its C++ fallbacks, exactly as designed - so
+# nothing failed and nobody knew until somebody listened to a package. The same
+# thing had already happened once to /Game/Characters (2026-09-04).
+#
+# So check the staged manifest (the list of every file UAT put in the build)
+# against the disk: for each directory, EVERY .uasset/.umap under it must be
+# staged, and at least one must exist. The directories come from two places on
+# purpose - the list below AND the +DirectoriesToAlwaysCook lines in
+# Config/DefaultGame.ini - so deleting an ini line cannot also delete its check.
+# The comment above those ini lines says which system loads each one.
+#
+# A directory that is not on disk at all fails too. That is /Game/Characters on a
+# clone that never ran Scripts/import-mannequin.sh (the art is gitignored), and a
+# package made there ships every player as a fallback primitive under a red
+# CHARACTER ART NOT INSTALLED banner that a playtester cannot act on.
+#
+# Skip with TRACE_SKIP_COOK_CHECK=1.
+# ------------------------------------------------------------------------------
+PATH_LOADED_DIRS="/Engine/BasicShapes /Game/Trace/Input /Game/Trace/Data /Game/Trace/UI
+/Game/Trace/Materials /Game/Characters /Game/Trace/Audio /Game/Trace/Art/Pack/Knife"
+
+trace_check_cooked_dirs() {
+    local Manifest="$1"
+    local Work Dirs Dir Rel DiskRoot Prefix NDisk NStaged NMissing Failed=0
+
+    if [ "${TRACE_SKIP_COOK_CHECK:-0}" = "1" ]; then
+        trace_warn "TRACE_SKIP_COOK_CHECK=1: NOT checking that sound, the knife and the character"
+        trace_warn "art are in this build."
+        return 0
+    fi
+    if [ ! -f "$Manifest" ]; then
+        trace_err "No staged manifest at: ${Manifest}"
+        trace_err "Cannot tell whether the build holds the directories the game loads by path."
+        return 1
+    fi
+
+    Work="$(mktemp -d -t trace-cookcheck)"
+    cut -f1 "$Manifest" | LC_ALL=C sort -u > "${Work}/staged"
+    Dirs="$( { for Dir in $PATH_LOADED_DIRS; do echo "$Dir"; done
+               grep -Eo '^\+DirectoriesToAlwaysCook=\(Path="[^"]+"\)' "${TRACE_PROJECT_ROOT}/Config/DefaultGame.ini" 2>/dev/null \
+                   | sed -E 's/.*Path="([^"]+)".*/\1/'; } | awk 'NF && !seen[$0]++' )"
+
+    trace_msg "Directories the game loads by path, against ${Manifest}:"
+    for Dir in $Dirs; do
+        case "$Dir" in
+            /Game/*)   Rel="${Dir#/Game/}";   DiskRoot="${TRACE_PROJECT_ROOT}/Content/${Rel}"; Prefix="${TRACE_PROJECT_NAME}/Content/${Rel}/" ;;
+            /Engine/*) Rel="${Dir#/Engine/}"; DiskRoot="${UE_ROOT}/Engine/Content/${Rel}";   Prefix="Engine/Content/${Rel}/" ;;
+            *) trace_warn "  ${Dir}: not a /Game or /Engine path; not checked."; continue ;;
+        esac
+        # Packages on disk, spelled the way the manifest spells them.
+        : > "${Work}/disk"
+        if [ -d "$DiskRoot" ]; then
+            ( cd "$DiskRoot" && find . -type f \( -name '*.uasset' -o -name '*.umap' \) ) \
+                | sed -e 's#^\./##' -e "s#^#${Prefix}#" | LC_ALL=C sort -u > "${Work}/disk"
+        fi
+        awk -v p="$Prefix" 'index($0, p) == 1 && /\.(uasset|umap)$/' "${Work}/staged" > "${Work}/here"
+        LC_ALL=C comm -23 "${Work}/disk" "${Work}/here" > "${Work}/missing"
+        NDisk="$(wc -l < "${Work}/disk" | tr -d ' ')"
+        NStaged="$(wc -l < "${Work}/here" | tr -d ' ')"
+        NMissing="$(wc -l < "${Work}/missing" | tr -d ' ')"
+
+        if [ "$NDisk" = "0" ] && [ "$NStaged" = "0" ]; then
+            trace_err "  ${Dir}: NOT IN THE BUILD, and not on disk either (${DiskRoot})."
+            if [ "$Dir" = "/Game/Characters" ]; then
+                trace_err "      Run Scripts/import-mannequin.sh, then package again. The art is gitignored."
+            fi
+            Failed=1
+        elif [ "$NStaged" = "0" ]; then
+            trace_err "  ${Dir}: NOT IN THE BUILD - 0 of ${NDisk} packages on disk were staged."
+            Failed=1
+        elif [ "$NMissing" != "0" ]; then
+            trace_err "  ${Dir}: ${NMissing} of ${NDisk} packages on disk were NOT staged:"
+            sed -e 's#^#        #' "${Work}/missing" | head -8 >&2
+            if [ "$NMissing" -gt 8 ]; then trace_err "        ... and $((NMissing - 8)) more"; fi
+            Failed=1
+        elif [ "$NDisk" = "0" ]; then
+            trace_msg "  ${Dir}: ${NStaged} staged (nothing on disk here to compare with)"
+        else
+            trace_msg "  ${Dir}: ${NStaged} staged, all ${NDisk} on disk"
+        fi
+    done
+    rm -rf "$Work"
+
+    if [ "$Failed" = "1" ]; then
+        trace_err ""
+        trace_err "The game loads these by PATH, which the cooker cannot see; only"
+        trace_err "+DirectoriesToAlwaysCook in Config/DefaultGame.ini puts them in a package. Without"
+        trace_err "them the build runs its fallbacks: no sound, a cube for a knife, placeholder bodies."
+        trace_err "Put the directory back in DirectoriesToAlwaysCook (read the comment above those"
+        trace_err "lines), or restore the files, and package again. This build is NOT fit to send."
+        return 1
+    fi
+    return 0
+}
+
 trace_require_uproject
 trace_resolve_engine
+
+# Where UAT stages the build, and so where gate 4 reads the manifest. A
+# -stagingdirectory= passed through after `--` moves it.
+STAGE_ROOT="${TRACE_PROJECT_ROOT}/Saved/StagedBuilds"
+for Arg in ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}; do
+    case "$Arg" in -stagingdirectory=*) STAGE_ROOT="${Arg#-stagingdirectory=}" ;; esac
+done
+[ -n "$MANIFEST" ] || MANIFEST="${STAGE_ROOT}/${PLATFORM}/Manifest_UFSFiles_${PLATFORM}.txt"
+
+if [ "$DO_VERIFY_COOK_ONLY" = "1" ]; then
+    if [ -f "$MANIFEST" ]; then
+        trace_msg "Checking the staged build from $(date -r "$MANIFEST" '+%Y-%m-%d %H:%M' 2>/dev/null || echo 'an earlier run')."
+    fi
+    if trace_check_cooked_dirs "$MANIFEST"; then exit 0; else exit 1; fi
+fi
+
 trace_check_toolchain
 
 RUNUAT="${UE_ROOT}/Engine/Build/BatchFiles/RunUAT.sh"
@@ -241,6 +376,20 @@ trace_msg "This is slow — a first cook of this project takes tens of minutes. 
 mkdir -p "$OUTPUT" 2>/dev/null || true
 
 START="$(date +%s)"
+# Gate 4 must read THIS run's manifest, not one an earlier package left behind.
+COOK_STAMP="$(mktemp -t trace-package-start)"
+trap 'rm -f "$COOK_STAMP"' EXIT
+
+# Gate 4, run after the build is on disk. See trace_check_cooked_dirs.
+trace_gate_cooked_dirs() {
+    if [ "${TRACE_SKIP_COOK_CHECK:-0}" != "1" ] && [ ! "$MANIFEST" -nt "$COOK_STAMP" ]; then
+        trace_err "The staged manifest was not written by this run, so it describes an older build:"
+        trace_err "  ${MANIFEST}"
+        trace_err "If you staged somewhere else, pass --manifest <file> or -- -stagingdirectory=<dir>."
+        return 1
+    fi
+    trace_check_cooked_dirs "$MANIFEST"
+}
 
 # ------------------------------------------------------------------------------
 # GATE 1 and GATE 2 — exit code, and RunUAT's own verdict line.
@@ -341,6 +490,13 @@ if [ "$PLATFORM" = "Mac" ]; then
         exit 1
     fi
 
+    # GATE 4 — sound, the knife, the character art: everything loaded by path.
+    if ! trace_gate_cooked_dirs; then
+        trace_err "Bundle: ${APP}"
+        trace_err "Full log kept at: ${PACKAGE_LOG}"
+        exit 1
+    fi
+
     SIZE="$(du -sh "$APP" 2>/dev/null | cut -f1 | tr -d ' ')"
     trace_msg "Success in ${ELAPSED}s."
     trace_msg "Bundle:  ${TRACE_C_BOLD}${APP}${TRACE_C_OFF}  (${SIZE})"
@@ -352,7 +508,7 @@ if [ "$PLATFORM" = "Mac" ]; then
 
     rm -f "$PACKAGE_LOG"
 
-    # ---- GATE 4 — THE ARTEFACT YOU CAN ACTUALLY SEND ------------------------------------------
+    # ---- GATE 5 — THE ARTEFACT YOU CAN ACTUALLY SEND ------------------------------------------
     #
     # THIS USED TO BE A WARNING AND THAT WAS NOT ENOUGH. The script printed
     # "the bundle is ad-hoc signed, see docs/PLAYTEST.md" and the owner's
@@ -395,6 +551,11 @@ if [ "$PLATFORM" = "Mac" ]; then
     trace_msg "      (A ${TRACE_DEFAULT_MAP}?listen URL on the command line does NOT host a"
     trace_msg "       packaged build — it lands on the title menu and binds nothing.)"
 else
+    # GATE 4 on the other hosts too: the cook set is platform-neutral.
+    if ! trace_gate_cooked_dirs; then
+        trace_err "Full log kept at: ${PACKAGE_LOG}"
+        exit 1
+    fi
     rm -f "$PACKAGE_LOG"
     trace_msg "Success in ${ELAPSED}s. Build archived under ${OUTPUT}."
 fi
