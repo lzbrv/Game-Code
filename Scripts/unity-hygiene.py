@@ -162,6 +162,20 @@ def load_baseline():
         }
 
 
+def repo_path(path, root=ROOT, pathmod=os.path):
+    """
+    `path` relative to the repo, ALWAYS with forward slashes.
+
+    The baseline is shared by both machines, so its keys must not depend on the
+    OS that runs the check. os.path.relpath answers `Source\\Trace\\...` on
+    Windows, which matched none of the baselined lines, so Ranen's pre-commit
+    hook refused every commit with "7 NEW file-scope `using namespace`
+    directive(s)" - blaming directives nobody had added. `pathmod` exists so a
+    Mac can prove the Windows answer: pass ntpath with a Windows-style path.
+    """
+    return pathmod.relpath(path, root).replace(pathmod.sep, "/")
+
+
 def main():
     write_baseline = "--write-baseline" in sys.argv
 
@@ -172,7 +186,7 @@ def main():
                 continue
             path = os.path.join(dirpath, name)
             for line_no, text in scan(path):
-                rel = os.path.relpath(path, ROOT)
+                rel = repo_path(path)
                 # Keyed on FILE plus the directive, not the line number: a directive
                 # that merely moved down the file is the same one, and a baseline
                 # that churns on every unrelated edit is a baseline nobody trusts.
