@@ -2121,6 +2121,7 @@ namespace TraceSlimeballVerify
 		{
 			UE_LOG(LogTraceGame, Warning,
 				TEXT("[SLIME] no authoritative game world — run this on the server, in a live match."));
+			TraceVerifyLock::Release(TEXT("Trace.Slimeball.Verify"));
 			return;
 		}
 
@@ -2131,7 +2132,10 @@ namespace TraceSlimeballVerify
 			TEXT("[SLIME] ===== spec v18 §2: the two stuck passives, the 35%% slow (with spec §4's carrier rule), "
 			     "and 'can be shot through'. Every arm is RED FIRST. ====="));
 
-		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		// The subject is released on the tick that ends this run, however it ends — see
+		// TraceVerifyLock::ReleaseWhenFinished. Before, it was held to its 60 s deadline.
+		FTSTicker::GetCoreTicker().AddTicker(TraceVerifyLock::ReleaseWhenFinished(TEXT("Trace.Slimeball.Verify"),
+			FTickerDelegate::CreateLambda(
 			[State, WeakWorld = TWeakObjectPtr<UWorld>(WorldPtr)](float) -> bool
 		{
 			UWorld* TickWorld = WeakWorld.Get();
@@ -2237,7 +2241,7 @@ namespace TraceSlimeballVerify
 			State->List.Report();
 			RestoreAllArms();
 			return false;
-		}), 0.25f);
+		})), 0.25f);
 	}
 
 	// =============================================================================================

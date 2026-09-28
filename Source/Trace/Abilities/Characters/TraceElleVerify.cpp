@@ -568,6 +568,7 @@ namespace TraceElleVerify
 		if (WorldPtr == nullptr)
 		{
 			UE_LOG(LogTraceGame, Warning, TEXT("[ELLEVERIFY] no authoritative game world — run this on the server."));
+			TraceVerifyLock::Release(TEXT("Trace.Elle.Verify"));
 			return;
 		}
 		UnpauseAndReport(WorldPtr, TEXT("ELLEVERIFY"));
@@ -588,7 +589,10 @@ namespace TraceElleVerify
 		State->PhaseStartReal = FPlatformTime::Seconds();
 		State->AcquireDeadline = State->PhaseStartReal + 120.0;
 
-		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		// The subject is released on the tick that ends this run, however it ends — see
+		// TraceVerifyLock::ReleaseWhenFinished. Before, it was held to its 60 s deadline.
+		FTSTicker::GetCoreTicker().AddTicker(TraceVerifyLock::ReleaseWhenFinished(TEXT("Trace.Elle.Verify"),
+			FTickerDelegate::CreateLambda(
 			[State, WeakWorld = TWeakObjectPtr<UWorld>(WorldPtr)](float) -> bool
 		{
 			UWorld* TickWorld = WeakWorld.Get();
@@ -1171,7 +1175,7 @@ namespace TraceElleVerify
 				UE_LOG(LogTraceGame, Error, TEXT("[ELLEVERIFY] VERDICT: *** FAIL *** (%d)"), State->Failed);
 			}
 			return false;
-		}));
+		})));
 	}
 
 	// =============================================================================================

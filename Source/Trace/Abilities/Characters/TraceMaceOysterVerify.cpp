@@ -591,6 +591,7 @@ namespace TraceMaceOysterVerify
 		if (WorldPtr == nullptr)
 		{
 			UE_LOG(LogTraceGame, Warning, TEXT("[OYSTERVERIFY] no authoritative game world — run this on the server."));
+			TraceVerifyLock::Release(TEXT("Trace.Oyster.Verify"));
 			return;
 		}
 		UnpauseAndReport(WorldPtr, TEXT("OYSTERVERIFY"));
@@ -611,7 +612,10 @@ namespace TraceMaceOysterVerify
 			Settings.OysterPicklerPullSpeed, Settings.OysterPicklerPullRadiusUU,
 			Settings.OysterPicklerCooldownSeconds);
 
-		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		// The subject is released on the tick that ends this run, however it ends — see
+		// TraceVerifyLock::ReleaseWhenFinished. Before, it was held to its 60 s deadline.
+		FTSTicker::GetCoreTicker().AddTicker(TraceVerifyLock::ReleaseWhenFinished(TEXT("Trace.Oyster.Verify"),
+			FTickerDelegate::CreateLambda(
 			[State, WeakWorld = TWeakObjectPtr<UWorld>(WorldPtr)](float) -> bool
 		{
 			UWorld* TickWorld = WeakWorld.Get();
@@ -801,12 +805,33 @@ namespace TraceMaceOysterVerify
 					return true;
 				}
 
-				State->Victim = Enemies[0];
-				if (Enemies[0]->Health != nullptr)
+				// NOT THE CORE CARRIER. He is immune to Control by design (spec §4), so poisoning him
+				// measures the choke point, not the poison. Enemies[0] used to be taken blind, and in a
+				// batch this runs straight after Trace.Elle.Verify, whose last phase hands the Core to
+				// an enemy: the jar poisoned nobody and three correct checks reported the poison broken.
+				ATraceCharacter* PoisonTarget = nullptr;
+				for (ATraceCharacter* Enemy : Enemies)
 				{
-					Enemies[0]->Health->ResetHealth();
+					if (!UTraceAbilityComponent::IsCarrier(Enemy))
+					{
+						PoisonTarget = Enemy;
+						break;
+					}
 				}
-				if (ATraceOysterJar* JarActor = OysterSet->DebugSpawnJarAt(FeetOf(Enemies[0]), false))
+				if (PoisonTarget == nullptr)
+				{
+					State->Check(false, TEXT("a living enemy who is NOT the Core carrier exists to poison — the carrier "
+					                         "is immune to Control, so without one the poison numbers are untested"));
+					State->Phase = 8;
+					return true;
+				}
+
+				State->Victim = PoisonTarget;
+				if (PoisonTarget->Health != nullptr)
+				{
+					PoisonTarget->Health->ResetHealth();
+				}
+				if (ATraceOysterJar* JarActor = OysterSet->DebugSpawnJarAt(FeetOf(PoisonTarget), false))
 				{
 					JarActor->ServerBreakNow(TEXT("harness: poison arithmetic"));
 				}
@@ -864,7 +889,7 @@ namespace TraceMaceOysterVerify
 			UE_LOG(LogTraceGame, Display, TEXT("[OYSTERVERIFY] VERDICT: %s"),
 				(State->Failed == 0 && State->Passed > 0) ? TEXT("PASS") : TEXT("*** FAIL ***"));
 			return false;
-		}));
+		})));
 	}
 
 	FAutoConsoleCommand CmdOysterVerify(
@@ -971,6 +996,7 @@ namespace TraceMaceOysterVerify
 		if (WorldPtr == nullptr)
 		{
 			UE_LOG(LogTraceGame, Warning, TEXT("[MACEVERIFY] no authoritative game world — run this on the server."));
+			TraceVerifyLock::Release(TEXT("Trace.Mace.Verify"));
 			return;
 		}
 		UnpauseAndReport(WorldPtr, TEXT("MACEVERIFY"));
@@ -991,7 +1017,10 @@ namespace TraceMaceOysterVerify
 			Settings.MaceSpikeArriveRadiusUU, Settings.MaceSpikeCooldownSeconds,
 			Settings.AirStrafeHardCapSpeed, Settings.AirStrafeAsymptoteScale, Settings.MaceSpikePullSpeedMultiplier);
 
-		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		// The subject is released on the tick that ends this run, however it ends — see
+		// TraceVerifyLock::ReleaseWhenFinished. Before, it was held to its 60 s deadline.
+		FTSTicker::GetCoreTicker().AddTicker(TraceVerifyLock::ReleaseWhenFinished(TEXT("Trace.Mace.Verify"),
+			FTickerDelegate::CreateLambda(
 			[State, WeakWorld = TWeakObjectPtr<UWorld>(WorldPtr)](float) -> bool
 		{
 			UWorld* TickWorld = WeakWorld.Get();
@@ -1370,7 +1399,7 @@ namespace TraceMaceOysterVerify
 			UE_LOG(LogTraceGame, Display, TEXT("[MACEVERIFY] VERDICT: %s"),
 				(State->Failed == 0 && State->Passed > 0) ? TEXT("PASS") : TEXT("*** FAIL ***"));
 			return false;
-		}));
+		})));
 	}
 
 	FAutoConsoleCommand CmdMaceVerify(

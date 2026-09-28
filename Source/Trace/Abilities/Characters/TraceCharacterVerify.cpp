@@ -411,6 +411,7 @@ namespace TraceCharacterVerify
 		if (WorldPtr == nullptr)
 		{
 			UE_LOG(LogTraceGame, Error, TEXT("[ROCCO] no authoritative world — server only."));
+			TraceVerifyLock::Release(TEXT("Trace.Rocco.Verify"));   // no verdict is coming to release it
 			return false;
 		}
 
@@ -1080,6 +1081,7 @@ namespace TraceCharacterVerify
 		if (WorldPtr == nullptr)
 		{
 			UE_LOG(LogTraceGame, Error, TEXT("[CHUT] no authoritative world — server only."));
+			TraceVerifyLock::Release(TEXT("Trace.Chut.Verify"));   // no verdict is coming to release it
 			return false;
 		}
 

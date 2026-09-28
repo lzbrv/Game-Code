@@ -37,6 +37,7 @@
 #include "TraceSettings.h"
 #include "UI/Text/TraceGameText.h"   // refusal toasts: HUD.TOAST_*
 #include "Abilities/Characters/TraceVerifyLock.h"   // one character fixture at a time
+#include "Misc/ScopeExit.h"                          // ON_SCOPE_EXIT — the verify releases the subject
 
 #define LOCTEXT_NAMESPACE "TraceLily"
 
@@ -3053,6 +3054,10 @@ namespace TraceLilyVerifyFile
 				*TraceVerifyLock::CurrentHolder());
 			return;
 		}
+
+		// SYNCHRONOUS: the whole check runs inside this call, so the subject is free the moment it
+		// returns. Without this it was held to its 60 s deadline, and a batch waited out that minute.
+		ON_SCOPE_EXIT{ TraceVerifyLock::Release(TEXT("Trace.Lily.Verify")); };
 		const TCHAR* const Tag = TEXT("LILY");
 		const UTraceSettings& Settings = UTraceSettings::Get();
 

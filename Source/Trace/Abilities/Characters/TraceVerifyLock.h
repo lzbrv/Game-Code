@@ -25,10 +25,20 @@
 // than the one being fixed. So a claim carries a deadline in REAL time and a later fixture may take
 // the subject once it passes. Real time, not world time, because a fixture that froze the world
 // clock is precisely one that will never release.
+//
+// *** BUT THE DEADLINE IS THE BACKSTOP, NOT THE RELEASE. *** For a while only Rocco, Chut and the
+// dash cloak released; the other six held the subject until their 60 s ran out. One at a time that
+// looked like "slow but correct". In a batch of eight it was neither: every fixture sat out its
+// predecessor's full minute, the queue gave up after three, and Oyster, Mace and Lily were never
+// measured at all ("waited three minutes for Trace.Elle.Verify and gave up"). So EVERY fixture now
+// releases on EVERY way it can end — a synchronous one with ON_SCOPE_EXIT straight after the claim,
+// a ticker-driven one by handing its ticker to ReleaseWhenFinished below — and the deadline is left
+// for the case nobody wrote code for.
 
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Containers/Ticker.h"
 
 namespace TraceVerifyLock
 {
@@ -70,9 +80,34 @@ namespace TraceVerifyLock
 	 * fixture has to be restructured to be queueable and none of them can hold a stale pointer to a
 	 * pawn across the wait.
 	 *
+	 * THE GIVE-UP IS PER HOLDER, NOT PER QUEUE. A command gives up only after three minutes behind
+	 * ONE holder; each time the subject changes hands the wait starts again. A fixed three minutes
+	 * for the whole wait meant the eighth fixture in a batch had to fit behind seven others in that
+	 * window, so the queue's depth decided which characters got tested. Behind one holder, three
+	 * minutes cannot run out in practice: every claim expires first (60 s by default), and an expired
+	 * claim is taken. It is there for a holder that keeps re-claiming and never finishes.
+	 *
 	 * @param CommandName the console command to re-run, which is also the lock's identity.
 	 * @return true if the subject is yours now. false means "queued, or given up" — the caller must
 	 *         return either way, and the queue will call the command again if it is coming back.
 	 */
 	TRACE_API bool ClaimOrQueue(const TCHAR* CommandName, double ExpectedSeconds = 60.0);
+
+	/**
+	 * Wraps a ticker-driven fixture's ticker so the claim is released on the tick that ENDS the run,
+	 * whichever way it ends — verdict, INVALID, "the world went away", "a participant went away".
+	 *
+	 * WHY A WRAPPER AND NOT A Release() AT THE VERDICT. Those fixtures stop by returning false from
+	 * one lambda, and each has four or five places that do it. A Release beside each one is a list
+	 * the next early-out will be missing from. The ticker stopping IS the run ending, so the release
+	 * lives there, once. It runs after the body's last tick, so anything the body restores on its
+	 * way out (a red arm's cvar, a knob) is back before the next fixture can claim.
+	 *
+	 *     FTSTicker::GetCoreTicker().AddTicker(TraceVerifyLock::ReleaseWhenFinished(
+	 *         TEXT("Trace.Elle.Verify"), FTickerDelegate::CreateLambda([State](float) -> bool { ... })));
+	 *
+	 * For a single ticker that runs to the end only. A fixture that re-schedules itself as a chain of
+	 * one-shot tickers (Rocco, Chut) would release after its first step; those release at the verdict.
+	 */
+	TRACE_API FTickerDelegate ReleaseWhenFinished(const TCHAR* FixtureName, FTickerDelegate Body);
 }
