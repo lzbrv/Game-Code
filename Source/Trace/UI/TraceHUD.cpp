@@ -63,6 +63,7 @@
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "UnrealClient.h"                 // FScreenshotRequest
+#include "Engine/GameViewportClient.h"    // Trace.HUD.Results.Verify - the viewport input path a real pad takes
 #include "Engine/TextureRenderTarget2D.h"  // Trace.HUD.Kit.Verify's stroke readback
 #include "Kismet/GameplayStatics.h"       // OpenLevel, for RETURN TO TITLE
 #include "Kismet/KismetRenderingLibrary.h" // Trace.HUD.Kit.Verify's stroke readback
@@ -6800,6 +6801,54 @@ namespace TraceHUDMatchEndMusic
 	constexpr float DrawStopFadeSeconds = 0.50f;
 }
 
+// ===================================================================================================
+// THE RESULTS SCREEN'S CONTINUE, AND WHY IT WAITS
+//
+// Pad A is CONTINUE here and JUMP everywhere else (TraceUserSettings Default_Pad_Jump), and the match
+// does not take the pawns away at the whistle: a player who is jumping when the clock runs out is
+// still pressing A on the first frames of this screen. With no wait, that jump skipped the results
+// before they had faded in — and on a listen host ended them for every guest (EndResultsNow).
+// ===================================================================================================
+namespace TraceHUDResultsInput
+{
+	/**
+	 * How long the results screen has to have been FULLY faded in before CONTINUE is accepted, in real
+	 * seconds. About 1.15 s after the whistle in all: long enough to stop jumping at a screen that has
+	 * just taken over the view, short enough not to read as a dead key. The CONTINUE legend fades in
+	 * when it ends, so the key is only named once it works.
+	 */
+	constexpr double ContinueGraceSeconds = 1.0;
+
+#if !UE_BUILD_SHIPPING
+	/** How many times ContinueFromResults has run in this process. Trace.HUD.Results.Verify reads it. */
+	int32 GContinueCount = 0;
+#endif
+}
+
+/**
+ * One team column's geometry, in 1080p design pixels (x UIScale) — shared by DrawScoreboardTeam, which
+ * draws it, and the results screen, which has to size the card under it BEFORE it is drawn. The two
+ * used to agree by a "must match" comment over a copied sum.
+ */
+namespace TraceHUDScoreboardLayout
+{
+	/** The team's header plate: the word, and the team-colour accent under it. */
+	constexpr float HeaderH = 34.f;
+
+	/** Between the header plate and the first row. */
+	constexpr float HeaderGap = 4.f;
+
+	/** One player row. */
+	constexpr float RowH = 28.f;
+
+	/** The team-colour accent under the team word (team select's device, at this size). */
+	constexpr float AccentW = 40.f;
+	constexpr float AccentH = 3.f;
+
+	/** The accent's top, up from the plate's bottom edge. The word centres in the plate above it. */
+	constexpr float AccentBottomInset = 8.f;
+}
+
 /**
  * The post-match screen.
  *
@@ -7081,8 +7130,10 @@ void ATraceHUD::DrawMatchResult()
 	const float CardX = (ViewW - CardW) * 0.5f;
 	const float CardY = ViewH * 0.40f;
 	const float CardPad = 20.f * UIScale;
-	// Must match DrawScoreboardTeam's own header/row geometry.
-	const float CardH = CardPad * 2.f + (30.f * UIScale) + (4.f * UIScale) + MaxRows * (28.f * UIScale);
+	// DrawScoreboardTeam's own header/row geometry, from the one place both read it.
+	const float CardH = CardPad * 2.f
+		+ (TraceHUDScoreboardLayout::HeaderH + TraceHUDScoreboardLayout::HeaderGap) * UIScale
+		+ MaxRows * (TraceHUDScoreboardLayout::RowH * UIScale);
 
 	DrawKitPanel(CardX, CardY, CardW, CardH, 1.f);
 
@@ -7120,17 +7171,45 @@ void ATraceHUD::DrawMatchResult()
 	// first); on a client it takes only that player home. Not while the pause menu is up — that is its
 	// own Enter.
 	{
-		// Pad A obeys CONTROLLER INPUT like every menu (TracePadMenu::IsEnabled), and the legend says
-		// ENTER when the pad is off, rather than naming a button that does nothing.
-		const bool bPad = TracePadMenu::IsEnabled() && TracePadMenu::HasSeenPad(TracePC.Get());
-		const TArray<FTraceKitLegendItem> Legend = {
-			{ bPad ? TRACE_TEXT("HUD.RESULT_PAD_KEY_CONTINUE", "A") : TRACE_TEXT("HUD.RESULT_KEY_CONTINUE", "ENTER"),
-			  TRACE_TEXT("HUD.RESULT_CONTINUE", "CONTINUE") },
-		};
-		TraceMenuKit::DrawKeyLegend(this, Legend, CX, StripY + StripH + (12.f * UIScale), 30.f * UIScale, Now);
+		// NOT ON THE WHISTLE. Pad A is JUMP until this screen takes over and the pawns are not taken away
+		// at full time, so a pad player jumping as the clock runs out is pressing A on this screen's
+		// first frames — and on a host, CONTINUE ends the results for every guest. So (see
+		// TraceHUDResultsInput): nothing is accepted until the screen has stood fully faded in for
+		// ContinueGraceSeconds, and both keys are read as REMEMBERED edges seeded down, so a key held
+		// across the whistle, or across the end of the grace, is not a press until it is let go.
+		const double RealNow = TraceMenuKit::RealSeconds();
+		if (ResultsShownRealSeconds < 0.0 && ResultFade.IsFullyShown())
+		{
+			ResultsShownRealSeconds = RealNow;
+		}
+		const bool bContinueOpen = (ResultsShownRealSeconds >= 0.0)
+			&& (RealNow - ResultsShownRealSeconds) >= TraceHUDResultsInput::ContinueGraceSeconds;
 
-		if (TracePC != nullptr && !PauseMenu.IsOpen()
-			&& (TracePC->WasInputKeyJustPressed(EKeys::Enter) || TracePadMenu::ConfirmPressed(TracePC.Get())))
+		// SAMPLED EVERY FRAME, BEFORE ANY GATE: an edge that is read only when it is allowed to act would
+		// see a key held through the grace as a new press on the first frame after it. RisingEdge is the
+		// pad's, and honours CONTROLLER INPUT (while still recording the button, so switching the pad
+		// back on under a held A is not a press). ENTER keeps its own memory the same way.
+		const bool bPadPressed = TracePadMenu::RisingEdge(TracePC.Get(), TracePadMenu::ConfirmKey(), bResultsPadConfirmWasDown);
+		const bool bEnterDown = (TracePC != nullptr) && TracePC->IsInputKeyDown(EKeys::Enter);
+		const bool bEnterPressed = bEnterDown && !bResultsEnterWasDown;
+		bResultsEnterWasDown = bEnterDown;
+
+		// Pad A obeys CONTROLLER INPUT like every menu (TracePadMenu::IsEnabled), and the legend says
+		// ENTER when the pad is off, rather than naming a button that does nothing. It fades up as the
+		// grace ends, so the key is named only once pressing it works.
+		const float LegendAlpha = ResultsContinueFade.Update(bContinueOpen);
+		if (LegendAlpha > 0.f)
+		{
+			TraceMenuKit::FScopedOpacity LegendFade(LegendAlpha);
+			const bool bPad = TracePadMenu::IsEnabled() && TracePadMenu::HasSeenPad(TracePC.Get());
+			const TArray<FTraceKitLegendItem> Legend = {
+				{ bPad ? TRACE_TEXT("HUD.RESULT_PAD_KEY_CONTINUE", "A") : TRACE_TEXT("HUD.RESULT_KEY_CONTINUE", "ENTER"),
+				  TRACE_TEXT("HUD.RESULT_CONTINUE", "CONTINUE") },
+			};
+			TraceMenuKit::DrawKeyLegend(this, Legend, CX, StripY + StripH + (12.f * UIScale), 30.f * UIScale, Now);
+		}
+
+		if (bContinueOpen && !PauseMenu.IsOpen() && (bPadPressed || bEnterPressed))
 		{
 			ContinueFromResults();
 		}
@@ -7144,6 +7223,9 @@ void ATraceHUD::ContinueFromResults()
 		return;
 	}
 	bResultsContinued = true;
+#if !UE_BUILD_SHIPPING
+	++TraceHUDResultsInput::GContinueCount;
+#endif
 
 	UWorld* const World = GetWorld();
 	if (ATraceGameMode* HostMode = (World != nullptr) ? World->GetAuthGameMode<ATraceGameMode>() : nullptr)
@@ -7226,8 +7308,8 @@ void ATraceHUD::DrawScoreboard()
 float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Width)
 {
 	const FLinearColor TeamColor = TraceTeamColor(Team);
-	const float RowH = 28.f * UIScale;
-	const float HeaderH = 30.f * UIScale;
+	const float RowH = TraceHUDScoreboardLayout::RowH * UIScale;
+	const float HeaderH = TraceHUDScoreboardLayout::HeaderH * UIScale;
 
 	// Column anchors. Name is left-aligned; the character and the three numeric columns are
 	// right-aligned so their digits line up regardless of width.
@@ -7282,13 +7364,26 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 	const bool bShowCharacters = false;
 
 	// ---- Header -------------------------------------------------------------------------------
-	DrawHudRect(TraceHUDStyle::WithAlpha(TeamColor, 0.25f), X, Y, Width, HeaderH);
+	//
+	// THE KIT'S PLATE, NOT A TINTED BAND (stylespec §0: no flat rect panels). This was TeamColor at 25 %
+	// with the team word in TeamColor on top of it — BLUE on its own band measured about 2.3:1. The word
+	// is the plate's own white now, and the team's colour is the short accent under it, which is how
+	// the team select marks a side, so the two screens name a team the same way.
+	DrawKitPanel(X, Y, Width, HeaderH, 1.f);
+
+	// The word, and the column heads beside it, centre in the plate ABOVE the accent's strip.
+	const float AccentTop = Y + HeaderH - (TraceHUDScoreboardLayout::AccentBottomInset * UIScale);
+	const float WordBoxY = Y + (TraceHUDScoreboardLayout::AccentH * UIScale);
+	const float WordBoxH = AccentTop - WordBoxY;
 
 	const FString TeamLabel = TraceTeamName(Team).ToString().ToUpper();
-	DrawTextLeft(TeamLabel, TeamColor, NameX, VCenterTextY(TeamLabel, FontMedium, UIScale, Y, HeaderH), FontMedium, UIScale);
+	DrawTextLeft(TeamLabel, TraceMenuKit::VisualsFor(ETraceKitState::Default).Label, NameX,
+		VCenterTextY(TeamLabel, FontMedium, UIScale, WordBoxY, WordBoxH), FontMedium, UIScale);
+	DrawHudRect(TeamColor, NameX, AccentTop,
+		TraceHUDScoreboardLayout::AccentW * UIScale, FMath::Max(2.f, TraceHUDScoreboardLayout::AccentH * UIScale));
 
 	const float HeaderTextY = VCenterTextY(TRACE_TEXT("HUD.SCOREBOARD_COL_KILLS", "K"),
-		FontSmall, UIScale, Y, HeaderH);
+		FontSmall, UIScale, WordBoxY, WordBoxH);
 	if (bShowCharacters)
 	{
 		DrawTextRight(TRACE_TEXT("HUD.SCOREBOARD_COL_CHAR", "CHAR"), TraceHUDStyle::InkDim,
@@ -7311,16 +7406,22 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 
 	// ---- Rows ---------------------------------------------------------------------------------
 	const float RowTextScale = 1.05f * UIScale;
-	float RowY = Y + HeaderH + (4.f * UIScale);
+	const float FirstRowY = Y + HeaderH + (TraceHUDScoreboardLayout::HeaderGap * UIScale);
+	float RowY = FirstRowY;
+
+	// YOUR ROW SITS ON THE KIT'S "THIS ONE" PLATE — the amber-ringed hover plate, as the kill feed marks
+	// a row about you — where it used to sit on a flat TeamColor rect at 14 %. Drawn BEFORE any row's
+	// text: the plate's ring and halo are baked into the sprite and overhang its rect, and drawn in turn
+	// they would lie over the words of the row above.
+	const int32 LocalRow = Members.IndexOfByKey(LocalPS.Get());
+	if (LocalRow != INDEX_NONE)
+	{
+		DrawKitPanel(X, FirstRowY + LocalRow * RowH - (2.f * UIScale), Width, RowH, 1.f, /*bAboutYou=*/true);
+	}
 
 	for (const ATracePlayerState* Member : Members)
 	{
 		const bool bIsLocal = (Member == LocalPS.Get());
-		if (bIsLocal)
-		{
-			// Subtle highlight so you can find yourself instantly.
-			DrawHudRect(TraceHUDStyle::WithAlpha(TeamColor, 0.14f), X, RowY - (2.f * UIScale), Width, RowH);
-		}
 
 		// Upper case, as the team screen already draws it: an engine-made machine name arrives mixed-case.
 		FString Name = Member->GetPlayerName().ToUpper();
@@ -10655,6 +10756,263 @@ namespace TraceHUDFadeVerify
 		TEXT("that every overlay fades on REAL time (the pause fade completes with the world paused), that the ")
 		TEXT("pages' black never lets the arena through a page turn, and that the match crossfades with them. ")
 		TEXT("Run on the Arena while team select is up: -TraceExecAt=4 -TraceExec=\"Trace.UI.Fade.Verify\"."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
+}
+#endif // !UE_BUILD_SHIPPING
+
+// ===================================================================================================
+// Trace.HUD.Results.Verify — THE RESULTS SCREEN'S CONTINUE IS NOT A JUMP
+//
+// Ends the match on the HOST (a standalone game is one) and presses pad A on the whistle's own frame,
+// the way a player who is jumping at full time does, then walks the other ways a press can arrive too
+// early or not count at all. Every arm but the last must NOT continue; the last one must. The only
+// thing read back is the process-wide count of ContinueFromResults calls, because a CONTINUE that
+// works ends this world and the HUD with it.
+//
+//   whistle frame   A pressed on the frame the match ends (a jump)             -> nothing
+//   0.35 s          ENTER tapped while the screen is still in its grace         -> nothing
+//   0.60 s          A tapped again (still jumping)                              -> nothing
+//   0.90 - 1.80 s   A HELD from inside the grace to past its end                -> nothing
+//   2.10 s          A tapped with CONTROLLER INPUT off                          -> nothing
+//   2.60 s          A tapped (or ENTER, with `key=enter`)                       -> CONTINUE, once
+//
+// A screenshot of the settled results screen, CONTINUE legend up, is taken at 1.50 s.
+//
+// Headless recipe (after team select and the loadout, so the pawn is live and A really is JUMP):
+//   Arena -bots=4 -TraceExecAt=6 -TraceExec="Trace.Teams.Close|Trace.V10.After 1.5 Trace.Loadout.Press lock"
+//         -TraceExec2At=14 -TraceExec2="Trace.HUD.Results.Verify"
+// ===================================================================================================
+#if !UE_BUILD_SHIPPING
+
+namespace TraceHUDResultsVerify
+{
+	struct FRun
+	{
+		TWeakObjectPtr<UWorld> World;
+		TWeakObjectPtr<APlayerController> Controller;
+		double WhistleReal = 0.0;
+		int32 Stage = 0;
+		int32 CountAtWhistle = 0;
+		int32 Passes = 0;
+		int32 Failures = 0;
+		bool bPadSettingWas = true;
+		bool bPadSettingTouched = false;
+		bool bFinalKeyIsEnter = false;
+		/** The one press that must work did, exactly once. */
+		bool bCompleted = false;
+	};
+
+	static void Report(FRun& Run, const TCHAR* Claim, bool bPass, const FString& Detail)
+	{
+		(bPass ? Run.Passes : Run.Failures) += 1;
+		UE_LOG(LogTraceGame, Display, TEXT("[ResultsVerify]   %-4s %s  %s"), bPass ? TEXT("ok") : TEXT("FAIL"), Claim, *Detail);
+	}
+
+	/** One press or release through the viewport, as a real pad or keyboard delivers it. */
+	static void Inject(FRun& Run, const FKey& Key, bool bDown)
+	{
+		APlayerController* const Target = Run.Controller.Get();
+		if (Target == nullptr)
+		{
+			return;
+		}
+		FViewport* const GameViewportPtr =
+			(GEngine != nullptr && GEngine->GameViewport != nullptr) ? GEngine->GameViewport->Viewport : nullptr;
+		const FInputKeyEventArgs KeyArgs(GameViewportPtr, FInputDeviceId::CreateFromInternalId(0), Key,
+			bDown ? IE_Pressed : IE_Released, bDown ? 1.f : 0.f, /*bIsTouchEvent*/ false, FPlatformTime::Cycles64());
+		if (GEngine != nullptr && GEngine->GameViewport != nullptr)
+		{
+			GEngine->GameViewport->InputKey(KeyArgs);
+		}
+		else
+		{
+			Target->InputKey(KeyArgs);
+		}
+		UE_LOG(LogTraceGame, Display, TEXT("[ResultsVerify] t=%.2fs %s %s"),
+			FPlatformTime::Seconds() - Run.WhistleReal, *Key.ToString(), bDown ? TEXT("down") : TEXT("up"));
+	}
+
+	static int32 ContinuesSinceWhistle(const FRun& Run)
+	{
+		return TraceHUDResultsInput::GContinueCount - Run.CountAtWhistle;
+	}
+
+	static void RestorePadSetting(FRun& Run)
+	{
+		if (Run.bPadSettingTouched)
+		{
+			UTraceUserSettings::Get().bPadEnabled = Run.bPadSettingWas;
+			Run.bPadSettingTouched = false;
+		}
+	}
+
+	static void Finish(FRun& Run, bool bCompleted)
+	{
+		RestorePadSetting(Run);
+		if (Run.Failures == 0 && bCompleted)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[ResultsVerify] ===== PASS (%d checks) — VERDICT: a jump at the whistle cannot skip the results ====="),
+				Run.Passes);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[ResultsVerify] ===== *** FAIL *** %d of %d check(s)%s — VERDICT: FAIL ====="),
+				Run.Failures, Run.Failures + Run.Passes, bCompleted ? TEXT("") : TEXT(", run did not finish"));
+		}
+	}
+
+	/** Every arm before the last one must leave the count alone. Returns false (run over) if one did not. */
+	static bool NothingContinuedYet(FRun& Run, const TCHAR* LastArm)
+	{
+		if (ContinuesSinceWhistle(Run) == 0)
+		{
+			return true;
+		}
+		Report(Run, TEXT("no press before the grace's end, or with the pad off, continues"), false,
+			FString::Printf(TEXT("CONTINUE fired by t=%.2fs; the last arm sent was: %s"),
+				FPlatformTime::Seconds() - Run.WhistleReal, LastArm));
+		return false;
+	}
+
+	/** One tick. Returns false when the run is over. */
+	static bool Tick(FRun& Run)
+	{
+		const double Elapsed = FPlatformTime::Seconds() - Run.WhistleReal;
+		const FKey PadA = EKeys::Gamepad_FaceButton_Bottom;
+
+		// The stages are ordered by time; each one runs once, on the first tick at or after its time.
+		static const double StageTimes[] = { 0.10, 0.35, 0.45, 0.60, 0.70, 0.90, 1.50, 1.60, 1.80, 1.95,
+			2.10, 2.20, 2.40, 2.60, 2.70, 4.50 };
+		static const TCHAR* const StageArms[] = {
+			TEXT("A on the whistle frame"), TEXT("A on the whistle frame"), TEXT("ENTER at 0.35 s"),
+			TEXT("ENTER at 0.35 s"), TEXT("A at 0.60 s"), TEXT("A at 0.60 s"), TEXT("A held from 0.90 s"),
+			TEXT("A held from 0.90 s"), TEXT("A held from 0.90 s"), TEXT("A released at 1.80 s"),
+			TEXT("A released at 1.80 s"), TEXT("A with CONTROLLER INPUT off"), TEXT("A with CONTROLLER INPUT off"),
+			TEXT("A with CONTROLLER INPUT off"), TEXT("the final press"), TEXT("the final press") };
+
+		// Anything that continued before the final press is a failure, whichever tick notices it.
+		if (Run.Stage < 13 && !NothingContinuedYet(Run, StageArms[FMath::Clamp(Run.Stage, 0, 15)]))
+		{
+			return false;
+		}
+
+		if (Run.Stage >= UE_ARRAY_COUNT(StageTimes) || Elapsed < StageTimes[Run.Stage])
+		{
+			return true;
+		}
+
+		switch (Run.Stage++)
+		{
+		case 0:  Inject(Run, PadA, false); break;
+		case 1:  Inject(Run, EKeys::Enter, true); break;
+		case 2:  Inject(Run, EKeys::Enter, false); break;
+		case 3:  Inject(Run, PadA, true); break;
+		case 4:  Inject(Run, PadA, false); break;
+		case 5:  Inject(Run, PadA, true); break;
+		case 6:
+		{
+			const FString Path = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"),
+				FString::Printf(TEXT("ResultsVerify_%s.png"), *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"))));
+			UE_LOG(LogTraceGame, Display, TEXT("[ResultsVerify] results screenshot requested: %s"), *Path);
+			FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+			break;
+		}
+		case 7:
+		{
+			const UWorld* const WorldPtr = Run.World.Get();
+			const ATraceGameState* const MatchGS = (WorldPtr != nullptr) ? WorldPtr->GetGameState<ATraceGameState>() : nullptr;
+			Report(Run, TEXT("A on the whistle frame, ENTER at 0.35 s and A at 0.60 s did not continue"),
+				ContinuesSinceWhistle(Run) == 0 && MatchGS != nullptr && MatchGS->TraceMatchState == ETraceMatchState::PostMatch,
+				FString::Printf(TEXT("continues %d, still on the results screen %d"), ContinuesSinceWhistle(Run),
+					(MatchGS != nullptr && MatchGS->TraceMatchState == ETraceMatchState::PostMatch) ? 1 : 0));
+			break;
+		}
+		case 8:  Inject(Run, PadA, false); break;
+		case 9:
+			Report(Run, TEXT("A held from inside the grace to past its end is not a press"),
+				ContinuesSinceWhistle(Run) == 0, FString::Printf(TEXT("continues %d"), ContinuesSinceWhistle(Run)));
+			break;
+		case 10:
+			Run.bPadSettingWas = UTraceUserSettings::Get().bPadEnabled;
+			Run.bPadSettingTouched = true;
+			UTraceUserSettings::Get().bPadEnabled = false;
+			Inject(Run, PadA, true);
+			break;
+		case 11: Inject(Run, PadA, false); break;
+		case 12:
+			Report(Run, TEXT("CONTROLLER INPUT off: A continues nothing"),
+				ContinuesSinceWhistle(Run) == 0, FString::Printf(TEXT("continues %d"), ContinuesSinceWhistle(Run)));
+			RestorePadSetting(Run);
+			break;
+		case 13: Inject(Run, Run.bFinalKeyIsEnter ? EKeys::Enter : PadA, true); break;
+		case 14: Inject(Run, Run.bFinalKeyIsEnter ? EKeys::Enter : PadA, false); break;
+		default:
+			// 4.5 s: the deadline for the one press that must work.
+			Report(Run, Run.bFinalKeyIsEnter ? TEXT("a fresh ENTER after the grace continues, once")
+			                                 : TEXT("a fresh A after the grace continues, once"),
+				false, FString::Printf(TEXT("continues %d by t=%.2fs"), ContinuesSinceWhistle(Run), Elapsed));
+			return false;
+		}
+
+		if (Run.Stage > 13 && ContinuesSinceWhistle(Run) == 1)
+		{
+			Report(Run, Run.bFinalKeyIsEnter ? TEXT("a fresh ENTER after the grace continues, once")
+			                                 : TEXT("a fresh A after the grace continues, once"),
+				true, FString::Printf(TEXT("CONTINUE at t=%.2fs"), Elapsed));
+			Run.bCompleted = true;
+			return false;
+		}
+		return true;
+	}
+
+	static void Start(const TArray<FString>& Args, UWorld* WorldPtr)
+	{
+		ATraceGameMode* const Rules = (WorldPtr != nullptr) ? WorldPtr->GetAuthGameMode<ATraceGameMode>() : nullptr;
+		const ATraceGameState* const MatchGS = (WorldPtr != nullptr) ? WorldPtr->GetGameState<ATraceGameState>() : nullptr;
+		APlayerController* const Target = (WorldPtr != nullptr) ? WorldPtr->GetFirstPlayerController() : nullptr;
+		if (Rules == nullptr || MatchGS == nullptr || Target == nullptr || MatchGS->TraceMatchState == ETraceMatchState::PostMatch)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[ResultsVerify] ===== *** FAIL *** INCONCLUSIVE: needs a live match on the host (the Arena, before full time) — VERDICT: FAIL ====="));
+			return;
+		}
+
+		TSharedRef<FRun> Run = MakeShared<FRun>();
+		Run->World = WorldPtr;
+		Run->Controller = Target;
+		for (const FString& Arg : Args)
+		{
+			Run->bFinalKeyIsEnter |= Arg.Equals(TEXT("key=enter"), ESearchCase::IgnoreCase);
+		}
+
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[ResultsVerify] ===== the results screen's CONTINUE: whistle-frame jump, grace, held A, pad off, then %s ====="),
+			Run->bFinalKeyIsEnter ? TEXT("ENTER") : TEXT("A"));
+
+		// THE WHISTLE AND THE JUMP ON ONE FRAME. The press goes in first, so it is this frame's input
+		// when the HUD draws the first frame of the results screen.
+		Run->CountAtWhistle = TraceHUDResultsInput::GContinueCount;
+		Run->WhistleReal = FPlatformTime::Seconds();
+		Inject(*Run, EKeys::Gamepad_FaceButton_Bottom, true);
+		Rules->DebugFinishMatch(ETraceTeam::Blue, ETraceMatchEndReason::Clock);
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Run](float /*Delta*/) -> bool
+		{
+			if (!Tick(*Run))
+			{
+				Finish(*Run, Run->bCompleted);
+				return false;
+			}
+			return true;
+		}), 0.f);
+	}
+
+	static FAutoConsoleCommandWithWorldAndArgs CmdResultsVerify(
+		TEXT("Trace.HUD.Results.Verify"),
+		TEXT("Ends the match on the host with pad A pressed on the whistle frame (a jump), then proves that no press ")
+		TEXT("inside the results screen's grace, no held A and no A with CONTROLLER INPUT off continues, and that a ")
+		TEXT("fresh A (or ENTER with key=enter) afterwards does. Run on the Arena after lock-in."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
 }
 #endif // !UE_BUILD_SHIPPING

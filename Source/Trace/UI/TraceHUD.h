@@ -1256,6 +1256,25 @@ private:
 	/** CONTINUE has been pressed on the results screen; the travel is under way. */
 	bool bResultsContinued = false;
 
+	/**
+	 * THE RESULTS SCREEN'S CONTINUE WAITS (TraceHUDResultsInput in TraceHUD.cpp). Real time
+	 * (TraceMenuKit::RealSeconds) of the first frame the results screen stood fully faded in; negative
+	 * until then. CONTINUE is accepted only ContinueGraceSeconds after it.
+	 */
+	double ResultsShownRealSeconds = -1.0;
+
+	/**
+	 * The results screen's own memory of its two CONTINUE keys (pad A, ENTER), sampled on EVERY frame
+	 * of the screen from the whistle on — grace, pause menu and all — and SEEDED DOWN. A key already
+	 * held when the match ended (pad A is JUMP) has to be let go and pressed again before it counts,
+	 * and a press inside the grace is spent there rather than carried past it.
+	 */
+	bool bResultsPadConfirmWasDown = true;
+	bool bResultsEnterWasDown = true;
+
+	/** The CONTINUE legend's fade: it comes up when the grace ends, so the key is named only once it works. */
+	FTraceKitFade ResultsContinueFade;
+
 #if !UE_BUILD_SHIPPING
 	// ---- Spec v16 §2 draw record ----------------------------------------------------------------
 	//
