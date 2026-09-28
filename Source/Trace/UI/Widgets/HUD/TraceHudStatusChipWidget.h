@@ -62,18 +62,18 @@ public:
 
 protected:
 	/**
-	 * The outline. A Border whose brush carries the chip's tint at 45% alpha, with its padding acting
-	 * as the stroke width — Slate has no stroked-rect primitive either, and two nested Borders is the
-	 * cheapest honest way to get one. (The Canvas pass draws the same outline as four thin rects.)
+	 * The chip's outer Border. It used to carry the chip's tint as a hairline; the chip is the
+	 * handmade kit's navy plate now (ChipFill) and this draws nothing. Still bound: the generator's
+	 * contract lists it, and removing a bound name is an asset change for no gain.
 	 */
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UBorder> ChipOutline;
 
-	/** The dark fill inside the outline. Stays dark so six stacked chips never light the corner up. */
+	/** The kit's navy plate. Stays dark so six stacked chips never light the corner up. */
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UBorder> ChipFill;
 
-	/** The saturated tab down the left edge. This is what carries the colour at a glance. */
+	/** The status colour: an upright pip inside the plate's left corner. What carries it at a glance. */
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UImage> ColorTab;
 

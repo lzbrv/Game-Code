@@ -31,6 +31,9 @@ namespace TraceMenuKitFile
 #if !UE_BUILD_SHIPPING
 	/** Every DrawTexture this file has handed a HUD. Trace.UI.Kit.Verify reads it around a call. */
 	static int64 GTexturedQuadsIssued = 0;
+
+	/** The tint of the last quad handed to a HUD, so the verify can see what a panel ASKED for. */
+	static FLinearColor GLastQuadTint = FLinearColor::Transparent;
 #endif
 
 	static void IssueTexturedQuad(AHUD* HUD, UTexture2D* Texture, const FTraceKitQuad& Quad,
@@ -40,6 +43,7 @@ namespace TraceMenuKitFile
 			Tint, BLEND_Translucent);
 #if !UE_BUILD_SHIPPING
 		++GTexturedQuadsIssued;
+		GLastQuadTint = Tint;
 #endif
 	}
 
@@ -357,6 +361,44 @@ void TraceMenuKit::DrawStatePlate(AHUD* HUD, ETraceKitState State, float X, floa
 	{
 		DrawFallbackPlate(HUD, State, X, Y, W, H, PlateTint);
 	}
+}
+
+bool TraceMenuKit::DrawPanelPlate(AHUD* HUD, ETraceKitState State, float X, float Y, float W, float H,
+	float CornerHeight, float Alpha)
+{
+	const float A = FMath::Clamp(Alpha, 0.f, 1.f);
+	if (HUD == nullptr || W <= 0.f || H <= 0.f || A <= 0.f)
+	{
+		return false;
+	}
+
+	// The state's plate at its FLAT tint: Pressed keeps its knock-down, Hover does not breathe.
+	const FTraceKitVisuals Visuals = VisualsFor(State);
+	const float PlateTint = Visuals.PlateTint;
+	const float Corner = (CornerHeight > 0.f) ? CornerHeight : H;
+
+	if (DrawPlate(HUD, Sprite(Visuals.Plate), TraceMenuArtStyle::ButtonFrame, X, Y, W, H, Corner,
+		FLinearColor(PlateTint, PlateTint, PlateTint, A)))
+	{
+		return true;
+	}
+
+	// DrawFallbackPlate's rect, with the alpha carried through (that function scales RGB only).
+	const bool bDisabled = (State == ETraceKitState::Disabled);
+	const float Thick = FMath::Max(1.f, FMath::RoundToFloat(FMath::Min(H, Corner) * 0.03f));
+	FLinearColor Fill = TraceMenuKitFile::Scaled(bDisabled ? TraceMenuArtStyle::DisabledFill : TraceMenuArtStyle::PlateFill,
+		PlateTint);
+	Fill.A = A;
+	HUD->DrawRect(Fill, X, Y, W, H);
+
+	if (bDisabled || State == ETraceKitState::Hover || State == ETraceKitState::Pressed)
+	{
+		FLinearColor Edge = bDisabled ? TraceMenuArtStyle::DisabledRing
+			: TraceMenuKitFile::Scaled(TraceMenuArtStyle::AmberLifted(), PlateTint);
+		Edge.A = A;
+		TraceMenuKitFile::StrokeRect(HUD, X, Y, W, H, Thick, Edge);
+	}
+	return false;
 }
 
 // =================================================================================================
@@ -1215,7 +1257,40 @@ namespace TraceMenuKitFile
 				FString::Printf(TEXT("light %.2f px, hud %.2f px on a 60 px plate"), LightCaps, HudCaps));
 		}
 
-		// ---- 8. PRIME LOADS EVERY SPRITE ---------------------------------------------------------
+		// ---- 8. A PANEL (added for the match HUD) --------------------------------------------------
+		//
+		// The HUD's plates are panels, not buttons: they must carry an alpha (a kill-feed row fades out
+		// with its names) and must not breathe (the "about you" hover plate is up for seconds). Drawn
+		// through the real HUD outside its draw pass, like section 4: the canvas refuses the quads with
+		// a log line, and what is checked is what the kit ASKED for.
+		{
+			AHUD* LiveHUD = FindLocalHUD();
+			const int64 BeforeZero = GTexturedQuadsIssued;
+			const bool bZeroDrew = TraceMenuKit::DrawPanelPlate(LiveHUD, ETraceKitState::Default,
+				10.f, 10.f, 200.f, 40.f, 0.f, 0.f);
+			Check(TEXT("a panel at alpha 0 draws nothing"),
+				!bZeroDrew && GTexturedQuadsIssued == BeforeZero, TEXT(""));
+
+			if (LiveHUD == nullptr || TraceMenuKit::Sprite(ETraceKitSprite::BtnHover) == nullptr)
+			{
+				Check(TEXT("a panel carries its alpha and does not breathe"), false,
+					TEXT("INCONCLUSIVE: needs a local HUD and a drawable hover plate - run in a game world"));
+			}
+			else
+			{
+				const int64 Before = GTexturedQuadsIssued;
+				const bool bDrew = TraceMenuKit::DrawPanelPlate(LiveHUD, ETraceKitState::Hover,
+					10.f, 10.f, 200.f, 40.f, 0.f, 0.35f);
+				const FLinearColor Asked = GLastQuadTint;
+				Check(TEXT("a panel carries its alpha and does not breathe"),
+					bDrew && GTexturedQuadsIssued > Before && FMath::IsNearlyEqual(Asked.A, 0.35f)
+						&& Asked.R == 1.f && Asked.G == 1.f && Asked.B == 1.f,
+					FString::Printf(TEXT("%lld quad(s), tint (%.2f, %.2f, %.2f, %.2f)"),
+						GTexturedQuadsIssued - Before, Asked.R, Asked.G, Asked.B, Asked.A));
+			}
+		}
+
+		// ---- 9. PRIME LOADS EVERY SPRITE ---------------------------------------------------------
 		Check(TEXT("Prime() loads every kit sprite"), TraceMenuKit::Prime() == SpriteCount,
 			FString::Printf(TEXT("%d/%d"), TraceMenuKit::Prime(), SpriteCount));
 

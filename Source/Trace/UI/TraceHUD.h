@@ -11,7 +11,7 @@
 // toggle — Content/Trace/UI/HUD/WBP_TraceHudCorner, with the Canvas pass below it as a live
 // fallback that runs whenever the asset is absent, fails to validate, or the toggle is off.
 // EVERYTHING ELSE ON THIS HUD IS STILL CANVAS and is not half-converted: the crosshair, the charge
-// ring, the bottom-LEFT health/dash/weapon/ability-cooldown stack, the kill feed, the scoreboard,
+// ring, the bottom-LEFT health/dash/ability-cooldown stack, the kill feed, the scoreboard,
 // the death panel, the banners, the pause menu and the character select screen. See
 // DrawAmmoAndStatuses() and BuildCornerState().
 //
@@ -160,6 +160,48 @@ public:
 
 	/** Prints the record above with @p Tag, so a screenshot and a line of log are the same event. */
 	void LogFxHudDrawRecord(const TCHAR* Tag) const;
+
+	/**
+	 * The handmade-kit HUD pass's half of the draw record, for Trace.HUD.Kit.Verify. Same rule as the
+	 * two above: every field is written where the pixels are emitted, never from the state that fed
+	 * the pass, and the whole record is cleared at the top of every DrawHUD.
+	 */
+	struct FHudKitRecord
+	{
+		/** A pause / select / loadout screen owned the view on this frame. */
+		bool bOverlayUp = false;
+
+		/** The top score bar, the crosshair, and how many kill-feed rows drew. */
+		bool bTopPanel = false;
+		bool bCrosshair = false;
+		int32 KillFeedRows = 0;
+
+		/** The bottom-left stack's plate. */
+		bool bStackPlate = false;
+
+		/** The ammo plate's two label words as drawn ("PISTOL" / "" at a full clip). */
+		FString AmmoLabel;
+		FString AmmoRightLabel;
+
+		/** The KNIFE plate that stands in the ammo corner while the knife is out. */
+		bool bKnifeBlock = false;
+
+		/** The death panel, its killer line as drawn, and the kill-feed glyph it drew ("" for none). */
+		bool bDeathPanel = false;
+		FString DeathKillerLine;
+		FString DeathIcon;
+
+		/** HALF TIME, the goal flash, and GO with the subtitle it carried. */
+		bool bHalfTimeCard = false;
+		bool bScoreFlash = false;
+		bool bGoBanner = false;
+		FString GoSubtitle;
+
+		/** The HOSTING / CONNECTED chip, and the alpha it drew at. */
+		bool bNetPanel = false;
+		float NetPanelAlpha = 0.f;
+	};
+	const FHudKitRecord& GetHudKitRecord() const { return HudKitRecord; }
 #endif
 
 protected:
@@ -282,14 +324,15 @@ protected:
 	void DrawScreenEdgeVignette(const FLinearColor& Hue, float PeakAlpha);
 
 	/**
-	 * Health, the EQUIPPED WEAPON, dash CHARGES and the parry cooldown: the bottom-left ability
-	 * stack. (Boost is gone.)
+	 * Health, dash CHARGES, the ability rows and the parry cooldown: the bottom-left stack, on the
+	 * handmade kit's plate. (Boost is gone; the WEAPON row is gone too — the gun is named on the ammo
+	 * plate, and the knife has its own plate there.)
 	 *
 	 * Row order is load-bearing, not cosmetic. The stack grows UPWARDS from the health bar, so a row
-	 * drawn earlier sits lower and closer to health. Health is drawn last and never moves; the
-	 * weapon row is drawn first because it is the only other row that is ALWAYS present, which makes
-	 * it the only other row that can be found by muscle memory. Everything above it is conditional
-	 * and is allowed to shuffle.
+	 * drawn earlier sits lower and closer to health. Health never moves; DASH is drawn first because it
+	 * is the one other row every player has every frame; the ability rows next; and the rows that come
+	 * and go (PARRY while carrying, SLIDE while a slide-jump is live) sit ON TOP, so their coming and
+	 * going moves nothing but the plate's top edge.
 	 */
 	void DrawHealthAndDash();
 
@@ -315,8 +358,8 @@ protected:
 	 *
 	 * *** UNDER, WHICH MEANS IT IS DRAWN FIRST AND THE E ROW MOVES UP. *** The bottom-left stack
 	 * grows upward from the health bar, so "under the E row" is the slot the E row was going to use.
-	 * The rows BELOW (weapon, dash, slide) were already drawn and never move — which is the stack's
-	 * standing rule: only the top of the stack is allowed to shuffle.
+	 * The row BELOW (dash) was already drawn and never moves — which is the stack's standing rule:
+	 * only the top of the stack is allowed to shuffle.
 	 *
 	 * @param RowY  top of the half-height row. @return the Y the E row should now draw at.
 	 */
@@ -448,6 +491,12 @@ protected:
 	float DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX, float BottomY, float BlockW);
 
 	/**
+	 * The KNIFE plate, in the ammo plate's place while the knife is out: the word, one meter toward
+	 * ready (the pullout, then the swing cooldown) and the cooldown's seconds. Returns its top edge.
+	 */
+	float DrawKnifeBlock(const FTraceHudCornerState& InState, float RightX, float BottomY, float BlockW);
+
+	/**
 	 * One status chip, right-aligned, with its BOTTOM edge at @p BottomY. Returns the Y above it.
 	 *
 	 * @param Fraction  0..1 of the effect REMAINING — the draining indicator spec v16 §2 demands
@@ -549,6 +598,12 @@ protected:
 	void DrawScoreboard();
 
 	/**
+	 * The results screen's CONTINUE (ENTER / pad A). Host: ends the post-match window for everybody,
+	 * as its timer would. Client: takes this player home. Once per HUD.
+	 */
+	void ContinueFromResults();
+
+	/**
 	 * True while the local player is holding the scoreboard open (Tab).
 	 *
 	 * THE one answer to that question on this HUD: DrawScoreboard() draws on it, and
@@ -575,8 +630,44 @@ protected:
 	void DrawChargePips(float X, float Y, float W, float H, int32 Charges, int32 MaxCharges,
 		float PartialFraction, const FLinearColor& FillColor);
 
-	/** Filled rect plus a thin border, used as the background of every panel. */
+	/**
+	 * Filled rect plus a thin border. NO LONGER the background of the match HUD's panels — those are
+	 * the handmade kit's plate now (DrawKitPanel). Kept for the two WARNING panels that are meant to
+	 * look like nothing else on screen: the missing-art warning and the network failure banner.
+	 */
 	void DrawPanel(float X, float Y, float W, float H, const FLinearColor& Fill, const FLinearColor& Border);
+
+	/**
+	 * THE HANDMADE KIT'S PLATE under a HUD panel: T_MenuBtn_Default 9-sliced through
+	 * TraceMenuKit::DrawPanelPlate, its corner a button's (capped at 60 reference px) so a tall card
+	 * keeps the artist's corner. @p bAboutYou draws the kit's amber-ringed plate instead (the menus'
+	 * "this one" state) for a row that is about the local player. Never breathes; @p Alpha fades the
+	 * plate with its contents.
+	 */
+	void DrawKitPanel(float X, float Y, float W, float H, float Alpha = 1.f, bool bAboutYou = false);
+
+	/**
+	 * A stroke whose ALPHA SURVIVES. AHUD::DrawLine goes through FBatchedElements::AddLine, which sets
+	 * the colour's alpha to 1 before it is ever blended — so every "fade" drawn with it stayed at full
+	 * strength and then vanished in one frame (the hit marker, the kill-feed glyphs). This draws the
+	 * stroke as two translucent triangles instead. Use it for anything that fades.
+	 */
+	void DrawLineAlpha(float X0, float Y0, float X1, float Y1, const FLinearColor& Color, float Thickness);
+
+	/**
+	 * One right-hand caption of the bottom-left stack, drawn at (@p X, centred on the row), and
+	 * RECORDED: the plate under the stack is sized to the widest caption the rows drew, so a short
+	 * caption no longer sits in a wide empty panel. Digits are measured as zeros, so a countdown does
+	 * not make the plate breathe.
+	 */
+	void DrawStackCaption(const FString& Text, const FLinearColor& Color, float X, float RowY, float RowH);
+
+	/**
+	 * True while a screen that owns the whole view is up — the pause menu, team select, character
+	 * select, the loadout page. The match chrome (clock, banners, kill feed, crosshair, the two corners)
+	 * does not draw under them: under their scrims it was ghost text cutting through the page title.
+	 */
+	bool IsFullScreenOverlayUp() const;
 
 	/** Horizontal meter: drop shadow, dark trough, coloured fill from the left. Fraction is clamped. */
 	void DrawMeter(float X, float Y, float W, float H, float Fraction, const FLinearColor& FillColor);
@@ -853,10 +944,59 @@ private:
 	float ScoreFlashTime = -1000.f;
 	ETraceTeam ScoreFlashTeam = ETraceTeam::None;
 
-	/** Client-local time the match went InProgress, so "GO" can be shown for a moment. */
+	/**
+	 * Client-local time play last KICKED OFF, so "GO" can be shown for a moment: the match going
+	 * InProgress, and — this was missing — the half-time break ending. TraceMatchState stays
+	 * InProgress through the break, so the second half used to start with no cue at all.
+	 */
 	float MatchStartTime = -1000.f;
 	ETraceMatchState LastSeenMatchState = ETraceMatchState::WaitingForPlayers;
 	bool bMatchStateCacheValid = false;
+
+	/** The half-time break as of the last draw, for the falling edge above. */
+	bool bWasHalfTimeBreak = false;
+
+	/** The last kickoff was the end of a half-time break: GO says SIDES SWITCHED under it. */
+	bool bKickoffAfterBreak = false;
+
+	// ---- The select screens and the HOSTING chip ----------------------------------------------
+
+	/** Team select / character select / loadout up on the last draw (NOT the pause menu). */
+	bool bSelectOverlayWasUp = false;
+
+	/** When those last came up. The HOSTING chip's reveal window is re-armed if they ate it. */
+	float SelectOverlayOpenedAt = -1000.f;
+
+	/** The HOSTING chip's drawn alpha: it fades out instead of vanishing and yanking the kill feed up. */
+	float NetPanelAlpha = 0.f;
+
+	/** The kill feed's drawn top, eased toward KillFeedTopY so it glides when the chip above it goes. */
+	float DrawnKillFeedTopY = -1.f;
+
+	// ---- The bottom-left stack's plate ---------------------------------------------------------
+
+	/** Rightmost caption edge drawn THIS frame (DrawStackCaption), and the one the last frame drew. */
+	float StackCaptionRightThisFrame = 0.f;
+	float StackCaptionRightLastFrame = 0.f;
+
+	/** The plate's drawn right edge: grows at once (words never hang off it), shrinks eased. */
+	float DrawnStackPlateRight = -1.f;
+
+	// ---- The E row's ready flash -----------------------------------------------------------------
+
+	/**
+	 * The E row flashes once on the RISING EDGE of ready, like the V row, and then holds steady. It
+	 * used to pulse for as long as E was ready — most of the match — right above a V row whose own
+	 * comment calls exactly that a strobe.
+	 */
+	float ActivatedReadyFlashTime = -1000.f;
+	bool bActivatedWasCooling = false;
+
+	// ---- The Core banner's pulse -----------------------------------------------------------------
+
+	/** The banner's text on the last draw, and when it last changed: it pulses for 2 s after a change. */
+	FString LastCoreBannerText;
+	float CoreBannerChangeTime = -1000.f;
 
 	// ---- FX/AUDIO plan §7.1 — the refusal toast's one slot -------------------------------------
 
@@ -920,6 +1060,9 @@ private:
 	/** True once the results-screen bed has been asked for. Pairs with the timestamp above. */
 	bool bMatchEndBedResumed = false;
 
+	/** CONTINUE has been pressed on the results screen; the travel is under way. */
+	bool bResultsContinued = false;
+
 #if !UE_BUILD_SHIPPING
 	// ---- Spec v16 §2 draw record ----------------------------------------------------------------
 	//
@@ -964,5 +1107,8 @@ private:
 
 	/** §2.5/§2.6 — the owner vignettes actually emitted, e.g. "CLOAK a=0.10". */
 	TArray<FString> DrawnVignettes;
+
+	/** The handmade-kit pass's record. See FHudKitRecord. */
+	FHudKitRecord HudKitRecord;
 #endif
 };

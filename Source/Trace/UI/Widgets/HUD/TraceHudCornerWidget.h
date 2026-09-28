@@ -119,8 +119,9 @@ protected:
 	// ---- The ammo plate -----------------------------------------------------------------------
 
 	/**
-	 * The plate's outline, tinted by the ROUNDS colour, so a bee clip changes the plate as well as
-	 * its contents and the whole corner announces itself.
+	 * The plate's outer Border. It used to be a hairline tinted by the ROUNDS colour; the plate is the
+	 * handmade kit's navy plate now (PlateFill) and this draws nothing. It is where the whole plate's
+	 * visibility is switched, which is why it is still bound.
 	 */
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UBorder> PlateOutline;
@@ -193,6 +194,9 @@ private:
 
 	/** Grows the tick pool to @p InCount visible ticks, collapsing any beyond it. */
 	void EnsureTicks(int32 InCount);
+
+	/** Shows or collapses the count's row (collapsed while the plate stands in for the knife). */
+	void SetCountRowVisible(bool bInVisible);
 
 	// ---- SPEC v22 §A1: THE CORNER TYPES IN THE ARTIST'S FACE ---------------------------------------
 	//

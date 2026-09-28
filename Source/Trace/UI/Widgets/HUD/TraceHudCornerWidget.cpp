@@ -8,6 +8,9 @@
 #include "Components/HorizontalBox.h"
 #include "Components/HorizontalBoxSlot.h"
 #include "Components/Image.h"
+#include "Components/PanelWidget.h"
+#include "Components/SizeBox.h"
+#include "UI/Text/TraceAtlasTextWidget.h"             // UTraceAtlasText — the count's atlas twin is a UWidget
 #include "Components/ProgressBar.h"
 #include "Components/TextBlock.h"
 #include "Components/VerticalBox.h"
@@ -26,10 +29,6 @@ namespace TraceHudCornerWidgetFile
 	{
 		return FLinearColor(InColor.R, InColor.G, InColor.B, InAlpha);
 	}
-
-	/** How much of the rounds colour the plate's border carries. DrawAmmoBlock's own two numbers. */
-	static constexpr float PlateEdgeAlphaNormal = 0.30f;
-	static constexpr float PlateEdgeAlphaBee = 0.55f;
 
 	/** An unlit magazine tick: the rounds colour at 14%, so the strip's SHAPE survives an empty clip. */
 	static constexpr float UnlitTickAlpha = 0.14f;
@@ -187,7 +186,7 @@ FTraceHudCornerPresented UTraceHudCornerWidget::PresentCorner(const FTraceHudCor
 	FTraceHudCornerPresented Presented;
 
 	SetVisibility(ESlateVisibility::HitTestInvisible);
-	ApplyCornerTransform(InDesignScale, InState.bAmmoBlock);
+	ApplyCornerTransform(InDesignScale, InState.bAmmoBlock || InState.bKnifeBlock);
 
 	PresentChips(InState, Presented);
 	PresentAmmo(InState, Presented);
@@ -222,6 +221,39 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 	// NO GUN, NO PLATE. The gate is UTraceWeaponComponent::ShouldShowAmmo(), decided once in
 	// ATraceHUD::BuildCornerState and carried here — never re-derived, because a second definition of
 	// "the carrier has no gun" is free to disagree with the one the weapon enforces.
+	//
+	// THE KNIFE borrows the plate: its name on the label, the swing cooldown's seconds on the right,
+	// no count, and the reload bar as its one meter toward ready (the pullout, then the cooldown).
+	// Pressing 1 for the knife used to leave this corner empty — nothing said it had taken.
+	if (!InState.bAmmoBlock && InState.bKnifeBlock)
+	{
+		PlateOutline->SetVisibility(ESlateVisibility::HitTestInvisible);
+		InstallAtlasLabels();
+
+		CountText->SetText(FText::GetEmpty());
+		CapacityText->SetText(FText::GetEmpty());
+		// No count, so no count ROW: the plate closes up to the label and the meter instead of standing
+		// a 40 px empty band under them. (CountText's row's size box; restored below for a gun.)
+		SetCountRowVisible(false);
+		AmmoLabelText->SetText(FText::FromString(InState.KnifeLabel));
+		AmmoLabelText->SetColorAndOpacity(FSlateColor(InState.KnifeFraction >= 1.f
+			? InState.RoundsColor : TraceHudCornerWidgetFile::WithAlpha(InState.RoundsColor, 0.6f)));
+		ReloadLabelText->SetText(FText::FromString(InState.KnifeReadout));
+		ReloadLabelText->SetColorAndOpacity(FSlateColor(TraceHudCornerWidgetFile::WithAlpha(InState.RoundsColor, 0.6f)));
+		TraceAtlasTextSwap::MirrorAll(AtlasLabels);
+
+		MagazineStrip->SetVisibility(ESlateVisibility::Collapsed);
+		ReloadBar->SetVisibility(ESlateVisibility::HitTestInvisible);
+		ReloadBar->SetFillColorAndOpacity(InState.KnifeFraction >= 1.f
+			? InState.RoundsColor : TraceHudCornerWidgetFile::WithAlpha(InState.RoundsColor, 0.45f));
+		ReloadBar->SetPercent(FMath::Clamp(InState.KnifeFraction, 0.f, 1.f));
+
+		OutPresented.bKnifeBlock = true;
+		OutPresented.AmmoLabel = InState.KnifeLabel;
+		OutPresented.RightLabel = InState.KnifeReadout;
+		return;
+	}
+
 	if (!InState.bAmmoBlock)
 	{
 		PlateOutline->SetVisibility(ESlateVisibility::Collapsed);
@@ -229,12 +261,11 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 	}
 
 	PlateOutline->SetVisibility(ESlateVisibility::HitTestInvisible);
+	SetCountRowVisible(true);
 
-	// The plate's border takes the rounds colour, so a bee clip changes the plate as well as its
-	// contents and the whole corner announces itself.
-	PlateOutline->SetBrushColor(TraceHudCornerWidgetFile::WithAlpha(InState.RoundsColor,
-		InState.bBeeClip ? TraceHudCornerWidgetFile::PlateEdgeAlphaBee
-		                 : TraceHudCornerWidgetFile::PlateEdgeAlphaNormal));
+	// The plate is the handmade kit's navy plate now (the asset's PlateFill, generate-hud-widgets.py);
+	// it no longer wears a hairline tinted by the rounds colour. A bee clip still announces itself
+	// three ways without it: the amber words, the five fat pips and the amber count.
 
 	InstallAtlasLabels();
 
@@ -265,6 +296,16 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 		ReloadBar->SetPercent(FMath::Clamp(InState.ReloadFraction, 0.f, 1.f));
 
 		OutPresented.bReloadBar = true;
+	}
+	else if (InState.DeployFraction >= 0.f)
+	{
+		// THE PULLOUT: the gun is coming out and cannot fire yet — a dim bar filling toward the clip,
+		// where the old bottom-left WEAPON row's meter used to say it. Not a reload, so not recorded
+		// as one.
+		MagazineStrip->SetVisibility(ESlateVisibility::Collapsed);
+		ReloadBar->SetVisibility(ESlateVisibility::HitTestInvisible);
+		ReloadBar->SetFillColorAndOpacity(TraceHudCornerWidgetFile::WithAlpha(InState.RoundsColor, 0.45f));
+		ReloadBar->SetPercent(FMath::Clamp(InState.DeployFraction, 0.f, 1.f));
 	}
 	else
 	{
@@ -302,6 +343,8 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 	OutPresented.bAmmoBlock = true;
 	OutPresented.bBeeClip = InState.bBeeClip;
 	OutPresented.AmmoText = InState.CountText + InState.CapacityText;
+	OutPresented.AmmoLabel = InState.AmmoLabel;
+	OutPresented.RightLabel = InState.RightLabel;
 }
 
 void UTraceHudCornerWidget::PresentChips(const FTraceHudCornerState& InState,
@@ -352,6 +395,34 @@ void UTraceHudCornerWidget::PresentChips(const FTraceHudCornerState& InState,
 	}
 
 	StatusStack->SetVisibility(Usable > 0 ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);
+}
+
+void UTraceHudCornerWidget::SetCountRowVisible(bool bInVisible)
+{
+	// The count's row is the SizeBox that holds it (NumberSize, 40 tall, in generate-hud-widgets.py).
+	// Found by walking up to the nearest size box rather than bound — the row is layout, not a thing
+	// C++ fills. The walk starts from the count's ATLAS widget once it is installed: the atlas text swap
+	// takes CountText out of the tree and puts its atlas twin in the same slot, so CountText itself has
+	// no parent after the first present.
+	UWidget* Start = CountText;
+	for (const FTraceAtlasLabel& Label : AtlasLabels)
+	{
+		if (Label.Source == CountText && Label.Atlas != nullptr)
+		{
+			Start = Label.Atlas.Get();
+			break;
+		}
+	}
+	UWidget* Ancestor = (Start != nullptr) ? Start->GetParent() : nullptr;
+	for (int32 Depth = 0; Ancestor != nullptr && Depth < 4; ++Depth)
+	{
+		if (Ancestor->IsA<USizeBox>())
+		{
+			Ancestor->SetVisibility(bInVisible ? ESlateVisibility::SelfHitTestInvisible : ESlateVisibility::Collapsed);
+			return;
+		}
+		Ancestor = Ancestor->GetParent();
+	}
 }
 
 void UTraceHudCornerWidget::EnsureTicks(int32 InCount)

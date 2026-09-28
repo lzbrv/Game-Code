@@ -121,11 +121,21 @@ def color(r, g, b, a=1.0):
 
 
 INK = color(0.95, 0.96, 1.00, 1.00)          # chip labels
-INK_DIM = color(0.68, 0.72, 0.78, 1.00)      # "/30", and the default label ink
-PANEL_FILL = color(0.02, 0.03, 0.05, 0.72)   # behind the chips and the ammo plate
-TROUGH = color(0.06, 0.07, 0.09, 0.85)       # under the magazine strip
-DRAIN_TRACK = color(0.00, 0.00, 0.00, 0.50)  # WithAlpha(TraceHUDStyle::Shadow, 0.5)
-NEUTRAL_ROUNDS = color(0.90, 0.93, 1.00, 1.00)  # the ammo plate's resting border tint
+INK_DIM = color(0.52, 0.55, 0.62, 1.00)      # "/30" - TraceHUDStyle::InkDim, the kit's CaptionInk
+TROUGH = color(0.0040, 0.0044, 0.0044, 1.00) # a meter's groove: the kit's disabled-plate black
+NEUTRAL_ROUNDS = color(0.90, 0.93, 1.00, 1.00)  # the count's resting ink
+NO_EDGE = color(0.0, 0.0, 0.0, 0.0)          # the old tinted hairlines, switched off
+
+# THE HANDMADE KIT'S PLATE (TraceMenuArtStyle::PlateFill, sRGB 29,41,81, in linear here) at the match
+# HUD's panel alpha (TraceHUDStyle::PanelAlpha, 0.92). The Canvas corner draws the kit's own sprite,
+# T_MenuBtn_Default, through TraceMenuKit::DrawPanelPlate. This corner cannot: a Box brush slices
+# against the TEXTURE's pixels (22 texels a corner - see TraceMenuArtStyle.h), which does not fit a
+# 24 px chip. So it draws the same SILHOUETTE as a rounded box - the default plate is a flat navy
+# rounded rect whose corner is a true circle of 0.2215 x the plate's height (ButtonFrame.Corner,
+# measured), capped at a 60 px button's corner for anything taller.
+KIT_PLATE = color(0.01228, 0.02217, 0.08228, 0.92)
+KIT_CORNER_FRACTION = 272.4 / 1230.0
+KIT_CORNER_CAP_H = 60.0
 
 # =============================================================================
 # 2. THE LAYOUT, in design pixels
@@ -136,7 +146,6 @@ NEUTRAL_ROUNDS = color(0.90, 0.93, 1.00, 1.00)  # the ammo plate's resting borde
 
 BLOCK_W = 260.0        # DrawAmmoAndStatuses: BlockW
 PLATE_PAD = 6.0        # DrawAmmoBlock: PlatePad
-EDGE = 1.5             # DrawPanel: T = max(1, 1.5 * UIScale) - the panel border
 PLATE_BOX_W = BLOCK_W + (PLATE_PAD * 2.0)   # 272: the plate overhangs the chips
 
 LABEL_H = 14.0         # DrawAmmoBlock: LabelH
@@ -146,9 +155,15 @@ ROW_GAP = 5.0          # DrawAmmoBlock: Gap
 COUNT_GAP = 4.0        # DrawAmmoBlock: the 4 px between "26" and "/30"
 
 CHIP_H = 24.0          # DrawStatusChip: ChipH
-CHIP_TAB_W = 4.0       # DrawStatusChip: TabW
+CHIP_TAB_W = 3.0       # DrawStatusChip: PipW - the status colour, as an upright pip
 CHIP_DRAIN_H = 3.0     # DrawStatusChip: DrainH
 CHIP_TEXT_INSET = 6.0  # DrawStatusChip: the 6 px either side of the text
+
+# The kit plate's corner radius, and the inset that keeps the pip and the drain inside it
+# (DrawStatusChip's Corner = min(ChipH, 60) * 0.25).
+PLATE_RADIUS = KIT_CORNER_CAP_H * KIT_CORNER_FRACTION     # the ammo plate: a button's corner
+CHIP_RADIUS = CHIP_H * KIT_CORNER_FRACTION
+CHIP_CORNER_INSET = CHIP_H * 0.25
 
 # Font sizes are the ONE thing here with no Canvas literal to copy: the Canvas
 # HUD draws with the engine's bitmap UFonts (GEngine->GetSmallFont()) and UMG
@@ -274,6 +289,25 @@ def make_anchors(min_x, min_y, max_x, max_y):
     raise last_error
 
 
+def rounded_brush(radius):
+    """
+    The kit plate's silhouette: a ROUNDED BOX with a circular corner of @radius and no outline.
+
+    WHITE, and the colour goes on the Border's brush_color: a Border multiplies the two, and one
+    colour in one place is the rule this file keeps for every brush.
+    """
+    brush = unreal.SlateBrush()
+    brush.set_editor_property("draw_as", unreal.SlateBrushDrawType.ROUNDED_BOX)
+    brush.set_editor_property("tint_color", unreal.SlateColor(unreal.LinearColor.WHITE))
+    outline = brush.get_editor_property("outline_settings")
+    outline.set_editor_property("corner_radii", unreal.Vector4(radius, radius, radius, radius))
+    outline.set_editor_property("rounding_type", unreal.SlateBrushRoundingType.FIXED_RADIUS)
+    outline.set_editor_property("width", 0.0)
+    outline.set_editor_property("color", unreal.SlateColor(NO_EDGE))
+    brush.set_editor_property("outline_settings", outline)
+    return brush
+
+
 def flat_brush(tint, size_x=16.0, size_y=16.0):
     """
     A plain filled rectangle in @tint.
@@ -384,19 +418,19 @@ def open_asset(name, parent_class):
 # 5. WBP_TraceHudStatusChip
 #
 #     RootSize (SizeBox, 24 tall)
-#       ChipOutline (Border)          <- 1.5 px of padding IS the outline
-#         ChipFill (Border)           <- the dark panel
+#       ChipOutline (Border)          <- no longer drawn (NO_EDGE); kept because C++ binds it
+#         ChipFill (Border)           <- the kit's navy plate, as a rounded box
 #           ChipStack (Overlay)
 #             ChipRow (HorizontalBox)
-#               ColorTab (Image)      <- 4 px of saturated tint down the edge
+#               ColorTab (Image)      <- the status colour: an upright pip inside the corner
 #               LabelText (TextBlock)
 #               ReadoutText (TextBlock)
-#             DrainSize (SizeBox, 3 tall, bottom)
+#             DrainSize (SizeBox, 3 tall, bottom, inset clear of the corners)
 #               DrainBar (ProgressBar)
 #
-# The Canvas pass draws exactly this: a panel, a four-rect border, a tab, two
-# strings and a two-rect drain. Slate has no stroked-rect primitive either, so
-# the border is two nested Borders - the outer one's PADDING is the stroke.
+# The Canvas pass draws exactly this (DrawStatusChip): the kit plate, a pip, two
+# strings and a two-rect drain. It used to be a slate panel with a tinted hairline
+# and a square tab down its edge.
 # =============================================================================
 
 def build_chip(asset):
@@ -404,16 +438,16 @@ def build_chip(asset):
     root.set_height_override(CHIP_H)
     root.set_editor_property("visibility", unreal.SlateVisibility.SELF_HIT_TEST_INVISIBLE)
 
+    # No stroke any more, so no padding: the plate fills the chip, as on Canvas.
     outline = add(asset, unreal.Border, "ChipOutline", root)
-    outline.set_editor_property("padding", margin(EDGE, EDGE, EDGE, EDGE))
-    # Tinted from C++ every frame (the status's own hue at 45%); this is only what
-    # it looks like sitting in the editor.
-    outline.set_editor_property("brush_color", INK_DIM)
+    outline.set_editor_property("padding", margin(0.0, 0.0, 0.0, 0.0))
+    outline.set_editor_property("brush_color", NO_EDGE)
     outline.set_editor_property("visibility", unreal.SlateVisibility.SELF_HIT_TEST_INVISIBLE)
 
     fill = add(asset, unreal.Border, "ChipFill", outline)
     fill.set_editor_property("padding", margin(0.0, 0.0, 0.0, 0.0))
-    fill.set_editor_property("brush_color", PANEL_FILL)
+    fill.set_editor_property("background", rounded_brush(CHIP_RADIUS))
+    fill.set_editor_property("brush_color", KIT_PLATE)
     fill.set_editor_property("visibility", unreal.SlateVisibility.SELF_HIT_TEST_INVISIBLE)
 
     stack = add(asset, unreal.Overlay, "ChipStack", fill)
@@ -434,6 +468,10 @@ def build_chip(asset):
     tab_slot = tab.slot
     tab_slot.set_editor_property("size", unreal.SlateChildSize(1.0, unreal.SlateSizeRule.AUTOMATIC))
     tab_slot.set_editor_property("vertical_alignment", unreal.VerticalAlignment.V_ALIGN_FILL)
+    # Clear of the rounded corner on the left, and a pip rather than a full-height tab: half the
+    # height above the drain, centred, exactly DrawStatusChip's PipH.
+    pip_pad = (CHIP_H - CHIP_DRAIN_H) * 0.25
+    tab_slot.set_editor_property("padding", margin(CHIP_CORNER_INSET, pip_pad, 0.0, pip_pad))
 
     label = add(asset, unreal.TextBlock, "LabelText", row)
     set_font(label, FONT_SMALL, INK)
@@ -459,9 +497,11 @@ def build_chip(asset):
     drain_slot = drain_size.slot
     drain_slot.set_editor_property("horizontal_alignment", unreal.HorizontalAlignment.H_ALIGN_FILL)
     drain_slot.set_editor_property("vertical_alignment", unreal.VerticalAlignment.V_ALIGN_BOTTOM)
+    # Inset clear of the plate's two bottom corners and lifted 2 px off its edge, as on Canvas.
+    drain_slot.set_editor_property("padding", margin(CHIP_CORNER_INSET, 0.0, CHIP_CORNER_INSET, 2.0))
 
     drain = add(asset, unreal.ProgressBar, "DrainBar", drain_size)
-    style_progress_bar(drain, DRAIN_TRACK)
+    style_progress_bar(drain, TROUGH)
     drain.set_editor_property("percent", 0.65)
     drain.set_editor_property("visibility", unreal.SlateVisibility.HIT_TEST_INVISIBLE)
 
@@ -551,16 +591,18 @@ def build_corner(asset):
     # are made at runtime). Same pixels, no negative numbers.
     plate_box_slot.set_editor_property("padding", margin(0.0, 0.0, 0.0, 0.0))
 
+    # The outline Border is no longer drawn (NO_EDGE) - it was a hairline tinted by the rounds colour.
+    # It stays in the tree because C++ binds it (it is what the plate's visibility is set on).
     plate_outline = add(asset, unreal.Border, "PlateOutline", plate_box)
-    plate_outline.set_editor_property("padding", margin(EDGE, EDGE, EDGE, EDGE))
-    plate_outline.set_editor_property("brush_color", NEUTRAL_ROUNDS)
+    plate_outline.set_editor_property("padding", margin(0.0, 0.0, 0.0, 0.0))
+    plate_outline.set_editor_property("brush_color", NO_EDGE)
     plate_outline.set_editor_property("visibility", unreal.SlateVisibility.SELF_HIT_TEST_INVISIBLE)
 
     plate_fill = add(asset, unreal.Border, "PlateFill", plate_outline)
-    # 1.5 of outline + 4.5 here = the 6 px inset the Canvas plate has always had.
-    plate_fill.set_editor_property("padding", margin(PLATE_PAD - EDGE, PLATE_PAD - EDGE,
-                                                     PLATE_PAD - EDGE, PLATE_PAD - EDGE))
-    plate_fill.set_editor_property("brush_color", PANEL_FILL)
+    # The 6 px inset the Canvas plate has always had.
+    plate_fill.set_editor_property("padding", margin(PLATE_PAD, PLATE_PAD, PLATE_PAD, PLATE_PAD))
+    plate_fill.set_editor_property("background", rounded_brush(PLATE_RADIUS))
+    plate_fill.set_editor_property("brush_color", KIT_PLATE)
     plate_fill.set_editor_property("visibility", unreal.SlateVisibility.SELF_HIT_TEST_INVISIBLE)
 
     rows = add(asset, unreal.VerticalBox, "PlateRows", plate_fill)
@@ -577,7 +619,7 @@ def build_corner(asset):
 
     ammo_label = add(asset, unreal.TextBlock, "AmmoLabelText", label_row)
     set_font(ammo_label, FONT_SMALL, INK_DIM)
-    ammo_label.set_editor_property("text", unreal.Text("AMMO"))
+    ammo_label.set_editor_property("text", unreal.Text("PISTOL"))
     ammo_label.set_editor_property("visibility", unreal.SlateVisibility.HIT_TEST_INVISIBLE)
     ammo_label.slot.set_editor_property("size",
         unreal.SlateChildSize(1.0, unreal.SlateSizeRule.AUTOMATIC))

@@ -80,11 +80,42 @@ struct FTraceHudCornerState
 	/** "/30". Subordinate to the count on purpose: "7" must read in peripheral vision, "/30" need not. */
 	FString CapacityText;
 
-	/** "AMMO", or "BEE ROUNDS". */
+	/**
+	 * The gun's NAME — "PISTOL" or "SMG" — or "BEE ROUNDS" for X's clip. It used to be the word "AMMO",
+	 * which repeats what the number says, while a whole bottom-left WEAPON row named the gun; the name
+	 * now lives here and that row is gone.
+	 */
 	FString AmmoLabel;
 
-	/** "[R]  RELOAD" from the player's OWN binding, or "RELOADING  1.2". */
+	/**
+	 * "[R]  RELOAD" from the player's OWN binding — ONLY when the clip is low or empty — or
+	 * "RELOADING  1.2". Empty at a healthy clip: an instruction nobody needs at 30/30 is clutter.
+	 */
 	FString RightLabel;
+
+	/**
+	 * 0..1 of the gun's PULLOUT elapsed while it is being drawn (the 0.13-0.2 s in which it cannot fire),
+	 * negative otherwise. The magazine strip fills with it, as the WEAPON row's meter used to.
+	 */
+	float DeployFraction = -1.f;
+
+	// ---- The knife plate ---------------------------------------------------------------------
+	//
+	// The knife has no clip, so ShouldShowAmmo() hides the ammo plate — and the corner then said nothing
+	// about the weapon at all. Pressing 1 for the knife's speed has to show that it took, and the swing
+	// cooldown is a refusal the player otherwise reads as the game ignoring a click. So a small KNIFE
+	// plate stands where the ammo plate would be. Canvas only: the UMG corner does not draw it yet.
+
+	bool bKnifeBlock = false;
+
+	/** "KNIFE". */
+	FString KnifeLabel;
+
+	/** The swing cooldown's seconds while cooling, else empty. */
+	FString KnifeReadout;
+
+	/** 0..1 toward ready: the pullout while it is drawn, then the swing cooldown. 1 = ready. */
+	float KnifeFraction = 1.f;
 
 	/** Bee amber or the neutral. Tints the rounds, the plate's border and the unlit ticks. */
 	FLinearColor RoundsColor = FLinearColor::White;
@@ -133,6 +164,13 @@ struct FTraceHudCornerPresented
 
 	/** "26/30" — the two text blocks that were actually filled, concatenated. */
 	FString AmmoText;
+
+	/** The plate's two label words as set on the widget ("PISTOL" / "", or "KNIFE" / "0.3"). */
+	FString AmmoLabel;
+	FString RightLabel;
+
+	/** The plate stood in for the knife (bAmmoBlock stays false: there is no clip). */
+	bool bKnifeBlock = false;
 
 	/** One entry per chip widget actually shown, in the order shown (bottom-up). */
 	TArray<FString> Chips;

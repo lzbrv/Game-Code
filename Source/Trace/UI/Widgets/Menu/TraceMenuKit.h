@@ -299,6 +299,21 @@ namespace TraceMenuKit
 	TRACE_API void DrawStatePlate(AHUD* HUD, ETraceKitState State, float X, float Y, float W, float H,
 		float NowSeconds, float CornerHeight = 0.f);
 
+	/**
+	 * A PANEL: the state's plate as a surface rather than a control (the match HUD's score bar,
+	 * chips, kill-feed rows, cards). Two differences from DrawStatePlate, both deliberate:
+	 *
+	 *   * it never breathes. A hover plate here means "this one is about you", not "the pointer is
+	 *     on it", and a panel that pulsed for as long as it was up would be a strobe;
+	 *   * @p Alpha multiplies the sprite AND its fallback, so a panel can fade out with the words on
+	 *     it. A fading row whose plate stayed solid is a box with nothing in it.
+	 *
+	 * @p CornerHeight <= 0 means H. Draws nothing at Alpha <= 0. Returns true when the sprite drew,
+	 * false when the flat fallback did (or nothing did).
+	 */
+	TRACE_API bool DrawPanelPlate(AHUD* HUD, ETraceKitState State, float X, float Y, float W, float H,
+		float CornerHeight = 0.f, float Alpha = 1.f);
+
 	// =============================================================================================
 	// TEXT ON THE KIT
 	// =============================================================================================

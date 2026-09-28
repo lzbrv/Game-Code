@@ -2,7 +2,9 @@
 
 #include "UI/TraceHUD.h"
 
+#include "CanvasItem.h"                        // FCanvasTriangleItem — strokes whose alpha survives
 #include "Components/StaticMeshComponent.h"  // v25 §3 — the pull ring measures the drawn orb's bounds
+#include "GlobalRenderResources.h"            // GWhiteTexture, under those strokes
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"           // SendRemoteClientsHome — a host leaving takes its guests home
 #include "Core/TraceGameState.h"
@@ -18,7 +20,7 @@
 #include "GameFramework/PlayerState.h"
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceHealthComponent.h"
-#include "Gameplay/TraceMelee.h"          // v10 §1 — the equipped-weapon row and its two timers
+#include "Gameplay/TraceMelee.h"          // v10 §1 — the weapon's name, pullout and swing cooldown (the corner)
 #include "Gameplay/TraceParry.h"          // v6 §3 — the parry-kill banner and the death-panel line
 #include "Gameplay/TraceWeaponComponent.h" // v16 §1/§2 — the ammo block reads the clip through this
 // v16 §2 — the status stack. ELEVEN statuses now (six from v16 §2, plus FX/AUDIO plan §7.3's five:
@@ -51,13 +53,16 @@
 #include "Movement/TraceCharacterMovementComponent.h"
 #include "Core/TraceCharacterRoster.h"    // v14 §3 — the accent colour and the ability's name
 #include "Settings/TraceUserSettings.h"   // v14 §5 — the ability's bound key, if the input slice has one
+#include "Settings/TraceGamepadInput.h"   // TracePadMenu::HasSeenPad — the results screen's CONTINUE key
 #include "InputCoreTypes.h"               // EKeys::Escape, for the pause poll
 #include "Misc/CommandLine.h"
 #include "Misc/DateTime.h"
 #include "Misc/Parse.h"
 #include "Misc/Paths.h"
 #include "UnrealClient.h"                 // FScreenshotRequest
+#include "Engine/TextureRenderTarget2D.h"  // Trace.HUD.Kit.Verify's stroke readback
 #include "Kismet/GameplayStatics.h"       // OpenLevel, for RETURN TO TITLE
+#include "Kismet/KismetRenderingLibrary.h" // Trace.HUD.Kit.Verify's stroke readback
 #include "Kismet/KismetSystemLibrary.h"   // QuitGame
 #include "Trace.h"                        // LogTraceGame
 #include "TraceSettings.h"
@@ -148,38 +153,57 @@ namespace TraceHUDStyle
 	// Palette. Deliberately desaturated so the two team colours are the only saturated things on
 	// screen — that is what makes "who has the Core" readable at a glance.
 	static const FLinearColor Ink        (0.95f, 0.96f, 1.00f, 1.00f);
-	static const FLinearColor InkDim     (0.68f, 0.72f, 0.78f, 1.00f);
-	static const FLinearColor PanelFill  (0.02f, 0.03f, 0.05f, 0.72f);
 	/**
-	 * The top score panel ONLY (bible §7.2), and it is now OPAQUE. Every other panel keeps PanelFill —
-	 * they sit over darker ground or exist for a moment, and a heavier scrim everywhere would deaden
-	 * the HUD.
-	 *
-	 * ---------------------------------------------------------------------------------------------
-	 * 0.72 -> 0.86 -> 1.0, AND THE THIRD STEP IS THE ONE THAT FINISHES IT
-	 * ---------------------------------------------------------------------------------------------
-	 * The visual audit measured the bleed as a LUMINANCE SPREAD across the panel's top band over
-	 * comparably bright arena geometry — p95 minus p5, in output bytes — and got 57.7 at alpha 0.72
-	 * (crop_scorebar.png). The lift to 0.86 halved it to 34.0, and the QA pass photographed what 34
-	 * still looks like: "the bright structure behind the panel reads as a pale grey rectangle stuck
-	 * inside its left third" (crop_scorepanel_now.png). Halved was not fixed.
-	 *
-	 * The arithmetic says why, and says where this ends. What survives the scrim is (1 - alpha) times
-	 * the world's own spread behind it, and 34.0 / 0.14 puts that world spread at about 243 — this
-	 * arena's white walkways against its black floor, which is very nearly the whole range there is.
-	 * So every remaining tenth of alpha buys 24 bytes of contrast back, and the only value that
-	 * reaches zero is 1.0. At 0.96 the residual would still be ~10, which is visible as a grey smudge
-	 * on a white wall; there is no defensible stopping point short of opaque.
-	 *
-	 * WHAT IT COSTS, STATED PLAINLY: the arena is no longer faintly visible behind the score bar. That
-	 * is 240 x 74 reference pixels of a 1920 x 1080 screen, at the top centre, where nothing is ever
-	 * shot — and this is the ONE panel that always has bright world behind it, which is the whole
-	 * reason it is the only one that gets this treatment. FTraceCharacterSelect's backdrop made the
-	 * same call for the same measured reason and its comment is worth reading beside this one.
+	 * Secondary words: captions, countdowns, the footer. The handmade kit's own secondary grey
+	 * (TraceMenuKit::CaptionInk, the UMG title's INK_DIM), so the match HUD's quiet words are the same
+	 * grey as the menus'. It was a lighter blue-grey of its own.
 	 */
-	static const FLinearColor TopPanelFill(0.02f, 0.03f, 0.05f, 1.00f);
-	static const FLinearColor PanelBorder(0.55f, 0.62f, 0.72f, 0.35f);
-	static const FLinearColor Trough     (0.06f, 0.07f, 0.09f, 0.85f);
+	static const FLinearColor InkDim     (0.52f, 0.55f, 0.62f, 1.00f);
+
+	/**
+	 * THE HANDMADE KIT'S PLATE, OVER THE WORLD. Every panel on this HUD is now the artist's navy plate
+	 * (T_MenuBtn_Default, 9-sliced through TraceMenuKit::DrawPanelPlate) instead of a flat slate rect
+	 * with a grey hairline. Over the arena it sits at this alpha: enough that a bright walkway behind
+	 * the bottom-left stack no longer shows through as a pale stripe (it did at the old 0.72), not so
+	 * much that the corner reads as a hole in the screen. The top score bar and the modal cards are
+	 * drawn opaque.
+	 */
+	static constexpr float PanelAlpha = 0.92f;
+
+	/** A plate's corner is the button's up to this height (stylespec §6: tall cards keep 60 px). */
+	static constexpr float PanelCornerMax = 60.f;
+
+	/**
+	 * THE ONE PULSE. Every "act on this now" state on the HUD breathes at this one rate, so two of them
+	 * on screen at once rise and fall together instead of flickering against each other (they used to
+	 * run at 5, 6, 7, 8 and 12 rad/s).
+	 */
+	static constexpr float PulseRadiansPerSecond = 6.f;
+
+	/** 0..1, in phase for every caller. */
+	static float PulseWave(float InSeconds)
+	{
+		return 0.5f + 0.5f * FMath::Sin(InSeconds * PulseRadiansPerSecond);
+	}
+
+	/*
+	 * WHY THE TOP SCORE BAR IS DRAWN OPAQUE (bible §7.2), kept from when it was a slate TopPanelFill.
+	 *
+	 * 0.72 -> 0.86 -> 1.0, AND THE THIRD STEP IS THE ONE THAT FINISHED IT. The visual audit measured
+	 * the bleed as a LUMINANCE SPREAD across the panel's top band over comparably bright arena
+	 * geometry — p95 minus p5, in output bytes — and got 57.7 at alpha 0.72 (crop_scorebar.png). The
+	 * lift to 0.86 halved it to 34.0, and the QA pass photographed what 34 still looks like: "the
+	 * bright structure behind the panel reads as a pale grey rectangle stuck inside its left third".
+	 * What survives a scrim is (1 - alpha) times the world's own spread behind it, and 34.0 / 0.14 puts
+	 * that at about 243 — this arena's white walkways against its black floor — so the only value that
+	 * reaches zero is 1.0. The bar is the ONE panel that always has bright world behind it, which is
+	 * why it alone is opaque; the others sit at PanelAlpha.
+	 */
+	/**
+	 * A meter's empty groove: the kit's disabled-plate black (sRGB 13,14,14), cut into the navy plate
+	 * the meters now sit on. The old slate trough was nearly the colour of the old slate panel.
+	 */
+	static const FLinearColor Trough     (0.0040f, 0.0044f, 0.0044f, 1.00f);
 	static const FLinearColor Shadow     (0.00f, 0.00f, 0.00f, 0.55f);
 	static const FLinearColor Danger     (0.95f, 0.22f, 0.18f, 1.00f);
 	static const FLinearColor Good       (0.24f, 0.90f, 0.42f, 1.00f);
@@ -215,7 +239,14 @@ namespace TraceHUDStyle
 	// derives from TopPanelY + TopPanelH and follows automatically; the footer keeps its
 	// PanelH - 22 baseline, verified to clear the clock at UIScale 0.6 (720p).
 	static constexpr float TopPanelY = 14.f;
-	static constexpr float TopPanelW = 520.f;
+	/**
+	 * The score bar's MINIMUM width. 320, down from 520: two scores and a clock take about 280, and the
+	 * old bar was a wide slab of empty panel either side of them. The bar still grows to fit a long
+	 * footer ("HALF ENDS AT NEXT TURNOVER" plus the hard-cap seconds), measured every frame.
+	 */
+	static constexpr float TopPanelW = 320.f;
+	/** Where the two scores sit either side of the clock, from the bar's centre. Was 120 on the wide bar. */
+	static constexpr float ScoreInset = 90.f;
 	static constexpr float TopPanelH = 74.f;
 	static constexpr float BannerGap = 10.f;
 
@@ -282,6 +313,15 @@ namespace TraceHUDStyle
 
 	/** How long "BLUE SCORES" stays up after a capture, and "GO" after the whistle. */
 	static constexpr float ScoreFlashDuration = 2.4f;
+
+	/**
+	 * The goal flash's band: its headline sits at this fraction of the view, the band starts this many
+	 * reference px above it and is this tall. One definition, because the death panel has to clear it:
+	 * a wipe scores and kills at once, and the two used to touch.
+	 */
+	static constexpr float ScoreBandHeadlineFraction = 0.34f;
+	static constexpr float ScoreBandLift = 12.f;
+	static constexpr float ScoreBandHeight = 96.f;
 	/** How long the "TEAM WIPE +2" flash stays up, in seconds. */
 	static constexpr float WipeBonusDuration = 3.0f;
 
@@ -335,6 +375,141 @@ namespace TraceHUDStyle
 	static float ThirdPersonCrosshairScaleSetting()
 	{
 		return FMath::Clamp(UTraceSettings::Get().ThirdPersonCrosshairScale, 1.f, 3.f);
+	}
+
+	/**
+	 * How long the HOSTING / CONNECTED chip stays up after the connection answer changes. It is re-armed
+	 * when a select screen closes that covered it (see DrawHUD), and fades out rather than vanishing.
+	 */
+	static constexpr float NetRevealSeconds = 10.f;
+
+	/** The chip's fade, in seconds, and how fast the kill feed under it follows it (1/s). */
+	static constexpr float NetPanelFadeSeconds = 0.3f;
+	static constexpr float KillFeedAnchorEase = 12.f;
+
+	/** A new kill-feed row fades and slides in over this long instead of appearing in one frame. */
+	static constexpr float KillFeedEnterSeconds = 0.15f;
+}
+
+// =================================================================================================
+// THE KICKOFF — when "GO" is shown, as one pure function the harness can hold to account.
+//
+// "GO" is keyed to MatchStartTime, which used to be set only when TraceMatchState changed to
+// InProgress. The state STAYS InProgress through the half-time break (ATraceGameState::bHalfTimeBreak),
+// so the second half began with no cue: the loadout page vanished and play resumed mid-thought. The
+// break's falling edge is a kickoff too, and it is the one where the sides have just switched.
+// =================================================================================================
+namespace TraceHUDKickoff
+{
+	enum class EKind : uint8
+	{
+		None,
+		MatchStart,
+		AfterBreak,
+	};
+
+	/**
+	 * Whether play kicked off between the last draw and this one.
+	 *
+	 * @param bHaveLast  false on a HUD's first draw: that draw establishes the baseline, so a late
+	 *                   joiner is not greeted by a GO for a whistle they never heard.
+	 */
+	static EKind Detect(bool bHaveLast, ETraceMatchState LastState, ETraceMatchState StateNow,
+		bool bLastBreak, bool bBreakNow)
+	{
+		if (!bHaveLast)
+		{
+			return EKind::None;
+		}
+		if (StateNow != LastState && StateNow == ETraceMatchState::InProgress)
+		{
+			return EKind::MatchStart;
+		}
+		if (StateNow == ETraceMatchState::InProgress && bLastBreak && !bBreakNow)
+		{
+			return EKind::AfterBreak;
+		}
+		return EKind::None;
+	}
+
+	/**
+	 * THE HALF-TIME CARD WAITS FOR THE SCORE FLASH. A goal that ends a half starts the break in the same
+	 * server call, so "HALF TIME" (0.30 H) and "BLUE SCORES" (its band spans 0.33-0.42 H) were drawn on
+	 * top of each other for 2.4 s. The goal is shown first, then the card.
+	 */
+	static bool HalfTimeCardYieldsTo(float ScoreFlashAge, float ScoreFlashDuration)
+	{
+		return ScoreFlashAge >= 0.f && ScoreFlashAge <= ScoreFlashDuration;
+	}
+}
+
+#if !UE_BUILD_SHIPPING
+namespace TraceHUDCapture
+{
+	/**
+	 * `Trace.HUD.ForceScoreboard 1` holds the Tab scoreboard open, for a headless capture: this
+	 * project's testing policy forbids typing into a window, and Tab is a held key. Capture only.
+	 */
+	static TAutoConsoleVariable<int32> CVarForceScoreboard(
+		TEXT("Trace.HUD.ForceScoreboard"),
+		0,
+		TEXT("1: draw the Tab scoreboard as if Tab were held. Capture device only."),
+		ECVF_Cheat);
+}
+#endif
+
+// =================================================================================================
+// STROKES THAT FADE
+//
+// AHUD::DrawLine builds an FCanvasLineItem, and FBatchedElements::AddLine (the engine's, 5.8
+// BatchedElements.cpp) sets the colour's alpha to 1 before the line is ever batched: "Some legacy code
+// relies on Color.A being ignored". No blend mode can bring it back. So every fade drawn with DrawLine
+// on this HUD stayed at full strength and then vanished in one frame — the hit marker, and the
+// kill-feed glyphs, which were photographed floating on their own after their row and names had faded
+// away. A stroke here is a quad of two TRANSLUCENT triangles on the white texture, whose vertex colour
+// keeps its alpha all the way to the blend.
+// =================================================================================================
+namespace TraceHUDStroke
+{
+	/** Appends the two triangles of one stroke to @p Tris. Nothing for a zero-length or invisible stroke. */
+	static void AddQuad(TArray<FCanvasUVTri>& Tris, float X0, float Y0, float X1, float Y1,
+		const FLinearColor& Color, float Thickness)
+	{
+		const FVector2D From(X0, Y0);
+		const FVector2D To(X1, Y1);
+		FVector2D Along = To - From;
+		const double Length = Along.Size();
+		if (Length < 1.e-3 || Color.A <= 0.f)
+		{
+			return;
+		}
+		Along /= Length;
+
+		const FVector2D Side = FVector2D(-Along.Y, Along.X) * (0.5 * FMath::Max(Thickness, 1.f));
+		const FVector2D Corners[4] = { From + Side, To + Side, To - Side, From - Side };
+		const int32 Order[2][3] = { { 0, 1, 2 }, { 0, 2, 3 } };
+
+		for (const int32 (&Tri)[3] : Order)
+		{
+			FCanvasUVTri& Out = Tris.AddDefaulted_GetRef();
+			Out.V0_Pos = Corners[Tri[0]];
+			Out.V1_Pos = Corners[Tri[1]];
+			Out.V2_Pos = Corners[Tri[2]];
+			Out.V0_UV = Out.V1_UV = Out.V2_UV = FVector2D::ZeroVector;
+			Out.V0_Color = Out.V1_Color = Out.V2_Color = Color;
+		}
+	}
+
+	/** Draws @p Tris translucently onto @p InCanvas and empties the list. */
+	static void Flush(UCanvas* InCanvas, TArray<FCanvasUVTri>& Tris)
+	{
+		if (InCanvas != nullptr && Tris.Num() > 0 && GWhiteTexture != nullptr)
+		{
+			FCanvasTriangleItem Item(Tris, GWhiteTexture);
+			Item.BlendMode = SE_BLEND_Translucent;
+			InCanvas->DrawItem(Item);
+		}
+		Tris.Reset();
 	}
 }
 
@@ -943,12 +1118,37 @@ void ATraceHUD::DrawHUD()
 		bScoreCacheValid = true;
 
 		const ETraceMatchState StateNow = TraceGS->TraceMatchState;
-		if (bMatchStateCacheValid && StateNow != LastSeenMatchState && StateNow == ETraceMatchState::InProgress)
+		const bool bBreakNow = TraceGS->IsHalfTimeBreak();
+		const TraceHUDKickoff::EKind Kickoff = TraceHUDKickoff::Detect(bMatchStateCacheValid,
+			LastSeenMatchState, StateNow, bWasHalfTimeBreak, bBreakNow);
+		if (Kickoff != TraceHUDKickoff::EKind::None)
 		{
 			MatchStartTime = Now;
+			bKickoffAfterBreak = (Kickoff == TraceHUDKickoff::EKind::AfterBreak);
 		}
 		LastSeenMatchState = StateNow;
+		bWasHalfTimeBreak = bBreakNow;
 		bMatchStateCacheValid = true;
+	}
+
+	// ---- The select screens' edges, for the HOSTING chip ----------------------------------------
+	//
+	// The chip introduces the host's address for NetRevealSeconds after the connection answer changes
+	// — which is match start, exactly when team select and the loadout page cover the screen. The whole
+	// window used to expire under them. If the window was still running when a select screen came up,
+	// it starts again the moment the screen goes.
+	{
+		const bool bSelectUp = CharacterSelect.IsOpen() || LoadoutSelect.IsOpen();
+		if (bSelectUp && !bSelectOverlayWasUp)
+		{
+			SelectOverlayOpenedAt = Now;
+		}
+		else if (!bSelectUp && bSelectOverlayWasUp
+			&& (SelectOverlayOpenedAt - LastRoleChangeTime) < TraceHUDStyle::NetRevealSeconds)
+		{
+			LastRoleChangeTime = Now;
+		}
+		bSelectOverlayWasUp = bSelectUp;
 	}
 
 	LogAffordanceAvailabilityOnce();
@@ -1039,7 +1239,22 @@ void ATraceHUD::DrawHUD()
 	// Once the whistle has gone the live chrome is noise: a crosshair you cannot shoot with, a
 	// clock that has stopped, a Core banner nobody can act on. DrawMatchResult takes the screen.
 	const bool bPostMatch = (TraceGS != nullptr) && (TraceGS->TraceMatchState == ETraceMatchState::PostMatch);
-	if (!bPostMatch)
+
+	// *** NOTHING OF THE MATCH DRAWS UNDER A SCREEN THAT OWNS THE VIEW. ***
+	//
+	// Only the bottom-left stack and the ammo corner used to be gated. The clock, the Core banner,
+	// HALF TIME, the score flash, the death panel, the kill feed and the crosshair all drew under the
+	// loadout page's scrim, and photographed as ghost text ("00:18", "CORE OUT OF PLAY") cutting
+	// through BUILD YOUR LOADOUT. The page has its own countdown now (TIME, top right), so the match
+	// clock is not needed there either.
+	const bool bOverlayUp = IsFullScreenOverlayUp();
+
+#if !UE_BUILD_SHIPPING
+	HudKitRecord = FHudKitRecord();
+	HudKitRecord.bOverlayUp = bOverlayUp;
+#endif
+
+	if (!bPostMatch && !bOverlayUp)
 	{
 		// UNDER EVERYTHING ELSE, and that ordering is the whole reason it is safe to draw over the
 		// play area at all: Canvas is immediate mode, so the band goes down before the crosshair,
@@ -1069,29 +1284,20 @@ void ATraceHUD::DrawHUD()
 
 		DrawHitMarker();
 
-		// *** NOT WHILE A FULL-SCREEN MENU OWNS THE SCREEN. ***
-		//
-		// Health, dash charges and the weapon row are readouts about a pawn you are not driving while
-		// you are reading a menu, and they were drawn straight over the top of one: photographed on
-		// the loadout page as two meters and an ammo count sitting on the scrim the page had just
-		// painted over the match.
-		//
-		// The match CLOCK deliberately keeps drawing — during the half time break it is the countdown
-		// telling you how long you have to pick, which is the one piece of match state a player on
-		// this screen actually needs.
-		//
-		// Pre-existing and shared with the character select, which has done this for as long as it has
-		// existed. Fixed at the draw rather than inside the new page, because the page is not what is
-		// wrong and a fix inside it would leave the other screens still bleeding.
-		if (!PauseMenu.IsOpen() && !CharacterSelect.IsOpen() && !LoadoutSelect.IsOpen())
-		{
-			DrawHealthAndDash();
-		}
+		// Health, dash charges and the ability rows.
+		DrawHealthAndDash();
+	}
 
-		// Spec v16 §2 — the bottom-right corner. After the bottom-left stack purely so the two
-		// corners are read in the same order in this function as they are on screen.
+	// Spec v16 §2 — the bottom-right corner. OUTSIDE the overlay gate and inside the post-match one:
+	// it hides itself under an overlay (both presenters), and it must RUN to do that — a UMG corner
+	// keeps painting until it is told not to. See DrawAmmoAndStatuses.
+	if (!bPostMatch)
+	{
 		DrawAmmoAndStatuses();
+	}
 
+	if (!bPostMatch && !bOverlayUp)
+	{
 		DrawScoresAndClock();
 		DrawCoreBanner();
 		DrawPhaseBanner();
@@ -1111,7 +1317,9 @@ void ATraceHUD::DrawHUD()
 	// of the match including the full-time screen.
 	//
 	// KillFeedTopY is reset here and republished by DrawNetworkStatus below, so the feed hangs off
-	// whatever height that panel actually took this frame rather than off a guessed clearance.
+	// whatever height that panel actually took this frame rather than off a guessed clearance. Both
+	// passes RUN under an overlay (the connection log and the feed's easing keep their state) and
+	// draw nothing there.
 	KillFeedTopY = TraceHUDStyle::TopPanelY * UIScale;
 	DrawNetworkStatus();
 	DrawNetworkFailureBanner();
@@ -1607,6 +1815,9 @@ void ATraceHUD::DrawCrosshair()
 	}
 
 	DrawAimReticle(CX, CY, /*Visibility=*/1.f, Scale, CrosshairInk);
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.bCrosshair = true;
+#endif
 
 	if (ViewBlend > 0.02f)
 	{
@@ -1810,7 +2021,7 @@ void ATraceHUD::DrawPassReticle(float Visibility)
 	// This wrote "LMB  -  THROW" under the brackets for as long as the Core was held (and "THROW READY
 	// IN x.x" on a pass cooldown real play never starts). The co-developer's text pass removed both
 	// lines, together with the "YOU HAVE THE CORE - LMB THROWS" banner: the carrier is in third person
-	// holding the Core, the WEAPON row is dimmed, and LMB is the button they were already pressing to
+	// holding the Core, the gun has left the ammo corner, and LMB is the button they were already pressing to
 	// shoot. The "LMB" was also hard-coded — THROW / PASS CORE is rebindable, so after a rebind the
 	// caption named the wrong key. The throw charge ring still writes its own power readout here.
 }
@@ -2460,9 +2671,9 @@ void ATraceHUD::DrawAbilityToast(float TopY, float Margin, float RowH)
 	// referred to. 6 px of air so the two read as two things.
 	const float ChipY = TopY - ChipH - (6.f * UIScale);
 
-	DrawPanel(Margin, ChipY, ChipW, ChipH,
-		TraceHUDStyle::WithAlpha(TraceHUDStyle::PanelFill, TraceHUDStyle::PanelFill.A * Alpha),
-		TraceHUDStyle::WithAlpha(ToastTint, 0.75f * Alpha));
+	// The kit's plate, fading with its words. The tint (dim for "not yet", red for "no") is carried by
+	// the words alone now; it used to be a hairline border round a slate rect as well.
+	DrawKitPanel(Margin, ChipY, ChipW, ChipH, TraceHUDStyle::PanelAlpha * Alpha);
 
 	DrawTextLeft(Label, TraceHUDStyle::WithAlpha(ToastTint, Alpha),
 		Margin + PadX, VCenterTextY(Label, FontSmall, UIScale, ChipY, ChipH), FontSmall, UIScale);
@@ -2533,11 +2744,15 @@ void ATraceHUD::DrawHitMarker()
 		// Kill ticks and zone colours are deliberately NOT consulted: a blocked shot has no zone
 		// worth reporting (nothing was damaged) and cannot have killed. Colour is shield white and
 		// only shield white.
+		// Through TraceHUDStroke, not AHUD::DrawLine: DrawLine throws the alpha away (see the note on
+		// TraceHUDStroke), so the marker sat at full strength for its whole life and then popped off.
 		const FLinearColor BlockedColor = TraceHUDStyle::WithAlpha(TraceHUDStyle::ShieldWhite, Alpha);
-		DrawLine(CX, CY - Outer, CX, CY - Inner, BlockedColor, Thickness);
-		DrawLine(CX, CY + Inner, CX, CY + Outer, BlockedColor, Thickness);
-		DrawLine(CX - Outer, CY, CX - Inner, CY, BlockedColor, Thickness);
-		DrawLine(CX + Inner, CY, CX + Outer, CY, BlockedColor, Thickness);
+		TArray<FCanvasUVTri> BlockedTris;
+		TraceHUDStroke::AddQuad(BlockedTris, CX, CY - Outer, CX, CY - Inner, BlockedColor, Thickness);
+		TraceHUDStroke::AddQuad(BlockedTris, CX, CY + Inner, CX, CY + Outer, BlockedColor, Thickness);
+		TraceHUDStroke::AddQuad(BlockedTris, CX - Outer, CY, CX - Inner, CY, BlockedColor, Thickness);
+		TraceHUDStroke::AddQuad(BlockedTris, CX + Inner, CY, CX + Outer, CY, BlockedColor, Thickness);
+		TraceHUDStroke::Flush(Canvas, BlockedTris);
 
 		// THE SOUND, ON THE ARRIVAL EDGE AND NOWHERE ELSE. This pass runs for every frame of the
 		// 0.25 s the marker is up, so the timestamp the marker is dated by IS the event: it changes
@@ -2589,11 +2804,13 @@ void ATraceHUD::DrawHitMarker()
 	const FLinearColor Color = TraceHUDStyle::WithAlpha(Base, Alpha);
 
 	// Four diagonal ticks — the classic X, drawn as four separate segments so the middle stays
-	// clear and the crosshair underneath is still readable.
-	DrawLine(CX - Outer, CY - Outer, CX - Inner, CY - Inner, Color, Thickness);
-	DrawLine(CX + Inner, CY - Inner, CX + Outer, CY - Outer, Color, Thickness);
-	DrawLine(CX - Outer, CY + Outer, CX - Inner, CY + Inner, Color, Thickness);
-	DrawLine(CX + Inner, CY + Inner, CX + Outer, CY + Outer, Color, Thickness);
+	// clear and the crosshair underneath is still readable. Translucent strokes, so the X actually
+	// fades over its 0.35 / 0.6 s instead of holding at full strength and then vanishing.
+	TArray<FCanvasUVTri> MarkerTris;
+	TraceHUDStroke::AddQuad(MarkerTris, CX - Outer, CY - Outer, CX - Inner, CY - Inner, Color, Thickness);
+	TraceHUDStroke::AddQuad(MarkerTris, CX + Inner, CY - Inner, CX + Outer, CY - Outer, Color, Thickness);
+	TraceHUDStroke::AddQuad(MarkerTris, CX - Outer, CY + Outer, CX - Inner, CY + Inner, Color, Thickness);
+	TraceHUDStroke::AddQuad(MarkerTris, CX + Inner, CY + Inner, CX + Outer, CY + Outer, Color, Thickness);
 
 #if !UE_BUILD_SHIPPING
 	bDrewHitMarker = true;
@@ -2605,11 +2822,13 @@ void ATraceHUD::DrawHitMarker()
 	{
 		const float FarInner = Outer + (4.f * UIScale);
 		const float FarOuter = FarInner + (7.f * UIScale);
-		DrawLine(CX - FarOuter, CY - FarOuter, CX - FarInner, CY - FarInner, Color, Thickness);
-		DrawLine(CX + FarInner, CY - FarInner, CX + FarOuter, CY - FarOuter, Color, Thickness);
-		DrawLine(CX - FarOuter, CY + FarOuter, CX - FarInner, CY + FarInner, Color, Thickness);
-		DrawLine(CX + FarInner, CY + FarInner, CX + FarOuter, CY + FarOuter, Color, Thickness);
+		TraceHUDStroke::AddQuad(MarkerTris, CX - FarOuter, CY - FarOuter, CX - FarInner, CY - FarInner, Color, Thickness);
+		TraceHUDStroke::AddQuad(MarkerTris, CX + FarInner, CY - FarInner, CX + FarOuter, CY - FarOuter, Color, Thickness);
+		TraceHUDStroke::AddQuad(MarkerTris, CX - FarOuter, CY + FarOuter, CX - FarInner, CY + FarInner, Color, Thickness);
+		TraceHUDStroke::AddQuad(MarkerTris, CX + FarInner, CY + FarInner, CX + FarOuter, CY + FarOuter, Color, Thickness);
 	}
+
+	TraceHUDStroke::Flush(Canvas, MarkerTris);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -2633,469 +2852,292 @@ void ATraceHUD::DrawHealthAndDash()
 	const float HealthH = 26.f * UIScale;
 	const float RowH    = 10.f * UIScale;
 	const float RowGap  = 8.f * UIScale;
+	const float CaptionX = Margin + BarW + (10.f * UIScale);
+
+	// The captions the rows drew LAST frame size this frame's plate (see DrawStackCaption).
+	StackCaptionRightLastFrame = StackCaptionRightThisFrame;
+	StackCaptionRightThisFrame = 0.f;
 
 	// ---- The label gutter, MEASURED rather than assumed (spec v23 §A4) -------------------------
 	//
-	// This was a flat 58 px, and 58 px was sized for Lato. Sofachrome is a much wider face, so the
-	// moment §A4 moved these labels onto the atlas the number stopped being big enough: off the
-	// atlas's own advance table, "WEAPON" occupies 71-84 px across the range of point sizes
-	// FontSmall resolves to on this HUD, "THROW" 58-68 and "PARRY" 54-64.
+	// This was a flat 58 px, sized for Lato. The atlas faces are wider, and the meter is drawn AFTER
+	// the label starting at Margin + LabelW, so a gutter that is too narrow does not overflow
+	// harmlessly — the meter's trough paints over the tail of the word. The floor keeps the authored
+	// 58 wherever it still fits.
 	//
-	// That matters because the meter is drawn AFTER the label and starts at Margin + LabelW, so a
-	// gutter that is too narrow does not overflow harmlessly — the meter's trough paints over the
-	// tail of the word. Converting the face without this would have traded a font bug for a
-	// legibility bug, which is the thing A1's own note warns about: "widths change, because the face
-	// is wider, and every consumer of a width on this HUD measures it rather than assuming it".
-	// This was the one consumer that did not.
-	//
-	// The floor keeps the authored 58 wherever it still fits, so nothing moves at sizes where the
-	// old number was already correct.
-	//
-	// NOT IN THIS LIST: the ability row's own "[KEY]", which shares this gutter but is built from
-	// the player's binding inside DrawAbilityRow. The default "[E]" needs ~18 px and every ordinary
-	// binding is comfortably inside the widest fixed label above. A deliberately long binding could
-	// still overrun it — left as it is rather than letting one pathological key shrink every meter
-	// in the stack.
+	// NOT IN THIS LIST: the ability rows' own "[KEY]", built from the player's binding inside
+	// DrawAbilityRow. The default "[E]" needs ~18 px and an ordinary binding fits inside the widest
+	// fixed label here; one pathological binding is not allowed to shrink every meter in the stack.
+	// "THROW" stays a literal: only the superseded charge bar behind the Trace.HUD.V16 red arm draws it.
 	float LabelW = 58.f * UIScale;
 	{
-		// NOT static any more: the wording is the document's now, so the gutter has to be measured
-		// against whatever it says this session. "THROW" stays a literal — the only row that draws it
-		// is the superseded charge bar below, which lives behind the Trace.HUD.V16 red arm.
-		const TCHAR* const GutterLabels[] = {
-			*TRACE_TEXT("HUD.ROW_WEAPON", "WEAPON"), TEXT("THROW"),
-			*TRACE_TEXT("HUD.ROW_PARRY", "PARRY"), *TRACE_TEXT("HUD.ROW_DASH", "DASH"),
-			*TRACE_TEXT("HUD.ROW_SLIDE", "SLIDE")
+		const FString GutterLabels[] = {
+			FString(TEXT("THROW")),
+			TRACE_TEXT("HUD.ROW_PARRY", "PARRY"),
+			TRACE_TEXT("HUD.ROW_DASH", "DASH"),
+			TRACE_TEXT("HUD.ROW_SLIDE", "SLIDE"),
 		};
-		for (const TCHAR* const GutterLabel : GutterLabels)
+		for (const FString& GutterLabel : GutterLabels)
 		{
-			LabelW = FMath::Max(LabelW,
-				MeasureWidth(FString(GutterLabel), FontSmall, UIScale) + (8.f * UIScale));
+			LabelW = FMath::Max(LabelW, MeasureWidth(GutterLabel, FontSmall, UIScale) + (8.f * UIScale));
 		}
 	}
 
 	const float HealthY = ViewH - Margin - HealthH;
 
-	// The ability stack grows UPWARDS from the health bar, so adding a row does not move health — the
-	// one element a player finds by muscle memory rather than by reading.
-	float RowY = HealthY - (14.f * UIScale) - RowH;
+	// The stack grows UPWARDS from the health bar, so adding a row does not move health — the one
+	// element a player finds by muscle memory rather than by reading.
+	const float FirstRowY = HealthY - (14.f * UIScale) - RowH;
 
 	const FLinearColor TeamTint = TraceTeamColor(LocalTeam);
 
-	// ---- WP6.1 — the scrim under the whole block ------------------------------------------------
+	// ---- What will draw, asked ONCE --------------------------------------------------------------
 	//
-	// This corner was the ONE block of HUD text sitting on the raw world (bible §7.2: "text never
-	// sits on raw world"), and over a lit walkway the labels simply vanished (visual audit §4.6,
-	// v23integ_31_dash.png). The panel has to be drawn FIRST, under everything — so the union of
-	// what the rows below will draw is computed up front by evaluating the same conditions the row
-	// draws use. Every probe is a const read of state that cannot change within this frame, so
-	// asking twice (once here, once at the row) cannot disagree with itself.
+	// The plate has to go down first, under everything, so the rows are decided up front. Every probe
+	// is a const read of state that cannot change inside this frame.
+	//
+	// THE ROW ORDER, bottom to top, and why: DASH, then the ability rows (V under E), then the rows
+	// that come and go — PARRY while carrying, SLIDE while a slide-jump is live, and the red arm's
+	// throw bar. The conditional rows used to sit UNDER the ability rows, so every slide pushed E (and
+	// the refusal toast above it) up a row and dropped it back when the slide ended. On top, they only
+	// ever move the plate's top edge. (The WEAPON row is gone: the weapon's name is on the ammo plate
+	// in the other corner, and at rest its full lavender meter looked exactly like the DASH meter
+	// above it — three near-identical bars.)
+	FTraceDashHudState Dash;
+	const bool bDashRow = TracePC->GetDashHudState(Dash);
+
+	const bool bAbilityRow = (LocalPS != nullptr) && LocalPS->HasAnyAbility();
+
+	// FX plan §7.2's V row is HALF height, so it is measured and added to the block directly.
+	float PlannedVRowH = 0.f;
+	float PlannedVRowAdvance = 0.f;
+	const bool bVRow = IsSecondaryRowUp(PlannedVRowH, PlannedVRowAdvance, RowH);
+
+	float ParryRemaining = 0.f;
+	float ParryTotal = 0.f;
+	bool bParryActive = false;
+	const bool bParryRow = bLocalCarrying && (LocalChar != nullptr)
+		&& LocalChar->GetParryHudState(ParryRemaining, ParryTotal, bParryActive);
+
+	const UTraceCharacterMovementComponent* const TraceMove = (LocalChar != nullptr)
+		? Cast<UTraceCharacterMovementComponent>(LocalChar->GetCharacterMovement())
+		: nullptr;
+	const bool bSlideRow = (TraceMove != nullptr) && TraceMove->IsSlideJumpAvailable();
+
+	ATraceCore* const ChargeCore = (!TraceHUDV16::IsArmed() && TraceGS != nullptr) ? TraceGS->Core.Get() : nullptr;
+	const bool bChargeRow = (ChargeCore != nullptr) && ChargeCore->IsThrowCharging();
+
+	const UTraceHealthComponent* const HealthComp = (LocalChar != nullptr) ? LocalChar->Health.Get() : nullptr;
+
+	const int32 PlannedRows = (bDashRow ? 1 : 0) + (bAbilityRow ? 1 : 0) + (bParryRow ? 1 : 0)
+		+ (bSlideRow ? 1 : 0) + (bChargeRow ? 1 : 0);
+
+	// ---- THE PLATE: the handmade kit's navy plate under the whole block --------------------------
+	//
+	// This corner was the ONE block of HUD text sitting on the raw world (bible §7.2), and over a lit
+	// walkway the labels vanished. It is the kit's plate now, not a slate rect with a hairline, and it
+	// is as wide as the captions actually are: it was sized for "PICKLER 14.4" with a fixed 134 px, so
+	// with the usual short captions a third of it was empty panel. The width grows at once (a caption
+	// never hangs off the edge) and shrinks eased (a cooldown ending does not snap the plate).
+	if (PlannedRows > 0 || HealthComp != nullptr)
 	{
-		int32 PlannedRows = 0;
-		if (LocalChar != nullptr && LocalChar->IsAlive())
-		{
-			++PlannedRows;   // weapon row
-		}
-		if (!TraceHUDV16::IsArmed())
-		{
-			ATraceCore* const ChargeCore = (TraceGS != nullptr) ? TraceGS->Core : nullptr;
-			if (ChargeCore != nullptr && ChargeCore->IsThrowCharging())
-			{
-				++PlannedRows;   // throw-charge row (red-arm builds only)
-			}
-		}
-		if (bLocalCarrying && LocalChar != nullptr)
-		{
-			float ParryRemaining = 0.f, ParryTotal = 0.f;
-			bool bParryActive = false;
-			if (LocalChar->GetParryHudState(ParryRemaining, ParryTotal, bParryActive))
-			{
-				++PlannedRows;   // parry row
-			}
-		}
-		{
-			FTraceDashHudState Dash;
-			if (TracePC->GetDashHudState(Dash))
-			{
-				++PlannedRows;   // dash pips
-			}
-		}
-		if (const UTraceCharacterMovementComponent* const TraceMove = (LocalChar != nullptr)
-				? Cast<UTraceCharacterMovementComponent>(LocalChar->GetCharacterMovement())
-				: nullptr)
-		{
-			if (TraceMove->IsSlideJumpAvailable())
-			{
-				++PlannedRows;   // slide-jump window
-			}
-		}
-		if (LocalPS != nullptr && LocalPS->HasAnyAbility())
-		{
-			++PlannedRows;   // ability row — the one row that draws through death by design
-		}
+		// Each full row advances by RowH + RowGap, the V row by its own measured advance, so the top of
+		// the block is arithmetic. The bottom is the health bar even on a frame where it does not draw:
+		// a plate whose bottom edge flickered with death would be worse than the dead strip.
+		const float BlockTop = (PlannedRows > 0)
+			? FirstRowY - static_cast<float>(PlannedRows - 1) * (RowH + RowGap) - (bVRow ? PlannedVRowAdvance : 0.f)
+			: HealthY;
+		const float BlockBottom = HealthY + HealthH;
 
-		// FX plan §7.2's V row is HALF height, so it cannot be counted as a row — it is measured and
-		// added to the block height directly. Same discipline as every probe above it: a const read
-		// of state that cannot change within this frame, asked here and again at the row.
-		float PlannedVRowH = 0.f;
-		float PlannedVRowAdvance = 0.f;
-		const float ExtraVRowHeight = IsSecondaryRowUp(PlannedVRowH, PlannedVRowAdvance, RowH)
-			? PlannedVRowAdvance
-			: 0.f;
+		const float PlateX = Margin - (14.f * UIScale);
+		const float TargetRight = FMath::Max(Margin + BarW, StackCaptionRightLastFrame) + (14.f * UIScale);
+		const float EaseDelta = (GetWorld() != nullptr) ? FMath::Clamp(GetWorld()->GetDeltaSeconds(), 0.f, 0.1f) : 0.f;
+		DrawnStackPlateRight = (DrawnStackPlateRight < 0.f || TargetRight >= DrawnStackPlateRight)
+			? TargetRight
+			: FMath::FInterpTo(DrawnStackPlateRight, TargetRight, EaseDelta, 8.f);
 
-		const bool bHealthDraws = (LocalChar != nullptr) && (LocalChar->Health != nullptr);
+		DrawKitPanel(PlateX, BlockTop - (10.f * UIScale), DrawnStackPlateRight - PlateX,
+			(BlockBottom - BlockTop) + (20.f * UIScale), TraceHUDStyle::PanelAlpha);
 
-		// Nothing will draw at all (mode A with no pawn, pre-pick) — no rows means no scrim.
-		if (PlannedRows > 0 || bHealthDraws)
-		{
-			// Each row above the first advances the cursor by exactly RowH + RowGap (the ability
-			// row's own return step is the same 8 * UIScale gap), so the top of the block is
-			// arithmetic. The bottom is the health bar even on a frame where it does not draw:
-			// a scrim whose bottom edge flickered with death would be worse than the dead strip.
-			const float BlockTop = (PlannedRows > 0)
-				? RowY - static_cast<float>(PlannedRows - 1) * (RowH + RowGap) - ExtraVRowHeight
-				: HealthY;
-			const float BlockBottom = HealthY + HealthH;
-
-			// 134 reference px past the meters covers the right-hand row captions ("PICKLER 14.4").
-			DrawPanel(Margin - (14.f * UIScale), BlockTop - (10.f * UIScale),
-				LabelW + BarW + (134.f * UIScale),
-				(BlockBottom - BlockTop) + (20.f * UIScale),
-				TraceHUDStyle::PanelFill, TraceHUDStyle::PanelBorder);
-		}
+#if !UE_BUILD_SHIPPING
+		HudKitRecord.bStackPlate = true;
+#endif
 	}
 
-	// ---- Equipped weapon (spec v10 §1) ----------------------------------------------------------
+	float RowY = FirstRowY;
+
+	// ---- Dash charges ---------------------------------------------------------------------------
 	//
-	// DRAWN FIRST, so it is the row NEAREST the health bar and therefore the one row in this stack
-	// whose screen position never moves. Every other row here is conditional — parry only for a
-	// carrier, slide only mid-slide — so a row drawn after them would slide up and down the screen
-	// as those conditions flicker. The weapon is the one piece of state that is always true, and a
-	// player checking "am I holding the knife?" mid-fight must find it in the same place every time.
-	//
-	// It also carries the two timings the spec names, because both are invisible otherwise and both
-	// are refusals the player will otherwise read as the game ignoring their input:
-	//   - the 0.2 s PULLOUT, during which you can neither shoot nor swing, drawn as a filling meter;
-	//   - the 0.5 s swing COOLDOWN, drawn the same way, so "why did my click do nothing" has an
-	//     answer on screen rather than in a log.
-	// A dead player gets no row at all: the weapon you are not holding is not information.
-	if (LocalChar != nullptr && LocalChar->IsAlive())
+	// PIPS, not a bar. Spec §5 gives the Core carrier a second dash charge, and a single fill bar
+	// cannot express "one banked, one recharging" — which is exactly the state a carrier has to read
+	// before deciding whether to spend one escaping. The pip row degrades to a single pip in a build
+	// without the charge system, so it is correct either way. NEAREST THE HEALTH BAR now that the
+	// weapon row is gone: the one row every player has every frame, found by muscle memory.
+	if (bDashRow)
 	{
-		const bool bKnife   = TraceMelee::IsKnifeEquipped(LocalChar);
-		const float Deploy  = TraceMelee::GetDeployRemaining(LocalChar);
-		const float Cooling = TraceMelee::GetSwingCooldownRemaining(LocalChar);
+		const bool bReady = (Dash.Charges > 0);
 
-		// The CARRIER's weapon is stowed, not held: they cannot shoot and cannot swing, and saying
-		// "KNIFE" to somebody whose knife does nothing would be a lie. They keep the row — dimmed
-		// label, 35% dim meter, so nothing below it moves — and it names NO weapon. It used to read
-		// "STOWED"; the co-developer's text pass removed that word, and the dim row says it already.
-		// *** SPEC v29 §5 — THERE ARE THREE WEAPON STATES NOW, SO THIS ROW NAMES THREE. ***
-		// It said KNIFE or GUN, which was a complete answer while the selector had two reachable
-		// values. v28 §9 added the SMG (so "GUN" covered two different weapons with different damage,
-		// falloff and reload) and v29 §5 made the knife state reachable on purpose via the 1 key. A
-		// player who presses 1 for the speed boost has to be able to see that it took — the guns
-		// leaving the screen says it, and this row is the second, unambiguous confirmation.
-		const bool bSmgOut = TraceMelee::IsWeaponEquipped(LocalChar, ETraceEquippedWeapon::Smg);
-		const FString WeaponText = bLocalCarrying
-			? FString()
-			: (bKnife ? TRACE_TEXT("HUD.WEAPON_KNIFE", "KNIFE")
-			          : (bSmgOut ? TRACE_TEXT("HUD.WEAPON_SMG", "SMG")
-			                     : TRACE_TEXT("HUD.WEAPON_PISTOL", "PISTOL")));
+		const FString& DashLabel = TRACE_TEXT("HUD.ROW_DASH", "DASH");
+		DrawTextLeft(DashLabel, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
+			Margin, VCenterTextY(DashLabel, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 
-		const FString& WeaponLabel = TRACE_TEXT("HUD.ROW_WEAPON", "WEAPON");
-		DrawTextLeft(WeaponLabel, bLocalCarrying ? TraceHUDStyle::InkDim : TraceHUDStyle::Ink,
-			Margin, VCenterTextY(WeaponLabel, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+		// Charging reads as a dim team-tinted sliver; ready snaps to full brightness.
+		const FLinearColor PipColor = bReady
+			? TraceHUDStyle::Shade(TeamTint, 1.0f, 0.25f)
+			: TraceHUDStyle::Shade(TeamTint, 0.45f, 0.0f);
 
-		// One meter, three meanings, in priority order — pullout beats cooldown beats ready, which is
-		// exactly the order in which they gate the trigger.
-		float  Fraction = 1.f;
-		FLinearColor WeaponColor = bKnife
-			? FLinearColor(0.85f, 0.85f, 0.92f, 1.f)              // blade white
-			: TraceHUDStyle::Shade(TeamTint, 1.0f, 0.25f);        // the gun wears the team's colour
-		FString StatusText = WeaponText;
+		DrawChargePips(Margin + LabelW, RowY, BarW - LabelW, RowH,
+			Dash.Charges, Dash.MaxCharges, Dash.RechargeFraction, PipColor);
 
-		if (Deploy > TraceHUDStyle::TimeEpsilon)
+		// A number is worth a lot here: dash is the only counterplay to a carrier, so players plan
+		// around exactly when it comes back.
+		if (Dash.Remaining > TraceHUDStyle::TimeEpsilon)
 		{
-			// *** SPEC v31 §1 — ASK FOR THE PULLOUT OF THE WEAPON BEING DRAWN, NOT THE BASE. ***
-			//
-			// The knife's pullout is 35% shorter than every gun's (KnifeSwapMultiplier, spent in
-			// TraceMelee::GetSwapSecondsFor). GetSwapSeconds() is now only the BASE that multiplier
-			// modifies, so dividing by it here made the meter start at 1 - 0.130/0.200 = 0.35 and
-			// fill from 0.35 to 1 on every knife draw — a meter that is already a third full the
-			// instant the draw begins, which reads as "it is nearly done" for the whole 0.13 s.
-			// The gate itself was never wrong; only the picture of it was. Found by the integration
-			// pass, flagged by the §1 slice, whose ownership did not include this file.
-			//
-			// The selector already holds the DESTINATION while the deploy runs — ApplyEquip sets it
-			// and then starts the timer — so bKnife is the weapon being drawn, not the one leaving.
-			const float SwapTotal = FMath::Max(TraceHUDStyle::TimeEpsilon,
-				TraceMelee::GetSwapSecondsFor(bKnife ? ETraceEquippedWeapon::Knife
-				                                     : (bSmgOut ? ETraceEquippedWeapon::Smg
-				                                                : ETraceEquippedWeapon::Gun)));
-			Fraction = FMath::Clamp(1.f - (Deploy / SwapTotal), 0.f, 1.f);
-			WeaponColor = TraceHUDStyle::Shade(TeamTint, 0.45f, 0.0f);
-			// The caption stays the weapon's NAME while it is drawn. It used to flicker to
-			// "PISTOL  DRAWING" for the 0.13-0.2 s of the pullout; the co-developer's text pass removed
-			// that word, and the darker meter filling from empty already says it.
-		}
-		else if (bKnife && !bLocalCarrying && Cooling > TraceHUDStyle::TimeEpsilon)
-		{
-			const float CooldownTotal = FMath::Max(TraceHUDStyle::TimeEpsilon, TraceMelee::GetSwingCooldownSeconds());
-			Fraction = FMath::Clamp(1.f - (Cooling / CooldownTotal), 0.f, 1.f);
-			WeaponColor = FLinearColor(0.45f, 0.45f, 0.50f, 1.f);
-			StatusText = TRACE_TEXTF("HUD.WEAPON_COOLDOWN", "{0}  {1}",
-				{ WeaponText, FString::Printf(TEXT("%.1f"), Cooling) });
-		}
-		else if (bLocalCarrying)
-		{
-			Fraction = 0.35f;
-			WeaponColor = TraceHUDStyle::Shade(TeamTint, 0.45f, 0.0f);
+			DrawStackCaption(FString::Printf(TEXT("%.1f"), Dash.Remaining), TraceHUDStyle::InkDim,
+				CaptionX, RowY, RowH);
 		}
 
-		DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, Fraction, WeaponColor);
+		RowY -= (RowH + RowGap);
+	}
 
-		if (!StatusText.IsEmpty())
+	// ---- Activated ability (spec v14 §5), with the V row under it ----------------------------------
+	//
+	// The only rows here drawn on a dead player's frame. See DrawAbilityRow().
+	RowY = DrawAbilityRow(RowY, Margin, BarW, RowH, LabelW, TeamTint);
+
+	// ---- Parry (spec §3), carrier only ----------------------------------------------------------
+	//
+	// Drawn only when the mechanic actually reports state (see ATraceCharacter::GetParryHudState) and
+	// only for the CARRIER, since a non-carrier pressing parry does nothing at all.
+	if (bParryRow)
+	{
+		const float Charge = FMath::Clamp(1.f - (ParryRemaining / FMath::Max(TraceHUDStyle::TimeEpsilon, ParryTotal)), 0.f, 1.f);
+		const bool bReady = (ParryRemaining <= TraceHUDStyle::TimeEpsilon);
+
+		const FString& Label = TRACE_TEXT("HUD.ROW_PARRY", "PARRY");
+		DrawTextLeft(Label, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
+			Margin, VCenterTextY(Label, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+
+		// RED while the 0.2s window is open, matching the red the whole trace turns (spec §3), so
+		// the meter and the world are saying the same thing at the same moment.
+		const FLinearColor ParryColor = bParryActive
+			? TraceHUDStyle::Danger
+			: (bReady ? FLinearColor(0.95f, 0.35f, 0.30f, 1.f) : FLinearColor(0.38f, 0.16f, 0.14f, 1.f));
+
+		DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, bParryActive ? 1.f : Charge, ParryColor);
+
+		if (!bReady && !bParryActive)
 		{
-			DrawTextLeft(StatusText, TraceHUDStyle::InkDim,
-				Margin + BarW + (10.f * UIScale),
-				VCenterTextY(StatusText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+			DrawStackCaption(FString::Printf(TEXT("%.1f"), ParryRemaining), TraceHUDStyle::InkDim,
+				CaptionX, RowY, RowH);
 		}
+
+		RowY -= (RowH + RowGap);
+	}
+
+	// ---- Slide-jump window --------------------------------------------------------------------
+	//
+	// Spec v4 §1 makes the slide-jump the payoff move and gives it a TIMING WINDOW, and a timing window
+	// with no feedback is unlearnable. The row exists only while a slide-jump is available and says
+	// which of its two states the player is in — armed, or armed AND inside the bonus window.
+	if (bSlideRow)
+	{
+		const bool bWellTimed = TraceMove->IsSlideJumpWellTimed();
+
+		const FString& SlideLabel = TRACE_TEXT("HUD.ROW_SLIDE", "SLIDE");
+		DrawTextLeft(SlideLabel, bWellTimed ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
+			Margin, VCenterTextY(SlideLabel, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+
+		// Breathing while the bonus is live, on the HUD's one pulse, so it reads as a moment to act on.
+		const FLinearColor WindowColor = bWellTimed
+			? TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, 0.7f + 0.3f * TraceHUDStyle::PulseWave(Now))
+			: TraceHUDStyle::Shade(TeamTint, 0.45f, 0.0f);
+
+		DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, bWellTimed ? 1.f : 0.35f, WindowColor);
+
+		DrawStackCaption(bWellTimed
+				? TRACE_TEXT("HUD.SLIDE_JUMP_NOW", "JUMP NOW")
+				: TRACE_TEXT("HUD.SLIDE_SLIDING", "SLIDING"),
+			TraceHUDStyle::InkDim, CaptionX, RowY, RowH);
 
 		RowY -= (RowH + RowGap);
 	}
 
 	// ---- Throw charge — SUPERSEDED BY THE CROSSHAIR RING (spec v16 §2) --------------------------
 	//
-	// Verbatim: "For the throw charge, use the old circle around the crosshair animation for game
-	// mode a to demonstrate how charged /100% the throw is, RATHER THAN A BAR ON THE HUD." So this
-	// row is off in a shipped build; DrawThrowChargeRing() is where the charge is drawn now.
-	//
-	// IT IS KEPT, BEHIND THE RED ARM, AND ONLY FOR THAT. Trace.HUD.V16 0 puts the bar back so the
-	// superseded HUD can be photographed against the same fixture in the same binary as the ring —
-	// which for a drawing change is the only "before" that proves anything. Delete it the day the
-	// arm goes, not before.
-	//
-	// The v13 §6 reasoning it was written under is unchanged and now lives on DrawThrowChargeRing().
-	if (!TraceHUDV16::IsArmed())
+	// Off in a shipped build; DrawThrowChargeRing() is where the charge is drawn. KEPT, behind the red
+	// arm and only for it: Trace.HUD.V16 0 puts the bar back so the superseded HUD can be photographed
+	// against the same fixture in the same binary as the ring. Delete it the day the arm goes.
+	if (bChargeRow)
 	{
-		ATraceCore* ChargeCore = (TraceGS != nullptr) ? TraceGS->Core : nullptr;
-		if (ChargeCore != nullptr && ChargeCore->IsThrowCharging())
-		{
 #if !UE_BUILD_SHIPPING
-			bDrewChargeBar = true;
+		bDrewChargeBar = true;
 #endif
-			const float Alpha = FMath::Max(0.f, ChargeCore->GetThrowChargeAlpha());
-			const float Power = ChargeCore->GetThrowChargeScaleNow();
-			const bool  bFull = (Alpha >= 1.f);
+		const float Alpha = FMath::Max(0.f, ChargeCore->GetThrowChargeAlpha());
+		const float Power = ChargeCore->GetThrowChargeScaleNow();
+		const bool  bFull = (Alpha >= 1.f);
 
-			const FString ChargeLabel(TEXT("THROW"));
-			DrawTextLeft(ChargeLabel, bFull ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
-				Margin, VCenterTextY(ChargeLabel, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+		const FString ChargeLabel(TEXT("THROW"));
+		DrawTextLeft(ChargeLabel, bFull ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
+			Margin, VCenterTextY(ChargeLabel, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 
-			// Winding up wears the team tint dimly; the instant it is FULL it snaps to Good and pulses
-			// at the same 12 rad/s every other "act now" state on this HUD uses. That transition is the
-			// single most useful thing the meter does, because past full the charge clamps and holding
-			// longer buys nothing — the player needs to know to let go, not to keep holding.
-			const FLinearColor ChargeColor = bFull
-				? TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, 0.7f + 0.3f * FMath::Sin(Now * 12.f))
-				: TraceHUDStyle::Shade(TeamTint, 0.75f, 0.1f);
+		const FLinearColor ChargeColor = bFull
+			? TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, 0.7f + 0.3f * TraceHUDStyle::PulseWave(Now))
+			: TraceHUDStyle::Shade(TeamTint, 0.75f, 0.1f);
 
-			const float MeterX = Margin + LabelW;
-			const float MeterW = BarW - LabelW;
-			DrawMeter(MeterX, RowY, MeterW, RowH, FMath::Min(Alpha, 1.f), ChargeColor);
+		const float MeterX = Margin + LabelW;
+		const float MeterW = BarW - LabelW;
+		DrawMeter(MeterX, RowY, MeterW, RowH, FMath::Min(Alpha, 1.f), ChargeColor);
 
-			// THE FLOOR TICK. An instant click is not zero power (15%), and a meter that starts empty
-			// implies it is — a player would read a fast tap as "the throw did not happen" rather than
-			// as "the throw was weak", which is the exact misreading the floor exists to prevent. So the
-			// bar carries a mark at the floor: below it is unreachable, and that is worth showing once
-			// rather than explaining never.
-			const float FloorFraction = FMath::Clamp(ATraceCore::GetThrowChargeScaleForHold(0.f), 0.f, 1.f);
-			DrawRect(TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.55f),
-				MeterX + (MeterW * FloorFraction), RowY, FMath::Max(1.f, 1.f * UIScale), RowH);
+		// THE FLOOR TICK: an instant click is 15% power, not zero, and the bar says so once.
+		const float FloorFraction = FMath::Clamp(ATraceCore::GetThrowChargeScaleForHold(0.f), 0.f, 1.f);
+		DrawRect(TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, 0.55f),
+			MeterX + (MeterW * FloorFraction), RowY, FMath::Max(1.f, 1.f * UIScale), RowH);
 
-			// The POWER, not the elapsed hold: momentum is what the player is choosing, and seconds are
-			// a number they would have to convert. Printed from the same published curve the throw
-			// itself releases at (GetThrowChargeScaleForHold), so the readout cannot drift from the game.
-			const FString ChargeText = bFull
-				? FString(TEXT("FULL"))
-				: FString::Printf(TEXT("%.0f%%"), 100.f * FMath::Max(0.f, Power));
-			DrawTextLeft(ChargeText, bFull ? TraceHUDStyle::Good : TraceHUDStyle::InkDim,
-				Margin + BarW + (10.f * UIScale),
-				VCenterTextY(ChargeText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+		DrawStackCaption(bFull ? FString(TEXT("FULL")) : FString::Printf(TEXT("%.0f%%"), 100.f * FMath::Max(0.f, Power)),
+			bFull ? TraceHUDStyle::Good : TraceHUDStyle::InkDim, CaptionX, RowY, RowH);
 
-			RowY -= (RowH + RowGap);
-		}
+		RowY -= (RowH + RowGap);
 	}
 
-	// ---- Parry (spec §3), where BOOST used to be ------------------------------------------------
+	// ---- FX/AUDIO plan §7.1 — the refusal toast, above the top of the block --------------------
 	//
-	// BOOST IS DELETED (spec §1: "remove boost from the game entirely"), and its row is gone with it,
-	// including the GetBoostHudState() call that fed it — leaving that call here would have broken
-	// the build the moment the movement slice removed the accessor.
-	//
-	// The ability stack keeps its shape because parry inherits the slot: a carrier-only, cooldown-
-	// gated key on the same stack as dash. Drawn only when the mechanic actually reports state (see
-	// ATraceCharacter::GetParryHudState) and only for the CARRIER, since a non-carrier pressing parry
-	// does nothing at all and a meter for a key that does nothing is worse than no meter.
-	if (bLocalCarrying && LocalChar != nullptr)
-	{
-		float ParryRemaining = 0.f;
-		float ParryTotal = 0.f;
-		bool bParryActive = false;
-		if (LocalChar->GetParryHudState(ParryRemaining, ParryTotal, bParryActive))
-		{
-			const float Charge = FMath::Clamp(1.f - (ParryRemaining / FMath::Max(TraceHUDStyle::TimeEpsilon, ParryTotal)), 0.f, 1.f);
-			const bool bReady = (ParryRemaining <= TraceHUDStyle::TimeEpsilon);
-
-			const FString& Label = TRACE_TEXT("HUD.ROW_PARRY", "PARRY");
-			DrawTextLeft(Label, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
-				Margin, VCenterTextY(Label, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
-
-			// RED while the 0.2s window is open, matching the red the whole trace turns (spec §3), so
-			// the meter and the world are saying the same thing at the same moment. Otherwise its own
-			// hue, so the stack does not read as one three-line bar.
-			const FLinearColor ParryColor = bParryActive
-				? TraceHUDStyle::Danger
-				: (bReady ? FLinearColor(0.95f, 0.35f, 0.30f, 1.f) : FLinearColor(0.38f, 0.16f, 0.14f, 1.f));
-
-			DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, bParryActive ? 1.f : Charge, ParryColor);
-
-			if (!bReady && !bParryActive)
-			{
-				const FString CountdownText = FString::Printf(TEXT("%.1f"), ParryRemaining);
-				DrawTextLeft(CountdownText, TraceHUDStyle::InkDim,
-					Margin + BarW + (10.f * UIScale),
-					VCenterTextY(CountdownText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
-			}
-
-			RowY -= (RowH + RowGap);
-		}
-	}
-
-	// ---- Dash charges -------------------------------------------------------------------------
-	//
-	// PIPS, not a bar. Spec §5 gives the Core carrier a second dash charge, and a single fill bar
-	// cannot express "one banked, one recharging" — which is exactly the state a carrier has to read
-	// before deciding whether to spend one escaping. The pip row degrades to a single pip in a build
-	// without the charge system, so it is correct either way.
-	{
-		FTraceDashHudState Dash;
-		if (TracePC->GetDashHudState(Dash))
-		{
-			const bool bReady = (Dash.Charges > 0);
-
-			const FString& DashLabel = TRACE_TEXT("HUD.ROW_DASH", "DASH");
-			DrawTextLeft(DashLabel, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
-				Margin, VCenterTextY(DashLabel, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
-
-			// Charging reads as a dim team-tinted sliver; ready snaps to full brightness.
-			const FLinearColor PipColor = bReady
-				? TraceHUDStyle::Shade(TeamTint, 1.0f, 0.25f)
-				: TraceHUDStyle::Shade(TeamTint, 0.45f, 0.0f);
-
-			DrawChargePips(Margin + LabelW, RowY, BarW - LabelW, RowH,
-				Dash.Charges, Dash.MaxCharges, Dash.RechargeFraction, PipColor);
-
-			// A number is worth a lot here: dash is the only counterplay to a carrier, so players plan
-			// around exactly when it comes back.
-			if (Dash.Remaining > TraceHUDStyle::TimeEpsilon)
-			{
-				const FString CountdownText = FString::Printf(TEXT("%.1f"), Dash.Remaining);
-				DrawTextLeft(CountdownText, TraceHUDStyle::InkDim,
-					Margin + BarW + (10.f * UIScale),
-					VCenterTextY(CountdownText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
-			}
-
-			// This used to be the last row and so never advanced the cursor. The slide-jump row
-			// below is drawn from the same RowY, so without this the two land on top of each other.
-			RowY -= (RowH + RowGap);
-		}
-	}
-
-	// ---- Slide-jump window --------------------------------------------------------------------
-	//
-	// Spec v4 §1 makes the slide-jump the payoff move and gives it a TIMING WINDOW. A timing window
-	// with no feedback is unlearnable: the player presses jump, sometimes gets 110% of their speed
-	// back and sometimes gets 100%, and has no way to tell which happened or why. That does not read
-	// as a skill they have not learned yet, it reads as an inconsistent game.
-	//
-	// So the row only exists while a slide-jump is actually available, and it says which of the two
-	// states the player is in — armed, or armed AND inside the bonus window. Deliberately a separate
-	// row rather than a flash on the dash pips: dash and slide are different resources spent on
-	// different keys, and overloading one meter to mean both is how a player learns the wrong thing.
-	if (const UTraceCharacterMovementComponent* TraceMove = (LocalChar != nullptr)
-			? Cast<UTraceCharacterMovementComponent>(LocalChar->GetCharacterMovement())
-			: nullptr)
-	{
-		if (TraceMove->IsSlideJumpAvailable())
-		{
-			const bool bWellTimed = TraceMove->IsSlideJumpWellTimed();
-
-			const FString& SlideLabel = TRACE_TEXT("HUD.ROW_SLIDE", "SLIDE");
-			DrawTextLeft(SlideLabel, bWellTimed ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
-				Margin, VCenterTextY(SlideLabel, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
-
-			// Pulsed while the bonus is live so it reads as a moment to act on, steady-dim while the
-			// slide is merely running. The pulse is the same 12 rad/s the SHIELD DOWN callout uses,
-			// so "something is happening right now" looks the same everywhere on this HUD.
-			const FLinearColor WindowColor = bWellTimed
-				? TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, 0.7f + 0.3f * FMath::Sin(Now * 12.f))
-				: TraceHUDStyle::Shade(TeamTint, 0.45f, 0.0f);
-
-			DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, bWellTimed ? 1.f : 0.35f, WindowColor);
-
-			const FString WindowText = bWellTimed
-				? TRACE_TEXT("HUD.SLIDE_JUMP_NOW", "JUMP NOW")
-				: TRACE_TEXT("HUD.SLIDE_SLIDING", "SLIDING");
-			DrawTextLeft(WindowText, TraceHUDStyle::InkDim,
-				Margin + BarW + (10.f * UIScale),
-				VCenterTextY(WindowText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
-
-			RowY -= (RowH + RowGap);
-		}
-	}
-
-	// ---- Activated ability (spec v14 §5) --------------------------------------------------------
-	//
-	// Drawn LAST of the conditional rows, so it sits highest in the stack and nothing below it moves
-	// when it appears — and, critically, it is the only row here that is drawn on a dead player's
-	// frame. See DrawAbilityRow().
-	RowY = DrawAbilityRow(RowY, Margin, BarW, RowH, LabelW, TeamTint);
-
-	// ---- FX/AUDIO plan §7.1 — the refusal toast, directly above the ability row -----------------
-	//
-	// OUTSIDE the scrim planned above, and on purpose: the toast brings its own scrim (it has to,
-	// because it appears and disappears in under two seconds and a block that grew and shrank with
-	// it would make the whole stack jump). It is the only element in this corner that is allowed to
-	// move the block's apparent top edge, because it is the only one that is momentary.
+	// OUTSIDE the plate, on its own plate: it appears and disappears in under two seconds, and a block
+	// that grew and shrank with it would make the whole stack jump. With E the top row (the ordinary
+	// case) it sits directly above the row the refusal was about.
 	DrawAbilityToast(RowY, Margin, RowH);
 
 	// ---- Health -----------------------------------------------------------------------------
-	if (const UTraceHealthComponent* HealthComp = (LocalChar != nullptr) ? LocalChar->Health.Get() : nullptr)
+	if (HealthComp != nullptr)
 	{
-		// The bar, the regen climb and the regen countdown. See DrawHealthBar().
+		// The bar, the regen climb, the regen countdown, and INVULNERABLE. See DrawHealthBar().
 		DrawHealthBar(HealthComp, Margin, HealthY, BarW, HealthH);
 
+		// The number sits at the bar's right end. Over the fill (only at or near full health, where the
+		// fill is white) it is set in the plate's navy; over the empty groove it is white.
 		const FString HealthText = FString::Printf(TEXT("%d"), FMath::CeilToInt(HealthComp->Health));
-		DrawTextRight(HealthText, TraceHUDStyle::Ink,
-			Margin + BarW - (10.f * UIScale),
-			VCenterTextY(HealthText, FontMedium, UIScale, HealthY, HealthH), FontMedium, UIScale);
+		const float NumberRight = Margin + BarW - (10.f * UIScale);
+		const float NumberMid = NumberRight - MeasureWidth(HealthText, FontMedium, UIScale) * 0.5f;
+		const bool bOnFill = (Margin + FMath::Clamp(DrawnHealthFraction, 0.f, 1.f) * BarW) >= NumberMid;
+		DrawTextRight(HealthText, bOnFill ? TraceMenuArtStyle::PlateFill : TraceHUDStyle::Ink,
+			NumberRight, VCenterTextY(HealthText, FontMedium, UIScale, HealthY, HealthH), FontMedium, UIScale);
 
-		// Carrying the Core means bullets cannot touch you — the single most important piece of
-		// state a player can have, so it gets a callout right on the health bar.
-		//
-		// ALWAYS "INVULNERABLE" NOW. There was a pulsing red "SHIELD DOWN" for the pass window, when
-		// the carrier's shield dropped; that window only opens from the removed hover-pass (the Core's
-		// bPassInputHeld has no writer) or a test harness, so in real play the carrier's shield is
-		// never down and that branch could not run. It went with its text.
+		// Carrying the Core means bullets cannot touch you — the single most important piece of state a
+		// player can have. The bar wears a shield-white frame for as long as it is true; the word
+		// INVULNERABLE is its caption (DrawHealthBar), where it used to be white type printed across a
+		// mint fill at about 1.4:1.
 		if (bLocalCarrying)
 		{
-			const FString& InvulnText = TRACE_TEXT("HUD.CARRIER_INVULNERABLE", "INVULNERABLE");
-			if (!InvulnText.IsEmpty())
-			{
-				DrawTextLeft(InvulnText, TraceHUDStyle::Ink,
-					Margin + (10.f * UIScale),
-					VCenterTextY(InvulnText, FontSmall, UIScale, HealthY, HealthH), FontSmall, UIScale);
-			}
+			const float Thick = FMath::Max(1.f, FMath::RoundToFloat(2.f * UIScale));
+			const float Reach = Thick + FMath::Max(1.f, 1.f * UIScale);
+			const float FrameX = Margin - Reach;
+			const float FrameY = HealthY - Reach;
+			const float FrameW = BarW + Reach * 2.f;
+			const float FrameH = HealthH + Reach * 2.f;
+			DrawRect(TraceHUDStyle::ShieldWhite, FrameX, FrameY, FrameW, Thick);
+			DrawRect(TraceHUDStyle::ShieldWhite, FrameX, FrameY + FrameH - Thick, FrameW, Thick);
+			DrawRect(TraceHUDStyle::ShieldWhite, FrameX, FrameY + Thick, Thick, FrameH - Thick * 2.f);
+			DrawRect(TraceHUDStyle::ShieldWhite, FrameX + FrameW - Thick, FrameY + Thick, Thick, FrameH - Thick * 2.f);
 		}
 	}
 }
@@ -3152,8 +3194,8 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 	// ---- FX/AUDIO plan §7.2 — THE V ROW, DRAWN FIRST SO IT LANDS *UNDER* THE E ROW --------------
 	//
 	// See DrawSecondaryCooldownRow(): the stack grows upward, so the slot this function was about to
-	// use is the one below where the E row will end up. Everything already drawn (weapon, dash,
-	// slide, parry) is untouched.
+	// use is the one below where the E row will end up. The dash row, already drawn, is untouched;
+	// parry and slide are drawn above E, after this.
 	RowY = DrawSecondaryCooldownRow(RowY, Margin, BarW, RowH, LabelW, Accent);
 
 	const float Remaining = LocalPS->GetActivatedCooldownRemaining();
@@ -3181,13 +3223,26 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 	DrawTextLeft(Label, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
 		Margin, VCenterTextY(Label, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
 
-	// Ready pulses in the character's own accent colour; charging is a dim version of it. The accent
-	// rather than the team tint, matching the select screen — the player learned the colour there and
-	// it is the one thing on this HUD that says WHICH character they are. (Accent itself is resolved
-	// at the top of this function now, because the V row wears it too.)
-	const FLinearColor RowColor = bReady
-		? TraceHUDStyle::WithAlpha(Accent, 0.75f + 0.25f * FMath::Sin(Now * 8.f))
-		: TraceHUDStyle::Shade(Accent, 0.40f, 0.0f);
+	// The accent colour, rather than the team tint: it is the one thing on this HUD that says which
+	// ability is under the key. (Resolved at the top of this function, because the V row wears it too.)
+	//
+	// *** ONE FLASH ON THE RISING EDGE OF READY, THEN STEADY — the V row's rule. *** Ready used to PULSE,
+	// at 8 rad/s, for as long as E was ready, which is most of the match: a meter that never stopped
+	// moving, right above a V row whose own comment calls exactly that a strobe. The one moment worth an
+	// animation is the instant E comes back.
+	if (bReady && bActivatedWasCooling)
+	{
+		ActivatedReadyFlashTime = Now;
+	}
+	bActivatedWasCooling = !bReady;
+
+	const float FlashAge = Now - ActivatedReadyFlashTime;
+	const bool bFlashing = (FlashAge >= 0.f && FlashAge < 0.4f);
+
+	const FLinearColor RowColor = bFlashing
+		? TraceHUDStyle::Ink
+		: (bReady ? TraceHUDStyle::Shade(Accent, 0.85f, 0.15f)
+		          : TraceHUDStyle::Shade(Accent, 0.40f, 0.0f));
 
 	DrawMeter(Margin + LabelW, RowY, BarW - LabelW, RowH, bReady ? 1.f : Fraction, RowColor);
 
@@ -3207,7 +3262,7 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 	const FString AbilityName = (Entry != nullptr) ? FString(Entry->ActivatedName) : FString();
 
 	FString StatusText = AbilityName;
-	FLinearColor StatusColor = bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim;
+	FLinearColor StatusColor = (bReady || bFlashing) ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim;
 
 	if (!bReady)
 	{
@@ -3224,9 +3279,7 @@ float ATraceHUD::DrawAbilityRow(float RowY, float Margin, float BarW, float RowH
 		}
 	}
 
-	DrawTextLeft(StatusText, StatusColor,
-		Margin + BarW + (10.f * UIScale),
-		VCenterTextY(StatusText, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+	DrawStackCaption(StatusText, StatusColor, Margin + BarW + (10.f * UIScale), RowY, RowH);
 
 	return RowY - (RowH + (8.f * UIScale));
 }
@@ -3338,9 +3391,8 @@ float ATraceHUD::DrawSecondaryCooldownRow(float RowY, float Margin, float BarW, 
 		: TRACE_TEXTF("HUD.ABILITY_SECONDARY_COOLING", "{0}  {1}",
 			{ RowLabel, FString::Printf(TEXT("%.1f"), Remaining) });
 
-	DrawTextLeft(Caption, bFlashing ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
-		Margin + BarW + (10.f * UIScale),
-		VCenterTextY(Caption, FontSmall, UIScale, RowY, VRowH), FontSmall, UIScale);
+	DrawStackCaption(Caption, bFlashing ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
+		Margin + BarW + (10.f * UIScale), RowY, VRowH);
 
 #if !UE_BUILD_SHIPPING
 	DrawnSecondaryRowText = Caption;
@@ -3387,8 +3439,26 @@ void ATraceHUD::DrawHealthBar(const UTraceHealthComponent* HealthComp, float X, 
 	}
 
 	const float Fraction = FMath::Clamp(DrawnHealthFraction, 0.f, 1.f);
-	const FLinearColor BarColor = TraceHUDStyle::LerpColor(TraceHUDStyle::Danger, TraceHUDStyle::Good, Fraction);
+
+	// WHITE, THEN YELLOW, THEN RED — three steps, not a red-to-mint gradient. The mint of a full bar
+	// was the most saturated thing on the HUD, clashing with the kit's navy / white / amber, and the
+	// white number and INVULNERABLE printed on it read at about 1.4:1. White is the kit's word colour;
+	// the two warning steps are the HUD's own headshot yellow and damage red, never the orange team's
+	// amber, which a player on Orange would read as their own colour.
+	const FLinearColor BarColor = (Fraction <= 0.25f) ? TraceHUDStyle::Danger
+		: ((Fraction <= 0.5f) ? TraceHUDStyle::Warning : TraceHUDStyle::Ink);
 	DrawMeter(X, Y, W, H, Fraction, BarColor);
+
+	// ---- The caption: INVULNERABLE while carrying, else the regen line -----------------------------
+	//
+	// INVULNERABLE is the more urgent fact and the carrier is never damaged anyway, so it wins the one
+	// caption slot. The regen fuse under the bar keeps drawing either way.
+	const FString& InvulnText = TRACE_TEXT("HUD.CARRIER_INVULNERABLE", "INVULNERABLE");
+	const bool bInvulnCaption = bLocalCarrying && !InvulnText.IsEmpty();
+	if (bInvulnCaption)
+	{
+		DrawStackCaption(InvulnText, TraceHUDStyle::ShieldWhite, X + W + (10.f * UIScale), Y, H);
+	}
 
 	// ---- Regeneration (spec v13 §1) -------------------------------------------------------------
 	//
@@ -3401,7 +3471,7 @@ void ATraceHUD::DrawHealthBar(const UTraceHealthComponent* HealthComp, float X, 
 	}
 
 	const bool bRegenerating = HealthComp->IsRegenerating();
-	const float Pulse = 0.5f + 0.5f * FMath::Sin(Now * 7.f);
+	const float Pulse = TraceHUDStyle::PulseWave(Now);
 	const float FillW = Fraction * W;
 
 	// A fuse UNDERNEATH the bar, filling left to right over the delay and solid while regeneration
@@ -3439,10 +3509,10 @@ void ATraceHUD::DrawHealthBar(const UTraceHealthComponent* HealthComp, float X, 
 		// them they make the bar read as MOVING at a rate the eye can see, which the underlying 10
 		// HP/s (0.1 of the bar per second) genuinely does not on its own.
 		//
-		// Lifted most of the way to Ink rather than left as Good, for the same contrast reason the
-		// fuse moved: at high health the fill IS Good, and a Good-coloured crest on it disappears
-		// precisely as the player approaches the top of the bar.
-		const FLinearColor Crest = TraceHUDStyle::LerpColor(TraceHUDStyle::Good, TraceHUDStyle::Ink, 0.7f);
+		// GREEN, the one colour on this HUD that means healing. It used to be lifted most of the way to
+		// white so it would show on a mint fill; the fill is white / yellow / red now, and a near-white
+		// crest would vanish on the white top of the bar instead.
+		const FLinearColor Crest = TraceHUDStyle::Good;
 
 		const float CrestW = FMath::Min(FMath::Max(4.f, 7.f * UIScale), FMath::Max(0.f, W - FillW) + (7.f * UIScale));
 		const float CrestX = FMath::Clamp(X + FillW - (CrestW * 0.5f), X, X + W - CrestW);
@@ -3467,9 +3537,10 @@ void ATraceHUD::DrawHealthBar(const UTraceHealthComponent* HealthComp, float X, 
 		? TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, 0.7f + 0.3f * Pulse)
 		: TraceHUDStyle::InkDim;
 
-	DrawTextLeft(RegenText, RegenColor,
-		X + W + (10.f * UIScale),
-		VCenterTextY(RegenText, FontSmall, UIScale, Y, H), FontSmall, UIScale);
+	if (!bInvulnCaption)
+	{
+		DrawStackCaption(RegenText, RegenColor, X + W + (10.f * UIScale), Y, H);
+	}
 }
 
 void ATraceHUD::DrawChargePips(float X, float Y, float W, float H, int32 Charges, int32 MaxCharges,
@@ -3858,30 +3929,76 @@ bool ATraceHUD::BuildCornerState(FTraceHudCornerState& OutState) const
 				FMath::Clamp(ReloadTotal - OutState.ReloadRemaining, 0.f, ReloadTotal) / ReloadTotal;
 		}
 
-		// The WORDS are the third independent bee-round signal, and the right-hand half is the reload
-		// key — read from the player's own bindings rather than hardcoded to R, exactly as the ability
-		// row does. A HUD that hardcodes a key is a HUD that lies to the first player who rebinds it.
+		// THE WORDS: the GUN'S NAME, or BEE ROUNDS — the third independent bee-round signal. It used to
+		// say "AMMO" over a number that already says it is ammo, while a separate bottom-left WEAPON row
+		// named the gun (and looked exactly like the DASH meter above it). The name is here now and the
+		// row is gone. SPEC v29 §5's three weapon states stay three: PISTOL or SMG here, KNIFE on its own
+		// plate below (the ammo plate hides for it).
+		const bool bSmgOut = TraceMelee::IsWeaponEquipped(LocalChar.Get(), ETraceEquippedWeapon::Smg);
 		OutState.AmmoLabel = OutState.bBeeClip
 			? TRACE_TEXT("HUD.AMMO_LABEL_BEE", "BEE ROUNDS")
-			: TRACE_TEXT("HUD.AMMO_LABEL", "AMMO");
+			: (bSmgOut ? TRACE_TEXT("HUD.WEAPON_SMG", "SMG") : TRACE_TEXT("HUD.WEAPON_PISTOL", "PISTOL"));
 		OutState.AmmoLabelColor = OutState.bBeeClip
 			? TraceHUDStatusStyle::BeeRounds
 			: TraceHUDStyle::InkDim;
 
 		// EXTRACTED to ATraceHUD::ActionKeyLabel — see the note at the ability row. Identical lookup,
-		// identical fallback, one definition.
+		// identical fallback, one definition. Read from the player's own bindings rather than
+		// hardcoded to R: a HUD that hardcodes a key lies to the first player who rebinds it.
 		const FString ReloadKeyLabel = ActionKeyLabel(TEXT("Reload"), TEXT("R"));
 
+		// THE RELOAD PROMPT ONLY WHEN IT IS NEWS: a low or empty clip. At 30/30 "[R] RELOAD" is an
+		// instruction nobody needs, printed in the corner every frame of the match.
+		const bool bWantsReload = OutState.bLowAmmo || (OutState.InClip <= 0);
 		OutState.RightLabel = OutState.bReloading
 			? TRACE_TEXTF("HUD.AMMO_RELOADING", "RELOADING  {0}",
 				{ FString::Printf(TEXT("%.1f"), OutState.ReloadRemaining) })
-			: TRACE_TEXTF("HUD.AMMO_RELOAD_PROMPT", "[{0}]  RELOAD", { ReloadKeyLabel });
+			: (bWantsReload
+				? TRACE_TEXTF("HUD.AMMO_RELOAD_PROMPT", "[{0}]  RELOAD", { ReloadKeyLabel })
+				: FString());
+
+		// THE PULLOUT. The 0.13-0.2 s after a swap in which the gun cannot fire used to be the WEAPON
+		// row's filling meter; the magazine strip fills instead now. Asked for the gun being DRAWN (the
+		// selector holds the destination while the deploy runs), per spec v31 §1.
+		const float Deploy = TraceMelee::GetDeployRemaining(LocalChar.Get());
+		if (Deploy > TraceHUDStyle::TimeEpsilon)
+		{
+			const float SwapTotal = FMath::Max(TraceHUDStyle::TimeEpsilon, TraceMelee::GetSwapSecondsFor(
+				bSmgOut ? ETraceEquippedWeapon::Smg : ETraceEquippedWeapon::Gun));
+			OutState.DeployFraction = FMath::Clamp(1.f - (Deploy / SwapTotal), 0.f, 1.f);
+		}
 
 		OutState.RightLabelColor = OutState.bReloading
 			? TraceHUDStatusStyle::Reloading
 			: TraceHUDStyle::InkDim;
 
 		OutState.ReloadBarColor = TraceHUDStatusStyle::Reloading;
+	}
+	else if (!bLocalCarrying && TraceMelee::IsKnifeEquipped(LocalChar.Get()))
+	{
+		// ---- The knife plate: the ammo plate's stand-in while the knife is out ----------------------
+		//
+		// The carrier is excluded: their weapon is stowed, and naming a knife that does nothing would be
+		// a lie. One meter toward ready: the pullout while the knife is being drawn, then the swing
+		// cooldown — exactly the order in which they gate the click.
+		OutState.bKnifeBlock = true;
+		OutState.KnifeLabel = TRACE_TEXT("HUD.WEAPON_KNIFE", "KNIFE");
+		OutState.RoundsColor = TraceHUDStatusStyle::NormalRounds;
+
+		const float Deploy = TraceMelee::GetDeployRemaining(LocalChar.Get());
+		const float Cooling = TraceMelee::GetSwingCooldownRemaining(LocalChar.Get());
+		if (Deploy > TraceHUDStyle::TimeEpsilon)
+		{
+			const float SwapTotal = FMath::Max(TraceHUDStyle::TimeEpsilon,
+				TraceMelee::GetSwapSecondsFor(ETraceEquippedWeapon::Knife));
+			OutState.KnifeFraction = FMath::Clamp(1.f - (Deploy / SwapTotal), 0.f, 1.f);
+		}
+		else if (Cooling > TraceHUDStyle::TimeEpsilon)
+		{
+			const float CooldownTotal = FMath::Max(TraceHUDStyle::TimeEpsilon, TraceMelee::GetSwingCooldownSeconds());
+			OutState.KnifeFraction = FMath::Clamp(1.f - (Cooling / CooldownTotal), 0.f, 1.f);
+			OutState.KnifeReadout = FString::Printf(TEXT("%.1f"), Cooling);
+		}
 	}
 
 	// ---- The status stack, growing upward -------------------------------------------------------
@@ -4236,8 +4353,13 @@ void ATraceHUD::PresentCornerCanvas(const FTraceHudCornerState& InState)
 	const float BlockW = 260.f * UIScale;
 	const float RightEdge = ViewW - Margin;
 
-	// Ammo first and pinned: it owns the corner and never moves. See the header.
-	const float StackBottom = DrawAmmoBlock(InState, RightEdge, ViewH - Margin, BlockW);
+	// Ammo first and pinned: it owns the corner and never moves. See the header. The knife's plate
+	// stands in the same place while the knife is out (the two are never up together).
+	float StackBottom = DrawAmmoBlock(InState, RightEdge, ViewH - Margin, BlockW);
+	if (InState.bKnifeBlock)
+	{
+		StackBottom = DrawKnifeBlock(InState, RightEdge, ViewH - Margin, BlockW);
+	}
 
 	// The stack grows upward from there, in the order BuildCornerState filled it: index 0 nearest
 	// the corner. Twelve pixels of clearance above the ammo block's own top edge.
@@ -4264,7 +4386,6 @@ float ATraceHUD::DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX
 	// these numbers was arrived at by looking at a capture.
 	const int32 InClip = InState.InClip;
 	const int32 ClipCapacity = InState.ClipCapacity;
-	const bool  bBeeClip = InState.bBeeClip;
 	const bool  bReloading = InState.bReloading;
 	const FLinearColor RoundsColor = InState.RoundsColor;
 
@@ -4288,16 +4409,12 @@ float ATraceHUD::DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX
 	//
 	// A PANEL BEHIND THE WHOLE BLOCK, and it is not decoration. This arena is emissive neon at Glow
 	// 3.5 with a bloom pass to match, and the first armed capture put the white "26" straight over a
-	// blown-out light: it was almost unreadable, while the status chips a few pixels above it — which
-	// already had a panel — read perfectly. The one number a player checks without looking cannot be
-	// allowed to depend on what happens to be behind it.
-	//
-	// The border is tinted by the ROUNDS colour, so a bee clip changes the plate as well as its
-	// contents and the whole corner announces itself.
+	// blown-out light. The one number a player checks without looking cannot be allowed to depend on
+	// what happens to be behind it. It is the handmade kit's navy plate now; a bee clip is announced by
+	// its amber words and five fat pips rather than by a tinted hairline round a slate rect.
 	const float PlatePad = 6.f * UIScale;
-	DrawPanel(RightX - BlockW - PlatePad, LabelTop - PlatePad,
-		BlockW + (PlatePad * 2.f), (BottomY - LabelTop) + (PlatePad * 2.f),
-		TraceHUDStyle::PanelFill, TraceHUDStyle::WithAlpha(RoundsColor, bBeeClip ? 0.55f : 0.30f));
+	DrawKitPanel(RightX - BlockW - PlatePad, LabelTop - PlatePad,
+		BlockW + (PlatePad * 2.f), (BottomY - LabelTop) + (PlatePad * 2.f), TraceHUDStyle::PanelAlpha);
 
 	// ---- The count -------------------------------------------------------------------------------
 	//
@@ -4334,6 +4451,13 @@ float ATraceHUD::DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX
 		DrawRect(InState.ReloadBarColor, RightX - BlockW, StripTop,
 			BlockW * FMath::Clamp(InState.ReloadFraction, 0.f, 1.f), StripH);
 	}
+	else if (InState.DeployFraction >= 0.f)
+	{
+		// THE PULLOUT: the gun is coming out and cannot fire yet, so the strip is a dim bar filling
+		// toward the clip — a fourth shape, where the WEAPON row's meter used to say it.
+		DrawRect(TraceHUDStyle::WithAlpha(RoundsColor, 0.45f), RightX - BlockW, StripTop,
+			BlockW * FMath::Clamp(InState.DeployFraction, 0.f, 1.f), StripH);
+	}
 	else
 	{
 		// Integer widths, pixel-snapped, for the same reason the crosshair and the kill-feed glyphs
@@ -4362,16 +4486,56 @@ float ATraceHUD::DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX
 	// (Both strings, and both colours, are resolved once in BuildCornerState so the UMG corner says
 	// the identical words with the identical key.)
 	DrawTextLeft(InState.AmmoLabel, InState.AmmoLabelColor, RightX - BlockW, LabelTop, FontSmall, UIScale);
-	DrawTextRight(InState.RightLabel, InState.RightLabelColor, RightX, LabelTop, FontSmall, UIScale);
+	if (!InState.RightLabel.IsEmpty())
+	{
+		DrawTextRight(InState.RightLabel, InState.RightLabelColor, RightX, LabelTop, FontSmall, UIScale);
+	}
 
 #if !UE_BUILD_SHIPPING
+	HudKitRecord.AmmoLabel = InState.AmmoLabel;
+	HudKitRecord.AmmoRightLabel = InState.RightLabel;
 	bDrewAmmoBlock = true;
-	bDrewBeeClip = bBeeClip;
+	bDrewBeeClip = InState.bBeeClip;
 	bDrewReloadBar = bReloading;
 	DrawnMagazineTicks = LitTicks;
 	DrawnAmmoText = FString::Printf(TEXT("%s%s"), *CountText, *CapacityText);
 #endif
 
+	return LabelTop;
+}
+
+float ATraceHUD::DrawKnifeBlock(const FTraceHudCornerState& InState, float RightX, float BottomY, float BlockW)
+{
+	// The knife's stand-in for the ammo plate: the ammo plate's label line and strip, without the
+	// count (a knife has no clip). One meter toward ready — the pullout, then the swing cooldown — and
+	// the cooldown's seconds on the right while it runs.
+	const float StripH = 12.f * UIScale;
+	const float LabelH = 14.f * UIScale;
+	const float Gap = 5.f * UIScale;
+	const float PlatePad = 6.f * UIScale;
+
+	const float StripTop = BottomY - StripH;
+	const float LabelTop = StripTop - Gap - LabelH;
+
+	DrawKitPanel(RightX - BlockW - PlatePad, LabelTop - PlatePad,
+		BlockW + (PlatePad * 2.f), (BottomY - LabelTop) + (PlatePad * 2.f), TraceHUDStyle::PanelAlpha);
+
+	const float Fraction = FMath::Clamp(InState.KnifeFraction, 0.f, 1.f);
+	const bool bReady = Fraction >= 1.f;
+	DrawRect(TraceHUDStyle::Trough, RightX - BlockW, StripTop, BlockW, StripH);
+	DrawRect(bReady ? TraceHUDStatusStyle::NormalRounds : TraceHUDStyle::WithAlpha(TraceHUDStatusStyle::NormalRounds, 0.45f),
+		RightX - BlockW, StripTop, BlockW * Fraction, StripH);
+
+	DrawTextLeft(InState.KnifeLabel, bReady ? TraceHUDStyle::Ink : TraceHUDStyle::InkDim,
+		RightX - BlockW, LabelTop, FontSmall, UIScale);
+	if (!InState.KnifeReadout.IsEmpty())
+	{
+		DrawTextRight(InState.KnifeReadout, TraceHUDStyle::InkDim, RightX, LabelTop, FontSmall, UIScale);
+	}
+
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.bKnifeBlock = true;
+#endif
 	return LabelTop;
 }
 
@@ -4381,29 +4545,46 @@ float ATraceHUD::DrawStatusChip(float RightX, float BottomY, float ChipW, const 
 	const float ChipH = 24.f * UIScale;
 	const float ChipTop = BottomY - ChipH;
 	const float ChipLeft = RightX - ChipW;
-	const float TabW = FMath::Max(2.f, FMath::RoundToFloat(4.f * UIScale));
 	const float DrainH = FMath::Max(2.f, FMath::RoundToFloat(3.f * UIScale));
 
-	// Panel, then a saturated tab down the left edge. The tab is what carries the colour at a glance;
-	// the fill stays dark so six chips stacked up never turn the corner into a light box.
-	DrawPanel(ChipLeft, ChipTop, ChipW, ChipH,
-		TraceHUDStyle::PanelFill, TraceHUDStyle::WithAlpha(Tint, 0.45f));
-	DrawRect(Tint, ChipLeft, ChipTop, TabW, ChipH);
+	// THE KIT'S PLATE, and the status colour INSIDE it: a short upright pip at the left and the drain
+	// along the bottom, both kept clear of the plate's rounded corners. It was a slate rect with a
+	// tinted hairline and a saturated tab down its square left edge. The fill stays navy so six chips
+	// stacked up never turn the corner into a light box.
+	DrawKitPanel(ChipLeft, ChipTop, ChipW, ChipH, TraceHUDStyle::PanelAlpha);
 
-	const float TextTop = VCenterTextY(Label, FontSmall, UIScale, ChipTop, ChipH - DrainH);
-	DrawTextLeft(Label, TraceHUDStyle::Ink, ChipLeft + TabW + (6.f * UIScale), TextTop, FontSmall, UIScale);
-	DrawTextRight(Readout, TraceHUDStyle::WithAlpha(Tint, 0.95f), RightX - (6.f * UIScale),
-		TextTop, FontSmall, UIScale);
+	const float Corner = FMath::Min(ChipH, TraceHUDStyle::PanelCornerMax * UIScale) * 0.25f;
+	const float PipW = FMath::Max(2.f, FMath::RoundToFloat(3.f * UIScale));
+	const float PipH = FMath::RoundToFloat((ChipH - DrainH) * 0.5f);
+	const float PipX = ChipLeft + Corner;
+	DrawRect(Tint, PipX, ChipTop + ((ChipH - DrainH) - PipH) * 0.5f, PipW, PipH);
+
+	// The label SHRINKS to fit beside its readout rather than running into it: "SLOWED  -35% SPEED"
+	// and a seconds readout share 260 px, and the words are the document's to lengthen.
+	const float TextLeft = PipX + PipW + (6.f * UIScale);
+	const float ReadoutRight = RightX - Corner;
+	const float ReadoutW = Readout.IsEmpty() ? 0.f : MeasureWidth(Readout, FontSmall, UIScale);
+	const float LabelRoom = FMath::Max(1.f, (ReadoutRight - ReadoutW - (8.f * UIScale)) - TextLeft);
+	const float LabelNatural = MeasureWidth(Label, FontSmall, UIScale);
+	const float LabelScale = (LabelNatural > LabelRoom)
+		? UIScale * FMath::Max(0.7f, LabelRoom / LabelNatural)
+		: UIScale;
+
+	DrawTextLeft(Label, TraceHUDStyle::Ink, TextLeft,
+		VCenterTextY(Label, FontSmall, LabelScale, ChipTop, ChipH - DrainH), FontSmall, LabelScale);
+	DrawTextRight(Readout, TraceHUDStyle::WithAlpha(Tint, 0.95f), ReadoutRight,
+		VCenterTextY(Readout, FontSmall, UIScale, ChipTop, ChipH - DrainH), FontSmall, UIScale);
 
 	// *** THE DRAINING INDICATOR, AND IT DRAINS — the opposite direction to every cooldown meter in
 	// the bottom-left stack, which FILLS toward ready. That is the second half of spec v16 §2's
 	// "separate from cooldowns": the corner separates them in space, this separates them in motion,
 	// so the two never read as the same widget out of the corner of an eye. It also rules out the
 	// thing the spec explicitly forbids — "a bare icon that never changes is not a status display".
-	const float DrainW = ChipW * FMath::Clamp(Fraction, 0.f, 1.f);
-	DrawRect(TraceHUDStyle::WithAlpha(TraceHUDStyle::Shadow, 0.5f),
-		ChipLeft, ChipTop + ChipH - DrainH, ChipW, DrainH);
-	DrawRect(Tint, ChipLeft, ChipTop + ChipH - DrainH, DrainW, DrainH);
+	const float DrainLeft = ChipLeft + Corner;
+	const float DrainSpan = FMath::Max(0.f, ChipW - Corner * 2.f);
+	const float DrainTop = ChipTop + ChipH - DrainH - FMath::Max(1.f, FMath::RoundToFloat(2.f * UIScale));
+	DrawRect(TraceHUDStyle::Trough, DrainLeft, DrainTop, DrainSpan, DrainH);
+	DrawRect(Tint, DrainLeft, DrainTop, DrainSpan * FMath::Clamp(Fraction, 0.f, 1.f), DrainH);
 
 #if !UE_BUILD_SHIPPING
 	// The chip records the LABEL AND THE FRACTION IT ACTUALLY DREW, not the state it was handed —
@@ -4679,6 +4860,9 @@ bool ATraceHUD::PresentCornerUmg(bool bInLive, const FTraceHudCornerState& InSta
 	bDrewReloadBar = Presented.bReloadBar;
 	DrawnMagazineTicks = Presented.LitTicks;
 	DrawnStatusChips = Presented.Chips;
+	HudKitRecord.AmmoLabel = Presented.AmmoLabel;
+	HudKitRecord.AmmoRightLabel = Presented.RightLabel;
+	HudKitRecord.bKnifeBlock = Presented.bKnifeBlock;
 #endif
 
 	return true;
@@ -4693,32 +4877,22 @@ void ATraceHUD::DrawScoresAndClock()
 	// WP1 — the practice range plays ONE ENORMOUS HALF (a fortnight; ATracePracticeGameMode::
 	// GetHalfSeconds), and formatting that literally printed "20159:53" over the target row. THE
 	// one predicate is asked, never the game-mode class (TracePracticeRange.h: "a second opinion
-	// about 'am I in the range?' is how a cheat escapes"). Server-sided by construction — the range
-	// is single-player/local by spec, and the listen host of one IS the server, so this is true
-	// exactly where anyone can be standing in a range.
+	// about 'am I in the range?' is how a cheat escapes").
 	const bool bPractice = TracePracticeRange::IsActive(GetWorld());
 
 	const float CX = ViewW * 0.5f;
-	const float PanelW = TraceHUDStyle::TopPanelW * UIScale;
 	const float PanelH = TraceHUDStyle::TopPanelH * UIScale;
-	const float PanelX = CX - PanelW * 0.5f;
 	const float PanelY = TraceHUDStyle::TopPanelY * UIScale;
-
-	DrawPanel(PanelX, PanelY, PanelW, PanelH, TraceHUDStyle::TopPanelFill, TraceHUDStyle::PanelBorder);
 
 	const int32 BlueScore   = (TraceGS != nullptr) ? TraceGS->GetScore(ETraceTeam::Blue) : 0;
 	const int32 OrangeScore = (TraceGS != nullptr) ? TraceGS->GetScore(ETraceTeam::Orange) : 0;
 
 	const float ScoreScale = 1.6f * UIScale;
 	const float ScoreY = PanelY + (14.f * UIScale);
-	const float ScoreInset = 120.f * UIScale;
+	const float ScoreInset = TraceHUDStyle::ScoreInset * UIScale;
+	const float ClockScale = 1.15f * UIScale;
 
-	// Blue always sits left, Orange always right, on every client — a fixed layout is far easier
-	// to read at a glance than a "your team first" one.
-	DrawTextRight(FString::FromInt(BlueScore), TraceTeamColor(ETraceTeam::Blue),
-		CX - ScoreInset, ScoreY, FontLarge, ScoreScale);
-	DrawTextLeft(FString::FromInt(OrangeScore), TraceTeamColor(ETraceTeam::Orange),
-		CX + ScoreInset, ScoreY, FontLarge, ScoreScale);
+	// ---- The words, decided before the plate is sized to them -------------------------------------
 
 	// Clock / phase in the middle. GetMatchTimeRemaining() is driven by the replicated
 	// GetServerWorldTimeSeconds() clock, so every client counts down together.
@@ -4746,10 +4920,9 @@ void ATraceHUD::DrawScoresAndClock()
 		{
 			if (bPractice)
 			{
-				// The word, not the fortnight. A practice clock is also never urgent, so the
-				// ClockUrgentSeconds red check is deliberately skipped with the number.
+				// The word, not the fortnight. A practice clock is also never urgent.
 				ClockText = TRACE_TEXT("HUD.CLOCK_PRACTICE", "PRACTICE");
-				ClockColor = TraceHUDStyle::InkDim;
+				ClockColor = TraceHUDStyle::Ink;
 				break;
 			}
 			const float Remaining = TraceGS->GetMatchTimeRemaining();
@@ -4768,13 +4941,26 @@ void ATraceHUD::DrawScoresAndClock()
 		}
 	}
 
-	DrawTextCentered(ClockText, ClockColor, CX, ScoreY + (6.f * UIScale), FontLarge, 1.15f * UIScale);
-
-	// Bottom line of the panel: WHICH PHASE, and — since spec v4 §7 — WHICH OF THE TWO GAMES.
+	// ---- PRACTICE: one plate, one word ------------------------------------------------------------
 	//
-	// "FIRST TO N" was never the rule and the score cap is now deleted outright (spec v4 §6): the
-	// clock decides the match, so the phase is the useful thing to show.
-	// ATraceGameState::GetHalfLabel() already reads "1ST HALF" / "HALF TIME" / "2ND HALF".
+	// The range read "0  PRACTICE  0 / PRACTICE RANGE": two scores that SuppressScore pins at zero and a
+	// footer repeating the clock slot. Both go; the plate is sized to the one word that is true.
+	if (bPractice)
+	{
+		const float WordW = MeasureWidth(ClockText, FontLarge, ClockScale);
+		const float PracticeH = 44.f * UIScale;
+		const float PracticeW = WordW + (60.f * UIScale);
+		DrawKitPanel(CX - PracticeW * 0.5f, PanelY, PracticeW, PracticeH, 1.f);
+		DrawTextCentered(ClockText, ClockColor, CX,
+			VCenterTextY(ClockText, FontLarge, ClockScale, PanelY, PracticeH), FontLarge, ClockScale);
+#if !UE_BUILD_SHIPPING
+		HudKitRecord.bTopPanel = true;
+#endif
+		return;
+	}
+
+	// Bottom line of the panel: WHICH PHASE. ATraceGameState::GetHalfLabel() already reads "1ST HALF" /
+	// "HALF TIME" / "2ND HALF". "FIRST TO N" was never the rule (spec v4 §6): the clock decides.
 	FString FooterText = (TraceGS != nullptr)
 		? TraceGS->GetHalfLabel()
 		: TRACE_TEXT("HUD.FOOTER_MATCH_FALLBACK", "MATCH");
@@ -4787,32 +4973,12 @@ void ATraceHUD::DrawScoresAndClock()
 		FooterText = TRACE_TEXT("HUD.FOOTER_FULL_TIME", "FULL TIME");
 	}
 
-	// WP1 — the range names itself instead of a half ("1ST HALF" of a fortnight is the exact line
-	// that read as a hung timer). BEFORE the mode-suffix append below, which stays: every capture
-	// must still say which scoring mode it came from, so the line reads "PRACTICE RANGE - GOALS".
-	// The pending-whistle and mercy branches below cannot fire in practice (HalvesPerMatch = 1,
-	// wipe bonus 0) and are deliberately NOT special-cased here.
-	if (bPractice)
-	{
-		FooterText = TRACE_TEXT("HUD.FOOTER_PRACTICE_RANGE", "PRACTICE RANGE");
-	}
-
 	// ---- Deferred half time / full time (spec v9 §11) --------------------------------------------
 	//
 	// The clock has hit 0:00 and PLAY IS STILL LIVE. Without this the HUD shows a frozen 0:00 with
-	// "1ST HALF" underneath it and nothing happening, which reads exactly like a hung timer — worse
-	// than the mid-run cut-off §11 exists to fix. MEASURED, both arms of this same binary at the same
-	// moment of the same scenario: Trace.HUD.PendingPeriodEndLabel 0 captured "00:00 / 1ST HALF" with
-	// the Core live in Blue's hands and no explanation anywhere on screen.
-	//
-	// The PHASE half of the footer is what gets replaced — "1ST HALF" is the least useful thing on
-	// the panel once the half is over, and it is the exact word that makes the frozen clock look
-	// broken. The MODE suffix below is deliberately still appended: it has to be in every capture.
-	//
-	// ATraceGameState::GetPendingPeriodEndLabel() picks "HALF ENDS AT NEXT DEAD BALL" vs "MATCH ENDS
-	// AT NEXT DEAD BALL" itself, from the same CurrentHalf < NumHalves test ATraceGameMode::
-	// EndPeriodNow() makes, so this can never promise a half time that is really full time. Both
-	// accessors are driven by replicated state and are correct on a client and on the listen host.
+	// "1ST HALF" underneath it and nothing happening, which reads exactly like a hung timer. So the
+	// PHASE half of the footer is replaced by ATraceGameState::GetPendingPeriodEndLabel(), which picks
+	// HALF vs MATCH itself from the same test ATraceGameMode::EndPeriodNow() makes.
 	const bool bPendingWhistle = (TraceGS != nullptr) && TraceGS->IsPendingPeriodEnd()
 		&& (GHudPendingPeriodEndLabel != 0);
 	if (bPendingWhistle)
@@ -4820,42 +4986,59 @@ void ATraceHUD::DrawScoresAndClock()
 		FooterText = TraceGS->GetPendingPeriodEndLabel();
 	}
 
-	// THE MODE USED TO BE APPENDED HERE, and it is gone with the A/B toggle. It had to be visible in
-	// every screenshot while there were two rulesets to compare — a capture that does not say which
-	// mode it is from is a capture nobody can file — and it was appended rather than given a panel of
-	// its own because a constant does not deserve to compete with the clock for attention. With one
-	// ruleset it is a constant that says nothing at all, so the footer is the period and the whistle
-	// again.
-
-	const float FooterY = PanelY + PanelH - (22.f * UIScale);
-
-	// Danger, and pulsed, for the same reason the mercy warning is: this is a state the player has
-	// only a few seconds to act inside. InkDim on a 0:00 clock is invisible.
-	const FLinearColor FooterColor = bPendingWhistle
-		? TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, 0.65f + 0.35f * FMath::Sin(Now * 6.f))
-		: TraceHUDStyle::InkDim;
-
-	DrawTextCentered(FooterText, FooterColor, CX, FooterY, FontSmall, UIScale);
-
-	// The hard cap (spec v9 §11's "guard against never breaking") sits at the RIGHT EDGE OF THE
-	// PANEL, on the footer's own baseline. It was under the panel for one capture and landed on top
-	// of the "BLUE HAS THE CORE" banner, which hangs off the panel bottom by TraceHUDStyle::BannerGap
-	// — there is no free strip there, and the collision was legible in the screenshot. The footer is
-	// centred and short, so the right gutter is empty in every phase.
-	//
-	// Dim and bare seconds, deliberately: the label is the RULE, this is only the backstop, and a
-	// player who reads "78s" as "the half ends in 78 seconds" has been misinformed — it is the
-	// latest it can end. GetPendingPeriodEndTimeRemaining() returns 0 when no cap is armed (a
-	// PeriodEndMaxDeferSeconds of 0 disables it), and then nothing is drawn at all.
+	// The hard cap (spec v9 §11's "guard against never breaking"): dim bare seconds in the plate's
+	// right gutter, on the footer's baseline. The label is the RULE, this is only the backstop — "78s"
+	// is the latest the half can end, not when it will. Nothing when no cap is armed.
+	FString CapText;
 	if (bPendingWhistle)
 	{
 		const float CapRemaining = TraceGS->GetPendingPeriodEndTimeRemaining();
 		if (CapRemaining > 0.f)
 		{
-			DrawTextRight(TRACE_TEXTF("HUD.PENDING_WHISTLE_CAP_SECONDS", "{0}s",
-					{ FMath::CeilToInt(CapRemaining) }),
-				TraceHUDStyle::InkDim, PanelX + PanelW - (12.f * UIScale), FooterY, FontSmall, UIScale);
+			CapText = TRACE_TEXTF("HUD.PENDING_WHISTLE_CAP_SECONDS", "{0}s", { FMath::CeilToInt(CapRemaining) });
 		}
+	}
+
+	// ---- THE PLATE: the handmade kit's navy plate, as wide as its contents ------------------------
+	//
+	// It was a 520-wide slate slab (sRGB 43,52,65) with a grey hairline, holding about 280 px of
+	// scores and clock. It is the kit's plate now, at least 320 wide and wider only when the footer
+	// needs it — "HALF ENDS AT NEXT TURNOVER" with the hard-cap seconds in the gutter must never
+	// collide. OPAQUE, for the measured reason written beside TraceHUDStyle::PanelAlpha.
+	const float FooterW = MeasureWidth(FooterText, FontSmall, UIScale);
+	const float CapW = CapText.IsEmpty() ? 0.f : MeasureWidth(CapText, FontSmall, UIScale);
+	const float GutterPad = 16.f * UIScale;
+	const float PanelW = FMath::Max(TraceHUDStyle::TopPanelW * UIScale,
+		FooterW + 2.f * (CapW + GutterPad * 2.f));
+	const float PanelX = CX - PanelW * 0.5f;
+
+	DrawKitPanel(PanelX, PanelY, PanelW, PanelH, 1.f);
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.bTopPanel = true;
+#endif
+
+	// Blue always sits left, Orange always right, on every client — a fixed layout is far easier
+	// to read at a glance than a "your team first" one.
+	DrawTextRight(FString::FromInt(BlueScore), TraceTeamColor(ETraceTeam::Blue),
+		CX - ScoreInset, ScoreY, FontLarge, ScoreScale);
+	DrawTextLeft(FString::FromInt(OrangeScore), TraceTeamColor(ETraceTeam::Orange),
+		CX + ScoreInset, ScoreY, FontLarge, ScoreScale);
+
+	DrawTextCentered(ClockText, ClockColor, CX, ScoreY + (6.f * UIScale), FontLarge, ClockScale);
+
+	const float FooterY = PanelY + PanelH - (22.f * UIScale);
+
+	// Danger, and breathing on the HUD's one pulse, for the same reason the mercy warning does: this
+	// is a state the player has only a few seconds to act inside. InkDim on a 0:00 clock is invisible.
+	const FLinearColor FooterColor = bPendingWhistle
+		? TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, 0.65f + 0.35f * TraceHUDStyle::PulseWave(Now))
+		: TraceHUDStyle::InkDim;
+
+	DrawTextCentered(FooterText, FooterColor, CX, FooterY, FontSmall, UIScale);
+
+	if (!CapText.IsEmpty())
+	{
+		DrawTextRight(CapText, TraceHUDStyle::InkDim, PanelX + PanelW - GutterPad, FooterY, FontSmall, UIScale);
 	}
 
 	// ---- Mercy-rule warning ---------------------------------------------------------------------
@@ -4863,11 +5046,8 @@ void ATraceHUD::DrawScoresAndClock()
 	// The mercy rule (spec v4 §6) ends the match the moment a lead reaches MercyRuleLead, and a
 	// match that stops in the middle of the first half with no warning reads exactly like the
 	// "keeps stopping and restarting" complaint this HUD has spent two passes answering. So the last
-	// couple of points are announced: the losing side knows what is at stake and the winning side
-	// knows it is one capture from the whistle.
-	//
-	// Read at the point of use, like everything else on the settings page — turn the rule off
-	// mid-match and this disappears with it.
+	// couple of points are announced. Read at the point of use: turn the rule off mid-match and this
+	// disappears with it.
 	const int32 MercyLead = UTraceSettings::Get().MercyRuleLead;
 	const bool bMatchLive = (TraceGS != nullptr)
 		&& TraceGS->TraceMatchState == ETraceMatchState::InProgress
@@ -4879,8 +5059,7 @@ void ATraceHUD::DrawScoresAndClock()
 		const int32 Remaining = MercyLead - Lead;
 
 		// Two points out, AND somebody actually ahead. The Lead > 0 test is not redundant: at a
-		// mercy threshold of 1 a 0-0 scoreline is "one point from the win" for both teams at once,
-		// and the warning was measured naming Orange as the leader of a drawn game.
+		// mercy threshold of 1 a 0-0 scoreline is "one point from the win" for both teams at once.
 		if (Lead > 0 && Remaining > 0 && Remaining <= TraceHUDStyle::MercyWarningPoints)
 		{
 			const ETraceTeam LeadingTeam = (BlueScore > OrangeScore) ? ETraceTeam::Blue : ETraceTeam::Orange;
@@ -4890,20 +5069,23 @@ void ATraceHUD::DrawScoresAndClock()
 				: TRACE_TEXTF("HUD.MERCY_N_POINTS", "MERCY RULE: {0} IS {1} POINTS FROM THE WIN",
 					{ TraceTeamName(LeadingTeam).ToString().ToUpper(), Remaining });
 
-			// Pulsed and team coloured, one line UNDER the Core banner.
-			//
-			// It was above the panel, which is where there is visibly empty screen — and it was
-			// clipped off the top edge in the first capture, because TopPanelY is only 14 reference
-			// pixels and there is no room up there at all. Below the possession banner is the next
-			// free strip and it is the right neighbourhood anyway: these are the two lines that say
-			// what is at stake right now.
-			const float MercyY = (TraceHUDStyle::TopPanelY + TraceHUDStyle::TopPanelH
-				+ TraceHUDStyle::BannerGap + 34.f) * UIScale;
+			if (!MercyText.IsEmpty())
+			{
+				// Team coloured, on a kit plate of its own, one line UNDER the Core banner — the two lines
+				// that say what is at stake right now. It was bare pulsing text on the world.
+				const float MercyY = (TraceHUDStyle::TopPanelY + TraceHUDStyle::TopPanelH
+					+ TraceHUDStyle::BannerGap + 40.f) * UIScale;
+				const float TextW = MeasureWidth(MercyText, FontSmall, UIScale);
+				const float TextH = MeasureHeight(MercyText, FontSmall, UIScale);
+				const float PadX = 14.f * UIScale;
+				const float PadY = 4.f * UIScale;
+				DrawKitPanel(CX - TextW * 0.5f - PadX, MercyY - PadY, TextW + PadX * 2.f, TextH + PadY * 2.f,
+					TraceHUDStyle::PanelAlpha);
 
-			const FLinearColor MercyColor = TraceHUDStyle::WithAlpha(
-				TraceTeamColor(LeadingTeam), 0.65f + 0.35f * FMath::Sin(Now * 5.f));
-
-			DrawTextCentered(MercyText, MercyColor, CX, MercyY, FontSmall, UIScale);
+				const FLinearColor MercyColor = TraceHUDStyle::WithAlpha(
+					TraceTeamColor(LeadingTeam), 0.65f + 0.35f * TraceHUDStyle::PulseWave(Now));
+				DrawTextCentered(MercyText, MercyColor, CX, MercyY, FontSmall, UIScale);
+			}
 		}
 	}
 }
@@ -4925,6 +5107,19 @@ void ATraceHUD::DrawCoreBanner()
 	if (Core == nullptr)
 	{
 		return;
+	}
+
+	// THE PRACTICE RANGE PARKS ITS CORE ON A RACK, BY DESIGN (bCoreOnRack), so "CORE OUT OF PLAY" sat
+	// under the top bar for the whole session. The rack pad in the world already names the Core.
+	if (TracePracticeRange::IsActive(GetWorld()))
+	{
+		if (const UTracePracticeRangeSubsystem* Range = UTracePracticeRangeSubsystem::Get(GetWorld()))
+		{
+			if (Range->IsCoreOnRack())
+			{
+				return;
+			}
+		}
 	}
 
 	FString BannerText;
@@ -4984,14 +5179,22 @@ void ATraceHUD::DrawCoreBanner()
 		return;
 	}
 
-	// Pulse anything that demands a reaction: an enemy has it, or it is lying on the field and the
-	// next person to touch it owns the possession. (The local carrier returned above.)
+	// Pulse anything that demands a reaction — an enemy has it, or it is lying on the field and the
+	// next person to touch it owns the possession — BUT ONLY FOR TWO SECONDS AFTER THE BANNER CHANGES.
+	// Those two states are most of the match, and a banner that breathed for all of it was one more
+	// thing flickering at the top of the screen. The change is the news; after it the banner holds.
+	if (BannerText != LastCoreBannerText)
+	{
+		LastCoreBannerText = BannerText;
+		CoreBannerChangeTime = Now;
+	}
 	const bool bUrgent = (Carrier != nullptr)
 		? (Carrier->GetTeam() != LocalTeam)
 		: Core->IsLoose();
-	if (bUrgent)
+	const float SinceChange = Now - CoreBannerChangeTime;
+	if (bUrgent && SinceChange >= 0.f && SinceChange < 2.f)
 	{
-		BannerColor = TraceHUDStyle::WithAlpha(BannerColor, 0.7f + 0.3f * FMath::Sin(Now * 6.f));
+		BannerColor = TraceHUDStyle::WithAlpha(BannerColor, 0.7f + 0.3f * TraceHUDStyle::PulseWave(Now));
 	}
 
 	const float CX = ViewW * 0.5f;
@@ -5003,7 +5206,9 @@ void ATraceHUD::DrawCoreBanner()
 	const float PadX = 16.f * UIScale;
 	const float PadY = 5.f * UIScale;
 
-	DrawRect(TraceHUDStyle::Shadow, CX - TextW * 0.5f - PadX, BannerY - PadY, TextW + PadX * 2.f, TextH + PadY * 2.f);
+	// The kit's plate under the words (it was a black shadow pill), in step with the score bar above it.
+	DrawKitPanel(CX - TextW * 0.5f - PadX, BannerY - PadY, TextW + PadX * 2.f, TextH + PadY * 2.f,
+		TraceHUDStyle::PanelAlpha);
 	DrawTextCentered(BannerText, BannerColor, CX, BannerY, FontMedium, BannerScale);
 }
 
@@ -5026,18 +5231,20 @@ void ATraceHUD::DrawNetworkStatus()
 		return;
 	}
 
+	// White on the kit's plate for an ordinary answer (it was green on a slate panel); the warning
+	// yellow only for the one state that is a warning.
 	FString Headline;
-	FLinearColor Accent = TraceHUDStyle::Good;
+	FLinearColor Accent = TraceHUDStyle::Ink;
 	switch (ConnectionRole)
 	{
 	case TraceNet::ERole::Hosting:
 		Headline = TRACE_TEXTF("HUD.NET_HOSTING", "HOSTING  {0}", { Endpoint });
-		Accent = TraceHUDStyle::Good;
+		Accent = TraceHUDStyle::Ink;
 		break;
 
 	case TraceNet::ERole::Client:
 		Headline = TRACE_TEXTF("HUD.NET_CONNECTED", "CONNECTED  {0}", { Endpoint });
-		Accent = TraceHUDStyle::Good;
+		Accent = TraceHUDStyle::Ink;
 		// Bots fill the empty slots and yield them as humans arrive, so the useful second line for a
 		// client is simply how many humans are in the match with them.
 		Detail.Reset();
@@ -5130,12 +5337,30 @@ void ATraceHUD::DrawNetworkStatus()
 	//       never be hideable.
 	// When the panel does not draw, KillFeedTopY keeps the top-panel default DrawHUD reset it to,
 	// so the feed simply rides at the top-panel line.
-	constexpr float RevealSeconds = 10.f;
+	//
+	// And (d): never under a screen that owns the view — see IsFullScreenOverlayUp. If this pass's
+	// reveal window was running when a select screen came up, DrawHUD starts it again when the screen
+	// goes, so the address is still introduced at match start.
+	//
+	// THE PANEL FADES rather than vanishing (NetPanelFadeSeconds), and the kill feed hanging under it
+	// eases after it (DrawKillFeed), so its going no longer yanks the whole feed up in one frame.
 	const bool bWarningState = (ConnectionRole == TraceNet::ERole::Offline);
-	if (!bWarningState && !IsScoreboardHeld() && (Now - LastRoleChangeTime) > RevealSeconds)
+	const bool bWantPanel = !IsFullScreenOverlayUp()
+		&& (bWarningState || IsScoreboardHeld() || (Now - LastRoleChangeTime) <= TraceHUDStyle::NetRevealSeconds);
+	{
+		const float FadeDelta = (GetWorld() != nullptr) ? FMath::Clamp(GetWorld()->GetDeltaSeconds(), 0.f, 0.1f) : 0.f;
+		const float Step = FadeDelta / FMath::Max(0.01f, TraceHUDStyle::NetPanelFadeSeconds);
+		NetPanelAlpha = bWantPanel ? FMath::Min(1.f, NetPanelAlpha + Step) : FMath::Max(0.f, NetPanelAlpha - Step);
+		if (IsFullScreenOverlayUp())
+		{
+			NetPanelAlpha = 0.f;   // not a fade: the overlay owns the view on this very frame
+		}
+	}
+	if (NetPanelAlpha <= 0.f)
 	{
 		return;
 	}
+	const float PanelAlphaNow = NetPanelAlpha;
 
 	const float HeadScale = 1.05f * UIScale;
 	const float DetailScale = 0.95f * UIScale;
@@ -5156,17 +5381,28 @@ void ATraceHUD::DrawNetworkStatus()
 	const float PanelX = ViewW - PanelW - (18.f * UIScale);
 	const float PanelY = TraceHUDStyle::TopPanelY * UIScale;
 
-	DrawPanel(PanelX, PanelY, PanelW, PanelH, TraceHUDStyle::PanelFill,
-		TraceHUDStyle::WithAlpha(Accent, 0.45f));
+	DrawKitPanel(PanelX, PanelY, PanelW, PanelH, TraceHUDStyle::PanelAlpha * PanelAlphaNow);
 
-	DrawTextLeft(Headline, Accent, PanelX + PadX, PanelY + PadY, FontMedium, HeadScale);
+	DrawTextLeft(Headline, TraceHUDStyle::WithAlpha(Accent, PanelAlphaNow), PanelX + PadX, PanelY + PadY,
+		FontMedium, HeadScale);
 	if (!Detail.IsEmpty())
 	{
-		DrawTextLeft(Detail, TraceHUDStyle::InkDim, PanelX + PadX, PanelY + PadY + HeadH, FontSmall, DetailScale);
+		DrawTextLeft(Detail, TraceHUDStyle::WithAlpha(TraceHUDStyle::InkDim, PanelAlphaNow),
+			PanelX + PadX, PanelY + PadY + HeadH, FontSmall, DetailScale);
 	}
 
-	// Publish the bottom edge so DrawKillFeed() can stack underneath this panel instead of over it.
-	KillFeedTopY = PanelY + PanelH;
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.bNetPanel = true;
+	HudKitRecord.NetPanelAlpha = PanelAlphaNow;
+#endif
+
+	// Publish the bottom edge so DrawKillFeed() can stack underneath this panel instead of over it —
+	// only while the panel is wanted: a fading panel hands the feed its line back straight away, and
+	// the feed eases up after it.
+	if (bWantPanel)
+	{
+		KillFeedTopY = PanelY + PanelH;
+	}
 }
 
 void ATraceHUD::DrawNetworkFailureBanner()
@@ -5398,7 +5634,8 @@ namespace TraceKillFeedArt
 
 	static constexpr float MarginX = 18.f;   // must match DrawNetworkStatus's right margin
 	static constexpr float GapUnderPanel = 8.f;
-	static constexpr float RowGap = 4.f;
+	/** 6, up from 4: an "about you" row wears the kit's amber-ringed plate, and its ring needs the room. */
+	static constexpr float RowGap = 6.f;
 	static constexpr float PadX = 10.f;
 	static constexpr float PadY = 5.f;
 	static constexpr float IconGap = 9.f;
@@ -5436,6 +5673,10 @@ void ATraceHUD::DrawKillIcon(ETraceKillIcon Icon, float X, float Y, float Cell, 
 	// white glyph disappears the moment it crosses a lit edge.
 	const FLinearColor Surround(0.f, 0.f, 0.f, 0.80f * Color.A);
 
+	// TRANSLUCENT STROKES (TraceHUDStroke), not AHUD::DrawLine. DrawLine discards alpha, so these glyphs
+	// — and their black surrounds — stayed solid while the row's plate and names faded over 0.75 s, and
+	// were photographed floating on their own, row gone, for the last frames of every entry.
+	TArray<FCanvasUVTri> GlyphTris;
 	for (int32 Pass = 0; Pass < 2; ++Pass)
 	{
 		const FLinearColor PassColor = (Pass == 0) ? Surround : Color;
@@ -5444,10 +5685,12 @@ void ATraceHUD::DrawKillIcon(ETraceKillIcon Icon, float X, float Y, float Cell, 
 
 		for (const TraceKillFeedArt::FGlyphStroke& Stroke : Strokes)
 		{
-			DrawLine(X + Stroke.X0 * Scale, Y + Stroke.Y0 * Scale,
+			TraceHUDStroke::AddQuad(GlyphTris, X + Stroke.X0 * Scale, Y + Stroke.Y0 * Scale,
 				X + Stroke.X1 * Scale, Y + Stroke.Y1 * Scale,
 				PassColor, PassThickness);
 		}
+		// Each pass flushed on its own, so the fill always lands on top of the whole surround.
+		TraceHUDStroke::Flush(Canvas, GlyphTris);
 		for (const TraceKillFeedArt::FGlyphDot& Dot : Dots)
 		{
 			DrawRect(PassColor,
@@ -5484,6 +5727,23 @@ void ATraceHUD::DrawKillFeed()
 		UE_LOG(LogTraceGame, Display, TEXT("[KillFeed] HUD found the relay; the feed will draw on this machine."));
 	}
 
+	// THE ANCHOR EASES. KillFeedTopY is the line under the HOSTING chip while it is up, the top-bar line
+	// otherwise, and it used to be taken as-is — so the whole feed snapped up by the chip's height the
+	// frame the chip went, and down again when Tab brought it back. Tracked even on frames that draw no
+	// rows, so the next row does not arrive mid-glide.
+	{
+		const float EaseDelta = FMath::Clamp(World->GetDeltaSeconds(), 0.f, 0.1f);
+		DrawnKillFeedTopY = (DrawnKillFeedTopY < 0.f)
+			? KillFeedTopY
+			: FMath::FInterpTo(DrawnKillFeedTopY, KillFeedTopY, EaseDelta, TraceHUDStyle::KillFeedAnchorEase);
+	}
+
+	// Nothing of the match draws under a screen that owns the view (IsFullScreenOverlayUp).
+	if (IsFullScreenOverlayUp())
+	{
+		return;
+	}
+
 	const TArray<FTraceKillFeedEntry>& Rows = KillFeedRelay->GetEntries();
 	if (Rows.Num() == 0)
 	{
@@ -5518,8 +5778,25 @@ void ATraceHUD::DrawKillFeed()
 	const int32 RawLocalId = (LocalPS != nullptr) ? LocalPS->GetPlayerId() : INDEX_NONE;
 	const int32 LocalPlayerId = (RawLocalId > 0) ? RawLocalId : INDEX_NONE;
 
-	float RowY = KillFeedTopY + TraceKillFeedArt::GapUnderPanel * UIScale;
+	float RowY = DrawnKillFeedTopY + TraceKillFeedArt::GapUnderPanel * UIScale;
 	int32 Drawn = 0;
+
+	// A NEW ROW SLIDES IN. Rows are newest-first, so a kill used to push every row down one row in a
+	// single frame. For its first KillFeedEnterSeconds the newest row fades in and the stack starts one
+	// row-pitch higher, gliding down into place.
+	float EnterAlpha = 1.f;
+	if (Rows.Num() > 0)
+	{
+		const float NewestAge = ATraceKillFeedRelay::GetEntryAge(Rows[0], World);
+		if (NewestAge >= 0.f && NewestAge < TraceHUDStyle::KillFeedEnterSeconds)
+		{
+			EnterAlpha = FMath::Clamp(NewestAge / TraceHUDStyle::KillFeedEnterSeconds, 0.f, 1.f);
+			const float Eased = 1.f - FMath::Square(1.f - EnterAlpha);
+			const float Pitch = FMath::Max(MeasureHeight(Rows[0].VictimName, FontSmall, TraceKillFeedArt::NameScale * UIScale),
+				Cell * static_cast<float>(TraceKillFeedArt::GlyphGrid)) + (TraceKillFeedArt::PadY * 2.f + TraceKillFeedArt::RowGap) * UIScale;
+			RowY -= (1.f - Eased) * Pitch;
+		}
+	}
 
 	for (const FTraceKillFeedEntry& Entry : Rows)
 	{
@@ -5540,9 +5817,10 @@ void ATraceHUD::DrawKillFeed()
 		}
 
 		const float FadeStart = ATraceKillFeedRelay::EntryLifetime - ATraceKillFeedRelay::EntryFadeTime;
-		const float Alpha = (Age <= FadeStart)
+		const float Alpha = ((Age <= FadeStart)
 			? 1.f
-			: FMath::Clamp(1.f - (Age - FadeStart) / ATraceKillFeedRelay::EntryFadeTime, 0.f, 1.f);
+			: FMath::Clamp(1.f - (Age - FadeStart) / ATraceKillFeedRelay::EntryFadeTime, 0.f, 1.f))
+			* ((Drawn == 0) ? EnterAlpha : 1.f);
 
 		const FString KillerText = TraceKillFeedArt::Shorten(Entry.KillerName);
 		const FString VictimText = TraceKillFeedArt::Shorten(Entry.VictimName);
@@ -5556,24 +5834,14 @@ void ATraceHUD::DrawKillFeed()
 		const float RowH = FMath::Max(TextH, IconPx) + PadY * 2.f;
 		const float RowX = RightX - RowW;
 
-		// A row involving the local player gets a coloured edge — the one thing a player wants to
-		// find in a feed without reading it is whether it was about them.
-		FLinearColor Border = TraceHUDStyle::PanelBorder;
-		if (LocalPlayerId != INDEX_NONE)
-		{
-			if (Entry.bHasKiller && Entry.KillerPlayerId == LocalPlayerId)
-			{
-				Border = TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, 0.85f);
-			}
-			else if (Entry.VictimPlayerId == LocalPlayerId)
-			{
-				Border = TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, 0.85f);
-			}
-		}
+		// A row involving the local player wears the kit's AMBER-RINGED plate — the menus' "this one"
+		// state — because the one thing a player wants to find in a feed without reading it is whether
+		// it was about them. Killer or victim, the same plate: the names say which. (It was a green or
+		// red hairline round a slate rect.)
+		const bool bAboutYou = (LocalPlayerId != INDEX_NONE)
+			&& ((Entry.bHasKiller && Entry.KillerPlayerId == LocalPlayerId) || Entry.VictimPlayerId == LocalPlayerId);
 
-		DrawPanel(RowX, RowY, RowW, RowH,
-			TraceHUDStyle::WithAlpha(TraceHUDStyle::PanelFill, TraceHUDStyle::PanelFill.A * Alpha),
-			TraceHUDStyle::WithAlpha(Border, Border.A * Alpha));
+		DrawKitPanel(RowX, RowY, RowW, RowH, TraceHUDStyle::PanelAlpha * Alpha, bAboutYou);
 
 		const float TextY = RowY + (RowH - TextH) * 0.5f;
 		const float IconY = FMath::RoundToFloat(RowY + (RowH - IconPx) * 0.5f);
@@ -5598,6 +5866,10 @@ void ATraceHUD::DrawKillFeed()
 		RowY += RowH + TraceKillFeedArt::RowGap * UIScale;
 		++Drawn;
 	}
+
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.KillFeedRows = Drawn;
+#endif
 }
 
 void ATraceHUD::DrawPhaseBanner()
@@ -5647,6 +5919,20 @@ void ATraceHUD::DrawPhaseBanner()
 	// end you are about to attack, so telling the player it happened is the whole point of the card.
 	if (TraceGS->IsHalfTimeBreak())
 	{
+		// THE GOAL FIRST, THEN THE CARD. A goal scored while the half was pending ends the half in the
+		// same server call, and this card (0.30 H) and the 2.4 s score flash's band (0.33-0.42 H) drew
+		// two headline stacks on top of each other. The break is tens of seconds long; the card can
+		// wait for the flash.
+		if (ScoreFlashTeam != ETraceTeam::None
+			&& TraceHUDKickoff::HalfTimeCardYieldsTo(Now - ScoreFlashTime, TraceHUDStyle::ScoreFlashDuration))
+		{
+			return;
+		}
+
+#if !UE_BUILD_SHIPPING
+		HudKitRecord.bHalfTimeCard = true;
+#endif
+
 		// The subtitle is placed off the MEASURED height of the headline, not off a hand-picked
 		// constant. A 3.0-scaled FontLarge is ~64px tall at UIScale 1, so the previous fixed 46px
 		// offset drew "SIDES SWITCHED" straight through the middle of "HALF TIME" — confirmed in a
@@ -5678,13 +5964,32 @@ void ATraceHUD::DrawPhaseBanner()
 		}
 	}
 
-	// InProgress: a short "GO" on the whistle, then out of the way for good.
+	// InProgress: a short "GO" on the whistle, then out of the way for good — at the match start AND at
+	// the end of the half-time break (TraceHUDKickoff::Detect). The second half used to resume with no
+	// cue at all: the loadout page vanished and play was simply live. Under that GO, SIDES SWITCHED:
+	// every human spent the break on the loadout page, which covers the HALF TIME card that says it.
 	const float Age = Now - MatchStartTime;
 	if (Age >= 0.f && Age < TraceHUDStyle::GoBannerDuration)
 	{
 		const float Alpha = 1.f - (Age / TraceHUDStyle::GoBannerDuration);
+		const float GoScale = 3.0f * UIScale;
+		const float GoY = BannerY + (40.f * UIScale);
 		DrawTextCentered(TRACE_TEXT("HUD.BANNER_GO", "GO"), TraceHUDStyle::WithAlpha(TraceHUDStyle::Good, Alpha),
-			CX, BannerY + (40.f * UIScale), FontLarge, 3.0f * UIScale);
+			CX, GoY, FontLarge, GoScale);
+
+		const FString Subtitle = bKickoffAfterBreak
+			? TRACE_TEXT("HUD.BANNER_SIDES_SWITCHED_SHORT", "SIDES SWITCHED")
+			: FString();
+		if (!Subtitle.IsEmpty())
+		{
+			DrawTextCentered(Subtitle, TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, Alpha), CX,
+				GoY + MeasureHeight(Subtitle, FontLarge, GoScale) + (6.f * UIScale), FontSmall, 1.2f * UIScale);
+		}
+
+#if !UE_BUILD_SHIPPING
+		HudKitRecord.bGoBanner = true;
+		HudKitRecord.GoSubtitle = Subtitle;
+#endif
 	}
 }
 
@@ -5704,23 +6009,30 @@ void ATraceHUD::DrawScoreFlash()
 
 	const FLinearColor TeamColor = TraceTeamColor(ScoreFlashTeam);
 	const float CX = ViewW * 0.5f;
-	const float Y = ViewH * 0.34f;
+	const float Y = ViewH * TraceHUDStyle::ScoreBandHeadlineFraction;
 
 	// A team-coloured band behind it: at a glance, the colour alone answers "who scored?". The dark
 	// underlay is not optional — the arena is a field of bright emissive strips, and a tint alone
 	// loses every legibility contest it enters with the geometry behind it.
-	const float BandH = 96.f * UIScale;
-	const float BandY = Y - (12.f * UIScale);
+	const float BandH = TraceHUDStyle::ScoreBandHeight * UIScale;
+	const float BandY = Y - (TraceHUDStyle::ScoreBandLift * UIScale);
 	const float Rule = FMath::Max(1.f, 2.f * UIScale);
 
-	DrawRect(FLinearColor(0.f, 0.01f, 0.02f, 0.62f * Alpha), 0.f, BandY, ViewW, BandH);
-	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.18f * Alpha), 0.f, BandY, ViewW, BandH);
-	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.75f * Alpha), 0.f, BandY, ViewW, Rule);
-	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.75f * Alpha), 0.f, BandY + BandH, ViewW, Rule);
+	// THE TEAM COLOUR IS IN THE RULES, THE WORDS ARE WHITE. The headline used to be set in the team
+	// colour, on a band washed with that same colour, over an arena lit in it — "BLUE SCORES" was the
+	// least legible text on its own band. The wash is gone (the underlay is the kit's black scrim) and
+	// the two team-coloured rules still answer "who scored?" at a glance.
+	DrawRect(FLinearColor(0.f, 0.f, 0.f, 0.62f * Alpha), 0.f, BandY, ViewW, BandH);
+	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.85f * Alpha), 0.f, BandY, ViewW, Rule);
+	DrawRect(TraceHUDStyle::WithAlpha(TeamColor, 0.85f * Alpha), 0.f, BandY + BandH, ViewW, Rule);
+
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.bScoreFlash = true;
+#endif
 
 	const FString Headline = TRACE_TEXTF("HUD.SCOREFLASH_TEAM_SCORES", "{0} SCORES",
 		{ TraceTeamName(ScoreFlashTeam).ToString().ToUpper() });
-	DrawTextCentered(Headline, TraceHUDStyle::WithAlpha(TeamColor, Alpha), CX, Y, FontLarge, 2.3f * UIScale);
+	DrawTextCentered(Headline, TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, Alpha), CX, Y, FontLarge, 2.3f * UIScale);
 
 	// The reset is the thing that felt like a crash, so it is named out loud.
 	DrawTextCentered(TRACE_TEXT("HUD.SCOREFLASH_CORE_RESET", "CORE RESET  -  BACK TO SPAWNS"),
@@ -5785,8 +6097,9 @@ void ATraceHUD::DrawParryKillBanner()
 	const float PadX = 16.f * UIScale;
 	const float PadY = 5.f * UIScale;
 
-	DrawRect(TraceHUDStyle::WithAlpha(TraceHUDStyle::Shadow, Alpha),
-		CX - TextW * 0.5f - PadX, BannerY - PadY, TextW + PadX * 2.f, TextH + PadY * 2.f);
+	// The kit's plate under it (it was a black shadow pill), fading with the words.
+	DrawKitPanel(CX - TextW * 0.5f - PadX, BannerY - PadY, TextW + PadX * 2.f, TextH + PadY * 2.f,
+		TraceHUDStyle::PanelAlpha * Alpha);
 	DrawTextCentered(Line, Tint, CX, BannerY, FontMedium, BannerScale);
 }
 
@@ -5798,54 +6111,82 @@ void ATraceHUD::DrawDeathPanel()
 	}
 
 	const float CX = ViewW * 0.5f;
-	const float PanelW = 560.f * UIScale;
-	const float PanelH = 150.f * UIScale;
-	const float PanelX = CX - PanelW * 0.5f;
-	const float PanelY = ViewH * 0.42f;
+	const float PadX = 28.f * UIScale;
+	const float PadTop = 14.f * UIScale;
 
-	DrawPanel(PanelX, PanelY, PanelW, PanelH, TraceHUDStyle::PanelFill, TraceHUDStyle::PanelBorder);
+	// Under the goal flash's band while it is up — a team wipe scores and kills in one moment, and the
+	// panel used to sit touching the band's bottom rule.
+	float PanelY = ViewH * 0.42f;
+	const float FlashAge = Now - ScoreFlashTime;
+	if (ScoreFlashTeam != ETraceTeam::None && FlashAge >= 0.f && FlashAge <= TraceHUDStyle::ScoreFlashDuration)
+	{
+		const float BandBottom = ViewH * TraceHUDStyle::ScoreBandHeadlineFraction
+			+ (TraceHUDStyle::ScoreBandHeight - TraceHUDStyle::ScoreBandLift) * UIScale;
+		PanelY = FMath::Max(PanelY, BandBottom + (16.f * UIScale));
+	}
+	const float PadBottom = 16.f * UIScale;
+	const float LineGap = 6.f * UIScale;
 
-	DrawTextCentered(TRACE_TEXT("HUD.DEATH_ELIMINATED", "ELIMINATED"), TraceHUDStyle::Danger,
-		CX, PanelY + (16.f * UIScale), FontLarge, 1.2f * UIScale);
+	// ---- The lines, decided before the plate is sized to them --------------------------------------
 
-	// Killer line, if the server told us who did it. "Trail" deaths in particular are worth
-	// naming — they are the rule nobody believes until they see it attributed.
+	const FString& HeadText = TRACE_TEXT("HUD.DEATH_ELIMINATED", "ELIMINATED");
+	const float HeadScale = 1.2f * UIScale;
+
+	// Killer line, if the server told us who did it. "Trail" deaths in particular are worth naming —
+	// they are the rule nobody believes until they see it attributed.
+	//
+	// *** THE CAUSE IS THE KILL FEED'S GLYPH NOW, NOT THE INTERNAL CAUSE NAME. *** The line read
+	// "by BOT Orange 5  (Bullet)": the raw damage FName, mixed case, outside the text document — and it
+	// could disagree with the feed, which showed the SMG glyph for that same death. The glyph is taken
+	// from the feed's own row for this death (the relay resolved it: pistol / SMG / skull / chevrons /
+	// shield / blade / rocket / cross), so the two can no longer say different things. The {1} slot of
+	// DEATH_KILLER_LINE is passed empty, which keeps every existing wording of that line valid.
+	FString KillerLine;
+	FName Cause = NAME_None;
+	bool bHaveIcon = false;
+	ETraceKillIcon CauseIcon = ETraceKillIcon::World;
 	if (TracePC != nullptr && !TracePC->GetLastKillerName().IsEmpty())
 	{
-		const FName Cause = TracePC->GetLastDeathCause();
-		// The two spaces in front of the bracket stay in the code, not in the document: it trims
-		// what it reads, so a leading gap could not survive a round trip through it.
-		const FString CauseText = Cause.IsNone()
-			? FString()
-			: (FString(TEXT("  ")) + TRACE_TEXTF("HUD.DEATH_CAUSE_SUFFIX", "({0})", { Cause.ToString() }));
-		const FString KillerLine = TRACE_TEXTF("HUD.DEATH_KILLER_LINE", "by {0}{1}",
-			{ TracePC->GetLastKillerName(), CauseText });
-		DrawTextCentered(KillerLine, TraceHUDStyle::InkDim, CX, PanelY + (62.f * UIScale), FontMedium, 0.95f * UIScale);
+		Cause = TracePC->GetLastDeathCause();
+		KillerLine = TRACE_TEXTF("HUD.DEATH_KILLER_LINE", "by {0}{1}",
+			{ TracePC->GetLastKillerName(), FString() });
 
-		// SPEC v6 §3 asks for feedback that leaves the dasher in no doubt. "by <carrier> (Parried)"
-		// names the fact; this names the RULE, because "Parried" is a brand new cause of death and a
-		// player who has never met it will read it as a bug — they dashed a trace, which they know
-		// kills the carrier, and instead they died. One extra line is the cheapest possible fix, and
-		// it says RED because red is the tell they had 0.2 s to notice and did not.
-		if (Cause == TraceParry::GetParryKillCause())
+		const UWorld* const World = GetWorld();
+		const int32 RawLocalId = (LocalPS != nullptr) ? LocalPS->GetPlayerId() : INDEX_NONE;
+		if (KillFeedRelay.IsValid() && World != nullptr && RawLocalId > 0)
 		{
-			DrawTextCentered(TRACE_TEXT("HUD.DEATH_PARRY_EXPLAINER", "YOU DASHED A PARRIED (RED) TRACE"),
-				TraceParry::GetTintColor(),
-				CX, PanelY + (82.f * UIScale), FontSmall, 0.85f * UIScale);
+			// The newest row with this player as the victim — and only if it is THIS death: its age
+			// (on the server clock) must fit inside how long we have been dead, with a little slack for
+			// replication. An older row is a previous life.
+			const float SecondsDead = FMath::Max(0.f, Now - LocalDeathTime);
+			for (const FTraceKillFeedEntry& Entry : KillFeedRelay->GetEntries())
+			{
+				if (Entry.VictimPlayerId == RawLocalId)
+				{
+					if (ATraceKillFeedRelay::GetEntryAge(Entry, World) <= SecondsDead + 1.5f)
+					{
+						CauseIcon = Entry.Icon;
+						bHaveIcon = true;
+					}
+					break;
+				}
+			}
 		}
 	}
+	const float KillerScale = 0.95f * UIScale;
 
-	// Countdown, from the AUTHORITATIVE respawn deadline the player state replicates. It used to be
-	// derived from UTraceSettings::RespawnDelay, which spec §1 moved to 3s on ATraceGameMode — so
-	// the panel counted down from 5 while the respawn actually fired at 3, and the player was put
-	// back in the game while their screen still said "RESPAWN IN 2".
-	//
-	// LocalDeathTime is kept as the fallback for the frame or two before the player state's deadline
-	// has replicated, so the panel never shows a blank or a bogus number on the death frame itself.
-	// NOTE the test is on the raw deadline, not on the returned seconds: GetRespawnTimeRemaining()
-	// clamps to zero both when no respawn is pending AND when the pending one has elapsed, so using
-	// the return value to choose the source would fall back to the stale local estimate for the last
-	// moment of every death — the one moment the panel must read "RESPAWNING...".
+	// SPEC v6 §3: "Parried" is a cause of death nobody has met before, and a player who dashed a trace
+	// and died instead will read it as a bug — so the rule gets its own line, in the parry's red.
+	const FString ParryText = (!KillerLine.IsEmpty() && Cause == TraceParry::GetParryKillCause())
+		? TRACE_TEXT("HUD.DEATH_PARRY_EXPLAINER", "YOU DASHED A PARRIED (RED) TRACE")
+		: FString();
+	const float ParryScale = 0.85f * UIScale;
+
+	// Countdown, from the AUTHORITATIVE respawn deadline the player state replicates (it used to be
+	// derived from UTraceSettings::RespawnDelay and counted from 5 while the respawn fired at 3).
+	// LocalDeathTime is the fallback for the frame or two before the deadline has replicated. The test
+	// is on the raw deadline: GetRespawnTimeRemaining() clamps to zero both when no respawn is pending
+	// and when it has elapsed, and the second is the one moment the panel must read "RESPAWNING...".
 	const ATracePlayerState* TracePS = (TracePC != nullptr) ? TracePC->GetTracePlayerState() : nullptr;
 	const bool bHaveAuthoritativeDeadline = (TracePS != nullptr) && (TracePS->RespawnEndServerTime > 0.f);
 
@@ -5855,8 +6196,69 @@ void ATraceHUD::DrawDeathPanel()
 	const FString RespawnText = (Remaining > 0.f)
 		? TRACE_TEXTF("HUD.RESPAWN_IN", "RESPAWN IN {0}", { FMath::CeilToInt(Remaining) })
 		: TRACE_TEXT("HUD.RESPAWNING", "RESPAWNING...");
+	const float RespawnScale = 1.05f * UIScale;
 
-	DrawTextCentered(RespawnText, TraceHUDStyle::Ink, CX, PanelY + (100.f * UIScale), FontMedium, 1.05f * UIScale);
+	// The glyph box, sized exactly as the feed sizes it (DrawKillFeed), so the two glyphs match.
+	const float Cell = FMath::Max(2.f,
+		FMath::FloorToFloat(TraceKillFeedArt::IconBoxPx * UIScale / static_cast<float>(TraceKillFeedArt::GlyphGrid)));
+	const float IconPx = Cell * static_cast<float>(TraceKillFeedArt::GlyphGrid);
+	const float IconGap = TraceKillFeedArt::IconGap * UIScale;
+
+	const float HeadH = MeasureHeight(HeadText, FontLarge, HeadScale);
+	const float KillerH = KillerLine.IsEmpty() ? 0.f : FMath::Max(MeasureHeight(KillerLine, FontMedium, KillerScale),
+		bHaveIcon ? IconPx : 0.f);
+	const float ParryH = ParryText.IsEmpty() ? 0.f : MeasureHeight(ParryText, FontSmall, ParryScale);
+	const float RespawnH = MeasureHeight(RespawnText, FontMedium, RespawnScale);
+
+	const float KillerTextW = KillerLine.IsEmpty() ? 0.f : MeasureWidth(KillerLine, FontMedium, KillerScale);
+	const float KillerW = KillerTextW + (bHaveIcon ? IconGap + IconPx : 0.f);
+	const float ContentW = FMath::Max(FMath::Max(MeasureWidth(HeadText, FontLarge, HeadScale), KillerW),
+		FMath::Max(MeasureWidth(ParryText, FontSmall, ParryScale), MeasureWidth(RespawnText, FontMedium, RespawnScale)));
+
+	// ---- THE PLATE: the kit's, OPAQUE, and as big as its lines -----------------------------------
+	//
+	// It was a fixed 560 x 150 slate panel at 0.72, with the arena showing clearly through it and a
+	// third of it empty when there was no killer line.
+	const float PanelW = FMath::Max(360.f * UIScale, ContentW + PadX * 2.f);
+	const float PanelH = PadTop + HeadH + (KillerH > 0.f ? LineGap + KillerH : 0.f)
+		+ (ParryH > 0.f ? LineGap * 0.5f + ParryH : 0.f) + LineGap * 1.5f + RespawnH + PadBottom;
+	DrawKitPanel(CX - PanelW * 0.5f, PanelY, PanelW, PanelH, 1.f);
+
+	float LineY = PanelY + PadTop;
+	DrawTextCentered(HeadText, TraceHUDStyle::Danger, CX, LineY, FontLarge, HeadScale);
+	LineY += HeadH;
+
+	if (KillerH > 0.f)
+	{
+		LineY += LineGap;
+		const float LeftX = CX - KillerW * 0.5f;
+		DrawTextLeft(KillerLine, TraceHUDStyle::InkDim, LeftX,
+			LineY + (KillerH - MeasureHeight(KillerLine, FontMedium, KillerScale)) * 0.5f, FontMedium, KillerScale);
+		if (bHaveIcon)
+		{
+			DrawKillIcon(CauseIcon, FMath::RoundToFloat(LeftX + KillerTextW + IconGap),
+				FMath::RoundToFloat(LineY + (KillerH - IconPx) * 0.5f), Cell, TraceKillFeedArt::ColorFor(CauseIcon));
+		}
+		LineY += KillerH;
+	}
+
+	if (ParryH > 0.f)
+	{
+		LineY += LineGap * 0.5f;
+		DrawTextCentered(ParryText, TraceParry::GetTintColor(), CX, LineY, FontSmall, ParryScale);
+		LineY += ParryH;
+	}
+
+	LineY += LineGap * 1.5f;
+	DrawTextCentered(RespawnText, TraceHUDStyle::Ink, CX, LineY, FontMedium, RespawnScale);
+
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.bDeathPanel = true;
+	HudKitRecord.DeathKillerLine = KillerLine;
+	HudKitRecord.DeathIcon = bHaveIcon
+		? StaticEnum<ETraceKillIcon>()->GetNameStringByValue(static_cast<int64>(CauseIcon))
+		: FString();
+#endif
 }
 
 // ===================================================================================================
@@ -5930,8 +6332,8 @@ void ATraceHUD::DrawMatchResult()
 	const int32 Blue = TraceGS->GetScore(ETraceTeam::Blue);
 	const int32 Orange = TraceGS->GetScore(ETraceTeam::Orange);
 
-	// Dim the whole world. Nothing happening out there matters any more.
-	DrawRect(FLinearColor(0.f, 0.01f, 0.02f, 0.82f), 0.f, 0.f, ViewW, ViewH);
+	// Dim the whole world. Nothing happening out there matters any more. The kit's modal scrim.
+	TraceMenuKit::DrawScrim(this, ViewW, ViewH);
 
 	const float CX = ViewW * 0.5f;
 
@@ -6133,30 +6535,27 @@ void ATraceHUD::DrawMatchResult()
 	}
 
 	// The headline is the REASON, not a fixed "FULL TIME": a mercy win says MERCY RULE. Coloured
-	// with it too, so the two outcomes are told apart at a glance from a screenshot.
+	// with it too, so the two outcomes are told apart at a glance from a screenshot. Through the text
+	// document now: TraceMatchEndReasonHeadline() is literal TCHARs (the game mode's log still uses it),
+	// so the one headline on this screen was the one Ranen could not edit.
 	const bool bMercy = (EndReason == ETraceMatchEndReason::Mercy);
-	DrawTextCentered(TraceMatchEndReasonHeadline(EndReason),
-		bMercy ? TraceHUDStyle::Danger : TraceHUDStyle::InkDim,
+	const FString ReasonText = bMercy
+		? TRACE_TEXT("HUD.RESULT_HEAD_MERCY", "MERCY RULE")
+		: ((EndReason == ETraceMatchEndReason::Clock)
+			? TRACE_TEXT("HUD.RESULT_HEAD_CLOCK", "FULL TIME")
+			: TRACE_TEXT("HUD.RESULT_HEAD_OTHER", "MATCH OVER"));
+	DrawTextCentered(ReasonText, bMercy ? TraceHUDStyle::Danger : TraceHUDStyle::InkDim,
 		CX, ViewH * 0.095f, FontSmall, 1.3f * UIScale);
 
 	DrawTextCentered(ResultText, ResultColor, CX, ViewH * 0.135f, FontLarge, 2.6f * UIScale);
 
-	// One line of plain English under the result. A results screen that says "MERCY RULE" and
-	// nothing else leaves the reader to guess the threshold; this states the rule that fired. It used
-	// to name the scoring mode as well, which was the fact an A/B playtest's notes needed and the one
-	// a screenshot otherwise lost; there is one ruleset now and naming it says nothing.
-	const FString SubText = bMercy
-		? TRACE_TEXTF("HUD.RESULT_MERCY_SUB", "{0} LED BY {1} - THE MATCH ENDED EARLY",
-			{ TraceTeamName(Winner).ToString().ToUpper(), FMath::Abs(Blue - Orange) })
-		: TRACE_TEXTF("HUD.RESULT_CLOCK_SUB", "{0} HALVES ON THE CLOCK",
-			{ (TraceGS->NumHalves == 2) ? TRACE_TEXT("HUD.RESULT_HALVES_TWO", "TWO")
-			                            : TRACE_TEXT("HUD.RESULT_HALVES_ALL", "ALL") });
-
-	DrawTextCentered(SubText, TraceHUDStyle::InkDim, CX, ViewH * 0.205f, FontSmall, 1.05f * UIScale);
+	// NO EXPLANATORY LINE UNDER THE RESULT ANY MORE. "BLUE LED BY 2 - THE MATCH ENDED EARLY" / "TWO
+	// HALVES ON THE CLOCK" restated the headline above it in a sentence; the headline says why the
+	// match ended and the score below says by how much. (The owner's copy rule: labels, not sentences.)
 
 	// Final score, spelled out as two team-coloured numbers rather than one string, so the winner
 	// is legible from across the room.
-	const float ScoreY = ViewH * 0.255f;
+	const float ScoreY = ViewH * 0.225f;
 	const float ScoreInset = 60.f * UIScale;
 	DrawTextRight(FString::FromInt(Blue), TraceTeamColor(ETraceTeam::Blue), CX - ScoreInset, ScoreY, FontLarge, 2.4f * UIScale);
 	DrawTextCentered(TRACE_TEXT("HUD.RESULT_SCORE_SEPARATOR", "-"), TraceHUDStyle::InkDim,
@@ -6188,7 +6587,7 @@ void ATraceHUD::DrawMatchResult()
 	// Must match DrawScoreboardTeam's own header/row geometry.
 	const float CardH = CardPad * 2.f + (30.f * UIScale) + (4.f * UIScale) + MaxRows * (28.f * UIScale);
 
-	DrawPanel(CardX, CardY, CardW, CardH, FLinearColor(0.01f, 0.02f, 0.03f, 0.90f), TraceHUDStyle::PanelBorder);
+	DrawKitPanel(CardX, CardY, CardW, CardH, 1.f);
 
 	const float Gutter = 22.f * UIScale;
 	const float ColumnW = (CardW - CardPad * 2.f - Gutter) * 0.5f;
@@ -6211,11 +6610,52 @@ void ATraceHUD::DrawMatchResult()
 	const float StripH = 46.f * UIScale;
 	const float StripY = ViewH - (110.f * UIScale);
 	const float StripW = FMath::Min(ViewW - (120.f * UIScale), 620.f * UIScale);
-	DrawPanel(CX - StripW * 0.5f, StripY, StripW, StripH,
-		FLinearColor(0.02f, 0.03f, 0.05f, 0.85f), TraceHUDStyle::PanelBorder);
+	DrawKitPanel(CX - StripW * 0.5f, StripY, StripW, StripH, 1.f);
 
 	DrawTextCentered(ReturnText, TraceHUDStyle::Ink, CX,
 		VCenterTextY(ReturnText, FontMedium, 1.05f * UIScale, StripY, StripH), FontMedium, 1.05f * UIScale);
+
+	// ---- CONTINUE -----------------------------------------------------------------------------
+	//
+	// The screen was a forced 14 s wait with no way on but Escape -> pause -> RETURN TO TITLE (which, on
+	// a host, used to strand the guests). ENTER / pad A now goes on: on the host it ends the results
+	// window for everybody, exactly as the timer would (ATraceGameMode::EndResultsNow sends guests home
+	// first); on a client it takes only that player home. Not while the pause menu is up — that is its
+	// own Enter.
+	{
+		const bool bPad = TracePadMenu::HasSeenPad(TracePC.Get());
+		const TArray<FTraceKitLegendItem> Legend = {
+			{ bPad ? TRACE_TEXT("HUD.RESULT_PAD_KEY_CONTINUE", "A") : TRACE_TEXT("HUD.RESULT_KEY_CONTINUE", "ENTER"),
+			  TRACE_TEXT("HUD.RESULT_CONTINUE", "CONTINUE") },
+		};
+		TraceMenuKit::DrawKeyLegend(this, Legend, CX, StripY + StripH + (12.f * UIScale), 30.f * UIScale, Now);
+
+		if (TracePC != nullptr && !PauseMenu.IsOpen()
+			&& (TracePC->WasInputKeyJustPressed(EKeys::Enter)
+				|| TracePC->WasInputKeyJustPressed(EKeys::Gamepad_FaceButton_Bottom)))
+		{
+			ContinueFromResults();
+		}
+	}
+}
+
+void ATraceHUD::ContinueFromResults()
+{
+	if (bResultsContinued)
+	{
+		return;
+	}
+	bResultsContinued = true;
+
+	UWorld* const World = GetWorld();
+	if (ATraceGameMode* HostMode = (World != nullptr) ? World->GetAuthGameMode<ATraceGameMode>() : nullptr)
+	{
+		HostMode->EndResultsNow();
+		return;
+	}
+
+	UE_LOG(LogTraceGame, Log, TEXT("Results screen: CONTINUE — this client returns to the title."));
+	UGameplayStatics::OpenLevel(this, FName(TraceMaps::MainMenu), /*bAbsolute=*/true);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -6224,6 +6664,12 @@ void ATraceHUD::DrawMatchResult()
 
 bool ATraceHUD::IsScoreboardHeld() const
 {
+#if !UE_BUILD_SHIPPING
+	if (TraceHUDCapture::CVarForceScoreboard.GetValueOnGameThread() != 0)
+	{
+		return true;
+	}
+#endif
 	return TracePC != nullptr && TracePC->IsScoreboardOpen();
 }
 
@@ -6242,15 +6688,23 @@ void ATraceHUD::DrawScoreboard()
 	const float PanelX = (ViewW - PanelW) * 0.5f;
 	const float PanelY = ViewH * 0.5f - PanelH * 0.55f;
 
-	DrawPanel(PanelX, PanelY, PanelW, PanelH, FLinearColor(0.01f, 0.02f, 0.03f, 0.88f), TraceHUDStyle::PanelBorder);
+	// The kit's plate as a card (the corner a button's, not the card's), near-opaque: the board is read
+	// over a live match and has to win against it.
+	DrawKitPanel(PanelX, PanelY, PanelW, PanelH, 0.96f);
 
 	const int32 Blue = (TraceGS != nullptr) ? TraceGS->GetScore(ETraceTeam::Blue) : 0;
 	const int32 Orange = (TraceGS != nullptr) ? TraceGS->GetScore(ETraceTeam::Orange) : 0;
 	const float CX = PanelX + PanelW * 0.5f;
 
-	DrawTextCentered(TRACE_TEXTF("HUD.SCOREBOARD_SCORELINE", "{0}  -  {1}", { Blue, Orange }),
-		TraceHUDStyle::Ink,
-		CX, PanelY + (14.f * UIScale), FontLarge, 1.2f * UIScale);
+	// The scoreline as the top bar and the results screen draw it: each number in its team's colour
+	// either side of a dim separator. It was one plain white string, the only place the score was not
+	// coloured by team.
+	const float LineScale = 1.2f * UIScale;
+	const float LineY = PanelY + (14.f * UIScale);
+	const float LineInset = 34.f * UIScale;
+	DrawTextRight(FString::FromInt(Blue), TraceTeamColor(ETraceTeam::Blue), CX - LineInset, LineY, FontLarge, LineScale);
+	DrawTextCentered(TRACE_TEXT("HUD.RESULT_SCORE_SEPARATOR", "-"), TraceHUDStyle::InkDim, CX, LineY, FontLarge, LineScale);
+	DrawTextLeft(FString::FromInt(Orange), TraceTeamColor(ETraceTeam::Orange), CX + LineInset, LineY, FontLarge, LineScale);
 
 	const float Gutter = 22.f * UIScale;
 	const float ColumnW = (PanelW - Gutter * 3.f) * 0.5f;
@@ -6259,8 +6713,8 @@ void ATraceHUD::DrawScoreboard()
 	DrawScoreboardTeam(ETraceTeam::Blue,   PanelX + Gutter, ColumnY, ColumnW);
 	DrawScoreboardTeam(ETraceTeam::Orange, PanelX + Gutter * 2.f + ColumnW, ColumnY, ColumnW);
 
-	DrawTextCentered(TRACE_TEXT("HUD.SCOREBOARD_HOLD_TAB", "HOLD TAB"), TraceHUDStyle::InkDim, CX,
-		PanelY + PanelH - (24.f * UIScale), FontSmall, UIScale);
+	// NO "HOLD TAB" FOOTER. It was an instruction shown only to somebody already holding Tab — and a
+	// literal, so it named the wrong key after a rebind and meant nothing to a pad's VIEW button.
 }
 
 float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Width)
@@ -6513,14 +6967,40 @@ float ATraceHUD::DrawScoreboardTeam(ETraceTeam Team, float X, float Y, float Wid
 
 namespace TraceHUDType
 {
-	/** The point size whose line height equals what @p Font at @p Scale draws. */
+	/**
+	 * The point size whose line height equals what @p Font at @p Scale draws.
+	 *
+	 * CACHED per (font, scale). The answer is a property of the engine font and the scale and nothing
+	 * else, and it was being re-measured — a UFont GetTextSize("Ag") — on every text draw and every
+	 * measure, several hundred times a frame with the stack, the corner, the feed and the scoreboard up.
+	 * The scales this HUD asks for are a handful of multiples of UIScale, so the map stays small; it is
+	 * dropped wholesale if a live resize ever walks it past its bound. A failed measurement (no canvas
+	 * yet) is not cached.
+	 */
 	static float SizeFor(AHUD* HUD, UFont* Font, float Scale)
 	{
-		float MeasuredW = 0.f;
+		// The engine font's measured LINE HEIGHT is what is cached; the atlas side (LineHeight(1)) is
+		// asked every time, so a live face switch (Trace.Text.Atlas) can never read a stale size.
+		static TMap<TPair<const UFont*, int32>, float> MeasuredLines;
+		const TPair<const UFont*, int32> Key(Font, FMath::RoundToInt(Scale * 4096.f));
+
 		float MeasuredH = 0.f;
-		if (HUD != nullptr)
+		if (const float* Known = MeasuredLines.Find(Key))
 		{
+			MeasuredH = *Known;
+		}
+		else if (HUD != nullptr)
+		{
+			float MeasuredW = 0.f;
 			HUD->GetTextSize(TEXT("Ag"), MeasuredW, MeasuredH, Font, Scale);
+			if (MeasuredH > 1.f)
+			{
+				if (MeasuredLines.Num() >= 256)
+				{
+					MeasuredLines.Reset();
+				}
+				MeasuredLines.Add(Key, MeasuredH);
+			}
 		}
 
 		const float UnitLine = TraceText::LineHeight(1.f);
@@ -6746,6 +7226,46 @@ void ATraceHUD::DrawPanel(float X, float Y, float W, float H, const FLinearColor
 	DrawRect(Border, X, Y + H - T, W, T);
 	DrawRect(Border, X, Y, T, H);
 	DrawRect(Border, X + W - T, Y, T, H);
+}
+
+void ATraceHUD::DrawKitPanel(float X, float Y, float W, float H, float Alpha, bool bAboutYou)
+{
+	TraceMenuKit::DrawPanelPlate(this, bAboutYou ? ETraceKitState::Hover : ETraceKitState::Default,
+		X, Y, W, H, FMath::Min(H, TraceHUDStyle::PanelCornerMax * UIScale), Alpha);
+}
+
+void ATraceHUD::DrawLineAlpha(float X0, float Y0, float X1, float Y1, const FLinearColor& Color, float Thickness)
+{
+	TArray<FCanvasUVTri> Tris;
+	TraceHUDStroke::AddQuad(Tris, X0, Y0, X1, Y1, Color, Thickness);
+	TraceHUDStroke::Flush(Canvas, Tris);
+}
+
+void ATraceHUD::DrawStackCaption(const FString& Text, const FLinearColor& Color, float X, float RowY, float RowH)
+{
+	if (Text.IsEmpty())
+	{
+		return;
+	}
+	DrawTextLeft(Text, Color, X, VCenterTextY(Text, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale);
+
+	// Measured with every digit as a zero, so "RIPPLE  9.1" and "RIPPLE  10.0" size the plate alike and a
+	// countdown never makes it breathe.
+	FString Template = Text;
+	for (TCHAR& Char : Template)
+	{
+		if (Char >= TEXT('0') && Char <= TEXT('9'))
+		{
+			Char = TEXT('0');
+		}
+	}
+	StackCaptionRightThisFrame = FMath::Max(StackCaptionRightThisFrame,
+		X + MeasureWidth(Template, FontSmall, UIScale));
+}
+
+bool ATraceHUD::IsFullScreenOverlayUp() const
+{
+	return PauseMenu.IsOpen() || CharacterSelect.IsOpen() || LoadoutSelect.IsOpen();
 }
 
 void ATraceHUD::DrawMeter(float X, float Y, float W, float H, float Fraction, const FLinearColor& FillColor)
@@ -7941,7 +8461,7 @@ namespace TraceHudCornerVerify
 			// six months from now.
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[HUDUMG] STILL CANVAS, deliberately: the crosshair and its charge/pass ring; the "
-				     "bottom-LEFT stack (health, weapon, dash charges, parry and the ACTIVATED ABILITY "
+				     "bottom-LEFT stack (health, dash charges, parry and the ACTIVATED ABILITY "
 				     "COOLDOWN row); the kill feed; the score/clock panel; the scoreboard; the death panel; "
 				     "every banner; the pause menu; the character select screen."));
 			UE_LOG(LogTraceGame, Display,
@@ -8724,4 +9244,371 @@ namespace TraceFxHudShots
 		}));
 }
 
+#endif // !UE_BUILD_SHIPPING
+
+// ===================================================================================================
+// Trace.HUD.Kit.Verify — the handmade-kit HUD pass, held to account
+//
+// Four parts, and the first three can each be seen to FAIL against the code this pass replaced:
+//
+//   1. A FADED STROKE RENDERS FADED. A white stroke at alpha 0.25 is drawn into a small render target
+//      through TraceHUDStroke (what the hit marker and the kill-feed glyphs use now) and the pixel is
+//      read back — then the same stroke through FCanvasLineItem, which is exactly what AHUD::DrawLine
+//      builds. The second is the CONTROL: it must come back at full strength, or this check could not
+//      see the bug it exists for.
+//   2. THE SECOND HALF KICKS OFF. TraceHUDKickoff::Detect on the half-time break's falling edge.
+//   3. THE HALF-TIME CARD WAITS FOR THE GOAL FLASH, and the HOSTING chip's reveal is re-armed.
+//   4. LIVE, over the next 60 s, from the HUD's own draw record: a frame with a pause / select /
+//      loadout screen up draws no match chrome under it; a live frame draws the kit plates, names the
+//      gun on the ammo plate and keeps "[R] RELOAD" off a healthy clip; a dead frame's killer line
+//      carries no internal cause name and draws the feed's glyph. States the run never reaches are
+//      reported INCONCLUSIVE, never as passes.
+//
+// Headless recipe (Arena):
+//   -TraceExecAt=6 -TraceExec="Trace.HUD.Kit.Verify kill=22"
+//   -TraceExec2At=10 -TraceExec2="Trace.Teams.Close|Trace.Loadout.Press wait=3,lock"
+// (kill=<s>: an enemy bot shoots the local pawn dead, alone, s seconds after the command.)
+// ===================================================================================================
+#if !UE_BUILD_SHIPPING
+namespace TraceHUDKitVerify
+{
+	struct FRun
+	{
+		TWeakObjectPtr<UWorld> World;
+		double Deadline = 0.0;
+		int32 Failures = 0;
+		int32 Passes = 0;
+		bool bSawOverlay = false;
+		bool bSawLive = false;
+		bool bSawDead = false;
+		double DeadSince = -1.0;
+		double SelectSince = -1.0;
+	};
+
+	static void Report(FRun& Run, const TCHAR* Claim, bool bPass, const FString& Detail)
+	{
+		(bPass ? Run.Passes : Run.Failures) += 1;
+		UE_LOG(LogTraceGame, Display, TEXT("[HUDKit]   %-4s %s  %s"), bPass ? TEXT("ok") : TEXT("FAIL"), Claim, *Detail);
+	}
+
+	/**
+	 * One 8 px white stroke at @p StrokeAlpha across a black 32x32 target, read back at its centre.
+	 * @p bLineItem draws it the way AHUD::DrawLine does (FCanvasLineItem); otherwise through
+	 * TraceHUDStroke. Returns false when this RHI cannot draw to a render target here.
+	 */
+	static bool MeasureStroke(UWorld* WorldPtr, bool bLineItem, float StrokeAlpha, FColor& OutPixel)
+	{
+		UTextureRenderTarget2D* Target = UKismetRenderingLibrary::CreateRenderTarget2D(WorldPtr, 32, 32,
+			RTF_RGBA8, FLinearColor::Black);
+		if (Target == nullptr)
+		{
+			return false;
+		}
+
+		UCanvas* TargetCanvas = nullptr;
+		FVector2D TargetSize = FVector2D::ZeroVector;
+		FDrawToRenderTargetContext Context;
+		UKismetRenderingLibrary::BeginDrawCanvasToRenderTarget(WorldPtr, Target, TargetCanvas, TargetSize, Context);
+		if (TargetCanvas == nullptr)
+		{
+			UKismetRenderingLibrary::EndDrawCanvasToRenderTarget(WorldPtr, Context);
+			UKismetRenderingLibrary::ReleaseRenderTarget2D(Target);
+			return false;
+		}
+
+		const FLinearColor Faded(1.f, 1.f, 1.f, StrokeAlpha);
+		if (bLineItem)
+		{
+			FCanvasLineItem Line(FVector2D(2.f, 16.f), FVector2D(30.f, 16.f));
+			Line.SetColor(Faded);
+			Line.LineThickness = 8.f;
+			TargetCanvas->DrawItem(Line);
+		}
+		else
+		{
+			TArray<FCanvasUVTri> Tris;
+			TraceHUDStroke::AddQuad(Tris, 2.f, 16.f, 30.f, 16.f, Faded, 8.f);
+			TraceHUDStroke::Flush(TargetCanvas, Tris);
+		}
+
+		UKismetRenderingLibrary::EndDrawCanvasToRenderTarget(WorldPtr, Context);
+		OutPixel = UKismetRenderingLibrary::ReadRenderTargetPixel(WorldPtr, Target, 16, 16);
+		UKismetRenderingLibrary::ReleaseRenderTarget2D(Target);
+		return true;
+	}
+
+	static void RunStaticChecks(FRun& Run, UWorld* WorldPtr)
+	{
+		// ---- 1. A faded stroke renders faded ------------------------------------------------------
+		{
+			FColor KitPixel;
+			FColor LinePixel;
+			const bool bKit = MeasureStroke(WorldPtr, /*bLineItem=*/false, 0.25f, KitPixel);
+			const bool bLine = MeasureStroke(WorldPtr, /*bLineItem=*/true, 0.25f, LinePixel);
+			if (!bKit || !bLine)
+			{
+				Report(Run, TEXT("a stroke at alpha 0.25 renders faded"), false,
+					TEXT("INCONCLUSIVE: no render target could be drawn in this world (-nullrhi?)"));
+			}
+			else
+			{
+				Report(Run, TEXT("control: AHUD::DrawLine's path draws alpha 0.25 at FULL strength"),
+					LinePixel.R >= 230,
+					FString::Printf(TEXT("FCanvasLineItem pixel R=%d (the engine forces A=1 in AddLine)"), LinePixel.R));
+				Report(Run, TEXT("a HUD stroke at alpha 0.25 renders faded (hit marker, kill-feed glyphs)"),
+					KitPixel.R > 20 && KitPixel.R < 180,
+					FString::Printf(TEXT("TraceHUDStroke pixel R=%d, expected well under full"), KitPixel.R));
+			}
+		}
+
+		// ---- 2. Kickoffs --------------------------------------------------------------------------
+		{
+			using TraceHUDKickoff::EKind;
+			const EKind MatchStart = TraceHUDKickoff::Detect(true, ETraceMatchState::WaitingForPlayers,
+				ETraceMatchState::InProgress, false, false);
+			const EKind SecondHalf = TraceHUDKickoff::Detect(true, ETraceMatchState::InProgress,
+				ETraceMatchState::InProgress, /*bLastBreak=*/true, /*bBreakNow=*/false);
+			const EKind BreakBegins = TraceHUDKickoff::Detect(true, ETraceMatchState::InProgress,
+				ETraceMatchState::InProgress, false, true);
+			const EKind FirstDraw = TraceHUDKickoff::Detect(false, ETraceMatchState::WaitingForPlayers,
+				ETraceMatchState::InProgress, true, false);
+			const EKind FullTime = TraceHUDKickoff::Detect(true, ETraceMatchState::InProgress,
+				ETraceMatchState::PostMatch, false, false);
+
+			Report(Run, TEXT("GO at the match start"), MatchStart == EKind::MatchStart, TEXT(""));
+			Report(Run, TEXT("GO + SIDES SWITCHED when the half-time break ends"), SecondHalf == EKind::AfterBreak,
+				TEXT("state stays InProgress through the break; only the break's falling edge says play resumed"));
+			Report(Run, TEXT("no GO when the break begins, at full time, or on a HUD's first draw"),
+				BreakBegins == EKind::None && FullTime == EKind::None && FirstDraw == EKind::None, TEXT(""));
+		}
+
+		// ---- 3. Sequencing ------------------------------------------------------------------------
+		{
+			const float Flash = TraceHUDStyle::ScoreFlashDuration;
+			Report(Run, TEXT("the HALF TIME card waits while a goal flash is up, then shows"),
+				TraceHUDKickoff::HalfTimeCardYieldsTo(0.5f, Flash) && !TraceHUDKickoff::HalfTimeCardYieldsTo(Flash + 0.1f, Flash)
+					&& !TraceHUDKickoff::HalfTimeCardYieldsTo(-1000.f, Flash),
+				FString::Printf(TEXT("flash %.1fs"), Flash));
+		}
+	}
+
+	/** One drawn frame against the three live claims. Returns true when every state has been seen. */
+	static bool CheckFrame(FRun& Run)
+	{
+		UWorld* WorldPtr = Run.World.Get();
+		ATraceHUD* HudPtr = (WorldPtr != nullptr) ? TraceHudCornerVerify::FindLocalHud(WorldPtr) : nullptr;
+		if (HudPtr == nullptr)
+		{
+			return false;
+		}
+
+		const ATraceHUD::FHudKitRecord& Rec = HudPtr->GetHudKitRecord();
+		const ATraceGameState* GS = WorldPtr->GetGameState<ATraceGameState>();
+		const bool bLiveMatch = (GS != nullptr) && GS->TraceMatchState == ETraceMatchState::InProgress
+			&& !GS->IsHalfTimeBreak();
+		APlayerController* PC = WorldPtr->GetFirstPlayerController();
+		const ATraceCharacter* Pawn = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
+		const ATracePlayerController* TracePCPtr = Cast<ATracePlayerController>(PC);
+
+		// Asked of the REPLICATED select flags, not of the HUD's own IsFullScreenOverlayUp: a harness
+		// that took the code under test's word for when an overlay is up could never catch that code
+		// getting it wrong.
+		const ATracePlayerState* LocalTraceState = (PC != nullptr) ? PC->GetPlayerState<ATracePlayerState>() : nullptr;
+		const bool bSelectUp = (TracePCPtr != nullptr && TracePCPtr->IsTeamSelectOpen())
+			|| (LocalTraceState != nullptr && LocalTraceState->IsCharacterSelectOpen());
+
+		// ...and a beat after the flag comes up, so the frame on which the screen opens (the chrome
+		// has already been drawn when the select screen's own Tick first sees the flag) is not read.
+		if (!bSelectUp)
+		{
+			Run.SelectSince = -1.0;
+		}
+		else if (Run.SelectSince < 0.0)
+		{
+			Run.SelectSince = FPlatformTime::Seconds();
+		}
+
+		if (!Run.bSawOverlay && bSelectUp && (FPlatformTime::Seconds() - Run.SelectSince) >= 0.3)
+		{
+			Run.bSawOverlay = true;
+			Report(Run, TEXT("OVERLAY: no match chrome under a screen that owns the view"),
+				!Rec.bTopPanel && !Rec.bCrosshair && Rec.KillFeedRows == 0 && !Rec.bStackPlate && !Rec.bNetPanel
+					&& !Rec.bDeathPanel && !Rec.bScoreFlash && !Rec.bHalfTimeCard,
+				FString::Printf(TEXT("top bar %d, crosshair %d, feed rows %d, stack %d, net chip %d"),
+					Rec.bTopPanel ? 1 : 0, Rec.bCrosshair ? 1 : 0, Rec.KillFeedRows, Rec.bStackPlate ? 1 : 0,
+					Rec.bNetPanel ? 1 : 0));
+		}
+		else if (!Run.bSawLive && !Rec.bOverlayUp && bLiveMatch && Pawn != nullptr && Pawn->IsAlive()
+			&& HudPtr->GetV16DrawRecord().bAmmoBlock)
+		{
+			Run.bSawLive = true;
+			Report(Run, TEXT("LIVE: the top bar and the bottom-left stack are drawn"),
+				Rec.bTopPanel && Rec.bStackPlate && Rec.bCrosshair,
+				FString::Printf(TEXT("top bar %d, stack %d, crosshair %d"),
+					Rec.bTopPanel ? 1 : 0, Rec.bStackPlate ? 1 : 0, Rec.bCrosshair ? 1 : 0));
+
+			const FString& Pistol = TRACE_TEXT("HUD.WEAPON_PISTOL", "PISTOL");
+			const FString& Smg = TRACE_TEXT("HUD.WEAPON_SMG", "SMG");
+			const FString& Bee = TRACE_TEXT("HUD.AMMO_LABEL_BEE", "BEE ROUNDS");
+			Report(Run, TEXT("LIVE: the ammo plate names the gun"),
+				Rec.AmmoLabel == Pistol || Rec.AmmoLabel == Smg || Rec.AmmoLabel == Bee,
+				FString::Printf(TEXT("label \"%s\""), *Rec.AmmoLabel));
+
+			const UTraceWeaponComponent* Gun = Pawn->FindComponentByClass<UTraceWeaponComponent>();
+			if (Gun != nullptr && !Gun->IsReloading()
+				&& Gun->GetClipAmmo() > FMath::CeilToInt(TraceHUDStatusStyle::LowAmmoFraction * Gun->GetClipSize()))
+			{
+				Report(Run, TEXT("LIVE: no reload prompt on a healthy clip"), Rec.AmmoRightLabel.IsEmpty(),
+					FString::Printf(TEXT("clip %d/%d, right label \"%s\""), Gun->GetClipAmmo(), Gun->GetClipSize(),
+						*Rec.AmmoRightLabel));
+			}
+		}
+		else if (!Run.bSawDead && !Rec.bOverlayUp && Rec.bDeathPanel && TracePCPtr != nullptr)
+		{
+			// A beat after the panel comes up, not on its first frame: the feed row the glyph is read
+			// from can land a frame after the death (and later still on a remote client), and a glyph
+			// that appears a frame late is not something a player could see.
+			if (Run.DeadSince < 0.0)
+			{
+				Run.DeadSince = FPlatformTime::Seconds();
+			}
+			if (FPlatformTime::Seconds() - Run.DeadSince < 0.25)
+			{
+				return false;
+			}
+			Run.bSawDead = true;
+			const FName Cause = TracePCPtr->GetLastDeathCause();
+			Report(Run, TEXT("DEAD: the killer line carries no internal cause name"),
+				Cause.IsNone() || !Rec.DeathKillerLine.Contains(Cause.ToString()),
+				FString::Printf(TEXT("cause '%s', line \"%s\""), *Cause.ToString(), *Rec.DeathKillerLine));
+			const APlayerState* LocalState = (PC != nullptr) ? PC->PlayerState.Get() : nullptr;
+			Report(Run, TEXT("DEAD: the death panel draws the kill feed's glyph for the cause"),
+				!Rec.DeathIcon.IsEmpty() || Rec.DeathKillerLine.IsEmpty(),
+				FString::Printf(TEXT("glyph '%s' (local player id %d)"), *Rec.DeathIcon,
+					(LocalState != nullptr) ? LocalState->GetPlayerId() : -1));
+		}
+
+		return Run.bSawOverlay && Run.bSawLive && Run.bSawDead;
+	}
+
+	static void Finish(FRun& Run)
+	{
+		const TCHAR* Unseen[3] = { nullptr, nullptr, nullptr };
+		int32 NumUnseen = 0;
+		if (!Run.bSawOverlay) { Unseen[NumUnseen++] = TEXT("OVERLAY"); }
+		if (!Run.bSawLive)    { Unseen[NumUnseen++] = TEXT("LIVE"); }
+		if (!Run.bSawDead)    { Unseen[NumUnseen++] = TEXT("DEAD"); }
+		for (int32 Index = 0; Index < NumUnseen; ++Index)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[HUDKit]   INCONCLUSIVE: the run never reached a %s frame."), Unseen[Index]);
+		}
+
+		if (Run.Failures == 0)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[HUDKit] ===== PASS (%d checks%s) ====="), Run.Passes,
+				NumUnseen > 0 ? TEXT(", some states unseen - see above") : TEXT(""));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[HUDKit] ===== *** FAIL *** %d of %d check(s) ====="),
+				Run.Failures, Run.Failures + Run.Passes);
+		}
+	}
+
+	/**
+	 * `kill=<seconds>`: that long after the command, the local pawn — and only it — is shot dead by an
+	 * enemy bot (cause "Bullet"), through the shipping UTraceHealthComponent::Kill. A single, attributed
+	 * death is what the DEAD claims are about; Trace.Health.Hurt kills all ten at once, and a burst of
+	 * ten pushes the local player's row out of the feed's 8-row buffer, leaving no glyph to find.
+	 */
+	static void ScheduleLocalKill(TWeakObjectPtr<UWorld> WeakWorld, float Seconds)
+	{
+		const double When = FPlatformTime::Seconds() + static_cast<double>(Seconds);
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([WeakWorld, When](float /*Delta*/) -> bool
+		{
+			UWorld* Live = WeakWorld.Get();
+			if (Live == nullptr)
+			{
+				return false;
+			}
+			if (FPlatformTime::Seconds() < When)
+			{
+				return true;
+			}
+
+			APlayerController* LocalPC = Live->GetFirstPlayerController();
+			ATraceCharacter* Victim = (LocalPC != nullptr) ? Cast<ATraceCharacter>(LocalPC->GetPawn()) : nullptr;
+			if (Victim == nullptr || !Victim->IsAlive() || Victim->Health == nullptr || Live->GetNetMode() == NM_Client)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[HUDKit] kill=: no live local pawn on an authority; nothing killed."));
+				return false;
+			}
+
+			AController* Shooter = nullptr;
+			for (FConstControllerIterator It = Live->GetControllerIterator(); It; ++It)
+			{
+				AController* Candidate = It->Get();
+				const ATracePlayerState* CandidateState = (Candidate != nullptr) ? Candidate->GetPlayerState<ATracePlayerState>() : nullptr;
+				if (Candidate != nullptr && Candidate != LocalPC && CandidateState != nullptr
+					&& CandidateState->Team != Victim->GetTeam() && Candidate->GetPawn() != nullptr)
+				{
+					Shooter = Candidate;
+					break;
+				}
+			}
+
+			UE_LOG(LogTraceGame, Display, TEXT("[HUDKit] kill=: the local pawn is shot dead by %s."),
+				(Shooter != nullptr) ? *Shooter->GetName() : TEXT("<nobody>"));
+			Victim->Health->Kill(Shooter, FName(TEXT("Bullet")));
+			return false;
+		}), 0.f);
+	}
+
+	static void Start(const TArray<FString>& Args, UWorld* WorldPtr)
+	{
+		if (WorldPtr == nullptr)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[HUDKit] Trace.HUD.Kit.Verify: no world."));
+			return;
+		}
+
+		TSharedRef<FRun> Run = MakeShared<FRun>();
+		Run->World = WorldPtr;
+		Run->Deadline = FPlatformTime::Seconds() + 60.0;
+
+		for (const FString& Arg : Args)
+		{
+			float KillAfter = -1.f;
+			if (FParse::Value(*Arg, TEXT("kill="), KillAfter) && KillAfter >= 0.f)
+			{
+				ScheduleLocalKill(WorldPtr, KillAfter);
+			}
+		}
+
+		UE_LOG(LogTraceGame, Display, TEXT("[HUDKit] ===== the handmade-kit HUD: strokes, kickoffs, overlays ====="));
+		RunStaticChecks(*Run, WorldPtr);
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[HUDKit] watching drawn frames for up to 60 s for an OVERLAY, a LIVE and a DEAD frame..."));
+
+		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Run](float /*Delta*/) -> bool
+		{
+			const bool bAllSeen = CheckFrame(*Run);
+			if (bAllSeen || FPlatformTime::Seconds() >= Run->Deadline || !Run->World.IsValid())
+			{
+				Finish(*Run);
+				return false;
+			}
+			return true;
+		}), 0.f);
+	}
+
+	static FAutoConsoleCommandWithWorldAndArgs CmdKitVerify(
+		TEXT("Trace.HUD.Kit.Verify"),
+		TEXT("The handmade-kit HUD pass: a faded stroke renders faded (render-target readback, with the ")
+		TEXT("DrawLine path as the control), GO on the second-half kickoff, the half-time card waits for ")
+		TEXT("the goal flash, then 60 s of drawn frames: no match chrome under an overlay, the gun named ")
+		TEXT("on the ammo plate, no reload prompt on a healthy clip, and a death panel with the feed's ")
+		TEXT("glyph instead of the internal cause name."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
+}
 #endif // !UE_BUILD_SHIPPING

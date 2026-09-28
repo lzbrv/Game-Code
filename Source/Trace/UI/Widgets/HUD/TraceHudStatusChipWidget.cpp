@@ -19,9 +19,6 @@ namespace TraceHudStatusChipWidgetFile
 		return FLinearColor(InColor.R, InColor.G, InColor.B, InAlpha);
 	}
 
-	/** How much of the tint the outline carries. Matches DrawStatusChip's border exactly. */
-	static constexpr float OutlineAlpha = 0.45f;
-
 	/** The readout is the tint, very slightly knocked back. Matches DrawStatusChip exactly. */
 	static constexpr float ReadoutAlpha = 0.95f;
 }
@@ -83,10 +80,10 @@ FString UTraceHudStatusChipWidget::ApplyChip(const FTraceHudCornerChip& InChip)
 
 	SetVisibility(ESlateVisibility::HitTestInvisible);
 
-	// The tint, on the three things that carry it. Everything else about the chip — the fill colour,
-	// the trough behind the drain, the fonts, the paddings — is styling and stays in the asset.
-	ChipOutline->SetBrushColor(TraceHudStatusChipWidgetFile::WithAlpha(
-		InChip.Tint, TraceHudStatusChipWidgetFile::OutlineAlpha));
+	// The tint, on the three things that carry it: the pip, the readout and the drain. Everything
+	// else about the chip — the kit's navy plate, the trough behind the drain, the fonts, the
+	// paddings — is styling and stays in the asset. (The outline no longer takes the tint: the chip
+	// is the kit's plate, not a slate panel with a coloured hairline.)
 	ColorTab->SetColorAndOpacity(InChip.Tint);
 	ReadoutText->SetColorAndOpacity(FSlateColor(TraceHudStatusChipWidgetFile::WithAlpha(
 		InChip.Tint, TraceHudStatusChipWidgetFile::ReadoutAlpha)));
