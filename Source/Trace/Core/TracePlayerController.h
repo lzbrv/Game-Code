@@ -516,7 +516,34 @@ public:
 	 */
 	void SetGameInputSuppressed(bool bSuppressed);
 
+	/**
+	 * The same call, from a page that is handing input back and has its OWN keys.
+	 *
+	 * @p PageReadsKey answers "is this one of the keys the closing page acts on?" — the pause menu's
+	 * FTraceOptionsMenu::ReadsKey (ENTER, SPACE, ESC...), the team/loadout flow's
+	 * FTraceCharacterSelect::ReadsKey (Q, E, F, ENTER...). A key that went down WHILE the page was up
+	 * and is one of those keys was pressed for the page — SPACE on RESUME, Q to change tab — so it is
+	 * not re-delivered as a gameplay press when input comes back, and Enhanced Input ignores it until
+	 * it is released. See RedeliverHeldPressEdges and IgnorePageKeysUntilReleased.
+	 *
+	 * Only the restore (false) uses it. The one-argument form is this with a page that reads nothing.
+	 */
+	void SetGameInputSuppressed(bool bSuppressed, TFunctionRef<bool(const FKey&)> PageReadsKey);
+
 	bool IsGameInputSuppressed() const { return bGameInputSuppressed; }
+
+	/**
+	 * What the most recent hand-back of input did, for Trace.Input.RestoreVerify. Bit N of a mask is
+	 * ETraceInputAction N. REDELIVERED: the action's press was re-fired because its key was still
+	 * down. WITHHELD: its key was down, but only because it went down on the closing page and that
+	 * page reads it — so it was not re-fired. The count goes up once per hand-back that got as far as
+	 * deciding (not in the Trace.Input.RedeliverHeldOnRestore 0 arm, which decides nothing).
+	 */
+	int32 GetInputRestoreCount() const { return InputRestoreCount; }
+	uint64 GetLastRestoreRedeliveredMask() const { return LastRestoreRedeliveredMask; }
+	uint64 GetLastRestoreWithheldMask() const { return LastRestoreWithheldMask; }
+	/** Enhanced Input mappings the last hand-back took away until their key is released. See IgnorePageKeysUntilReleased. */
+	int32 GetLastRestoreIgnoredKeyCount() const { return LastRestoreIgnoredKeyCount; }
 
 	// -----------------------------------------------------------------------------------------
 	// HUD data sources for mechanics owned by other slices.
@@ -1122,8 +1149,49 @@ private:
 	 * NOT A BUFFER. It asks the input device what is down RIGHT NOW, so a press made and released
 	 * under the overlay is correctly gone. And deliberately only the hold-shaped actions — see the
 	 * comment at the call site for why a resting finger must not spend a dash or a 35 s ability.
+	 *
+	 * NOT THE CLOSING PAGE'S OWN KEYS. A key that went down while the overlay was up AND is one
+	 * @p PageReadsKey claims was pressed for the page, not for the game: SPACE selecting RESUME is
+	 * still down on the frame the menu closes, and re-delivering it jumped the player out of the menu.
+	 * A key held since BEFORE the overlay opened is re-delivered whatever the page reads — it cannot
+	 * have been a press on the page without first being let go. So is a key the page does not read
+	 * (CTRL pressed on the loadout page is still a crouch when the half starts).
 	 */
-	void RedeliverHeldPressEdges();
+	void RedeliverHeldPressEdges(TFunctionRef<bool(const FKey&)> PageReadsKey);
+
+	/**
+	 * The other half of "not the closing page's own keys", and the half a PAUSED world needs: every
+	 * boolean Enhanced Input mapping whose key went down on the closing page (IsKeyHeldForClosingPage)
+	 * is ignored by Enhanced Input until that key is released. Without it, SPACE on RESUME still
+	 * jumped in solo play, because Enhanced Input fires Started for a held key on the first frame
+	 * after an unpause. Called from the restore branch of SetGameInputSuppressed, just before
+	 * RedeliverHeldPressEdges.
+	 */
+	void IgnorePageKeysUntilReleased(TFunctionRef<bool(const FKey&)> PageReadsKey);
+
+	/**
+	 * Is @p Key down now, one @p PageReadsKey claims, and did it go down while gameplay input was
+	 * suppressed (its last up->down transition at or after GameInputSuppressedAtRealTime)? That is a
+	 * key pressed FOR the page. Always false with Trace.Input.WithholdPageKeysOnRestore 0.
+	 */
+	bool IsKeyHeldForClosingPage(const FKey& Key, TFunctionRef<bool(const FKey&)> PageReadsKey) const;
+
+	/**
+	 * World REAL time (it runs while paused) at which gameplay input was last suppressed, compared
+	 * against a key's FKeyState::LastUpDownTransitionTime to tell "held since before the overlay"
+	 * from "pressed on it".
+	 *
+	 * FLOAT, NOT DOUBLE, ON PURPOSE: the engine stores that stamp as a float cut from the same
+	 * GetRealTimeSeconds(), so the two are rounded identically and a press on the page's first frame
+	 * compares EQUAL (and counts as on the page) rather than a rounding error either side of it.
+	 */
+	float GameInputSuppressedAtRealTime = 0.f;
+
+	/** See GetInputRestoreCount. */
+	int32 InputRestoreCount = 0;
+	uint64 LastRestoreRedeliveredMask = 0;
+	uint64 LastRestoreWithheldMask = 0;
+	int32 LastRestoreIgnoredKeyCount = 0;
 
 	/** Priority of our mapping context. Nothing else adds a context, so 0 is fine. */
 	static constexpr int32 InputMappingPriority = 0;

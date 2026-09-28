@@ -344,6 +344,32 @@ namespace TraceLoadoutSelectFile
 	}
 }
 
+namespace TraceLoadoutSelect
+{
+	bool ReadsKey(const FKey& Key)
+	{
+		// The page's own table, asked "what would this ONE key do?" — pad on and library mode on, the
+		// widest the page ever reads, so nothing it can act on is missed.
+		const FTraceLoadoutKeys OneKey = TraceLoadoutSelectFile::ReadKeysWith(
+			[&Key](const FKey& Asked) { return Asked == Key; }, /*bPadEnabled=*/true, /*bLibrary=*/true);
+
+		bool bNumberKey = false;
+		for (const bool bEachNumber : OneKey.bNumber)
+		{
+			bNumberKey = bNumberKey || bEachNumber;
+		}
+
+		return OneKey.NavX != 0 || OneKey.NavY != 0 || OneKey.bEquip || OneKey.bLock || OneKey.bBack
+			|| OneKey.bTabLeft || OneKey.bTabRight || OneKey.bShift || bNumberKey
+			// The pointer (StepPointer), and the pad's D-pad / stick (ReadKeys, through TracePadMenu).
+			|| Key == EKeys::LeftMouseButton
+			|| Key == EKeys::Gamepad_DPad_Up || Key == EKeys::Gamepad_DPad_Down
+			|| Key == EKeys::Gamepad_DPad_Left || Key == EKeys::Gamepad_DPad_Right
+			|| Key == EKeys::Gamepad_LeftStick_Up || Key == EKeys::Gamepad_LeftStick_Down
+			|| Key == EKeys::Gamepad_LeftStick_Left || Key == EKeys::Gamepad_LeftStick_Right;
+	}
+}
+
 #if !UE_BUILD_SHIPPING
 // =================================================================================================
 // Trace.Loadout.Press — drive the LIVE page from a headless run, for screenshots

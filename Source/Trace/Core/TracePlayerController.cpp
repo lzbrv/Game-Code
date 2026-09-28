@@ -33,6 +33,8 @@
 #include "InputCoreTypes.h"                // EKeys
 #include "InputMappingContext.h"
 #include "InputModifiers.h"
+#include "EnhancedActionKeyMapping.h"      // bShouldBeIgnored — a page key is taken from Enhanced Input until released
+#include "KeyState.h"                     // FKeyState::LastUpDownTransitionTime — was a held key pressed on the page?
 #include "InputTriggers.h"                 // ETriggerEvent
 #include "Misc/CommandLine.h"              // -TraceNoInputAssets (spec v17 §6)
 #include "Misc/Parse.h"                    // FParse::Param
@@ -1359,6 +1361,12 @@ namespace
 
 void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
 {
+	// A caller with no keys of its own: nothing it read can be mistaken for a gameplay press.
+	SetGameInputSuppressed(bSuppressed, [](const FKey&) { return false; });
+}
+
+void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed, TFunctionRef<bool(const FKey&)> PageReadsKey)
+{
 	if (!IsLocalController() || bGameInputSuppressed == bSuppressed)
 	{
 		return;
@@ -1368,6 +1376,15 @@ void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
 
 	if (bSuppressed)
 	{
+		// REAL time, because the pause below stops game time and a key's down time is measured in
+		// real time. RedeliverHeldPressEdges reads it back to tell a key held since before the page
+		// opened from a key pressed on the page. A float, cut exactly as the engine cuts the key's own
+		// stamp — see the member.
+		if (const UWorld* SuppressWorld = GetWorld())
+		{
+			GameInputSuppressedAtRealTime = static_cast<float>(SuppressWorld->GetRealTimeSeconds());
+		}
+
 		ApplyMenuInputMode();
 
 		// Release any held gameplay input before the handlers go quiet. Without this a player who
@@ -1429,7 +1446,15 @@ void ATracePlayerController::SetGameInputSuppressed(bool bSuppressed)
 		// Dash, Reload, the two equips and the primary ability are TAPS: a resting finger on one of
 		// those keys is not a request, and firing them here would spend a 35 s ability or a full clip
 		// on somebody who was leaning on a key while they read a menu.
-		RedeliverHeldPressEdges();
+		//
+		// AND NOT THE PAGE'S OWN KEYS. SPACE selects RESUME on the pause menu and is JUMP in a match;
+		// the menu closes on the frame SPACE goes down, so it is still down here, and re-delivering it
+		// jumped the player out of the menu — and could spend an ability that rides the jump key. Q
+		// changes tab on the loadout page and is PARRY. See the function — and the one before it,
+		// which takes those keys away from Enhanced Input too, because in a PAUSED world Enhanced Input
+		// would otherwise fire Started for them on its own on the first unpaused frame.
+		IgnorePageKeysUntilReleased(PageReadsKey);
+		RedeliverHeldPressEdges(PageReadsKey);
 	}
 
 	// The world's pause state is printed alongside, because "does opening the settings screen still
@@ -1471,7 +1496,108 @@ static FAutoConsoleVariableRef CVarTraceRedeliverHeldPressEdges(
 	     "0 is the RED arm: the press stays swallowed and the player must release and press again."),
 	ECVF_Cheat);
 
-void ATracePlayerController::RedeliverHeldPressEdges()
+// NAMED, not anonymous: this module builds as a unity blob (see Scripts/unity-hygiene.py).
+namespace TracePlayerControllerRestore
+{
+	/**
+	 * The A/B arm for WHICH held keys come back: 1 (default) withholds a key that went down on the
+	 * closing page and is one of that page's keys — from the re-delivery AND from Enhanced Input until
+	 * it is released; 0 is the RED arm — the behaviour before the fix, where SPACE on RESUME jumped. `Trace.Input.RestoreVerify red` flips it for
+	 * one run, so that harness is seen to fail on the old behaviour. Cheat-flagged for the reason
+	 * Trace.Input.RedeliverHeldOnRestore is (see above).
+	 */
+	static int32 GWithholdPageKeys = 1;
+	static FAutoConsoleVariableRef CVarWithholdPageKeys(
+		TEXT("Trace.Input.WithholdPageKeysOnRestore"),
+		GWithholdPageKeys,
+		TEXT("1 (default): when a menu hands gameplay input back, a key that went down while the menu was "
+		     "up and is one of that menu's own keys (SPACE / ENTER on the pause menu, Q / E / F on the "
+		     "loadout page) is NOT re-delivered as a gameplay press, and Enhanced Input ignores it until it "
+		     "is released. 0 is the RED arm: neither, so SPACE on RESUME also jumps."),
+		ECVF_Cheat);
+}
+
+bool ATracePlayerController::IsKeyHeldForClosingPage(const FKey& Key, TFunctionRef<bool(const FKey&)> PageReadsKey) const
+{
+	if (TracePlayerControllerRestore::GWithholdPageKeys == 0 || PlayerInput == nullptr || !Key.IsValid()
+		|| !PageReadsKey(Key))
+	{
+		return false;
+	}
+
+	// Down NOW, and its last up->down transition is at or after the moment input was suppressed: it
+	// went down while the page was up. Both stamps are the same float cut of world real time — see
+	// GameInputSuppressedAtRealTime.
+	const FKeyState* const HeldState = PlayerInput->GetKeyState(Key);
+	return HeldState != nullptr && HeldState->bDown && HeldState->LastUpDownTransitionTime >= GameInputSuppressedAtRealTime;
+}
+
+void ATracePlayerController::IgnorePageKeysUntilReleased(TFunctionRef<bool(const FKey&)> PageReadsKey)
+{
+	LastRestoreIgnoredKeyCount = 0;
+
+	UEnhancedPlayerInput* const Enhanced = Cast<UEnhancedPlayerInput>(PlayerInput);
+	if (Enhanced == nullptr)
+	{
+		return;
+	}
+
+	// *** THE PATH THE RE-DELIVERY FILTER ALONE DOES NOT CLOSE — MEASURED, NOT THEORISED. ***
+	//
+	// The first run of Trace.Input.RestoreVerify had RedeliverHeldPressEdges withholding SPACE exactly
+	// as designed, and the pawn still left the ground 0.35 s after RESUME. The pause did it. Enhanced
+	// Input forces every action's trigger state to None while the world is paused (its own source:
+	// "if the game is paused invalidate trigger unless the action allows it", and IA_Jump does not),
+	// so on the first UNPAUSED frame a SPACE that is still down is a brand-new None -> Triggered
+	// transition and Started fires — through OnJumpStarted, with suppression already lifted. Solo
+	// with bots, the case every playtest runs, is exactly the case that pauses.
+	//
+	// So the key is also taken away from Enhanced Input until the player lets go, with the engine's
+	// OWN mechanism for "this key was down for something else": FEnhancedActionKeyMapping::
+	// bShouldBeIgnored, which Enhanced Input sets itself for a key held across a mapping rebuild or a
+	// flush, skips while the key is down, and clears on the key's release event. Nothing here has to
+	// remember to undo it.
+	//
+	// BOOLEAN ACTIONS ONLY, as Enhanced Input's own flush does: an axis (IA_Move on W A S D) is not
+	// taken away — a player navigating with W who resumes still holding it walks, which is what held
+	// axes have always done. And EVERY boolean action on the key, tap or hold, keyboard or pad: pad B
+	// is BACK here and DASH in a match, and pad A is SELECT here and JUMP.
+	//
+	// THE ONE CONST_CAST, and why it is sound: GetEnhancedActionMappingsView() is the only public way
+	// to reach the mappings and it hands them out const, but the objects behind it are the ordinary
+	// (non-const) EnhancedActionMappings array of this controller's own PlayerInput. bShouldBeIgnored
+	// is a Transient runtime flag on them that Enhanced Input itself writes, on this same game thread,
+	// from FlushPressedKeys, from RebuildControlMappings and from InputKey. Nothing is held across a
+	// frame: the loop writes and lets go, and a rebuild that re-instances a mapping carries the flag
+	// over with the rest of its runtime state.
+	FString IgnoredKeyNames;
+	for (const FEnhancedActionKeyMapping& Mapping : Enhanced->GetEnhancedActionMappingsView())
+	{
+		if (Mapping.bShouldBeIgnored || Mapping.Action == nullptr
+			|| Mapping.Action->ValueType != EInputActionValueType::Boolean
+			|| !IsKeyHeldForClosingPage(Mapping.Key, PageReadsKey))
+		{
+			continue;
+		}
+		const_cast<FEnhancedActionKeyMapping&>(Mapping).bShouldBeIgnored = true;
+		++LastRestoreIgnoredKeyCount;
+		const FString MappingKeyName = Mapping.Key.ToString();
+		if (!IgnoredKeyNames.Contains(MappingKeyName))
+		{
+			IgnoredKeyNames += FString::Printf(TEXT("%s%s"), IgnoredKeyNames.IsEmpty() ? TEXT("") : TEXT(" "), *MappingKeyName);
+		}
+	}
+
+	if (LastRestoreIgnoredKeyCount > 0)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[%s] Input restored: %d gameplay mapping(s) ignored until released — their key went down on "
+			     "the closing page (%s)."),
+			*GetName(), LastRestoreIgnoredKeyCount, *IgnoredKeyNames);
+	}
+}
+
+void ATracePlayerController::RedeliverHeldPressEdges(TFunctionRef<bool(const FKey&)> PageReadsKey)
 {
 	if (GTraceRedeliverHeldPressEdges == 0)
 	{
@@ -1502,52 +1628,106 @@ void ATracePlayerController::RedeliverHeldPressEdges()
 	// pause menu is up would otherwise come back with the press swallowed, because the primary slot
 	// (Q) is not the key their finger is on. GetKeys returns only the VALID slots, so an unbound
 	// action asks IsInputKeyDown nothing at all.
-	auto IsHeld = [this, &UserSettings](ETraceInputAction Action)
+	//
+	// *** AND NOT A KEY THE CLOSING PAGE WAS PRESSED WITH. *** SPACE is SELECT on the pause menu and
+	// JUMP in a match, and the menu closes on the frame SPACE goes down — so SPACE is still down right
+	// here, and this used to hand it straight back as a jump: RESUME and a jump in the same instant.
+	// Q (the loadout page's TAB-left, and PARRY) did the same when the loadout window closed on it.
+	//
+	// The test is two facts about the key, and it needs both:
+	//   * the page READS it (PageReadsKey — each page's own table, next to the code that polls it);
+	//   * it went down WHILE the page was up: its last up->down transition is at or after the moment
+	//     input was suppressed. A key held since BEFORE the page opened is still re-delivered, which is
+	//     the whole of spec v18 §1c and must not regress: it cannot have been a press on the page
+	//     without first being let go, and letting go moves the stamp.
+	// A key the page does not read (CTRL on the loadout page) is re-delivered however it went down.
+	//
+	// ONE KEY OF SEVERAL: an action is re-delivered if ANY of its keys is held for the game. Parry on
+	// Q pressed for the page plus Parry on the thumb button held since before still parries.
+	static_assert(static_cast<int32>(ETraceInputAction::Count) <= 64,
+		"The restore record keeps one bit per ETraceInputAction in a uint64.");
+
+	int32 Redelivered = 0;
+	int32 WithheldCount = 0;
+	uint64 RedeliveredMask = 0;
+	uint64 WithheldMask = 0;
+	FString WithheldKeyNames;
+
+	auto IsHeld = [this, &UserSettings, &PageReadsKey, &Redelivered, &WithheldCount, &RedeliveredMask,
+		&WithheldMask, &WithheldKeyNames](ETraceInputAction Action)
 	{
 		TArray<FKey> Keys;
 		UserSettings.GetKeys(Action, Keys);
+		bool bHeldForGame = false;
+		FString PageKeyName;
 		for (const FKey& Key : Keys)
 		{
-			if (IsInputKeyDown(Key))
+			if (!IsInputKeyDown(Key))
 			{
-				return true;
+				continue;
 			}
+			if (IsKeyHeldForClosingPage(Key, PageReadsKey))
+			{
+				PageKeyName = Key.ToString();
+				continue;
+			}
+			bHeldForGame = true;
+		}
+
+		const uint64 ActionBit = uint64(1) << static_cast<uint32>(Action);
+		if (bHeldForGame)
+		{
+			++Redelivered;
+			RedeliveredMask |= ActionBit;
+			return true;
+		}
+		if (!PageKeyName.IsEmpty())
+		{
+			++WithheldCount;
+			WithheldMask |= ActionBit;
+			WithheldKeyNames += FString::Printf(TEXT("%s%s"), WithheldKeyNames.IsEmpty() ? TEXT("") : TEXT(" "),
+				*PageKeyName);
 		}
 		return false;
 	};
 
-	int32 Redelivered = 0;
-
 	// Ordered as the player would experience them: the two that change where the pawn IS come first,
 	// so a player who came out of the menu already holding forward-and-crouch is sliding on the same
 	// frame they are moving, rather than one frame later.
-	if (IsHeld(ETraceInputAction::Crouch))          { OnCrouchStarted();           ++Redelivered; }
-	if (IsHeld(ETraceInputAction::Jump))            { OnJumpStarted();             ++Redelivered; }
-	if (IsHeld(ETraceInputAction::Fire))            { OnFireStarted();             ++Redelivered; }
-	if (IsHeld(ETraceInputAction::Pass))            { OnPassStarted();             ++Redelivered; }
-	if (IsHeld(ETraceInputAction::Parry))           { OnParryStarted();            ++Redelivered; }
+	if (IsHeld(ETraceInputAction::Crouch))          { OnCrouchStarted(); }
+	if (IsHeld(ETraceInputAction::Jump))            { OnJumpStarted(); }
+	if (IsHeld(ETraceInputAction::Fire))            { OnFireStarted(); }
+	if (IsHeld(ETraceInputAction::Pass))            { OnPassStarted(); }
+	if (IsHeld(ETraceInputAction::Parry))           { OnParryStarted(); }
 	// SPEC v26 §1. THE PULL IS HOLD-SHAPED AND THEREFORE BELONGS IN THIS LIST — it is the clearest
 	// case of the whole mechanism: the player is holding a key over a turned-over Core, opens the
 	// pause menu, closes it, and without this their finger is on the button while the server thinks
 	// they let go. (Before v26 it rode the Parry row above; splitting the actions splits the
 	// re-delivery too, or the new bind would be the one control a menu could silently eat.)
-	if (IsHeld(ETraceInputAction::PullCore))        { OnPullCoreStarted();         ++Redelivered; }
+	if (IsHeld(ETraceInputAction::PullCore))        { OnPullCoreStarted(); }
 	// SPEC v28 §10. THE MELEE BIND IS HOLD-SHAPED FOR EXACTLY ONE REASON and it is the one that
 	// matters: its press may go to the Core PULL. A player holding right mouse over a turned-over
 	// Core, opening the pause menu and closing it again is the same failure the PullCore row above
 	// describes, reached through a different button. The swing half is press-edge only and simply
 	// re-swings if it is off cooldown, which is what a held melee button means anyway.
-	if (IsHeld(ETraceInputAction::Melee))           { OnMeleeStarted();            ++Redelivered; }
-	if (IsHeld(ETraceInputAction::AbilitySecondary)){ OnAbilitySecondaryStarted(); ++Redelivered; }
-	if (IsHeld(ETraceInputAction::Scoreboard))      { OnScoreboardStarted();       ++Redelivered; }
+	if (IsHeld(ETraceInputAction::Melee))           { OnMeleeStarted(); }
+	if (IsHeld(ETraceInputAction::AbilitySecondary)){ OnAbilitySecondaryStarted(); }
+	if (IsHeld(ETraceInputAction::Scoreboard))      { OnScoreboardStarted(); }
 
 	// Printed even at zero, and that is the point: "nobody was holding anything" and "the re-delivery
 	// did not run" are different facts, and a line that only appears on success cannot tell them
 	// apart. One line per menu close either way.
+	++InputRestoreCount;
+	LastRestoreRedeliveredMask = RedeliveredMask;
+	LastRestoreWithheldMask = WithheldMask;
+
 	UE_LOG(LogTraceGame, Display,
 		TEXT("[%s] Input restored: re-delivered %d held press edge(s) that the overlay swallowed "
-		     "(spec v18 §1c). Held axes recover on their own; buttons do not."),
-		*GetName(), Redelivered);
+		     "(spec v18 §1c). Held axes recover on their own; buttons do not. Withheld %d pressed on the "
+		     "closing page itself%s%s%s."),
+		*GetName(), Redelivered, WithheldCount,
+		WithheldKeyNames.IsEmpty() ? TEXT("") : TEXT(" ("), *WithheldKeyNames,
+		WithheldKeyNames.IsEmpty() ? TEXT("") : TEXT(")"));
 }
 
 // -------------------------------------------------------------------------------------------

@@ -59,6 +59,7 @@
 class AHUD;
 class ATracePlayerController;
 class ATracePlayerState;
+struct FKey;
 
 /**
  * The team-select overlay.
@@ -115,6 +116,12 @@ public:
 
 	/** The key that opens this screen. Referenced by the footer hint so the two cannot drift. */
 	static const TCHAR* OpenKeyName() { return TEXT("H"); }
+
+	/**
+	 * Is @p Key one this screen acts on? Part of FTraceCharacterSelect::ReadsKey — the flow's answer
+	 * when it hands gameplay input back. PollInput's keys; a new verb there belongs here too.
+	 */
+	static bool ReadsKey(const FKey& Key);
 
 #if !UE_BUILD_SHIPPING
 	/**

@@ -289,6 +289,27 @@ bool FTraceTeamSelect::PollOpenHotkey(ATracePlayerController* PC)
 	return true;
 }
 
+bool FTraceTeamSelect::ReadsKey(const FKey& Key)
+{
+	// PollInput's keys, in its order: H / pad B close, C / pad X to the loadout, 1 and 2 pick a side,
+	// the arrows / A D / D-pad / stick move, ENTER / pad A confirm, and the pointer's click.
+	static const FKey TeamSelectVerbKeys[] = {
+		EKeys::H, EKeys::C, EKeys::One, EKeys::Two,
+		EKeys::Left, EKeys::A, EKeys::Right, EKeys::D,
+		EKeys::Enter, EKeys::LeftMouseButton,
+		EKeys::Gamepad_DPad_Left, EKeys::Gamepad_DPad_Right,
+		EKeys::Gamepad_LeftStick_Left, EKeys::Gamepad_LeftStick_Right,
+	};
+	for (const FKey& TeamSelectVerbKey : TeamSelectVerbKeys)
+	{
+		if (Key == TeamSelectVerbKey)
+		{
+			return true;
+		}
+	}
+	return Key == TracePadMenu::ConfirmKey() || Key == TracePadMenu::BackKey() || Key == TracePadMenu::AltKey();
+}
+
 void FTraceTeamSelect::Tick(AHUD* HUD, ATracePlayerController* PC, ATracePlayerState* LocalState,
 	float InViewW, float InViewH, float InUIScale, float InNow, bool bInputAllowed)
 {

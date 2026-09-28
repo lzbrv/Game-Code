@@ -2639,6 +2639,32 @@ void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 	}
 }
 
+bool FTraceOptionsMenu::ReadsKey(const FKey& Key)
+{
+	// PollNavigation's keys and PollMouse's button, in the order that function reads them. A verb
+	// added there is added here, or it comes back as a gameplay press when it closes the menu.
+	static const FKey OptionsMenuVerbKeys[] = {
+		EKeys::Down, EKeys::S, EKeys::Up, EKeys::W,                 // select a row
+		EKeys::Right, EKeys::D, EKeys::Left, EKeys::A,              // adjust it
+		EKeys::Enter, EKeys::SpaceBar,                              // SELECT — SPACE is also JUMP
+		EKeys::Escape,                                              // BACK, and out from the root
+		EKeys::BackSpace, EKeys::Delete,                            // unbind / clear a slot
+		EKeys::LeftMouseButton,                                     // click (acts on release)
+		EKeys::Gamepad_DPad_Up, EKeys::Gamepad_DPad_Down, EKeys::Gamepad_DPad_Left, EKeys::Gamepad_DPad_Right,
+		EKeys::Gamepad_LeftStick_Up, EKeys::Gamepad_LeftStick_Down,
+		EKeys::Gamepad_LeftStick_Left, EKeys::Gamepad_LeftStick_Right,
+		EKeys::Gamepad_FaceButton_Top,                              // pad unbind
+	};
+	for (const FKey& OptionsMenuVerbKey : OptionsMenuVerbKeys)
+	{
+		if (Key == OptionsMenuVerbKey)
+		{
+			return true;
+		}
+	}
+	return Key == TracePadMenu::ConfirmKey() || Key == TracePadMenu::BackKey();
+}
+
 void FTraceOptionsMenu::PollNavigation(APlayerController* PC)
 {
 	// ---- D31-PAD — THE PAD DRIVES THIS OVERLAY TOO ----------------------------------------------

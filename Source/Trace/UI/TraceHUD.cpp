@@ -1547,9 +1547,13 @@ void ATraceHUD::WireCharacterSelect()
 				// Only if the pause menu is not ALSO holding input down. Restoring unconditionally
 				// here would hand movement back to a player staring at a pause menu — the exact class
 				// of bug the pause menu's own single-exit-path comment is about.
+				//
+				// WITH THE FLOW'S OWN KEYS: Q changes the loadout tab and is PARRY, and a Q pressed on
+				// the page and still down as the window closes must not come back as a parry.
 				if (!Strong->PauseMenu.IsOpen())
 				{
-					PC->SetGameInputSuppressed(false);
+					PC->SetGameInputSuppressed(false,
+						[](const FKey& ClosingPageKey) { return FTraceCharacterSelect::ReadsKey(ClosingPageKey); });
 				}
 			}
 		}
@@ -1588,9 +1592,13 @@ void ATraceHUD::OpenPauseMenu()
 				// perfectly reachable to open the pause menu over a select screen and close it again,
 				// and handing movement back to a player who is still choosing a character would let
 				// them walk out of the arena behind the overlay.
+				//
+				// WITH THE MENU'S OWN KEYS: SPACE selects RESUME and is JUMP, and it is still down on
+				// the frame RESUME closes the menu. It must not come back as a jump.
 				if (!Strong->CharacterSelect.IsOpen())
 				{
-					PC->SetGameInputSuppressed(false);
+					PC->SetGameInputSuppressed(false,
+						[](const FKey& ClosingPageKey) { return FTraceOptionsMenu::ReadsKey(ClosingPageKey); });
 				}
 			}
 		}

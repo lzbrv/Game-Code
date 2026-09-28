@@ -1675,6 +1675,47 @@ namespace TraceCharacterSelectFile
 // Lifecycle + input
 // =============================================================================================
 
+bool FTraceCharacterSelect::ReadsKey(const FKey& Key)
+{
+	// The team screen is part of the flow whichever page follows it.
+	if (FTraceTeamSelect::ReadsKey(Key))
+	{
+		return true;
+	}
+
+	// The loadout page, when it is the page (the default). Its table is derived from its own key
+	// reader, and it deliberately has no SPACE — so SPACE held when the window closes is still a jump.
+	if (TraceLoadoutSelect::IsArmed())
+	{
+		return TraceLoadoutSelect::ReadsKey(Key);
+	}
+
+	// The ten-card character page behind Trace.UI.LoadoutScreen 0: PollInput's keys. ITS SPACE LOCKS
+	// A CARD IN, so here SPACE is the page's.
+	for (int32 CardIndex = 0; CardIndex < 10; ++CardIndex)
+	{
+		if (Key == TraceCharacterSelectFile::NumberKeyForIndex(CardIndex))
+		{
+			return true;
+		}
+	}
+	static const FKey CharacterPageVerbKeys[] = {
+		EKeys::Left, EKeys::A, EKeys::Right, EKeys::D, EKeys::Up, EKeys::W, EKeys::Down, EKeys::S,
+		EKeys::Enter, EKeys::SpaceBar, EKeys::LeftMouseButton,
+		EKeys::Gamepad_DPad_Up, EKeys::Gamepad_DPad_Down, EKeys::Gamepad_DPad_Left, EKeys::Gamepad_DPad_Right,
+		EKeys::Gamepad_LeftStick_Up, EKeys::Gamepad_LeftStick_Down,
+		EKeys::Gamepad_LeftStick_Left, EKeys::Gamepad_LeftStick_Right,
+	};
+	for (const FKey& CharacterPageVerbKey : CharacterPageVerbKeys)
+	{
+		if (Key == CharacterPageVerbKey)
+		{
+			return true;
+		}
+	}
+	return Key == TracePadMenu::ConfirmKey();
+}
+
 void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerState* LocalState,
 	float InViewW, float InViewH, float InUIScale, float InNow, bool bInputAllowed)
 {

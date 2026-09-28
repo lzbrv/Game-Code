@@ -279,6 +279,19 @@ public:
 	bool IsOpen() const { return Page != EPage::Closed; }
 
 	/**
+	 * Is @p Key one this overlay acts on — select, back, clear, navigate, click?
+	 *
+	 * Asked by the host when the pause menu hands gameplay input back: a key in this list that went
+	 * down while the menu was up was pressed FOR the menu, and must not come back as a gameplay press.
+	 * SPACE is the case that made it necessary — SELECT here, JUMP in a match, and still down on the
+	 * frame RESUME closes the menu. See ATracePlayerController::RedeliverHeldPressEdges.
+	 *
+	 * The table is PollNavigation's and PollMouse's keys, and lives beside them in the .cpp: a new
+	 * verb there belongs here too. (A rebind capture reads every key, but never closes the menu.)
+	 */
+	static bool ReadsKey(const FKey& Key);
+
+	/**
 	 * P10: the overlay's opacity this frame, 0..1. It fades in after any Open*() and, after Close(),
 	 * keeps drawing the page it closed on (no input, no pointer) while it fades out. IsOpen() is NOT
 	 * widened by the fade: input, the pause and the host's input mode all follow Close() at once.

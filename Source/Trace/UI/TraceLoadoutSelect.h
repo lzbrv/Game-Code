@@ -100,6 +100,17 @@ namespace TraceLoadoutSelect
 
 	/** The same rule, read off @p WorldContext's replicated Trace game state. True with no game state. */
 	TRACE_API bool IsReopenAllowed(const UObject* WorldContext);
+
+	/**
+	 * Is @p Key one the loadout page acts on (Q / E tabs, F lock, ENTER equip, 1-5, the arrows, the
+	 * pointer's click, the pad's)? Part of FTraceCharacterSelect::ReadsKey — the flow's answer when
+	 * the window closes and gameplay input comes back: Q is PARRY, and a Q pressed to change tab must
+	 * not come back as one.
+	 *
+	 * DERIVED FROM THE PAGE'S OWN KEY TABLE (ReadKeysWith), not a second copy of it, so a verb added
+	 * there is covered here with no edit. SPACE is not in that table, so it is not in this one.
+	 */
+	TRACE_API bool ReadsKey(const FKey& Key);
 }
 
 /**

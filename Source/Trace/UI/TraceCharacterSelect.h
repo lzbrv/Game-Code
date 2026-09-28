@@ -67,6 +67,7 @@ class APlayerController;
 class ATracePlayerState;
 class UFont;
 class ATracePlayerController;
+struct FKey;
 
 /**
  * The select overlay.
@@ -113,6 +114,17 @@ public:
 
 	/** P10: the team page's fade this frame (0..1), fading out included. See FTraceTeamSelect::GetFadeAlpha. */
 	float GetTeamSelectFadeAlpha() const { return TeamSelect.GetFadeAlpha(); }
+
+	/**
+	 * Is @p Key one this FLOW acts on — the team screen, and whichever page follows it (the loadout
+	 * page, or this class's own character page behind Trace.UI.LoadoutScreen 0)?
+	 *
+	 * The host passes it when OnClosed hands gameplay input back, because one OnClosed covers the
+	 * whole flow. A key in it that went down while the flow was up was pressed for a page — Q to
+	 * change the loadout tab is PARRY in a match — and must not come back as a gameplay press. See
+	 * ATracePlayerController::RedeliverHeldPressEdges.
+	 */
+	static bool ReadsKey(const FKey& Key);
 
 	/**
 	 * Poll input and draw. Call exactly once per frame from the owning AHUD::DrawHUD.
