@@ -26,15 +26,36 @@ if git diff --cached --name-only --diff-filter=ACM | grep -qiE '^Config/.*\.ini$
     CONFIG_STAGED=1
 fi
 
-# Windows installs frequently expose python as `python`, not `python3`.
-if command -v python3 >/dev/null 2>&1; then PY=python3
-elif command -v python  >/dev/null 2>&1; then PY=python
-else
-    echo "pre-commit: no python found; skipping the Config hygiene check." >&2
+# Pick a Python 3 that RUNS, not one that merely EXISTS on PATH.
+#
+# On a stock Windows 10/11 machine, Git Bash finds `python3` (and often `python`)
+# in %LOCALAPPDATA%\Microsoft\WindowsApps. That is the Microsoft Store alias: it
+# prints "Python was not found; run without arguments to install from the
+# Microsoft Store..." and exits non-zero. Choosing by `command -v` alone picked
+# it, and then every commit was refused with the unity-hygiene message below,
+# blaming code for a missing interpreter. So each candidate has to execute a
+# line of Python 3 first. `py -3` is the python.org launcher, which Windows
+# installs even when neither name is on PATH. PY is deliberately left unquoted
+# where it is used, so `py -3` splits into the command and its flag.
+PY=""
+for Candidate in python3 python "py -3"; do
+    # shellcheck disable=SC2086
+    if $Candidate -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1; then
+        PY=$Candidate
+        break
+    fi
+done
+if [ -z "$PY" ]; then
+    echo "pre-commit: no working Python 3 (tried python3, python, py -3)." >&2
+    echo "pre-commit: SKIPPING the Config hygiene and unity-hygiene checks - this commit" >&2
+    echo "            has NOT been checked for the Windows unity-build break." >&2
+    echo "            On Windows: install Python 3 from python.org, or turn off the" >&2
+    echo "            python/python3 'App execution aliases' in Windows Settings." >&2
     exit 0
 fi
 
-if [ "$CONFIG_STAGED" = "1" ] && ! "$PY" "$ROOT/Scripts/config-hygiene.py" --check; then
+# shellcheck disable=SC2086
+if [ "$CONFIG_STAGED" = "1" ] && ! $PY "$ROOT/Scripts/config-hygiene.py" --check; then
     echo
     echo "pre-commit: refusing the commit - Config/*.ini carries editor noise."
     echo "  Fix it:      $PY Scripts/config-hygiene.py --fix && git add Config"
@@ -42,13 +63,16 @@ if [ "$CONFIG_STAGED" = "1" ] && ! "$PY" "$ROOT/Scripts/config-hygiene.py" --che
     exit 1
 fi
 
-# ---- unity hygiene: the Windows-only break a Mac build cannot see -----------
+# ---- unity hygiene: the Windows-only break a Mac build usually cannot see ---
 #
 # A `using namespace` at file scope leaks into every file compiled after it in
-# the same unity blob, and MSVC raises C4459 as an ERROR where clang on macOS is
-# silent. That has broken the Windows build twice. This check is mechanical and
-# runs on both machines, which is the part of the gap a Mac CAN close.
-if ! "$PY" "$ROOT/Scripts/unity-hygiene.py"; then
+# the same unity blob, and MSVC raises C4459 as an ERROR. clang on macOS reports
+# it only when the two files share a blob on the Mac too, and the grouping
+# differs between machines. That has broken the Windows build twice. This check
+# is mechanical and runs on both machines, which is the part of the gap a Mac
+# CAN close.
+# shellcheck disable=SC2086
+if ! $PY "$ROOT/Scripts/unity-hygiene.py"; then
     echo
     echo "pre-commit: refusing the commit - a new file-scope \`using namespace\` would"
     echo "            break the Windows build in a file nobody touched."
