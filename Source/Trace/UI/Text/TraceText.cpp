@@ -544,7 +544,7 @@ namespace TraceTextFile
 		return FEngineFontServices::Get().GetFontMeasure();
 	}
 
-	static float FallbackLineWidth(const FString& Line, float Size)
+	static float FallbackLineWidth(FStringView Line, float Size)
 	{
 		const TSharedPtr<FSlateFontMeasure> Measure = Measurer();
 		if (!Measure.IsValid())
@@ -557,16 +557,47 @@ namespace TraceTextFile
 			Measure->Measure(Line, TraceMenuArtStyle::MenuFont(Size), 1.f).X);
 	}
 
-	static void SplitLines(const FString& Text, TArray<FString>& OutLines)
+	/**
+	 * Calls @p Visit(FStringView Line, int32 LineIndex) for every '\n'-separated line of @p Text and
+	 * returns how many there were. P11: THE SAME LINES THE OLD SPLIT PRODUCED, WITHOUT COPYING THEM.
+	 *
+	 * This used to be FString::ParseIntoArray into a TArray<FString> — a heap array plus one string
+	 * per line, built up to four times per drawn string (layout, measure, and the blitter's re-measure),
+	 * on every string of every frame. The rule is unchanged: empty lines are kept, so "A\n" is two
+	 * lines, "\n" is two empty ones and "" is one empty line. Trace.Text.SelfTest runs the old split
+	 * beside this one (SelfTestLayout, at the bottom of this file) and requires identical results.
+	 */
+	template <typename FVisitor>
+	static int32 ForEachLine(const FString& Text, FVisitor&& Visit)
 	{
-		Text.ParseIntoArray(OutLines, TEXT("\n"), /*InCullEmpty=*/false);
-		if (OutLines.Num() == 0)
+		const TCHAR* const Chars = *Text;
+		const int32 Length = Text.Len();
+		int32 LineStart = 0;
+		int32 LineCount = 0;
+		for (int32 Index = 0; Index <= Length; ++Index)
 		{
-			OutLines.Add(FString());
+			if (Index == Length || Chars[Index] == TEXT('\n'))
+			{
+				Visit(FStringView(Chars + LineStart, Index - LineStart), LineCount);
+				++LineCount;
+				LineStart = Index + 1;
+			}
 		}
+		return LineCount;
 	}
 
-	static float AtlasLineWidth(const FString& Line, float Size, float Tracking, ETraceTextWeight Weight,
+	/** How many lines ForEachLine would visit, without visiting them. */
+	static int32 CountLines(const FString& Text)
+	{
+		int32 Breaks = 0;
+		for (const TCHAR Char : Text)
+		{
+			Breaks += (Char == TEXT('\n')) ? 1 : 0;
+		}
+		return Breaks + 1;
+	}
+
+	static float AtlasLineWidth(FStringView Line, float Size, float Tracking, ETraceTextWeight Weight,
 		bool bTabularDigits = false)
 	{
 		const Metrics::FFace& Face = EffectiveFace(Weight);
@@ -898,18 +929,15 @@ float TraceText::SizeForCapHeight(float InCapHeight, ETraceTextWeight Weight)
 
 float TraceText::MeasureWidth(const FString& Text, const FStyle& Style)
 {
-	TArray<FString> Lines;
-	TraceTextFile::SplitLines(Text, Lines);
-
 	const bool bAtlas = IsAtlasActive();
 	float Widest = 0.f;
-	for (const FString& Line : Lines)
+	TraceTextFile::ForEachLine(Text, [&Widest, &Style, bAtlas](FStringView Line, int32 /*LineIndex*/)
 	{
 		const float Width = bAtlas
 			? TraceTextFile::AtlasLineWidth(Line, Style.Size, Style.Tracking, Style.Weight, Style.bTabularDigits)
 			: TraceTextFile::FallbackLineWidth(Line, Style.Size);
 		Widest = FMath::Max(Widest, Width);
-	}
+	});
 	return Widest;
 }
 
@@ -920,9 +948,7 @@ float TraceText::MeasureWidth(const FString& Text, float Size)
 
 FVector2f TraceText::Measure(const FString& Text, const FStyle& Style)
 {
-	TArray<FString> Lines;
-	TraceTextFile::SplitLines(Text, Lines);
-	return FVector2f(MeasureWidth(Text, Style), LineHeight(Style.Size) * Lines.Num());
+	return FVector2f(MeasureWidth(Text, Style), LineHeight(Style.Size) * TraceTextFile::CountLines(Text));
 }
 
 // =================================================================================================
@@ -957,21 +983,41 @@ FVector2f TraceText::AlignOffset(const FVector2f& BlockSize, const FStyle& Style
 	return FVector2f(X, Y);
 }
 
-bool TraceText::LayoutString(const FString& Text, const FStyle& Style, TArray<FGlyphQuad>& OutQuads)
+bool TraceText::LayoutString(const FString& Text, const FStyle& Style, TArray<FGlyphQuad>& OutQuads,
+	float* OutBlockWidth)
 {
 	OutQuads.Reset();
+	if (OutBlockWidth != nullptr)
+	{
+		*OutBlockWidth = 0.f;
+	}
 
 	if (!IsAtlasActive() || Text.IsEmpty() || Style.Size <= 0.f)
 	{
 		return false;
 	}
 
-	TArray<FString> Lines;
-	TraceTextFile::SplitLines(Text, Lines);
+	// P11: EACH LINE IS MEASURED ONCE. The block width used to come from MeasureWidth() (a second
+	// split and a full measure) and then every line was measured AGAIN below to align it, and the
+	// Canvas blitter measured the whole string a third time for its return value. The widths are the
+	// same function of the same inputs, so remembering them changes no pixel.
+	TArray<float, TInlineAllocator<8>> LineWidths;
+	float BlockWidth = 0.f;
+	TraceTextFile::ForEachLine(Text, [&LineWidths, &BlockWidth, &Style](FStringView Line, int32 /*LineIndex*/)
+	{
+		const float Width = TraceTextFile::AtlasLineWidth(Line, Style.Size, Style.Tracking, Style.Weight,
+			Style.bTabularDigits);
+		LineWidths.Add(Width);
+		BlockWidth = FMath::Max(BlockWidth, Width);
+	});
+	if (OutBlockWidth != nullptr)
+	{
+		*OutBlockWidth = BlockWidth;
+	}
 
 	const float Scale = TraceTextFile::ScaleFor(Style.Size);
 	const float Height = LineHeight(Style.Size);
-	const FVector2f Block(MeasureWidth(Text, Style), Height * Lines.Num());
+	const FVector2f Block(BlockWidth, Height * LineWidths.Num());
 	const FVector2f Origin = AlignOffset(Block, Style, Style.Size);
 
 	// THE ONLY THING THE WEIGHT CHANGES. One face is picked here, once, and the loop below is the
@@ -992,15 +1038,12 @@ bool TraceText::LayoutString(const FString& Text, const FStyle& Style, TArray<FG
 
 	OutQuads.Reserve(Text.Len());
 
-	for (int32 LineIndex = 0; LineIndex < Lines.Num(); ++LineIndex)
+	TraceTextFile::ForEachLine(Text, [&](FStringView Line, int32 LineIndex)
 	{
-		const FString& Line = Lines[LineIndex];
-
 		// Every line is aligned inside the BLOCK, so a centred two-line label centres both lines
 		// rather than centring the longest and left-aligning the rest.
 		float PenX = Origin.X;
-		const float LineWidth = TraceTextFile::AtlasLineWidth(Line, Style.Size, Style.Tracking, Style.Weight,
-			Style.bTabularDigits);
+		const float LineWidth = LineWidths[LineIndex];
 		switch (Style.HAlign)
 		{
 		case EHAlign::Center: PenX += (Block.X - LineWidth) * 0.5f; break;
@@ -1037,7 +1080,204 @@ bool TraceText::LayoutString(const FString& Text, const FStyle& Style, TArray<FG
 
 			PenX += Glyph.Advance * Scale + Style.Tracking;
 		}
-	}
+	});
 
 	return true;
 }
+
+// =================================================================================================
+// P11 — THE FAST PATH, CHECKED AGAINST THE ALGORITHM IT REPLACED
+// =================================================================================================
+// MeasureWidth / Measure / LayoutString stopped copying every line into a TArray<FString> and
+// stopped measuring each line two or three times. That is only worth having if it changed NOTHING on
+// screen, so the pre-P11 algorithm is kept here verbatim as the reference, and Trace.Text.SelfTest
+// runs both over a corpus (empty lines, trailing breaks, tabs, Latin-1 fallback glyphs, digits) in
+// every weight, alignment, tracking and figure style, and requires bit-identical widths, block sizes
+// and quads. A later edit to the fast path that moves one glyph by a fraction of a pixel fails here.
+// Dev only.
+#if !UE_BUILD_SHIPPING
+namespace TraceTextFile
+{
+	/** Pre-P11 SplitLines. */
+	static void ReferenceSplitLines(const FString& Text, TArray<FString>& OutLines)
+	{
+		Text.ParseIntoArray(OutLines, TEXT("\n"), /*InCullEmpty=*/false);
+		if (OutLines.Num() == 0)
+		{
+			OutLines.Add(FString());
+		}
+	}
+
+	/** Pre-P11 TraceText::MeasureWidth. */
+	static float ReferenceMeasureWidth(const FString& Text, const TraceText::FStyle& Style)
+	{
+		TArray<FString> Lines;
+		ReferenceSplitLines(Text, Lines);
+
+		const bool bAtlas = TraceText::IsAtlasActive();
+		float Widest = 0.f;
+		for (const FString& Line : Lines)
+		{
+			const float Width = bAtlas
+				? AtlasLineWidth(Line, Style.Size, Style.Tracking, Style.Weight, Style.bTabularDigits)
+				: FallbackLineWidth(Line, Style.Size);
+			Widest = FMath::Max(Widest, Width);
+		}
+		return Widest;
+	}
+
+	/** Pre-P11 TraceText::LayoutString. */
+	static bool ReferenceLayoutString(const FString& Text, const TraceText::FStyle& Style,
+		TArray<TraceText::FGlyphQuad>& OutQuads)
+	{
+		OutQuads.Reset();
+		if (!TraceText::IsAtlasActive() || Text.IsEmpty() || Style.Size <= 0.f)
+		{
+			return false;
+		}
+
+		TArray<FString> Lines;
+		ReferenceSplitLines(Text, Lines);
+
+		const float Scale = ScaleFor(Style.Size);
+		const float Height = TraceText::LineHeight(Style.Size);
+		const FVector2f Block(ReferenceMeasureWidth(Text, Style), Height * Lines.Num());
+		const FVector2f Origin = TraceText::AlignOffset(Block, Style, Style.Size);
+
+		const Metrics::FFace& Face = EffectiveFace(Style.Weight);
+		const float AtlasW = static_cast<float>(Face.AtlasWidth);
+		const float AtlasH = static_cast<float>(Face.AtlasHeight);
+		const Metrics::FFace& Fallback = Metrics::FallbackFace;
+		const float FallbackW = static_cast<float>(Fallback.AtlasWidth);
+		const float FallbackH = static_cast<float>(Fallback.AtlasHeight);
+		const float FallbackLift = FallbackBaselineShift(Face) * Scale;
+
+		for (int32 LineIndex = 0; LineIndex < Lines.Num(); ++LineIndex)
+		{
+			const FString& Line = Lines[LineIndex];
+			float PenX = Origin.X;
+			const float LineWidth = AtlasLineWidth(Line, Style.Size, Style.Tracking, Style.Weight, Style.bTabularDigits);
+			switch (Style.HAlign)
+			{
+			case TraceText::EHAlign::Center: PenX += (Block.X - LineWidth) * 0.5f; break;
+			case TraceText::EHAlign::Right:  PenX += (Block.X - LineWidth);        break;
+			default:                                                               break;
+			}
+			const float PenY = Origin.Y + Height * LineIndex;
+
+			for (int32 CharIndex = 0; CharIndex < Line.Len(); ++CharIndex)
+			{
+				const FResolvedGlyph Glyph = ResolveGlyph(Face, Line[CharIndex], Style.bTabularDigits);
+				if (Glyph.Cell != nullptr)
+				{
+					const Metrics::FCell& Cell = *Glyph.Cell;
+					const float SheetW = Glyph.bFallback ? FallbackW : AtlasW;
+					const float SheetH = Glyph.bFallback ? FallbackH : AtlasH;
+
+					TraceText::FGlyphQuad& Quad = OutQuads.AddDefaulted_GetRef();
+					Quad.Pos = FVector2f(PenX + Glyph.Offset * Scale, PenY + (Glyph.bFallback ? FallbackLift : 0.f));
+					Quad.Size = FVector2f(Cell.USize * Scale, Cell.VSize * Scale);
+					Quad.UVMin = FVector2f(Cell.U / SheetW, Cell.V / SheetH);
+					Quad.UVSize = FVector2f(Cell.USize / SheetW, Cell.VSize / SheetH);
+					Quad.bFallback = Glyph.bFallback;
+				}
+				PenX += Glyph.Advance * Scale + Style.Tracking;
+			}
+		}
+		return true;
+	}
+
+	static bool SameQuad(const TraceText::FGlyphQuad& A, const TraceText::FGlyphQuad& B)
+	{
+		return A.Pos == B.Pos && A.Size == B.Size && A.UVMin == B.UVMin && A.UVSize == B.UVSize
+			&& A.bFallback == B.bFallback;
+	}
+}
+
+bool TraceText::SelfTestLayout(TArray<FString>& OutLines)
+{
+	OutLines.Reset();
+
+	if (!IsAtlasActive())
+	{
+		OutLines.Add(TEXT("--   the glyph atlas is not live, so the atlas layout cannot be compared (not run)"));
+		return true;
+	}
+
+	static const TCHAR* const Corpus[] =
+	{
+		TEXT(""), TEXT("A"), TEXT(" "), TEXT("PLAY"), TEXT("00:34"), TEXT("RESPAWN IN 10"),
+		TEXT("HOSTING  192.168.1.20:7777"), TEXT("VULNERABLE  x3  +35%"),
+		TEXT("FIRST LINE\nSECOND, LONGER LINE"), TEXT("TRAILING BREAK\n"), TEXT("\nLEADING BREAK"),
+		TEXT("\n"), TEXT("\n\n"), TEXT("A\n\nB"), TEXT("TAB\tSEPARATED"), TEXT("CR\r\nLF"),
+		TEXT("BJÖRN  ÉLAN"), TEXT("ZERO​WIDTH"), TEXT("CJK 漢 FALLS BACK"),
+	};
+	static const ETraceTextWeight Weights[] = { ETraceTextWeight::Light, ETraceTextWeight::Bold, ETraceTextWeight::Hud };
+	static const EHAlign HAligns[] = { EHAlign::Left, EHAlign::Center, EHAlign::Right };
+	static const EVAlign VAligns[] = { EVAlign::Top, EVAlign::Center, EVAlign::Bottom, EVAlign::Baseline, EVAlign::CapTop };
+	static const float Sizes[] = { 13.7f, 24.f, 41.f };
+	static const float Trackings[] = { 0.f, 2.5f, -1.f };
+
+	int32 Cases = 0;
+	int32 Failures = 0;
+	TArray<FGlyphQuad> Fast;
+	TArray<FGlyphQuad> Reference;
+
+	for (const TCHAR* const Raw : Corpus)
+	{
+		const FString Text(Raw);
+		for (const ETraceTextWeight Weight : Weights)
+		for (const EHAlign HAlign : HAligns)
+		for (const EVAlign VAlign : VAligns)
+		for (const float Size : Sizes)
+		for (const float Tracking : Trackings)
+		for (int32 Tabular = 0; Tabular < 2; ++Tabular)
+		{
+			FStyle Style(Size, FLinearColor::White, Weight);
+			Style.HAlign = HAlign;
+			Style.VAlign = VAlign;
+			Style.Tracking = Tracking;
+			Style.bTabularDigits = (Tabular != 0);
+			++Cases;
+
+			const float WantWidth = TraceTextFile::ReferenceMeasureWidth(Text, Style);
+			TArray<FString> RefLines;
+			TraceTextFile::ReferenceSplitLines(Text, RefLines);
+			const FVector2f WantBlock(WantWidth, LineHeight(Size) * RefLines.Num());
+			const bool bWantLaid = TraceTextFile::ReferenceLayoutString(Text, Style, Reference);
+
+			float GotBlockWidth = -1.f;
+			const float GotWidth = MeasureWidth(Text, Style);
+			const FVector2f GotBlock = Measure(Text, Style);
+			const bool bGotLaid = LayoutString(Text, Style, Fast, &GotBlockWidth);
+
+			bool bSame = (GotWidth == WantWidth) && (GotBlock == WantBlock) && (bGotLaid == bWantLaid)
+				&& (!bGotLaid || GotBlockWidth == WantWidth) && (Fast.Num() == Reference.Num());
+			for (int32 Index = 0; bSame && Index < Fast.Num(); ++Index)
+			{
+				bSame = TraceTextFile::SameQuad(Fast[Index], Reference[Index]);
+			}
+
+			if (!bSame)
+			{
+				++Failures;
+				if (Failures <= 5)
+				{
+					OutLines.Add(FString::Printf(
+						TEXT("FAIL \"%s\" weight %d halign %d valign %d size %.1f track %.1f tab %d: width %.6f vs %.6f, "
+						     "block %.6fx%.6f vs %.6fx%.6f, quads %d vs %d"),
+						*Text.ReplaceCharWithEscapedChar(), static_cast<int32>(Weight), static_cast<int32>(HAlign),
+						static_cast<int32>(VAlign), Size, Tracking, Tabular, GotWidth, WantWidth,
+						GotBlock.X, GotBlock.Y, WantBlock.X, WantBlock.Y, Fast.Num(), Reference.Num()));
+				}
+			}
+		}
+	}
+
+	OutLines.Add(FString::Printf(
+		TEXT("%-4s the allocation-free layout matches the pre-P11 algorithm bit for bit: %d of %d cases "
+		     "(widths, block sizes, every glyph quad)"),
+		(Failures == 0) ? TEXT("ok") : TEXT("FAIL"), Cases - Failures, Cases));
+	return Failures == 0;
+}
+#endif // !UE_BUILD_SHIPPING

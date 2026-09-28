@@ -103,7 +103,7 @@ Press `` ` `` in game for the console.
 | `Trace.Text.Dump` | Writes `Config/TraceGameText.ini` from every string the game has shown. **Keeps every line you have written exactly as you wrote it** (trailing spaces, empty values, even a line the game is refusing) and only adds lines for text that is new. |
 | `Trace.Text.Reload` | Re-reads the file without restarting. Edit, alt-tab, reload, look. |
 | `Trace.Text.Verify` | Checks the file against the game: lines that were ignored and why, keys that match nothing, strings on screen with no line in the file (a deleted line shows up here), lines you have emptied, and characters the typeface cannot draw. |
-| `Trace.Text.SelfTest` | Proves the safety rule (which edits are accepted and which are refused), that an empty value removes a line, and that a dump keeps every line as written. Needs no match. |
+| `Trace.Text.SelfTest` | Proves the safety rule (which edits are accepted and which are refused), that an empty value removes a line, that a dump keeps every line as written, that a reload reaches every screen already showing the line, and that text is laid out exactly as it was before the P11 speed-up. Needs no match. |
 
 Without the game: `python3 Scripts/dump-game-text.py` regenerates the file from the source code, with
 the same rules as `Trace.Text.Dump`. With `--check` it changes nothing and exits 1 if the file is out

@@ -121,9 +121,18 @@
 // =================================================================================================
 // COST
 // =================================================================================================
-// One hash lookup per string per draw, against a map that is built once. The HUD draws on the order
-// of a hundred strings a frame, so this is a few microseconds. Values are stored by the map and
-// returned by reference, so no string is copied and no allocation happens after load.
+// ONE LOOKUP PER CALL SITE PER PROCESS, then a pointer read. The HUD draws on the order of a hundred
+// strings a frame, so the per-call cost is multiplied by that every frame, and it used to be real:
+// P11 measured TraceGameText::Get at ~210 ns a call (Trace.Text.Bench) — it builds the key as an
+// FString, trims and upper-cases it (three heap allocations) and hashes it, on every draw, for a key
+// it had already registered. TRACE_TEXT now remembers its answer at the call site (FCallSite, below):
+// the first call registers and looks up exactly as before, and every later call returns the same
+// stored string. That cannot go stale, and it is the property the whole store was built for: the
+// entries never move, and a reload rewrites their words IN PLACE, so the remembered reference shows
+// the new wording on the very next draw. Trace.Text.SelfTest proves that on a live entry.
+//
+// A table-driven call (TraceGameText::Get with a key from a data row) still does the full lookup;
+// there is no call site to remember it at.
 // =================================================================================================
 
 #pragma once
@@ -262,6 +271,41 @@ namespace TraceGameText
 	 */
 	TRACE_API FString Format(const TCHAR* Key, const TCHAR* DefaultText,
 		const FStringFormatOrderedArguments& Args);
+
+	/** The formatting half alone, for a pattern already looked up: what TRACE_TEXTF expands to. */
+	TRACE_API FString FormatPattern(const FString& Pattern, const FStringFormatOrderedArguments& Args);
+
+	/**
+	 * Bumped by every LoadDocument (the first load and each Trace.Text.Reload). A cache of anything
+	 * DERIVED from the words — a measured width, a wrapped paragraph — keys on this so a reload
+	 * re-derives it. The words themselves need no such key: see FCallSite.
+	 */
+	TRACE_API uint32 GetGeneration();
+
+	/**
+	 * P11 — ONE TRACE_TEXT CALL SITE'S ANSWER, REMEMBERED.
+	 *
+	 * Every TRACE_TEXT expansion owns one of these as a function-local static. The first call asks
+	 * Get() — registering the key exactly as before — and keeps the address of the stored string;
+	 * every later call returns that string without touching the map. Safe for the life of the
+	 * process because Get()'s reference is (see Get: entries are only ever added, never moved, and a
+	 * reload rewrites the words in place). Constant-initialised, so the static costs no guard.
+	 *
+	 * Game thread only, like Get().
+	 */
+	struct FCallSite
+	{
+		const FString* Value = nullptr;
+	};
+
+	FORCEINLINE const FString& GetAt(FCallSite& Site, const TCHAR* Key, const TCHAR* DefaultText)
+	{
+		if (Site.Value == nullptr)
+		{
+			Site.Value = &Get(Key, DefaultText);
+		}
+		return *Site.Value;
+	}
 }
 
 /**
@@ -274,6 +318,10 @@ namespace TraceGameText
  * what lets Scripts/dump-game-text.py read the pair straight out of the source, and what stops
  * anybody passing a runtime-built key by accident, which would register a new entry every frame.
  *
+ * AND SO EACH EXPANSION CAN REMEMBER ITS ANSWER (P11). The macro is a lambda with its own
+ * FCallSite static: one lookup the first time the line runs, a pointer read every time after. The
+ * result is still `const FString&` into the store, so a reload still shows on the next draw.
+ *
  * THE ONE LEGITIMATE EXCEPTION IS A DATA TABLE, and it is worth naming because it costs something.
  * TraceUserSettings' crosshair palette carries the key in a column beside the wording, so its call
  * reads TraceGameText::Get(Stop.TextKey, Stop.Name) and there is no literal for a scanner to find.
@@ -281,7 +329,12 @@ namespace TraceGameText
  * SOURCE, only in one written from a RUNNING GAME (Trace.Text.Dump), because that is the only place
  * the key exists. The script counts them and says so rather than quietly writing a short file.
  */
-#define TRACE_TEXT(Key, Default) TraceGameText::Get(TEXT(Key), TEXT(Default))
+#define TRACE_TEXT(Key, Default) \
+	([]() -> const FString& \
+	{ \
+		static TraceGameText::FCallSite TraceGameTextSite; \
+		return TraceGameText::GetAt(TraceGameTextSite, TEXT(Key), TEXT(Default)); \
+	}())
 
 /**
  * The same, for a string with slots in it. The braced list is the arguments, in slot order.
@@ -292,4 +345,4 @@ namespace TraceGameText
  * Returns FString BY VALUE — it is a freshly composed string, unlike TRACE_TEXT which hands back a
  * reference to the stored one.
  */
-#define TRACE_TEXTF(Key, Default, ...) TraceGameText::Format(TEXT(Key), TEXT(Default), __VA_ARGS__)
+#define TRACE_TEXTF(Key, Default, ...) TraceGameText::FormatPattern(TRACE_TEXT(Key, Default), __VA_ARGS__)

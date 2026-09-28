@@ -45,6 +45,9 @@ namespace TraceGameTextFile
 	FString GLoadedPath;
 	bool bGLoaded = false;
 
+	/** See TraceGameText::GetGeneration. */
+	uint32 GGeneration = 0;
+
 	/** Set only while SelfTestDocument drives a deliberately refused line, so its log stays clean. */
 	bool bGQuietRefusals = false;
 
@@ -145,10 +148,36 @@ namespace TraceGameTextFile
 		Entry.bOverridden = true;
 	}
 
+	/** True when @p Key is already what NormaliseKey would make of it: no edge spaces, no lower case. */
+	bool IsNormalised(const TCHAR* Key)
+	{
+		if (Key == nullptr || *Key == TEXT('\0') || FChar::IsWhitespace(*Key))
+		{
+			return false;
+		}
+		const TCHAR* Last = Key;
+		for (const TCHAR* Char = Key; *Char != TEXT('\0'); ++Char)
+		{
+			if (FChar::IsLower(*Char))
+			{
+				return false;
+			}
+			Last = Char;
+		}
+		return !FChar::IsWhitespace(*Last);
+	}
+
 	FEntry& FindOrRegister(const TCHAR* Key, const TCHAR* DefaultText)
 	{
-		const FString KeyStr(Key);
-		const FString Normalised = NormaliseKey(KeyStr);
+		// ONE ALLOCATION FOR A KEY THAT IS ALREADY IN SHAPE, which is every literal key in the code:
+		// NormaliseKey's trim and upper-case each copied the string, on every call, to arrive at the
+		// string they started with. A key typed in lower case or with stray spaces still goes the
+		// long way and still lands on the same entry.
+		FString Normalised(Key);
+		if (!IsNormalised(Key))
+		{
+			Normalised = NormaliseKey(Normalised);
+		}
 
 		if (FEntry** Existing = GByKey.Find(Normalised))
 		{
@@ -156,7 +185,7 @@ namespace TraceGameTextFile
 		}
 
 		TUniquePtr<FEntry> Created = MakeUnique<FEntry>();
-		Created->Key = KeyStr;
+		Created->Key = Key;
 		Created->DefaultText = DefaultText;
 
 		FEntry* Raw = Created.Get();
@@ -348,6 +377,21 @@ FString Format(const TCHAR* Key, const TCHAR* DefaultText, const FStringFormatOr
 	return FString::Format(*Pattern, Args);
 }
 
+FString FormatPattern(const FString& Pattern, const FStringFormatOrderedArguments& Args)
+{
+	// Same rule as Format: a line the document removed stays removed.
+	if (Pattern.IsEmpty())
+	{
+		return FString();
+	}
+	return FString::Format(*Pattern, Args);
+}
+
+uint32 GetGeneration()
+{
+	return TraceGameTextFile::GGeneration;
+}
+
 FString GetDefaultDocumentPath()
 {
 	return FPaths::ConvertRelativePathToFull(
@@ -357,6 +401,7 @@ FString GetDefaultDocumentPath()
 void LoadDocument()
 {
 	TraceGameTextFile::bGLoaded = true;
+	++TraceGameTextFile::GGeneration;
 	TraceGameTextFile::GLoadedPath.Reset();
 	TraceGameTextFile::GUnmatchedDocumentKeys.Reset();
 	TraceGameTextFile::GRejectedOverrides.Reset();
@@ -672,6 +717,57 @@ bool SelfTestDocument(TArray<FString>& OutLines)
 	TraceGameTextFile::GDocument = SavedDocument;
 	TraceGameTextFile::GDocumentAsTyped = SavedAsTyped;
 	TraceGameTextFile::GRejectedOverrides = SavedRejected;
+
+	// ---- P11: A REMEMBERED CALL SITE SHOWS A RELOAD ----------------------------------------------
+	//
+	// TRACE_TEXT keeps the ADDRESS of the stored string at every call site (FCallSite) and never asks
+	// the map again. That is right only while a reload rewrites a live entry's words IN PLACE. This
+	// drives exactly that rewrite on a REAL registered entry, through the shipped apply step, and asks
+	// a call site that remembered the entry before it: a store that ever started moving or copying its
+	// strings fails here, instead of silently freezing every label in the game at its first wording.
+	// The entry is put back through the same apply step with the live document, so nothing changes.
+	{
+		FEntry* Live = nullptr;
+		for (const TUniquePtr<FEntry>& Entry : TraceGameTextFile::GEntries)
+		{
+			if (Entry.IsValid())
+			{
+				Live = Entry.Get();
+				break;
+			}
+		}
+
+		if (Live == nullptr)
+		{
+			OutLines.Add(TEXT("--   a remembered TRACE_TEXT call site shows a reload: nothing registered yet, not run"));
+		}
+		else
+		{
+			FCallSite Site;   // exactly what one TRACE_TEXT line holds
+			const FString Before = GetAt(Site, *Live->Key, *Live->DefaultText);
+
+			// Same slots as the default, so the rule accepts it on any key.
+			const FString Reworded = FString(TEXT("P11 SELFTEST REWORDED ")) + ExtractSlots(Live->DefaultText);
+			const FString Normalised = TraceGameTextFile::NormaliseKey(Live->Key);
+
+			TraceGameTextFile::GDocument.Add(Normalised, Reworded);
+			TraceGameTextFile::ApplyDocumentTo(*Live);
+			const FString AfterReload = GetAt(Site, *Live->Key, *Live->DefaultText);
+
+			TraceGameTextFile::GDocument = SavedDocument;
+			TraceGameTextFile::ApplyDocumentTo(*Live);
+			TraceGameTextFile::GRejectedOverrides = SavedRejected;
+			const FString AfterRestore = GetAt(Site, *Live->Key, *Live->DefaultText);
+
+			const bool bPass = AfterReload.Equals(Reworded, ESearchCase::CaseSensitive)
+				&& AfterRestore.Equals(Before, ESearchCase::CaseSensitive);
+			bAllPassed = bAllPassed && bPass;
+			OutLines.Add(FString::Printf(
+				TEXT("%-4s %-52s %s: \"%s\" -> reload -> \"%s\" -> restored \"%s\""),
+				bPass ? TEXT("ok") : TEXT("FAIL"), TEXT("a remembered TRACE_TEXT call site shows a reload"),
+				*Live->Key, *Before, *AfterReload, *AfterRestore));
+		}
+	}
 
 	return bAllPassed;
 }

@@ -100,8 +100,16 @@ namespace TraceCanvasTextFile
 			return 0.f;
 		}
 
-		TArray<TraceText::FGlyphQuad> Quads;
-		if (!TraceText::LayoutString(Text, Style, Quads))
+		// P11: ONE QUAD ARRAY FOR EVERY STRING, not a fresh heap array per string per frame. Canvas draws
+		// only ever run on the game thread; anything else (a loading-screen paint, say) gets its own.
+		static TArray<TraceText::FGlyphQuad> GameThreadQuads;
+		TArray<TraceText::FGlyphQuad> OtherThreadQuads;
+		TArray<TraceText::FGlyphQuad>& Quads = IsInGameThread() ? GameThreadQuads : OtherThreadQuads;
+
+		// The block width comes back from the same layout pass: it IS MeasureWidth(Text, Style), which
+		// this used to recompute from scratch for its return value.
+		float BlockWidth = 0.f;
+		if (!TraceText::LayoutString(Text, Style, Quads, &BlockWidth))
 		{
 			return 0.f;
 		}
@@ -130,7 +138,7 @@ namespace TraceCanvasTextFile
 			Surface->DrawItem(Tile);
 		}
 
-		return TraceText::MeasureWidth(Text, Style);
+		return BlockWidth;
 	}
 }
 

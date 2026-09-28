@@ -390,8 +390,12 @@ namespace TraceText
 	 * Quads are NOT guaranteed to come from one texture: a codepoint the style's face has no cell
 	 * for comes back flagged bFallback, addressing the Latin-1 sheet. Sample QuadTexture(), not
 	 * AtlasTexture(), for each one.
+	 *
+	 * @param OutBlockWidth  optional: the laid-out block's width, which is MeasureWidth(Text, Style)
+	 *                       for the same style — so a caller that wants both measures once (P11).
 	 */
-	TRACE_API bool LayoutString(const FString& Text, const FStyle& Style, TArray<FGlyphQuad>& OutQuads);
+	TRACE_API bool LayoutString(const FString& Text, const FStyle& Style, TArray<FGlyphQuad>& OutQuads,
+		float* OutBlockWidth = nullptr);
 
 	/**
 	 * The offset from the caller's (X, Y) to the top-left of the first line's line box, for the
@@ -399,4 +403,13 @@ namespace TraceText
 	 * applied to a font that knows nothing about this module.
 	 */
 	TRACE_API FVector2f AlignOffset(const FVector2f& BlockSize, const FStyle& Style, float Size);
+
+#if !UE_BUILD_SHIPPING
+	/**
+	 * P11: runs MeasureWidth / Measure / LayoutString against the pre-P11 algorithm (kept in
+	 * TraceText.cpp as the reference) over a corpus in every weight, alignment, tracking and figure
+	 * style, and requires bit-identical results. Trace.Text.SelfTest calls it. @return true on a match.
+	 */
+	TRACE_API bool SelfTestLayout(TArray<FString>& OutLines);
+#endif
 }

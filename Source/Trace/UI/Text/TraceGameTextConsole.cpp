@@ -226,6 +226,17 @@ namespace
 			}
 			Failures += bRoundTripOk ? 0 : 1;
 
+			// ---- P11: the text layout's fast path against the algorithm it replaced ---------------
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[GameText] ===== text layout: the fast path against the pre-P11 algorithm ====="));
+			TArray<FString> LayoutLines;
+			const bool bLayoutOk = TraceText::SelfTestLayout(LayoutLines);
+			for (const FString& ReportLine : LayoutLines)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[GameText]   %s"), *ReportLine);
+			}
+			Failures += bLayoutOk ? 0 : 1;
+
 			UE_LOG(LogTraceGame, Display, TEXT("[GameText] ===== %s ====="),
 				(Failures == 0) ? TEXT("PASS") : TEXT("*** FAIL ***"));
 		}));
@@ -410,6 +421,201 @@ namespace
 					? TEXT("PASS — the document and the game agree")
 					: TEXT("*** PROBLEMS FOUND *** — see the lines above"));
 		}));
+}
+
+// =================================================================================================
+// P11 — Trace.Text.Bench [passes]: what one string costs, lookup and measurement, in nanoseconds.
+//
+// THE NUMBERS THE PERFORMANCE PASS QUOTES, and the check that it changed nothing on screen. Every
+// Canvas screen asks the document for its words and TraceText for their widths on every frame, so
+// the per-call cost of those two is multiplied by a few hundred calls a frame. This times them over
+// REGISTERED keys (so it registers nothing) and a fixed corpus of HUD-shaped strings, and prints a
+// CHECKSUM of every width and every glyph quad: two builds whose checksums agree lay the corpus out
+// to the same pixel, which is what "faster, and nothing moved" has to mean.
+//
+// Named, not anonymous: this module is a unity build (Scripts/check-jumbo-build-collisions.py).
+// =================================================================================================
+namespace TraceGameTextBenchFile
+{
+	/** The corpus: short labels, clocks, a joined address, a status chip, two lines, a Latin-1 name. */
+	static const TCHAR* const Corpus[] =
+	{
+		TEXT("DASH"),
+		TEXT("PARRY"),
+		TEXT("00:34"),
+		TEXT("RESPAWN IN 3"),
+		TEXT("HOSTING  192.168.1.20:7777"),
+		TEXT("VULNERABLE  x3  +35%"),
+		TEXT("KEEPING YOUR TEAM IN 9"),
+		TEXT("PLAYER ONE > PLAYER TWO"),
+		TEXT("FIRST LINE\nSECOND, LONGER LINE"),
+		TEXT("TRAILING BREAK\n"),
+		TEXT("\n"),
+		TEXT("BJÖRN  ÉLAN"),
+		TEXT("TAB\tSEPARATED"),
+	};
+
+	static double NsPer(uint64 Cycles, int64 Calls)
+	{
+		return (Calls > 0) ? (FPlatformTime::ToSeconds64(Cycles) * 1.0e9 / static_cast<double>(Calls)) : 0.0;
+	}
+
+	static void Run(const TArray<FString>& Args)
+	{
+		const int32 Passes = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 1000000) : 2000;
+
+		// ---- 1. The document lookup ------------------------------------------------------------
+		//
+		// TraceGameText::Get with the key and default a call site passes: exactly what TRACE_TEXT
+		// expanded to before P11, and what a table-driven call (a data row carrying its key) still
+		// does today. Registered keys only, so the bench adds nothing to a later Trace.Text.Dump.
+		TArray<TraceGameText::FEntry> Entries;
+		TraceGameText::GetAllEntries(Entries);
+		const int32 KeyCount = FMath::Min(64, Entries.Num());
+
+		uint64 LookupCycles = 0;
+		int64 LookupCalls = 0;
+		int32 LookupSink = 0;
+		if (KeyCount > 0)
+		{
+			for (int32 Index = 0; Index < KeyCount; ++Index)
+			{
+				LookupSink += TraceGameText::Get(*Entries[Index].Key, *Entries[Index].DefaultText).Len();
+			}
+			const uint64 Start = FPlatformTime::Cycles64();
+			for (int32 Pass = 0; Pass < Passes; ++Pass)
+			{
+				for (int32 Index = 0; Index < KeyCount; ++Index)
+				{
+					LookupSink += TraceGameText::Get(*Entries[Index].Key, *Entries[Index].DefaultText).Len();
+				}
+			}
+			LookupCycles = FPlatformTime::Cycles64() - Start;
+			LookupCalls = static_cast<int64>(Passes) * KeyCount;
+		}
+
+		// The same keys through a remembered call site: what every TRACE_TEXT line does since P11
+		// (TraceGameText::FCallSite). The first pass fills the sites; the timed passes are the steady
+		// state a HUD frame sees.
+		uint64 SiteCycles = 0;
+		if (KeyCount > 0)
+		{
+			TArray<TraceGameText::FCallSite> Sites;
+			Sites.SetNum(KeyCount);
+			for (int32 Index = 0; Index < KeyCount; ++Index)
+			{
+				LookupSink += TraceGameText::GetAt(Sites[Index], *Entries[Index].Key, *Entries[Index].DefaultText).Len();
+			}
+			const uint64 SiteStart = FPlatformTime::Cycles64();
+			for (int32 Pass = 0; Pass < Passes; ++Pass)
+			{
+				for (int32 Index = 0; Index < KeyCount; ++Index)
+				{
+					LookupSink += TraceGameText::GetAt(Sites[Index], *Entries[Index].Key, *Entries[Index].DefaultText).Len();
+				}
+			}
+			SiteCycles = FPlatformTime::Cycles64() - SiteStart;
+		}
+
+		// ---- 2. Measuring and laying out the corpus, in the HUD's face ----------------------------
+		TraceText::FStyle Style(20.f, FLinearColor::White, ETraceTextWeight::Hud);
+		Style.HAlign = TraceText::EHAlign::Center;
+		TraceText::FStyle Tabular = Style;
+		Tabular.bTabularDigits = true;
+		Tabular.Tracking = 1.5f;
+		Tabular.HAlign = TraceText::EHAlign::Right;
+
+		const int32 CorpusCount = UE_ARRAY_COUNT(Corpus);
+		TArray<FString> Strings;
+		for (int32 Index = 0; Index < CorpusCount; ++Index)
+		{
+			Strings.Add(Corpus[Index]);
+		}
+
+		// The checksum first, from one untimed pass: every width, every quad's position, size, UVs and
+		// sheet, for both styles. Printed with the timings so a before/after pair can be diffed.
+		uint32 Checksum = 0;
+		float WidthSum = 0.f;
+		int32 QuadCount = 0;
+		TArray<TraceText::FGlyphQuad> Quads;
+		for (const TraceText::FStyle* Each : { &Style, &Tabular })
+		{
+			for (const FString& Text : Strings)
+			{
+				const float Width = TraceText::MeasureWidth(Text, *Each);
+				const FVector2f Block = TraceText::Measure(Text, *Each);
+				WidthSum += Width;
+				Checksum = HashCombine(Checksum, GetTypeHash(Width));
+				Checksum = HashCombine(Checksum, GetTypeHash(Block.X));
+				Checksum = HashCombine(Checksum, GetTypeHash(Block.Y));
+				const bool bLaidOut = TraceText::LayoutString(Text, *Each, Quads);
+				Checksum = HashCombine(Checksum, GetTypeHash(bLaidOut));
+				for (const TraceText::FGlyphQuad& Quad : Quads)
+				{
+					Checksum = HashCombine(Checksum, GetTypeHash(Quad.Pos.X));
+					Checksum = HashCombine(Checksum, GetTypeHash(Quad.Pos.Y));
+					Checksum = HashCombine(Checksum, GetTypeHash(Quad.Size.X));
+					Checksum = HashCombine(Checksum, GetTypeHash(Quad.Size.Y));
+					Checksum = HashCombine(Checksum, GetTypeHash(Quad.UVMin.X));
+					Checksum = HashCombine(Checksum, GetTypeHash(Quad.UVMin.Y));
+					Checksum = HashCombine(Checksum, GetTypeHash(Quad.UVSize.X));
+					Checksum = HashCombine(Checksum, GetTypeHash(Quad.UVSize.Y));
+					Checksum = HashCombine(Checksum, GetTypeHash(Quad.bFallback));
+				}
+				QuadCount += Quads.Num();
+			}
+		}
+
+		float MeasureSink = 0.f;
+		uint64 Start = FPlatformTime::Cycles64();
+		for (int32 Pass = 0; Pass < Passes; ++Pass)
+		{
+			for (const FString& Text : Strings)
+			{
+				MeasureSink += TraceText::MeasureWidth(Text, Style);
+			}
+		}
+		const uint64 MeasureCycles = FPlatformTime::Cycles64() - Start;
+
+		int32 LayoutSink = 0;
+		Start = FPlatformTime::Cycles64();
+		for (int32 Pass = 0; Pass < Passes; ++Pass)
+		{
+			for (const FString& Text : Strings)
+			{
+				TArray<TraceText::FGlyphQuad> PerCall;   // what the Canvas blitter did per string
+				TraceText::LayoutString(Text, Style, PerCall);
+				LayoutSink += PerCall.Num();
+			}
+		}
+		const uint64 LayoutCycles = FPlatformTime::Cycles64() - Start;
+		const int64 CorpusCalls = static_cast<int64>(Passes) * CorpusCount;
+
+		UE_LOG(LogTraceGame, Display, TEXT("[TextBench] ===== %d pass(es); atlas %s ====="),
+			Passes, TraceText::IsAtlasActive() ? TEXT("live") : TEXT("DOWN (Lato fallback)"));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TextBench]   document lookup, key+default (%d registered keys): %8.1f ns/call"),
+			KeyCount, NsPer(LookupCycles, LookupCalls));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TextBench]   document lookup through a TRACE_TEXT call site (P11):  %8.1f ns/call"),
+			NsPer(SiteCycles, LookupCalls));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TextBench]   MeasureWidth over the %d-string corpus:              %8.1f ns/call"),
+			CorpusCount, NsPer(MeasureCycles, CorpusCalls));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TextBench]   LayoutString over the corpus (fresh quad array):     %8.1f ns/call"),
+			NsPer(LayoutCycles, CorpusCalls));
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TextBench]   CHECKSUM %08x  (%d quads, width sum %.4f) - equal checksums lay the corpus out identically"),
+			Checksum, QuadCount, WidthSum);
+		UE_LOG(LogTraceGame, Verbose, TEXT("[TextBench] sinks %d %.1f %d"), LookupSink, MeasureSink, LayoutSink);
+	}
+
+	static FAutoConsoleCommand CmdBench(
+		TEXT("Trace.Text.Bench"),
+		TEXT("Trace.Text.Bench [passes]: nanoseconds per document lookup, per MeasureWidth and per "
+		     "LayoutString, plus a layout checksum for before/after comparison. Registers nothing. Dev only."),
+		FConsoleCommandWithArgsDelegate::CreateStatic(&Run));
 }
 
 #endif   // !UE_BUILD_SHIPPING
