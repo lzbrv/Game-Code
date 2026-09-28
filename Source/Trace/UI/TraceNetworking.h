@@ -138,6 +138,12 @@ namespace TraceNet
 	/**
 	 * Subscribes to UEngine::OnNetworkFailure and OnTravelFailure exactly once per process.
 	 *
+	 * A HOST is not told about a guest's dropped connection (ConnectionLost / ConnectionTimeout
+	 * raised against its own server driver): that is somebody else's connection, not a failure of
+	 * this machine, and it used to put "A PLAYER LEFT THE MATCH" in red over live play for 12 s.
+	 * ATraceGameMode::Logout announces every guest's leave in the kill feed instead — a clean leave
+	 * and a timeout alike — and names them.
+	 *
 	 * Bound to GEngine, which outlives every map, and never unbound: the handler captures nothing and
 	 * only writes to the static store below, so there is no lifetime to manage and nothing to leak.
 	 * That matters because a failed join DESTROYS the world that started it — the engine browses back
@@ -147,18 +153,30 @@ namespace TraceNet
 	TRACE_API void BindFailureHandlers();
 
 	/**
-	 * The last connection failure, if there was one recently.
+	 * The last connection failure, if there was one recently: its HEADLINE, the one line a player is
+	 * shown.
 	 *
 	 * Survives the travel back to the title screen, which is the whole reason it is a file-static and
 	 * not a member: by the time anything can draw the message, the world that failed is gone.
 	 *
+	 * There is deliberately no detail line to go with it. The engine's own error string ("CONNECTION
+	 * TIMEOUT: UNETCONNECTION::TICK: CONNECTION TIMED OUT. CLOSING CONNECTION.. ELAPSED: 20.02, ...")
+	 * used to be published here and every banner drew it, upper-cased, edge to edge. It is written
+	 * to the log at Error by ReportFailure, which is where the person reading a bug report looks.
+	 *
 	 * @param OutAgeSeconds  wall-clock seconds since it happened, so callers can fade it out.
 	 * @return false when nothing has failed this session.
 	 */
-	TRACE_API bool GetLastFailure(FString& OutHeadline, FString& OutDetail, double& OutAgeSeconds);
+	TRACE_API bool GetLastFailure(FString& OutHeadline, double& OutAgeSeconds);
 
-	/** Records a failure by hand — used for the ones the engine does not raise (e.g. a busy port). */
-	TRACE_API void ReportFailure(const FString& Headline, const FString& Detail);
+	/**
+	 * Records a failure by hand — used for the ones the engine does not raise (e.g. a busy port).
+	 *
+	 * @param Headline   what the player reads. Editable text (TRACE_TEXT), ASCII, one short line.
+	 * @param LogDetail  the engine's code and message, or anything else a programmer wants. Goes to
+	 *                   the log only; never to a screen.
+	 */
+	TRACE_API void ReportFailure(const FString& Headline, const FString& LogDetail = FString());
 
 	/** Forgets the last failure. Called when the player starts a fresh attempt. */
 	TRACE_API void ClearFailure();
@@ -186,9 +204,12 @@ namespace TraceNet
 	 * answers once per title screen. The title screen uses it to put the player back in the JOIN
 	 * prompt with the reason under the field instead of on PLAY under a banner.
 	 */
-	TRACE_API bool ConsumeFailedJoin(FString& OutHeadline, FString& OutDetail);
+	TRACE_API bool ConsumeFailedJoin(FString& OutHeadline);
 
-	/** Plain-English form of an engine failure code. "Connection timed out", not "ConnectionTimeout". */
+	/**
+	 * The player's line for an engine failure code: "NO RESPONSE FROM HOST", not "ConnectionTimeout".
+	 * Short, ASCII, one line — every banner draws it centred and unwrapped.
+	 */
 	TRACE_API FString DescribeNetworkFailure(ENetworkFailure::Type FailureType);
 	TRACE_API FString DescribeTravelFailure(ETravelFailure::Type FailureType);
 
@@ -267,7 +288,14 @@ namespace TraceNet
 	// NET 51920028, agree, connect — and then disagree about the replicated layout of the actor the
 	// client owns. Refusing at the handshake with a version message is a far better failure than a
 	// session that connects and then behaves inexplicably.
-	inline constexpr int32 NetProtocolVersion = 2;
+	//
+	// 2 -> 3: the replicated surface has moved three times since Demo 31 without a bump — the
+	// loadout (UTraceAbilityComponent's replicated Loadout and ServerRequestSetLoadout), the
+	// host-leaving notice (ATracePlayerController::ClientHostLeft, a new client RPC, which shifts the
+	// controller's RPC table), and the kill feed's LEFT row (ETraceKillIcon::Left, a value an older
+	// build would draw as a rifle round with nobody's name in front of it). A build from before any
+	// of those must be refused at the handshake with VERSION MISMATCH, not let in to disagree.
+	inline constexpr int32 NetProtocolVersion = 3;
 
 	/**
 	 * The exact string GetNetVersionChecksum() CRCs, e.g. "trace netproto 1, project 0.1.0".

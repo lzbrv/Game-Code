@@ -567,7 +567,7 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 	// nothing is listening on.
 	OutView.PortWarning = TraceNet::IsDefaultPortFreeCached()
 		? FString()
-		: FString(TRACE_TEXT("MENU.PORT_BUSY_WARNING", "PORT 7777 IS BUSY ON THIS MACHINE - THE HUD WILL SHOW THE REAL PORT IN-GAME"));
+		: TRACE_TEXTF("NET.PORT_BUSY", "PORT {0} BUSY - USING ANOTHER PORT", { TraceNet::DefaultPort });
 
 	// D30 — THE KEY LEGEND IS GONE, at the owner's request ("remove the text at the bottom: close
 	// trace, w/s..."). It read
@@ -605,18 +605,19 @@ void ATraceMenuHUD::BuildMenuView(FTraceTitleMenuView& OutView) const
 	// ---- Failure banner ---------------------------------------------------------------------------
 	{
 		FString Headline;
-		FString Detail;
 		double AgeSeconds = 0.0;
-		if (TraceNet::GetLastFailure(Headline, Detail, AgeSeconds))
+		if (TraceNet::GetLastFailure(Headline, AgeSeconds) && !Headline.IsEmpty())
 		{
 			// A minute is a long time for a banner, and it is deliberate: the failure that matters
 			// happens while the player is looking at a DIFFERENT screen.
+			//
+			// The headline only. The engine's error string is in the log and nowhere else (see
+			// TraceNet::GetLastFailure); an emptied line (Ranen's "KEY =") shows no banner at all.
 			constexpr double VisibleSeconds = 60.0;
 			if (AgeSeconds <= VisibleSeconds && !bModalOwnsScreen)
 			{
 				OutView.bFailureVisible = true;
 				OutView.FailureHeadline = Headline;
-				OutView.FailureDetail = Detail;
 				OutView.FailureFade = static_cast<float>(FMath::Clamp((VisibleSeconds - AgeSeconds) / 6.0, 0.0, 1.0));
 			}
 		}
@@ -744,16 +745,15 @@ void ATraceMenuHUD::BeginPlay()
 	// is shown there instead of the banner, not as well (the engine's code is still in the log).
 	{
 		FString FailedHeadline;
-		FString FailedDetail;
-		if (TraceNet::ConsumeFailedJoin(FailedHeadline, FailedDetail))
+		if (TraceNet::ConsumeFailedJoin(FailedHeadline))
 		{
 			Selected = ETraceMenuRow::Join;
 			OpenJoinPrompt();
 			JoinError = FailedHeadline;
 			JoinErrorText = JoinEntry.GetText();
 			TraceNet::ClearFailure();
-			UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] The last JOIN failed (%s | %s); the prompt is open again on '%s'."),
-				*FailedHeadline, *FailedDetail, *JoinEntry.GetText());
+			UE_LOG(LogTraceGame, Display, TEXT("[MenuInput] The last JOIN failed (%s; the engine's reason is the [Net] error above); the prompt is open again on '%s'."),
+				*FailedHeadline, *JoinEntry.GetText());
 		}
 	}
 
@@ -2646,21 +2646,22 @@ void ATraceMenuHUD::StartMatch()
 	//
 	// The in-match HUD is the authority and is already correct: TraceNet::DescribeConnection reads
 	// UNetDriver::LocalAddr, so the top-right chip shows the port that was actually bound.
+	//
+	// One line, the same one the title's address chip shows (NET.PORT_BUSY), and the HUD's HOSTING
+	// chip carries the real address in the match. The explanation is for the log.
 	const bool bPortFree = TraceNet::IsListenPortAvailable();
+	const FString PortBusyLine = TRACE_TEXTF("NET.PORT_BUSY", "PORT {0} BUSY - USING ANOTHER PORT", { TraceNet::DefaultPort });
 	if (!bPortFree)
 	{
-		TraceNet::ReportFailure(
-			TRACE_TEXTF("MENU.NET_PORT_BUSY_HEADLINE", "UDP {0} IS BUSY - HOSTING ON A DIFFERENT PORT",
-				{ TraceNet::DefaultPort }),
-			// ASCII only. These strings are drawn with the engine's built-in BITMAP fonts, whose
-			// glyph pages do not cover an em dash — it comes out as a box or as nothing at all.
-			TRACE_TEXT("MENU.NET_PORT_BUSY_DETAIL",
-				"ANOTHER COPY OF TRACE ALREADY HOLDS 7777. THE MATCH IS STILL JOINABLE, BUT THE ADDRESS TO SHARE IS THE ONE SHOWN TOP-RIGHT ON THE HUD - IT WILL NOT END IN 7777."));
+		TraceNet::ReportFailure(PortBusyLine,
+			FString::Printf(TEXT("UDP %d is held by another process; the listen server will bind the next free "
+				"port. The match is joinable at the address the HUD's HOSTING chip shows, not at :%d."),
+				TraceNet::DefaultPort, TraceNet::DefaultPort));
 	}
 
 	TravelCaption = bPortFree
 		? TRACE_TEXTF("MENU.TRAVEL_HOSTING_ON", "HOSTING ON {0}", { TraceNet::GetHostEndpoint() })
-		: FString(TRACE_TEXT("MENU.TRAVEL_PORT_BUSY", "PORT 7777 IS BUSY - CHECK THE HUD FOR THE REAL ADDRESS"));
+		: PortBusyLine;
 
 	UE_LOG(LogTraceGame, Display, TEXT("Title screen: PLAY -> %s?%s  hosting on %s, port %s"),
 		TraceMaps::Arena, *Options,
@@ -2702,7 +2703,8 @@ void ATraceMenuHUD::ConfirmJoin()
 	{
 		// Kept in the field rather than bounced back to the menu: an empty error that closes the
 		// prompt is how a player concludes the button does nothing.
-		JoinError = TRACE_TEXT("MENU.JOIN_ERROR_EMPTY_ADDRESS", "ENTER AN ADDRESS, e.g.  100.101.102.103:7777");
+		// The example address is the field's own placeholder, drawn right above this line.
+		JoinError = TRACE_TEXT("MENU.JOIN_ERROR_NO_ADDRESS", "ENTER AN ADDRESS");
 		JoinErrorText = Typed;
 		return;
 	}
@@ -2710,7 +2712,8 @@ void ATraceMenuHUD::ConfirmJoin()
 	APlayerController* PC = GetOwningPlayerController();
 	if (PC == nullptr)
 	{
-		JoinError = TRACE_TEXT("MENU.JOIN_ERROR_NO_LOCAL_PLAYER", "NO LOCAL PLAYER - CANNOT CONNECT");
+		UE_LOG(LogTraceGame, Error, TEXT("[MenuInput] JOIN refused: the title screen has no local player controller."));
+		JoinError = TRACE_TEXT("NET.ERROR_CONNECTION_FAILED", "CONNECTION FAILED");
 		JoinErrorText = Typed;
 		return;
 	}
@@ -3291,7 +3294,7 @@ void ATraceMenuHUD::DrawAddressChip()
 	// the ten minutes of confusion on the other end.
 	if (!TraceNet::IsDefaultPortFreeCached())
 	{
-		DrawTextCentered(TRACE_TEXT("MENU.PORT_BUSY_WARNING", "PORT 7777 IS BUSY ON THIS MACHINE - THE HUD WILL SHOW THE REAL PORT IN-GAME"),
+		DrawTextCentered(TRACE_TEXTF("NET.PORT_BUSY", "PORT {0} BUSY - USING ANOTHER PORT", { TraceNet::DefaultPort }),
 			TraceMenuArtStyle::AmberLifted(), CX, ChipY + ChipH + (4.f * UIScale), FontSmall, 0.95f * UIScale);
 	}
 }
@@ -3299,9 +3302,8 @@ void ATraceMenuHUD::DrawAddressChip()
 void ATraceMenuHUD::DrawFailureBanner()
 {
 	FString Headline;
-	FString Detail;
 	double AgeSeconds = 0.0;
-	if (!TraceNet::GetLastFailure(Headline, Detail, AgeSeconds))
+	if (!TraceNet::GetLastFailure(Headline, AgeSeconds) || Headline.IsEmpty())
 	{
 		return;
 	}
@@ -3321,17 +3323,18 @@ void ATraceMenuHUD::DrawFailureBanner()
 	// Amber, not a new red. This screen has exactly two hues and amber is already the one that means
 	// danger (see the palette note at the top of this file); introducing a third would cost more than
 	// the extra half-step of urgency is worth.
-	// Scales raised from 1.15 / 0.95 after reading a capture at 1280x720: the headline was a 9px
-	// strip and the engine failure code under it was genuinely unreadable. This is the one message
-	// on the screen that has to survive being photographed and pasted into a chat window.
+	// Scale raised from 1.15 after reading a capture at 1280x720: the headline was a 9px strip. This
+	// is the one message on the screen that has to survive being photographed and pasted into a chat.
+	//
+	// ONE LINE. The engine's own code and message used to be drawn under the headline, upper-cased and
+	// cut at 140 characters ("CONNECTIONTIMEOUT: UNETCONNECTION::TICK: ..."), edge to edge. It is in
+	// the log (TraceNet::ReportFailure), which is where the person a player sends it to will look.
 	const float HeadScale = 1.45f * UIScale;
-	const float DetailScale = 1.1f * UIScale;
 
 	const float BannerY = ViewH * 0.05f;
 	const float PadY = 11.f * UIScale;
 	const float HeadH = MeasureHeight(Headline, FontMedium, HeadScale);
-	const float DetailH = MeasureHeight(Detail, FontSmall, DetailScale);
-	const float BannerH = HeadH + DetailH + PadY * 2.f + (4.f * UIScale);
+	const float BannerH = HeadH + PadY * 2.f;
 
 	DrawRect(FLinearColor(0.18f, 0.05f, 0.00f, 0.90f * Fade), 0.f, BannerY, ViewW, BannerH);
 	DrawRect(TraceMenuStyle::WithAlpha(TraceMenuStyle::Amber, 0.85f * Fade), 0.f, BannerY, ViewW, FMath::Max(1.f, 2.f * UIScale));
@@ -3339,11 +3342,6 @@ void ATraceMenuHUD::DrawFailureBanner()
 
 	DrawTextCentered(Headline, TraceMenuStyle::WithAlpha(TraceMenuStyle::Amber, Fade),
 		ViewW * 0.5f, BannerY + PadY, FontMedium, HeadScale);
-
-	// The engine's own code and message, kept verbatim under the readable sentence. The player does
-	// not need it; the person they paste their log to does.
-	DrawTextCentered(Detail, TraceMenuStyle::WithAlpha(TraceMenuArtStyle::WordDefault, 0.8f * Fade),
-		ViewW * 0.5f, BannerY + PadY + HeadH + (4.f * UIScale), FontSmall, DetailScale);
 }
 
 void ATraceMenuHUD::DrawJoinPrompt()

@@ -349,7 +349,7 @@ ERole DescribeConnection(const UWorld* World, FString& OutEndpoint, FString& Out
 	OutEndpoint = TEXT("OFFLINE");
 	OutDetail = IsDefaultPortFreeCached()
 		? FString()
-		: TRACE_TEXTF("NET.STATUS_PORT_IN_USE", "UDP {0} IS IN USE BY ANOTHER PROCESS", { DefaultPort });
+		: TRACE_TEXTF("NET.STATUS_PORT_BUSY", "PORT {0} BUSY", { DefaultPort });
 
 	return ERole::Offline;
 }
@@ -364,7 +364,6 @@ ERole DescribeConnection(const UWorld* World, FString& OutEndpoint, FString& Out
 namespace
 {
 	FString LastFailureHeadline;
-	FString LastFailureDetail;
 	double LastFailureTime = -1.0;
 	bool bFailureHandlersBound = false;
 }
@@ -385,35 +384,30 @@ namespace TraceNetHostLeft
 	static constexpr double ShieldSeconds = 5.0;
 }
 
-void ReportFailure(const FString& Headline, const FString& Detail)
+void ReportFailure(const FString& Headline, const FString& LogDetail)
 {
+	// THE HEADLINE IS ALL A SCREEN GETS. The engine's own string used to be stored beside it and
+	// drawn under it on the title banner, the UMG banner and the in-match banner — upper-cased and
+	// cut at 140 characters, so a timeout read "CONNECTIONTIMEOUT: UNETCONNECTION::TICK: CONNECTION
+	// TIMED OUT. CLOSING CONNECTION.. ELAPSED: 20.02, REAL: 20.01, GOOD: 20.01, DRIVERTIME:..." edge
+	// to edge. It is for whoever reads the log, so the log line below is the only place it goes.
 	LastFailureHeadline = Headline;
-
-	// Truncated for the SCREEN only — the full string is in the log line below. Both banners centre
-	// a single unwrapped line, and an engine error string can be a couple of hundred characters of
-	// connection identifiers, which would run off both edges of the viewport.
-	constexpr int32 MaxDetailChars = 140;
-	LastFailureDetail = (Detail.Len() > MaxDetailChars)
-		? (Detail.Left(MaxDetailChars - 3) + TEXT("..."))
-		: Detail;
-
 	LastFailureTime = FPlatformTime::Seconds();
 
 	// Error, not Warning: this is always something the player asked for and did not get.
-	UE_LOG(LogTraceGame, Error, TEXT("[Net] %s — %s"), *Headline, *Detail);
+	UE_LOG(LogTraceGame, Error, TEXT("[Net] %s | %s"), *Headline, LogDetail.IsEmpty() ? TEXT("-") : *LogDetail);
 }
 
 void ClearFailure()
 {
 	LastFailureHeadline.Reset();
-	LastFailureDetail.Reset();
 	LastFailureTime = -1.0;
 	TraceNetHostLeft::NoticeTime = -1.0;
 }
 
 void ReportHostLeft()
 {
-	ReportFailure(TRACE_TEXT("NET.HOST_LEFT", "HOST LEFT"), FString());
+	ReportFailure(TRACE_TEXT("NET.HOST_LEFT", "HOST LEFT"), TEXT("the host said it was leaving the match"));
 	TraceNetHostLeft::NoticeTime = FPlatformTime::Seconds();
 }
 
@@ -442,7 +436,7 @@ void ForgetJoinAttempt()
 	TraceNetJoinAttempt::StartTime = -1.0;
 }
 
-bool ConsumeFailedJoin(FString& OutHeadline, FString& OutDetail)
+bool ConsumeFailedJoin(FString& OutHeadline)
 {
 	const double Started = TraceNetJoinAttempt::StartTime;
 	TraceNetJoinAttempt::StartTime = -1.0;
@@ -458,11 +452,10 @@ bool ConsumeFailedJoin(FString& OutHeadline, FString& OutDetail)
 	}
 
 	OutHeadline = LastFailureHeadline;
-	OutDetail = LastFailureDetail;
 	return true;
 }
 
-bool GetLastFailure(FString& OutHeadline, FString& OutDetail, double& OutAgeSeconds)
+bool GetLastFailure(FString& OutHeadline, double& OutAgeSeconds)
 {
 	if (LastFailureTime < 0.0)
 	{
@@ -470,47 +463,40 @@ bool GetLastFailure(FString& OutHeadline, FString& OutDetail, double& OutAgeSeco
 	}
 
 	OutHeadline = LastFailureHeadline;
-	OutDetail = LastFailureDetail;
 	OutAgeSeconds = FPlatformTime::Seconds() - LastFailureTime;
 	return true;
 }
 
+// THE PLAYER'S LINES. Labels, not sentences: one short ASCII line each, because every banner and the
+// JOIN prompt draw it centred and unwrapped in the kit's typeface (which has no em dash). The engine's
+// own code and message go to the log with it (ReportFailure), so nothing a programmer needs is lost by
+// keeping this short. Several codes share one line where a player could not act on the difference:
+// every "the two builds disagree" code reads VERSION MISMATCH with this build's NET code, which is on
+// the title screen of every build, bottom right, for comparing with the host's.
 FString DescribeNetworkFailure(ENetworkFailure::Type FailureType)
 {
 	switch (FailureType)
 	{
 	case ENetworkFailure::NetDriverAlreadyExists:
-		return TRACE_TEXT("NET.FAIL_DRIVER_ALREADY_EXISTS", "A NET DRIVER IS ALREADY RUNNING. RESTART THE GAME.");
 	case ENetworkFailure::NetDriverCreateFailure:
-		return TRACE_TEXT("NET.FAIL_DRIVER_CREATE", "COULD NOT CREATE A NET DRIVER.");
+		return TRACE_TEXT("NET.ERROR_RESTART", "NETWORK ERROR - RESTART THE GAME");
 	case ENetworkFailure::NetDriverListenFailure:
-		return TRACE_TEXTF("NET.FAIL_LISTEN", "COULD NOT LISTEN ON UDP {0}. ANOTHER COPY MAY ALREADY BE HOSTING.", { DefaultPort });
+		return TRACE_TEXTF("NET.ERROR_CANT_HOST", "CAN'T HOST ON PORT {0}", { DefaultPort });
 	case ENetworkFailure::ConnectionLost:
-		return TRACE_TEXT("NET.FAIL_CONNECTION_LOST", "CONNECTION LOST.");
+		return TRACE_TEXT("NET.ERROR_CONNECTION_LOST", "CONNECTION LOST");
 	case ENetworkFailure::ConnectionTimeout:
-		return TRACE_TEXT("NET.FAIL_TIMEOUT", "CONNECTION TIMED OUT. CHECK THE ADDRESS, THE VPN, AND UDP 7777 ON THE HOST.");
+		return TRACE_TEXT("NET.ERROR_NO_RESPONSE", "NO RESPONSE FROM HOST");
 	case ENetworkFailure::FailureReceived:
-		return TRACE_TEXT("NET.FAIL_REFUSED", "THE SERVER REFUSED THE CONNECTION.");
-	// THE FOUR VERSION-MISMATCH CODES NAME THE CHECK, because "different builds" is true and useless:
-	// it does not say what to compare or where to look. The NET code is on the title screen of every
-	// build, bottom-right, so the instruction is one a player can actually carry out.
+		return TRACE_TEXT("NET.ERROR_REFUSED", "HOST REFUSED THE CONNECTION");
 	case ENetworkFailure::OutdatedClient:
-		return TRACE_TEXTF("NET.FAIL_BUILD_MISMATCH_CLIENT",
-			"BUILD MISMATCH. YOURS IS {0} — COMPARE IT WITH THE HOST'S (TITLE SCREEN, BOTTOM RIGHT).",
-			{ GetNetVersionLabel() });
 	case ENetworkFailure::OutdatedServer:
-		return TRACE_TEXTF("NET.FAIL_BUILD_MISMATCH_SERVER",
-			"BUILD MISMATCH. YOURS IS {0} — THE HOST'S TITLE SCREEN MUST SHOW THE SAME CODE.",
-			{ GetNetVersionLabel() });
-	case ENetworkFailure::PendingConnectionFailure:
-		return TRACE_TEXT("NET.FAIL_UNREACHABLE", "COULD NOT REACH THAT ADDRESS.");
 	case ENetworkFailure::NetGuidMismatch:
 	case ENetworkFailure::NetChecksumMismatch:
-		return TRACE_TEXTF("NET.FAIL_DIFFERENT_BUILDS_CHECKSUM",
-			"CLIENT AND SERVER ARE RUNNING DIFFERENT BUILDS. YOURS IS {0}.",
-			{ GetNetVersionLabel() });
+		return TRACE_TEXTF("NET.ERROR_VERSION_MISMATCH", "VERSION MISMATCH - YOURS IS {0}", { GetNetVersionLabel() });
+	case ENetworkFailure::PendingConnectionFailure:
+		return TRACE_TEXT("NET.ERROR_CANT_REACH_HOST", "CAN'T REACH HOST");
 	default:
-		return TRACE_TEXT("NET.FAIL_GENERIC", "THE CONNECTION FAILED.");
+		return TRACE_TEXT("NET.ERROR_CONNECTION_FAILED", "CONNECTION FAILED");
 	}
 }
 
@@ -518,26 +504,23 @@ FString DescribeTravelFailure(ETravelFailure::Type FailureType)
 {
 	switch (FailureType)
 	{
-	case ETravelFailure::NoLevel:
-	case ETravelFailure::LoadMapFailure:
-		return TRACE_TEXT("NET.TRAVEL_FAIL_MAP_LOAD", "THE SERVER'S MAP COULD NOT BE LOADED.");
 	case ETravelFailure::InvalidURL:
-		return TRACE_TEXT("NET.TRAVEL_FAIL_INVALID_URL", "THAT ADDRESS IS NOT VALID. USE  <ip>:7777.");
+		return TRACE_TEXT("NET.ERROR_INVALID_ADDRESS", "INVALID ADDRESS");
 	case ETravelFailure::PackageMissing:
 	case ETravelFailure::NoDownload:
-		return TRACE_TEXT("NET.TRAVEL_FAIL_MISSING_CONTENT", "THE SERVER IS RUNNING CONTENT THIS BUILD DOES NOT HAVE.");
 	case ETravelFailure::PackageVersion:
-		return TRACE_TEXT("NET.TRAVEL_FAIL_DIFFERENT_BUILDS", "CLIENT AND SERVER ARE RUNNING DIFFERENT BUILDS.");
+		return TRACE_TEXTF("NET.ERROR_VERSION_MISMATCH", "VERSION MISMATCH - YOURS IS {0}", { GetNetVersionLabel() });
 	case ETravelFailure::PendingNetGameCreateFailure:
-		return TRACE_TEXT("NET.TRAVEL_FAIL_START_CONNECTION", "COULD NOT START THE CONNECTION.");
+		return TRACE_TEXT("NET.ERROR_CONNECTION_FAILED", "CONNECTION FAILED");
 	case ETravelFailure::ServerTravelFailure:
-		return TRACE_TEXT("NET.TRAVEL_FAIL_SERVER_MAP_CHANGE", "THE SERVER FAILED TO CHANGE MAP.");
 	case ETravelFailure::ClientTravelFailure:
-		return TRACE_TEXT("NET.TRAVEL_FAIL_CLIENT_FOLLOW", "THIS CLIENT FAILED TO FOLLOW THE SERVER.");
+		return TRACE_TEXT("NET.ERROR_MAP_CHANGE", "MAP CHANGE FAILED");
 	case ETravelFailure::CheatCommands:
-		return TRACE_TEXT("NET.TRAVEL_FAIL_CHEATS", "TRAVEL IS DISABLED BECAUSE CHEAT COMMANDS WERE USED.");
+		return TRACE_TEXT("NET.ERROR_CHEATS", "CHEATS USED - RESTART THE GAME");
+	case ETravelFailure::NoLevel:
+	case ETravelFailure::LoadMapFailure:
 	default:
-		return TRACE_TEXT("NET.TRAVEL_FAIL_GENERIC", "TRAVEL FAILED.");
+		return TRACE_TEXT("NET.ERROR_MAP_LOAD", "MAP FAILED TO LOAD");
 	}
 }
 
@@ -557,15 +540,27 @@ void BindFailureHandlers()
 		{
 			// A dropped connection means two completely different things depending on which end you
 			// are. On the CLIENT it means "you have been disconnected" and is alarming. On the SERVER
-			// the engine raises the same code when a remote player times out — telling the host
-			// "CONNECTION LOST" for somebody else's wifi would be actively misleading, and after a
-			// pass spent making failures visible, a false alarm is the fastest way to teach people to
-			// ignore the banner.
+			// the engine raises the same code when a remote player times out — somebody else's wifi,
+			// not a failure of this machine.
 			//
 			// ServerConnection is non-null only on a client, so its absence identifies the server.
 			const bool bWeAreTheServer = (FailedDriver != nullptr) && (FailedDriver->ServerConnection == nullptr);
 			const bool bPeerDropped =
 				(FailureType == ENetworkFailure::ConnectionLost) || (FailureType == ENetworkFailure::ConnectionTimeout);
+
+			// SO THE HOST GETS NO BANNER FOR IT. It used to: "A PLAYER LEFT THE MATCH" in red, centred
+			// over live play for 12 s, naming nobody, with the engine's timeout line under it — and
+			// again on the title screen for a minute if the host went back there. Worse, a guest who
+			// left CLEANLY (RETURN TO TITLE) raised nothing at all, so the two ways of leaving looked
+			// different. Both now reach ATraceGameMode::Logout, which puts "<NAME> LEFT" in the kill
+			// feed; this is only the engine's side of the story, for the log.
+			if (bWeAreTheServer && bPeerDropped)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[Net] A guest's connection dropped (%s%s%s). No banner: the kill feed names who left."),
+					ENetworkFailure::ToString(FailureType), ErrorString.IsEmpty() ? TEXT("") : TEXT(": "), *ErrorString);
+				return;
+			}
 
 			// The host has just TOLD this guest it is leaving (ReportHostLeft). The connection failure
 			// its departure raises a moment later is the consequence, not the news: keep HOST LEFT.
@@ -578,14 +573,10 @@ void BindFailureHandlers()
 				return;
 			}
 
-			const FString Headline = (bWeAreTheServer && bPeerDropped)
-				? TRACE_TEXT("NET.FAIL_PEER_LEFT", "A PLAYER LEFT THE MATCH")
-				: DescribeNetworkFailure(FailureType);
-
 			// The engine's own ErrorString is often empty and, when it is not, is aimed at a
-			// programmer ("UNetConnection::Tick: Connection TIMED OUT"). Keep both: the readable
-			// sentence for the player, the raw code for the log and the bug report.
-			ReportFailure(Headline,
+			// programmer ("UNetConnection::Tick: Connection TIMED OUT"). The player gets the short
+			// line; the raw code goes to the log for the bug report, and nowhere else.
+			ReportFailure(DescribeNetworkFailure(FailureType),
 				FString::Printf(TEXT("%s%s%s"),
 					ENetworkFailure::ToString(FailureType),
 					ErrorString.IsEmpty() ? TEXT("") : TEXT(": "),

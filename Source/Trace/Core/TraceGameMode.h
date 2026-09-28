@@ -1037,6 +1037,13 @@ private:
 	 */
 	TSet<TWeakObjectPtr<AController>> LogoutsInFlight;
 
+	/**
+	 * SendRemoteClientsHome has sent the guests to the title: the host is leaving (or the match is
+	 * over) and travels next. Their Logouts are then the server's own doing, not news, so no
+	 * "<NAME> LEFT" row is announced for them. Never reset: this GameMode is gone after the travel.
+	 */
+	bool bSendingGuestsHome = false;
+
 	/** Monotonic, so two bots never share a scoreboard name even after churn. */
 	int32 NextBotNumber = 1;
 

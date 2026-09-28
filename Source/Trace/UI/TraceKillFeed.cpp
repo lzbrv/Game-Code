@@ -127,6 +127,7 @@ namespace TraceKillFeedCauses
 		case ETraceKillIcon::Backstab: return TEXT("BACKSTAB");
 		case ETraceKillIcon::Ability:  return TEXT("ROCKET");
 		case ETraceKillIcon::Smg:      return TEXT("SMG");
+		case ETraceKillIcon::Left:     return TEXT("LEFT");
 		default:                       return TEXT("BULLET");
 		}
 	}
@@ -473,6 +474,27 @@ void ATraceKillFeedRelay::ServerAnnounceKill(FTraceKillFeedEntry Entry)
 	// guarantees the listen server's own HUD is fed by the same function a remote client's is,
 	// rather than by a privileged branch that nobody would notice had rotted.
 	OnRep_Entries();
+}
+
+void ATraceKillFeedRelay::ServerAnnounceLeave(const APlayerState* Leaver)
+{
+	if (!HasAuthority() || Leaver == nullptr || Leaver->IsABot())
+	{
+		return;
+	}
+
+	FTraceKillFeedEntry Entry;
+	Entry.Icon = ETraceKillIcon::Left;
+	Entry.bHasKiller = false;
+	Entry.VictimName = Leaver->GetPlayerName();
+	Entry.VictimPlayerId = Leaver->GetPlayerId();
+	if (const ATracePlayerState* const TraceLeaver = Cast<ATracePlayerState>(Leaver))
+	{
+		Entry.VictimTeam = TraceLeaver->Team;
+	}
+
+	UE_LOG(LogTraceGame, Display, TEXT("[KillFeed] '%s' left the match; the feed says so."), *Entry.VictimName);
+	ServerAnnounceKill(Entry);
 }
 
 void ATraceKillFeedRelay::OnRep_Entries()

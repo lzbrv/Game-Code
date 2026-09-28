@@ -84,6 +84,7 @@
 #include "TraceKillFeed.generated.h"
 
 class AController;
+class APlayerState;
 class ATraceCharacter;
 class UTraceHealthComponent;
 class UWorld;
@@ -127,7 +128,15 @@ enum class ETraceKillIcon : uint8
 	 * as the shot. A second gun deserved a second glyph for the same reason the rocket got one:
 	 * "which weapon beat me" is the feed's whole answer.
 	 */
-	Smg = 8
+	Smg = 8,
+	/**
+	 * NOT A DEATH: a human guest left the match (ATraceGameMode::Logout), cleanly or by timing out.
+	 * No glyph and no killer — the row reads "<NAME> LEFT". It rides the kill feed because the feed
+	 * is already the one replicated, late-joiner-safe, every-machine list of "who just stopped being
+	 * in this fight", and a leave used to be announced nowhere (a timeout put an anonymous red banner
+	 * on the host only; a clean leave said nothing at all).
+	 */
+	Left = 9
 };
 
 /**
@@ -268,6 +277,12 @@ public:
 	 * itself here rather than growing a second path.
 	 */
 	void ServerAnnounceKill(FTraceKillFeedEntry Entry);
+
+	/**
+	 * Server: publish "<NAME> LEFT" for a human who is leaving the match (ETraceKillIcon::Left).
+	 * Refuses bots and a null state. Called from ATraceGameMode::Logout for remote guests only.
+	 */
+	void ServerAnnounceLeave(const APlayerState* Leaver);
 
 	/** Bound to every character's UTraceHealthComponent::OnDeath on the server. */
 	UFUNCTION()

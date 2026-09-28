@@ -45,10 +45,13 @@ A failed connection used to be completely silent, which is why the Demo 5 report
 broken VPN from a broken game. Now:
 
 - The travel screen names what it is doing — `CONNECTING TO 100.101.102.103:7777`.
-- On failure the game returns to the title screen with an amber banner across the top giving the
-  reason in plain English (`CONNECTION TIMED OUT. CHECK THE ADDRESS, THE VPN, AND UDP 7777 ON THE
-  HOST.`) plus the engine's own failure code underneath for the bug report.
-- Mid-match disconnects raise the same banner over the HUD.
+- On failure the game returns to the title screen with the reason as one short line (`NO RESPONSE
+  FROM HOST`): a failed JOIN reopens the JOIN prompt with it under the address, anything else shows
+  it in an amber banner across the top. The engine's own failure code and message go to the log
+  (`[Net] <line> | <engine code>: <engine message>`), for the bug report, and never to the screen.
+- Your own connection failing mid-match shows the same line on a banner over the HUD. A GUEST
+  dropping or leaving is not the host's failure: it raises no banner, and every screen's kill feed
+  says `<NAME> LEFT` instead (clean leave and timeout alike).
 - If UDP 7777 is already held by another process, you are warned on the title screen *and* before
   travelling. **The port moves — hosting does not fail.** Measured: with a second copy of the game
   already on 7777, `UIpNetDriver` binds the next free port instead and logs
@@ -71,7 +74,7 @@ broken VPN from a broken game. Now:
 - **Windows**: allow the same binaries on Private networks in Windows Defender Firewall.
 - **Over Tailscale** this is usually all you need — no port forwarding, no router config. See §4.
 - Symptom of a blocked port: the client sits on `CONNECTING TO …` and then reports
-  `CONNECTION TIMED OUT`. The host's log shows nothing at all, because nothing ever arrived.
+  `NO RESPONSE FROM HOST`. The host's log shows nothing at all, because nothing ever arrived.
 
 ### Checking it worked
 

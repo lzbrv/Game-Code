@@ -5408,9 +5408,8 @@ void ATraceHUD::DrawNetworkStatus()
 void ATraceHUD::DrawNetworkFailureBanner()
 {
 	FString Headline;
-	FString Detail;
 	double AgeSeconds = 0.0;
-	if (!TraceNet::GetLastFailure(Headline, Detail, AgeSeconds))
+	if (!TraceNet::GetLastFailure(Headline, AgeSeconds) || Headline.IsEmpty())
 	{
 		return;
 	}
@@ -5422,27 +5421,41 @@ void ATraceHUD::DrawNetworkFailureBanner()
 	{
 		return;
 	}
+
+	// Nothing of the match draws under a screen that owns the view (IsFullScreenOverlayUp).
+	if (IsFullScreenOverlayUp())
+	{
+		return;
+	}
 	const float Fade = static_cast<float>(FMath::Clamp((VisibleSeconds - AgeSeconds) / 2.0, 0.0, 1.0));
 
+	// ON THE KIT, AND ONE LINE. This was a flat red rect with a red hairline — the last pre-kit panel
+	// in the match HUD — carrying the headline in red and, under it, the engine's own error string
+	// ("CONNECTIONTIMEOUT: UNETCONNECTION::TICK: CONNECTION TIMED OUT. CLOSING CONNECTION.. ELAPSED:
+	// ..."), which is log-only now (TraceNet::ReportFailure). The plate is the kit's amber-ringed
+	// "this is about you" panel, the same one a kill-feed row about you wears, with the line in white.
+	//
+	// It is also rarely the host's any more: a guest dropping raises no failure on the host at all
+	// (the kill feed says "<NAME> LEFT"), so what reaches this banner is this machine's own trouble.
 	const float CX = ViewW * 0.5f;
 	const float Y = ViewH * 0.16f;
 	const float HeadScale = 1.2f * UIScale;
 
 	const float HeadW = MeasureWidth(Headline, FontMedium, HeadScale);
 	const float HeadH = MeasureHeight(Headline, FontMedium, HeadScale);
-	const float DetailH = MeasureHeight(Detail, FontSmall, UIScale);
-	const float PadX = 20.f * UIScale;
-	const float PadY = 10.f * UIScale;
+	const float PadX = 22.f * UIScale;
+	const float PadY = 12.f * UIScale;
 
-	const float PanelW = FMath::Max(HeadW, MeasureWidth(Detail, FontSmall, UIScale)) + PadX * 2.f;
-	const float PanelH = HeadH + DetailH + PadY * 2.f;
+	const float PanelW = HeadW + PadX * 2.f;
+	const float PanelH = HeadH + PadY * 2.f;
 
-	DrawPanel(CX - PanelW * 0.5f, Y, PanelW, PanelH,
-		FLinearColor(0.20f, 0.03f, 0.02f, 0.88f * Fade),
-		TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, 0.75f * Fade));
+	DrawKitPanel(CX - PanelW * 0.5f, Y, PanelW, PanelH, TraceHUDStyle::PanelAlpha * Fade, /*bAboutYou=*/true);
+	DrawTextCentered(Headline, TraceHUDStyle::WithAlpha(TraceHUDStyle::Ink, Fade), CX, Y + PadY, FontMedium, HeadScale);
 
-	DrawTextCentered(Headline, TraceHUDStyle::WithAlpha(TraceHUDStyle::Danger, Fade), CX, Y + PadY, FontMedium, HeadScale);
-	DrawTextCentered(Detail, TraceHUDStyle::WithAlpha(TraceHUDStyle::InkDim, Fade), CX, Y + PadY + HeadH, FontSmall, UIScale);
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.bNetFailurePanel = true;
+	HudKitRecord.NetFailureLines.Add(Headline);
+#endif
 }
 
 // -------------------------------------------------------------------------------------------
@@ -5781,6 +5794,11 @@ void ATraceHUD::DrawKillFeed()
 	float RowY = DrawnKillFeedTopY + TraceKillFeedArt::GapUnderPanel * UIScale;
 	int32 Drawn = 0;
 
+	// A LEAVE ROW ("<NAME> LEFT", ATraceGameMode::Logout) has no killer and no glyph: the name in its
+	// team's colour, then the verb in the kit's caption grey. Removing the verb's line (Ranen's
+	// "KEY =") removes the rows themselves rather than leaving a bare name that reads like a death.
+	const FString& LeftVerb = TRACE_TEXT("HUD.FEED_LEFT", "LEFT");
+
 	// A NEW ROW SLIDES IN. Rows are newest-first, so a kill used to push every row down one row in a
 	// single frame. For its first KillFeedEnterSeconds the newest row fades in and the stack starts one
 	// row-pitch higher, gliding down into place.
@@ -5817,6 +5835,12 @@ void ATraceHUD::DrawKillFeed()
 		}
 
 		const float FadeStart = ATraceKillFeedRelay::EntryLifetime - ATraceKillFeedRelay::EntryFadeTime;
+		const bool bLeaveRow = (Entry.Icon == ETraceKillIcon::Left);
+		if (bLeaveRow && LeftVerb.IsEmpty())
+		{
+			continue;
+		}
+
 		const float Alpha = ((Age <= FadeStart)
 			? 1.f
 			: FMath::Clamp(1.f - (Age - FadeStart) / ATraceKillFeedRelay::EntryFadeTime, 0.f, 1.f))
@@ -5828,8 +5852,12 @@ void ATraceHUD::DrawKillFeed()
 		const float KillerW = Entry.bHasKiller ? MeasureWidth(KillerText, FontSmall, NameScale) : 0.f;
 		const float VictimW = MeasureWidth(VictimText, FontSmall, NameScale);
 		const float TextH = MeasureHeight(VictimText, FontSmall, NameScale);
+		const float VerbW = bLeaveRow ? MeasureWidth(LeftVerb, FontSmall, NameScale) : 0.f;
 
-		const float ContentW = (Entry.bHasKiller ? KillerW + IconGap : 0.f) + IconPx + IconGap + VictimW;
+		// A leave row is NAME + gap + VERB; a kill row is [KILLER + gap] + GLYPH + gap + VICTIM.
+		const float ContentW = bLeaveRow
+			? (VictimW + IconGap + VerbW)
+			: ((Entry.bHasKiller ? KillerW + IconGap : 0.f) + IconPx + IconGap + VictimW);
 		const float RowW = ContentW + PadX * 2.f;
 		const float RowH = FMath::Max(TextH, IconPx) + PadY * 2.f;
 		const float RowX = RightX - RowW;
@@ -5847,21 +5875,39 @@ void ATraceHUD::DrawKillFeed()
 		const float IconY = FMath::RoundToFloat(RowY + (RowH - IconPx) * 0.5f);
 
 		float CursorX = RowX + PadX;
-		if (Entry.bHasKiller)
+		if (bLeaveRow)
 		{
-			DrawTextLeft(KillerText,
-				TraceHUDStyle::WithAlpha(TraceTeamColor(Entry.KillerTeam), Alpha),
+			DrawTextLeft(VictimText,
+				TraceHUDStyle::WithAlpha(TraceTeamColor(Entry.VictimTeam), Alpha),
 				CursorX, TextY, FontSmall, NameScale);
-			CursorX += KillerW + IconGap;
+			CursorX += VictimW + IconGap;
+			DrawTextLeft(LeftVerb, TraceHUDStyle::WithAlpha(TraceHUDStyle::InkDim, Alpha),
+				CursorX, TextY, FontSmall, NameScale);
+#if !UE_BUILD_SHIPPING
+			HudKitRecord.KillFeedTexts.Add(VictimText + TEXT(" ") + LeftVerb);
+#endif
 		}
+		else
+		{
+			if (Entry.bHasKiller)
+			{
+				DrawTextLeft(KillerText,
+					TraceHUDStyle::WithAlpha(TraceTeamColor(Entry.KillerTeam), Alpha),
+					CursorX, TextY, FontSmall, NameScale);
+				CursorX += KillerW + IconGap;
+			}
 
-		DrawKillIcon(Entry.Icon, FMath::RoundToFloat(CursorX), IconY, Cell,
-			TraceHUDStyle::WithAlpha(TraceKillFeedArt::ColorFor(Entry.Icon), Alpha));
-		CursorX += IconPx + IconGap;
+			DrawKillIcon(Entry.Icon, FMath::RoundToFloat(CursorX), IconY, Cell,
+				TraceHUDStyle::WithAlpha(TraceKillFeedArt::ColorFor(Entry.Icon), Alpha));
+			CursorX += IconPx + IconGap;
 
-		DrawTextLeft(VictimText,
-			TraceHUDStyle::WithAlpha(TraceTeamColor(Entry.VictimTeam), Alpha),
-			CursorX, TextY, FontSmall, NameScale);
+			DrawTextLeft(VictimText,
+				TraceHUDStyle::WithAlpha(TraceTeamColor(Entry.VictimTeam), Alpha),
+				CursorX, TextY, FontSmall, NameScale);
+#if !UE_BUILD_SHIPPING
+			HudKitRecord.KillFeedTexts.Add((Entry.bHasKiller ? KillerText + TEXT(" > ") : FString()) + VictimText);
+#endif
+		}
 
 		RowY += RowH + TraceKillFeedArt::RowGap * UIScale;
 		++Drawn;

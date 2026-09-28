@@ -35,6 +35,7 @@
 #include "TraceSettings.h"
 #include "TraceTypes.h"
 #include "UI/TraceHUD.h"
+#include "UI/TraceKillFeed.h"      // ServerAnnounceLeave — "<NAME> LEFT" from Logout
 #include "UI/TraceMatchOptions.h"
 #include "World/TraceArenaBuilder.h"
 #include "World/TraceTeamPlayerStart.h"
@@ -785,6 +786,24 @@ void ATraceGameMode::Logout(AController* Exiting)
 		if (ATraceCorePullRelay* Relay = ATraceCorePullRelay::Find(Exiting))
 		{
 			Relay->Destroy();
+		}
+
+		// A GUEST WHO LEAVES IS NAMED IN THE KILL FEED: "<NAME> LEFT", on every machine. A timeout and
+		// a clean RETURN TO TITLE both arrive here (UNetConnection::CleanUp -> OnNetCleanup -> Destroy
+		// -> AController::Destroyed -> Logout), which is why this is the place and the engine's
+		// network-failure callback is not: that one fires for a timeout only, and used to put an
+		// anonymous red "A PLAYER LEFT THE MATCH" on the host's screen alone (TraceNetworking.cpp).
+		//
+		// Remote humans only. Bots are not APlayerControllers. The host's own controller is local:
+		// it is logged out by its own travel, into a world nobody is looking at. And guests the host
+		// is sending home (bSendingGuestsHome) are not leaving; the host is.
+		const APlayerController* const LeavingPC = Cast<APlayerController>(Exiting);
+		if (LeavingPC != nullptr && !LeavingPC->IsLocalController() && !bSendingGuestsHome)
+		{
+			if (ATraceKillFeedRelay* const Feed = ATraceKillFeedRelay::Find(GetWorld()))
+			{
+				Feed->ServerAnnounceLeave(Exiting->PlayerState);
+			}
 		}
 	}
 
@@ -3960,6 +3979,7 @@ int32 ATraceGameMode::SendRemoteClientsHome(bool bHostLeft)
 	// want - the menu is a single-player screen, so ServerTravel (which would drag everybody into
 	// a NETWORKED menu map still owned by this host) would be wrong.
 	int32 RemotesSentHome = 0;
+	bSendingGuestsHome = true;   // their Logouts below are ours, not a guest leaving: see Logout
 	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
 	{
 		APlayerController* PC = It->Get();

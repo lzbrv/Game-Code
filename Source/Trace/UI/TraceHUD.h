@@ -200,6 +200,13 @@ public:
 		/** The HOSTING / CONNECTED chip, and the alpha it drew at. */
 		bool bNetPanel = false;
 		float NetPanelAlpha = 0.f;
+
+		/** The network-failure banner, and every line of text it drew (the engine's text must not be one). */
+		bool bNetFailurePanel = false;
+		TArray<FString> NetFailureLines;
+
+		/** Each kill-feed row's words as drawn, newest first ("KILLER > VICTIM", or "NAME LEFT"). */
+		TArray<FString> KillFeedTexts;
 	};
 	const FHudKitRecord& GetHudKitRecord() const { return HudKitRecord; }
 #endif
@@ -530,7 +537,10 @@ protected:
 	 */
 	void DrawNetworkStatus();
 
-	/** The last connection or travel failure, if recent. Same store the title screen draws from. */
+	/**
+	 * The last connection or travel failure, if recent (12 s): its one-line headline on the kit's
+	 * amber-ringed plate, centred. Same store the title screen draws from. Never under an overlay.
+	 */
 	void DrawNetworkFailureBanner();
 
 	/**

@@ -124,9 +124,9 @@ struct FTraceTitleMenuView
 	/** WP8.2 — "V 0.1.0   NET xxxxxxxx". The NET half is the cross-play check. The HUD owns the read. */
 	FString Version;
 
+	/** The last network failure's one line. There is no detail line: the engine's text is log-only. */
 	bool bFailureVisible = false;
 	FString FailureHeadline;
-	FString FailureDetail;
 	float FailureFade = 1.f;
 
 	bool bTravelVisible = false;
@@ -312,6 +312,11 @@ protected:
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UTextBlock> FailureHeadlineText;
 
+	/**
+	 * The banner's second line in the asset. Always COLLAPSED now: it carried the engine's own error
+	 * string, which is log-only (TraceNet::GetLastFailure). Kept bound so the generated asset needs no
+	 * regenerate and the block cannot show its design-time text.
+	 */
 	UPROPERTY(meta = (BindWidget))
 	TObjectPtr<UTextBlock> FailureDetailText;
 

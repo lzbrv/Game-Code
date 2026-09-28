@@ -538,8 +538,13 @@ void UTraceTitleMenuWidget::ApplyView(const FTraceTitleMenuView& InView)
 			// Canvas path spends five multiplications achieving.
 			FailureBanner->SetRenderOpacity(InView.FailureFade);
 			SetTextOn(FailureHeadlineText, InView.FailureHeadline);
-			SetTextOn(FailureDetailText, InView.FailureDetail);
 		}
+	}
+	if (FailureDetailText != nullptr && FailureDetailText->GetVisibility() != ESlateVisibility::Collapsed)
+	{
+		// One line only: see FailureDetailText in the header. MirrorAll below carries the collapse to
+		// the atlas twin that actually draws.
+		FailureDetailText->SetVisibility(ESlateVisibility::Collapsed);
 	}
 
 	// LAST. Every SetTextOn above wrote to a model; this is the line that puts the frame on screen in

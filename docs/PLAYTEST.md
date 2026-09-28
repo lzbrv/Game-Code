@@ -446,18 +446,22 @@ In a match, `Esc` opens the pause menu: **RESUME / SETTINGS / VIDEO / RETURN TO 
 **Work down this list in order.** It is ordered by how often each one is actually the problem, not by
 how technical it sounds.
 
-**First: read the screen.** A failed join does not fail silently — it drops you back to the title
-screen with an amber banner that stays up for a minute and says what went wrong in plain English. The
-messages you are likely to see:
+**First: read the screen.** A failed join does not fail silently — it puts you back in the JOIN prompt
+with the address you dialled and one short line under it saying what went wrong (anything else that
+fails shows the same line in an amber banner on the title screen for a minute). The engine's own error
+code is in the log, not on screen. The lines you are likely to see:
 
 | On screen | What it actually means |
 |---|---|
-| `CONNECTION TIMED OUT. CHECK THE ADDRESS, THE VPN, AND UDP 7777 ON THE HOST.` | Nothing answered. Host's firewall, Tailscale down at one end, or a wrong address. By far the most common. |
-| `COULD NOT REACH THAT ADDRESS.` | No route at all — usually Tailscale not running on one of the two machines. |
-| `THAT ADDRESS IS NOT VALID. USE  <ip>:7777.` | A typo. Retype or paste it. |
-| `THE SERVER REFUSED THE CONNECTION.` | You reached them, and they said no. Usually a full match. |
-| `CLIENT AND SERVER ARE RUNNING DIFFERENT BUILDS.` | Somebody has an older copy. Everyone needs the same download. |
-| `COULD NOT LISTEN ON UDP 7777. ANOTHER COPY MAY ALREADY BE HOSTING.` | On the host: you have Trace open twice. Close the other one. |
+| `NO RESPONSE FROM HOST` | Nothing answered. Host's firewall, Tailscale down at one end, or a wrong address. By far the most common. |
+| `CAN'T REACH HOST` | No route at all — usually Tailscale not running on one of the two machines. |
+| `INVALID ADDRESS` | A typo. Retype or paste it. |
+| `HOST REFUSED THE CONNECTION` | You reached them, and they said no. Usually a full match. |
+| `VERSION MISMATCH - YOURS IS NET xxxxxxxx` | Somebody has an older copy. Compare the NET code bottom right of both title screens; everyone needs the same download. |
+| `CAN'T HOST ON PORT 7777` | On the host: you have Trace open twice. Close the other one. |
+
+A guest who leaves a match (by choice or by dropping) shows up in everyone's kill feed as
+`<NAME> LEFT`. The host gets no warning banner for it: it is not the host's connection that failed.
 
 Then, in order:
 
