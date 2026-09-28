@@ -9,6 +9,7 @@
 #include "Materials/MaterialInterface.h"
 #include "Math/RotationMatrix.h"
 #include "Math/UnrealMathUtility.h"
+#include "Misc/PackageName.h"
 #include "UObject/ConstructorHelpers.h"
 #include "UObject/UObjectGlobals.h"
 
@@ -146,6 +147,14 @@ UStaticMesh* UTraceFxShapes::GetIcosphere()
 
 		for (const TCHAR* Path : Candidates)
 		{
+			// Asked BEFORE LoadObject, because the flags above do not reach a packaged build's
+			// loader: it prints "LoadPackage: SkipPackage: ... does not exist" at Warning for a
+			// missing package whatever the flags say, so both candidates were two warnings on every
+			// packaged launch. DoesPackageExist checks the IoStore there and the disk in the editor.
+			if (!FPackageName::DoesPackageExist(FString(Path)))
+			{
+				continue;
+			}
 			UStaticMesh* Found = LoadObject<UStaticMesh>(nullptr, Path, nullptr, LOAD_NoWarn | LOAD_Quiet);
 			if (Found != nullptr)
 			{
