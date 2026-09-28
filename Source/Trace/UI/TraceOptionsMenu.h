@@ -764,6 +764,9 @@ private:
 	// harmless neighbour (RESET directly above BACK). So the first press ARMS the row — its label turns
 	// into the question — and only a second press on the same row, within ArmWindowSeconds of REAL
 	// time, does it. Moving off the row, leaving the page or waiting it out disarms.
+	//
+	// RETURN TO TITLE and QUIT go through it too: one stray press used to end the match on the spot —
+	// and on a listen host, end it for everybody connected (LEAVE MATCH? / QUIT GAME? / END MATCH FOR ALL?).
 
 	/** What the next press confirms, or None. ClearLoadoutSlot for a slot clear. */
 	EAction ArmedAction = EAction::None;
@@ -1049,6 +1052,12 @@ private:
 
 	/** The world is really paused this frame (standalone). Decides PAUSED against MENU on the root. */
 	bool bWorldPaused = false;
+
+	/**
+	 * This machine is a listen host with somebody connected: leaving ends the match for them too, and
+	 * the armed RETURN TO TITLE / QUIT row says so (END MATCH FOR ALL?). Refreshed every Tick.
+	 */
+	bool bLeaveEndsMatchForAll = false;
 
 	/**
 	 * UI PLAN WP2.2 — the CALL SIGN field.

@@ -4,6 +4,7 @@
 
 #include "Components/StaticMeshComponent.h"  // v25 §3 — the pull ring measures the drawn orb's bounds
 #include "Core/TraceCharacter.h"
+#include "Core/TraceGameMode.h"           // SendRemoteClientsHome — a host leaving takes its guests home
 #include "Core/TraceGameState.h"
 #include "Core/TracePlayerController.h"
 #include "Core/TracePlayerState.h"
@@ -1271,20 +1272,38 @@ void ATraceHUD::OpenPauseMenu()
 	// same class.
 	PauseMenu.OnResume = []() {};
 
-	PauseMenu.OnReturnToTitle = [WeakThis]()
+	// *** A LISTEN HOST THAT LEAVES TAKES ITS GUESTS HOME FIRST. *** Both rows used to OpenLevel or quit
+	// on the spot, which tears the net driver down under every connected client: they sat on a frozen
+	// match until 'CONNECTION LOST.' arrived. The game mode's own end-of-match path already sent remotes
+	// home one frame ahead; leaving mid-match now does the same, and tells them the host left. (Both
+	// rows are also two presses now — the pause menu asks "LEAVE MATCH?" / "END MATCH FOR ALL?".)
+	auto SendGuestsHome = [](UWorld* LeavingWorld)
+	{
+		if (LeavingWorld != nullptr && LeavingWorld->GetNetMode() == NM_ListenServer)
+		{
+			if (ATraceGameMode* HostMode = LeavingWorld->GetAuthGameMode<ATraceGameMode>())
+			{
+				HostMode->SendRemoteClientsHome(/*bHostLeft=*/true);
+			}
+		}
+	};
+
+	PauseMenu.OnReturnToTitle = [WeakThis, SendGuestsHome]()
 	{
 		if (ATraceHUD* Strong = WeakThis.Get())
 		{
 			UE_LOG(LogTraceGame, Log, TEXT("Pause menu: RETURN TO TITLE."));
+			SendGuestsHome(Strong->GetWorld());
 			UGameplayStatics::OpenLevel(Strong, FName(TraceMaps::MainMenu), /*bAbsolute=*/true);
 		}
 	};
 
-	PauseMenu.OnQuit = [WeakThis]()
+	PauseMenu.OnQuit = [WeakThis, SendGuestsHome]()
 	{
 		if (ATraceHUD* Strong = WeakThis.Get())
 		{
 			UE_LOG(LogTraceGame, Log, TEXT("Pause menu: QUIT."));
+			SendGuestsHome(Strong->GetWorld());
 			UKismetSystemLibrary::QuitGame(Strong, Strong->TracePC.Get(), EQuitPreference::Quit,
 				/*bIgnorePlatformRestrictions=*/false);
 		}

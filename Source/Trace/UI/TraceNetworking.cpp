@@ -369,6 +369,22 @@ namespace
 	bool bFailureHandlersBound = false;
 }
 
+// A guest told by its host that the host is leaving (ATracePlayerController::ClientHostLeft). Named, not
+// anonymous: this module is a unity build (Scripts/check-jumbo-build-collisions.py).
+namespace TraceNetHostLeft
+{
+	/** FPlatformTime::Seconds() when this client was told its host left; negative when never. */
+	static double NoticeTime = -1.0;
+
+	/**
+	 * How long that notice outranks the connection failure its own teardown raises. The host's world
+	 * goes a frame after it sends the notice, so "Host closed the connection" / ConnectionLost arrives
+	 * right behind it — measured on a two-process run, in the same frame — and would otherwise replace
+	 * HOST LEFT with CONNECTION LOST on the guest's title screen.
+	 */
+	static constexpr double ShieldSeconds = 5.0;
+}
+
 void ReportFailure(const FString& Headline, const FString& Detail)
 {
 	LastFailureHeadline = Headline;
@@ -392,6 +408,13 @@ void ClearFailure()
 	LastFailureHeadline.Reset();
 	LastFailureDetail.Reset();
 	LastFailureTime = -1.0;
+	TraceNetHostLeft::NoticeTime = -1.0;
+}
+
+void ReportHostLeft()
+{
+	ReportFailure(TRACE_TEXT("NET.HOST_LEFT", "HOST LEFT"), FString());
+	TraceNetHostLeft::NoticeTime = FPlatformTime::Seconds();
 }
 
 // The title screen's JOIN attempt, remembered across the reload a failed join causes. Named, not
@@ -543,6 +566,17 @@ void BindFailureHandlers()
 			const bool bWeAreTheServer = (FailedDriver != nullptr) && (FailedDriver->ServerConnection == nullptr);
 			const bool bPeerDropped =
 				(FailureType == ENetworkFailure::ConnectionLost) || (FailureType == ENetworkFailure::ConnectionTimeout);
+
+			// The host has just TOLD this guest it is leaving (ReportHostLeft). The connection failure
+			// its departure raises a moment later is the consequence, not the news: keep HOST LEFT.
+			if (!bWeAreTheServer && TraceNetHostLeft::NoticeTime >= 0.0
+				&& (FPlatformTime::Seconds() - TraceNetHostLeft::NoticeTime) < TraceNetHostLeft::ShieldSeconds)
+			{
+				UE_LOG(LogTraceGame, Log,
+					TEXT("[Net] %s arrived right after the host said it was leaving; HOST LEFT stays the reason."),
+					ENetworkFailure::ToString(FailureType));
+				return;
+			}
 
 			const FString Headline = (bWeAreTheServer && bPeerDropped)
 				? TRACE_TEXT("NET.FAIL_PEER_LEFT", "A PLAYER LEFT THE MATCH")

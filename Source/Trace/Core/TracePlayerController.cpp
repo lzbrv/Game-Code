@@ -3609,6 +3609,18 @@ void ATracePlayerController::ClientNotifyKilledBy_Implementation(const FString& 
 	UE_LOG(LogTraceGame, Verbose, TEXT("[%s] Killed by '%s' (%s)"), *GetName(), *KillerName, *Cause.ToString());
 }
 
+void ATracePlayerController::ClientHostLeft_Implementation()
+{
+	// A listen host's own controller never receives this (only remote controllers are sent it), but a
+	// guard costs nothing and keeps a host from ever reporting its own departure to itself.
+	if (!IsLocalController() || GetNetMode() != NM_Client)
+	{
+		return;
+	}
+	UE_LOG(LogTraceGame, Display, TEXT("[Net] The host left the match; returning to the title screen."));
+	TraceNet::ReportHostLeft();
+}
+
 void ATracePlayerController::ClientNotifyParryKill_Implementation(const FString& VictimName)
 {
 	// CLIENT-LOCAL time on purpose, exactly like LastHitMarkerTime: the HUD fades this banner out

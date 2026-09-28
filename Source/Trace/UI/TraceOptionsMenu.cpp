@@ -10,6 +10,7 @@
 #include "Engine/Engine.h"
 #include "Engine/Font.h"
 #include "Engine/GameViewportClient.h"  // spec v28 §3a - the harness injects where FSceneViewport does
+#include "Engine/NetDriver.h"             // ClientConnections - does leaving end the match for guests?
 #include "InputKeyEventArgs.h"           // spec v28 §3a - a real FInputKeyEventArgs, not a call into the menu
 #include "Framework/Application/SlateApplication.h"  // spec v28 §3a - inject ABOVE the viewport gate
 #include "Widgets/SViewport.h"           // spec v28 §3a - the widget the synthetic click is aimed at
@@ -2200,6 +2201,10 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 		const UWorld* ClockWorld = (PC != nullptr) ? PC->GetWorld() : nullptr;
 		Now = (ClockWorld != nullptr) ? static_cast<float>(ClockWorld->GetRealTimeSeconds()) : InNow;
 		bWorldPaused = (ClockWorld != nullptr) && ClockWorld->IsPaused();
+
+		const UNetDriver* Driver = (ClockWorld != nullptr) ? ClockWorld->GetNetDriver() : nullptr;
+		bLeaveEndsMatchForAll = (ClockWorld != nullptr) && ClockWorld->GetNetMode() == NM_ListenServer
+			&& Driver != nullptr && Driver->ClientConnections.Num() > 0;
 	}
 
 #if !UE_BUILD_SHIPPING
@@ -2377,8 +2382,13 @@ void FTraceOptionsMenu::TickAutoActivate()
 				TEXT("[Options] -TraceMenuActivate: pressing row %d ('%s')."), Index, *Rows[Index].Label);
 
 			// Through the real activation, not around it. A harness that set Page directly would
-			// photograph a page no key press can reach.
+			// photograph a page no key press can reach. A two-step row (RETURN TO TITLE, QUIT, a
+			// RESET) is pressed twice, as a player confirming it would: "press this row" means do it.
 			ActivateSelected();
+			if (Rows.IsValidIndex(Selected) && IsArmedRow(Rows[Selected]))
+			{
+				ActivateSelected();
+			}
 			return;
 		}
 	}
@@ -2721,7 +2731,8 @@ bool FTraceOptionsMenu::ArmOrConfirm(EAction Action, int32 Slot)
 	ArmedSlot = Slot;
 	ArmedUntilReal = RealNow + ArmWindowSeconds;
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Armed %s%s: press again within %.0fs to confirm."),
-		(Action == EAction::ClearLoadoutSlot) ? TEXT("CLEAR slot ") : TEXT("RESET"),
+		(Action == EAction::ClearLoadoutSlot) ? TEXT("CLEAR slot ")
+			: ((Action == EAction::ReturnToTitle || Action == EAction::Quit) ? TEXT("LEAVE") : TEXT("RESET")),
 		(Action == EAction::ClearLoadoutSlot) ? *FString::FromInt(Slot + 1) : TEXT(""), ArmWindowSeconds);
 	return false;
 }
@@ -3848,6 +3859,8 @@ void FTraceOptionsMenu::ActivateSelected()
 	case EAction::ResetCrosshairDefaults:
 	case EAction::ResetAudioDefaults:
 	case EAction::ResetControllerDefaults:
+	case EAction::ReturnToTitle:
+	case EAction::Quit:
 		if (!ArmOrConfirm(Row.Action, INDEX_NONE))
 		{
 			return;
@@ -4768,9 +4781,23 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		if (IsArmedRow(Row))
 		{
 			// The two-step confirm: the row IS the question until it is answered or abandoned.
-			Text = (ArmedAction == EAction::ClearLoadoutSlot)
-				? TRACE_TEXTF("OPTIONS.LOADOUTS.CONFIRM_CLEAR", "CLEAR {0}?", { Row.SlotIndex + 1 })
-				: FString(TRACE_TEXT("OPTIONS.ROW.RESET_CONFIRM", "CONFIRM RESET"));
+			if (ArmedAction == EAction::ClearLoadoutSlot)
+			{
+				Text = TRACE_TEXTF("OPTIONS.LOADOUTS.CONFIRM_CLEAR", "CLEAR {0}?", { Row.SlotIndex + 1 });
+			}
+			else if (ArmedAction == EAction::ReturnToTitle || ArmedAction == EAction::Quit)
+			{
+				// Leaving asks, and a host with guests is told what leaving does to them.
+				Text = bLeaveEndsMatchForAll
+					? TRACE_TEXT("OPTIONS.PAUSE.CONFIRM_END_FOR_ALL", "END MATCH FOR ALL?")
+					: ((ArmedAction == EAction::Quit)
+						? TRACE_TEXT("OPTIONS.PAUSE.CONFIRM_QUIT", "QUIT GAME?")
+						: TRACE_TEXT("OPTIONS.PAUSE.CONFIRM_LEAVE", "LEAVE MATCH?"));
+			}
+			else
+			{
+				Text = TRACE_TEXT("OPTIONS.ROW.RESET_CONFIRM", "CONFIRM RESET");
+			}
 		}
 		else if (Row.Action == EAction::AutoDetectQuality && bAutoDetectPending)
 		{

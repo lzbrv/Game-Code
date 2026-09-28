@@ -3926,13 +3926,35 @@ void ATraceGameMode::ReturnToMainMenu()
 
 	UE_LOG(LogTraceGame, Log, TEXT("Post-match window elapsed; returning to %s."), TraceMaps::MainMenu);
 
-	// Send every REMOTE client home first, explicitly, before this machine leaves.
-	//
-	// The OpenLevel below is a purely local absolute travel. On a listen server that tears the net
-	// driver down under any connected client with no notice at all: they lose the host mid-frame
-	// and (before this) sat looking at a frozen post-match screen until something timed out. Now
-	// they are told to go to the same place, by name, one frame earlier.
-	//
+	// Send every REMOTE client home first, explicitly, before this machine leaves. See
+	// SendRemoteClientsHome: the OpenLevel below would otherwise tear the net driver down under them.
+	SendRemoteClientsHome(/*bHostLeft=*/false);
+
+	// Absolute travel: the menu runs a different game mode on a different map, and a relative
+	// travel would carry this match's URL options (?difficulty=, ?bots=) into it.
+	UGameplayStatics::OpenLevel(World, FName(TraceMaps::MainMenu), /*bAbsolute=*/true);
+}
+
+void ATraceGameMode::EndResultsNow()
+{
+	const ATraceGameState* GS = GetGameState<ATraceGameState>();
+	if (!HasAuthority() || GS == nullptr || GS->TraceMatchState != ETraceMatchState::PostMatch)
+	{
+		return;
+	}
+	GetWorldTimerManager().ClearTimer(ReturnToMenuTimerHandle);
+	UE_LOG(LogTraceGame, Log, TEXT("Results screen: CONTINUE pressed on the host."));
+	ReturnToMainMenu();
+}
+
+int32 ATraceGameMode::SendRemoteClientsHome(bool bHostLeft)
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || !HasAuthority())
+	{
+		return 0;
+	}
+
 	// ClientTravel with TRAVEL_Absolute and a local map path is a client RPC: the client loads the
 	// menu map on its OWN machine and drops the connection as part of doing so. That is what we
 	// want - the menu is a single-player screen, so ServerTravel (which would drag everybody into
@@ -3945,19 +3967,25 @@ void ATraceGameMode::ReturnToMainMenu()
 		// never appear in this iterator at all.
 		if (PC != nullptr && !PC->IsLocalController())
 		{
+			if (bHostLeft)
+			{
+				// Reliable and ordered ahead of the travel on the same channel, so the reason is on the
+				// client before its world goes.
+				if (ATracePlayerController* TracePC = Cast<ATracePlayerController>(PC))
+				{
+					TracePC->ClientHostLeft();
+				}
+			}
 			PC->ClientTravel(TraceMaps::MainMenu, ETravelType::TRAVEL_Absolute);
 			++RemotesSentHome;
 		}
 	}
 	if (RemotesSentHome > 0)
 	{
-		UE_LOG(LogTraceGame, Log, TEXT("[Net] Sent %d remote client(s) back to the menu before the host travels."),
-			RemotesSentHome);
+		UE_LOG(LogTraceGame, Log, TEXT("[Net] Sent %d remote client(s) back to the menu before the host travels%s."),
+			RemotesSentHome, bHostLeft ? TEXT(" (the host left mid-match)") : TEXT(""));
 	}
-
-	// Absolute travel: the menu runs a different game mode on a different map, and a relative
-	// travel would carry this match's URL options (?difficulty=, ?bots=) into it.
-	UGameplayStatics::OpenLevel(World, FName(TraceMaps::MainMenu), /*bAbsolute=*/true);
+	return RemotesSentHome;
 }
 
 // =============================================================================================

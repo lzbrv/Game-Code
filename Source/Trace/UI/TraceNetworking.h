@@ -164,6 +164,14 @@ namespace TraceNet
 	TRACE_API void ClearFailure();
 
 	/**
+	 * A guest's host has told it that it is leaving the match (ATracePlayerController::ClientHostLeft).
+	 * Records HOST LEFT as the last failure — the title screen shows it — and, for a few seconds,
+	 * stops the connection failure that the host's departure raises right behind it from replacing
+	 * that reason with CONNECTION LOST.
+	 */
+	TRACE_API void ReportHostLeft();
+
+	/**
 	 * The title screen's JOIN just started dialling. Remembered across the map reload a failed join
 	 * causes, so the NEXT title screen can tell "your join failed" from any other failure.
 	 */

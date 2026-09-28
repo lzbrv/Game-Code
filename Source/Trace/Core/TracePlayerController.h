@@ -301,6 +301,16 @@ public:
 	void ClientNotifyKilledBy(const FString& KillerName, FName Cause);
 
 	/**
+	 * The host is leaving a match that is still being played, and this client is about to be sent to
+	 * the title screen (ATraceGameMode::SendRemoteClientsHome). Records HOST LEFT as the last network
+	 * failure, which the title screen shows — so a guest learns why their match ended, rather than
+	 * arriving at the title with no explanation or, as before, sitting on a frozen match until
+	 * 'CONNECTION LOST.' arrived.
+	 */
+	UFUNCTION(Client, Reliable)
+	void ClientHostLeft();
+
+	/**
 	 * KILLER-side notification for spec v6 §3: your parry killed the enemy who dashed your trace.
 	 *
 	 * The dasher already learns why they died through ClientNotifyKilledBy above — the kill carries

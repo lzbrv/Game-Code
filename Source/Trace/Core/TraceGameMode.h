@@ -908,6 +908,28 @@ protected:
 
 public:
 	/**
+	 * Sends every REMOTE human back to the title screen, and returns how many were sent.
+	 *
+	 * The OpenLevel a listen host leaves by is a purely local travel: it tears the net driver down under
+	 * anybody connected, and they used to be left on a frozen match until a 'CONNECTION LOST.' arrived.
+	 * ClientTravel with an absolute local map path makes each client load the menu on its OWN machine,
+	 * dropping the connection as part of doing so — one frame before the host goes.
+	 *
+	 * @param bHostLeft  the host is leaving a match that is still being played (the pause menu's RETURN
+	 *                   TO TITLE or QUIT). Each client is told so first (ClientHostLeft), so their title
+	 *                   screen says HOST LEFT instead of nothing. False for the ordinary end of a match,
+	 *                   which the results screen has already explained.
+	 */
+	int32 SendRemoteClientsHome(bool bHostLeft);
+
+	/**
+	 * The results screen's CONTINUE, pressed on the host: ends the post-match window now instead of when
+	 * its timer runs out — the same ReturnToMainMenu the timer calls (guests are sent home first). Does
+	 * nothing outside PostMatch, so a stray press can never end a live match.
+	 */
+	void EndResultsNow();
+
+	/**
 	 * Run the select poll NOW rather than at the next quarter-second tick.
 	 *
 	 * For the moment the team screen closes (ATracePlayerController::ServerSetTeamSelectOpen): the
