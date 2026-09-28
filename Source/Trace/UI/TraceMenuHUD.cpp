@@ -339,11 +339,11 @@ namespace TraceMenuHUDJoin
 	static constexpr int32 Back    = 1;
 	static constexpr int32 ButtonCount = 2;
 
-	static constexpr float PanelW       = 820.f;   // the black panel, at most (and 0.86 of the view)
+	// The prompt's column: no panel is drawn (it sits on the kit's opaque black), but its width bounds
+	// the field, the buttons and the legend, and its top places them.
+	static constexpr float PanelW       = 820.f;   // at most (and 0.86 of the view)
 	static constexpr float PanelTopFrac = 0.28f;   // of the view height
 	static constexpr float PanelPadTop  = 34.f;
-	static constexpr float PanelPadBottom = 30.f;
-	static constexpr float PanelAlpha   = 0.90f;   // over the kit's 0.82 scrim, as the options pages
 
 	static constexpr float TitleCap     = 30.f;    // Sofachrome, white — the options pages' title size
 	static constexpr float SubtitleCap  = 12.f;
@@ -3264,8 +3264,9 @@ void ATraceMenuHUD::DrawHUD()
 	//
 	// SINCE THE HANDMADE-KIT PASS THE SWAP IS INVISIBLE, and a TRAVEL takes this path too. The Canvas
 	// title below is the kit — pure black, the artist's navy wordmark and white swoosh, the plates, the
-	// white blade — with no cyan grid, bezel or slate backdrop left in it, so opening SETTINGS or JOIN
-	// dims the same screen instead of switching to a teal one. A travel draws the kit's black travel
+	// white blade — with no cyan grid, bezel or slate backdrop left in it, so a SETTINGS fade passes
+	// over the same screen instead of a teal one. (SETTINGS and JOIN then cover it with the kit's opaque
+	// black: a title sub-page shows nothing of the title behind it.) A travel draws the kit's black travel
 	// card over it (DrawTravelOverlay), which is what lets the connecting card carry the ESC CANCEL
 	// legend, the elapsed seconds and the pointer.
 	const bool bWidgetAvailable = TryAdoptMenuWidget();
@@ -3611,13 +3612,18 @@ void ATraceMenuHUD::DrawJoinPrompt()
 	// This was the pre-kit design: a flat dark rectangle with 1.6 px cyan edges, a cyan title, a
 	// cyan-edged field with a cyan caret, and key hints as one long string — with no pointer (the OS
 	// arrow came back) and nothing a mouse could press. Now it is built from the kit like the options
-	// pages it sits beside: the kit's black scrim and a black panel with no edges, the field as the
-	// artist's glowing HOVER plate (it has the keyboard, so it is the focused control), CONNECT and BACK
-	// as real kit buttons, a [KEY] VERB legend, and the white blade pointer.
+	// pages it sits beside: the field as the artist's glowing HOVER plate (it has the keyboard, so it
+	// is the focused control), CONNECT and BACK as real kit buttons, a [KEY] VERB legend, and the white
+	// blade pointer.
 	//
-	// The screen behind it is the Canvas title, which is the kit too now (DrawBackdrop), so opening
-	// JOIN dims the same black screen instead of switching it to a teal one.
-	TraceMenuKit::DrawScrim(this, ViewW, ViewH);
+	// ON THE KIT'S OPAQUE BLACK, as the options pages sit over the title (visual-vs-kit F7). It was the
+	// 0.82 modal scrim plus a 0.90 black panel sized to the prompt, and the title's rows showed through
+	// straight under its content: PRACTICE behind the buttons, DIFFICULTY and its gold value box behind
+	// the ENTER / ESC / CTRL+V legend and THIS MACHINE IS, SETTINGS, QUIT and the JOIN blurb below the
+	// panel's edge. A title sub-page is a kit screen of its own; nothing of the title shows behind it.
+	// (The panel went with the scrim: black on black is not a panel, and a hard-cornered box is not a
+	// shape the kit has.)
+	TraceMenuKit::DrawScrim(this, ViewW, ViewH, 1.f);
 
 	const float CX = ViewW * 0.5f;
 	const float PanelW = FMath::Min(MJ::PanelW * S, ViewW * 0.86f);
@@ -3662,10 +3668,6 @@ void ATraceMenuHUD::DrawJoinPrompt()
 	const float LegendY = ButtonsY + ButtonH + MJ::LegendGap * S;
 	const float LegendBottom = LegendY + ((LegendLines > 0) ? (ChipH + (LegendLines - 1) * MJ::LegendLineGap * S) : 0.f);
 	const float MachineMid = LegendBottom + MJ::MachineGap * S;
-	const float PanelH = (MachineMid + MJ::MachineCap * 0.5f * S + MJ::PanelPadBottom * S) - PanelY;
-
-	// A black panel with NO coloured edges (stylespec §0), over the scrim, as the options pages do it.
-	DrawRect(FLinearColor(0.f, 0.f, 0.f, MJ::PanelAlpha), PanelX, PanelY, PanelW, PanelH);
 
 	// ---- Title and subtitle: Sofachrome, the page-title face -------------------------------------
 	TraceMenuKit::DrawCapText(this, TRACE_TEXT("MENU.JOIN_TITLE", "JOIN A GAME"), CX, TitleMid, MJ::TitleCap * S,

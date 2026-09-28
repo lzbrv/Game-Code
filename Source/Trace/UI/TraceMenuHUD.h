@@ -337,9 +337,10 @@ protected:
 	void DrawTravelOverlay();
 
 	/**
-	 * The modal address field raised by the JOIN row, on the handmade kit: a black panel over the
-	 * kit scrim, the field as a glowing plate, CONNECT and BACK as real buttons the mouse can press,
-	 * a [KEY] VERB legend, and the blade pointer. Draws nothing while the field is inactive.
+	 * The modal address field raised by the JOIN row, on the handmade kit: the kit's opaque black
+	 * over the whole title (as the options pages over the title), the field as a glowing plate,
+	 * CONNECT and BACK as real buttons the mouse can press, a [KEY] VERB legend, and the blade
+	 * pointer. Draws nothing while the field is inactive.
 	 */
 	void DrawJoinPrompt();
 
