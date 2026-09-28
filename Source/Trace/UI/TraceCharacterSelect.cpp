@@ -22,6 +22,7 @@
 #include "InputKeyEventArgs.h"          // FInputKeyEventArgs — same injector
 #include "Misc/CoreMiscDefines.h"       // FInputDeviceId
 
+#include "Abilities/TraceAbilityComponent.h"   // AreCharactersEnabled — who is about to get a select window
 #include "Core/TracePlayerController.h"   // D31-TEAMS — the team-select session lives on it
 #include "Settings/TraceGamepadInput.h"   // D32-PADMENU — TracePadMenu, the shared pad vocabulary
 #include "Core/TracePlayerState.h"
@@ -1705,6 +1706,10 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 			HoveredCard = INDEX_NONE;
 			PendingRequest = TraceCharacterRoster::NoneId;
 
+			// THE FIRST POINTER SAMPLE OF THIS OPENING IS NOT A MOVE — including a second opening, whose
+			// last sample is stale and would otherwise drag the highlight to the card under the pointer.
+			bHasCursor = false;
+
 			// FBox2D's default constructor leaves bIsValid UNINITIALISED, and PollInput runs before
 			// Draw on this very frame — so without this the first frame's hit test would read garbage
 			// and could report the pointer as being inside a card that has never been drawn. Cleared
@@ -1835,7 +1840,34 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 			FTraceTeamSelect::PollOpenHotkey(TracePC);
 		}
 
+		const bool bTeamWasOpen = TeamSelect.IsOpen();
 		TeamSelect.Tick(HUD, TracePC, LocalState, ViewW, ViewH, UIScale, Now, bInputAllowed && !bOpen);
+
+		// ---- THE HANDOFF (see bHandoffHeld) ----------------------------------------------------
+		//
+		// Armed on the frame team select closes, only for a player who is certainly about to get the
+		// select window, and released the moment it arrives or after HandoffHoldSeconds — so a player
+		// who is NOT going to get one (a mid-match H that kept their team, a locked-in player) is never
+		// held behind a black page.
+		const bool bSelectPending = (LocalState != nullptr)
+			&& LocalState->Team != ETraceTeam::None
+			&& !LocalState->HasCharacter()
+			&& !LocalState->IsCharacterLocked()
+			&& UTraceAbilityComponent::AreCharactersEnabled(LocalState);
+		if (bTeamWasOpen && !TeamSelect.IsOpen() && !bOpen && bSelectPending)
+		{
+			HandoffUntil = Now + HandoffHoldSeconds;
+		}
+		bHandoffHeld = !bOpen && !TeamSelect.IsOpen() && bSelectPending && Now < HandoffUntil;
+		if (!bHandoffHeld)
+		{
+			HandoffUntil = -1000.f;
+		}
+		else
+		{
+			// Black, as both pages are, rather than a flash of the match between them.
+			TraceMenuKit::DrawBackground(HUD, ViewW, ViewH);
+		}
 	}
 
 	// ---- The COMBINED overlay edge --------------------------------------------------------------
@@ -1845,7 +1877,7 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 	// team screen closing and the character screen opening, and a held W in that frame walks the
 	// player out of the arena behind a menu.
 	{
-		const bool bAnyOpen = bOpen || TeamSelect.IsOpen();
+		const bool bAnyOpen = bOpen || TeamSelect.IsOpen() || bHandoffHeld;
 		if (bAnyOpen != bOverlayOpen)
 		{
 			bOverlayOpen = bAnyOpen;
@@ -1889,6 +1921,9 @@ void FTraceCharacterSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerS
 	{
 		PendingRequest = TraceCharacterRoster::NoneId;
 	}
+
+	// ONE POINTER ON SCREEN: not ours while the pause menu is in front and drawing the live one.
+	bPointerOwned = bInputAllowed;
 
 	if (bInputAllowed && PC != nullptr && GFrameCounter >= IgnoreInputBeforeFrame)
 	{
@@ -1990,12 +2025,12 @@ void FTraceCharacterSelect::PollInput(APlayerController* PC, ATracePlayerState* 
 		if (NavDir != LastNavDir)
 		{
 			LastNavDir = NavDir;
-			NextNavTime = Now + NavRepeatDelay;
+			NextNavTime = Now + TracePadMenu::RepeatDelay;
 			MoveHighlight(NavDir);
 		}
 		else if (Now >= NextNavTime)
 		{
-			NextNavTime = Now + NavRepeatInterval;
+			NextNavTime = Now + TracePadMenu::RepeatInterval;
 			MoveHighlight(NavDir);
 		}
 	}
@@ -3486,8 +3521,9 @@ void FTraceCharacterSelect::DrawFrame(AHUD* HUD, float X, float Y, float W, floa
 void FTraceCharacterSelect::DrawCursor(AHUD* HUD)
 {
 	// The OS cursor does not appear in captured frames and is hidden outright during a match, so the
-	// overlay draws its own.
-	if (!bHasCursor)
+	// overlay draws its own — but NOT while the pause menu is in front: it draws the live pointer, and
+	// this one would sit frozen under its scrim as a second blade.
+	if (!bHasCursor || !bPointerOwned)
 	{
 		return;
 	}

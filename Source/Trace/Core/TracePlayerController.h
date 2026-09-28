@@ -373,7 +373,14 @@ public:
 	/** Seconds until the team select closes itself, clamped at zero. Zero when no deadline runs. */
 	float GetTeamSelectTimeRemaining() const;
 
-	/** Server only. Opens or closes the session and arms/clears the timeout. */
+	/**
+	 * Server only. Opens or closes the session and arms/clears the timeout.
+	 *
+	 * CLOSING RUNS THE SELECT POLL AT ONCE (ATraceGameMode::PollCharacterSelectNow), so the loadout
+	 * window opens in the same call that closes this one. Every close path — a pick, the timeout, H or
+	 * pad B, CHANGE LOADOUT — comes through here, and waiting for the 4 Hz poll left up to a quarter of
+	 * a second of live gameplay input, a captured mouse and a flash of the arena between two menus.
+	 */
 	void ServerSetTeamSelectOpen(bool bOpen, float DurationSeconds);
 
 	/** H, or Trace.Teams.Select. Asks the server to put the team-select screen up. */
@@ -400,9 +407,21 @@ public:
 	 * UTracePracticeRangeSubsystem::ReopenCharacterSelect uses in the practice range, rather than a
 	 * second way to change character: the range's version is restricted to the range, and a second
 	 * writer is exactly the drift this codebase keeps getting bitten by.
+	 *
+	 * *** AND THE LOADOUT LOCK APPLIES TO IT. *** With the loadout page on, this is CHANGE LOADOUT, and
+	 * it is refused during live play (TraceLoadoutSelect::IsReopenAllowed): it used to hand the
+	 * character back mid-match, the poll reopened the select window, and ServerSetLoadout accepted a
+	 * new loadout because the window was open — "locked until halftime" with a hole in it. In the
+	 * half-time break it reopens the window directly with the break's deadline and keeps the lock,
+	 * because the poll stands off for the whole break.
 	 */
 	UFUNCTION(Server, Reliable, WithValidation)
 	void ServerRequestCharacterSwitch();
+
+#if !UE_BUILD_SHIPPING
+	/** Test seam: forget the last team-screen request, so a harness's request is not the one refused. */
+	void DebugResetTeamRequestCooldown() { LastTeamRequestTime = NeverHitSentinel; }
+#endif
 
 	/** The verdict, back to the requesting client only. Granted is sent too — silence is not an answer. */
 	UFUNCTION(Client, Reliable)

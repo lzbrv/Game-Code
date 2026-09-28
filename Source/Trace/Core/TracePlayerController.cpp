@@ -10,6 +10,7 @@
 #include "Containers/Ticker.h"             // FTSTicker — the v13 §2 hotkey probe
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"                 // D31-TEAMS — the balance rule and the team change
+#include "Core/TraceGameState.h"                // the half-time break, for CHANGE LOADOUT
 #include "Core/TracePlayerState.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
@@ -47,6 +48,7 @@
 #include "Trace.h"                         // LogTraceGame
 #include "TraceSettings.h"                 // gameplay tuning (dash cooldown, and so on)
 #include "UI/TraceNetworking.h"            // TraceNet — failure handlers and the address helpers
+#include "UI/TraceLoadoutSelect.h"        // IsReopenAllowed — the loadout lock, asked by screen and server
 
 /**
  * Per-event Display logging for the input path. Off by default — on at 60 Hz the Move handler alone
@@ -3737,6 +3739,22 @@ void ATracePlayerController::ServerSetTeamSelectOpen(bool bOpen, float DurationS
 	// change that puts a modal in front of somebody, so push it now for the same reason
 	// ATracePlayerState::SetTeam does.
 	ForceNetUpdate();
+
+	// *** THE NEXT SCREEN OPENS IN THE SAME CALL THAT CLOSED THIS ONE. ***
+	//
+	// The select window used to wait for the game mode's 4 Hz poll, so for up to a quarter of a second
+	// (plus a round trip on a remote client) neither screen was up. The client's overlay edge saw
+	// "nothing open", handed gameplay back — mouse captured, movement live, held keys re-delivered —
+	// and then took it away again: a flash of arena and a jump from a held SPACE between two menus.
+	// The poll is idempotent, so running it now opens exactly the window it would have opened a
+	// moment later, with the same guards (characters on, a team, not already settled, not the break).
+	if (!bOpen && World != nullptr)
+	{
+		if (ATraceGameMode* const Rules = World->GetAuthGameMode<ATraceGameMode>())
+		{
+			Rules->PollCharacterSelectNow();
+		}
+	}
 }
 
 void ATracePlayerController::CloseTeamSelectOnTimeout()
@@ -3903,9 +3921,41 @@ void ATracePlayerController::ServerRequestCharacterSwitch_Implementation()
 		return;
 	}
 
+	// *** THE LOADOUT LOCK. *** "Loadout is locked until halftime." Asked of the same rule the team
+	// screen asks before it offers the key, so the legend and the server cannot disagree. Refused here,
+	// on the server, because a client that skipped its own screen is exactly the client the lock is for.
+	if (!TraceLoadoutSelect::IsReopenAllowed(this))
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TeamSelect] '%s' asked to change loadout during live play - refused. Loadouts change "
+			     "before the match and at half time."),
+			*State->GetPlayerName());
+		return;
+	}
+
 	if (State->IsCharacterSelectOpen())
 	{
 		return;   // Already choosing; a second nudge would only reset their deadline.
+	}
+
+	// *** HALF TIME: REOPEN THE WINDOW, KEEP EVERYTHING ELSE. ***
+	//
+	// The select poll stands off for the whole break (the break owns the window), so the path below —
+	// hand the character back and let the poll notice — would open nothing now and then, after the
+	// whistle, find an unlocked player and open the page in the SECOND HALF, during live play. So the
+	// window is reopened directly, with the break's own end as its deadline, and the lock and the
+	// current loadout are left alone: the page seeds from that loadout, and EndHalfTimeBreak shuts the
+	// window at the whistle as it always does.
+	if (const ATraceGameState* const TraceGS = World->GetGameState<ATraceGameState>())
+	{
+		if (TraceGS->IsHalfTimeBreak())
+		{
+			State->ServerSetCharacterSelectOpen(/*bOpen=*/true, TraceGS->MatchEndServerTime);
+			ServerSetTeamSelectOpen(/*bOpen=*/false, /*DurationSeconds=*/0.f);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TeamSelect] '%s' reopened their loadout at half time."), *State->GetPlayerName());
+			return;
+		}
 	}
 
 	// ---- THE SWITCH, AND IT IS THE PRACTICE RANGE'S MECHANISM VERBATIM --------------------------
@@ -3941,12 +3991,13 @@ void ATracePlayerController::ServerRequestCharacterSwitch_Implementation()
 
 	// The team screen closes so the character screen can open: the ordering gate in
 	// PollCharacterSelect will not open one while this is up, and leaving it up would make the
-	// CHANGE CHARACTER row look as if it had done nothing at all.
+	// CHANGE CHARACTER row look as if it had done nothing at all. Closing it runs that poll at once
+	// (see ServerSetTeamSelectOpen), so the select screen is up by the end of this call.
 	ServerSetTeamSelectOpen(/*bOpen=*/false, /*DurationSeconds=*/0.f);
 
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[TeamSelect] '%s' handed their character back mid-match; the select screen reopens on "
-		     "the next poll. No reconnect involved."),
+		TEXT("[TeamSelect] '%s' handed their character back; the select screen reopens now. No "
+		     "reconnect involved."),
 		*State->GetPlayerName());
 }
 

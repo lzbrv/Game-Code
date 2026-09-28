@@ -21,48 +21,34 @@
 #include "Trace.h"                       // LogTraceGame
 #include "TraceSettings.h"               // PlayersPerTeam, for the "3 / 5" line
 #include "TraceTypes.h"                  // TraceTeamColor / TraceTeamName
-#include "UI/TraceHardwareCursor.h"      // spec v24 §2 — one pointer on screen, not two
+#include "Abilities/TraceAbilityComponent.h"      // AreCharactersEnabled, for CHANGE LOADOUT
+#include "UI/TraceLoadoutSelect.h"       // IsReopenAllowed — the loadout lock, asked here and by the server
 #include "UI/Text/TraceCanvasText.h"     // spec v22 §A1 — this screen types from the glyph atlas
 #include "UI/Text/TraceGameText.h"       // the editable wording, Config/TraceGameText.ini
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
+#include "UI/Widgets/Menu/TraceMenuKit.h"        // the handmade kit: plates, chips, the blade pointer
 
 #if !UE_BUILD_SHIPPING
 int32 GTraceTeamSelectDebugPick = 0;
 #endif
 
+// THE HANDMADE KIT (UI/Widgets/Menu/TraceMenuKit.h): opaque black, navy plates with the orange hover
+// glow baked into the hover plate, the dark disabled plate for a side the balance rule refuses, white
+// words, KEY chips, the blade pointer. The pre-kit neon palette this screen used (Ink / InkDim /
+// Danger on a navy backdrop, flat rects with 1-3 px borders) is gone; the team colours are the kit's
+// own (TraceTeamColor: lifted navy and AmberLifted), carried as an accent inside each plate.
+//
 // NAMED, not anonymous: UBT compiles this module as a unity/jumbo build, so two files that each
 // define something at the top of an anonymous namespace become one namespace with two definitions.
 // Scripts/check-jumbo-build-collisions.py gates the build on exactly that.
 namespace TraceTeamSelectStyle
 {
-	// The same palette FTraceCharacterSelect uses. Duplicated as four constants rather than reached
-	// for across a file boundary because that screen's are file-local statics inside its .cpp — and
-	// four literals is a smaller lie than exporting a style header for one caller. If the two ever
-	// need to move together, the shared home is TraceMenuArtStyle, which both already include.
-	static const FLinearColor Ink    (0.94f, 0.97f, 1.00f, 1.00f);
-	static const FLinearColor InkSoft(0.76f, 0.84f, 0.90f, 1.00f);
-	static const FLinearColor InkDim (0.56f, 0.66f, 0.75f, 1.00f);
-	static const FLinearColor Danger (0.95f, 0.28f, 0.22f, 1.00f);
-
-	static const FLinearColor Plate = TraceMenuArtStyle::PlateFill;
-
-	/** OPAQUE, for the reason spelled out on FTraceCharacterSelect's own backdrop: the HUD has
-	 *  already drawn ammo, health, the scoreboard and the crosshair by the time this ticks, and one
-	 *  opaque rectangle is what makes a modal modal. */
-	static const FLinearColor Backdrop(0.0055f, 0.0090f, 0.0190f, 1.00f);
-
 	static FLinearColor WithAlpha(const FLinearColor& C, float A)
 	{
 		return FLinearColor(C.R, C.G, C.B, A);
 	}
 
-	/** Scales RGB and leaves alpha alone — AHUD::DrawLine discards alpha, so dimming must be in RGB. */
-	static FLinearColor Dimmed(const FLinearColor& C, float Mul)
-	{
-		return FLinearColor(C.R * Mul, C.G * Mul, C.B * Mul, C.A);
-	}
-
-	/** How long a server verdict stays on screen. Matched to the character select's 3.5 s. */
+	/** How long a verdict stays on screen. Matched to the character select's 3.5 s. */
 	static constexpr float MessageDuration = 3.5f;
 }
 
@@ -71,8 +57,10 @@ namespace TraceTeamSelectStyle
  * exactly like TraceSelectLayout in the character select.
  *
  * The vertical budget adds up to 1080:
- *   34..104 title and countdown | 190..760 the two plates | 812 the verdict line | 900 the footer
- *   controls. (128 held a rule sentence until the co-developer's text pass removed it.)
+ *   34..104 title and countdown | 214..654 the two plates | 700 the verdict line | 960 the key
+ *   legend, and 1002 the pad's once a pad has been seen — the loadout page's legend lines exactly, so
+ *   the page turn does not move the footer. The plates were 570 tall for at most five names and left
+ *   their lower 40 % empty.
  */
 namespace TraceTeamSelectLayout
 {
@@ -81,25 +69,26 @@ namespace TraceTeamSelectLayout
 	constexpr float TitleSize   = 42.f;
 	constexpr float TitleTrack  = 7.0f;
 
-	constexpr float PlateTop    = 190.f;
-	constexpr float PlateH      = 570.f;
-	constexpr float PlateGap    = 40.f;
+	constexpr float PlateTop    = 214.f;
+	constexpr float PlateH      = 440.f;
+	constexpr float PlateGap    = 48.f;
 	constexpr float PlatePad    = 30.f;
+
+	/** A tall plate keeps a button-sized corner (stylespec §6). */
+	constexpr float PlateCorner = 60.f;
+
+	/** The 1 / 2 KEY chip in each plate's corner. */
+	constexpr float PlateChipH  = 40.f;
 
 	/** Plates are capped so they do not become billboards on an ultrawide viewport. */
 	constexpr float PlateMaxW   = 520.f;
 
-	constexpr float VerdictY    = 812.f;
-	constexpr float FooterY     = 900.f;
+	constexpr float VerdictY    = 700.f;
+	constexpr float FooterY     = 960.f;
+	constexpr float FooterChipH = 32.f;
 
-	/**
-	 * D32-PADMENU — the pad legend's baseline, below the keyboard's.
-	 *
-	 * 28 rather than the 24 the body face would need on its own: the two lines are the same size and
-	 * a gap equal to the leading reads as one wrapped paragraph rather than as two legends for two
-	 * devices.
-	 */
-	constexpr float PadFooterGap = 28.f;
+	/** D32-PADMENU — the pad legend's chips, below the keyboard's. */
+	constexpr float PadFooterGap = 42.f;
 
 	constexpr float SizeDisplay = 46.f;
 	constexpr float SizeLead    = 22.f;
@@ -252,15 +241,6 @@ namespace TraceTeamSelectFile
 		}
 	}
 #endif
-
-	/** A one-pixel outline. AHUD has no stroked rect; four thin fills is what one is on Canvas. */
-	void StrokeRect(AHUD* HUD, float X, float Y, float W, float H, float Thick, const FLinearColor& Color)
-	{
-		HUD->DrawRect(Color, X, Y, W, Thick);
-		HUD->DrawRect(Color, X, Y + H - Thick, W, Thick);
-		HUD->DrawRect(Color, X, Y, Thick, H);
-		HUD->DrawRect(Color, X + W - Thick, Y, Thick, H);
-	}
 }
 
 // =============================================================================================
@@ -333,6 +313,12 @@ void FTraceTeamSelect::Tick(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 		if (bOpen)
 		{
 			HoveredRow = INDEX_NONE;
+			LocalVerdict.Reset();
+
+			// THE FIRST POINTER SAMPLE OF THIS OPENING IS NOT A MOVE. A position left from the last
+			// time the screen was up (an H mid-match) would otherwise count as one and take the
+			// highlight.
+			bHasCursor = false;
 
 			// FBox2D's default constructor leaves bIsValid UNINITIALISED and PollInput runs before
 			// Draw on this very frame, so without this the first hit test reads garbage and can
@@ -346,10 +332,12 @@ void FTraceTeamSelect::Tick(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 			// confirm a row, and a movement key held during warm-up must not either.
 			IgnoreInputBeforeFrame = GFrameCounter + 1;
 
-			// Start on the team the player is NOT on. It is the only row that does anything, and a
-			// default that does nothing is how a screen ends up feeling broken on the first press.
+			// START ON THE PLAYER'S OWN TEAM. ENTER / A is the reflex "continue", and it now keeps the
+			// team and moves on (the server answers AlreadyOnTeam and closes the screen). It used to
+			// start on the other team, so the same reflex asked to switch sides — respawning the
+			// player and bumping a bot — or, when the switch was refused, silently did nothing.
 			const ETraceTeam Current = (LocalState != nullptr) ? LocalState->Team : ETraceTeam::None;
-			Highlighted = (Current == ETraceTeam::Blue) ? RowOrange : RowBlue;
+			Highlighted = (Current == ETraceTeam::Orange) ? RowOrange : RowBlue;
 
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[TeamSelect] Screen opened (currently %s, %.0fs). Press %s again to close."),
@@ -363,21 +351,16 @@ void FTraceTeamSelect::Tick(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 		}
 	}
 
-	// ---- SPEC v24 §2 — the OS pointer stops being drawn over ours ------------------------------
-	//
-	// Renewed, never latched: the lease expires two frames after this stops being called, so a screen
-	// that closes hands the hardware pointer straight back. The character select renews it for its
-	// own frames; this covers the frames where THIS screen is the one with a pointer on it.
-	if (bOpen && bHasCursor)
-	{
-		TraceHardwareCursor::EnsureRunning();
-		TraceHardwareCursor::RenewSuppression(PC, TEXT("team select"));
-	}
-
 	if (!bOpen)
 	{
 		return;
 	}
+
+	// ONE POINTER ON SCREEN. While the pause menu (or the character page) is in front, it owns the
+	// pointer; this screen keeps drawing underneath but not its own blade, which used to sit frozen
+	// under the scrim beside the live one. The OS-arrow lease is renewed where the blade is drawn
+	// (TraceMenuKit::ShowCursor), and by the character select for the overlay in front.
+	bPointerOwned = bInputAllowed;
 
 	if (bInputAllowed && PC != nullptr && GFrameCounter >= IgnoreInputBeforeFrame)
 	{
@@ -433,13 +416,18 @@ void FTraceTeamSelect::PollInput(ATracePlayerController* PC, ATracePlayerState* 
 	// stay BACK. Y is deliberately left alone — the options overlay spends it on UNBIND, and a
 	// button that means "delete a binding" on one screen and "change your character" on the next is
 	// the kind of overload this tranche exists to avoid.
+	//
+	// *** ONLY WHILE THE LOADOUT MAY CHANGE. *** With the loadout page this is CHANGE LOADOUT, and in
+	// live play it was a way round "locked until halftime". The server refuses it now; the key is not
+	// read and not offered here either, by the same rule, so the legend never shows a dead key.
+	if (CanChangeLoadout(PC))
 	{
 		const bool bPadAlt = TracePadMenu::AltPressed(PC);
 		if (PC->WasInputKeyJustPressed(EKeys::C) || bPadAlt)
 		{
 			if (bPadAlt)
 			{
-				UE_LOG(LogTraceGame, Display, TEXT("[TeamSelect] Pad X -> change character."));
+				UE_LOG(LogTraceGame, Display, TEXT("[TeamSelect] Pad X -> change loadout."));
 			}
 			PC->ServerRequestCharacterSwitch();
 			return;
@@ -474,15 +462,17 @@ void FTraceTeamSelect::PollInput(ATracePlayerController* PC, ATracePlayerState* 
 	const int32 HighlightBefore = Highlighted;
 	if (NavDir != 0)
 	{
+		// The menus' one shared repeat clock, so the team page, the loadout page and the pause menu
+		// scroll at one speed.
 		if (NavDir != LastNavDir)
 		{
 			LastNavDir = NavDir;
-			NextNavTime = Now + NavRepeatDelay;
+			NextNavTime = Now + TracePadMenu::RepeatDelay;
 			Highlighted = FMath::Clamp(Highlighted + NavDir, 0, RowCount - 1);
 		}
 		else if (Now >= NextNavTime)
 		{
-			NextNavTime = Now + NavRepeatInterval;
+			NextNavTime = Now + TracePadMenu::RepeatInterval;
 			Highlighted = FMath::Clamp(Highlighted + NavDir, 0, RowCount - 1);
 		}
 	}
@@ -512,11 +502,11 @@ void FTraceTeamSelect::PollInput(ATracePlayerController* PC, ATracePlayerState* 
 	// ---- Commit ---------------------------------------------------------------------------------
 	//
 	// D32-PADMENU — A, through the SAME Confirm the keyboard and the mouse call, so the screen's own
-	// belief test and its request cooldown apply to a pad exactly as they do to a key.
+	// belief test and its request cooldown apply to a pad exactly as they do to a key. NOT SPACE: it is
+	// Jump, and it is the key a player is most likely to be holding when this screen appears.
 	{
 		const bool bPadConfirm = TracePadMenu::ConfirmPressed(PC);
-		if (PC->WasInputKeyJustPressed(EKeys::Enter) || PC->WasInputKeyJustPressed(EKeys::SpaceBar)
-			|| bPadConfirm)
+		if (PC->WasInputKeyJustPressed(EKeys::Enter) || bPadConfirm)
 		{
 			if (bPadConfirm)
 			{
@@ -612,11 +602,19 @@ void FTraceTeamSelect::Confirm(ATracePlayerController* PC, ATracePlayerState* Lo
 	// costs no round trip and produces the same message.
 	const AGameStateBase* const BaseGameState = (PC->GetWorld() != nullptr) ? PC->GetWorld()->GetGameState() : nullptr;
 	FString Reason;
+	bool bDestinationFull = false;
 	if (LocalState != nullptr && LocalState->Team != Wanted
-		&& !ATraceGameMode::IsTeamSwitchAllowed(BaseGameState, LocalState, Wanted, Reason))
+		&& !ATraceGameMode::IsTeamSwitchAllowed(BaseGameState, LocalState, Wanted, Reason, &bDestinationFull))
 	{
 		UE_LOG(LogTraceGame, Log, TEXT("[TeamSelect] Not sending %s: %s"),
 			*TraceTeamName(Wanted).ToString(), *Reason);
+
+		// SAID ON SCREEN, in the server's own words for the same refusal. It used to be a log line
+		// only, so the press looked like it had done nothing.
+		LocalVerdict = bDestinationFull
+			? TRACE_TEXTF("TEAMSELECT.VERDICT_TEAM_FULL", "REFUSED - {0} IS FULL", { TraceTeamName(Wanted).ToString().ToUpper() })
+			: TRACE_TEXT("TEAMSELECT.VERDICT_WOULD_UNBALANCE", "REFUSED - THAT WOULD STACK THE TEAMS");
+		LocalVerdictTime = Now;
 		return;
 	}
 
@@ -642,8 +640,24 @@ void FTraceTeamSelect::DebugPick(ETraceTeam Team, ATracePlayerController* PC, AT
 // Draw
 // =============================================================================================
 
+bool FTraceTeamSelect::CanChangeLoadout(const ATracePlayerController* PC)
+{
+	// The server's own rule (ServerRequestCharacterSwitch asks the same function), plus the switch
+	// that makes the key meaningless altogether.
+	return PC != nullptr && UTraceAbilityComponent::AreCharactersEnabled(PC)
+		&& TraceLoadoutSelect::IsReopenAllowed(PC);
+}
+
 FString FTraceTeamSelect::VerdictLine(const ATracePlayerController* PC) const
 {
+	// THIS SCREEN'S OWN REFUSAL, when it is the newer of the two: the balance rule said no before
+	// anything was sent, and the player is told so rather than seeing a press do nothing.
+	const bool bLocalIsNewer = (PC == nullptr) || (LocalVerdictTime >= PC->LastTeamResultLocalTime);
+	if (!LocalVerdict.IsEmpty() && bLocalIsNewer && (Now - LocalVerdictTime) <= TraceTeamSelectStyle::MessageDuration)
+	{
+		return LocalVerdict;
+	}
+
 	if (PC == nullptr || (Now - PC->LastTeamResultLocalTime) > TraceTeamSelectStyle::MessageDuration)
 	{
 		return FString();
@@ -670,151 +684,140 @@ FString FTraceTeamSelect::VerdictLine(const ATracePlayerController* PC) const
 
 void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerState* LocalState)
 {
-	using namespace TraceTeamSelectLayout;
-	using namespace TraceTeamSelectStyle;
-
 	const float S = UIScale;
 	const float CenterX = ViewW * 0.5f;
 
-	HUD->DrawRect(Backdrop, 0.f, 0.f, ViewW, ViewH);
-
-	// A wash at the top and the floor in the colour of the team the player is ON, so the screen is
-	// legible at a glance as "you are currently blue" before a word is read.
-	{
-		const FLinearColor Tint = TraceTeamColor((LocalState != nullptr) ? LocalState->Team : ETraceTeam::None);
-		constexpr int32 Bands = 10;
-		const float WashH = 300.f * S;
-		for (int32 Band = 0; Band < Bands; ++Band)
-		{
-			const float T = static_cast<float>(Band) / static_cast<float>(Bands);
-			const float BandY = WashH * T;
-			const float BandH = (WashH / Bands) + 1.f;
-
-			HUD->DrawRect(WithAlpha(Tint, 0.055f * (1.f - T)), 0.f, BandY, ViewW, BandH);
-			HUD->DrawRect(WithAlpha(Plate, 0.32f * (1.f - T)), 0.f, ViewH - BandY - BandH, ViewW, BandH);
-		}
-	}
+	// OPAQUE BLACK (stylespec §1): by the time this ticks the HUD has drawn ammo, health, the
+	// scoreboard and the crosshair, and one opaque page is what makes a modal modal.
+	TraceMenuKit::DrawBackground(HUD, ViewW, ViewH);
 
 	// ---- Header ---------------------------------------------------------------------------------
-	TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.TITLE", "SELECT YOUR TEAM"), Ink, CenterX, HeaderTop * S,
-		TitleSize * S, TitleTrack * S, TraceText::EHAlign::Center);
+	const float TitleSize = TraceTeamSelectLayout::TitleSize * S;
+	const float TitleTop = TraceTeamSelectLayout::HeaderTop * S;
+	const FString TitleText = TRACE_TEXT("TEAMSELECT.TITLE", "SELECT YOUR TEAM");
+	TraceTeamSelectFile::Text(HUD, TitleText, TraceMenuArtStyle::WordDefault,
+		CenterX, TitleTop, TitleSize, TraceTeamSelectLayout::TitleTrack * S, TraceText::EHAlign::Center);
+	const float TitleRight = CenterX
+		+ 0.5f * TraceTeamSelectFile::Width(TitleText, TitleSize, TraceTeamSelectLayout::TitleTrack * S);
 
-	// The close-out countdown, right-aligned against the margin. A timeout the player cannot see is
-	// indistinguishable from the game deciding at random for them — the same argument the character
-	// select's own countdown makes.
+	// The close-out countdown, right-aligned against the margin and sat on the title's cap line. A
+	// timeout the player cannot see is indistinguishable from the game deciding at random for them.
 	if (PC != nullptr && PC->TeamSelectDeadlineServerTime > 0.f)
 	{
 		const float Remaining = PC->GetTeamSelectTimeRemaining();
 		const bool bUrgent = Remaining <= 5.f;
+		const FLinearColor Amber = TraceMenuArtStyle::AmberLifted();
 		const FLinearColor CountColor = bUrgent
-			? WithAlpha(Danger, 0.72f + 0.28f * FMath::Sin(Now * 9.f))
-			: InkSoft;
+			? TraceTeamSelectStyle::WithAlpha(Amber, 0.72f + 0.28f * FMath::Sin(Now * 9.f))
+			: TraceMenuKit::FurnitureUnselected;
 
-		TraceTeamSelectFile::Text(HUD,
-			TRACE_TEXTF("TEAMSELECT.COUNTDOWN", "KEEPING YOUR TEAM IN {0}",
-				{ FMath::Max(0, FMath::CeilToInt(Remaining)) }),
-			CountColor, ViewW - (Margin * S), (HeaderTop + 16.f) * S,
-			SizeLabel * S, TrackLabel * S, TraceText::EHAlign::Right);
+		TraceText::FStyle CountStyle(TraceTeamSelectLayout::SizeLabel * S, CountColor, ETraceTextWeight::Light);
+		CountStyle.Tracking = TraceTeamSelectLayout::TrackLabel * S;
+		CountStyle.HAlign = TraceText::EHAlign::Right;
+		const FString CountText = TRACE_TEXTF("TEAMSELECT.COUNTDOWN", "KEEPING YOUR TEAM IN {0}",
+			{ FMath::Max(0, FMath::CeilToInt(Remaining)) });
+		const float CountRight = ViewW - TraceTeamSelectLayout::Margin * S;
+
+		// Beside the title where there is room, under it where there is not: on a 5:4 window the two
+		// ran into each other.
+		float CapMid = TitleTop + TraceText::Ascent(TitleSize, ETraceTextWeight::Light)
+			- TraceText::CapHeight(TitleSize, ETraceTextWeight::Light) * 0.5f;
+		if (CountRight - TraceText::MeasureWidth(CountText, CountStyle) < TitleRight + 24.f * S)
+		{
+			CapMid = TitleTop + TraceText::LineHeight(TitleSize) + 10.f * S;
+		}
+		TraceMenuKit::DrawTextCapCentered(HUD, CountText, CountRight, CapMid, CountStyle);
 	}
 
-	// NO RULE LINE UNDER THE TITLE. It spelled out the balance rule in two sentences across the whole
-	// width; the co-developer's text pass removed it. A refusal still explains itself at the moment it
-	// happens — the verdict line below turns red with "REFUSED - UNEVEN TEAMS" — which is when the
-	// player needs it.
-
 	// ---- The two plates -------------------------------------------------------------------------
-	const float AvailW = ViewW - (2.f * Margin * S) - (PlateGap * S);
-	const float PlateW = FMath::Min(PlateMaxW * S, AvailW * 0.5f);
-	const float TotalW = (PlateW * 2.f) + (PlateGap * S);
+	const float Gap = TraceTeamSelectLayout::PlateGap * S;
+	const float AvailW = ViewW - (2.f * TraceTeamSelectLayout::Margin * S) - Gap;
+	const float PlateW = FMath::Min(TraceTeamSelectLayout::PlateMaxW * S, AvailW * 0.5f);
+	const float TotalW = (PlateW * 2.f) + Gap;
 	const float FirstX = CenterX - (TotalW * 0.5f);
+	const float PlateY = TraceTeamSelectLayout::PlateTop * S;
+	const float PlateHeight = TraceTeamSelectLayout::PlateH * S;
 
-	DrawTeamPlate(HUD, PC, LocalState, RowBlue, FirstX, PlateTop * S, PlateW, PlateH * S);
-	DrawTeamPlate(HUD, PC, LocalState, RowOrange, FirstX + PlateW + (PlateGap * S), PlateTop * S, PlateW, PlateH * S);
+	// The highlighted plate LAST, so a neighbour cannot paint over its glow.
+	const int32 FirstRow = (Highlighted == RowBlue) ? RowOrange : RowBlue;
+	for (const int32 Row : { FirstRow, Highlighted })
+	{
+		DrawTeamPlate(HUD, PC, LocalState, Row, FirstX + (Row == RowOrange ? PlateW + Gap : 0.f), PlateY,
+			PlateW, PlateHeight);
+	}
 
-	// ---- The server's verdict -------------------------------------------------------------------
+	// ---- The verdict ----------------------------------------------------------------------------
 	{
 		const FString Verdict = VerdictLine(PC);
 		if (!Verdict.IsEmpty())
 		{
-			// THE RED ASKS THE VERDICT, NOT THE WORDS. This read StartsWith("REFUSED") while the
-			// wording lived in this file and could not move; now that the wording is editable, an
-			// owner who rewrote a refusal would have had it quietly turn white. Same three results,
-			// same red, whatever the document says.
-			const bool bRefusal = (PC != nullptr)
+			// THE COLOUR ASKS THE VERDICT, NOT THE WORDS, so an owner who rewords a refusal cannot turn
+			// it white. Amber is the kit's danger colour.
+			const bool bLocal = !LocalVerdict.IsEmpty() && Verdict == LocalVerdict;
+			const bool bRefusal = bLocal || ((PC != nullptr)
 				&& (PC->LastTeamResult == ETraceTeamChangeResult::WouldUnbalance
 					|| PC->LastTeamResult == ETraceTeamChangeResult::TeamFull
-					|| PC->LastTeamResult == ETraceTeamChangeResult::NotAllowed);
-			TraceTeamSelectFile::Text(HUD, Verdict, bRefusal ? Danger : Ink, CenterX, VerdictY * S,
-				SizeLead * S, 1.4f * S, TraceText::EHAlign::Center);
+					|| PC->LastTeamResult == ETraceTeamChangeResult::NotAllowed));
+			TraceTeamSelectFile::Text(HUD, Verdict,
+				bRefusal ? TraceMenuArtStyle::AmberLifted() : TraceMenuArtStyle::WordDefault,
+				CenterX, TraceTeamSelectLayout::VerdictY * S, TraceTeamSelectLayout::SizeLead * S, 1.4f * S,
+				TraceText::EHAlign::Center);
 		}
 	}
 
-	// ---- Footer ---------------------------------------------------------------------------------
+	DrawFooter(HUD, PC);
+	DrawCursor(HUD, PC);
+}
+
+void FTraceTeamSelect::DrawFooter(AHUD* HUD, ATracePlayerController* PC)
+{
+	// ---- Key legend -----------------------------------------------------------------------------
 	//
-	// D32-PADMENU — ONE line, not two, and the pad's half only appears once a controller has been
-	// seen on this machine (UTraceGamepadInputSubsystem::HasSeenGamepadInput). A keyboard-only player
-	// reads exactly what they read before this tranche; a player holding a pad is told the three
-	// buttons that do something here and nothing else. The hint is gated, the INPUT never is — the
-	// first button a player presses has to work, and it cannot if the screen is waiting to have seen
-	// one.
+	// KEY chips and one-word verbs, the loadout page's legend on the same line, so the page turn does
+	// not move the footer. The pad's line appears once a controller has been seen on this machine
+	// (the hint is gated; the input never is). CHANGE LOADOUT appears only while it is allowed.
+	const float S = UIScale;
+	const bool bLoadout = CanChangeLoadout(PC);
+	const FString ChooseWord = TRACE_TEXT("TEAMSELECT.LEGEND_CHOOSE", "CHOOSE");
+	const FString SelectWord = TRACE_TEXT("TEAMSELECT.LEGEND_SELECT", "SELECT");
+	const FString LoadoutWord = TRACE_TEXT("TEAMSELECT.LEGEND_LOADOUT", "LOADOUT");
+	const FString CloseWord = TRACE_TEXT("TEAMSELECT.LEGEND_CLOSE", "CLOSE");
+
+	TArray<FTraceKitLegendItem> Keyboard;
+	Keyboard.Add({ TRACE_TEXT("TEAMSELECT.KEY_MOVE", "ARROWS"), ChooseWord });
+	Keyboard.Add({ TRACE_TEXT("TEAMSELECT.KEY_SELECT", "ENTER"), SelectWord });
+	if (bLoadout)
 	{
-		const FString KeyboardLine = TRACE_TEXTF("TEAMSELECT.FOOTER_KEYBOARD",
-			"1 / 2 OR ARROWS + ENTER   SELECT TEAM        C   CHANGE LOADOUT        {0}   CLOSE",
-			{ FString(OpenKeyName()) });
+		Keyboard.Add({ TRACE_TEXT("TEAMSELECT.KEY_LOADOUT", "C"), LoadoutWord });
+	}
+	Keyboard.Add({ TRACE_TEXTF("TEAMSELECT.KEY_CLOSE", "{0}", { FString(OpenKeyName()) }), CloseWord });
 
-		// A SECOND LINE, NOT A LONGER ONE. The keyboard line is already 95 characters and fills a
-		// 1280-wide window at this point size; appending the pad's three buttons to it would have run
-		// off both edges, and the shrink-to-fit below would then have answered by making the whole
-		// legend too small to read. The reference layout is 1080 high and this line sits at 900, so
-		// there is room under it — measured, not assumed: FooterY + PadFooterGap is 928 of 1080.
-		const bool bPadLine = TracePadMenu::HasSeenPad(PC);
-		const FString PadLine = TRACE_TEXT("TEAMSELECT.FOOTER_GAMEPAD",
-			"A   SELECT TEAM        X   CHANGE LOADOUT        B   CLOSE");
-
-		// ---- FIT, and it turned out to be needed for a line that predates this tranche -----------
-		//
-		// PHOTOGRAPHED, not assumed: at 800x600 the KEYBOARD line above already ran off BOTH edges of
-		// the screen — it is typeset against a 1920-wide reference and UIScale only follows the
-		// HEIGHT, so a 4:3 window gets full-size type in two thirds of the width. The pad line is
-		// shorter and fitted anyway; both are measured together and given the SAME scale, because two
-		// legends for two devices set at two sizes would read as a mistake.
-		//
-		// The 0.70 floor is the same trade UI plan WP5 made on the JOIN panel: below it the type is
-		// unreadable and clipping is the better failure. Nothing changes at 16:9, where both lines
-		// already fit at 1.0 — verified at 1280x720.
-		const float FooterRoom = ViewW - 2.f * Margin * S;
-		float FooterScale = 1.f;
+	TArray<FTraceKitLegendItem> Pad;
+	if (TracePadMenu::HasSeenPad(PC))
+	{
+		Pad.Add({ TRACE_TEXT("TEAMSELECT.PAD_KEY_MOVE", "D-PAD"), ChooseWord });
+		Pad.Add({ TRACE_TEXT("TEAMSELECT.PAD_KEY_SELECT", "A"), SelectWord });
+		if (bLoadout)
 		{
-			float Widest = TraceTeamSelectFile::Width(KeyboardLine, SizeBody * S, TrackLabel * S);
-			if (bPadLine)
-			{
-				Widest = FMath::Max(Widest, TraceTeamSelectFile::Width(PadLine, SizeBody * S, TrackLabel * S));
-			}
-			if (Widest > FooterRoom && Widest > 1.f)
-			{
-				FooterScale = FMath::Max(0.70f, FooterRoom / Widest);
-			}
+			Pad.Add({ TRACE_TEXT("TEAMSELECT.PAD_KEY_LOADOUT", "X"), LoadoutWord });
 		}
-
-		TraceTeamSelectFile::Text(HUD, KeyboardLine, InkSoft, CenterX, FooterY * S,
-			SizeBody * S * FooterScale, TrackLabel * S * FooterScale, TraceText::EHAlign::Center);
-
-		if (bPadLine)
-		{
-			TraceTeamSelectFile::Text(HUD, PadLine, Ink, CenterX, (FooterY + PadFooterGap) * S,
-				SizeBody * S * FooterScale, TrackLabel * S * FooterScale, TraceText::EHAlign::Center);
-		}
+		Pad.Add({ TRACE_TEXT("TEAMSELECT.PAD_KEY_CLOSE", "B"), CloseWord });
 	}
 
-	DrawCursor(HUD);
+	// ONE SCALE FOR BOTH LINES, fitted to the window: UIScale follows the height, so a 4:3 window gets
+	// full-size type in two thirds of the width.
+	const float FullChipH = TraceTeamSelectLayout::FooterChipH * S;
+	const float ChipH = TraceMenuKit::KeyLegendFit(FullChipH, ViewW - 2.f * TraceTeamSelectLayout::Margin * S,
+		{ TraceMenuKit::KeyLegendWidth(Keyboard, FullChipH), TraceMenuKit::KeyLegendWidth(Pad, FullChipH) });
+
+	const float FooterTop = TraceTeamSelectLayout::FooterY * S;
+	TraceMenuKit::DrawKeyLegend(HUD, Keyboard, ViewW * 0.5f, FooterTop, ChipH, Now);
+	TraceMenuKit::DrawKeyLegend(HUD, Pad, ViewW * 0.5f, FooterTop + TraceTeamSelectLayout::PadFooterGap * S, ChipH, Now);
 }
 
 void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATracePlayerState* LocalState,
 	int32 Row, float X, float Y, float W, float H)
 {
-	using namespace TraceTeamSelectLayout;
-	using namespace TraceTeamSelectStyle;
-
 	const float S = UIScale;
 	const ETraceTeam Team = TeamForRow(Row);
 	const FLinearColor Tint = TraceTeamColor(Team);
@@ -825,39 +828,43 @@ void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATra
 	const bool bCurrent = (LocalState != nullptr) && (LocalState->Team == Team);
 
 	// The rule, asked exactly as the server will ask it. bAllowed is FALSE only for a row that would
-	// actually be refused, so "greyed" and "would be refused" are the same fact rather than two.
+	// actually be refused, so "the disabled plate" and "would be refused" are the same fact.
 	const AGameStateBase* const BaseGameState =
 		(PC != nullptr && PC->GetWorld() != nullptr) ? PC->GetWorld()->GetGameState() : nullptr;
 
 	FString Reason;
+	bool bDestinationFull = false;
 	const bool bAllowed = bCurrent
-		|| ATraceGameMode::IsTeamSwitchAllowed(BaseGameState, LocalState, Team, Reason);
+		|| ATraceGameMode::IsTeamSwitchAllowed(BaseGameState, LocalState, Team, Reason, &bDestinationFull);
 
-	// ---- Plate ---------------------------------------------------------------------------------
-	const float FillMul = bAllowed ? 1.f : 0.45f;
-	HUD->DrawRect(WithAlpha(Dimmed(Plate, 0.62f * FillMul), 0.94f), X, Y, W, H);
+	// ---- Plate: the kit's, in the state the row is in -------------------------------------------
+	const ETraceKitState State = TraceMenuKit::StateFor(bAllowed, bHighlighted);
+	const FTraceKitVisuals Visuals = TraceMenuKit::VisualsFor(State);
+	TraceMenuKit::DrawStatePlate(HUD, State, X, Y, W, H, Now, TraceTeamSelectLayout::PlateCorner * S);
 
-	// A band of the team's own colour across the top of the plate. It is the fastest read on the
-	// screen and the one thing that makes an ORANGE choice look orange before any text is parsed —
-	// which is the whole reason the amber team has never appeared in a screenshot of this game.
-	HUD->DrawRect(WithAlpha(Dimmed(Tint, FillMul), bHighlighted ? 1.f : 0.75f), X, Y, W, 10.f * S);
+	const float PadX = TraceTeamSelectLayout::PlatePad * S;
+	float CursorY = Y + PadX;
 
-	TraceTeamSelectFile::StrokeRect(HUD, X, Y, W, H, FMath::Max(1.f, (bHighlighted ? 3.f : 1.f) * S),
-		bHighlighted ? WithAlpha(Tint, 1.f) : WithAlpha(Ink, 0.28f));
+	// ---- Name, the team's colour under it, and the key chip -----------------------------------------
+	const float NameSize = TraceTeamSelectLayout::SizeDisplay * S;
+	TraceTeamSelectFile::Text(HUD, TraceTeamName(Team).ToString().ToUpper(), Visuals.Label,
+		X + PadX, CursorY, NameSize, 3.0f * S);
 
-	const float PadX = PlatePad * S;
-	float CursorY = Y + (PlatePad * S) + (14.f * S);
+	const float ChipH = TraceTeamSelectLayout::PlateChipH * S;
+	const FString KeyName = (Row == RowBlue)
+		? TRACE_TEXT("TEAMSELECT.PLATE_KEY_BLUE", "1")
+		: TRACE_TEXT("TEAMSELECT.PLATE_KEY_ORANGE", "2");
+	const float ChipW = TraceMenuKit::KeyChipWidth(KeyName, ChipH);
+	TraceMenuKit::DrawKeyChip(HUD, bAllowed ? ETraceKitState::Default : ETraceKitState::Disabled,
+		X + W - PadX - ChipW, CursorY + (TraceText::LineHeight(NameSize) - ChipH) * 0.5f, ChipH, KeyName, Now);
 
-	// ---- Name and key chip ----------------------------------------------------------------------
-	TraceTeamSelectFile::Text(HUD, TraceTeamName(Team).ToString().ToUpper(),
-		bAllowed ? Ink : Dimmed(Ink, 0.6f), X + PadX, CursorY, SizeDisplay * S, 3.0f * S);
+	CursorY += TraceText::LineHeight(NameSize) + (4.f * S);
 
-	TraceTeamSelectFile::Text(HUD, (Row == RowBlue)
-			? TRACE_TEXT("TEAMSELECT.PLATE_KEY_BLUE", "1")
-			: TRACE_TEXT("TEAMSELECT.PLATE_KEY_ORANGE", "2"),
-		InkDim, X + W - PadX, CursorY + (10.f * S), SizeLead * S, 0.f, TraceText::EHAlign::Right);
-
-	CursorY += TraceText::LineHeight(SizeDisplay * S) + (14.f * S);
+	// THE TEAM'S COLOUR, as an accent under its name: the fastest read on the screen, and the one
+	// thing that makes the orange side look orange before a word is parsed. Dimmed with the plate.
+	HUD->DrawRect(bAllowed ? Tint : TraceTeamSelectStyle::WithAlpha(Tint, 0.35f), X + PadX, CursorY, 96.f * S,
+		FMath::Max(2.f, 4.f * S));
+	CursorY += 18.f * S;
 
 	// ---- The count, which is what the rule is about ---------------------------------------------
 	TArray<const ATracePlayerState*> Members;
@@ -883,91 +890,94 @@ void FTraceTeamSelect::DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATra
 	TraceTeamSelectFile::Text(HUD,
 		TRACE_TEXTF("TEAMSELECT.PLATE_COUNT", "{0} / {1}   ({2} BOT{3})",
 			{ Members.Num(), TeamCap, BotCount, BotSuffix }),
-		InkSoft, X + PadX, CursorY, SizeLead * S, 1.4f * S);
+		Visuals.Furniture, X + PadX, CursorY, TraceTeamSelectLayout::SizeLead * S, 1.4f * S);
 
-	CursorY += TraceText::LineHeight(SizeLead * S) + (18.f * S);
+	CursorY += TraceText::LineHeight(TraceTeamSelectLayout::SizeLead * S) + (14.f * S);
 
 	// A hairline under the header block.
-	HUD->DrawRect(WithAlpha(Ink, 0.18f), X + PadX, CursorY, W - (2.f * PadX), FMath::Max(1.f, 1.f * S));
-	CursorY += 18.f * S;
+	HUD->DrawRect(TraceTeamSelectStyle::WithAlpha(Visuals.Furniture, 0.22f), X + PadX, CursorY, W - (2.f * PadX),
+		FMath::Max(1.f, 1.f * S));
+	CursorY += 16.f * S;
 
 	// ---- The roster ------------------------------------------------------------------------------
 	//
-	// Names, because "3 / 5" does not answer the question a player actually has, which is "are my
-	// friends on that side". Bots are labelled rather than hidden: a bot on the destination is the
-	// reason a switch that looks like it would stack the teams is allowed, and a player who cannot
-	// see the bots cannot see why.
-	const float RowH = TraceText::LineHeight(SizeBody * S) + (6.f * S);
+	// Names, because "3 / 5" does not answer "are my friends on that side". Bots are labelled rather
+	// than hidden: a bot on the destination is why a switch that looks like it would stack the teams
+	// is allowed.
+	const float BodySize = TraceTeamSelectLayout::SizeBody * S;
+	const float LabelSize = TraceTeamSelectLayout::SizeLabel * S;
+	const float RowH = TraceText::LineHeight(BodySize) + (6.f * S);
+	const float StatusY = Y + H - PadX - TraceText::LineHeight(LabelSize);
+	const FLinearColor Quiet = TraceMenuArtStyle::WordDisabled;
 	for (const ATracePlayerState* const Member : Members)
 	{
-		if (CursorY + RowH > Y + H - (PlatePad * S) - (46.f * S))
+		if (CursorY + RowH > StatusY - (8.f * S))
 		{
-			TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.ROSTER_MORE", "..."), InkDim,
-				X + PadX, CursorY, SizeBody * S);
+			TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.ROSTER_MORE", "..."), Quiet,
+				X + PadX, CursorY, BodySize);
 			break;
 		}
 
 		const bool bIsYou = (Member == LocalState);
-		const FLinearColor NameColor = bIsYou ? Tint : (Member->IsABot() ? InkDim : InkSoft);
+		const FLinearColor NameColor = bIsYou ? Tint : (Member->IsABot() ? Quiet : Visuals.Furniture);
 
 		TraceTeamSelectFile::Text(HUD, TraceTeamSelectFile::SafeName(Member), NameColor,
-			X + PadX, CursorY, SizeBody * S);
+			X + PadX, CursorY, BodySize);
 
 		if (bIsYou)
 		{
 			TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.ROSTER_YOU", "YOU"), Tint,
-				X + W - PadX, CursorY,
-				SizeLabel * S, TrackLabel * S, TraceText::EHAlign::Right);
+				X + W - PadX, CursorY, LabelSize, TraceTeamSelectLayout::TrackLabel * S, TraceText::EHAlign::Right);
 		}
 		else if (Member->IsABot())
 		{
-			TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.ROSTER_BOT", "BOT"), InkDim,
-				X + W - PadX, CursorY,
-				SizeLabel * S, TrackLabel * S, TraceText::EHAlign::Right);
+			TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.ROSTER_BOT", "BOT"), Quiet,
+				X + W - PadX, CursorY, LabelSize, TraceTeamSelectLayout::TrackLabel * S, TraceText::EHAlign::Right);
 		}
 
 		CursorY += RowH;
 	}
 
-	// ---- The footer of the plate: what pressing it would do ---------------------------------------
-	const float StatusY = Y + H - (PlatePad * S) - TraceText::LineHeight(SizeLabel * S);
+	// ---- The foot of the plate: what pressing it would do ---------------------------------------
 	if (bCurrent)
 	{
 		TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.PLATE_STATUS_CURRENT", "YOUR TEAM"), Tint,
-			X + PadX, StatusY,
-			SizeLabel * S, TrackLabel * S);
+			X + PadX, StatusY, LabelSize, TraceTeamSelectLayout::TrackLabel * S);
 	}
 	else if (!bAllowed)
 	{
-		// The reason, VERBATIM from the rule, so the greyed plate and the server's refusal say the
-		// same thing in the same words.
-		TraceTeamSelectFile::Text(HUD, Reason, Danger, X + PadX, StatusY, SizeLabel * S, TrackLabel * S);
+		// TWO WORDS, NOT THE RULE'S SENTENCE. The rule's reason ("BLUE IS FULL (5/5) AND HAS NO BOT TO
+		// STAND DOWN") is a log line built outside the text document; the plate says which of the two
+		// refusals it is, in words the document owns.
+		TraceTeamSelectFile::Text(HUD,
+			bDestinationFull ? TRACE_TEXT("TEAMSELECT.PLATE_STATUS_FULL", "FULL")
+			                 : TRACE_TEXT("TEAMSELECT.PLATE_STATUS_UNEVEN", "UNEVEN TEAMS"),
+			TraceMenuArtStyle::AmberLifted(), X + PadX, StatusY, LabelSize, TraceTeamSelectLayout::TrackLabel * S);
 	}
 	else
 	{
-		TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.PLATE_STATUS_JOIN", "PRESS TO JOIN"), Ink,
-			X + PadX, StatusY,
-			SizeLabel * S, TrackLabel * S);
+		TraceTeamSelectFile::Text(HUD, TRACE_TEXT("TEAMSELECT.PLATE_STATUS_JOIN", "PRESS TO JOIN"), Visuals.Label,
+			X + PadX, StatusY, LabelSize, TraceTeamSelectLayout::TrackLabel * S);
 	}
 }
 
-void FTraceTeamSelect::DrawCursor(AHUD* HUD)
+void FTraceTeamSelect::DrawCursor(AHUD* HUD, ATracePlayerController* PC)
 {
-	if (!bHasCursor)
+	// Not while something in front owns the pointer: that surface draws the live one.
+	if (!bHasCursor || !bPointerOwned)
 	{
 		return;
 	}
 
-	// ONE POINTER, DRAWN IN ONE PLACE. The same shared draw the character select, the options menu
-	// and the menu HUD all call; the fallback cross below is the same fallback they use.
-	if (TraceHardwareCursor::DrawPointer(HUD, CursorPos, UIScale))
+	// ONE POINTER, DRAWN IN ONE PLACE: the kit's blade, with the OS arrow's lease renewed as it draws.
+	if (TraceMenuKit::ShowCursor(HUD, PC, TEXT("team select"), CursorPos, UIScale))
 	{
 		return;
 	}
 
 	const float Size = 9.f * UIScale;
 	const float Thick = FMath::Max(1.f, 1.5f * UIScale);
-	const FLinearColor Color = TraceTeamSelectStyle::WithAlpha(TraceTeamSelectStyle::Ink, 0.95f);
+	const FLinearColor Color = TraceMenuArtStyle::WordDefault;
 
 	HUD->DrawLine(CursorPos.X - Size, CursorPos.Y, CursorPos.X - Size * 0.35f, CursorPos.Y, Color, Thick);
 	HUD->DrawLine(CursorPos.X + Size * 0.35f, CursorPos.Y, CursorPos.X + Size, CursorPos.Y, Color, Thick);

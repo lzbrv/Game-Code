@@ -4,15 +4,16 @@
 // team select menu. Players should load into team select before character select."
 //
 // D32-PADMENU: A CONTROLLER DRIVES THIS SCREEN TOO. D-pad or left stick moves the highlight, A
-// confirms, B closes (the pad's H), X changes character (the pad's C). The buttons come from
-// TracePadMenu in Settings/TraceGamepadInput.h so that this screen, the character screen, the title
-// screen and the options overlay cannot disagree about what A means; the REPEAT CLOCK stays this
-// screen's own, shared with its arrow keys, so a thumb and a finger scroll at the same speed here.
+// confirms, B closes (the pad's H), X changes loadout (the pad's C) while the loadout may change.
+// The buttons come from TracePadMenu in Settings/TraceGamepadInput.h so that this screen, the
+// character screen, the title screen and the options overlay cannot disagree about what A means;
+// the REPEAT CLOCK is the menus' shared one (TracePadMenu::RepeatDelay / RepeatInterval), shared
+// with the arrow keys, so a thumb and a finger scroll at the same speed here and on the next page.
 // The one thing a pad cannot do is OPEN this screen mid-match — see PollOpenHotkey.
 //
 // SHAPED EXACTLY LIKE FTraceCharacterSelect, and read that file's header first — every argument it
 // makes applies here unchanged. It is plain C++ rather than a UObject (it holds nothing that
-// outlives a frame and never replicates), it draws entirely through AHUD::DrawRect / DrawText, and
+// outlives a frame and never replicates), it draws through the handmade kit (TraceMenuKit), and
 // it POLLS input rather than binding it. The polling argument is if anything stronger here: this
 // screen is up during the warm-up before any pawn exists, AND it has to answer a key (H) that is
 // pressed while the screen is CLOSED and the gameplay input component owns the keyboard.
@@ -77,10 +78,12 @@ public:
 	 *
 	 * @param PC            the LOCAL controller. Null closes the overlay — the open flag lives on it.
 	 * @param LocalState    the local player's state, for their current team. May be null early.
-	 * @param bInputAllowed false while something in front of this owns the keyboard (the pause menu).
-	 *                      The screen still DRAWS, for the reason the character select still draws:
-	 *                      a screen that vanished behind the pause menu would read as the choice
-	 *                      having been cancelled, and the close-out clock is still running under it.
+	 * @param bInputAllowed false while something in front of this owns the keyboard AND the pointer
+	 *                      (the pause menu). The screen still DRAWS, for the reason the character
+	 *                      select still draws: a screen that vanished behind the pause menu would read
+	 *                      as the choice having been cancelled, and the close-out clock is still
+	 *                      running under it. It does not draw its POINTER then: the surface in front
+	 *                      has the live one, and a frozen blade under the scrim is a second pointer.
 	 */
 	void Tick(AHUD* HUD, ATracePlayerController* PC, ATracePlayerState* LocalState,
 		float InViewW, float InViewH, float InUIScale, float InNow, bool bInputAllowed);
@@ -134,15 +137,27 @@ private:
 	void Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerState* LocalState);
 	void DrawTeamPlate(AHUD* HUD, ATracePlayerController* PC, ATracePlayerState* LocalState,
 		int32 Row, float X, float Y, float W, float H);
-	void DrawCursor(AHUD* HUD);
+	void DrawFooter(AHUD* HUD, ATracePlayerController* PC);
+	void DrawCursor(AHUD* HUD, ATracePlayerController* PC);
+
+	/** C / pad X is offered and read only while the loadout may be changed (warm-up, half time). */
+	static bool CanChangeLoadout(const ATracePlayerController* PC);
 
 	/** The verdict line, or empty. Reads the controller's client-local last-result trio. */
 	FString VerdictLine(const ATracePlayerController* PC) const;
 
 	bool bOpen = false;
 
-	/** 0..RowCount-1. Starts on the team the player is NOT on — the only row that does anything. */
+	/**
+	 * 0..RowCount-1. STARTS ON THE PLAYER'S OWN TEAM, so the reflex "continue" press — ENTER or A —
+	 * keeps the team and moves on (the server answers AlreadyOnTeam and closes the screen). It used to
+	 * start on the other team, which made that same press a team switch.
+	 */
 	int32 Highlighted = RowBlue;
+
+	/** A refusal this screen made itself (it does not send what the balance rule already refuses). */
+	FString LocalVerdict;
+	float LocalVerdictTime = -1000.f;
 
 	/** Screen rects of the two plates as of the last draw. Hit testing and hover use them. */
 	FBox2D RowRects[RowCount];
@@ -170,12 +185,13 @@ private:
 	bool bHasCursor = false;
 	bool bMouseWasDown = false;
 
-	// ---- Held-key repeat for the left/right walk ------------------------------------------------
+	/** This screen is front-most and draws the pointer. False under the pause menu. */
+	bool bPointerOwned = true;
+
+	// ---- Held-key repeat for the left/right walk: the menus' shared clock (TracePadMenu) ---------
 
 	int32 LastNavDir = 0;
 	float NextNavTime = 0.f;
-	static constexpr float NavRepeatDelay = 0.35f;
-	static constexpr float NavRepeatInterval = 0.14f;
 };
 
 #if !UE_BUILD_SHIPPING

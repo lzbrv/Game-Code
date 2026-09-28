@@ -1,6 +1,8 @@
 #include "UI/TraceAbilityNames.h"
 
 #include "Core/TraceCharacterRoster.h"
+#include "TraceSettings.h"              // the dash cloak's tuned duration
+#include "UI/Text/TraceGameText.h"
 
 namespace TraceAbilityNames
 {
@@ -38,6 +40,13 @@ FString Describe(ETraceAbilityId Id)
 	{
 	case ETraceAbilityId::Bash:       return FString(Entry->Movement);   // now a passive
 	case ETraceAbilityId::Acrobatics: return FString(Entry->Passive);    // now a movement ability
+	case ETraceAbilityId::DashCloak:
+		// OYSTER HAS TWO PASSIVES NOW and the roster row has one passive line, PICKLE JAR's — so the
+		// unnamed dash cloak's card, which is nothing BUT its description, printed PICKLE JAR's rules a
+		// second time. Demo 35's own line instead, with the duration read from the tuning so the card
+		// cannot drift from the ability (the Demo 21 rule).
+		return TRACE_TEXTF("LOADOUT.DESC_DASH_CLOAK", "JUMPING DIRECTLY FOLLOWING A DASH CLOAKS YOU FOR {0}S.",
+			{ FString::Printf(TEXT("%.3g"), UTraceSettings::Get().OysterDashCloakDurationSeconds) });
 	default:
 		break;
 	}

@@ -100,7 +100,7 @@ public:
 	 * needed both of those call sites to learn about it, and either one missed is a player left
 	 * unable to move or an ammo counter drawn over a full-screen menu.
 	 */
-	bool IsOpen() const { return bOpen || TeamSelect.IsOpen(); }
+	bool IsOpen() const { return bOpen || TeamSelect.IsOpen() || bHandoffHeld; }
 
 	/**
 	 * Is the TEAM screen specifically up?
@@ -205,6 +205,23 @@ private:
 	bool bOverlayOpen = false;
 
 	/**
+	 * THE HANDOFF, held for a moment: team select has just closed and the select window has not
+	 * arrived yet, for a player who is certainly about to get one.
+	 *
+	 * The server now opens the window in the same call that closes team select, so on the host both
+	 * flags flip together. On a remote client they are two replicated properties on two actors (the
+	 * controller and the player state) and can land on different net updates; for those frames
+	 * nothing was open, the overlay edge handed gameplay input back, captured the mouse and showed
+	 * the arena, and then took it all away again. This keeps the overlay "open" — and the page black —
+	 * for at most HandoffHoldSeconds while the player is unsettled (characters on, on a team, no
+	 * character, not locked in). It is part of IsOpen(), so the pause menu closing inside the hold
+	 * cannot hand input back either.
+	 */
+	bool bHandoffHeld = false;
+	float HandoffUntil = -1000.f;
+	static constexpr float HandoffHoldSeconds = 0.5f;
+
+	/**
 	 * 0..Count-1, an index into TraceCharacterRoster::All(). Never an id; convert at the point of use.
 	 *
 	 * It is a LINEAR index even though spec v18 §2 draws the cards as a grid: the grid is a drawing
@@ -257,12 +274,13 @@ private:
 	bool bHasCursor = false;
 	bool bMouseWasDown = false;
 
-	// ---- Held-key repeat for the left/right walk ------------------------------------------------
+	/** This screen is front-most and draws the pointer. False under the pause menu. */
+	bool bPointerOwned = true;
+
+	// ---- Held-key repeat for the left/right walk: the menus' shared clock (TracePadMenu) ---------
 
 	int32 LastNavDir = 0;
 	float NextNavTime = 0.f;
-	static constexpr float NavRepeatDelay = 0.35f;
-	static constexpr float NavRepeatInterval = 0.12f;
 
 #if !UE_BUILD_SHIPPING
 	// ---- Trace.Characters.ClickTest — spec v15 §4's measurement for THIS screen -------------------

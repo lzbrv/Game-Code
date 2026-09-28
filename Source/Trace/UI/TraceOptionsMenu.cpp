@@ -655,6 +655,24 @@ namespace
 			}
 		}));
 
+	FAutoConsoleCommand CmdMenuLoadout(
+		TEXT("Trace.Menu.Loadout"),
+		TEXT("Trace.Menu.Loadout <1-5>. Opens SETTINGS > LOADOUTS with that slot's editor up, on whichever ")
+		TEXT("HUD is drawing an overlay. The Trace.Menu.* family's reason: a headless run has no keyboard, ")
+		TEXT("and the library editor is otherwise three presses deep. -TraceExec=\"Trace.Menu.Loadout 2\"."),
+		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
+		{
+			const int32 Slot = (Args.Num() > 0) ? FMath::Clamp(FCString::Atoi(*Args[0]), 1, 5) : 1;
+			if (GActiveOptionsMenu != nullptr)
+			{
+				GActiveOptionsMenu->DebugOpenLoadoutEditor(Slot - 1);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Options] Trace.Menu.Loadout: no HUD is drawing an overlay yet."));
+			}
+		}));
+
 	FAutoConsoleCommand CmdMenuNudge(
 		TEXT("Trace.Menu.Nudge"),
 		TEXT("Trace.Menu.Nudge <rows-from-top> <delta>. Moves the selection and adjusts it, exactly as ")
@@ -1449,6 +1467,18 @@ void FTraceOptionsMenu::OpenAudio()
 	UE_LOG(LogTraceGame, Display, TEXT("[Options] Audio settings opened."));
 }
 
+#if !UE_BUILD_SHIPPING
+void FTraceOptionsMenu::DebugOpenLoadoutEditor(int32 SlotIndex)
+{
+	OpenSettings();
+	LoadoutsReturnPage = Page;
+	Page = EPage::Loadouts;
+	IgnoreInputBeforeFrame = GFrameCounter + 1;
+	RebuildRows();
+	LoadoutEditor.OpenLibrary(SlotIndex);
+}
+#endif
+
 void FTraceOptionsMenu::OpenController()
 {
 	Page = EPage::Controller;
@@ -2000,7 +2030,10 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 		if (!LoadoutEditor.TickLibrary(HUD, PC, InViewW, InViewH, InUIScale, InNow,
 			/*bInputAllowed=*/GFrameCounter >= IgnoreInputBeforeFrame))
 		{
-			IgnoreInputBeforeFrame = GFrameCounter + 1;
+			// TWO frames, not one: the editor now leaves on pad B, and TracePadMenu documents that one
+			// physical press can be reported on two consecutive frames. A B seen again here would run
+			// GoBack and take the player off the LOADOUTS page as well.
+			IgnoreInputBeforeFrame = GFrameCounter + 2;
 			RebuildRows();
 		}
 		return;

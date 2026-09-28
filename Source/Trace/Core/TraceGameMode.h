@@ -907,6 +907,16 @@ protected:
 	void PollCharacterSelect();
 
 public:
+	/**
+	 * Run the select poll NOW rather than at the next quarter-second tick.
+	 *
+	 * For the moment the team screen closes (ATracePlayerController::ServerSetTeamSelectOpen): the
+	 * select window then opens in the same call, so no frame falls between the two menus. The poll is
+	 * idempotent and self-correcting, so running it early can only do what the timer would have done
+	 * a moment later.
+	 */
+	void PollCharacterSelectNow() { PollCharacterSelect(); }
+
 #if !UE_BUILD_SHIPPING
 	/**
 	 * Test seam: run one select poll now, instead of waiting up to a quarter second for the timer.

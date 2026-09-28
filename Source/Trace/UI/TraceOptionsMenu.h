@@ -252,6 +252,11 @@ public:
 	 */
 	void OpenController();
 
+#if !UE_BUILD_SHIPPING
+	/** Trace.Menu.Loadout <n>: the LOADOUTS page with slot n's editor open, for a headless capture. */
+	void DebugOpenLoadoutEditor(int32 SlotIndex);
+#endif
+
 	/** Closes, fires OnClosed, and abandons any rebind that was in progress. */
 	void Close();
 
