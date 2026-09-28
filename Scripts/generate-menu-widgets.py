@@ -291,10 +291,12 @@ def set_vec2(obj, prop, x, y):
 def frame_image_size(plate_h, glow, src_plate_h, src_w, src_h):
     """Brush ImageSize for a plate drawn @plate_h tall, as a plain (w, h) pair.
 
-    Slate draws a Box brush's corners at Margin * ImageSize, so this is the
-    number that decides the corner's on-screen size. Deriving it from the
-    sheet's aspect ratio is what keeps the corner circular rather than oval at
-    every row width.
+    This is the brush's DESIRED size. It does NOT size a Box brush's slices:
+    UE 5.8's FSlateElementBatcher::AddBoxElements puts them at the TEXTURE's
+    size * Margin, whatever ImageSize says. That is harmless where the texture
+    is about as tall as the drawn image (T_MenuBtn: 76 texels, 72 px) and wrong
+    where it is not - see the DIFFICULTY value chip in build_menu_row, which
+    goes through a ScaleBox for exactly that reason.
 
     Returned as a tuple rather than an engine struct because which struct the
     engine wants is set_vec2's problem, and it can only answer it against the
@@ -408,9 +410,12 @@ PANEL_HEIGHT = (PANEL_PAD_T
 # the owner's v23 choice). A header that does not parse FAILS the run - a silent
 # default here is exactly the drift this replaces.
 #
-# ONLY THE LABEL. The DIFFICULTY value keeps 25 (FS_ROW_VALUE): it sits in the
-# 34 px value chip, not on the 60 px plate, and at the label's size its caps
-# would fill two thirds of that chip.
+# THE DIFFICULTY VALUE BY THE SAME RULE, ON ITS CHIP (visual-vs-kit F11). It
+# kept the literal 25 after the label moved, which is caps of 17 px in a chip
+# whose plate came out about 20 px tall (see VALUE_CHIP_H): "NORMAL" filled the
+# gold box edge to edge. It is now the kit's value-box proportion - the size
+# whose Light caps are LabelCapFraction of the CHIP's plate, exactly what
+# TraceMenuKit::DrawValueBox and the Canvas title's DIFFICULTY row draw.
 # =============================================================================
 
 KIT_HEADER = os.path.join(PROJECT_DIR, "Source", "Trace", "UI", "Widgets", "Menu", "TraceMenuKit.h")
@@ -454,8 +459,11 @@ def kit_label_size(plate_h):
 
 # Font sizes, in the 1080 design space. All but the row label unchanged from the
 # v17 pass, which set them against a 1280x720 capture of both renderers side by side.
+# The DIFFICULTY value chip's PLATE height: the Canvas row's BoxH in ATraceMenuHUD::DrawRow.
+VALUE_CHIP_H   = 34.0
+
 FS_ROW_LABEL   = kit_label_size(ROW_HEIGHT)   # 32.79 today: caps 22.2 px on the 60 px plate
-FS_ROW_VALUE   = 25        # the DIFFICULTY value, in its 34 px chip - see the block above
+FS_ROW_VALUE   = kit_label_size(VALUE_CHIP_H) # 18.58 today: caps 12.6 px on the 34 px chip
 FS_ROW_STATUS  = 13
 FS_ROW_ARROW   = 20
 FS_TAGLINE     = 15
@@ -1155,12 +1163,36 @@ def build_menu_row():
     slot_on_canvas(canvas, value_group, anchors(1.0, 0.5), (-8.0, 0.0, 0.0, 0.0),
                    alignment=(1.0, 0.5), auto_size=True, z_order=3)
 
-    chip_h = 34.0
+    # THE CHIP IS DRAWN THROUGH A SCALE BOX, because Slate does not size a Box brush's slices the way
+    # frame_image_size's docstring assumes. FSlateElementBatcher::AddBoxElements (UE 5.8) places the
+    # nine-slice lines at TEXTURE size * Margin - TextureHeight * Margin.Top - and ImageSize only sets
+    # the widget's desired size. T_MenuValueBox is 160 x 91 texels, so every slice was drawn at the
+    # sprite's own scale: 11 px of glow and 10 px of plate per corner, inside a chip 42 px tall. The
+    # plate came out about 20 px, the corners at full sprite size, and the value filled it (F11).
+    # (The row PLATE gets away with it: T_MenuBtn is 76 texels for a 72 px image.)
+    #
+    # So the image is authored at the texture's own size, where Slate's slices are right, and the
+    # ScaleBox shrinks the whole chip - slices included - to the size the Canvas title draws it
+    # (TraceMenuKit::DrawValueBoxPlate at VALUE_CHIP_H). The ScaleBox takes the overlay's size (Fill),
+    # hands the image that size divided by the scale, and paints it at the scale.
+    chip_image = frame_image_size(VALUE_CHIP_H, VAL_GLOW, VAL_PLATE_H, VAL_SPRITE_W, VAL_SPRITE_H)
+    chip_texture = Textures.get("T_MenuValueBox")
+    chip_texels_h = float(chip_texture.blueprint_get_size_y()) if chip_texture is not None else chip_image[1]
+    chip_scale = chip_image[1] / chip_texels_h
     chip = make_image(tree, "ValueChip", image_brush=brush(
         "T_MenuValueBox",
-        frame_image_size(chip_h, VAL_GLOW, VAL_PLATE_H, VAL_SPRITE_W, VAL_SPRITE_H),
+        (chip_image[0] / chip_scale, chip_image[1] / chip_scale),
         frame_margin(VAL_CAP, VAL_SPRITE_W, VAL_SPRITE_H)))
-    overlay_slot(value_group, chip)
+    chip_box = mk(tree, unreal.ScaleBox, "ValueChipScale")
+    set_prop(chip_box, "stretch", "Stretch", unreal.Stretch.USER_SPECIFIED)
+    set_prop(chip_box, "user_specified_scale", "UserSpecifiedScale", chip_scale)
+    chip_box.add_child(chip)
+    chip_slot = chip.slot
+    chip_slot.set_editor_property("horizontal_alignment", unreal.HorizontalAlignment.H_ALIGN_FILL)
+    chip_slot.set_editor_property("vertical_alignment", unreal.VerticalAlignment.V_ALIGN_FILL)
+    overlay_slot(value_group, chip_box)
+    log("DIFFICULTY value chip: plate {0:.0f} px, drawn at {1:.3f} of T_MenuValueBox's {2:.0f} texels; "
+        "value size {3} (the kit's value-box caps).".format(VALUE_CHIP_H, chip_scale, chip_texels_h, FS_ROW_VALUE))
 
     value_box = mk(tree, unreal.HorizontalBox, "ValueBox")
     overlay_slot(value_group, value_box, padding=(16.0, 2.0, 16.0, 2.0),
@@ -1546,9 +1578,9 @@ def main():
         fail("only {0} of the {1} sprites the title screen places are importable. The screen would "
              "draw white boxes where the missing ones are.".format(len(got), len(placed)))
 
-    if FS_ROW_LABEL is None:
-        fail("the row label's size could not be derived from the C++ headers (see the failure above). "
-             "Refusing to author the rows at a guessed size.")
+    if FS_ROW_LABEL is None or FS_ROW_VALUE is None:
+        fail("the row label's and value's sizes could not be derived from the C++ headers (see the failure "
+             "above). Refusing to author the rows at a guessed size.")
         for message in Failures:
             unreal.log_error("[MenuWidgets] FAILED: {0}".format(message))
         return 1

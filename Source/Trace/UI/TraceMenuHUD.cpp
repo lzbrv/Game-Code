@@ -3987,9 +3987,6 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 			TraceText::EHAlign::Left, LabelMaxW);
 	}
 
-	// The value keeps the size it had (the UMG row's 25 in its 34 px chip); only the word moved to the kit.
-	const float LabelScale = 1.55f * UIScale;
-
 	// The row's own FURNITURE (the JOIN readout, the DIFFICULTY value's arrows) in the kit's furniture
 	// colour, as on the UMG row — white on the selected row, 0.85 white otherwise. Never cyan.
 	const FLinearColor RowFurniture = RowVisuals.Furniture;
@@ -4009,6 +4006,12 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 	// As the UMG row lays it out: the value box (T_MenuValueBox, gold-edged) sits 8 px in from the
 	// plate's right end, 34 px tall, holding "<  VALUE  >" with 16 px of padding and 14 px between the
 	// arrows and the value.
+	//
+	// THE WORD AT THE KIT'S VALUE-BOX PROPORTIONS (visual-vs-kit F11): caps LabelCapFraction of the
+	// box, in Light, as TraceMenuKit::DrawValueBox sets every value — and as the UMG chip's ValueText is
+	// authored (FS_ROW_VALUE in Scripts/generate-menu-widgets.py, computed from the same fraction). It
+	// was the engine's medium font at 1.55, which happened to land near that here while the UMG chip
+	// set the word at the row label's size and filled its box edge to edge; one rule now, on both.
 	if (!RowView.Value.IsEmpty())
 	{
 		const float ArrowS = 8.f * UIScale;
@@ -4016,8 +4019,9 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 		const float ArrowGap = 14.f * UIScale;
 		const float BoxPad = 16.f * UIScale;
 		const float BoxH = 34.f * UIScale;
+		const float ValueCapH = BoxH * TraceMenuKit::LabelCapFraction;
 
-		const float ValueW = MeasureWidth(RowView.Value, FontMedium, LabelScale);
+		const float ValueW = TraceMenuKit::CapTextWidth(RowView.Value, ValueCapH, ETraceTextWeight::Light);
 		const float BoxRight = X + Width - 8.f * UIScale;
 		const float RightArrowX = BoxRight - BoxPad - ArrowS;
 		const float ValueRight = RightArrowX - ArrowGap;
@@ -4025,9 +4029,8 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 		const float BoxLeft = LeftArrowX - BoxPad;
 
 		TraceMenuKit::DrawValueBoxPlate(this, BoxLeft, Y + (RowH - BoxH) * 0.5f, BoxRight - BoxLeft, BoxH);
-
-		const float ValueY = Y + (RowH - MeasureHeight(RowView.Value, FontMedium, LabelScale)) * 0.5f;
-		TraceMenuHUDType::Draw(this, RowView.Value, RowView.ValueColor, ValueRight - ValueW, ValueY, FontMedium, LabelScale);
+		TraceMenuKit::DrawCapText(this, RowView.Value, ValueRight, Y + RowH * 0.5f, ValueCapH, RowView.ValueColor,
+			ETraceTextWeight::Light, TraceText::EHAlign::Right);
 
 		if (RowView.bShowArrows)
 		{
