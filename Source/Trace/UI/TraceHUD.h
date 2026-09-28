@@ -521,6 +521,14 @@ protected:
 	 */
 	bool PresentCornerUmg(bool bInLive, const FTraceHudCornerState& InState);
 
+	/**
+	 * Loads, builds, validates and adds the UMG corner (and its chip pool), once per HUD. @return true
+	 * when CornerWidget exists afterwards. A failed adoption latches bCornerAdoptFailed and puts the
+	 * corner on Canvas, exactly as it always did. P11: BeginPlay calls it (then collapses the corner),
+	 * so the class load and widget build happen at map load rather than in the first frame's draw.
+	 */
+	bool AdoptCornerWidget();
+
 	/** True when Trace.UI.UseUMG says the corner may use the widget. Never registers the cvar. */
 	bool IsUmgCornerEnabled() const;
 
@@ -591,6 +599,13 @@ protected:
 	 * bind failed says OFFLINE rather than repeating a promise the process did not keep.
 	 */
 	void DrawNetworkStatus();
+
+	/**
+	 * P11: builds the network chip's words (role, headline, detail, accent) into the NetPanel* members
+	 * and runs the change detection and change log that used to run every frame. Called by
+	 * DrawNetworkStatus only when FNetPanelInputs moves, or once a second.
+	 */
+	void ComposeNetworkStatus();
 
 	/**
 	 * The practice range's pad labels (CORE RACK, INFINITE ABILITIES ON / OFF, LOADOUT): each a kit
@@ -940,8 +955,10 @@ private:
 	//
 	// *** THE CANVAS PATH IS A LIVE FALLBACK, NOT A DELETED ONE (spec v17 §0.1). *** Asset missing,
 	// asset invalid, toggle off — the corner is the one the game has drawn since v16 and the log says
-	// which arm won, once, by name. That is also why the widget is created LAZILY on the first frame
-	// the toggle asks for it rather than in BeginPlay: a build with no UI assets never touches UMG.
+	// which arm won, once, by name. The widget is created only when the toggle asks for it, so a build
+	// with the toggle off never touches UMG. P11: when it IS on, BeginPlay adopts it (AdoptCornerWidget)
+	// rather than the first frame's draw, so the class load and widget build land at map load; the
+	// first frame then finds it built. A build with no UI assets pays one failed LoadClass either way.
 
 	/** The corner widget, once adopted. Null while on the Canvas path. */
 	UPROPERTY(Transient)
@@ -1030,6 +1047,36 @@ private:
 	 */
 	FString LastConnectionAnswer;
 	float LastRoleChangeTime = -1000.f;
+
+	/**
+	 * P11 — what the network chip's words depend on, read every frame (no allocation) and compared with
+	 * the last composed set. Pointers are compared as identities only, never dereferenced.
+	 */
+	struct FNetPanelInputs
+	{
+		int32 NetMode = -1;
+		const void* Driver = nullptr;
+		const void* ServerConnection = nullptr;
+		int32 Connections = -1;
+		int32 Humans = -1;
+		uint32 TextGeneration = 0;
+
+		bool operator==(const FNetPanelInputs& Other) const
+		{
+			return NetMode == Other.NetMode && Driver == Other.Driver
+				&& ServerConnection == Other.ServerConnection && Connections == Other.Connections
+				&& Humans == Other.Humans && TextGeneration == Other.TextGeneration;
+		}
+	};
+	FNetPanelInputs NetPanelInputs;
+	double NetPanelComposedAt = -1000.0;
+
+	/** The composed chip: false for an ordinary offline match (no chrome at all). */
+	bool bNetPanelHasAnswer = false;
+	uint8 NetPanelRole = 0;   // TraceNet::ERole
+	FString NetPanelHeadline;
+	FString NetPanelDetail;
+	FLinearColor NetPanelAccent = FLinearColor::White;
 
 	// ---- Practice range pad labels --------------------------------------------------------------
 

@@ -6,6 +6,8 @@
 #include "Components/StaticMeshComponent.h"  // v25 §3 — the pull ring measures the drawn orb's bounds
 #include "GlobalRenderResources.h"            // GWhiteTexture, under those strokes
 #include "Core/TraceCharacter.h"
+#include "Debug/TracePerfProbe.h"         // P11 — TRACE_PERF_SCOPE (Trace.Perf.Sample)
+#include "Core/TracePreload.h"           // P11 — WarmMatchTables at BeginPlay
 #include "Core/TraceGameMode.h"           // SendRemoteClientsHome — a host leaving takes its guests home
 #include "Core/TraceGameState.h"
 #include "Core/TracePlayerController.h"
@@ -73,6 +75,7 @@
 #include "UI/TraceAutoShot.h"
 #include "UI/TraceMatchOptions.h"         // TraceMatchFlow::PostMatchDuration, TraceMaps
 #include "UI/TraceNetworking.h"           // TraceNet — host address, connection state, failures
+#include "Engine/NetDriver.h"             // P11 — the network chip's change key (driver, connections)
 #include "UI/Widgets/Menu/TraceMenuKit.h" // TraceMenuKit::Prime, from BeginPlay
 // v17 §4 (step 4b) — the bottom-right corner's second presenter. UMG is linked by Trace.Build.cs,
 // which retired "contract 7: Canvas only" in this same pass; nothing else on this HUD uses it.
@@ -386,6 +389,13 @@ namespace TraceHUDStyle
 
 	/** The chip's fade, in seconds, and how fast the kill feed under it follows it (1/s). */
 	static constexpr float NetPanelFadeSeconds = 0.3f;
+
+	/**
+	 * P11: the chip's words are rebuilt when a cheap input changes, and also at least this often (real
+	 * seconds) so the inputs TraceNet caches for two seconds (adapter addresses, the port probe) are
+	 * never held longer than their own cache holds them.
+	 */
+	static constexpr double NetRecomposeSeconds = 1.0;
 	static constexpr float KillFeedAnchorEase = 12.f;
 
 	/** A new kill-feed row fades and slides in over this long instead of appearing in one frame. */
@@ -1028,6 +1038,19 @@ void ATraceHUD::BeginPlay()
 	// the pause menu's first frame used to show flat fallback plates. See TraceMenuKit::Prime.
 	TraceMenuKit::Prime();
 
+	// P11: the rosters the HUD's names and colours read (and the server's kickoff assigns from),
+	// resolved at map load on every machine that draws. Idempotent; see Core/TracePreload.h.
+	TracePreload::WarmMatchTables();
+
+	// P11: the UMG corner too, when it is the live path — the widget class load, the widget and its
+	// chip pool used to be built inside the first frame's DrawHUD. Collapsed until the corner pass
+	// first presents it, so nothing can flash before the first real frame. If the local player is not
+	// attached yet this does nothing and the first draw adopts it, as before.
+	if (IsUmgCornerEnabled() && AdoptCornerWidget())
+	{
+		CornerWidget->HideCorner();
+	}
+
 	// ---- FX/AUDIO plan §5.7 — THE MATCH AMBIENCE ------------------------------------------------
 	//
 	// W2-AUDIOBANK landed UTraceMusicSubsystem one wave ahead of its call sites; this is one of the
@@ -1070,6 +1093,8 @@ void ATraceHUD::BeginPlay()
 
 void ATraceHUD::DrawHUD()
 {
+	TRACE_PERF_SCOPE(HudDraw);   // P11: Trace.Perf.Sample; nothing in Shipping
+
 	Super::DrawHUD();
 
 	UWorld* World = GetWorld();
@@ -1336,21 +1361,30 @@ void ATraceHUD::DrawHUD()
 		DrawHitMarker();
 
 		// Health, dash charges and the ability rows.
-		DrawHealthAndDash();
+		{
+			TRACE_PERF_SCOPE(HudStack);
+			DrawHealthAndDash();
+		}
 
 		// Spec v16 §2 — the bottom-right corner. Drawn while any of the chrome is; when none is, it is
 		// not called, and the tail of DrawHUD hides a UMG corner that nothing addressed
 		// (bCornerAddressedThisDraw). While the chrome is fading, the UMG corner fades with it
 		// (PresentCornerUmg sets its render opacity).
-		DrawAmmoAndStatuses();
+		{
+			TRACE_PERF_SCOPE(HudCorner);
+			DrawAmmoAndStatuses();
+		}
 
-		DrawScoresAndClock();
-		DrawCoreBanner();
-		DrawPhaseBanner();
-		DrawScoreFlash();
-		DrawParryKillBanner();
-		DrawDeathPanel();
-		DrawScoreboard();
+		{
+			TRACE_PERF_SCOPE(HudTop);
+			DrawScoresAndClock();
+			DrawCoreBanner();
+			DrawPhaseBanner();
+			DrawScoreFlash();
+			DrawParryKillBanner();
+			DrawDeathPanel();
+			DrawScoreboard();
+		}
 	}
 
 	// At its own fade. NOT under the match layer's: the pause menu opened at full time has always sat
@@ -1374,12 +1408,18 @@ void ATraceHUD::DrawHUD()
 		// passes RUN under an overlay (the connection log and the feed's easing keep their state) and
 		// draw nothing there.
 		KillFeedTopY = TraceHUDStyle::TopPanelY * UIScale;
-		DrawNetworkStatus();
-		DrawNetworkFailureBanner();
+		{
+			TRACE_PERF_SCOPE(HudNet);
+			DrawNetworkStatus();
+			DrawNetworkFailureBanner();
+		}
 
 		// After the network panel, and outside the bPostMatch gate: the last few kills are still worth
 		// reading on the full-time screen, and they are the only record of how a half ended.
-		DrawKillFeed();
+		{
+			TRACE_PERF_SCOPE(HudFeed);
+			DrawKillFeed();
+		}
 	}
 
 	// ---- P10 — THE PAGES' SHARED BLACK, under whichever page is up or fading -----------------------
@@ -1401,17 +1441,23 @@ void ATraceHUD::DrawHUD()
 	// Outside the bPostMatch gate for a duller reason: the screen is closed by then anyway (the server
 	// closes it the moment a character is held), and a gate here would be a second condition able to
 	// disagree with the replicated one.
-	CharacterSelect.Tick(this, TracePC.Get(), LocalPS.Get(), ViewW, ViewH, UIScale, Now,
-		/*bInputAllowed=*/!PauseMenu.IsOpen());
+	{
+		TRACE_PERF_SCOPE(HudPages);
+		CharacterSelect.Tick(this, TracePC.Get(), LocalPS.Get(), ViewW, ViewH, UIScale, Now,
+			/*bInputAllowed=*/!PauseMenu.IsOpen());
+	}
 
 	// IMMEDIATELY AFTER, AND ONLY ONE OF THEM DRAWS. CharacterSelect still runs first because it
 	// hosts the TEAM screen and the overlay open/close callbacks the rest of the HUD reads; with the
 	// loadout arm on it returns before its own ten cards, and this draws the three columns in their
 	// place. Input is gated on the team screen as well as the pause menu: while you are still
 	// choosing a side, the loadout page behind it must not eat your arrow keys.
-	LoadoutSelect.Tick(this, TracePC.Get(), LocalPS.Get(), ViewW, ViewH, UIScale, Now,
-		/*bInputAllowed=*/!PauseMenu.IsOpen() && !CharacterSelect.IsTeamSelectOpen()
-			&& TraceLoadoutSelect::IsArmed());
+	{
+		TRACE_PERF_SCOPE(HudPages);
+		LoadoutSelect.Tick(this, TracePC.Get(), LocalPS.Get(), ViewW, ViewH, UIScale, Now,
+			/*bInputAllowed=*/!PauseMenu.IsOpen() && !CharacterSelect.IsTeamSelectOpen()
+				&& TraceLoadoutSelect::IsArmed());
+	}
 
 #if !UE_BUILD_SHIPPING
 	HudKitRecord.TeamSelectAlpha = CharacterSelect.GetTeamSelectFadeAlpha();
@@ -1422,7 +1468,10 @@ void ATraceHUD::DrawHUD()
 #endif
 
 	// Last, over everything including the full-time takeover. Draws nothing once closed AND faded out.
-	PauseMenu.Tick(this, TracePC.Get(), ViewW, ViewH, UIScale, Now);
+	{
+		TRACE_PERF_SCOPE(HudPages);
+		PauseMenu.Tick(this, TracePC.Get(), ViewW, ViewH, UIScale, Now);
+	}
 
 	// SPEC v17 §4 (step 4b). The Canvas corner simply is not drawn on a frame where its pass does not
 	// run; a UMG corner has to be TOLD, or the last ammo count of the match hangs over the full-time
@@ -2653,25 +2702,76 @@ void ATraceHUD::DrawThrowChargeRing()
 #endif
 }
 
+namespace TraceHUDKeyLabels
+{
+	/**
+	 * P11 — ONE ROW PER ACTION ASKED ABOUT, remembering the key it was last drawn for and the words.
+	 *
+	 * The label is a pure function of the BOUND KEY, so the cache is keyed on exactly that: every call
+	 * still reads the live binding (an array index), and the key's display name is rebuilt only when
+	 * the binding differs from the one the words were made for. A rebind in the options menu therefore
+	 * shows on the very next frame, with no invalidation hook to forget. What is saved is the part that
+	 * cost something: the walk of the action table by string compare, and FKey::GetDisplayName's FText
+	 * plus two string copies, three times a frame.
+	 */
+	struct FEntry
+	{
+		FString ConfigId;
+		bool bActionKnown = false;
+		ETraceInputAction Action = ETraceInputAction::Count;
+		bool bHasLabel = false;
+		FKey LabelKey;
+		FString Label;
+	};
+
+	static TArray<FEntry>& Entries()
+	{
+		static TArray<FEntry> Rows;
+		return Rows;
+	}
+}
+
 FString ATraceHUD::ActionKeyLabel(const TCHAR* ConfigId, const TCHAR* Fallback)
 {
-	// BY THE STABLE CONFIG ID, never by index into ETraceInputAction: the enum is the input slice's
-	// and is free to grow. An action this build does not have simply is not found, and the caller's
-	// documented default is printed — which is what the ability row did before this was extracted,
-	// so behaviour is unchanged at every existing call site.
-	for (const FTraceInputActionInfo& Info : TraceInputActions::All())
+	TArray<TraceHUDKeyLabels::FEntry>& Rows = TraceHUDKeyLabels::Entries();
+	TraceHUDKeyLabels::FEntry* Row = Rows.FindByPredicate([ConfigId](const TraceHUDKeyLabels::FEntry& Each)
 	{
-		if (FCString::Stricmp(Info.ConfigId, ConfigId) == 0)
+		return Each.ConfigId.Equals(ConfigId, ESearchCase::IgnoreCase);
+	});
+
+	if (Row == nullptr)
+	{
+		// BY THE STABLE CONFIG ID, never by index into ETraceInputAction: the enum is the input slice's
+		// and is free to grow. An action this build does not have simply is not found, and the caller's
+		// documented default is printed — which is what the ability row did before this was extracted,
+		// so behaviour is unchanged at every existing call site. The table is compiled in, so the
+		// answer to "which action is this id" is found once.
+		Row = &Rows.AddDefaulted_GetRef();
+		Row->ConfigId = ConfigId;
+		for (const FTraceInputActionInfo& Info : TraceInputActions::All())
 		{
-			const FKey BoundKey = UTraceUserSettings::Get().GetKey(Info.Action);
-			if (BoundKey.IsValid())
+			if (FCString::Stricmp(Info.ConfigId, ConfigId) == 0)
 			{
-				return BoundKey.GetDisplayName(/*bLongDisplayName=*/false).ToString().ToUpper();
+				Row->bActionKnown = true;
+				Row->Action = Info.Action;
+				break;
 			}
-			break;
 		}
 	}
-	return FString(Fallback);
+
+	const FKey BoundKey = Row->bActionKnown ? UTraceUserSettings::Get().GetKey(Row->Action) : FKey();
+	if (!BoundKey.IsValid())
+	{
+		return FString(Fallback);
+	}
+
+	if (!Row->bHasLabel || Row->LabelKey != BoundKey)
+	{
+		Row->bHasLabel = true;
+		Row->LabelKey = BoundKey;
+		Row->Label = BoundKey.GetDisplayName(/*bLongDisplayName=*/false).ToString().ToUpper();
+	}
+	return Row->Label;
 }
 
 // ===================================================================================================
@@ -2942,15 +3042,19 @@ void ATraceHUD::DrawHealthAndDash()
 	// "THROW" stays a literal: only the superseded charge bar behind the Trace.HUD.V16 red arm draws it.
 	float LabelW = 58.f * UIScale;
 	{
-		const FString GutterLabels[] = {
-			FString(TEXT("THROW")),
-			TRACE_TEXT("HUD.ROW_PARRY", "PARRY"),
-			TRACE_TEXT("HUD.ROW_DASH", "DASH"),
-			TRACE_TEXT("HUD.ROW_SLIDE", "SLIDE"),
+		// P11: by reference, not four string copies a frame. Still MEASURED every frame (four short
+		// widths, no allocation since TraceText stopped splitting into copies), so a reworded label or
+		// a face switch moves the gutter on the next frame with nothing to invalidate.
+		static const FString ThrowLabel(TEXT("THROW"));
+		const FString* const GutterLabels[] = {
+			&ThrowLabel,
+			&TRACE_TEXT("HUD.ROW_PARRY", "PARRY"),
+			&TRACE_TEXT("HUD.ROW_DASH", "DASH"),
+			&TRACE_TEXT("HUD.ROW_SLIDE", "SLIDE"),
 		};
-		for (const FString& GutterLabel : GutterLabels)
+		for (const FString* GutterLabel : GutterLabels)
 		{
-			LabelW = FMath::Max(LabelW, MeasureWidth(GutterLabel, FontSmall, UIScale) + (8.f * UIScale));
+			LabelW = FMath::Max(LabelW, MeasureWidth(*GutterLabel, FontSmall, UIScale) + (8.f * UIScale));
 		}
 	}
 
@@ -4828,6 +4932,73 @@ void ATraceHUD::HideCornerWidget()
 	}
 }
 
+bool ATraceHUD::AdoptCornerWidget()
+{
+	if (CornerWidget != nullptr)
+	{
+		return true;
+	}
+	if (bCornerAdoptFailed)
+	{
+		return false;
+	}
+
+	// The lambda keeps the four failure exits identical: one reason string, one log line, one
+	// latch, and Canvas from here on.
+	auto AbandonAdoption = [this](const FString& InWhy) -> bool
+	{
+		bCornerAdoptFailed = true;
+		SetCornerPath(ECornerPath::Canvas, InWhy);
+		return false;
+	};
+
+	APlayerController* OwningController = PlayerOwner.Get();
+	if (OwningController == nullptr || OwningController->GetLocalPlayer() == nullptr)
+	{
+		// No latch: a HUD can legitimately exist for a frame before its local player does, and
+		// latching here would send a perfectly healthy client to Canvas for the whole match.
+		return false;
+	}
+
+	const double AdoptStart = FPlatformTime::Seconds();   // P11: logged once adopted
+	UClass* LoadedCornerClass = LoadClass<UTraceHudCornerWidget>(nullptr,
+		UTraceHudCornerWidget::CornerBlueprintPath());
+	if (LoadedCornerClass == nullptr)
+	{
+		return AbandonAdoption(FString::Printf(
+			TEXT("%s did not load (run Scripts/generate-hud-widgets.py to author it). This is a "
+			     "supported configuration, not an error"),
+			UTraceHudCornerWidget::CornerBlueprintPath()));
+	}
+
+	UTraceHudCornerWidget* NewCorner = CreateWidget<UTraceHudCornerWidget>(OwningController, LoadedCornerClass);
+	if (NewCorner == nullptr)
+	{
+		return AbandonAdoption(FString::Printf(TEXT("CreateWidget failed for %s"),
+			UTraceHudCornerWidget::CornerBlueprintPath()));
+	}
+
+	FString AdoptReason;
+	if (!NewCorner->InitialiseCorner(AdoptReason))
+	{
+		// Error, unlike the missing-asset case: an asset that EXISTS and does not match the C++
+		// contract is a broken generate or a hand edit, and it is the one outcome somebody has to
+		// go and fix. The game keeps playing on Canvas either way.
+		UE_LOG(LogTraceGame, Error,
+			TEXT("[HUDUMG] *** %s is present but does not match the C++ contract: %s. *** The corner "
+			     "falls back to Canvas. Re-run Scripts/generate-hud-widgets.py."),
+			UTraceHudCornerWidget::CornerBlueprintPath(), *AdoptReason);
+		return AbandonAdoption(FString::Printf(TEXT("the widget asset failed validation (%s)"), *AdoptReason));
+	}
+
+	NewCorner->AddToPlayerScreen(TraceHudCornerUmg::CornerZOrder);
+	CornerWidget = NewCorner;
+
+	UE_LOG(LogTraceGame, Display, TEXT("[HUDUMG] corner adopted in %.1f ms (class load, widget, chip pool)."),
+		(FPlatformTime::Seconds() - AdoptStart) * 1000.0);
+	return true;
+}
+
 bool ATraceHUD::PresentCornerUmg(bool bInLive, const FTraceHudCornerState& InState)
 {
 	if (!TraceHudCornerUmg::IsCornerEnabled())
@@ -4844,57 +5015,9 @@ bool ATraceHUD::PresentCornerUmg(bool bInLive, const FTraceHudCornerState& InSta
 		return false;
 	}
 
-	if (CornerWidget == nullptr)
+	if (CornerWidget == nullptr && !AdoptCornerWidget())
 	{
-		// The lambda keeps the four failure exits identical: one reason string, one log line, one
-		// latch, and Canvas from here on.
-		auto AbandonAdoption = [this](const FString& InWhy) -> bool
-		{
-			bCornerAdoptFailed = true;
-			SetCornerPath(ECornerPath::Canvas, InWhy);
-			return false;
-		};
-
-		APlayerController* OwningController = PlayerOwner.Get();
-		if (OwningController == nullptr || OwningController->GetLocalPlayer() == nullptr)
-		{
-			// No latch: a HUD can legitimately exist for a frame before its local player does, and
-			// latching here would send a perfectly healthy client to Canvas for the whole match.
-			return false;
-		}
-
-		UClass* LoadedCornerClass = LoadClass<UTraceHudCornerWidget>(nullptr,
-			UTraceHudCornerWidget::CornerBlueprintPath());
-		if (LoadedCornerClass == nullptr)
-		{
-			return AbandonAdoption(FString::Printf(
-				TEXT("%s did not load (run Scripts/generate-hud-widgets.py to author it). This is a "
-				     "supported configuration, not an error"),
-				UTraceHudCornerWidget::CornerBlueprintPath()));
-		}
-
-		UTraceHudCornerWidget* NewCorner = CreateWidget<UTraceHudCornerWidget>(OwningController, LoadedCornerClass);
-		if (NewCorner == nullptr)
-		{
-			return AbandonAdoption(FString::Printf(TEXT("CreateWidget failed for %s"),
-				UTraceHudCornerWidget::CornerBlueprintPath()));
-		}
-
-		FString AdoptReason;
-		if (!NewCorner->InitialiseCorner(AdoptReason))
-		{
-			// Error, unlike the missing-asset case: an asset that EXISTS and does not match the C++
-			// contract is a broken generate or a hand edit, and it is the one outcome somebody has to
-			// go and fix. The game keeps playing on Canvas either way.
-			UE_LOG(LogTraceGame, Error,
-				TEXT("[HUDUMG] *** %s is present but does not match the C++ contract: %s. *** The corner "
-				     "falls back to Canvas. Re-run Scripts/generate-hud-widgets.py."),
-				UTraceHudCornerWidget::CornerBlueprintPath(), *AdoptReason);
-			return AbandonAdoption(FString::Printf(TEXT("the widget asset failed validation (%s)"), *AdoptReason));
-		}
-
-		NewCorner->AddToPlayerScreen(TraceHudCornerUmg::CornerZOrder);
-		CornerWidget = NewCorner;
+		return false;
 	}
 
 	SetCornerPath(ECornerPath::Umg, FString());
@@ -5305,7 +5428,7 @@ void ATraceHUD::DrawCoreBanner()
 // Phase callouts
 // -------------------------------------------------------------------------------------------
 
-void ATraceHUD::DrawNetworkStatus()
+void ATraceHUD::ComposeNetworkStatus()
 {
 	FString Endpoint;
 	FString Detail;
@@ -5317,6 +5440,7 @@ void ATraceHUD::DrawNetworkStatus()
 	// from the inside, which is the bug this pass exists to close.
 	if (ConnectionRole == TraceNet::ERole::Offline && Detail.IsEmpty())
 	{
+		bNetPanelHasAnswer = false;
 		return;
 	}
 
@@ -5413,10 +5537,79 @@ void ATraceHUD::DrawNetworkStatus()
 		}
 	}
 
+	bNetPanelHasAnswer = true;
+	NetPanelRole = static_cast<uint8>(ConnectionRole);
+	NetPanelHeadline = Headline;
+	NetPanelDetail = Detail;
+	NetPanelAccent = Accent;
+}
+
+void ATraceHUD::DrawNetworkStatus()
+{
+	// ---- P11 — THE PANEL'S WORDS ARE COMPOSED WHEN THEIR INPUTS MOVE, NOT EVERY FRAME ------------
+	//
+	// Everything below the gate used to run on every frame of the match whether or not the panel
+	// showed (it is hidden for most of a match): the connection description, three or four formatted
+	// strings, the "answer" string built to compare against the last one. The inputs that decide those
+	// words are few and cheap to read, so they are read every frame and the words are rebuilt only
+	// when one of them changes — the net mode, the driver and its server connection, how many clients
+	// are connected, how many humans are in the match, and the text document's generation (a
+	// Trace.Text.Reload). The two inputs that are not cheap — this machine's adapter addresses and the
+	// UDP port probe — are cached for two seconds inside TraceNet already, so a re-compose every second
+	// (hosting or joined) picks up any change of theirs no later than their own cache would have let it
+	// through.
+	{
+		FNetPanelInputs Inputs;
+		if (const UWorld* const NetWorld = GetWorld())
+		{
+			Inputs.NetMode = static_cast<int32>(NetWorld->GetNetMode());
+			if (const UNetDriver* const Driver = NetWorld->GetNetDriver())
+			{
+				Inputs.Driver = Driver;
+				Inputs.ServerConnection = Driver->ServerConnection;
+				Inputs.Connections = Driver->ClientConnections.Num();
+			}
+			if (const AGameStateBase* const State = NetWorld->GetGameState())
+			{
+				Inputs.Humans = 0;
+				for (const APlayerState* Player : State->PlayerArray)
+				{
+					Inputs.Humans += (Player != nullptr && !Player->IsABot()) ? 1 : 0;
+				}
+			}
+		}
+		Inputs.TextGeneration = TraceGameText::GetGeneration();
+
+		// NO TIMED RE-COMPOSE IN A STANDALONE MATCH. There the only slow input is the UDP port probe,
+		// and the fact the chip reports — "this match could not host: the port was taken" — was decided
+		// when the match tried to listen; a port that frees up later does not make this match joinable.
+		// So it is asked once, not re-probed with a socket bind every two seconds for the whole match.
+		const double ComposeNow = FPlatformTime::Seconds();
+		const bool bTimedRefresh = (Inputs.NetMode != static_cast<int32>(NM_Standalone))
+			&& (ComposeNow - NetPanelComposedAt) >= TraceHUDStyle::NetRecomposeSeconds;
+		if (!(Inputs == NetPanelInputs) || bTimedRefresh)
+		{
+			NetPanelInputs = Inputs;
+			NetPanelComposedAt = ComposeNow;
+			ComposeNetworkStatus();
+		}
+	}
+
+	if (!bNetPanelHasAnswer)
+	{
+		return;
+	}
+
+	const TraceNet::ERole ConnectionRole = static_cast<TraceNet::ERole>(NetPanelRole);
+	const FString& Headline = NetPanelHeadline;
+	const FString& Detail = NetPanelDetail;
+	const FLinearColor Accent = NetPanelAccent;
+
 	// ---- WP8.4 — the draw gate (visual audit §4.1: a raw IP burned into every match frame) ------
 	//
-	// Everything above ran regardless: the connection is still resolved and the human-count change
-	// log still lands (it is the two-machine triage record). Only the PANEL is now gated:
+	// Everything above runs whether or not the panel shows: the connection is still resolved (when its
+	// inputs change — see the top of this function) and the human-count change log still lands (it is
+	// the two-machine triage record). Only the PANEL is gated:
 	//   (a) the scoreboard is held — Tab is the "show me the match's paperwork" gesture, and this
 	//       pass draws after DrawScoreboard, so the panel sits above the board it annotates;
 	//   (b) the connection answer changed within RevealSeconds — match start, a player joining, a

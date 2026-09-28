@@ -240,7 +240,15 @@ namespace TraceLoadoutSelectFile
 	 */
 	ETraceTextWeight DescriptionWeight()
 	{
-		const IConsoleVariable* Arm = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.HUD.Text.Erbaum"));
+		// P11: the variable is FOUND once and READ every call. A console lookup is a lock plus a map
+		// probe with a string built for the key, and this runs for every card on every frame. Only a
+		// successful find is remembered, so a variable not registered yet is looked for again next time
+		// rather than baked in as missing (the reason the character page's copy was never cached).
+		static const IConsoleVariable* Arm = nullptr;
+		if (Arm == nullptr)
+		{
+			Arm = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.HUD.Text.Erbaum"));
+		}
 		const bool bErbaum = (Arm == nullptr) || (Arm->GetInt() != 0);
 		return bErbaum ? ETraceTextWeight::Hud : ETraceTextWeight::Light;
 	}

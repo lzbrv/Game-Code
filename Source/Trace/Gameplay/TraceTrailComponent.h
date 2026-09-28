@@ -847,6 +847,16 @@ public:
 	/** v13 §7: what the fitter's rendered-geometry index currently holds, for the harness's report. */
 	static void GetLevelVisualIndexStats(int32& OutBoxes, int32& OutCells, bool& OutBuilt);
 
+	/**
+	 * P11: builds the rendered-geometry index for @p World NOW, if the fitter uses it and it is not
+	 * built for this world yet. The index used to be built by the first MeasureVisualPenetration —
+	 * the first carry near a wall, mid-match — walking every actor and filling a few thousand grid
+	 * cells on one gameplay frame. ATraceArenaBuilder::BeginPlay calls this once the arena is built or
+	 * adopted and presented (ApplyScoringShape), which is the state the lazy build would have seen:
+	 * nothing moves the arena's geometry after that. Returns true when it built.
+	 */
+	static bool PrewarmLevelVisualIndex(UWorld* World);
+
 #if !UE_BUILD_SHIPPING
 	/**
 	 * SPEC v12 §6 VERIFICATION. How far the trace is currently INSIDE the level, measured on both

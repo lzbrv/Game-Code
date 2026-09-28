@@ -55,6 +55,8 @@
 
 #include "Core/TraceCharacter.h"
 #include "Core/TraceGameMode.h"
+#include "World/TraceArenaBuilder.h"       // P11 — the wall fitter indexes these by type
+#include "World/TraceBakedPiece.h"
 #include "Core/TraceGameState.h"        // the match state the grace report reads
 #include "Gameplay/TraceCore.h"                // IsTraceInvulnerableFor (spec §4)
 #include "Gameplay/TraceHealthComponent.h"
@@ -3976,6 +3978,9 @@ namespace
 		TWeakObjectPtr<UWorld> World;
 		bool bBuilt = false;
 
+		/** P11: the world's clock when this index was built — 0 means before its first tick (map load). */
+		double BuiltAtWorldSeconds = -1.0;
+
 		TArray<UTraceTrailComponent::FTraceClipBox> Boxes;
 		TMap<FIntVector, TArray<int32>> Cells;
 		TArray<int32> Oversized;
@@ -3994,6 +3999,7 @@ namespace
 		{
 			World = nullptr;
 			bBuilt = false;
+			BuiltAtWorldSeconds = -1.0;
 			Boxes.Reset();
 			Cells.Reset();
 			Oversized.Reset();
@@ -4002,9 +4008,11 @@ namespace
 
 		void Build(UWorld* InWorld)
 		{
+			const double BuildStart = FPlatformTime::Seconds();   // P11: logged below
 			Reset();
 			World = InWorld;
 			bBuilt = true;
+			BuiltAtWorldSeconds = (InWorld != nullptr) ? InWorld->GetTimeSeconds() : -1.0;
 
 			UTraceTrailComponent::GatherRenderedLevelBoxes(InWorld, Boxes, Skipped);
 
@@ -4052,9 +4060,9 @@ namespace
 			{
 				UE_LOG(LogTraceGame, Log,
 					TEXT("Trace: wall fitter indexed %d rendered arena boxes (%d degenerate skipped, %d "
-					     "oversized, %d grid cells at %.0fuu). Clearance asked for: %.1fuu."),
+					     "oversized, %d grid cells at %.0fuu) in %.1f ms. Clearance asked for: %.1fuu."),
 					Boxes.Num(), Skipped, Oversized.Num(), Cells.Num(), CellSize,
-					WallFitRequiredClearance());
+					(FPlatformTime::Seconds() - BuildStart) * 1000.0, WallFitRequiredClearance());
 			}
 		}
 
@@ -4290,9 +4298,11 @@ void UTraceTrailComponent::GatherRenderedLevelBoxes(UWorld* World, TArray<FTrace
 		// /Game/Maps/Arena. The wall fitter then fell back to collision-only fitting, which cannot
 		// see the emissive trim the trace clips into (spec v13 §7) — the fix silently degraded on
 		// the map the whole bake exists to produce, while still reporting itself healthy.
+		//
+		// P11: BY TYPE, not by class NAME. The name test built an FString per actor in the level to
+		// find these two classes (and their subclasses, which IsA also answers for).
 		const bool bIsArenaGeometry = Actor != nullptr
-			&& (Actor->GetClass()->GetName().Contains(TEXT("ArenaBuilder"))
-				|| Actor->GetClass()->GetName().Contains(TEXT("BakedPiece")));
+			&& (Actor->IsA<ATraceArenaBuilder>() || Actor->IsA<ATraceBakedPiece>());
 		if (!bIsArenaGeometry)
 		{
 			continue;
@@ -4336,6 +4346,20 @@ void UTraceTrailComponent::GatherRenderedLevelBoxes(UWorld* World, TArray<FTrace
 void UTraceTrailComponent::InvalidateLevelVisualIndex()
 {
 	GLevelVisualIndex.Reset();
+}
+
+bool UTraceTrailComponent::PrewarmLevelVisualIndex(UWorld* World)
+{
+	if (World == nullptr || !World->IsGameWorld() || !WallFitUsesRenderedGeometry())
+	{
+		return false;
+	}
+	if (GLevelVisualIndex.bBuilt && GLevelVisualIndex.World.Get() == World)
+	{
+		return false;
+	}
+	GLevelVisualIndex.EnsureBuilt(World);
+	return true;
 }
 
 void UTraceTrailComponent::GetLevelVisualIndexStats(int32& OutBoxes, int32& OutCells, bool& OutBuilt)
@@ -16232,3 +16256,75 @@ void UTraceTrailComponent::CountPooledPieces(int32& OutStaticTotal, int32& OutSk
 	OutStaticTotal = SmearMeshes.Num() + PredictedSmearMeshes.Num();
 	OutSkinnedTotal = PoseGhosts.Num();
 }
+
+// =================================================================================================
+// P11 — Trace.Trail.IndexVerify: the wall fitter's rendered-arena index is built at MAP LOAD, and it
+// is the same index the old lazy build made.
+//
+// Run it on the server or in a standalone match, any time after the first frames:
+//   1. the index must have been built for this world BEFORE THE WORLD'S FIRST TICK (world clock 0) —
+//      only the prewarm in ATraceArenaBuilder::BeginPlay builds it then; the lazy build it replaced
+//      landed whenever the first trail fit asked (measured: ~6 s in, during team select), so with the
+//      prewarm removed this fails, which is the point;
+//   2. a FRESH gather of the arena now, box by box, must match what the index holds — so building it
+//      at BeginPlay saw exactly the geometry a mid-match build sees.
+// Dev only.
+// =================================================================================================
+#if !UE_BUILD_SHIPPING
+namespace TraceTrailIndexVerifyFile
+{
+	static void Run(UWorld* World)
+	{
+		if (World == nullptr || !World->IsGameWorld())
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[TrailIndex] no game world. VERDICT: INCONCLUSIVE"));
+			return;
+		}
+		if (!WallFitUsesRenderedGeometry())
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[TrailIndex] Trace.Trail.WallFitVisual is 0: the fitter does not use the index. VERDICT: INCONCLUSIVE"));
+			return;
+		}
+
+		const bool bBuiltForThisWorld = GLevelVisualIndex.bBuilt && GLevelVisualIndex.World.Get() == World;
+		const bool bBuiltAtMapLoad = bBuiltForThisWorld && GLevelVisualIndex.BuiltAtWorldSeconds <= 0.0;
+
+		TArray<UTraceTrailComponent::FTraceClipBox> Fresh;
+		int32 FreshSkipped = 0;
+		UTraceTrailComponent::GatherRenderedLevelBoxes(World, Fresh, FreshSkipped);
+
+		int32 FirstMismatch = INDEX_NONE;
+		const bool bSameCount = (Fresh.Num() == GLevelVisualIndex.Boxes.Num()) && (FreshSkipped == GLevelVisualIndex.Skipped);
+		if (bSameCount)
+		{
+			for (int32 Index = 0; Index < Fresh.Num(); ++Index)
+			{
+				const FBox& Want = Fresh[Index].WorldBounds;
+				const FBox& Have = GLevelVisualIndex.Boxes[Index].WorldBounds;
+				if (!Want.Min.Equals(Have.Min, 0.01) || !Want.Max.Equals(Have.Max, 0.01))
+				{
+					FirstMismatch = Index;
+					break;
+				}
+			}
+		}
+
+		const bool bPass = bBuiltAtMapLoad && bSameCount && FirstMismatch == INDEX_NONE && Fresh.Num() > 0;
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[TrailIndex] built at map load: %s | index %d boxes (%d skipped), fresh gather %d boxes (%d skipped)%s"),
+			bBuiltAtMapLoad ? TEXT("yes (world clock 0.00 s)")
+				: (bBuiltForThisWorld ? *FString::Printf(TEXT("NO - built lazily at world clock %.2f s, mid-session"),
+					GLevelVisualIndex.BuiltAtWorldSeconds) : TEXT("NO - not built for this world yet")),
+			GLevelVisualIndex.Boxes.Num(), GLevelVisualIndex.Skipped, Fresh.Num(), FreshSkipped,
+			(FirstMismatch != INDEX_NONE) ? *FString::Printf(TEXT(" | box %d differs"), FirstMismatch) : TEXT(""));
+		UE_LOG(LogTraceGame, Display, TEXT("[TrailIndex] VERDICT: %s"), bPass ? TEXT("PASS") : TEXT("FAIL"));
+	}
+
+	static FAutoConsoleCommandWithWorld CmdIndexVerify(
+		TEXT("Trace.Trail.IndexVerify"),
+		TEXT("P11: checks the trace wall fitter's rendered-arena index was built at map load (run it before "
+		     "the first carry) and matches a fresh gather of the arena. Dev only."),
+		FConsoleCommandWithWorldDelegate::CreateStatic(&Run));
+}
+#endif // !UE_BUILD_SHIPPING

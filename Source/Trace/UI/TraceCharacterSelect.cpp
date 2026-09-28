@@ -1072,13 +1072,16 @@ namespace TraceCharacterSelectType
 	 */
 	static ETraceTextWeight DescriptionWeight()
 	{
-		// Looked up rather than cached in a static. The arm is declared in UI/TraceHUD.cpp and this is
-		// a different translation unit, so a cached pointer would bake in whatever the answer was on
-		// the first frame this screen ever drew — including "not registered yet" — and the red arm
-		// would then be dead for the rest of the process. Called once per card per frame; a console
-		// lookup is a hash probe.
-		const IConsoleVariable* Arm =
-			IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.HUD.Text.Erbaum"));
+		// The arm is declared in UI/TraceHUD.cpp and this is a different translation unit, so a pointer
+		// cached unconditionally would bake in whatever the answer was on the first frame this screen
+		// ever drew — including "not registered yet" — and the red arm would then be dead for the rest
+		// of the process. P11: so only a SUCCESSFUL find is remembered; a miss is looked for again next
+		// call. Called once per card per frame, and a console lookup is a lock plus a keyed map probe.
+		static const IConsoleVariable* Arm = nullptr;
+		if (Arm == nullptr)
+		{
+			Arm = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.HUD.Text.Erbaum"));
+		}
 		const bool bErbaum = (Arm == nullptr) || (Arm->GetInt() != 0);
 		return bErbaum ? ETraceTextWeight::Hud : ETraceTextWeight::Light;
 	}

@@ -30,6 +30,7 @@
 #include "Settings/TraceUserSettings.h"
 #include "TimerManager.h"
 #include "Trace.h"                    // LogTraceGame
+#include "Debug/TracePerfProbe.h"   // P11 — TRACE_PERF_SCOPE
 #include "UI/Text/TraceCanvasText.h"   // spec v22 §A1 — this renderer types from the atlas
 #include "UI/Text/TraceGameText.h"     // the editable wording, Config/TraceGameText.ini
 #include "UI/TraceAutoShot.h"
@@ -3026,6 +3027,8 @@ int32 ATraceMenuHUD::JoinButtonAtPoint(const FVector2D& Point) const
 
 void ATraceMenuHUD::DrawHUD()
 {
+	TRACE_PERF_SCOPE(MenuHudDraw);   // P11: Trace.Perf.Sample; nothing in Shipping
+
 	Super::DrawHUD();
 
 	UWorld* World = GetWorld();

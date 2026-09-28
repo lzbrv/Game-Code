@@ -1,6 +1,7 @@
 // Copyright (c) Trace. All Rights Reserved.
 
 #include "Core/TraceGameMode.h"
+#include "Core/TracePreload.h"   // P11 — WarmMatchTables at map load
 
 #include "Components/BoxComponent.h"                     // scoring-volume trigger extent
 #include "EngineUtils.h"                                 // TActorIterator
@@ -429,6 +430,10 @@ void ATraceGameMode::PreInitializeComponents()
 void ATraceGameMode::BeginPlay()
 {
 	Super::BeginPlay();
+
+	// P11: the character and ability rosters, resolved while the map loads rather than on the kickoff
+	// frame that hands the bots their characters. See Core/TracePreload.h.
+	TracePreload::WarmMatchTables();
 
 	// Belt and braces for paths that skip PreInitializeComponents' happy case — seamless travel, a
 	// Blueprint subclass that forgets to call Super, PIE quirks. Both are idempotent.

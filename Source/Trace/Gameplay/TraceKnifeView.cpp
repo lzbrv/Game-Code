@@ -15,7 +15,6 @@
 #include "Engine/SkeletalMesh.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/World.h"
-#include "EngineUtils.h"                     // TActorIterator
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformTime.h"
@@ -33,6 +32,7 @@
 #include "Gameplay/TraceFxShapes.h"
 #include "Gameplay/TraceMelee.h"
 #include "Trace.h"
+#include "Debug/TracePerfProbe.h"   // P11 — TRACE_PERF_SCOPE
 
 // Named after the file and NEVER anonymous: this module is a unity build and
 // Scripts/check-jumbo-build-collisions.py gates on exactly that. Four Windows-only breaks in this
@@ -820,6 +820,7 @@ void UTraceKnifeViewSubsystem::ResolveAssets()
 	// LOAD_NoWarn | LOAD_Quiet because "the art has not been pulled" is the ORDINARY state of a fresh
 	// clone, not an error. The engine's own missing-package warning reads as a fault; the one line
 	// below says what actually happened and what to do about it.
+	const double LoadStart = FPlatformTime::Seconds();   // P11: logged with the result below
 	PackMesh    = LoadObject<USkeletalMesh>(nullptr, TraceKnifeViewFile::MeshPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
 	ClipIdle    = LoadObject<UAnimSequence>(nullptr, TraceKnifeViewFile::IdlePath, nullptr, LOAD_NoWarn | LOAD_Quiet);
 	ClipDraw    = LoadObject<UAnimSequence>(nullptr, TraceKnifeViewFile::DrawPath, nullptr, LOAD_NoWarn | LOAD_Quiet);
@@ -845,11 +846,12 @@ void UTraceKnifeViewSubsystem::ResolveAssets()
 	}
 
 	UE_LOG(LogTraceGame, Log,
-		TEXT("[KnifeView] pack blade up: %s + clips idle %.4fs / draw %s / stab %s / inspect %s."),
+		TEXT("[KnifeView] pack blade up: %s + clips idle %.4fs / draw %s / stab %s / inspect %s (loaded in %.1f ms)."),
 		*GetNameSafe(PackMesh), ClipIdle->GetPlayLength(),
 		ClipDraw != nullptr ? *FString::Printf(TEXT("%.4fs"), ClipDraw->GetPlayLength()) : TEXT("MISSING"),
 		ClipStab != nullptr ? *FString::Printf(TEXT("%.4fs"), ClipStab->GetPlayLength()) : TEXT("MISSING"),
-		ClipInspect != nullptr ? *FString::Printf(TEXT("%.4fs"), ClipInspect->GetPlayLength()) : TEXT("MISSING"));
+		ClipInspect != nullptr ? *FString::Printf(TEXT("%.4fs"), ClipInspect->GetPlayLength()) : TEXT("MISSING"),
+		(FPlatformTime::Seconds() - LoadStart) * 1000.0);
 }
 
 UAnimSequence* UTraceKnifeViewSubsystem::SequenceFor(ETraceKnifeClip Clip) const
@@ -906,6 +908,8 @@ void UTraceKnifeViewSubsystem::ForgetDeadRecords()
 
 void UTraceKnifeViewSubsystem::Tick(float DeltaSeconds)
 {
+	TRACE_PERF_SCOPE(KnifeTick);   // P11: Trace.Perf.Sample; nothing in Shipping
+
 	Super::Tick(DeltaSeconds);
 
 	UWorld* World = GetWorld();
@@ -951,9 +955,20 @@ void UTraceKnifeViewSubsystem::Tick(float DeltaSeconds)
 
 	ForgetDeadRecords();
 
-	for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+	// P11: FROM THE LOCAL PLAYER CONTROLLERS, not from every character in the world. The rule below is
+	// "a pawn whose controller is a local PLAYER controller", so the pawns it can ever accept are the
+	// local players' own — one, or one per split-screen player. Walking the world's characters to find
+	// it built an iterator array of all ten every frame and threw nine away. The test on the pawn's
+	// own controller is kept exactly, so the answer is the same set on every frame, including the
+	// frames on a client where the pawn has arrived and its controller has not.
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
 	{
-		ATraceCharacter* Pawn = *It;
+		const APlayerController* LocalPC = It->Get();
+		if (LocalPC == nullptr || !LocalPC->IsLocalController())
+		{
+			continue;
+		}
+		ATraceCharacter* Pawn = Cast<ATraceCharacter>(LocalPC->GetPawn());
 
 		// =========================================================================================
 		// *** THE PAWN A HUMAN IS LOOKING OUT OF. NOT "LOCALLY CONTROLLED". MEASURED BUG. ***

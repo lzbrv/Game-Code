@@ -365,6 +365,10 @@ int32 TraceMenuKit::Prime()
 		Sprite(Which);
 		Loaded += (PeekSprite(Which) != nullptr) ? 1 : 0;
 	}
+
+	// P11: the pointer is kit art too, drawn by every overlay (DrawCursor / ShowCursor), and it was the
+	// one piece still loaded by its first draw — on the frame team select opens.
+	TraceHardwareCursor::Prime();
 	return Loaded;
 }
 

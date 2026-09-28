@@ -898,8 +898,12 @@ UStaticMeshComponent* ATraceFxBurst::MakeSolidPiece(USceneComponent* Parent, con
 	UTraceFxShapes::ConfigureFxComponent(Piece);
 	Piece->SetCanEverAffectNavigation(false);
 
-	Piece->RegisterComponent();
-
+	// P11 — THE MATERIAL GOES ON BEFORE THE COMPONENT IS REGISTERED. Registered first, every piece
+	// created its render proxy (and asked for its pipeline states) with the mesh's default material,
+	// then set the glow MID a line later and had the whole render state torn down and built again for
+	// it at the end of the frame: two proxies per piece, on every burst. A material instance can be
+	// made on a component that is not registered yet; registering afterwards builds the one proxy the
+	// piece will draw with.
 	const ETraceFxBlend Preferred = bAdditiveOnly ? ETraceFxBlend::Translucent : ETraceFxBlend::Emissive;
 	UMaterialInstanceDynamic* MID = UTraceFxShapes::MakeGlowMID(Piece, 0, Preferred, OutBlend);
 
@@ -927,10 +931,12 @@ UStaticMeshComponent* ATraceFxBurst::MakeSolidPiece(USceneComponent* Parent, con
 		// "no grey primitive on a forced None" is the acceptance this tranche is measured by.
 		Piece->SetVisibility(false);
 		OutBlend = ETraceFxBlend::None;
+		Piece->RegisterComponent();
 		return Piece;
 	}
 
 	OutMID = MID;
+	Piece->RegisterComponent();
 	return Piece;
 }
 
@@ -965,8 +971,7 @@ UInstancedStaticMeshComponent* ATraceFxBurst::MakeInstancedPiece(USceneComponent
 	UTraceFxShapes::ConfigureFxComponent(Piece);
 	Piece->SetCanEverAffectNavigation(false);
 
-	Piece->RegisterComponent();
-
+	// P11: material first, then register — one render proxy per piece. See MakeSolidPiece.
 	const ETraceFxBlend Preferred = bAdditiveOnly ? ETraceFxBlend::Translucent : ETraceFxBlend::Emissive;
 	UMaterialInstanceDynamic* MID = UTraceFxShapes::MakeGlowMID(Piece, 0, Preferred, OutBlend);
 
@@ -985,10 +990,12 @@ UInstancedStaticMeshComponent* ATraceFxBurst::MakeInstancedPiece(USceneComponent
 	{
 		Piece->SetVisibility(false);
 		OutBlend = ETraceFxBlend::None;
+		Piece->RegisterComponent();
 		return Piece;
 	}
 
 	OutMID = MID;
+	Piece->RegisterComponent();
 	return Piece;
 }
 
@@ -1709,16 +1716,21 @@ namespace TraceFxLoopBudget
 		Piece->SetRelativeLocation(ClampToFootprint(LocalOffset));
 		Piece->SetRelativeScale3D(FVector(Scale, Scale, Scale));
 
-		Piece->RegisterComponent();
-
 		// ADDITIVE ONLY — §1.4 says so in as many words, and the reason is the same one the tracer's
 		// halo gives: a while-active effect sits ON a pawn for seconds at a time, and an opaque one
 		// would hide the pawn it is decorating. Translucent resolves to Additive in this project; the
 		// opaque rungs below it are refused rather than accepted.
+		//
+		// P11: the MID is made BEFORE the component registers, so it registers once with the material
+		// it draws with rather than building a proxy for the default one and rebuilding it a line later.
 		ETraceFxBlend Blend = ETraceFxBlend::None;
 		UMaterialInstanceDynamic* MID = UTraceFxShapes::MakeGlowMID(Piece, 0, ETraceFxBlend::Translucent, Blend);
 		const bool bUsable = (MID != nullptr)
 			&& (Blend == ETraceFxBlend::Additive || Blend == ETraceFxBlend::Translucent);
+		if (bUsable)
+		{
+			Piece->RegisterComponent();
+		}
 		if (!bUsable)
 		{
 			// No grey. Same rule as the bursts': no material means no effect, not a default primitive.

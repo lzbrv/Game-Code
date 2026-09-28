@@ -138,15 +138,46 @@ bool UTraceHudCornerWidget::InitialiseCorner(FString& OutReason)
 	}
 
 	// Keep the probe: it becomes chip 0, so the validation costs one widget rather than one wasted one.
-	if (UVerticalBoxSlot* ProbeSlot = StatusStack->AddChildToVerticalBox(ProbeChip))
+	AdoptChip(ProbeChip);
+
+	// P11 — THE POOL IS GROWN NOW, while the corner is being adopted (map load), not the first time
+	// that many statuses are up at once. That first time is mid-fight by definition — poisoned and
+	// slowed together — and each new chip was a CreateWidget plus a slot in the stack on that frame.
+	// Collapsed chips cost nothing to draw; a fight with more statuses than this still grows the pool
+	// exactly as before.
+	while (ChipPool.Num() < TraceHudCornerLayout::PrewarmedChips)
 	{
-		ProbeSlot->SetPadding(FMargin(0.f, 0.f, 0.f, TraceHudCornerLayout::ChipGapDesignPx));
-		ProbeSlot->SetHorizontalAlignment(HAlign_Fill);
+		if (AddPooledChip() == nullptr)
+		{
+			break;
+		}
 	}
-	ProbeChip->SetVisibility(ESlateVisibility::Collapsed);
-	ChipPool.Add(ProbeChip);
 
 	return true;
+}
+
+void UTraceHudCornerWidget::AdoptChip(UTraceHudStatusChipWidget* InChip)
+{
+	if (InChip == nullptr)
+	{
+		return;
+	}
+	if (UVerticalBoxSlot* ChipSlot = StatusStack->AddChildToVerticalBox(InChip))
+	{
+		ChipSlot->SetPadding(FMargin(
+			TraceHudCornerLayout::ChipInsetDesignPx, 0.f,
+			TraceHudCornerLayout::ChipInsetDesignPx, TraceHudCornerLayout::ChipGapDesignPx));
+		ChipSlot->SetHorizontalAlignment(HAlign_Fill);
+	}
+	InChip->SetVisibility(ESlateVisibility::Collapsed);
+	ChipPool.Add(InChip);
+}
+
+UTraceHudStatusChipWidget* UTraceHudCornerWidget::AddPooledChip()
+{
+	UTraceHudStatusChipWidget* NewChip = CreateWidget<UTraceHudStatusChipWidget>(this, ChipWidgetClass);
+	AdoptChip(NewChip);
+	return NewChip;
 }
 
 void UTraceHudCornerWidget::HideCorner()
@@ -360,22 +391,15 @@ void UTraceHudCornerWidget::PresentChips(const FTraceHudCornerState& InState,
 	// Grow the pool to fit. Chips are pooled rather than rebuilt because the stack changes every time
 	// a poison ticks over a tenth of a second, and re-parenting six widgets a frame would allocate a
 	// fresh slot object per chip per frame for a corner that looks identical.
+	//
+	// P11: InitialiseCorner already grew it to TraceHudCornerLayout::PrewarmedChips, so this only runs
+	// in a fight with more statuses up at once than that.
 	while (ChipPool.Num() < ChipCount)
 	{
-		UTraceHudStatusChipWidget* NewChip = CreateWidget<UTraceHudStatusChipWidget>(this, ChipWidgetClass);
-		if (NewChip == nullptr)
+		if (AddPooledChip() == nullptr)
 		{
 			break;
 		}
-
-		if (UVerticalBoxSlot* ChipSlot = StatusStack->AddChildToVerticalBox(NewChip))
-		{
-			ChipSlot->SetPadding(FMargin(
-				TraceHudCornerLayout::ChipInsetDesignPx, 0.f,
-				TraceHudCornerLayout::ChipInsetDesignPx, TraceHudCornerLayout::ChipGapDesignPx));
-			ChipSlot->SetHorizontalAlignment(HAlign_Fill);
-		}
-		ChipPool.Add(NewChip);
 	}
 
 	// *** THE STACK IS FILLED FROM THE BOTTOM. *** Chips[0] is the one nearest the ammo (the Canvas

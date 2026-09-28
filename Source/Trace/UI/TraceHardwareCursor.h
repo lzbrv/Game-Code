@@ -190,6 +190,16 @@ namespace TraceHardwareCursor
 	TRACE_API float PointerHeight(float InUIScale);
 
 	/**
+	 * P11: loads T_MenuCursor NOW and keeps it for the life of the process, so the first overlay that
+	 * draws the pointer finds it resident and drawable. It used to be loaded by the first DrawPointer —
+	 * a FlushAsyncLoading on the frame team select opened (the match's frame 1) or the frame Settings
+	 * opened on the title, then a frame or two of the vector fallback until its render resource landed —
+	 * and cached weakly, so a long match could collect it and pay again. TraceMenuKit::Prime calls
+	 * this, so both HUDs' BeginPlay do. Idempotent. @return true when the sprite is loaded.
+	 */
+	TRACE_API bool Prime();
+
+	/**
 	 * Draw Trace's pointer through @p HUD with its POINT on @p TipPos.
 	 *
 	 * @return false when the sprite is not available (a build with no menu art, or the frame or two

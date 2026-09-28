@@ -185,6 +185,7 @@ namespace
 			return;
 		}
 		GRosterBuilt = true;
+		const double BuildStart = FPlatformTime::Seconds();   // P11: a whole-class walk; say what it cost
 
 		TMap<ETraceCharacterId, UClass*>& Map = RosterMap();
 		Map.Reset();
@@ -233,8 +234,8 @@ namespace
 			Map.Add(ClaimedId, Candidate);
 		}
 
-		UE_LOG(LogTraceGame, Log, TEXT("[Ability] Roster discovered by reflection: %d of %d characters implemented."),
-			Map.Num(), TraceCharacterCount);
+		UE_LOG(LogTraceGame, Log, TEXT("[Ability] Roster discovered by reflection: %d of %d characters implemented (%.1f ms)."),
+			Map.Num(), TraceCharacterCount, (FPlatformTime::Seconds() - BuildStart) * 1000.0);
 	}
 }
 

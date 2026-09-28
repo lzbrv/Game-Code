@@ -233,6 +233,13 @@ namespace TraceHudCornerLayout
 	static constexpr float ChipGapDesignPx = 6.f;
 
 	/**
+	 * P11: status chips built when the corner is adopted (map load), so the first fight with this many
+	 * statuses up at once creates no widget. Poisoned + slowed + vulnerable + a buff is about the most a
+	 * fight produces; more still works, it simply grows the pool on that frame as it always did.
+	 */
+	static constexpr int32 PrewarmedChips = 4;
+
+	/**
 	 * Gap between two magazine ticks, in design pixels. DrawAmmoBlock's 1.5, and the ticks are
 	 * likewise runtime-created (there are thirty of them, or five).
 	 */

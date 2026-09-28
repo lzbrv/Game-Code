@@ -195,6 +195,18 @@ private:
 	/** Grows the tick pool to @p InCount visible ticks, collapsing any beyond it. */
 	void EnsureTicks(int32 InCount);
 
+	/**
+	 * P11: puts @p InChip into the status stack with the chips' slot (the plate-overhang inset and the
+	 * gap under it), collapsed, at the end of the pool. THE ONE WAY A CHIP JOINS THE STACK — the
+	 * validation probe used to be added with no side inset, so the chip it became (pool slot 0: the
+	 * only chip when one status is up, the top one when several are) stood 6 design px wider on each
+	 * side than every other chip and than the Canvas corner's.
+	 */
+	void AdoptChip(UTraceHudStatusChipWidget* InChip);
+
+	/** Creates one chip from ChipWidgetClass and adopts it. @return null when CreateWidget failed. */
+	UTraceHudStatusChipWidget* AddPooledChip();
+
 	/** Shows or collapses the count's row (collapsed while the plate stands in for the knife). */
 	void SetCountRowVisible(bool bInVisible);
 

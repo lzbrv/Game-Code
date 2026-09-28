@@ -623,13 +623,18 @@ namespace TraceCharacterRosterFile
 			else
 			{
 				FString WhyNot;
+				// P11: timed, because this is a synchronous load of every character asset and WHERE it
+				// lands (a loading card, or the kickoff frame) is the difference between invisible and
+				// a hitch. See TracePreload::WarmMatchTables.
+				const double LoadStart = FPlatformTime::Seconds();
 				if (TryBuildFromAssets(AssetStorage(), WhyNot))
 				{
 					GSource = TraceCharacterRoster::ESource::Assets;
 					UE_LOG(LogTraceGame, Display,
-						TEXT("[CharacterData] Roster source: ASSETS — all %d loaded from %s. "
+						TEXT("[CharacterData] Roster source: ASSETS — all %d loaded from %s in %.1f ms. "
 						     "Run Trace.VerifyCharacterData to compare them with the C++ table."),
-						TraceCharacterRoster::Count, UTraceCharacterDefinition::CharactersPackageRoot());
+						TraceCharacterRoster::Count, UTraceCharacterDefinition::CharactersPackageRoot(),
+						(FPlatformTime::Seconds() - LoadStart) * 1000.0);
 				}
 				else
 				{

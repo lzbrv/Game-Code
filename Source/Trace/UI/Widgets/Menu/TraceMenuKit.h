@@ -285,6 +285,10 @@ namespace TraceMenuKit
 	 * it draws its flat fallback for a frame before the art appears (measured on the settings overlay:
 	 * all 8 sprites not drawable on its first frame, and a 93 ms frame). Idempotent and cheap after
 	 * the first call. Returns how many sprites are loaded.
+	 *
+	 * P11: it primes the POINTER too (TraceHardwareCursor::Prime, rooted like these), which was the one
+	 * piece of kit art still loaded by its first draw — a FlushAsyncLoading on the frame team select
+	 * opened. The return value still counts the ETraceKitSprite sheet only.
 	 */
 	TRACE_API int32 Prime();
 

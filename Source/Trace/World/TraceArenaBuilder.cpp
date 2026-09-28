@@ -12,6 +12,7 @@
 #include "World/TraceCoreSpawn.h"       // spec v17 §2 - the placed Core spawn marker
 #include "World/TraceSideRampProfile.h" // the concave side ramps' design, and its live-band check
 #include "World/TraceTeamPlayerStart.h"
+#include "Gameplay/TraceTrailComponent.h"  // P11 — PrewarmLevelVisualIndex at BeginPlay
 
 #include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
@@ -2769,6 +2770,12 @@ void ATraceArenaBuilder::BeginPlay()
 	// before anything begins play. This covers a level-placed builder in a map with no Trace game
 	// mode, and clients (who have no game mode at all and build their copy off the replicated actor).
 	EnsureBuilt();
+
+	// P11: the trace wall fitter's index of the rendered arena, built now — the arena is built and
+	// presented, and every level actor's components are registered by BeginPlay — instead of on the
+	// first carry near a wall in the middle of a match. Not from EnsureBuilt: on the server that runs
+	// from the game mode's PreInitializeComponents, before a baked level's pieces have registered.
+	UTraceTrailComponent::PrewarmLevelVisualIndex(GetWorld());
 }
 
 void ATraceArenaBuilder::EnsureBuilt()

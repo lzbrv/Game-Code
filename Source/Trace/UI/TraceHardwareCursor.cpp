@@ -294,6 +294,12 @@ namespace TraceHardwareCursorFile
 		if (Texture == nullptr)
 		{
 			Texture = LoadObject<UTexture2D>(nullptr, TraceMenuArtStyle::Cursor);
+			if (Texture != nullptr)
+			{
+				// P11: rooted like the kit's sprites (TraceMenuKit::Sprite), so the weak cache below can
+				// never lose it mid-match and pay the load again. See TraceHardwareCursor::Prime.
+				Texture->AddToRoot();
+			}
 			if (Texture == nullptr)
 			{
 				bPointerFailed = true;
@@ -385,6 +391,14 @@ FLinearColor TraceHardwareCursor::PointerTint()
 	// WHITE: the artist's blade, untinted (stylespec §9). It was the pre-kit interface cyan; the kit
 	// has no cyan in it. See the header.
 	return FLinearColor::White;
+}
+
+bool TraceHardwareCursor::Prime()
+{
+	// PointerSprite() loads, roots and caches; it returns null until the texture is DRAWABLE, which is
+	// the point of calling it this early — the render thread gets its frames before anything draws.
+	TraceHardwareCursorFile::PointerSprite();
+	return TraceHardwareCursorFile::PointerCache.IsValid();
 }
 
 float TraceHardwareCursor::PointerHeight(float InUIScale)
