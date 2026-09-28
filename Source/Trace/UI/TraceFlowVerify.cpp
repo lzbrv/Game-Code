@@ -16,6 +16,11 @@
 //      pawn behind it is killed, and after the respawn the cursor must still be shown and the viewport
 //      must not have captured the mouse. OnPossess used to put the game-only mode back and freeze the
 //      pointer for the rest of the page. Closing the menu must still take the mouse back.
+//   E. HALF TIME SHUTS THE TEAM SCREEN. With the team screen open (H), the half-time whistle closes it
+//      as it opens the loadout window, so the loadout page is the only page drawn and it takes the
+//      input. The team screen used to stay up under the loadout page: each gated the other's input,
+//      so no key, pad or click worked until the team screen's own 15 s timeout ran out. The second
+//      half's whistle then shuts the window and hands the input back.
 //   D. FULL TIME SHUTS THE MENUS. With the team screen open, the whistle closes it (and any loadout
 //      window), the server refuses a team change after the whistle, and the select poll opens nothing
 //      over the results. The team page used to stay up over the results and still switch teams.
@@ -60,6 +65,9 @@ namespace TraceFlowVerify
 		OpenMenuForRespawn,
 		WaitForRespawn,
 		CloseMenuAfterRespawn,
+		OpenMenuForHalfTime,
+		HalfTimeDrawn,
+		SecondHalf,
 		OpenMenuForWhistle,
 		AfterWhistle,
 		Done,
@@ -424,7 +432,7 @@ namespace TraceFlowVerify
 				if (SinceStep > 3.0)
 				{
 					Report(Run, false, TEXT("B: the team screen took the input"), DescribeInput(HumanPC, WorldPtr));
-					GoTo(Run, EStep::OpenMenuForWhistle);
+					GoTo(Run, EStep::OpenMenuForHalfTime);
 				}
 				return true;
 			}
@@ -480,6 +488,101 @@ namespace TraceFlowVerify
 			}
 			Report(Run, !HumanPC->IsGameInputSuppressed() && HasGameMouse(HumanPC, WorldPtr),
 				TEXT("B2 closing the menu hands the mouse back to the game"), DescribeInput(HumanPC, WorldPtr));
+			GoTo(Run, EStep::OpenMenuForHalfTime);
+			return true;
+		}
+
+		// ---- E. HALF TIME SHUTS THE TEAM SCREEN ---------------------------------------------------
+		case EStep::OpenMenuForHalfTime:
+		{
+			if (MatchGS->IsHalfTimeBreak() || MatchGS->CurrentHalf >= MatchGS->NumHalves)
+			{
+				Skip(Run, TEXT("E: half time over an open team screen"),
+					FString::Printf(TEXT("no half-time whistle left to blow (half %d of %d, break %d)"),
+						MatchGS->CurrentHalf, MatchGS->NumHalves, MatchGS->IsHalfTimeBreak() ? 1 : 0));
+				GoTo(Run, EStep::OpenMenuForWhistle);
+				return true;
+			}
+			if (SinceStep < 0.3)
+			{
+				return true;
+			}
+			if (!HumanPC->IsTeamSelectOpen())
+			{
+				Rules->OpenTeamSelectFor(HumanPC);   // the H key's server path, which live play accepts
+				return true;
+			}
+			// The bug needs the team page actually UP on this client, not just the replicated flag.
+			if ((!HumanPC->IsGameInputSuppressed() || !Hud->GetHudKitRecord().bTeamSelectOpen) && SinceStep < 3.0)
+			{
+				return true;
+			}
+			const bool bTeamPageUp = Hud->GetHudKitRecord().bTeamSelectOpen;
+
+			Rules->DebugEndPeriodNow();
+			const bool bCharacters = UTraceAbilityComponent::AreCharactersEnabled(HumanPC);
+			const double LoadoutBy = static_cast<double>(HumanState->CharacterSelectDeadlineServerTime);
+			Report(Run, bTeamPageUp && MatchGS->IsHalfTimeBreak() && !HumanPC->IsTeamSelectOpen()
+					&& (!bCharacters || (HumanState->IsCharacterSelectOpen()
+						&& FMath::Abs(LoadoutBy - static_cast<double>(MatchGS->MatchEndServerTime)) < 0.6)),
+				TEXT("*** E1 the half-time whistle closes the open team screen and opens the loadout window ***"),
+				FString::Printf(TEXT("team page drawn before %d, break %d, team screen %d, loadout window %d (characters %d), "
+					"window closes %.1fs / break ends %.1fs"),
+					bTeamPageUp ? 1 : 0, MatchGS->IsHalfTimeBreak() ? 1 : 0, HumanPC->IsTeamSelectOpen() ? 1 : 0,
+					HumanState->IsCharacterSelectOpen() ? 1 : 0, bCharacters ? 1 : 0,
+					LoadoutBy - NowServer, static_cast<double>(MatchGS->MatchEndServerTime) - NowServer));
+			GoTo(Run, EStep::HalfTimeDrawn);
+			return true;
+		}
+
+		case EStep::HalfTimeDrawn:
+		{
+			// A second and a half of HUD frames: long enough for the team page's own close (it follows the
+			// replicated flag) to have run, and for -TraceAutoShotRepeat to catch the page in a capture.
+			if (SinceStep < 1.5)
+			{
+				return true;
+			}
+			const ATraceHUD::FHudKitRecord& Rec = Hud->GetHudKitRecord();
+			if (!UTraceAbilityComponent::AreCharactersEnabled(HumanPC))
+			{
+				Skip(Run, TEXT("E2: the loadout page takes the input at half time"), TEXT("characters are off; no loadout page"));
+			}
+			else
+			{
+				// The loadout page's input gate is !pause && !team page (TraceHUD's LoadoutSelect.Tick call);
+				// these are the two flags that frame drew with.
+				Report(Run, Rec.bLoadoutOpen && !Rec.bTeamSelectOpen && !Rec.bPauseOpen
+						&& HumanPC->IsGameInputSuppressed() && HasMenuMouse(HumanPC, WorldPtr),
+					TEXT("*** E2 at half time the loadout page is the only page up, and it has the input ***"),
+					FString::Printf(TEXT("loadout page drawn %d, team page drawn %d, pause %d; %s"),
+						Rec.bLoadoutOpen ? 1 : 0, Rec.bTeamSelectOpen ? 1 : 0, Rec.bPauseOpen ? 1 : 0,
+						*DescribeInput(HumanPC, WorldPtr)));
+			}
+			GoTo(Run, EStep::SecondHalf);
+			return true;
+		}
+
+		case EStep::SecondHalf:
+		{
+			if (SinceStep < 0.05)
+			{
+				if (MatchGS->IsHalfTimeBreak())
+				{
+					Rules->DebugEndHalfTimeBreak();
+				}
+				return true;
+			}
+			if (HumanPC->IsGameInputSuppressed() && SinceStep < 3.0)
+			{
+				return true;
+			}
+			Report(Run, !MatchGS->IsHalfTimeBreak() && MatchGS->CurrentHalf == 2 && !HumanPC->IsTeamSelectOpen()
+					&& !HumanState->IsCharacterSelectOpen() && !HumanPC->IsGameInputSuppressed(),
+				TEXT("E3 the second half's whistle shuts the window and hands the input back"),
+				FString::Printf(TEXT("half %d, break %d, team screen %d, loadout window %d; %s"), MatchGS->CurrentHalf,
+					MatchGS->IsHalfTimeBreak() ? 1 : 0, HumanPC->IsTeamSelectOpen() ? 1 : 0,
+					HumanState->IsCharacterSelectOpen() ? 1 : 0, *DescribeInput(HumanPC, WorldPtr)));
 			GoTo(Run, EStep::OpenMenuForWhistle);
 			return true;
 		}
@@ -569,7 +672,7 @@ namespace TraceFlowVerify
 		Run->Deadline = FPlatformTime::Seconds() + 150.0;
 		GoTo(*Run, EStep::Start);
 
-		UE_LOG(LogTraceGame, Display, TEXT("[FlowVerify] ===== the match flow: pre-match hold, toasts, respawn under a menu, full time ====="));
+		UE_LOG(LogTraceGame, Display, TEXT("[FlowVerify] ===== the match flow: pre-match hold, toasts, respawn under a menu, half time, full time ====="));
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Run](float /*Delta*/) -> bool
 		{
 			return Tick(*Run);
@@ -580,7 +683,8 @@ namespace TraceFlowVerify
 		TEXT("Trace.Flow.Verify"),
 		TEXT("The match flow end to end (Arena, run early while team select is up, -bots=4): the match clock waits ")
 		TEXT("for the pre-match menus and starts a warm-up after lock-in; warm-up K/D wiped; bot names upper case; ")
-		TEXT("refusal toasts from the text document; a respawn under an open menu keeps the menu's mouse; full ")
+		TEXT("refusal toasts from the text document; a respawn under an open menu keeps the menu's mouse; half ")
+		TEXT("time over an open team screen closes it and leaves the loadout page in charge; full ")
 		TEXT("time closes the menus and refuses a team change. Ends the match."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
 }

@@ -964,6 +964,14 @@ public:
 #if !UE_BUILD_SHIPPING
 	/** Test seam: blow the full-time whistle now, through the shipped FinishMatch (Trace.Flow.Verify). */
 	void DebugFinishMatch(ETraceTeam WinningTeam, ETraceMatchEndReason Reason) { FinishMatch(WinningTeam, Reason); }
+
+	/**
+	 * Test seams: the end-of-half whistle now, through the shipped EndPeriodNow (in the first half of
+	 * two, that is BeginHalfTimeBreak), and the second half's whistle now, through the shipped
+	 * EndHalfTimeBreak. Trace.Flow.Verify E: half time arriving with the team screen up.
+	 */
+	void DebugEndPeriodNow() { EndPeriodNow(TEXT("flow verify")); }
+	void DebugEndHalfTimeBreak() { EndHalfTimeBreak(); }
 #endif
 
 #if !UE_BUILD_SHIPPING

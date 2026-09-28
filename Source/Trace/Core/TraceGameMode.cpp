@@ -3887,6 +3887,15 @@ void ATraceGameMode::BeginHalfTimeBreak()
 	//
 	// HUMANS ONLY. Bots keep the uniform loadouts they were given; nothing opens a bot's screen and
 	// PollCharacterSelect already treats an open one on a bot as the defensive case it is.
+	//
+	// *** AN OPEN TEAM SCREEN SHUTS HERE, TOO. *** H is accepted in live play, so a player can have
+	// the team screen up when this whistle goes. Left open, it froze their break: the team page takes
+	// input only while no loadout window is open, and the loadout page takes input only while no team
+	// page is open, so with both up neither did — no key, pad or click, no in-game pointer — until the
+	// team screen's own 15 s timeout, and PollCharacterSelect (which normally tidies such overlaps)
+	// stands off for the whole break. The same close ServerRequestCharacterSwitch makes when it
+	// reopens the loadout at half time: the player keeps their team, and the sides switch regardless.
+	// It runs after the break flag is set above, so the select poll it triggers opens nothing.
 	const float SelectDeadline =
 		static_cast<float>(TraceGameState->GetServerWorldTimeSeconds() + BreakDuration);
 	for (APlayerState* Each : TraceGameState->PlayerArray)
@@ -3895,6 +3904,15 @@ void ATraceGameMode::BeginHalfTimeBreak()
 		if (Candidate != nullptr && !Candidate->IsABot())
 		{
 			Candidate->ServerSetCharacterSelectOpen(/*bOpen=*/true, SelectDeadline);
+
+			ATracePlayerController* const ChooserPC = Cast<ATracePlayerController>(Candidate->GetOwningController());
+			if (ChooserPC != nullptr && ChooserPC->IsTeamSelectOpen())
+			{
+				ChooserPC->ServerSetTeamSelectOpen(/*bOpen=*/false, 0.f);
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[TeamSelect] Half time closed '%s''s team screen; keeping %s. The loadout window is up."),
+					*Candidate->GetPlayerName(), *TraceTeamName(Candidate->Team).ToString());
+			}
 		}
 	}
 
