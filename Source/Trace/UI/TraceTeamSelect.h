@@ -132,6 +132,15 @@ public:
 	 * path works, and a test that bypassed it would pass with the whole screen disconnected.
 	 */
 	void DebugPick(ETraceTeam Team, ATracePlayerController* PC, ATracePlayerState* LocalState);
+
+	/**
+	 * The title as the last Draw set it, in 1080p design px: its cap height, where its caps are
+	 * centred from the top, and its letter spacing. Trace.UI.Fade.Verify holds it against the loadout
+	 * page's across the page turn.
+	 */
+	float GetDebugTitleCapPx() const { return DebugTitleCapPx; }
+	float GetDebugTitleCapMidPx() const { return DebugTitleCapMidPx; }
+	float GetDebugTitleTrackPx() const { return DebugTitleTrackPx; }
 #endif
 
 private:
@@ -217,6 +226,13 @@ private:
 
 	int32 LastNavDir = 0;
 	float NextNavTime = 0.f;
+
+#if !UE_BUILD_SHIPPING
+	/** See GetDebugTitleCapPx. */
+	float DebugTitleCapPx = 0.f;
+	float DebugTitleCapMidPx = 0.f;
+	float DebugTitleTrackPx = 0.f;
+#endif
 };
 
 #if !UE_BUILD_SHIPPING

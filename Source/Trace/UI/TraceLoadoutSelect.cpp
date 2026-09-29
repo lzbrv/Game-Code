@@ -1708,6 +1708,10 @@ void FTraceLoadoutSelect::DrawHeader(AHUD* HUD, const ATracePlayerState* LocalSt
 	const float HalfRoom = FMath::Min(CentreX - FurnitureLeft, FurnitureRight - CentreX) - 24.f * S;
 	TraceMenuKit::DrawCapText(HUD, Title, CentreX, CapMid, TraceLoadoutLayout::TitleCap * S,
 		TraceMenuArtStyle::WordDefault, ETraceTextWeight::Light, TraceText::EHAlign::Center, FMath::Max(1.f, 2.f * HalfRoom));
+#if !UE_BUILD_SHIPPING
+	DebugTitleCapPx = TraceLoadoutLayout::TitleCap;
+	DebugTitleCapMidPx = TraceLoadoutLayout::TitleCapMid;
+#endif
 }
 
 void FTraceLoadoutSelect::DrawTabs(AHUD* HUD, APlayerController* PC, float X, float Y, float W)

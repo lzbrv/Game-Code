@@ -1596,6 +1596,15 @@ void ATraceHUD::DrawHUD()
 	HudKitRecord.bTeamSelectOpen = CharacterSelect.IsTeamSelectOpen();
 	HudKitRecord.bLoadoutOpen = LoadoutSelect.IsOpen();
 	HudKitRecord.bPauseOpen = PauseMenu.IsOpen();
+	{
+		const FTraceTeamSelect& TeamPage = CharacterSelect.GetTeamSelectForDebug();
+		HudKitRecord.TeamTitleCapPx = TeamPage.GetDebugTitleCapPx();
+		HudKitRecord.TeamTitleCapMidPx = TeamPage.GetDebugTitleCapMidPx();
+		HudKitRecord.TeamTitleTrackPx = TeamPage.GetDebugTitleTrackPx();
+		HudKitRecord.LoadoutTitleCapPx = LoadoutSelect.GetDebugTitleCapPx();
+		HudKitRecord.LoadoutTitleCapMidPx = LoadoutSelect.GetDebugTitleCapMidPx();
+		HudKitRecord.LoadoutTitleTrackPx = LoadoutSelect.GetDebugTitleTrackPx();
+	}
 #endif
 
 	// Last, over everything including the full-time takeover. Draws nothing once closed AND faded out.
@@ -10751,6 +10760,11 @@ namespace TraceHUDFadeVerify
 		int32 RateFrames = 0;
 		double RateFirstTime = -1.0;
 		double RateSettledTime = -1.0;
+
+		/** Team select's title as the settled page drew it (cap, cap line, spacing; 1080p px). */
+		float TeamTitleCap = 0.f;
+		float TeamTitleMid = 0.f;
+		float TeamTitleTrack = 0.f;
 	};
 
 	/** Feeds one drawn frame to the rate check for a fade heading to @p bTarget over @p Seconds. */
@@ -10877,6 +10891,9 @@ namespace TraceHUDFadeVerify
 			// things being tested.)
 			if (Rec.bTeamSelectOpen && Rec.TeamSelectAlpha >= 1.f)
 			{
+				Run.TeamTitleCap = Rec.TeamTitleCapPx;
+				Run.TeamTitleMid = Rec.TeamTitleCapMidPx;
+				Run.TeamTitleTrack = Rec.TeamTitleTrackPx;
 				Enter(Run, EStep::PageTurn);
 				Exec(WorldPtr, TEXT("Trace.Teams.Close"));
 				return true;
@@ -10918,6 +10935,14 @@ namespace TraceHUDFadeVerify
 					FString::Printf(TEXT("least coverage on any frame %.4f (black x team x loadout)"), Run.MinCover));
 				Report(Run, TEXT("PAGE TURN: no match chrome between the pages"), Run.MaxLayer <= 0.001f,
 					FString::Printf(TEXT("match layer peaked at %.3f"), Run.MaxLayer));
+				Report(Run, TEXT("PAGE TURN: the title keeps its size, line and spacing (every title's 30 px cap)"),
+					Run.TeamTitleCap > 0.f && FMath::IsNearlyEqual(Run.TeamTitleCap, Rec.LoadoutTitleCapPx, 0.25f)
+						&& FMath::IsNearlyEqual(Run.TeamTitleCap, TraceMenuKit::PageTitleCapPx, 0.25f)
+						&& FMath::IsNearlyEqual(Run.TeamTitleMid, Rec.LoadoutTitleCapMidPx, 0.5f)
+						&& FMath::IsNearlyEqual(Run.TeamTitleTrack, Rec.LoadoutTitleTrackPx, 0.05f),
+					FString::Printf(TEXT("team select cap %.1f px on line %.1f, tracking %.1f; loadout page cap %.1f px on line %.1f, tracking %.1f"),
+						Run.TeamTitleCap, Run.TeamTitleMid, Run.TeamTitleTrack, Rec.LoadoutTitleCapPx,
+						Rec.LoadoutTitleCapMidPx, Rec.LoadoutTitleTrackPx));
 				Enter(Run, EStep::Settle);
 			}
 			else if (SinceStep > 6.0)

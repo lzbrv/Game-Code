@@ -64,10 +64,20 @@ namespace TraceTeamSelectStyle
  */
 namespace TraceTeamSelectLayout
 {
-	constexpr float Margin      = 54.f;
-	constexpr float HeaderTop   = 34.f;
-	constexpr float TitleSize   = 42.f;
-	constexpr float TitleTrack  = 7.0f;
+	constexpr float Margin      = TraceMenuKit::PageMarginPx;
+
+	/**
+	 * THE TITLE (SELECT YOUR TEAM) IS SET LIKE EVERY OTHER SCREEN TITLE, and exactly like the loadout
+	 * page's that follows this one: Sofachrome, white, untracked, caps TraceMenuKit::PageTitleCapPx
+	 * (30) tall and centred on the pages' title line. It was type size 42 letter-spaced 7 (a 28 px cap,
+	 * tracked, 7 px lower), so the turn from this page to the loadout page changed the title's size,
+	 * spacing and height.
+	 */
+	constexpr float TitleCapMid = TraceMenuKit::PageTitleCapMidPx;
+	constexpr float TitleCap    = TraceMenuKit::PageTitleCapPx;
+
+	/** The gap between the title's caps and the countdown's when the countdown drops under the title. */
+	constexpr float CountUnderGap = 16.f;
 
 	constexpr float PlateTop    = 214.f;
 	constexpr float PlateH      = 440.f;
@@ -146,13 +156,6 @@ namespace TraceTeamSelectFile
 		Style.Tracking = Tracking;
 		Style.HAlign = Align;
 		return TraceCanvasText::Draw(HUD, InText, X, Y, Style);
-	}
-
-	float Width(const FString& InText, float Size, float Tracking = 0.f)
-	{
-		TraceText::FStyle Style(Size);
-		Style.Tracking = Tracking;
-		return TraceText::MeasureWidth(InText, Style);
 	}
 
 #if !UE_BUILD_SHIPPING
@@ -730,13 +733,20 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 	TraceMenuKit::DrawBackground(HUD, ViewW, ViewH);
 
 	// ---- Header ---------------------------------------------------------------------------------
-	const float TitleSize = TraceTeamSelectLayout::TitleSize * S;
-	const float TitleTop = TraceTeamSelectLayout::HeaderTop * S;
-	const FString TitleText = TRACE_TEXT("TEAMSELECT.TITLE", "SELECT YOUR TEAM");
-	TraceTeamSelectFile::Text(HUD, TitleText, TraceMenuArtStyle::WordDefault,
-		CenterX, TitleTop, TitleSize, TraceTeamSelectLayout::TitleTrack * S, TraceText::EHAlign::Center);
-	const float TitleRight = CenterX
-		+ 0.5f * TraceTeamSelectFile::Width(TitleText, TitleSize, TraceTeamSelectLayout::TitleTrack * S);
+	//
+	// The title as every screen sets it (TraceTeamSelectLayout::TitleCap), where the loadout page sets it.
+	const float TitleCapH = TraceTeamSelectLayout::TitleCap * S;
+	const float TitleCapMid = TraceTeamSelectLayout::TitleCapMid * S;
+	const FString& TitleText = TRACE_TEXT("TEAMSELECT.TITLE", "SELECT YOUR TEAM");
+	const float TitleW = TraceMenuKit::DrawCapText(HUD, TitleText, CenterX, TitleCapMid, TitleCapH,
+		TraceMenuArtStyle::WordDefault, ETraceTextWeight::Light, TraceText::EHAlign::Center,
+		FMath::Max(1.f, ViewW - 2.f * TraceTeamSelectLayout::Margin * S));
+	const float TitleRight = CenterX + 0.5f * TitleW;
+#if !UE_BUILD_SHIPPING
+	DebugTitleCapPx = TitleCapH / FMath::Max(S, KINDA_SMALL_NUMBER);
+	DebugTitleCapMidPx = TraceTeamSelectLayout::TitleCapMid;
+	DebugTitleTrackPx = 0.f;
+#endif
 
 	// The close-out countdown, right-aligned against the margin and sat on the title's cap line. A
 	// timeout the player cannot see is indistinguishable from the game deciding at random for them.
@@ -759,13 +769,13 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 			{ FMath::Max(0, FMath::CeilToInt(Remaining)) });
 		const float CountRight = ViewW - TraceTeamSelectLayout::Margin * S;
 
-		// Beside the title where there is room, under it where there is not: on a 5:4 window the two
-		// ran into each other.
-		float CapMid = TitleTop + TraceText::Ascent(TitleSize, ETraceTextWeight::Light)
-			- TraceText::CapHeight(TitleSize, ETraceTextWeight::Light) * 0.5f;
+		// Beside the title where there is room, on the title's cap line; under it where there is not:
+		// on a 5:4 window the two ran into each other.
+		float CapMid = TitleCapMid;
 		if (CountRight - TraceText::MeasureWidth(CountText, CountStyle) < TitleRight + 24.f * S)
 		{
-			CapMid = TitleTop + TraceText::LineHeight(TitleSize) + 10.f * S;
+			CapMid = TitleCapMid + 0.5f * TitleCapH + TraceTeamSelectLayout::CountUnderGap * S
+				+ 0.5f * TraceText::CapHeight(CountStyle.Size, ETraceTextWeight::Light);
 		}
 		TraceMenuKit::DrawTextCapCentered(HUD, CountText, CountRight, CapMid, CountStyle);
 	}

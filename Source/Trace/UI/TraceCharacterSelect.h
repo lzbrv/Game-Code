@@ -115,6 +115,11 @@ public:
 	/** P10: the team page's fade this frame (0..1), fading out included. See FTraceTeamSelect::GetFadeAlpha. */
 	float GetTeamSelectFadeAlpha() const { return TeamSelect.GetFadeAlpha(); }
 
+#if !UE_BUILD_SHIPPING
+	/** The team page itself, read-only, for a harness that reads what it drew. */
+	const FTraceTeamSelect& GetTeamSelectForDebug() const { return TeamSelect; }
+#endif
+
 	/**
 	 * Is @p Key one this FLOW acts on — the team screen, and whichever page follows it (the loadout
 	 * page, or this class's own character page behind Trace.UI.LoadoutScreen 0)?

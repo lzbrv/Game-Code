@@ -281,6 +281,16 @@ struct TRACE_API FTraceLoadoutSelect
 	const FString& DebugTitle() const { return PageTitle; }
 	bool DebugHalfTimeHeader() const { return bHalfTimeHeader; }
 
+#if !UE_BUILD_SHIPPING
+	/**
+	 * The title as the last draw set it, in 1080p design px: its cap height, where its caps are
+	 * centred from the top, and its letter spacing. Trace.UI.Fade.Verify holds team select's against it.
+	 */
+	float GetDebugTitleCapPx() const { return DebugTitleCapPx; }
+	float GetDebugTitleCapMidPx() const { return DebugTitleCapMidPx; }
+	float GetDebugTitleTrackPx() const { return 0.f; }   // DrawCapText sets no tracking
+#endif
+
 	/** The hover salt this page draws under (TraceMenuKit::FScopedHoverSalt): one per instance. */
 	uint32 HoverSalt() const;
 
@@ -381,6 +391,12 @@ private:
 
 	/** The in-match title (BUILD YOUR LOADOUT, or HALF TIME in the break), chosen by Tick. */
 	FString PageTitle;
+
+#if !UE_BUILD_SHIPPING
+	/** See GetDebugTitleCapPx. */
+	float DebugTitleCapPx = 0.f;
+	float DebugTitleCapMidPx = 0.f;
+#endif
 
 	/** The break's header: the score and SIDES SWITCHED beside the title. */
 	bool bHalfTimeHeader = false;

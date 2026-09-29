@@ -207,6 +207,17 @@ public:
 		bool bLoadoutOpen = false;
 		bool bPauseOpen = false;
 
+		/**
+		 * The two pages' titles as last set, in 1080p px: cap height, the line their caps are centred
+		 * on, and letter spacing (team select, then the loadout page). The page turn must not change them.
+		 */
+		float TeamTitleCapPx = 0.f;
+		float TeamTitleCapMidPx = 0.f;
+		float TeamTitleTrackPx = 0.f;
+		float LoadoutTitleCapPx = 0.f;
+		float LoadoutTitleCapMidPx = 0.f;
+		float LoadoutTitleTrackPx = 0.f;
+
 		/** The top score bar, the crosshair, and how many kill-feed rows drew. */
 		bool bTopPanel = false;
 		bool bCrosshair = false;
