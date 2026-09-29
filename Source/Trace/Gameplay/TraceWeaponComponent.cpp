@@ -5691,6 +5691,20 @@ namespace TraceKnifeTest
 		TArray<double> SwingIntervals;
 		int32 SwingCount = 0;
 
+		/**
+		 * THE FRAME THAT MEASURED EACH EVENT: the world-clock gap between the sample that saw it and the
+		 * one before. An event is read on the first frame at or after it happens, so it may be read up
+		 * to that one frame late, and only that frame's length is allowed it. (It was the longest frame
+		 * of the whole run, so one 150 ms hitch anywhere let every timing slip 150 ms.)
+		 */
+		double PulloutToKnifeFrame = 0.0;
+		double PulloutToGunFrame = 0.0;
+		TArray<double> SwingIntervalFrames;
+
+		/** Test hook (`hitch=<s>`): stall the game thread this long once, mid-swing, between two swings. */
+		float HitchSeconds = 0.f;
+		bool bHitchDone = false;
+
 		bool bStarted = false;
 		bool bAborted = false;
 		FString AbortReason;
@@ -5701,11 +5715,7 @@ namespace TraceKnifeTest
 		/** World time the start waits for when the Core had to come off him first. */
 		double SettleUntil = -1.0;
 
-		/**
-		 * The longest world-clock gap between two samples since the knife was asked for. Every timing
-		 * here is read on the first frame at or after the moment it happens, so it can be up to one
-		 * frame late; the verdict's tolerances are this wide rather than a fixed guess.
-		 */
+		/** The longest world-clock gap between two samples since the knife was asked for (reported only). */
 		double LongestFrameSeconds = 0.0;
 		double LastSampleWorldTime = -1.0;
 	};
@@ -5754,11 +5764,16 @@ namespace TraceKnifeTest
 				State->SwingIntervals.Num(), Min, Sum / State->SwingIntervals.Num(), Max,
 				TraceMelee::GetSwingCooldownSeconds());
 		}
+		else if (State->SwingCount == 0)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("KNIFE swing gap   : NO SWINGS LANDED. A knife that never swings is the failure this test exists to catch."));
+		}
 		else
 		{
 			UE_LOG(LogTraceGame, Warning,
-				TEXT("KNIFE swing gap   : NO SWINGS LANDED — %d starts. A knife that never swings is the failure this test exists to catch."),
-				State->SwingCount);
+				TEXT("KNIFE swing gap   : none measured — %d swing(s) in the %.1fs window (setting is %.3fs)."),
+				State->SwingCount, State->SwingSeconds, TraceMelee::GetSwingCooldownSeconds());
 		}
 
 		// Damage probe. Analytic, against the real world, through the same predicate the server uses.
@@ -5821,9 +5836,9 @@ namespace TraceKnifeTest
 		// The swing part used to print no verdict at all, so the last summary line of the command was
 		// the angle model's "[KnifeTest] 0 failures." — and an aborted run, or one in which the knife
 		// never swung, read as a pass in a batch log and in a commit message. Each timing is allowed
-		// one frame late (it is read on the first frame at or after it happens) and never early.
+		// ITS OWN measuring frame late (it is read on the first frame at or after it happens) and never
+		// early: a hitch in the swing phase loosens nothing but the swing it fell on.
 		const double Slack = KnifeTimingSlackSeconds;
-		const double FrameAllowance = State->LongestFrameSeconds + Slack;
 		const double WantToKnife = TraceMelee::GetSwapSecondsFor(ETraceEquippedWeapon::Knife);
 		const double WantToGun = TraceMelee::GetSwapSecondsFor(ETraceEquippedWeapon::Gun);
 		const double Cooldown = TraceMelee::GetSwingCooldownSeconds();
@@ -5837,24 +5852,46 @@ namespace TraceKnifeTest
 		}
 
 		TArray<FString> Problems;
-		if (State->PulloutToKnife < WantToKnife - Slack || State->PulloutToKnife > WantToKnife + FrameAllowance)
+		const double KnifeLatest = WantToKnife + State->PulloutToKnifeFrame + Slack;
+		if (State->PulloutToKnife < WantToKnife - Slack || State->PulloutToKnife > KnifeLatest)
 		{
-			Problems.Add(FString::Printf(TEXT("gun->knife pullout %.4fs, want %.4fs to %.4fs"),
-				State->PulloutToKnife, WantToKnife, WantToKnife + FrameAllowance));
+			Problems.Add(FString::Printf(TEXT("gun->knife pullout %.4fs, want %.4fs to %.4fs (its frame %.4fs)"),
+				State->PulloutToKnife, WantToKnife, KnifeLatest, State->PulloutToKnifeFrame));
 		}
-		if (State->PulloutToGun < WantToGun - Slack || State->PulloutToGun > WantToGun + FrameAllowance)
+		const double GunLatest = WantToGun + State->PulloutToGunFrame + Slack;
+		if (State->PulloutToGun < WantToGun - Slack || State->PulloutToGun > GunLatest)
 		{
-			Problems.Add(FString::Printf(TEXT("knife->gun pullout %.4fs, want %.4fs to %.4fs"),
-				State->PulloutToGun, WantToGun, WantToGun + FrameAllowance));
+			Problems.Add(FString::Printf(TEXT("knife->gun pullout %.4fs, want %.4fs to %.4fs (its frame %.4fs)"),
+				State->PulloutToGun, WantToGun, GunLatest, State->PulloutToGunFrame));
 		}
-		if (State->SwingIntervals.Num() == 0)
+		for (int32 GapIndex = 0; GapIndex < State->SwingIntervals.Num(); ++GapIndex)
 		{
-			Problems.Add(FString::Printf(TEXT("no swing-to-swing interval (%d swing(s) landed)"), State->SwingCount));
+			const double GapFrame = State->SwingIntervalFrames.IsValidIndex(GapIndex) ? State->SwingIntervalFrames[GapIndex] : 0.0;
+			const double Gap = State->SwingIntervals[GapIndex];
+			if (Gap < Cooldown - Slack || Gap > Cooldown + GapFrame + Slack)
+			{
+				Problems.Add(FString::Printf(TEXT("swing gap %d is %.4fs, want %.4fs to %.4fs (its frame %.4fs)"),
+					GapIndex + 1, Gap, Cooldown, Cooldown + GapFrame + Slack, GapFrame));
+			}
 		}
-		else if (ShortestGap < Cooldown - Slack || LongestGap > Cooldown + FrameAllowance)
+
+		// NO INTERVAL IS ONLY A KNIFE FAULT WHEN THE WINDOW COULD HOLD TWO SWINGS. A window shorter than
+		// the cooldown (a short SwingSeconds, or a long Trace.Knife.Cooldown) lands one swing whatever
+		// the knife does, and that run measured nothing: INVALID, not FAIL. No swing at all is a FAIL.
+		FString InvalidReason;
+		if (!State->bAborted && State->SwingIntervals.Num() == 0)
 		{
-			Problems.Add(FString::Printf(TEXT("swing gap %.4fs to %.4fs, want %.4fs to %.4fs"),
-				ShortestGap, LongestGap, Cooldown, Cooldown + FrameAllowance));
+			if (State->SwingCount >= 1 && State->SwingSeconds < Cooldown + Slack)
+			{
+				InvalidReason = FString::Printf(
+					TEXT("a %.1fs swing window cannot hold two swings %.3fs apart, so no swing gap was measured. Run it with a longer window."),
+					State->SwingSeconds, Cooldown);
+			}
+			else
+			{
+				Problems.Add(FString::Printf(TEXT("no swing-to-swing interval (%d swing(s) landed in %.1fs at a %.3fs cooldown)"),
+					State->SwingCount, State->SwingSeconds, Cooldown));
+			}
 		}
 		if (AngleFailures > 0)
 		{
@@ -5867,6 +5904,10 @@ namespace TraceKnifeTest
 				TEXT("[KnifeTest] ===== KNIFE VERDICT: INVALID — %s The swing part measured nothing. ====="),
 				*State->AbortReason);
 		}
+		else if (!InvalidReason.IsEmpty() && Problems.Num() == 0)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[KnifeTest] ===== KNIFE VERDICT: INVALID — %s ====="), *InvalidReason);
+		}
 		else if (Problems.Num() > 0)
 		{
 			UE_LOG(LogTraceGame, Error, TEXT("[KnifeTest] ===== KNIFE VERDICT: *** FAIL *** — %s ====="),
@@ -5876,16 +5917,17 @@ namespace TraceKnifeTest
 		{
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[KnifeTest] ===== KNIFE VERDICT: PASS — pullouts %.4fs / %.4fs, %d swings %.4f-%.4fs apart "
-				     "(each timing allowed one frame late, frames up to %.4fs), angle model clean ====="),
+				     "(each timing allowed its own frame late; the longest frame was %.4fs), angle model clean ====="),
 				State->PulloutToKnife, State->PulloutToGun, State->SwingCount, ShortestGap, LongestGap,
 				State->LongestFrameSeconds);
 		}
 	}
 
-	void Run(float SwingSeconds, float DelaySeconds)
+	void Run(float SwingSeconds, float DelaySeconds, float HitchSeconds)
 	{
 		TSharedRef<FState> State = MakeShared<FState>();
 		State->SwingSeconds = FMath::Max(1.0f, SwingSeconds);
+		State->HitchSeconds = FMath::Clamp(HitchSeconds, 0.f, 1.f);
 
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[KnifeTest] in %.1fs: swap to the knife, swing for %.1fs, swap back, and report every timing."),
@@ -5965,10 +6007,9 @@ namespace TraceKnifeTest
 						}
 
 						State->Elapsed += DeltaTime;
-						if (State->LastSampleWorldTime >= 0.0)
-						{
-							State->LongestFrameSeconds = FMath::Max(State->LongestFrameSeconds, Now - State->LastSampleWorldTime);
-						}
+						// The frame this sample closes: whatever it sees happened inside it.
+						const double SampleFrame = (State->LastSampleWorldTime >= 0.0) ? (Now - State->LastSampleWorldTime) : 0.0;
+						State->LongestFrameSeconds = FMath::Max(State->LongestFrameSeconds, SampleFrame);
 						State->LastSampleWorldTime = Now;
 
 						switch (State->Phase)
@@ -5980,6 +6021,7 @@ namespace TraceKnifeTest
 							if (Weapon->IsKnifeEquipped() && Weapon->CanSwing())
 							{
 								State->PulloutToKnife = static_cast<float>(Now - State->PhaseStart);
+								State->PulloutToKnifeFrame = SampleFrame;
 								UE_LOG(LogTraceGame, Display, TEXT("[KnifeTest] knife up after %.4fs; swinging for %.1fs."),
 									State->PulloutToKnife, State->SwingSeconds);
 								State->Phase = FState::EPhase::Swinging;
@@ -6006,8 +6048,18 @@ namespace TraceKnifeTest
 								if (State->LastSwingAt > 0.0)
 								{
 									State->SwingIntervals.Add(Now - State->LastSwingAt);
+									State->SwingIntervalFrames.Add(SampleFrame);
 								}
 								State->LastSwingAt = Now;
+							}
+							else if (State->HitchSeconds > 0.f && !State->bHitchDone && State->SwingCount >= 2
+								&& State->LastSwingAt > 0.0 && (Now - State->LastSwingAt) < 0.1)
+							{
+								// TEST HOOK: one long frame just after a swing, so the next swing is not on it.
+								State->bHitchDone = true;
+								UE_LOG(LogTraceGame, Display, TEXT("[KnifeTest] test hook: stalling the game thread %.2fs mid-swing."),
+									State->HitchSeconds);
+								FPlatformProcess::Sleep(State->HitchSeconds);
 							}
 
 							if ((Now - State->PhaseStart) >= State->SwingSeconds)
@@ -6025,6 +6077,7 @@ namespace TraceKnifeTest
 							if (!Weapon->IsKnifeEquipped() && Weapon->CanFire())
 							{
 								State->PulloutToGun = static_cast<float>(Now - State->PhaseStart);
+								State->PulloutToGunFrame = SampleFrame;
 								State->Phase = FState::EPhase::Done;
 								Report(State, Weapon, Character);
 								return false;
@@ -6052,12 +6105,23 @@ namespace TraceKnifeTest
 
 	FAutoConsoleCommand CmdTestKnife(
 		TEXT("Trace.TestKnife"),
-		TEXT("Dev only. Trace.TestKnife [SwingSeconds] [DelaySeconds] — swap to the knife, swing, swap back, and report the measured pullout and swing-to-swing timings."),
+		TEXT("Dev only. Trace.TestKnife [SwingSeconds] [DelaySeconds] [hitch=<s>] — swap to the knife, swing, swap back, ")
+		TEXT("and report the measured pullout and swing-to-swing timings, each allowed only the frame that measured it. ")
+		TEXT("A window too short for two swings is INVALID. hitch=<s> stalls one frame mid-swing (a test hook)."),
 		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
 		{
-			const float SwingSeconds = (Args.Num() > 0) ? FCString::Atof(*Args[0]) : 3.f;
-			const float DelaySeconds = (Args.Num() > 1) ? FMath::Max(0.f, FCString::Atof(*Args[1])) : 0.f;
-			Run(SwingSeconds, DelaySeconds);
+			float HitchSeconds = 0.f;
+			TArray<FString> Positional;
+			for (const FString& Arg : Args)
+			{
+				if (!FParse::Value(*Arg, TEXT("hitch="), HitchSeconds))
+				{
+					Positional.Add(Arg);
+				}
+			}
+			const float SwingSeconds = (Positional.Num() > 0) ? FCString::Atof(*Positional[0]) : 3.f;
+			const float DelaySeconds = (Positional.Num() > 1) ? FMath::Max(0.f, FCString::Atof(*Positional[1])) : 0.f;
+			Run(SwingSeconds, DelaySeconds, HitchSeconds);
 		}));
 }
 
