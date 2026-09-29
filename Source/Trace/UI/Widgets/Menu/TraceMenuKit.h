@@ -477,6 +477,19 @@ namespace TraceMenuKit
 	TRACE_API void DrawSliderTrack(AHUD* HUD, float X, float Y, float W, float H,
 		const FLinearColor& Tint = FLinearColor::White);
 
+	/**
+	 * The slider's RAIL (T_MenuSliderTrack) as a meter's groove, for the match HUD's bars. (X, Y, W, H) is
+	 * the rail ITSELF — the navy between its two gold lips, lips included — not the sprite: the gold halo
+	 * overhangs it on every side by at most @p MaxHalo px, squashed rather than cut so it still fades out,
+	 * which lets meters stacked a few pixels apart keep the kit's glow without their halos piling up. A
+	 * fill belongs inside RailLipInset(H) of the two long edges. Fallback: a PlateFill rect with gold edges.
+	 */
+	TRACE_API void DrawRail(AHUD* HUD, float X, float Y, float W, float H, float MaxHalo,
+		const FLinearColor& Tint = FLinearColor::White);
+
+	/** How far inside a DrawRail rect @p H tall its gold lips reach, in whole pixels, at least 1. */
+	TRACE_API float RailLipInset(float H);
+
 	/** Where the blade handle sits for a track of sprite height @p TrackH centred on (CenterX, CenterY). */
 	TRACE_API FBox2D SliderHandleRect(float CenterX, float CenterY, float TrackH);
 

@@ -17,8 +17,8 @@
 // line (where the structure over the spawn hides it, and its plate must not show through that) and
 // from the platform itself, where a player walking up to it stands.
 //
-//   1. the pad's label is drawn where the player is looking, whole (not faded) — or, where world
-//      geometry is in the way (the harness traces that itself), not drawn through it;
+//   1. the pad's label is drawn where the player is looking, whole (not faded), on an OPAQUE plate —
+//      or, where world geometry is in the way (the harness traces that itself), not drawn through it;
 //   2. every label the player can see reads LEFT TO RIGHT from there. A world-space text render on a
 //      pad is projected, both ends, through the player's own view: if its end lands left of its start,
 //      it is mirrored. (This is the check the old pads fail. The HUD's plates read left to right by
@@ -367,6 +367,15 @@ namespace TracePracticePadVerify
 						? FString::Printf(TEXT("\"%s\" plate (%.0f,%.0f)-(%.0f,%.0f), aim (%.0f,%.0f), alpha %.2f"), *Drawn->Text,
 							Drawn->Rect.Min.X, Drawn->Rect.Min.Y, Drawn->Rect.Max.X, Drawn->Rect.Max.Y, Aim.X, Aim.Y, Drawn->Alpha)
 						: FString(TEXT("the HUD drew no label for it")));
+
+				// An OPAQUE plate: at the HUD's panel alpha the range's bright pillar stripes ran through it
+				// and behind the words. Only the label's own distance fade may thin it.
+				if (Drawn != nullptr)
+				{
+					Report(Run, Drawn->PlateAlpha >= Drawn->Alpha - 0.001f,
+						FString::Printf(TEXT("*** the %s pad's plate is opaque, so the arena does not show through its words ***"), RoleName(Role)),
+						FString::Printf(TEXT("plate alpha %.3f at label alpha %.3f"), Drawn->PlateAlpha, Drawn->Alpha));
+				}
 
 				int32 WorldTexts = 0;
 				FString WorldDetail;

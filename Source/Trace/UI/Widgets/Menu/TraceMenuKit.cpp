@@ -819,6 +819,103 @@ void TraceMenuKit::DrawSliderTrack(AHUD* HUD, float X, float Y, float W, float H
 	TraceMenuKitFile::IssueTexturedQuad(HUD, Track, Quad, Tint);
 }
 
+// Named, not anonymous: the unity build (Scripts/check-jumbo-build-collisions.py).
+namespace TraceMenuKitRail
+{
+	// T_MenuSliderTrack in its own pixels (512 x 23). The rail — the navy and the gold lip either side of
+	// it — is rows 6..16 and columns 5..506; everything outside that is the halo. The ends are cut 11
+	// columns deep, the depth of the artist's soft end, and the stretched middle samples the same clean
+	// band DrawSliderTrack does.
+	static constexpr float SheetW = 512.f;
+	static constexpr float SheetH = 23.f;
+	static constexpr float RailRowTop = 6.f;
+	static constexpr float RailRowBottom = 17.f;
+	static constexpr float RailColLeft = 5.f;
+	static constexpr float RailColRight = 507.f;
+	static constexpr float EndCols = 11.f;
+	static constexpr float MiddleU = 0.30f;
+	static constexpr float MiddleUW = 0.40f;
+}
+
+float TraceMenuKit::RailLipInset(float H)
+{
+	namespace KR = TraceMenuKitRail;
+	return FMath::Max(1.f, FMath::RoundToFloat(FMath::Max(0.f, H) / (KR::RailRowBottom - KR::RailRowTop)));
+}
+
+void TraceMenuKit::DrawRail(AHUD* HUD, float X, float Y, float W, float H, float MaxHalo, const FLinearColor& Tint)
+{
+	namespace KR = TraceMenuKitRail;
+	if (HUD == nullptr || W <= 0.f || H <= 0.f)
+	{
+		return;
+	}
+
+	UTexture2D* const RailSprite = Sprite(ETraceKitSprite::SliderTrack);
+	if (RailSprite == nullptr)
+	{
+		const float LipPx = RailLipInset(H);
+		TraceMenuKitFile::FadedRect(HUD, TraceMenuArtStyle::PlateFill, X, Y, W, H);
+		TraceMenuKitFile::FadedRect(HUD, TraceMenuArtStyle::ValueGlowLifted(), X, Y, W, LipPx);
+		TraceMenuKitFile::FadedRect(HUD, TraceMenuArtStyle::ValueGlowLifted(), X, Y + H - LipPx, W, LipPx);
+		return;
+	}
+
+	// The sprite's scale is set by the RAIL's height; the halo keeps that scale until it would be taller
+	// than MaxHalo, and is squashed (both ways alike) from there.
+	const float PxPerRow = H / (KR::RailRowBottom - KR::RailRowTop);
+	const float NaturalHalo = KR::RailRowTop * PxPerRow;
+	const float HaloScale = (NaturalHalo > 0.f) ? FMath::Clamp(FMath::Max(0.f, MaxHalo) / NaturalHalo, 0.f, 1.f) : 0.f;
+	const float HaloUp = NaturalHalo * HaloScale;
+	const float HaloDown = (KR::SheetH - KR::RailRowBottom) * PxPerRow * HaloScale;
+	const float HaloLeft = KR::RailColLeft * PxPerRow * HaloScale;
+	const float HaloRight = (KR::SheetW - KR::RailColRight) * PxPerRow * HaloScale;
+	const float EndW = FMath::Min(KR::EndCols * PxPerRow, W * 0.5f);
+
+	// Five columns (halo, end, stretched middle, end, halo) by three rows (halo, rail, halo): every cell
+	// keeps its own sampled band, so the lips never stretch and the halo is never cut.
+	struct FRailSpan
+	{
+		float From;
+		float Size;
+		float Start;
+		float Span;
+	};
+	const FRailSpan Columns[5] = {
+		{ X - HaloLeft, HaloLeft, 0.f, KR::RailColLeft / KR::SheetW },
+		{ X, EndW, KR::RailColLeft / KR::SheetW, KR::EndCols / KR::SheetW },
+		{ X + EndW, W - EndW * 2.f, KR::MiddleU, KR::MiddleUW },
+		{ X + W - EndW, EndW, (KR::RailColRight - KR::EndCols) / KR::SheetW, KR::EndCols / KR::SheetW },
+		{ X + W, HaloRight, KR::RailColRight / KR::SheetW, (KR::SheetW - KR::RailColRight) / KR::SheetW },
+	};
+	const FRailSpan Bands[3] = {
+		{ Y - HaloUp, HaloUp, 0.f, KR::RailRowTop / KR::SheetH },
+		{ Y, H, KR::RailRowTop / KR::SheetH, (KR::RailRowBottom - KR::RailRowTop) / KR::SheetH },
+		{ Y + H, HaloDown, KR::RailRowBottom / KR::SheetH, (KR::SheetH - KR::RailRowBottom) / KR::SheetH },
+	};
+
+	for (const FRailSpan& Band : Bands)
+	{
+		for (const FRailSpan& Column : Columns)
+		{
+			if (Band.Size <= 0.f || Column.Size <= 0.f)
+			{
+				continue;
+			}
+			FTraceKitQuad Quad;
+			Quad.X = Column.From;
+			Quad.W = Column.Size;
+			Quad.U = Column.Start;
+			Quad.UW = Column.Span;
+			Quad.Y = Band.From;
+			Quad.H = Band.Size;
+			Quad.V = Band.Start;
+			Quad.VH = Band.Span;
+			TraceMenuKitFile::IssueTexturedQuad(HUD, RailSprite, Quad, Tint);
+		}
+	}
+}
+
 FBox2D TraceMenuKit::SliderHandleRect(float CenterX, float CenterY, float TrackH)
 {
 	const float HandleH = FMath::Max(0.f, TrackH) * SliderHandleToTrack;

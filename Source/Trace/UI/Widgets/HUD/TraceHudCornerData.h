@@ -169,6 +169,9 @@ struct FTraceHudCornerPresented
 	FString AmmoLabel;
 	FString RightLabel;
 
+	/** The left label's cap height as drawn, in design pixels (1080p px at UIScale 1). */
+	float AmmoLabelCapPx = 0.f;
+
 	/** The plate stood in for the knife (bAmmoBlock stays false: there is no clip). */
 	bool bKnifeBlock = false;
 
@@ -252,4 +255,13 @@ namespace TraceHudCornerLayout
 	 * correct, loud outcome rather than a silent one.
 	 */
 	static constexpr int32 MaxMagazineTicks = 240;
+
+	/**
+	 * The ammo plate's label line — PISTOL / SMG / BEE ROUNDS on the left, [R] RELOAD on the right — by
+	 * its CAP height, in design pixels. The asset's size-9 text gave a 6.6 px cap, the smallest words on
+	 * the HUD and under the 8.7 of the bottom-left stack's captions (the Canvas HUD's small font), which
+	 * is what this matches. The widget scales its labels to it at install (UTraceHudCornerWidget::
+	 * InstallAtlasLabels); a regenerated asset cannot shrink them back.
+	 */
+	static constexpr float LabelCapDesignPx = 8.75f;
 }

@@ -11,6 +11,7 @@
 #include "Components/PanelWidget.h"
 #include "Components/SizeBox.h"
 #include "UI/Text/TraceAtlasTextWidget.h"             // UTraceAtlasText — the count's atlas twin is a UWidget
+#include "UI/Text/TraceText.h"                        // SizeForCapHeight / CapHeight — the label line's size
 #include "Components/ProgressBar.h"
 #include "Components/TextBlock.h"
 #include "Components/VerticalBox.h"
@@ -32,6 +33,26 @@ namespace TraceHudCornerWidgetFile
 
 	/** An unlit magazine tick: the rounds colour at 14%, so the strip's SHAPE survives an empty clip. */
 	static constexpr float UnlitTickAlpha = 0.14f;
+
+	/** The SizeScale that puts @p Block's caps at @p CapPx in the HUD's face, from its authored size. */
+	static float ScaleToCap(const UTextBlock* Block, float CapPx)
+	{
+		const float Authored = (Block != nullptr) ? Block->GetFont().Size : 0.f;
+		return (Authored > 0.f) ? TraceText::SizeForCapHeight(CapPx, ETraceTextWeight::Hud) / Authored : 1.f;
+	}
+
+	/** The cap height @p Source is drawn at, in design pixels: its atlas twin's if it was swapped. */
+	static float DrawnCapPx(const TArray<FTraceAtlasLabel>& Labels, const UTextBlock* Source)
+	{
+		for (const FTraceAtlasLabel& Swapped : Labels)
+		{
+			if (Swapped.Source == Source && Swapped.Atlas != nullptr)
+			{
+				return TraceText::CapHeight(Swapped.Atlas->Size, ETraceTextWeight::Hud);
+			}
+		}
+		return (Source != nullptr) ? TraceText::CapHeight(Source->GetFont().Size, ETraceTextWeight::Hud) : 0.f;
+	}
 }
 
 const TCHAR* UTraceHudCornerWidget::CornerBlueprintPath()
@@ -246,8 +267,12 @@ void UTraceHudCornerWidget::InstallAtlasLabels()
 		AtlasLabels.Last().Atlas->SetTabularDigits(true);
 	}
 	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, CapacityText, 0.f, 1.f, ETraceTextWeight::Hud));
-	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, AmmoLabelText, 0.f, 1.f, ETraceTextWeight::Hud));
-	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, ReloadLabelText, 0.f, 1.f, ETraceTextWeight::Hud));
+	// The LABEL LINE at the stack's caption size (TraceHudCornerLayout::LabelCapDesignPx): the asset's
+	// size 9 made PISTOL and [R] RELOAD the smallest words on the HUD.
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, AmmoLabelText, 0.f,
+		TraceHudCornerWidgetFile::ScaleToCap(AmmoLabelText, TraceHudCornerLayout::LabelCapDesignPx), ETraceTextWeight::Hud));
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, ReloadLabelText, 0.f,
+		TraceHudCornerWidgetFile::ScaleToCap(ReloadLabelText, TraceHudCornerLayout::LabelCapDesignPx), ETraceTextWeight::Hud));
 	AtlasLabels.RemoveAll([](const FTraceAtlasLabel& Label) { return !Label.IsValid(); });
 }
 
@@ -286,6 +311,7 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 
 		OutPresented.bKnifeBlock = true;
 		OutPresented.AmmoLabel = InState.KnifeLabel;
+		OutPresented.AmmoLabelCapPx = TraceHudCornerWidgetFile::DrawnCapPx(AtlasLabels, AmmoLabelText);
 		OutPresented.RightLabel = InState.KnifeReadout;
 		return;
 	}
@@ -380,6 +406,7 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 	OutPresented.bBeeClip = InState.bBeeClip;
 	OutPresented.AmmoText = InState.CountText + InState.CapacityText;
 	OutPresented.AmmoLabel = InState.AmmoLabel;
+	OutPresented.AmmoLabelCapPx = TraceHudCornerWidgetFile::DrawnCapPx(AtlasLabels, AmmoLabelText);
 	OutPresented.RightLabel = InState.RightLabel;
 }
 

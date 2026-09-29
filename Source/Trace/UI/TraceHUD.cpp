@@ -210,6 +210,14 @@ namespace TraceHUDStyle
 	 */
 	static const FLinearColor Trough     (0.0040f, 0.0044f, 0.0044f, 1.00f);
 	static const FLinearColor Shadow     (0.00f, 0.00f, 0.00f, 0.55f);
+
+	/**
+	 * THE BOTTOM-LEFT METERS' RAIL (DrawMeter). The kit's slider rail is the plate's own navy, so its
+	 * empty groove is darkened by this much black to read as a groove, not as the plate; and its gold halo
+	 * is squashed to this many 1080p px, so rows 8 px apart do not pile their glows into one amber band.
+	 */
+	static const FLinearColor MeterGroove(0.00f, 0.00f, 0.00f, 0.35f);
+	static constexpr float MeterHaloPx = 3.f;
 	static const FLinearColor Danger     (0.95f, 0.22f, 0.18f, 1.00f);
 	static const FLinearColor Good       (0.24f, 0.90f, 0.42f, 1.00f);
 	/** Headshot hitmarker. Hot amber: distinct from both the white body tick and the red kill tick. */
@@ -3411,7 +3419,8 @@ void ATraceHUD::DrawHealthAndDash()
 		const FString HealthText = FString::Printf(TEXT("%d"), FMath::CeilToInt(HealthComp->Health));
 		const float NumberRight = Margin + BarW - (10.f * UIScale);
 		const float NumberMid = NumberRight - MeasureWidth(HealthText, FontMedium, UIScale) * 0.5f;
-		const bool bOnFill = (Margin + FMath::Clamp(DrawnHealthFraction, 0.f, 1.f) * BarW) >= NumberMid;
+		const float HealthLip = TraceMenuKit::RailLipInset(HealthH);
+		const bool bOnFill = (Margin + HealthLip + FMath::Clamp(DrawnHealthFraction, 0.f, 1.f) * (BarW - HealthLip * 2.f)) >= NumberMid;
 		DrawTextRight(HealthText, bOnFill ? TraceMenuArtStyle::PlateFill : TraceHUDStyle::Ink,
 			NumberRight, VCenterTextY(HealthText, FontMedium, UIScale, HealthY, HealthH), FontMedium, UIScale);
 
@@ -3765,7 +3774,14 @@ void ATraceHUD::DrawHealthBar(const UTraceHealthComponent* HealthComp, float X, 
 
 	const bool bRegenerating = HealthComp->IsRegenerating();
 	const float Pulse = TraceHUDStyle::PulseWave(Now);
-	const float FillW = Fraction * W;
+	// The fill sits between the rail's gold lips (DrawMeter), so the crest and the lit rail below ride
+	// that inner span, not the rail's outer edge.
+	const float Lip = TraceMenuKit::RailLipInset(H);
+	const float InnerX = X + Lip;
+	const float InnerY = Y + Lip;
+	const float InnerW = FMath::Max(0.f, W - Lip * 2.f);
+	const float InnerH = FMath::Max(1.f, H - Lip * 2.f);
+	const float FillW = Fraction * InnerW;
 
 	// A fuse UNDERNEATH the bar, filling left to right over the delay and solid while regeneration
 	// runs.
@@ -3807,12 +3823,12 @@ void ATraceHUD::DrawHealthBar(const UTraceHealthComponent* HealthComp, float X, 
 		// crest would vanish on the white top of the bar instead.
 		const FLinearColor Crest = TraceHUDStyle::Good;
 
-		const float CrestW = FMath::Min(FMath::Max(4.f, 7.f * UIScale), FMath::Max(0.f, W - FillW) + (7.f * UIScale));
-		const float CrestX = FMath::Clamp(X + FillW - (CrestW * 0.5f), X, X + W - CrestW);
-		DrawHudRect(TraceHUDStyle::WithAlpha(Crest, 0.45f + 0.5f * Pulse), CrestX, Y, CrestW, H);
+		const float CrestW = FMath::Min(FMath::Max(4.f, 7.f * UIScale), FMath::Max(0.f, InnerW - FillW) + (7.f * UIScale));
+		const float CrestX = FMath::Clamp(InnerX + FillW - (CrestW * 0.5f), InnerX, InnerX + InnerW - CrestW);
+		DrawHudRect(TraceHUDStyle::WithAlpha(Crest, 0.45f + 0.5f * Pulse), CrestX, InnerY, CrestW, InnerH);
 
 		const float RailH = FMath::Max(1.f, 2.f * UIScale);
-		DrawHudRect(TraceHUDStyle::WithAlpha(Crest, 0.25f + 0.35f * Pulse), X, Y, FillW, RailH);
+		DrawHudRect(TraceHUDStyle::WithAlpha(Crest, 0.25f + 0.35f * Pulse), InnerX, InnerY, FillW, RailH);
 	}
 
 	// ---- The words, to the right of the bar, where every other row in this stack puts its status --
@@ -3883,7 +3899,11 @@ namespace TraceHUDStatusStyle
 	 * greens on a poisoned Chut's screen at once, which is the exact collision this palette exists to
 	 * avoid. So statuses get their own wheel, spread far enough apart to survive a small window.
 	 */
-	static const FLinearColor SpeedBoost (0.30f, 0.95f, 0.95f, 1.f);   // electric cyan
+	// MAGENTA, NOT CYAN: cyan is the pre-kit Tron colour the kit forbids (stylespec §0), and this was the
+	// last of it on the match HUD. The move keeps the wheel's spacing: sRGB hue 310.0, 44.8 deg from
+	// SUSPEND's violet and 37.9 from VULNERABLE's rose, the widest gap left on it; gold (CHUD, BEE ROUNDS,
+	// RELOADING) and white (ZIP's ice) were both already taken.
+	static const FLinearColor SpeedBoost (1.00f, 0.30f, 0.85f, 1.f);   // magenta — Rocco's headshot boost
 	static const FLinearColor Poisoned   (0.35f, 0.95f, 0.20f, 1.f);   // toxic green, the cloud's own
 	static const FLinearColor Slowed     (0.35f, 0.55f, 1.00f, 1.f);   // cold blue
 	static const FLinearColor Vulnerable (1.00f, 0.35f, 0.45f, 1.f);   // rose — X's mark
@@ -3918,9 +3938,12 @@ namespace TraceHUDStatusStyle
 	//     STUCK   slime  75.0 -> Slimeball's slime  100.3 :  2.5 deg from POISONED   (was 27.8)
 	//     ZIP     ice   198.1 -> Lily's ice         185.8 :  5.8 deg from SPEEDBOOST (was 18.1)
 	//
-	// All three collapse onto a status they can be up AT THE SAME TIME AS, and two of the three pairs
+	// (That last row was measured against SPEED BOOST's old cyan, 180.0. SPEED BOOST is magenta now,
+	// 310.0 — cyan is not a kit colour — so the ZIP pair no longer collapses; the other two still do.)
+	//
+	// All three collapsed onto a status they can be up AT THE SAME TIME AS, and two of the three pairs
 	// mean opposite things: MODDED (your gun is better) would become X's VULNERABLE (you are taking
-	// extra damage), and ZIP (you are flying) would become SPEEDBOOST. POISONED and STUCK can be up
+	// extra damage), and ZIP (you are flying) would have become SPEEDBOOST. POISONED and STUCK can be up
 	// together on a poisoned Slimeball, which is why slime green was pushed toward yellow in the
 	// first place — deriving STUCK undoes exactly that push. So the literals are not a stale copy of
 	// the palette; they are the wheel's own palette, and they are 41.1 / 25.3 / 12.3 degrees away
@@ -4792,6 +4815,9 @@ float ATraceHUD::DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX
 
 #if !UE_BUILD_SHIPPING
 	HudKitRecord.AmmoLabel = InState.AmmoLabel;
+	HudKitRecord.AmmoLabelCapPx = MeasureHeight(InState.AmmoLabel, FontSmall, UIScale)
+		* (TraceText::CapHeight(1.f, TraceHUDType::HudWeight()) / FMath::Max(KINDA_SMALL_NUMBER, TraceText::LineHeight(1.f)))
+		/ FMath::Max(KINDA_SMALL_NUMBER, UIScale);
 	HudKitRecord.AmmoRightLabel = InState.RightLabel;
 	bDrewAmmoBlock = true;
 	bDrewBeeClip = InState.bBeeClip;
@@ -5187,6 +5213,8 @@ bool ATraceHUD::PresentCornerUmg(bool bInLive, const FTraceHudCornerState& InSta
 	DrawnMagazineTicks = Presented.LitTicks;
 	DrawnStatusChips = Presented.Chips;
 	HudKitRecord.AmmoLabel = Presented.AmmoLabel;
+	HudKitRecord.AmmoLabelCapPx = Presented.AmmoLabelCapPx;
+	HudKitRecord.bUmgCorner = true;
 	HudKitRecord.AmmoRightLabel = Presented.RightLabel;
 	HudKitRecord.bKnifeBlock = Presented.bKnifeBlock;
 #endif
@@ -5981,7 +6009,10 @@ void ATraceHUD::DrawPracticePadLabels()
 		const float PlateX = CX - PlateW * 0.5f;
 		const float PlateY = CY - PlateH * 0.5f;
 
-		TraceMenuKit::DrawPanelPlate(this, State, PlateX, PlateY, PlateW, PlateH, 0.f, TraceHUDStyle::PanelAlpha * Alpha);
+		// OPAQUE, like the kit's own buttons: at the HUD's panel alpha the range's bright pillar stripes ran
+		// straight through the plate and behind the words. Only the distance fade thins it.
+		const float PlateAlpha = Alpha;
+		TraceMenuKit::DrawPanelPlate(this, State, PlateX, PlateY, PlateW, PlateH, 0.f, PlateAlpha);
 		TraceMenuKit::DrawLabel(this, Text, CX, CY, PlateH, TraceHUDStyle::WithAlpha(Visuals.Label, Alpha),
 			PlateW - PlateH * TraceMenuKit::LabelPadFraction * 2.f);
 
@@ -5991,6 +6022,7 @@ void ATraceHUD::DrawPracticePadLabels()
 		Drawn.Text = Text;
 		Drawn.Rect = FBox2D(FVector2D(PlateX, PlateY), FVector2D(PlateX + PlateW, PlateY + PlateH));
 		Drawn.Alpha = Alpha;
+		Drawn.PlateAlpha = PlateAlpha;
 		Drawn.bLit = bLit;
 #endif
 	}
@@ -8057,16 +8089,28 @@ void ATraceHUD::UpdateOverlayFades()
 
 void ATraceHUD::DrawMeter(float X, float Y, float W, float H, float Fraction, const FLinearColor& FillColor)
 {
-	const float Edge = FMath::Max(1.f, 1.f * UIScale);
+	// SEATED ON THE KIT'S RAIL (T_MenuSliderTrack, the settings sliders' groove): the navy between two
+	// gold lips, its gold halo squashed to a few pixels so a stack of rows 8 px apart keeps the glow
+	// without the halos running together. The meters were bare bright rects on a black trough, the one
+	// thing in the corner not drawn from the artist's kit. The FILL keeps its colour and its meaning
+	// (accent for E, team for DASH, white / yellow / red for health) and fills the navy between the
+	// lips, over a groove darkened a little so the empty part still reads at a glance.
+	TraceMenuKit::DrawRail(this, X, Y, W, H, TraceHUDStyle::MeterHaloPx * UIScale);
 
-	DrawHudRect(TraceHUDStyle::Shadow, X - Edge, Y - Edge, W + Edge * 2.f, H + Edge * 2.f);
-	DrawHudRect(TraceHUDStyle::Trough, X, Y, W, H);
+	const float Lip = TraceMenuKit::RailLipInset(H);
+	const float InnerW = FMath::Max(0.f, W - Lip * 2.f);
+	const float InnerH = FMath::Max(1.f, H - Lip * 2.f);
+	DrawHudRect(TraceHUDStyle::MeterGroove, X + Lip, Y + Lip, InnerW, InnerH);
 
-	const float FillW = FMath::Clamp(Fraction, 0.f, 1.f) * W;
+	const float FillW = FMath::Clamp(Fraction, 0.f, 1.f) * InnerW;
 	if (FillW > 0.f)
 	{
-		DrawHudRect(FillColor, X, Y, FillW, H);
+		DrawHudRect(FillColor, X + Lip, Y + Lip, FillW, InnerH);
 	}
+
+#if !UE_BUILD_SHIPPING
+	++HudKitRecord.MeterRails;
+#endif
 }
 
 FString ATraceHUD::FormatClock(float Seconds)
@@ -10053,6 +10097,9 @@ namespace TraceFxHudShots
 //   5. THE KILL FEED DOES NOT ALLOCATE PER FRAME (P11): over 90 frames with a feed row up, the one
 //      shared stroke list its glyphs are drawn through grows a handful of times at most (a fresh array
 //      per flush, as before, shows as hundreds).
+//   6. ON THE KIT: the SPEED BOOST chip is not cyan (stylespec §0) and keeps its distance on the status
+//      wheel; a live frame's meters sit on the kit's rail, and the ammo plate's caption is at least an
+//      8 px cap at 1080p.
 //
 // Headless recipe (Arena):
 //   -TraceExecAt=6 -TraceExec="Trace.HUD.Kit.Verify kill=22"
@@ -10079,6 +10126,19 @@ namespace TraceHUDKitVerify
 		int32 FeedFrames = 0;
 		bool bFeedChecked = false;
 	};
+
+	/** sRGB hue, degrees, of a linear colour. */
+	static float HueOf(const FLinearColor& Linear)
+	{
+		return Linear.ToFColorSRGB().ReinterpretAsLinear().LinearRGBToHSV().R;
+	}
+
+	/** The shorter way round the wheel between two hues, degrees. */
+	static float HueGap(float A, float B)
+	{
+		const float Raw = FMath::Abs(A - B);
+		return FMath::Min(Raw, 360.f - Raw);
+	}
 
 	static void Report(FRun& Run, const TCHAR* Claim, bool bPass, const FString& Detail)
 	{
@@ -10177,6 +10237,24 @@ namespace TraceHUDKitVerify
 				BreakBegins == EKind::None && FullTime == EKind::None && FirstDraw == EKind::None, TEXT(""));
 		}
 
+		// ---- 2b. No status chip is cyan (stylespec §0) ----------------------------------------------
+		{
+			const FLinearColor Wheel[] = {
+				TraceHUDStatusStyle::Poisoned, TraceHUDStatusStyle::Slowed, TraceHUDStatusStyle::Vulnerable,
+				TraceHUDStatusStyle::Chud, TraceHUDStatusStyle::Suspend, TraceHUDStatusStyle::Modded,
+				TraceHUDStatusStyle::Cloaked, TraceHUDStatusStyle::Stuck, TraceHUDStatusStyle::Zip };
+			const float Boost = HueOf(TraceHUDStatusStyle::SpeedBoost);
+			float Nearest = 360.f;
+			for (const FLinearColor& Other : Wheel)
+			{
+				Nearest = FMath::Min(Nearest, HueGap(Boost, HueOf(Other)));
+			}
+			Report(Run, TEXT("*** the SPEED BOOST chip is not cyan (stylespec §0), and keeps its distance on the status wheel ***"),
+				HueGap(Boost, 180.f) >= 45.f && Nearest >= 30.f,
+				FString::Printf(TEXT("hue %.1f, %.1f deg from cyan, %.1f from the nearest other status"),
+					Boost, HueGap(Boost, 180.f), Nearest));
+		}
+
 		// ---- 3. Sequencing ------------------------------------------------------------------------
 		{
 			const float Flash = TraceHUDStyle::ScoreFlashDuration;
@@ -10248,6 +10326,12 @@ namespace TraceHUDKitVerify
 			Report(Run, TEXT("LIVE: the ammo plate names the gun"),
 				Rec.AmmoLabel == Pistol || Rec.AmmoLabel == Smg || Rec.AmmoLabel == Bee,
 				FString::Printf(TEXT("label \"%s\""), *Rec.AmmoLabel));
+
+			Report(Run, TEXT("*** LIVE: the bottom-left meters sit on the kit's rail (T_MenuSliderTrack) ***"),
+				Rec.MeterRails >= 2, FString::Printf(TEXT("%d meter(s) drawn on the rail"), Rec.MeterRails));
+			Report(Run, TEXT("*** LIVE: the ammo plate's caption is at least an 8 px cap at 1080p ***"),
+				Rec.AmmoLabelCapPx >= 8.f, FString::Printf(TEXT("\"%s\" cap %.2f px (%s corner)"), *Rec.AmmoLabel,
+					Rec.AmmoLabelCapPx, Rec.bUmgCorner ? TEXT("UMG") : TEXT("Canvas")));
 
 			const UTraceWeaponComponent* Gun = Pawn->FindComponentByClass<UTraceWeaponComponent>();
 			if (Gun != nullptr && !Gun->IsReloading()

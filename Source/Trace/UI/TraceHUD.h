@@ -215,9 +215,18 @@ public:
 		/** The bottom-left stack's plate. */
 		bool bStackPlate = false;
 
+		/** How many meters this frame drew seated on the kit's rail (DrawMeter). */
+		int32 MeterRails = 0;
+
 		/** The ammo plate's two label words as drawn ("PISTOL" / "" at a full clip). */
 		FString AmmoLabel;
 		FString AmmoRightLabel;
+
+		/** The left label's cap height as drawn, in 1080p px (screen px / UIScale), either corner path. */
+		float AmmoLabelCapPx = 0.f;
+
+		/** The bottom-right corner was the UMG widget this frame (false: the Canvas corner). */
+		bool bUmgCorner = false;
 
 		/** The KNIFE plate that stands in the ammo corner while the knife is out. */
 		bool bKnifeBlock = false;
@@ -253,6 +262,8 @@ public:
 			/** The plate's screen rect. The label's reading direction is left to right by construction. */
 			FBox2D Rect = FBox2D(ForceInit);
 			float Alpha = 0.f;
+			/** The plate's own alpha as drawn: the label's distance fade alone, so the plate is opaque. */
+			float PlateAlpha = 0.f;
 			/** The amber-ringed (hover) plate: the pad's switch is ON. */
 			bool bLit = false;
 		};
