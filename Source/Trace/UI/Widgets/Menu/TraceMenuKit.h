@@ -334,6 +334,27 @@ namespace TraceMenuKit
 	 */
 	TRACE_API float HoverBlend(float X, float Y, float W, float H, bool bHovered);
 
+	/**
+	 * Every hover blend asked inside this scope (DrawStatePlate, DrawButton, DrawKeyChip, VisualsAt,
+	 * HoverBlend) is keyed by @p Salt as well as by the plate's rect. The previous salt comes back on
+	 * exit. Outside any scope the salt is 0, and the keys are the plain rect keys every screen had.
+	 *
+	 * NEEDED WHEN TWO SURFACES DRAW PLATES ON THE SAME RECTS IN ONE FRAME. The pause menu's LOADOUTS
+	 * editor and the match loadout page are two FTraceLoadoutSelects with one layout, drawn page first,
+	 * editor second. Keyed by rect alone they shared one blend per card, and the second ask in a frame
+	 * reads what the first left, so the editor's hover ring sat on the card lit on the page beneath it.
+	 * Pass something that tells the two apart (the instance's address works).
+	 */
+	struct TRACE_API FScopedHoverSalt
+	{
+		explicit FScopedHoverSalt(uint32 Salt);
+		~FScopedHoverSalt();
+		FScopedHoverSalt(const FScopedHoverSalt&) = delete;
+		FScopedHoverSalt& operator=(const FScopedHoverSalt&) = delete;
+	private:
+		uint32 Saved = 0;
+	};
+
 	/** Default -> Hover visuals mixed at @p Blend (label, furniture). For Disabled/Pressed, VisualsFor(State). */
 	TRACE_API FTraceKitVisuals VisualsForBlend(ETraceKitState State, float Blend);
 

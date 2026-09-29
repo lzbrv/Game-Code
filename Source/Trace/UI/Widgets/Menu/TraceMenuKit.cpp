@@ -124,14 +124,23 @@ namespace TraceMenuKitFile
 	static TMap<uint64, FHoverEntry> GHover;
 	static uint64 GHoverSweptAt = 0;
 
-	/** A plate's identity for the blend: its rect, rounded to whole pixels, 16 bits a side. */
+	/** The current TraceMenuKit::FScopedHoverSalt's salt; 0 outside any scope. Game thread only. */
+	static uint32 GHoverSalt = 0;
+
+	/**
+	 * A plate's identity for the blend: its rect, rounded to whole pixels, 16 bits a side — and, inside
+	 * an FScopedHoverSalt, the salt mixed over it, so two surfaces on one rect are two plates. Salt 0
+	 * leaves the key exactly as it was, so a screen that never asks for a salt is unchanged.
+	 */
 	static uint64 HoverKey(float X, float Y, float W, float H)
 	{
 		const uint64 KX = static_cast<uint64>(static_cast<uint16>(FMath::RoundToInt(X)));
 		const uint64 KY = static_cast<uint64>(static_cast<uint16>(FMath::RoundToInt(Y)));
 		const uint64 KW = static_cast<uint64>(static_cast<uint16>(FMath::RoundToInt(W)));
 		const uint64 KH = static_cast<uint64>(static_cast<uint16>(FMath::RoundToInt(H)));
-		return KX | (KY << 16) | (KW << 32) | (KH << 48);
+		const uint64 RectKey = KX | (KY << 16) | (KW << 32) | (KH << 48);
+		return (GHoverSalt == 0) ? RectKey
+			: (RectKey ^ (static_cast<uint64>(GHoverSalt) * 0x9E3779B97F4A7C15ull));
 	}
 
 	/** One rate-limited step toward the target: InSeconds from 0 to 1, OutSeconds back. Real seconds. */
@@ -438,6 +447,17 @@ float TraceMenuKit::HoverBlend(float X, float Y, float W, float H, bool bHovered
 {
 	return TraceMenuKitFile::HoverBlendAt(TraceMenuKitFile::HoverKey(X, Y, W, H), bHovered, GFrameCounter,
 		RealSeconds());
+}
+
+TraceMenuKit::FScopedHoverSalt::FScopedHoverSalt(uint32 Salt)
+	: Saved(TraceMenuKitFile::GHoverSalt)
+{
+	TraceMenuKitFile::GHoverSalt = Salt;
+}
+
+TraceMenuKit::FScopedHoverSalt::~FScopedHoverSalt()
+{
+	TraceMenuKitFile::GHoverSalt = Saved;
 }
 
 FTraceKitVisuals TraceMenuKit::VisualsForBlend(ETraceKitState State, float Blend)
@@ -1758,6 +1778,52 @@ namespace TraceMenuKitFile
 			Check(TEXT("P10: the word eases with the ring (half-way colour at half blend)"),
 				Mid.Label.Equals(Expect, 1e-4f),
 				FString::Printf(TEXT("(%.3f, %.3f, %.3f)"), Mid.Label.R, Mid.Label.G, Mid.Label.B));
+		}
+
+		// ---- 12b. TWO SURFACES ON ONE RECT, IN ONE FRAME, KEEP THEIR OWN HOVER ----------------------
+		//
+		// The pause menu's LOADOUTS editor is drawn over the match loadout page in the same frame, with
+		// the same layout, so every card of one sits on a card of the other. Keyed by rect alone they
+		// were ONE blend: the page asked first and lit its card, the editor's ask in the same frame
+		// read what the page left, and the editor's ring stayed on the page's card. Each surface now
+		// draws inside its own FScopedHoverSalt. Driven frame by frame as the two draw: both unlit,
+		// then 50 ms on the first surface lights the card and the second leaves it dark.
+		{
+			const int32 SavedMotion = GMotion;
+			const float SavedScale = GFadeScale;
+			const uint64 SavedSweep = GHoverSweptAt;
+			GMotion = 1;
+			GFadeScale = 1.f;
+
+			uint64 PageKey = 0;
+			uint64 EditorKey = 0;
+			{
+				TraceMenuKit::FScopedHoverSalt PageSalt(0x51A7u);
+				PageKey = HoverKey(-3000.f, -2800.f, 346.f, 326.f);   // a card-sized rect no screen draws
+			}
+			{
+				TraceMenuKit::FScopedHoverSalt EditorSalt(0xED17u);
+				EditorKey = HoverKey(-3000.f, -2800.f, 346.f, 326.f);
+			}
+			const uint32 SaltAfter = GHoverSalt;
+			GHover.Remove(PageKey);
+			GHover.Remove(EditorKey);
+
+			HoverBlendAt(PageKey, false, 9000, 40.0);
+			HoverBlendAt(EditorKey, false, 9000, 40.0);
+			const float PageLit = HoverBlendAt(PageKey, true, 9001, 40.05);
+			const float EditorDark = HoverBlendAt(EditorKey, false, 9001, 40.05);
+
+			GHover.Remove(PageKey);
+			GHover.Remove(EditorKey);
+			GMotion = SavedMotion;
+			GFadeScale = SavedScale;
+			GHoverSweptAt = SavedSweep;
+
+			Check(TEXT("P10: two surfaces on one rect in one frame keep their own hover"),
+				PageKey != EditorKey && PageLit >= 0.5f && EditorDark == 0.f && SaltAfter == 0,
+				FString::Printf(TEXT("first surface lit %.2f, second (not lit) %.2f, keys %s, salt after scopes %u"),
+					PageLit, EditorDark, (PageKey != EditorKey) ? TEXT("differ") : TEXT("SHARED"), SaltAfter));
 		}
 
 		// ---- 13. P10: TABULAR FIGURES -----------------------------------------------------------------
