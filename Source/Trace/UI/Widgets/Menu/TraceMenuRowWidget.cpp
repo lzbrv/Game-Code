@@ -538,6 +538,17 @@ int32 UTraceMenuRow::CountResolvedArt(int32& OutTotal, TArray<FString>& OutMissi
 	return Resolved;
 }
 
+#if !UE_BUILD_SHIPPING
+float UTraceMenuRow::DebugValueChipWidth() const
+{
+	if (ValueChip == nullptr || !ValueChip->IsVisible())
+	{
+		return 0.f;
+	}
+	return static_cast<float>(ValueChip->GetCachedGeometry().GetAbsoluteSize().X);
+}
+#endif
+
 void UTraceMenuRow::InstallAtlasLabels()
 {
 	if (bAtlasLabelsInstalled)
@@ -1010,6 +1021,19 @@ void UTraceMenuRow::ApplyView(const FTraceMenuRowView& InView, float InNow)
 			ValueText->SetText(FText::FromString(InView.Value));
 			ValueText->SetColorAndOpacity(FSlateColor(bDisabled
 				? TraceMenuArtStyle::WordDisabled : InView.ValueColor));
+
+			// THE CHIP HOLDS ONE SIZE, as on the Canvas row (ATraceMenuHUD::DrawRow): the value is held
+			// at the widest word the row can show, centred in it. The chip is an overlay under the arrows
+			// and the value, so it took each word's own width, and its left edge and '<' jumped about
+			// 43 px between NORMAL and HARD.
+			for (const FTraceAtlasLabel& Each : AtlasLabels)
+			{
+				if (Each.Source == ValueText && Each.Atlas != nullptr)
+				{
+					Each.Atlas->SetMinWidth(InView.ValueWidest.IsEmpty() ? 0.f : Each.Atlas->MeasureWidthOf(InView.ValueWidest),
+						InView.ValueWidest.IsEmpty() ? HAlign_Right : HAlign_Center);
+				}
+			}
 		}
 	}
 

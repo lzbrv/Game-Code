@@ -74,6 +74,13 @@ struct FTraceMenuRowView
 	FString Value;
 	FLinearColor ValueColor = FLinearColor::White;
 
+	/**
+	 * The widest word Value can hold (DIFFICULTY: the widest of its three names as the value box sets
+	 * them). Both renderers size the value box to it and centre Value in it, so the box and its '<' do
+	 * not move when the value changes. Empty: sized to Value.
+	 */
+	FString ValueWidest;
+
 	/** Hover / keyboard selection. On this menu they are the same thing — see ATraceMenuHUD::DrawHUD. */
 	bool bSelected = false;
 
@@ -125,6 +132,11 @@ public:
 	 * @return the number of this row's slots that resolved; @p OutTotal is grown by how many there are.
 	 */
 	int32 CountResolvedArt(int32& OutTotal, TArray<FString>& OutMissing, const FString& InLabel) const;
+
+#if !UE_BUILD_SHIPPING
+	/** The value chip's width as Slate last laid it out, in window pixels (0: hidden). A harness reads it. */
+	float DebugValueChipWidth() const;
+#endif
 
 	// ---- The three states the artist drew, as brushes the asset carries -----------------------------
 	//

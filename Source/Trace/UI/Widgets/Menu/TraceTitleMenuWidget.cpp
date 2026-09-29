@@ -849,6 +849,14 @@ void UTraceTitleMenuWidget::DebugDescribeFailure(FTraceTitleFailureLayout& Out) 
 }
 #endif
 
+#if !UE_BUILD_SHIPPING
+float UTraceTitleMenuWidget::DebugRowValueChipWidth(int32 InRowIndex) const
+{
+	const UTraceMenuRow* const Row = OrderedRows.IsValidIndex(InRowIndex) ? OrderedRows[InRowIndex].Get() : nullptr;
+	return (Row != nullptr) ? Row->DebugValueChipWidth() : 0.f;
+}
+#endif
+
 bool UTraceTitleMenuWidget::GetRowViewportRect(int32 InRowIndex, FBox2D& OutRect) const
 {
 	if (!OrderedRows.IsValidIndex(InRowIndex))

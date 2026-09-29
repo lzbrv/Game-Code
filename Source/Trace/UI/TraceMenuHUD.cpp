@@ -1677,6 +1677,9 @@ namespace TraceMenuJoinVerify
 	static constexpr int32 FirstClickStep = 50;
 	static constexpr int32 DoneStep       = 100;
 
+	/** The stopat= test hook's check, run a few frames after the cleanup let go of the keys. */
+	static constexpr int32 StopCheckStep  = 95;
+
 	/** The pointer moves the click part makes once the screen has settled: under and over the 2 px rule. */
 	static constexpr float TwitchPx = 1.f;
 	static constexpr float NudgePx  = 6.f;
@@ -1694,7 +1697,9 @@ namespace TraceMenuJoinVerify
 		TEXT("the pending connection is really dropped; CONNECT / BACK / CANCEL take a click). quit: QUIT asks ")
 		TEXT("QUIT GAME? first, and Escape / pad B never close the game (QuitGame is intercepted for the run). ")
 		TEXT("click: a click at a pointer that has not moved lights its row and the second click acts; a 6 px ")
-		TEXT("move once settled makes the first click act. Prints a VERDICT. Run on the title map."),
+		TEXT("move once settled makes the first click act; the DIFFICULTY value box keeps one width for EASY, NORMAL ")
+		TEXT("and HARD, and (Canvas title) the arrow that does nothing is drawn dim. stopat=<step> (a test hook) stops the ")
+		TEXT("run right after that step, to prove it lets go of what it pressed. Prints a VERDICT. Run on the title map."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
 			[](const TArray<FString>& Args, UWorld* World)
 			{
@@ -1705,7 +1710,16 @@ namespace TraceMenuJoinVerify
 					UE_LOG(LogTraceGame, Warning, TEXT("[JoinVerify] No title-screen HUD here — run this on the menu map."));
 					return;
 				}
-				MenuHUD->BeginJoinVerify((Args.Num() > 0) ? Args[0] : FString());
+				FString Parts;
+				int32 StopAt = 0;
+				for (const FString& Arg : Args)
+				{
+					if (!FParse::Value(*Arg, TEXT("stopat="), StopAt))
+					{
+						Parts = Arg;
+					}
+				}
+				MenuHUD->BeginJoinVerify(Parts, StopAt);
 			}));
 
 	/**
@@ -1881,7 +1895,7 @@ namespace TraceMenuFailureVerify
 			}));
 }
 
-void ATraceMenuHUD::BeginJoinVerify(const FString& Parts)
+void ATraceMenuHUD::BeginJoinVerify(const FString& Parts, int32 StopAfterStep)
 {
 	if (JoinVerifyStep != 0)
 	{
@@ -1910,6 +1924,8 @@ void ATraceMenuHUD::BeginJoinVerify(const FString& Parts)
 	JoinVerifySavedAddress = LastJoinAddress;
 	JoinVerifySavedDifficulty = Difficulty;
 	JoinVerifyFailures = 0;
+	JoinVerifyHeldKeys.Reset();
+	JoinVerifyStopAt = FMath::Max(0, StopAfterStep);
 	bJoinVerifyPointerKnown = false;   // the first tick samples where the pointer starts
 	JoinVerifyInvalidReason.Reset();
 	JoinVerifyStep = JoinVerifyNextPart(0);
@@ -1946,6 +1962,9 @@ void ATraceMenuHUD::DebugRestPointerHere()
 	FirstCursorPos = LastCursorPos;
 	SettledCursorPos = LastCursorPos;
 	bHasSettledCursor = true;
+	bHoverHasMoved = false;
+	HoverBaselinePos = LastCursorPos;
+	bHasHoverBaseline = true;
 	RestingClickRow = INDEX_NONE;
 	RestingPressRow = INDEX_NONE;
 	TitleShownTime = Now - 10.f;
@@ -1956,8 +1975,11 @@ void ATraceMenuHUD::DebugFreshTitleHere()
 	bHasCursor = false;
 	bCursorHasMoved = false;
 	bHasSettledCursor = false;
+	bHoverHasMoved = false;
+	bHasHoverBaseline = false;
 	FirstCursorPos = FVector2D::ZeroVector;
 	SettledCursorPos = FVector2D::ZeroVector;
+	HoverBaselinePos = FVector2D::ZeroVector;
 	RestingClickRow = INDEX_NONE;
 	RestingPressRow = INDEX_NONE;
 	TitleShownTime = Now;
@@ -2019,6 +2041,23 @@ void ATraceMenuHUD::TickJoinVerify()
 		JoinVerifyMovePointer(PC, Rect.GetCenter());
 	};
 
+	// EVERY KEY AND BUTTON THE RUN PRESSES GOES THROUGH HERE, so the run knows what it is holding down.
+	// A run that stops between a press and its release (INVALID, or a part that gives up) lets go of
+	// each one in the cleanup below: the viewport's LMB stayed down otherwise, DIFFICULTY stayed drawn
+	// PRESSED until a real release, and the next pointer harness started with the button already held.
+	const auto Inject = [this, PC](const FKey& Key, bool bPressed)
+	{
+		InjectKey(PC, Key, bPressed);
+		if (bPressed)
+		{
+			JoinVerifyHeldKeys.AddUnique(Key);
+		}
+		else
+		{
+			JoinVerifyHeldKeys.Remove(Key);
+		}
+	};
+
 	// ---- THE POINTER IS THE HARNESS'S, AND ONLY THE HARNESS MOVES IT (R5) --------------------------
 	//
 	// The title's rows follow a moving pointer, which is correct and is part of what this run tests.
@@ -2077,12 +2116,12 @@ void ATraceMenuHUD::TickJoinVerify()
 		Check(TEXT("the engine is dialling (a pending net game exists)"), Pending(), DescribeState());
 		Check(TEXT("the connecting card draws its CANCEL legend"), TravelCancelRect.bIsValid,
 			TravelCancelRect.bIsValid ? TravelCancelRect.ToString() : FString(TEXT("no legend")));
-		InjectKey(PC, EKeys::Escape, /*bPressed=*/true);
+		Inject(EKeys::Escape, /*bPressed=*/true);
 		Advance();
 		break;
 
 	case 4:
-		InjectKey(PC, EKeys::Escape, /*bPressed=*/false);
+		Inject(EKeys::Escape, /*bPressed=*/false);
 		Advance();
 		break;
 
@@ -2144,12 +2183,12 @@ void ATraceMenuHUD::TickJoinVerify()
 		{
 			break;
 		}
-		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/true);
+		Inject(EKeys::LeftMouseButton, /*bPressed=*/true);
 		Advance();
 		break;
 
 	case 10:
-		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/false);
+		Inject(EKeys::LeftMouseButton, /*bPressed=*/false);
 		Advance();
 		break;
 
@@ -2174,12 +2213,12 @@ void ATraceMenuHUD::TickJoinVerify()
 		{
 			break;
 		}
-		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/true);
+		Inject(EKeys::LeftMouseButton, /*bPressed=*/true);
 		Advance();
 		break;
 
 	case 13:
-		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/false);
+		Inject(EKeys::LeftMouseButton, /*bPressed=*/false);
 		Advance();
 		break;
 
@@ -2203,12 +2242,12 @@ void ATraceMenuHUD::TickJoinVerify()
 		{
 			break;
 		}
-		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/true);
+		Inject(EKeys::LeftMouseButton, /*bPressed=*/true);
 		Advance();
 		break;
 
 	case 16:
-		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/false);
+		Inject(EKeys::LeftMouseButton, /*bPressed=*/false);
 		Advance();
 		break;
 
@@ -2262,7 +2301,7 @@ void ATraceMenuHUD::TickJoinVerify()
 			JoinVerifyStepTime = RealNow;
 			break;
 		}
-		InjectKey(PC, TapKeys[Tap], /*bPressed=*/true);
+		Inject(TapKeys[Tap], /*bPressed=*/true);
 		Advance();
 		break;
 	}
@@ -2277,7 +2316,7 @@ void ATraceMenuHUD::TickJoinVerify()
 		{
 			break;
 		}
-		InjectKey(PC, TapKeys[Tap], /*bPressed=*/false);
+		Inject(TapKeys[Tap], /*bPressed=*/false);
 		Advance();
 		break;
 	}
@@ -2408,7 +2447,7 @@ void ATraceMenuHUD::TickJoinVerify()
 		{
 			break;
 		}
-		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/true);
+		Inject(EKeys::LeftMouseButton, /*bPressed=*/true);
 		Advance();
 		break;
 
@@ -2424,7 +2463,7 @@ void ATraceMenuHUD::TickJoinVerify()
 			Check(TEXT("...the row under a resting pointer draws PRESSED while held"), DiffView.bPressed,
 				FString::Printf(TEXT("pressed=%d row=%d"), DiffView.bPressed ? 1 : 0, static_cast<int32>(Selected)));
 		}
-		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/false);
+		Inject(EKeys::LeftMouseButton, /*bPressed=*/false);
 		Advance();
 		break;
 
@@ -2433,7 +2472,7 @@ void ATraceMenuHUD::TickJoinVerify()
 		{
 			break;
 		}
-		InjectKey(PC, EKeys::LeftMouseButton, /*bPressed=*/false);
+		Inject(EKeys::LeftMouseButton, /*bPressed=*/false);
 		Advance();
 		break;
 
@@ -2573,7 +2612,7 @@ void ATraceMenuHUD::TickJoinVerify()
 		if (!JoinButtonRects[TraceMenuHUDJoin::Back].bIsValid)
 		{
 			Check(TEXT("the JOIN prompt draws a BACK button"), false, TEXT("no rect"));
-			JoinVerifyStep = JoinVerifyNextPart(73);
+			JoinVerifyStep = JoinVerifyNextPart(81);
 			JoinVerifyStepTime = RealNow;
 			break;
 		}
@@ -2626,12 +2665,172 @@ void ATraceMenuHUD::TickJoinVerify()
 		}
 		CloseJoinPrompt(TEXT("JoinVerify click part done"));
 		Selected = ETraceMenuRow::Play;
-		JoinVerifyStep = JoinVerifyNextPart(73);
+		Advance();
+		break;
+
+	// ---- THE DIFFICULTY VALUE BOX: one width for every value, and a dead arrow that looks dead -----
+	//
+	// EASY, NORMAL, HARD in turn, each read off the frame the title drew. The box was sized to the
+	// current word, so it jumped about 43 px between NORMAL and HARD (both renderers). And the Canvas
+	// row drew its arrows with AHUD::DrawLine, which draws at full alpha whatever the colour says: at
+	// HARD the '>' that does nothing was as bright as the '<'.
+	case 74:
+		UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] ----- the DIFFICULTY value box, EASY / NORMAL / HARD (%s title) -----"),
+			bMenuUmgActive ? TEXT("UMG") : TEXT("Canvas"));
+		SetDifficulty(ETraceBotDifficulty::Easy);
+		Advance();
+		break;
+
+	case 75: case 76: case 77:
+	{
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		const int32 LevelIndex = JoinVerifyStep - 75;   // 0 EASY, 1 NORMAL, 2 HARD
+		const int32 DiffRow = static_cast<int32>(ETraceMenuRow::Difficulty);
+		JoinVerifyDifficultyBoxW[LevelIndex] = bMenuUmgActive
+			? ((MenuWidget != nullptr) ? MenuWidget->DebugRowValueChipWidth(DiffRow) : 0.f)
+			: DebugDifficultyBoxW;
+
+		if (LevelIndex != 1)
+		{
+			const bool bAtHard = (LevelIndex == 2);
+			if (bMenuUmgActive)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify]   skip the arrow-ink check at %s: the UMG row sets its arrows as text, which keeps alpha."),
+					bAtHard ? TEXT("HARD") : TEXT("EASY"));
+			}
+			else
+			{
+				// [0] left, [1] right. The dead one goes to the canvas at 0.2, the live one near full.
+				const float DeadAlpha = DebugDifficultyArrowAlpha[bAtHard ? 1 : 0];
+				const float LiveAlpha = DebugDifficultyArrowAlpha[bAtHard ? 0 : 1];
+				Check(bAtHard ? TEXT("at HARD the '>' is drawn dim, through a stroke that keeps alpha")
+				              : TEXT("at EASY the '<' is drawn dim, through a stroke that keeps alpha"),
+					Difficulty == (bAtHard ? ETraceBotDifficulty::Hard : ETraceBotDifficulty::Easy)
+						&& DeadAlpha >= 0.f && DeadAlpha <= 0.3f && LiveAlpha >= 0.9f,
+					FString::Printf(TEXT("dead arrow alpha %.2f, live arrow %.2f (-1: drawn by a path that drops alpha)"),
+						DeadAlpha, LiveAlpha));
+			}
+		}
+
+		if (LevelIndex < 2)
+		{
+			SetDifficulty(LevelIndex == 0 ? ETraceBotDifficulty::Normal : ETraceBotDifficulty::Hard);
+			Advance();
+			break;
+		}
+
+		const float NarrowestW = FMath::Min3(JoinVerifyDifficultyBoxW[0], JoinVerifyDifficultyBoxW[1], JoinVerifyDifficultyBoxW[2]);
+		const float WidestW = FMath::Max3(JoinVerifyDifficultyBoxW[0], JoinVerifyDifficultyBoxW[1], JoinVerifyDifficultyBoxW[2]);
+		Check(TEXT("the DIFFICULTY value box keeps one width for EASY, NORMAL and HARD"),
+			NarrowestW > 0.f && WidestW - NarrowestW <= 0.5f,
+			FString::Printf(TEXT("box %.1f / %.1f / %.1f px (%s)"), JoinVerifyDifficultyBoxW[0], JoinVerifyDifficultyBoxW[1],
+				JoinVerifyDifficultyBoxW[2], bMenuUmgActive ? TEXT("UMG chip, window px") : TEXT("Canvas, 1080p px")));
+		SetDifficulty(JoinVerifySavedDifficulty);
+		Advance();
+		break;
+	}
+
+	// ---- BACK FROM A MATCH, THE CARD LIFTING: a small real move lights its row at once (L2) --------
+	//
+	// A title that has settled but whose loading card came down a moment ago: the click guard still
+	// waits out the card's grace (a replayed press must not act), but hover has no such risk. A player
+	// who nudged the pointer onto a row while the card lifted used to see nothing light until they
+	// moved again. The pointer is parked on DIFFICULTY first; then PLAY is lit and the card staged.
+	case 78:
+	{
+		const int32 DiffRow = static_cast<int32>(ETraceMenuRow::Difficulty);
+		if (!bRowRectsValid || !RowRects[DiffRow].bIsValid)
+		{
+			break;   // not laid out yet
+		}
+		ClickAt(RowRects[DiffRow]);
+		Advance();
+		break;
+	}
+
+	case 79:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		JoinVerifySavedCardKind = static_cast<uint8>(TraceLoadingScreen::LastCardKind());
+		JoinVerifySavedCardEnd = TraceLoadingScreen::DebugSetLastCardEnd(FPlatformTime::Seconds(), TraceLoadingScreen::ECard::Travel);
+		bHasCursor = true;
+		FirstCursorPos = LastCursorPos;
+		bCursorHasMoved = false;
+		bHasSettledCursor = false;
+		bHoverHasMoved = false;
+		bHasHoverBaseline = false;
+		RestingClickRow = INDEX_NONE;
+		RestingPressRow = INDEX_NONE;
+		TitleShownTime = Now - 10.f;
+		Selected = ETraceMenuRow::Play;
+		Advance();
+		break;
+
+	case 80:
+		if (StepAge < 0.1f)
+		{
+			break;
+		}
+		JoinVerifyMovePointer(PC, FVector2D(LastCursorPos.X + TraceMenuJoinVerify::NudgePx, LastCursorPos.Y));
+		Advance();
+		break;
+
+	case 81:
+		if (StepAge < 0.2f)
+		{
+			break;
+		}
+		{
+			const bool bInGrace = TraceLoadingScreen::IsWithinCardGrace(TraceMenuHUDPointerGuard::SettleSeconds);
+			Check(TEXT("inside the card's grace a small real move lights the row it is on"),
+				bInGrace && Selected == ETraceMenuRow::Difficulty && RowAtPoint(LastCursorPos) == static_cast<int32>(ETraceMenuRow::Difficulty),
+				FString::Printf(TEXT("row=%d, pointer on row %d, in the card's grace %d"), static_cast<int32>(Selected),
+					RowAtPoint(LastCursorPos), bInGrace ? 1 : 0));
+			Check(TEXT("...while a click still waits the grace out (the replayed-press guard is unchanged)"),
+				!bCursorHasMoved, FString::Printf(TEXT("clicks count %d"), bCursorHasMoved ? 1 : 0));
+		}
+		TraceLoadingScreen::DebugSetLastCardEnd(JoinVerifySavedCardEnd,
+			static_cast<TraceLoadingScreen::ECard>(JoinVerifySavedCardKind));
+		JoinVerifySavedCardEnd = -1.0;
+		DebugRestPointerHere();
+		Selected = ETraceMenuRow::Play;
+		JoinVerifyStep = JoinVerifyNextPart(81);
+		JoinVerifyStepTime = RealNow;
+		break;
+
+	// ---- The stopat test hook's check, once the cleanup's releases have been through an input pass ----
+	case TraceMenuJoinVerify::StopCheckStep:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		{
+			const bool bButtonDown = PC->IsInputKeyDown(EKeys::LeftMouseButton);
+			Check(TEXT("stopped mid-click, the run let go: the button is up and no row is left pressed"),
+				!bButtonDown && PressedRow == INDEX_NONE && RestingPressRow == INDEX_NONE,
+				FString::Printf(TEXT("LMB down %d, pressed row %d, resting press row %d"), bButtonDown ? 1 : 0, PressedRow,
+					RestingPressRow));
+		}
+		JoinVerifyStopAt = 0;
+		JoinVerifyStep = TraceMenuJoinVerify::DoneStep;
 		JoinVerifyStepTime = RealNow;
 		break;
 
 	default:
 		break;
+	}
+
+	// TEST HOOK (stopat=<step>): stop the run right after that step, as an INVALID stop would, so the
+	// cleanup below can be seen letting go of whatever that step pressed.
+	if (JoinVerifyStopAt > 0 && JoinVerifyStep == JoinVerifyStopAt + 1 && JoinVerifyInvalidReason.IsEmpty())
+	{
+		JoinVerifyInvalidReason = FString::Printf(TEXT("test hook: stopat=%d stopped the run right after that step"), JoinVerifyStopAt);
+		JoinVerifyStep = TraceMenuJoinVerify::DoneStep;
 	}
 
 	if (JoinVerifyStep < TraceMenuJoinVerify::DoneStep)
@@ -2640,6 +2839,35 @@ void ATraceMenuHUD::TickJoinVerify()
 	}
 
 	// ---- Put everything back, then the verdict ----------------------------------------------------
+	//
+	// Let go of anything still held first (see Inject), and forget the press it began: a release that
+	// landed on an armed row would otherwise act on it after the run.
+	if (JoinVerifySavedCardEnd >= 0.0)
+	{
+		TraceLoadingScreen::DebugSetLastCardEnd(JoinVerifySavedCardEnd,
+			static_cast<TraceLoadingScreen::ECard>(JoinVerifySavedCardKind));
+		JoinVerifySavedCardEnd = -1.0;
+	}
+	if (JoinVerifyHeldKeys.Num() > 0)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify]   releasing %d key(s) the run was still holding (stopped at a press)."),
+			JoinVerifyHeldKeys.Num());
+		PressedRow = INDEX_NONE;
+		RestingPressRow = INDEX_NONE;
+		for (const FKey& HeldKey : JoinVerifyHeldKeys)
+		{
+			InjectKey(PC, HeldKey, /*bPressed=*/false);
+		}
+		JoinVerifyHeldKeys.Reset();
+	}
+	if (JoinVerifyStopAt > 0)
+	{
+		// The test hook's check comes a few frames later (step 95): an injected edge reaches the
+		// player input, and the rows, on the next input pass, not on the frame it was sent.
+		JoinVerifyStep = TraceMenuJoinVerify::StopCheckStep;
+		JoinVerifyStepTime = RealNow;
+		return;
+	}
 	if (bTravelling)
 	{
 		CancelJoin();
@@ -2677,7 +2905,7 @@ void ATraceMenuHUD::TickJoinVerify()
 		UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] VERDICT: PASS — %s%s%s"),
 			(JoinVerifyParts & TraceMenuJoinVerify::PartJoin) ? TEXT("Escape and CANCEL call a join off (the engine's pending connection is dropped) and the prompt comes back. ") : TEXT(""),
 			(JoinVerifyParts & TraceMenuJoinVerify::PartQuit) ? TEXT("QUIT asks first; Escape and pad B never quit. ") : TEXT(""),
-			(JoinVerifyParts & TraceMenuJoinVerify::PartClick) ? TEXT("A click at a resting pointer lights its row, and the next one (or one after a small move) acts; a resting pointer lights no row on a fresh title and no JOIN button when the prompt opens.") : TEXT(""));
+			(JoinVerifyParts & TraceMenuJoinVerify::PartClick) ? TEXT("A click at a resting pointer lights its row, and the next one (or one after a small move) acts; a resting pointer lights no row on a fresh title and no JOIN button when the prompt opens; the DIFFICULTY box keeps one width and its dead arrow is dim.") : TEXT(""));
 	}
 	else
 	{
@@ -3889,7 +4117,6 @@ void ATraceMenuHUD::DrawHUD()
 			// different viewport coordinates in the opening frames. A 4px threshold with no settling
 			// window was satisfied by that jitter alone and let two launches in ten through.
 			namespace PG = TraceMenuHUDPointerGuard;
-			const bool bMovedBeforeThisSample = bCursorHasMoved;
 			const bool bPastSettleWindow = bHasCursor && (Now - TitleShownTime) > PG::SettleSeconds;
 			if (bPastSettleWindow && FVector2D::Distance(Position, FirstCursorPos) > PG::FirstSampleMovePx)
 			{
@@ -3920,17 +4147,38 @@ void ATraceMenuHUD::DrawHUD()
 
 			// THE FIRST SAMPLE IS A BASELINE, NOT A HOVER (RV9). It used to select the row under it, so a
 			// fresh launch with the OS pointer resting mid-screen opened with JOIN lit instead of PLAY, and
-			// a keyboard or pad player's first ENTER / A opened the JOIN prompt. The rows now follow the
-			// pointer only once it has REALLY moved — the same test a click has to pass (bCursorHasMoved:
-			// past the settling window's jitter, then any move of more than 2 px) — and after that, on
-			// every step of more than 2 px, as before.
+			// a keyboard or pad player's first ENTER / A opened the JOIN prompt. The rows follow the pointer
+			// only once it has REALLY moved, and after that on every step of more than 2 px, as before.
+			//
+			// "REALLY MOVED" FOR HOVER IS NOT THE CLICK'S TEST (L2). A click waits out the loading card's
+			// grace as well, because a press replayed from before the travel must not act; hover has no
+			// such risk, only the opening frames' jitter. Borrowing the click's test meant a player back
+			// from a match who nudged the pointer onto PLAY while the card lifted saw no row light until
+			// they moved again. So hover takes its own baseline at the first sample past the settling
+			// window with no card up — the jitter is over by then — and any move of more than 2 px from it
+			// counts. (Or the click's own test, whichever comes first.)
+			const bool bHoverMovedBeforeThisSample = bHoverHasMoved;
+			if (bPastSettleWindow && !bHoverHasMoved && !TraceLoadingScreen::IsCardUp())
+			{
+				if (!bHasHoverBaseline)
+				{
+					HoverBaselinePos = Position;
+					bHasHoverBaseline = true;
+				}
+				else if (FVector2D::Distance(Position, HoverBaselinePos) > PG::SettledMovePx)
+				{
+					bHoverHasMoved = true;
+				}
+			}
+			bHoverHasMoved = bHoverHasMoved || bCursorHasMoved;
+
 			if (!bHasCursor)
 			{
 				FirstCursorPos = Position;
 				bHasCursor = true;
 			}
-			else if (bCursorHasMoved
-				&& (!bMovedBeforeThisSample || FVector2D::Distance(Position, LastCursorPos) > 2.f))
+			else if (bHoverHasMoved
+				&& (!bHoverMovedBeforeThisSample || FVector2D::Distance(Position, LastCursorPos) > 2.f))
 			{
 				if (bRowRectsValid && !bTravelling && !IsJoinPromptOpen())
 				{
@@ -4709,6 +4957,26 @@ void ATraceMenuHUD::BuildRowView(ETraceMenuRow Row, bool bSelected, FTraceMenuRo
 		OutView.bShowArrows = true;
 		OutView.bCanLeft = (Difficulty != ETraceBotDifficulty::Easy);
 		OutView.bCanRight = (Difficulty != ETraceBotDifficulty::Hard);
+
+		// The widest of the three words as the value box sets them, so both renderers size the box to it
+		// and it keeps one width as the value changes. Measured, not assumed: the words are editable text.
+		// (Compared at one probe size: the widths scale together.)
+		const FString* WidestName = nullptr;
+		float WidestNameW = -1.f;
+		for (int32 DifficultyIndex = 0; DifficultyIndex < TraceDifficulty::Count; ++DifficultyIndex)
+		{
+			const FString& LevelName = TraceDifficulty::DisplayName(static_cast<ETraceBotDifficulty>(DifficultyIndex));
+			const float LevelNameW = TraceMenuKit::CapTextWidth(LevelName, 100.f);
+			if (LevelNameW > WidestNameW)
+			{
+				WidestNameW = LevelNameW;
+				WidestName = &LevelName;
+			}
+		}
+		if (WidestName != nullptr)
+		{
+			OutView.ValueWidest = *WidestName;
+		}
 	}
 }
 
@@ -4808,7 +5076,13 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 		const float BoxH = 34.f * UIScale;
 		const float ValueCapH = BoxH * TraceMenuKit::LabelCapFraction;
 
-		const float ValueW = TraceMenuKit::CapTextWidth(RowView.Value, ValueCapH, ETraceTextWeight::Light);
+		// THE BOX HOLDS ONE SIZE, whatever the value: it is sized to the widest word the row can show
+		// (RowView.ValueWidest), and the value is centred between the arrows. Sized to the current word,
+		// the box's left edge and the '<' jumped about 43 px each time the value changed (NORMAL is wide,
+		// HARD narrow). The UMG row holds the same width (UTraceMenuRow::ApplyView).
+		const FString& WidestValue = RowView.ValueWidest.IsEmpty() ? RowView.Value : RowView.ValueWidest;
+		const float ValueW = FMath::Max(TraceMenuKit::CapTextWidth(WidestValue, ValueCapH, ETraceTextWeight::Light),
+			TraceMenuKit::CapTextWidth(RowView.Value, ValueCapH, ETraceTextWeight::Light));
 		const float BoxRight = X + Width - 8.f * UIScale;
 		const float RightArrowX = BoxRight - BoxPad - ArrowS;
 		const float ValueRight = RightArrowX - ArrowGap;
@@ -4816,20 +5090,44 @@ FBox2D ATraceMenuHUD::DrawRow(ETraceMenuRow Row, float CenterX, float Y, float W
 		const float BoxLeft = LeftArrowX - BoxPad;
 
 		TraceMenuKit::DrawValueBoxPlate(this, BoxLeft, Y + (RowH - BoxH) * 0.5f, BoxRight - BoxLeft, BoxH);
-		TraceMenuKit::DrawCapText(this, RowView.Value, ValueRight, Y + RowH * 0.5f, ValueCapH, RowView.ValueColor,
-			ETraceTextWeight::Light, TraceText::EHAlign::Right);
+		TraceMenuKit::DrawCapText(this, RowView.Value, ValueRight - ValueW * 0.5f, Y + RowH * 0.5f, ValueCapH,
+			RowView.ValueColor, ETraceTextWeight::Light, TraceText::EHAlign::Center);
+#if !UE_BUILD_SHIPPING
+		if (Row == ETraceMenuRow::Difficulty)
+		{
+			DebugDifficultyBoxW = (BoxRight - BoxLeft) / FMath::Max(UIScale, KINDA_SMALL_NUMBER);
+		}
+#endif
 
 		if (RowView.bShowArrows)
 		{
 			// Dimmed at the ends of the range so the player can see there is nothing further that way.
+			// Through the kit's STROKE, not AHUD::DrawLine: the engine draws a line at full alpha whatever
+			// its colour says, so the dead arrow at EASY or HARD used to be as bright as the live one.
 			const float ArrowY = Y + RowH * 0.5f;
 			const FLinearColor LeftInk(RowFurniture.R, RowFurniture.G, RowFurniture.B, RowView.bCanLeft ? 0.95f : 0.20f);
 			const FLinearColor RightInk(RowFurniture.R, RowFurniture.G, RowFurniture.B, RowView.bCanRight ? 0.95f : 0.20f);
 
-			DrawLine(LeftArrowX, ArrowY, LeftArrowX + ArrowS, ArrowY - ArrowS, LeftInk, ArrowT);
-			DrawLine(LeftArrowX, ArrowY, LeftArrowX + ArrowS, ArrowY + ArrowS, LeftInk, ArrowT);
-			DrawLine(RightArrowX, ArrowY - ArrowS, RightArrowX + ArrowS, ArrowY, RightInk, ArrowT);
-			DrawLine(RightArrowX, ArrowY + ArrowS, RightArrowX + ArrowS, ArrowY, RightInk, ArrowT);
+#if !UE_BUILD_SHIPPING
+			const int64 StrokesBefore = TraceMenuKit::DebugStrokesIssued();
+#endif
+			TraceMenuKit::DrawStroke(this, LeftArrowX, ArrowY, LeftArrowX + ArrowS, ArrowY - ArrowS, LeftInk, ArrowT);
+			TraceMenuKit::DrawStroke(this, LeftArrowX, ArrowY, LeftArrowX + ArrowS, ArrowY + ArrowS, LeftInk, ArrowT);
+#if !UE_BUILD_SHIPPING
+			const FLinearColor LeftDrawn = TraceMenuKit::DebugLastStrokeColor();
+			const bool bLeftStroked = TraceMenuKit::DebugStrokesIssued() == StrokesBefore + 2;
+#endif
+			TraceMenuKit::DrawStroke(this, RightArrowX, ArrowY - ArrowS, RightArrowX + ArrowS, ArrowY, RightInk, ArrowT);
+			TraceMenuKit::DrawStroke(this, RightArrowX, ArrowY + ArrowS, RightArrowX + ArrowS, ArrowY, RightInk, ArrowT);
+#if !UE_BUILD_SHIPPING
+			if (Row == ETraceMenuRow::Difficulty)
+			{
+				// What went to the canvas, through a path that keeps alpha (-1: not through one).
+				const bool bRightStroked = TraceMenuKit::DebugStrokesIssued() == StrokesBefore + 4;
+				DebugDifficultyArrowAlpha[0] = bLeftStroked ? LeftDrawn.A : -1.f;
+				DebugDifficultyArrowAlpha[1] = bRightStroked ? TraceMenuKit::DebugLastStrokeColor().A : -1.f;
+			}
+#endif
 		}
 	}
 

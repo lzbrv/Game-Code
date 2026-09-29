@@ -84,6 +84,9 @@ namespace TraceDifficulty
 	 */
 	TRACE_API FString ToDisplayName(ETraceBotDifficulty Difficulty);
 
+	/** ToDisplayName without the copy: a reference into the text store, good until the next text reload. */
+	TRACE_API const FString& DisplayName(ETraceBotDifficulty Difficulty);
+
 	/**
 	 * Lowercase token used in the travel URL: "easy" / "normal" / "hard", FIXED. It used to be the
 	 * display name lower-cased, so renaming the label in the text document would have changed the

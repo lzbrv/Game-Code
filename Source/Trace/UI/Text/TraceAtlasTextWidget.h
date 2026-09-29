@@ -63,6 +63,9 @@ struct FTraceAtlasTextParams
 	/** Where the string sits inside a slot LARGER than it. Irrelevant in an auto-sized slot. */
 	TraceText::EHAlign SlotHAlign = TraceText::EHAlign::Center;
 	TraceText::EVAlign SlotVAlign = TraceText::EVAlign::Center;
+
+	/** The desired width is never less than this (local units). 0: the string's own width. */
+	float MinWidth = 0.f;
 };
 
 /**
@@ -160,6 +163,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Atlas Text")
 	TEnumAsByte<EVerticalAlignment> VerticalAlignment = VAlign_Center;
 
+	/** See SetMinWidth. 0: the widget is as wide as its string. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Trace Atlas Text")
+	float MinWidth = 0.f;
+
 	UFUNCTION(BlueprintCallable, Category = "Trace Atlas Text")
 	void SetText(const FString& InText);
 
@@ -188,6 +195,16 @@ public:
 	/** Width this widget would occupy right now, in local units. Correct in the fallback too. */
 	UFUNCTION(BlueprintCallable, Category = "Trace Atlas Text")
 	float MeasureWidth() const;
+
+	/** The width @p InText would take in this widget's style, in local units. */
+	float MeasureWidthOf(const FString& InText) const;
+
+	/**
+	 * Hold the widget at least @p InMinWidth wide (local units), with the string placed inside that
+	 * width per @p InAlign — a value that changes in a box that must not. 0 lets it fit its string
+	 * again. Re-lays out only when either changes, so calling it every frame is free.
+	 */
+	void SetMinWidth(float InMinWidth, EHorizontalAlignment InAlign);
 
 	//~ Begin UWidget interface
 	virtual void SynchronizeProperties() override;

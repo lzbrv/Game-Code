@@ -2,6 +2,8 @@
 
 #include "UI/Widgets/Menu/TraceMenuKit.h"
 
+#include "CanvasItem.h"                 // FCanvasTriangleItem — DrawStroke's alpha survives
+#include "Engine/Canvas.h"
 #include "Engine/Engine.h"
 #include "Engine/Texture2D.h"
 #include "Engine/World.h"
@@ -37,7 +39,22 @@ namespace TraceMenuKitFile
 
 	/** The tint of the last quad handed to a HUD, so the verify can see what a panel ASKED for. */
 	static FLinearColor GLastQuadTint = FLinearColor::Transparent;
+
+	/** Every DrawStroke that reached a canvas, and the colour (fade included) it went out at. */
+	static int64 GStrokesIssued = 0;
+	static FLinearColor GLastStrokeColor = FLinearColor::Transparent;
 #endif
+
+	/**
+	 * DrawStroke's triangles. One item for the process, emptied between strokes but keeping its
+	 * capacity, so a frame of strokes allocates nothing; the canvas copies the triangles while the item
+	 * draws, so it is free again as soon as DrawItem returns. Game thread only, like every kit draw.
+	 */
+	static FCanvasTriangleItem& StrokeItem()
+	{
+		static FCanvasTriangleItem Shared(FVector2D::ZeroVector, FVector2D::ZeroVector, FVector2D::ZeroVector, nullptr);
+		return Shared;
+	}
 
 	// ---- P10: the opacity every kit draw is multiplied by (TraceMenuKit::FScopedOpacity) ----------
 
@@ -774,6 +791,62 @@ bool TraceMenuKit::DrawValueBox(AHUD* HUD, float X, float Y, float W, float H, c
 		ETraceTextWeight::Light, /*bTabularDigits=*/true);
 	return true;
 }
+
+void TraceMenuKit::DrawStroke(AHUD* HUD, float X0, float Y0, float X1, float Y1, const FLinearColor& InColor,
+	float Thickness)
+{
+	// AHUD::Canvas is protected: the canvas the engine is drawing the HUD into (null outside a draw).
+	UCanvas* const TargetCanvas = (HUD != nullptr) ? TraceCanvasText::GameCanvas() : nullptr;
+	const FLinearColor StrokeColor = Faded(InColor);
+	const FVector2D From(X0, Y0);
+	const FVector2D To(X1, Y1);
+	FVector2D Along = To - From;
+	const double StrokeLength = Along.Size();
+	if (TargetCanvas == nullptr || GWhiteTexture == nullptr || !IsInGameThread() || StrokeLength < 1.e-3
+		|| StrokeColor.A <= 0.f)
+	{
+		return;
+	}
+	Along /= StrokeLength;
+
+	// A quad of two translucent triangles on the white texture: its vertex colour keeps its alpha all
+	// the way to the blend, which an FCanvasLineItem's does not (the engine sets A to 1 in AddLine).
+	const FVector2D Side = FVector2D(-Along.Y, Along.X) * (0.5 * FMath::Max(Thickness, 1.f));
+	const FVector2D Corners[4] = { From + Side, To + Side, To - Side, From - Side };
+	const int32 Order[2][3] = { { 0, 1, 2 }, { 0, 2, 3 } };
+
+	FCanvasTriangleItem& Item = TraceMenuKitFile::StrokeItem();
+	Item.TriangleList.Reset();
+	for (const int32 (&Tri)[3] : Order)
+	{
+		FCanvasUVTri& Out = Item.TriangleList.AddDefaulted_GetRef();
+		Out.V0_Pos = Corners[Tri[0]];
+		Out.V1_Pos = Corners[Tri[1]];
+		Out.V2_Pos = Corners[Tri[2]];
+		Out.V0_UV = Out.V1_UV = Out.V2_UV = FVector2D::ZeroVector;
+		Out.V0_Color = Out.V1_Color = Out.V2_Color = StrokeColor;
+	}
+	Item.Texture = GWhiteTexture;
+	Item.BlendMode = SE_BLEND_Translucent;
+	TargetCanvas->DrawItem(Item);
+	Item.TriangleList.Reset();
+#if !UE_BUILD_SHIPPING
+	++TraceMenuKitFile::GStrokesIssued;
+	TraceMenuKitFile::GLastStrokeColor = StrokeColor;
+#endif
+}
+
+#if !UE_BUILD_SHIPPING
+int64 TraceMenuKit::DebugStrokesIssued()
+{
+	return TraceMenuKitFile::GStrokesIssued;
+}
+
+FLinearColor TraceMenuKit::DebugLastStrokeColor()
+{
+	return TraceMenuKitFile::GLastStrokeColor;
+}
+#endif
 
 float TraceMenuKit::DrawPageClock(AHUD* HUD, float ViewW, float UIScale, float SecondsLeft, float NowSeconds)
 {

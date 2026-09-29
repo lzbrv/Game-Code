@@ -266,7 +266,7 @@ public:
 	 *   click  a click at a pointer that has not moved since the title came up.
 	 * See TickJoinVerify.
 	 */
-	void BeginJoinVerify(const FString& Parts = FString());
+	void BeginJoinVerify(const FString& Parts = FString(), int32 StopAfterStep = 0);
 
 	/** Trace.Menu.JoinOnce: JOIN @p Address through the real prompt and ConfirmJoin. Dev only. */
 	void DebugJoin(const FString& Address);
@@ -761,6 +761,17 @@ private:
 	bool bHasSettledCursor = false;
 
 	/**
+	 * HOVER'S OWN "HAS REALLY MOVED" (L2). The rows follow the pointer once this is true: a move of more
+	 * than 2 px from HoverBaselinePos, the first sample past the settling window with no loading card
+	 * up — or bCursorHasMoved, whichever comes first. It does NOT wait out the card's grace as a click
+	 * does (a replayed press is a click's risk, not hover's), so a nudge onto PLAY while the card lifts
+	 * lights PLAY. The first sample is still only a baseline (RV9).
+	 */
+	bool bHoverHasMoved = false;
+	FVector2D HoverBaselinePos = FVector2D::ZeroVector;
+	bool bHasHoverBaseline = false;
+
+	/**
 	 * The row a click at an unmoved pointer lit, or INDEX_NONE. The next click that lands on it is
 	 * acted on. See bCursorHasMoved.
 	 */
@@ -1055,6 +1066,26 @@ private:
 
 	/** Why the run stopped as INVALID, when something outside it moved the pointer. Empty otherwise. */
 	FString JoinVerifyInvalidReason;
+
+	/** Keys and buttons the run has pressed and not yet released; the cleanup releases them. */
+	TArray<FKey> JoinVerifyHeldKeys;
+
+	/** Test hook (stopat=<step>): the step after which the run stops, as an INVALID stop would. 0: off. */
+	int32 JoinVerifyStopAt = 0;
+
+	/**
+	 * The Canvas DIFFICULTY row as last drawn: its value box width in 1080p px, and the alpha each
+	 * arrow (left, right) went to the canvas at through a path that keeps alpha (-1: it did not).
+	 */
+	float DebugDifficultyBoxW = 0.f;
+	float DebugDifficultyArrowAlpha[2] = { -1.f, -1.f };
+
+	/** The click part's DIFFICULTY box width at EASY, NORMAL and HARD, as the active renderer drew it. */
+	float JoinVerifyDifficultyBoxW[3] = { 0.f, 0.f, 0.f };
+
+	/** The loading card's last end time the click part replaced to stage a lifting card; -1: none held. */
+	double JoinVerifySavedCardEnd = -1.0;
+	uint8 JoinVerifySavedCardKind = 0;
 
 	/** The harness's only way to move the pointer: moves it and records where it now reads. */
 	void JoinVerifyMovePointer(APlayerController* PC, const FVector2D& Where);

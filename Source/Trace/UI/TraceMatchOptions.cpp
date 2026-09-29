@@ -30,6 +30,11 @@ namespace
 
 FString TraceDifficulty::ToDisplayName(ETraceBotDifficulty Difficulty)
 {
+	return DisplayName(Difficulty);
+}
+
+const FString& TraceDifficulty::DisplayName(ETraceBotDifficulty Difficulty)
+{
 	switch (Difficulty)
 	{
 	case ETraceBotDifficulty::Easy: return TRACE_TEXT("MENU.DIFFICULTY_EASY", "EASY");

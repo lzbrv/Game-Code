@@ -309,6 +309,9 @@ public:
 #if !UE_BUILD_SHIPPING
 	/** The failure banner and its neighbours as Slate laid them out last frame. For Trace.Menu.FailureVerify. */
 	void DebugDescribeFailure(FTraceTitleFailureLayout& Out) const;
+
+	/** Row @p InRowIndex's value chip width as last laid out, window pixels; 0 when it has none. */
+	float DebugRowValueChipWidth(int32 InRowIndex) const;
 #endif
 
 	//~ Begin UUserWidget interface

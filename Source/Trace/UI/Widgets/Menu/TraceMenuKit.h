@@ -581,6 +581,20 @@ namespace TraceMenuKit
 	 */
 	TRACE_API float KeyLegendFit(float ChipH, float MaxW, std::initializer_list<float> Widths);
 
+	/**
+	 * A straight stroke from (X0, Y0) to (X1, Y1), @p Thickness px wide, that HONOURS ALPHA and the
+	 * current opacity. AHUD::DrawLine does not: the engine sets a line's alpha to 1 before batching it,
+	 * so a dimmed chevron drawn with it came out at full strength. Two translucent triangles instead.
+	 */
+	TRACE_API void DrawStroke(AHUD* HUD, float X0, float Y0, float X1, float Y1, const FLinearColor& Color,
+		float Thickness);
+
+#if !UE_BUILD_SHIPPING
+	/** How many DrawStroke calls have reached a canvas, and the colour (fade included) of the last. */
+	TRACE_API int64 DebugStrokesIssued();
+	TRACE_API FLinearColor DebugLastStrokeColor();
+#endif
+
 	/** Opaque black over the whole view (stylespec §1). */
 	TRACE_API void DrawBackground(AHUD* HUD, float ViewW, float ViewH);
 

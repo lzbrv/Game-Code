@@ -57,7 +57,7 @@ FVector2D STraceAtlasText::ComputeDesiredSize(float) const
 	// measured through TraceText, so it is right in BOTH faces — a fallback that reported the atlas's
 	// widths would reflow every auto-sized slot on screen the moment the texture went missing.
 	const FVector2f Size = TraceText::Measure(Params.Text, Params.Style);
-	return FVector2D(Size.X, Size.Y);
+	return FVector2D(FMath::Max(Size.X, Params.MinWidth), Size.Y);
 }
 
 int32 STraceAtlasText::OnPaint(const FPaintArgs& Args, const FGeometry& AllottedGeometry,
@@ -216,6 +216,7 @@ FTraceAtlasTextParams UTraceAtlasText::BuildParams() const
 
 	Out.SlotHAlign = TraceAtlasTextWidgetFile::FromSlate(HorizontalAlignment);
 	Out.SlotVAlign = TraceAtlasTextWidgetFile::FromSlate(VerticalAlignment);
+	Out.MinWidth = FMath::Max(0.f, MinWidth);
 	return Out;
 }
 
@@ -305,6 +306,26 @@ void UTraceAtlasText::SetWeightByName(const FString& InWeightName)
 float UTraceAtlasText::MeasureWidth() const
 {
 	return TraceText::MeasureWidth(Text, BuildParams().Style);
+}
+
+float UTraceAtlasText::MeasureWidthOf(const FString& InText) const
+{
+	TraceText::FStyle MeasureStyle(Size, Color, Weight);
+	MeasureStyle.Tracking = Tracking;
+	MeasureStyle.bTabularDigits = bTabularDigits;
+	return TraceText::MeasureWidth(InText, MeasureStyle);
+}
+
+void UTraceAtlasText::SetMinWidth(float InMinWidth, EHorizontalAlignment InAlign)
+{
+	const float Wanted = FMath::Max(0.f, InMinWidth);
+	if (FMath::IsNearlyEqual(MinWidth, Wanted, 0.01f) && HorizontalAlignment == InAlign)
+	{
+		return;
+	}
+	MinWidth = Wanted;
+	HorizontalAlignment = InAlign;
+	SynchronizeProperties();
 }
 
 #if WITH_EDITOR
