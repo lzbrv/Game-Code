@@ -135,6 +135,25 @@ public:
 	const UInputMappingContext* GetPadContext() const { return PadContext; }
 
 	/**
+	 * How long Enhanced Input may refuse the context before that is reported as an Error.
+	 *
+	 * A JOINING CLIENT'S FIRST FRAMES REFUSE AND THAT IS NOT A FAULT. Its controller exists a few
+	 * frames before its UPlayerInput does, AddMappingContext is a silent no-op until then, and Tick()
+	 * retries every frame — so every join used to log "refused ... no gamepad input will reach the
+	 * pawn" at Error two to seven times, followed 10-20 ms later by "Controller mappings applied".
+	 * An Error that is always false teaches everyone to skip Errors, including a real one. A refusal
+	 * is now logged quietly (Verbose) until it has lasted this long, and at Error once if it does.
+	 */
+	static constexpr double PadRefusalGraceSeconds = 3.0;
+
+	/** Refusals logged quietly inside the grace, and refusals that outlasted it. For Trace.Pad.Status. */
+	int32 GetQuietRefusalCount() const { return QuietRefusalCount; }
+	int32 GetReportedRefusalCount() const { return ReportedRefusalCount; }
+
+	/** True while the context is applied to a live local player. */
+	bool IsPadContextApplied() const { return AppliedTo.IsValid(); }
+
+	/**
 	 * The resolved UInputAction for an asset name ("IA_Look"), or null.
 	 *
 	 * Exists for Trace.Pad.Drive, which proves a pad key reaches an ACTION by reading that action's
@@ -210,6 +229,15 @@ private:
 
 	/** Latches the "no input assets, and the C++ fallback did not name what I needed" warning. */
 	bool bResolveFailureReported = false;
+
+	/** Real time the current run of refusals began; 0 while the context is applied. See PadRefusalGraceSeconds. */
+	double RefusedSinceRealTime = 0.0;
+
+	/** Latches the one Error for the current run of refusals. */
+	bool bRefusalReported = false;
+
+	int32 QuietRefusalCount = 0;
+	int32 ReportedRefusalCount = 0;
 };
 
 // =================================================================================================

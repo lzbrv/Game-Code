@@ -13,6 +13,7 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
+#include "HAL/PlatformTime.h"
 #include "InputAction.h"
 #include "InputCoreTypes.h"
 #include "InputKeyEventArgs.h"
@@ -451,6 +452,8 @@ void UTraceGamepadInputSubsystem::ApplyPadSettings()
 				TEXT("removed; the keyboard and mouse context is untouched."));
 		}
 		AppliedTo = nullptr;
+		RefusedSinceRealTime = 0.0;   // off is not a refusal; the grace starts again when it is back on
+		bRefusalReported = false;
 		return;
 	}
 
@@ -602,11 +605,47 @@ void UTraceGamepadInputSubsystem::ApplyPadSettings()
 
 	if (!bAccepted)
 	{
-		UE_LOG(LogTraceGame, Error,
-			TEXT("[Pad] Enhanced Input refused the controller mapping context — no gamepad input will ")
-			TEXT("reach the pawn. PlayerInput is currently '%s'."),
-			(PC->PlayerInput != nullptr) ? *PC->PlayerInput->GetClass()->GetName() : TEXT("<none>"));
+		// *** QUIET UNTIL IT HAS LASTED — see PadRefusalGraceSeconds. *** Tick() calls back every
+		// frame, so a client whose UPlayerInput is still being created lands here for a few frames and
+		// then succeeds. Only a refusal that outlives the grace is the misconfiguration the Error is
+		// for (a DefaultPlayerInputClass that is not UEnhancedPlayerInput), and it is said once.
+		const double RefusalNow = FPlatformTime::Seconds();
+		if (RefusedSinceRealTime <= 0.0)
+		{
+			RefusedSinceRealTime = RefusalNow;
+		}
+		const double RefusedFor = RefusalNow - RefusedSinceRealTime;
+		const FString PlayerInputClass = (PC->PlayerInput != nullptr)
+			? PC->PlayerInput->GetClass()->GetName() : FString(TEXT("<none>"));
+
+		if (RefusedFor < PadRefusalGraceSeconds)
+		{
+			++QuietRefusalCount;
+			UE_LOG(LogTraceGame, Verbose,
+				TEXT("[Pad] Enhanced Input has not taken the controller mapping context yet (PlayerInput '%s', ")
+				TEXT("%.0f ms in); retrying next frame."),
+				*PlayerInputClass, RefusedFor * 1000.0);
+		}
+		else if (!bRefusalReported)
+		{
+			bRefusalReported = true;
+			++ReportedRefusalCount;
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[Pad] Enhanced Input has refused the controller mapping context for %.1f s — no gamepad ")
+				TEXT("input will reach the pawn. PlayerInput is currently '%s'."),
+				RefusedFor, *PlayerInputClass);
+		}
 		return;
+	}
+
+	if (RefusedSinceRealTime > 0.0)
+	{
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[Pad] Enhanced Input took the controller mapping context after %.0f ms of retries%s."),
+			(FPlatformTime::Seconds() - RefusedSinceRealTime) * 1000.0,
+			bRefusalReported ? TEXT(" (the refusal WAS reported as an Error: it outlasted the grace)") : TEXT(""));
+		RefusedSinceRealTime = 0.0;
+		bRefusalReported = false;
 	}
 
 	UE_LOG(LogTraceGame, Display,
@@ -948,6 +987,14 @@ namespace TraceGamepadVerify
 			(Context != nullptr) ? TEXT("BUILT") : TEXT("NOT BUILT"),
 			(Context != nullptr) ? Context->GetMappings().Num() : 0,
 			Pad->HasSeenGamepadInput() ? TEXT("") : TEXT("NOT "));
+
+		// The join-time refusals, counted: quiet ones are a UPlayerInput still being created, and are
+		// expected on every client; a REPORTED one outlasted the grace and is a real fault.
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[Pad] STATUS: context applied=%d; Enhanced Input refusals so far: %d inside the %.1f s grace ")
+			TEXT("(quiet), %d reported as Error."),
+			Pad->IsPadContextApplied() ? 1 : 0, Pad->GetQuietRefusalCount(),
+			UTraceGamepadInputSubsystem::PadRefusalGraceSeconds, Pad->GetReportedRefusalCount());
 	}
 
 	// ---------------------------------------------------------------------------------------------
