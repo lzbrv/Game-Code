@@ -318,6 +318,12 @@ public:
 	};
 	const FHudKitRecord& GetHudKitRecord() const { return HudKitRecord; }
 
+	/**
+	 * Trace.HUD.Results.Verify: when the results screen first stood fully faded in (TraceMenuKit::
+	 * RealSeconds), which is when its CONTINUE grace starts; negative until then.
+	 */
+	double GetResultsShownRealSecondsForDebug() const { return ResultsShownRealSeconds; }
+
 	/** Trace.UI.Fade.Verify: the pause menu opened exactly as Escape opens it, and closed as RESUME does. */
 	void DebugOpenPauseMenu() { OpenPauseMenu(); }
 	void DebugClosePauseMenu() { PauseMenu.Close(); }

@@ -11328,6 +11328,19 @@ namespace TraceHUDResultsVerify
 		double InsideGracePressAt = -1.0;
 		int32 InsideGracePressStage = -1;
 
+		/**
+		 * Keys the run has pressed and not released. Every early end lets go of them (Release), so a run
+		 * that stops INCONCLUSIVE between stage 5's A and stage 8's release does not leave A held.
+		 */
+		TArray<FKey> HeldKeys;
+
+		/**
+		 * After an INCONCLUSIVE: 0 not wrapping up; then the steps that still run (screenshot, headline
+		 * and score reads, a fresh press that ends the screen as a passing run ends it). See WrapUp.
+		 */
+		int32 WrapStep = 0;
+		double WrapStepAt = 0.0;
+
 		/** When the final press went in, so its deadline follows it rather than the clock. */
 		double FinalPressAt = -1.0;
 
@@ -11372,8 +11385,75 @@ namespace TraceHUDResultsVerify
 		{
 			Target->InputKey(KeyArgs);
 		}
+		if (bDown)
+		{
+			Run.HeldKeys.AddUnique(Key);
+		}
+		else
+		{
+			Run.HeldKeys.Remove(Key);
+		}
 		UE_LOG(LogTraceGame, Display, TEXT("[ResultsVerify] t=%.2fs %s %s"),
 			FPlatformTime::Seconds() - Run.WhistleReal, *Key.ToString(), bDown ? TEXT("down") : TEXT("up"));
+	}
+
+	/** Lets go of every key the run is still holding. Every way the run ends goes through it. */
+	static void ReleaseHeld(FRun& Run)
+	{
+		const TArray<FKey> StillHeld = Run.HeldKeys;
+		for (const FKey& HeldKey : StillHeld)
+		{
+			Inject(Run, HeldKey, false);
+		}
+	}
+
+	/** The local match HUD the results screen is drawn by, or null. */
+	static const ATraceHUD* ResultsHudOf(const FRun& Run)
+	{
+		APlayerController* const ResultsPC = Run.Controller.Get();
+		return (ResultsPC != nullptr) ? Cast<ATraceHUD>(ResultsPC->GetHUD()) : nullptr;
+	}
+
+	/** The results screenshot, the frame the legend has faded in on. */
+	static void RequestResultsShot()
+	{
+		const FString Path = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"),
+			FString::Printf(TEXT("ResultsVerify_%s.png"), *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"))));
+		UE_LOG(LogTraceGame, Display, TEXT("[ResultsVerify] results screenshot requested: %s"), *Path);
+		FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+	}
+
+	/** The headline and the score, read off the draw record of the frame on screen. */
+	static void ReadResultsScreen(FRun& Run)
+	{
+		// THE HEADLINE IS A KIT SCREEN TITLE: the reason and the result both in the kit's heading face
+		// (Sofachrome), the reason in white — read off the draw record of the frame on screen.
+		const ATraceHUD* const ResultsHud = ResultsHudOf(Run);
+		if (ResultsHud == nullptr)
+		{
+			Report(Run, TEXT("the results headline is set in the kit's heading face"), false, TEXT("no local match HUD"));
+			return;
+		}
+		const ATraceHUD::FHudKitRecord& Drawn = ResultsHud->GetHudKitRecord();
+		const int32 KitFace = static_cast<int32>(ETraceTextWeight::Light);
+		Report(Run, TEXT("*** the results headline is set in the kit's heading face, the reason line white ***"),
+			!Drawn.ResultHead.IsEmpty() && Drawn.ResultHeadWeight == KitFace && Drawn.ResultLineWeight == KitFace
+				&& Drawn.ResultHeadColor.Equals(TraceMenuArtStyle::WordDefault, 0.01f)
+				&& (Run.Winner != ETraceTeam::None || Drawn.ResultLineColor.Equals(TraceMenuArtStyle::WordDefault, 0.01f)),
+			FString::Printf(TEXT("\"%s\" face %d %s / \"%s\" face %d %s (Light is %d)"),
+				*Drawn.ResultHead, Drawn.ResultHeadWeight, *Drawn.ResultHeadColor.ToString(),
+				*Drawn.ResultLine, Drawn.ResultLineWeight, *Drawn.ResultLineColor.ToString(), KitFace));
+
+		// THE SCORE IS SET AS THE HALF-TIME PAGE SETS IT: in the kit's value box, in the heading face,
+		// each number in its team's colour. It was the HUD's Erbaum at x2.4 with no plate.
+		Report(Run, TEXT("*** the final score is in the kit's value box, in the heading face and team colours, as at half time ***"),
+			!Drawn.ResultScore.IsEmpty() && Drawn.bResultScoreBox && Drawn.ResultScoreWeight == KitFace
+				&& Drawn.ResultScoreBlueColor.Equals(TraceTeamColor(ETraceTeam::Blue), 0.01f)
+				&& Drawn.ResultScoreOrangeColor.Equals(TraceTeamColor(ETraceTeam::Orange), 0.01f)
+				&& Drawn.ResultScoreCapPx >= 20.f,
+			FString::Printf(TEXT("\"%s\" box %d, face %d (Light is %d), cap %.1f px, blue %s, orange %s"),
+				*Drawn.ResultScore, Drawn.bResultScoreBox ? 1 : 0, Drawn.ResultScoreWeight, KitFace,
+				Drawn.ResultScoreCapPx, *Drawn.ResultScoreBlueColor.ToString(), *Drawn.ResultScoreOrangeColor.ToString()));
 	}
 
 	static int32 ContinuesSinceWhistle(const FRun& Run)
@@ -11392,6 +11472,7 @@ namespace TraceHUDResultsVerify
 
 	static void Finish(FRun& Run, bool bCompleted)
 	{
+		ReleaseHeld(Run);
 		RestorePadSetting(Run);
 		if (Run.Failures == 0 && !Run.InconclusiveReason.IsEmpty())
 		{
@@ -11426,6 +11507,73 @@ namespace TraceHUDResultsVerify
 		return false;
 	}
 
+	/**
+	 * AN INCONCLUSIVE RUN STILL LOOKS AT THE SCREEN. A hitch that moved an arm says nothing about the
+	 * headline, the score or the screenshot, so those still run at their usual times; then one fresh
+	 * press after the grace ends the screen the way a passing run ends it, rather than leaving the game
+	 * on the results screen until its timer runs out. Returns false when the run is over.
+	 */
+	static bool WrapUp(FRun& Run, double Elapsed)
+	{
+		const FKey FinalKey = Run.bFinalKeyIsEnter ? EKeys::Enter : EKeys::Gamepad_FaceButton_Bottom;
+		const double WrapNow = FPlatformTime::Seconds();
+		switch (Run.WrapStep)
+		{
+		case 0:
+			UE_LOG(LogTraceGame, Warning, TEXT("[ResultsVerify] INCONCLUSIVE at t=%.2fs: %s. Still reading the screen, then ending it."),
+				Elapsed, *Run.InconclusiveReason);
+			if (ContinuesSinceWhistle(Run) > 0)
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[ResultsVerify] The screen has already continued (on that press): nothing left to read."));
+				return false;
+			}
+			Run.WrapStep = 1;
+			return true;
+		case 1:
+			if (Elapsed >= 1.50)
+			{
+				RequestResultsShot();
+				Run.WrapStep = 2;
+			}
+			return true;
+		case 2:
+			if (Elapsed >= 1.60)
+			{
+				ReadResultsScreen(Run);
+				Run.WrapStep = 3;
+			}
+			return true;
+		case 3:
+		{
+			const ATraceHUD* const WrapHud = ResultsHudOf(Run);
+			const double ShownAt = (WrapHud != nullptr) ? WrapHud->GetResultsShownRealSecondsForDebug() : -1.0;
+			if (Elapsed >= 2.60 && ShownAt >= 0.0
+				&& TraceMenuKit::RealSeconds() >= ShownAt + TraceHUDResultsInput::ContinueGraceSeconds + 0.1)
+			{
+				Inject(Run, FinalKey, true);
+				Run.WrapStep = 4;
+				Run.WrapStepAt = WrapNow;
+			}
+			return true;
+		}
+		case 4:
+			if (WrapNow - Run.WrapStepAt >= 0.1)
+			{
+				Inject(Run, FinalKey, false);
+				Run.WrapStep = 5;
+				Run.WrapStepAt = WrapNow;
+			}
+			return true;
+		default:
+			if (ContinuesSinceWhistle(Run) > 0 || WrapNow - Run.WrapStepAt > 2.0)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[ResultsVerify] Wrapped up: continues %d."), ContinuesSinceWhistle(Run));
+				return false;
+			}
+			return true;
+		}
+	}
+
 	/** One tick. Returns false when the run is over. */
 	static bool Tick(FRun& Run)
 	{
@@ -11442,31 +11590,52 @@ namespace TraceHUDResultsVerify
 		const FKey PadA = EKeys::Gamepad_FaceButton_Bottom;
 
 		// The stages are ordered by time; each one runs once, on the first tick at or after its time.
-		static const double StageTimes[] = { 0.10, 0.35, 0.45, 0.60, 0.70, 0.90, 1.50, 1.60, 1.80, 1.95,
+		// The held-A arm goes in at 0.80 s: 0.35 s or more before the screen's own grace ends (it starts
+		// only when the screen has faded fully in, 0.15 s or more after the whistle), so an ordinary slow
+		// frame after it still lands inside. At 0.90 s a 50-120 ms frame could carry it past.
+		static const double StageTimes[] = { 0.10, 0.35, 0.45, 0.60, 0.70, 0.80, 1.50, 1.60, 1.80, 1.95,
 			2.10, 2.20, 2.40, 2.60, 2.70, 4.50 };
 		static const TCHAR* const StageArms[] = {
 			TEXT("A on the whistle frame"), TEXT("A on the whistle frame"), TEXT("ENTER at 0.35 s"),
-			TEXT("ENTER at 0.35 s"), TEXT("A at 0.60 s"), TEXT("A at 0.60 s"), TEXT("A held from 0.90 s"),
-			TEXT("A held from 0.90 s"), TEXT("A held from 0.90 s"), TEXT("A released at 1.80 s"),
+			TEXT("ENTER at 0.35 s"), TEXT("A at 0.60 s"), TEXT("A at 0.60 s"), TEXT("A held from 0.80 s"),
+			TEXT("A held from 0.80 s"), TEXT("A held from 0.80 s"), TEXT("A released at 1.80 s"),
 			TEXT("A released at 1.80 s"), TEXT("A with CONTROLLER INPUT off"), TEXT("A with CONTROLLER INPUT off"),
 			TEXT("A with CONTROLLER INPUT off"), TEXT("the final press"), TEXT("the final press") };
+
+		// An INCONCLUSIVE run still reads the screen, and ends it as a passing run does.
+		if (!Run.InconclusiveReason.IsEmpty())
+		{
+			return WrapUp(Run, Elapsed);
+		}
 
 		// A HITCH IS NOT THE SCREEN'S FAULT (RV8). The stages run on the first tick at or after their
 		// slot, so a stalled frame can send an arm late, or hold the frame that reads it; a press meant
 		// to land inside the grace that the screen only reads after it is a legal CONTINUE, and the run
 		// used to report that as the screen failing. So, before blaming the screen:
-		//   * the frame after an inside-grace press must still be inside the grace (the screen samples
-		//     keys once a frame, so it read the press no later than this tick), and
+		//   * the frame that READ an inside-grace press must still have been inside the SCREEN'S OWN grace.
+		//     This ticker runs after the frame's draw, so the draw that sampled a press sent last tick is
+		//     this frame's, at this frame's UI clock (TraceMenuKit::RealSeconds, the screen's clock); the
+		//     grace ends ContinueGraceSeconds after the screen first stood fully faded in. (It used to be
+		//     measured from the whistle, which left the held-A arm 0.10 s and called ordinary frame pacing
+		//     a hitch.) Read inside it, a CONTINUE is the screen's fault: NothingContinuedYet runs next.
 		//   * an inside-grace press may go in at most ResultsArmLateSeconds after its slot.
-		// Either one missed ends the run INCONCLUSIVE and names the arm. Measured against the whistle,
-		// which is conservative: the grace itself only starts once the screen has faded fully in.
-		if (Run.InsideGracePressAt >= 0.0 && Elapsed >= TraceHUDResultsInput::ContinueGraceSeconds)
+		// Either one missed ends the run INCONCLUSIVE, names the arm, and wraps up (see WrapUp).
+		if (Run.InsideGracePressAt >= 0.0)
 		{
-			Run.InconclusiveReason = FString::Printf(
-				TEXT("the frame after '%s' (sent at %.2f s) came at %.2f s, past the grace's end at %.2f s, so the screen "
-				     "may only have read the press after it — a frame hitch, not the screen"),
-				StageArms[Run.InsideGracePressStage + 1], Run.InsideGracePressAt, Elapsed, TraceHUDResultsInput::ContinueGraceSeconds);
-			return false;
+			const ATraceHUD* const GraceHud = ResultsHudOf(Run);
+			const double ShownAt = (GraceHud != nullptr) ? GraceHud->GetResultsShownRealSecondsForDebug() : -1.0;
+			const double ReadAt = TraceMenuKit::RealSeconds();
+			if (ShownAt >= 0.0 && ReadAt >= ShownAt + TraceHUDResultsInput::ContinueGraceSeconds)
+			{
+				Run.InconclusiveReason = FString::Printf(
+					TEXT("the frame that read '%s' (sent at %.2f s) drew %.2f s after the screen's grace ended (about %.2f s "
+					     "after the whistle), so that press was a legal one — a frame hitch, not the screen"),
+					StageArms[Run.InsideGracePressStage + 1], Run.InsideGracePressAt,
+					ReadAt - (ShownAt + TraceHUDResultsInput::ContinueGraceSeconds),
+					Elapsed - (ReadAt - (ShownAt + TraceHUDResultsInput::ContinueGraceSeconds)));
+				ReleaseHeld(Run);
+				return WrapUp(Run, Elapsed);
+			}
 		}
 		Run.InsideGracePressAt = -1.0;
 
@@ -11495,7 +11664,8 @@ namespace TraceHUDResultsVerify
 				TEXT("'%s' was due at %.2f s and could only go in at %.2f s — a frame hitch sent it late, so it no "
 				     "longer tests its slot in the grace"),
 				StageArms[Run.Stage + 1], StageTimes[Run.Stage], Elapsed);
-			return false;
+			ReleaseHeld(Run);
+			return WrapUp(Run, Elapsed);
 		}
 		if (bInsideGracePress)
 		{
@@ -11526,13 +11696,8 @@ namespace TraceHUDResultsVerify
 		case 4:  Inject(Run, PadA, false); break;
 		case 5:  Inject(Run, PadA, true); break;
 		case 6:
-		{
-			const FString Path = FPaths::Combine(FPaths::ProjectSavedDir(), TEXT("Screenshots"),
-				FString::Printf(TEXT("ResultsVerify_%s.png"), *FDateTime::Now().ToString(TEXT("%Y%m%d_%H%M%S"))));
-			UE_LOG(LogTraceGame, Display, TEXT("[ResultsVerify] results screenshot requested: %s"), *Path);
-			FScreenshotRequest::RequestScreenshot(Path, /*bShowUI=*/true, /*bAddFilenameSuffix=*/false);
+			RequestResultsShot();
 			break;
-		}
 		case 7:
 		{
 			const UWorld* const WorldPtr = Run.World.Get();
@@ -11541,38 +11706,7 @@ namespace TraceHUDResultsVerify
 				ContinuesSinceWhistle(Run) == 0 && MatchGS != nullptr && MatchGS->TraceMatchState == ETraceMatchState::PostMatch,
 				FString::Printf(TEXT("continues %d, still on the results screen %d"), ContinuesSinceWhistle(Run),
 					(MatchGS != nullptr && MatchGS->TraceMatchState == ETraceMatchState::PostMatch) ? 1 : 0));
-
-			// THE HEADLINE IS A KIT SCREEN TITLE: the reason and the result both in the kit's heading face
-			// (Sofachrome), the reason in white — read off the draw record of the frame on screen.
-			APlayerController* const ResultsPC = Run.Controller.Get();
-			const ATraceHUD* const ResultsHud = (ResultsPC != nullptr) ? Cast<ATraceHUD>(ResultsPC->GetHUD()) : nullptr;
-			if (ResultsHud != nullptr)
-			{
-				const ATraceHUD::FHudKitRecord& Drawn = ResultsHud->GetHudKitRecord();
-				const int32 KitFace = static_cast<int32>(ETraceTextWeight::Light);
-				Report(Run, TEXT("*** the results headline is set in the kit's heading face, the reason line white ***"),
-					!Drawn.ResultHead.IsEmpty() && Drawn.ResultHeadWeight == KitFace && Drawn.ResultLineWeight == KitFace
-						&& Drawn.ResultHeadColor.Equals(TraceMenuArtStyle::WordDefault, 0.01f)
-						&& (Run.Winner != ETraceTeam::None || Drawn.ResultLineColor.Equals(TraceMenuArtStyle::WordDefault, 0.01f)),
-					FString::Printf(TEXT("\"%s\" face %d %s / \"%s\" face %d %s (Light is %d)"),
-						*Drawn.ResultHead, Drawn.ResultHeadWeight, *Drawn.ResultHeadColor.ToString(),
-						*Drawn.ResultLine, Drawn.ResultLineWeight, *Drawn.ResultLineColor.ToString(), KitFace));
-
-				// THE SCORE IS SET AS THE HALF-TIME PAGE SETS IT: in the kit's value box, in the heading face,
-				// each number in its team's colour. It was the HUD's Erbaum at x2.4 with no plate.
-				Report(Run, TEXT("*** the final score is in the kit's value box, in the heading face and team colours, as at half time ***"),
-					!Drawn.ResultScore.IsEmpty() && Drawn.bResultScoreBox && Drawn.ResultScoreWeight == KitFace
-						&& Drawn.ResultScoreBlueColor.Equals(TraceTeamColor(ETraceTeam::Blue), 0.01f)
-						&& Drawn.ResultScoreOrangeColor.Equals(TraceTeamColor(ETraceTeam::Orange), 0.01f)
-						&& Drawn.ResultScoreCapPx >= 20.f,
-					FString::Printf(TEXT("\"%s\" box %d, face %d (Light is %d), cap %.1f px, blue %s, orange %s"),
-						*Drawn.ResultScore, Drawn.bResultScoreBox ? 1 : 0, Drawn.ResultScoreWeight, KitFace,
-						Drawn.ResultScoreCapPx, *Drawn.ResultScoreBlueColor.ToString(), *Drawn.ResultScoreOrangeColor.ToString()));
-			}
-			else
-			{
-				Report(Run, TEXT("the results headline is set in the kit's heading face"), false, TEXT("no local match HUD"));
-			}
+			ReadResultsScreen(Run);
 			break;
 		}
 		case 8:  Inject(Run, PadA, false); break;
@@ -11701,7 +11835,8 @@ namespace TraceHUDResultsVerify
 		TEXT("fresh A (or ENTER with key=enter) afterwards does, that the headline is in the kit's heading face, and ")
 		TEXT("that the final score sits in the kit's value box as the half-time page's does. ")
 		TEXT("`draw` ends it level, `mercy` on the mercy rule (BLUE on the clock otherwise). A frame hitch that moves an ")
-		TEXT("inside-grace arm past the grace ends it INCONCLUSIVE; `hitch=before` / `hitch=after` stage one on purpose. ")
+		TEXT("inside-grace arm past the screen's own grace ends it INCONCLUSIVE, after the screenshot and the headline and ")
+		TEXT("score reads, with one press that ends the screen; `hitch=before` / `hitch=after` stage one on purpose. ")
 		TEXT("Run on the Arena after lock-in."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
 }
