@@ -43,6 +43,7 @@
 #if !UE_BUILD_SHIPPING
 #include "Core/TracePlayerController.h"  // Trace.Menu.Verify's TEAM checks ask the rules and the team screen
 #include "Core/TracePlayerState.h"
+#include "Modes/TracePracticeRange.h"    // Trace.Menu.Verify: the range's pause root has no TEAM row
 #endif
 
 // =================================================================================================
@@ -4872,8 +4873,13 @@ void FTraceOptionsMenu::Draw(AHUD* HUD, APlayerController* PC)
 	//   * OVER THE TITLE it is opaque: a title sub-page is a kit screen of its own, on the kit's black
 	//     background. At the modal's 18% the title's rows, words and wordmark showed through between
 	//     these rows (PLAY under LOOK SPEED, QUIT under a note) once the box stopped hiding them.
+	//   * OVER A FULL-SCREEN KIT PAGE IN THE MATCH (the loadout page, team select) it is opaque too, as
+	//     the JOIN prompt is over the title: the page's cards read through the modal scrim around the
+	//     MENU heading and between its rows. Blended by the page's own black (SetUnderPageAlpha), so a
+	//     page that closes under the menu hands over to the arena's scrim without a jump.
 	const bool bOverMatch = static_cast<bool>(OnResume);
-	TraceMenuKit::DrawScrim(HUD, ViewW, ViewH, bOverMatch ? TraceMenuKit::ScrimAlpha : 1.f);
+	DrawnScrimAlpha = bOverMatch ? FMath::Lerp(TraceMenuKit::ScrimAlpha, 1.f, UnderPageAlpha) : 1.f;
+	TraceMenuKit::DrawScrim(HUD, ViewW, ViewH, DrawnScrimAlpha);
 
 	// ---- Page geometry --------------------------------------------------------------------------
 	//
@@ -6470,6 +6476,22 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 			Next(30, 0);
 			return;
 		}
+
+		// THE PRACTICE RANGE HAS NO TEAM SCREEN, so its pause root must have no TEAM row: it used to
+		// carry one that was greyed for the whole session.
+		if (TracePracticeRange::IsActive(VerifyWorld))
+		{
+			if (IsOpen())
+			{
+				Close();
+			}
+			bVerifySavedPadEnabled = Settings.bPadEnabled;
+			Settings.bPadEnabled = true;
+			TraceOptionsRebindProof::InjectViewportKeyAtFrameStart(EKeys::Gamepad_Special_Right, IE_Pressed);
+			Next(130, 3);
+			return;
+		}
+
 		const bool bLoadoutUp = TeamPC->GetTracePlayerState() != nullptr
 			&& TeamPC->GetTracePlayerState()->IsCharacterSelectOpen();
 		if (!TeamPC->CanRequestTeamSelect() && !(bLoadoutUp && !TeamPC->IsTeamSelectOpen()))
@@ -6494,6 +6516,23 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 		return;
 	}
 
+	case 130: TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_Special_Right, IE_Released); Next(131, 3); return;
+
+	case 131:
+	{
+		VerifyIndex = FindActionRow(EAction::OpenTeamSelect);
+		VerifyCheck(TEXT("T. in the practice range the pause root has no TEAM row (no team screen)"),
+			IsOpen() && Page == EPage::Root && VerifyIndex == INDEX_NONE,
+			FString::Printf(TEXT("open %d, page %d, TEAM row %d, rows %d"), IsOpen() ? 1 : 0, int32(Page), VerifyIndex, Rows.Num()));
+		if (IsOpen())
+		{
+			Close();
+		}
+		Settings.bPadEnabled = bVerifySavedPadEnabled;
+		Next(30, 1);
+		return;
+	}
+
 	case 120: TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_Special_Right, IE_Released); Next(121, 3); return;
 
 	case 121:
@@ -6506,6 +6545,8 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 				&& Selected != VerifyIndex,
 			FString::Printf(TEXT("open %d, TEAM row %d %s, selected %s"), IsOpen() ? 1 : 0, VerifyIndex,
 				bGrey ? TEXT("greyed") : TEXT("LIVE"), *RowName(Selected)));
+		VerifyCheck(TEXT("T. over the loadout page the menu is on opaque black: no card reads through"),
+			DrawnScrimAlpha >= 0.99f, FString::Printf(TEXT("scrim %.2f (the arena's is %.2f)"), DrawnScrimAlpha, TraceMenuKit::ScrimAlpha));
 		if (IsOpen())
 		{
 			Close();
@@ -6533,6 +6574,9 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 			VerifyCheck(TEXT("T. ...live, because the server would open the team screen now"),
 				Rows[VerifyIndex].bEnabled && TeamPC->CanRequestTeamSelect(), TEXT(""));
 		}
+		VerifyCheck(TEXT("T. over the arena the menu keeps the see-through match scrim"),
+			FMath::IsNearlyEqual(DrawnScrimAlpha, TraceMenuKit::ScrimAlpha, 0.01f),
+			FString::Printf(TEXT("scrim %.2f, want %.2f"), DrawnScrimAlpha, TraceMenuKit::ScrimAlpha));
 		TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_DPad_Down, IE_Pressed);
 		Next(103, 2);
 		return;
@@ -6584,6 +6628,8 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 				&& Selected != VerifyIndex,
 			FString::Printf(TEXT("open %d, TEAM row %d %s, selected %s"), IsOpen() ? 1 : 0, VerifyIndex,
 				bGrey ? TEXT("greyed") : TEXT("LIVE"), *RowName(Selected)));
+		VerifyCheck(TEXT("T. over the team screen the menu is on opaque black too"),
+			DrawnScrimAlpha >= 0.99f, FString::Printf(TEXT("scrim %.2f"), DrawnScrimAlpha));
 		TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_DPad_Down, IE_Pressed);
 		Next(109, 2);
 		return;

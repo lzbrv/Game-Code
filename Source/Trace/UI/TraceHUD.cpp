@@ -1582,8 +1582,12 @@ void ATraceHUD::DrawHUD()
 #endif
 
 	// Last, over everything including the full-time takeover. Draws nothing once closed AND faded out.
+	//
+	// Told how much of a full-screen page (team select, the loadout page) is under it: over one of those
+	// its scrim is the kit's opaque black, so the page's cards do not read through around its rows.
 	{
 		TRACE_PERF_SCOPE(HudPages);
+		PauseMenu.SetUnderPageAlpha(PageBackdropFade.Alpha());
 		PauseMenu.Tick(this, TracePC.Get(), ViewW, ViewH, UIScale, Now);
 	}
 
@@ -1725,22 +1729,32 @@ void ATraceHUD::OpenPauseMenu()
 	// THE TEAM ROW: a pad's way to the team screen mid-match (it has no H). The H key's own request
 	// (FTraceTeamSelect::PollOpenHotkey), greyed by the H key's own rules — the function the server
 	// refuses that request with — so the row and the key cannot disagree.
-	PauseMenu.OnTeamSelect = [WeakThis]()
+	//
+	// NOT IN THE PRACTICE RANGE. The range has no team screen at all (CanRequestTeamSelect is false there
+	// for the whole session), so the row would be a permanently greyed line in every range pause menu.
+	// Greyed-not-removed is for rows that are live some of the time; this one never is. Unset, the
+	// overlay leaves the row out (RebuildRows).
+	PauseMenu.OnTeamSelect = nullptr;
+	PauseMenu.CanTeamSelect = nullptr;
+	if (!TracePracticeRange::IsActive(GetWorld()))
 	{
-		if (const ATraceHUD* Strong = WeakThis.Get())
+		PauseMenu.OnTeamSelect = [WeakThis]()
 		{
-			if (ATracePlayerController* PC = Strong->TracePC.Get())
+			if (const ATraceHUD* Strong = WeakThis.Get())
 			{
-				PC->ServerRequestOpenTeamSelect();
+				if (ATracePlayerController* PC = Strong->TracePC.Get())
+				{
+					PC->ServerRequestOpenTeamSelect();
+				}
 			}
-		}
-	};
-	PauseMenu.CanTeamSelect = [WeakThis]() -> bool
-	{
-		const ATraceHUD* Strong = WeakThis.Get();
-		const ATracePlayerController* PC = (Strong != nullptr) ? Strong->TracePC.Get() : nullptr;
-		return PC != nullptr && PC->CanRequestTeamSelect();
-	};
+		};
+		PauseMenu.CanTeamSelect = [WeakThis]() -> bool
+		{
+			const ATraceHUD* Strong = WeakThis.Get();
+			const ATracePlayerController* PC = (Strong != nullptr) ? Strong->TracePC.Get() : nullptr;
+			return PC != nullptr && PC->CanRequestTeamSelect();
+		};
+	}
 
 	// *** A LISTEN HOST THAT LEAVES TAKES ITS GUESTS HOME FIRST. *** Both rows used to OpenLevel or quit
 	// on the spot, which tears the net driver down under every connected client: they sat on a frozen

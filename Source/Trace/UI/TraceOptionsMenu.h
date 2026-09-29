@@ -327,6 +327,18 @@ public:
 	bool IsCapturingKey() const { return bCapturingKey; }
 
 	/**
+	 * How much of a FULL-SCREEN KIT PAGE is under the overlay this frame, 0..1 — the team screen or the
+	 * loadout page, at the pages' shared black's alpha. Set by the host every frame before Tick. Over a
+	 * page the overlay's scrim is the kit's opaque black (it was the see-through match scrim, and the
+	 * page's cards read through around MENU and between its rows); over the 3D arena it stays the
+	 * modal scrim. Ignored on the title, where the scrim is opaque anyway.
+	 */
+	void SetUnderPageAlpha(float Alpha) { UnderPageAlpha = FMath::Clamp(Alpha, 0.f, 1.f); }
+
+	/** The scrim alpha the last Draw put under the page (before the overlay's own fade). A harness reads it. */
+	float GetDrawnScrimAlpha() const { return DrawnScrimAlpha; }
+
+	/**
 	 * Polls input and draws. Call exactly once per frame from the owning AHUD::DrawHUD while open.
 	 *
 	 * @param HUD       the drawing surface; every pixel goes through AHUD::DrawRect/DrawText/DrawLine
@@ -1150,6 +1162,12 @@ private:
 
 	/** The world is really paused this frame (standalone). Decides PAUSED against MENU on the root. */
 	bool bWorldPaused = false;
+
+	/** See SetUnderPageAlpha. */
+	float UnderPageAlpha = 0.f;
+
+	/** See GetDrawnScrimAlpha. */
+	float DrawnScrimAlpha = 0.f;
 
 	// ---- P10: the open/close fade ------------------------------------------------------------------
 
