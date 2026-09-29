@@ -1036,7 +1036,10 @@ private:
 	/** The label plate's share of a value row on this page. */
 	float LabelColumnFraction() const;
 
-	/** The kit's plate for @p State, or the value box, honouring Trace.Menu.Art 0 (the flat fallback arm). */
+	/**
+	 * The kit's plate for @p State, or the value box (the DISABLED plate when !bEnabled, matching the
+	 * greyed row's label), honouring Trace.Menu.Art 0 (the flat fallback arm).
+	 */
 	void DrawPlateFor(AHUD* HUD, ETraceKitState State, float X, float Y, float W, float H) const;
 	void DrawValueBoxFor(AHUD* HUD, float X, float Y, float W, float H, bool bEnabled) const;
 

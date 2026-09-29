@@ -4721,13 +4721,20 @@ void FTraceOptionsMenu::DrawPlateFor(AHUD* HUD, ETraceKitState State, float X, f
 
 void FTraceOptionsMenu::DrawValueBoxFor(AHUD* HUD, float X, float Y, float W, float H, bool bEnabled) const
 {
-	const FLinearColor Tint = bEnabled ? FLinearColor::White : FLinearColor(0.45f, 0.45f, 0.45f, 1.f);
-	if (TraceOptionsMenuArt::GEnabled == 0)
+	// ONE DISABLED LOOK PER ROW. A greyed row's label sits on the kit's DISABLED plate, so its value
+	// does too. It used to be the value box dimmed to 45%, a navy box beside a near-black label: one
+	// row in two states.
+	if (!bEnabled)
 	{
-		HUD->DrawRect(TraceMenuKit::Faded(TraceMenuArtStyle::PlateFill * Tint), X, Y, W, H);
+		DrawPlateFor(HUD, ETraceKitState::Disabled, X, Y, W, H);
 		return;
 	}
-	TraceMenuKit::DrawValueBoxPlate(HUD, X, Y, W, H, Tint);
+	if (TraceOptionsMenuArt::GEnabled == 0)
+	{
+		HUD->DrawRect(TraceMenuKit::Faded(TraceMenuArtStyle::PlateFill), X, Y, W, H);
+		return;
+	}
+	TraceMenuKit::DrawValueBoxPlate(HUD, X, Y, W, H);
 }
 
 void FTraceOptionsMenu::Draw(AHUD* HUD, APlayerController* PC)
@@ -5072,8 +5079,9 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 	// SPEC v28 §3c — "up to TWO keybinds per action, both editable": two chips, the primary on the
 	// left. A chip is the button plate at the sheet's KEY size: HOVER when it is the chip ENTER and
 	// BKSP will act on (the active chip of the selected row) or the one waiting for a key; DEFAULT
-	// holding a key; the dark DISABLED plate when it is empty (UNBOUND, or the "+" where a second
-	// bind would go) — empty is what that plate says.
+	// otherwise. An EMPTY chip (UNBOUND, or the "+" where a second bind would go) is a DEFAULT plate
+	// with its word in the quiet grey. It used to wear the dark DISABLED plate, but that plate means
+	// "cannot act" on this kit, and an empty chip is a live target: click it or ENTER it to bind.
 	if (Row.Kind == ERowKind::Binding)
 	{
 		const UTraceUserSettings& UserSettings = UTraceUserSettings::Get();
@@ -5133,9 +5141,9 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 			{
 				ChipText = Key.IsValid() ? UTraceUserSettings::DescribeKey(Key)
 					: ((Chip == 0) ? UTraceUserSettings::DescribeKey(Key) : FString(TRACE_TEXT("OPTIONS.KEYBIND.ADD_SECOND", "+")));
-				ChipState = bActive ? ETraceKitState::Hover
-					: (Key.IsValid() ? ETraceKitState::Default : ETraceKitState::Disabled);
-				ChipColor = TraceMenuKit::VisualsFor(ChipState).Label;
+				ChipState = bActive ? ETraceKitState::Hover : ETraceKitState::Default;
+				ChipColor = (bActive || Key.IsValid()) ? TraceMenuKit::VisualsFor(ChipState).Label
+					: TraceOptionsMenuPalette::Note;
 			}
 
 			DrawPlateFor(HUD, ChipState, ChipX, Y, ChipW, H);
@@ -5185,8 +5193,10 @@ void FTraceOptionsMenu::DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W,
 		{
 			ChipText = Key.IsValid() ? UTraceUserSettings::DescribePadKey(Key)
 				: FString(TRACE_TEXT("OPTIONS.PADBIND.UNBOUND", "UNBOUND"));
-			ChipState = bSelected ? ETraceKitState::Hover : (Key.IsValid() ? ETraceKitState::Default : ETraceKitState::Disabled);
-			ChipColor = TraceMenuKit::VisualsFor(ChipState).Label;
+			// An empty chip is a live target like the keyboard page's: DEFAULT plate, quiet word.
+			ChipState = bSelected ? ETraceKitState::Hover : ETraceKitState::Default;
+			ChipColor = (bSelected || Key.IsValid()) ? TraceMenuKit::VisualsFor(ChipState).Label
+				: TraceOptionsMenuPalette::Note;
 		}
 
 		DrawPlateFor(HUD, ChipState, ChipLeftX, Y, ChipW, H);
