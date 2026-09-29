@@ -1609,6 +1609,26 @@ void ATraceHUD::OpenPauseMenu()
 	// same class.
 	PauseMenu.OnResume = []() {};
 
+	// THE TEAM ROW: a pad's way to the team screen mid-match (it has no H). The H key's own request
+	// (FTraceTeamSelect::PollOpenHotkey), greyed by the H key's own rules — the function the server
+	// refuses that request with — so the row and the key cannot disagree.
+	PauseMenu.OnTeamSelect = [WeakThis]()
+	{
+		if (const ATraceHUD* Strong = WeakThis.Get())
+		{
+			if (ATracePlayerController* PC = Strong->TracePC.Get())
+			{
+				PC->ServerRequestOpenTeamSelect();
+			}
+		}
+	};
+	PauseMenu.CanTeamSelect = [WeakThis]() -> bool
+	{
+		const ATraceHUD* Strong = WeakThis.Get();
+		const ATracePlayerController* PC = (Strong != nullptr) ? Strong->TracePC.Get() : nullptr;
+		return PC != nullptr && PC->CanRequestTeamSelect();
+	};
+
 	// *** A LISTEN HOST THAT LEAVES TAKES ITS GUESTS HOME FIRST. *** Both rows used to OpenLevel or quit
 	// on the spot, which tears the net driver down under every connected client: they sat on a frozen
 	// match until 'CONNECTION LOST.' arrived. The game mode's own end-of-match path already sent remotes

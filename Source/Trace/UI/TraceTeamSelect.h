@@ -9,7 +9,7 @@
 // character screen, the title screen and the options overlay cannot disagree about what A means;
 // the REPEAT CLOCK is the menus' shared one (TracePadMenu::RepeatDelay / RepeatInterval), shared
 // with the arrow keys, so a thumb and a finger scroll at the same speed here and on the next page.
-// The one thing a pad cannot do is OPEN this screen mid-match — see PollOpenHotkey.
+// A pad opens this screen mid-match through the pause menu's TEAM row, not a button — see PollOpenHotkey.
 //
 // SHAPED EXACTLY LIKE FTraceCharacterSelect, and read that file's header first — every argument it
 // makes applies here unchanged. It is plain C++ rather than a UObject (it holds nothing that

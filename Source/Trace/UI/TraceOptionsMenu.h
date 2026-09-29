@@ -46,6 +46,7 @@ class UCameraComponent;
 class UTraceGameUserSettings;
 
 enum class ETraceKitState : uint8;   // UI/Widgets/Menu/TraceMenuKit.h — the kit's four plate states
+struct FTraceKitLegendItem;          // UI/Widgets/Menu/TraceMenuKit.h — one [KEY] VERB pair of the footer
 
 // =================================================================================================
 // SPEC v25 §1 — THE FOREGROUND-CANVAS ELEVATION IS GONE. *** THIS IS THE SETTINGS CRASH. ***
@@ -117,7 +118,7 @@ public:
 	enum class EPage : uint8
 	{
 		Closed = 0,
-		/** RESUME / SETTINGS / VIDEO / RETURN TO TITLE / QUIT. In-match only; the title screen has none. */
+		/** RESUME / TEAM / SETTINGS / VIDEO / RETURN TO TITLE / QUIT. In-match only; the title screen has none. */
 		Root,
 		Settings,
 		/**
@@ -142,8 +143,8 @@ public:
 		 * REACHED FROM THE SETTINGS PAGE AND NOT FROM THE PAUSE ROOT, which is the one place it differs
 		 * from VIDEO. Video earned its root row by an argument spec v11 §0 measured: the player it
 		 * exists for has a collapsed frame rate and must not be made to walk past mouse sensitivity
-		 * first. A crosshair has no such emergency, and a five-row pause root is worth more than a
-		 * sixth destination on it. It IS on the settings page, which is the only route the title screen
+		 * first. A crosshair has no such emergency, and a short pause root is worth more than another
+		 * destination on it. It IS on the settings page, which is the only route the title screen
 		 * has to anything.
 		 */
 		Crosshair,
@@ -169,7 +170,7 @@ public:
 		 * ITS OWN PAGE, and reached from SETTINGS rather than from the pause root — the same shape as
 		 * CROSSHAIR and for the same two reasons. The settings page is already twenty-odd rows and
 		 * three more sliders would push the pitch further into its 18px floor at 720p; and the pause
-		 * root stays five rows, because VIDEO earned its place there by an emergency (spec v11 §0: a
+		 * root stays short, because VIDEO earned its place there by an emergency (spec v11 §0: a
 		 * collapsed frame rate) and loudness is not one. A player who wants the music down can afford
 		 * the two-click walk; a player at 8 fps cannot.
 		 *
@@ -190,7 +191,7 @@ public:
 		 *
 		 * REACHED FROM SETTINGS AND NOT FROM THE PAUSE ROOT, like CROSSHAIR and AUDIO. VIDEO earned
 		 * its root row by an emergency (spec v11 §0: a collapsed frame rate). A pad that needs
-		 * rebinding is not one, and the pause root stays five rows.
+		 * rebinding is not one, and the pause root stays short.
 		 *
 		 * IT IS ALSO THE ONE PAGE A PLAYER MAY ARRIVE AT WITH NO KEYBOARD. That is why the pad drives
 		 * this whole overlay — see PollNavigation, which reads the D-pad, the left stick and the face
@@ -218,6 +219,18 @@ public:
 
 	/** Close the overlay and hand control back to the game. Presence of this adds the RESUME row. */
 	TFunction<void()> OnResume;
+
+	/**
+	 * Ask for the team screen — the H key's server request. Presence of this adds the TEAM row, the
+	 * pad's way to the team screen mid-match (a pad has no H). The overlay closes before it is called.
+	 */
+	TFunction<void()> OnTeamSelect;
+
+	/**
+	 * Whether the server's rules would open the team screen right now (the H key's rules, see
+	 * ATracePlayerController::CanRequestTeamSelect). The TEAM row is greyed while this says no.
+	 */
+	TFunction<bool()> CanTeamSelect;
 
 	/** Leave the match. Presence of this adds the RETURN TO TITLE row. */
 	TFunction<void()> OnReturnToTitle;
@@ -363,8 +376,10 @@ public:
 	 * stealing the selection on open, BACK keeping the player's place, the two-step RESET and slot
 	 * CLEAR, the choice arrows as click targets, and the menu clock running while the world is
 	 * paused). Public only so the console command can reach it. See TickVerify.
+	 *
+	 * @param bTeamRowOnly  run only the in-match TEAM row checks (section T).
 	 */
-	void DebugBeginVerify();
+	void DebugBeginVerify(bool bTeamRowOnly = false);
 #endif
 
 private:
@@ -449,6 +464,10 @@ private:
 	float VerifySavedVolume = 1.f;
 	bool bVerifySavedPadEnabled = true;
 	FString VerifySavedCallSign;
+	/** The bind a capture check must leave alone: read before the check, compared after it. */
+	FKey VerifyKeyBefore;
+	/** `Trace.Menu.Verify team`: only section T ran, and the verdict says so. */
+	bool bVerifyTeamRowOnly = false;
 
 	/**
 	 * While set, PollMouse reads THIS position and button instead of the OS pointer's. The harness's
@@ -514,6 +533,8 @@ private:
 	{
 		None = 0,
 		Resume,
+		/** The pause root's TEAM row: close, then OnTeamSelect (the H key's request). */
+		OpenTeamSelect,
 		OpenSettings,
 		OpenVideo,
 		/** SPEC v29 §3 — the CROSSHAIR row on the settings page. */
@@ -737,10 +758,11 @@ private:
 		int32 SlotIndex = INDEX_NONE;
 
 		/**
-		 * False when the row is meaningless right now — currently only RESOLUTION in windowed
-		 * fullscreen, which always takes the desktop's size. Greyed rather than removed: a row that
-		 * vanishes and reappears makes the list jump under the selection, and the player has no way
-		 * to learn that the mode they picked is what took their resolution choice away.
+		 * False when the row is meaningless right now: RESOLUTION in windowed fullscreen, which always
+		 * takes the desktop's size, and the pause root's TEAM while the server would refuse the team
+		 * screen (see RefreshRowStates). Greyed rather than removed: a row that vanishes and reappears
+		 * makes the list jump under the selection, and the player has no way to learn that the mode
+		 * they picked is what took their resolution choice away.
 		 */
 		bool bEnabled = true;
 
@@ -1028,6 +1050,10 @@ private:
 
 	void DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W, float H, bool bSelected);
 	void DrawCursor(AHUD* HUD, APlayerController* PC);
+
+	/** The footer's [KEY] VERB pairs this frame: the keyboard's line and the pad's. One builder for the draw and the checks. */
+	void BuildLegendItems(APlayerController* PC, TArray<FTraceKitLegendItem>& OutKeys,
+		TArray<FTraceKitLegendItem>& OutPad) const;
 
 	/** The page's footer: [KEY] VERB chips for the keyboard, and a second line for a pad. Returns its height. */
 	float LegendHeight(APlayerController* PC) const;

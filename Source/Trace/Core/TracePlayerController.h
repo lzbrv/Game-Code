@@ -393,9 +393,20 @@ public:
 	 */
 	void ServerSetTeamSelectOpen(bool bOpen, float DurationSeconds);
 
-	/** H, or Trace.Teams.Select. Asks the server to put the team-select screen up. */
+	/** H, the pause menu's TEAM row, or Trace.Teams.Select. Asks the server to put the team-select screen up. */
 	UFUNCTION(Server, Reliable, WithValidation)
 	void ServerRequestOpenTeamSelect();
+
+	/**
+	 * Would ServerRequestOpenTeamSelect open the team screen right now? False while it is already up,
+	 * while the loadout window is open, in the practice range and after full time.
+	 *
+	 * THE H KEY'S RULES, IN ONE PLACE: the server refuses the request with this, and the pause menu's
+	 * TEAM row (the pad's way to the team screen, since a pad has no H) greys itself with it, so the
+	 * row can never offer what the server would refuse. It reads only replicated state, which is what
+	 * lets the owning client ask it. The request's anti-spam cooldown is not a rule and is not here.
+	 */
+	bool CanRequestTeamSelect() const;
 
 	/** H again, or the screen's CLOSE row. Asks the server to take it down with nothing changed. */
 	UFUNCTION(Server, Reliable, WithValidation)

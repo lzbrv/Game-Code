@@ -23,6 +23,7 @@
 #include "HAL/IConsoleManager.h"         // Trace.Menu.Settings / Trace.Menu.Video, the capture hooks
 #include "HAL/PlatformTime.h"
 #include "Misc/CommandLine.h"            // -TraceMenuActivate, the paused-world capture hook
+#include "Misc/CoreDelegates.h"          // OnBeginFrame — Trace.Menu.Verify's MENU press lands where a pad's does
 #include "Misc/Parse.h"
 #include "Scalability.h"
 #include "Settings/TraceGameUserSettings.h"
@@ -38,6 +39,11 @@
 #include "UI/Widgets/Menu/TraceMenuKit.h"       // the shared, guarded kit renderer: sprites, plates, trough
 #include "UI/TraceHardwareCursor.h"        // UI QA finding 6 - one pointer, drawn in one place
 #include "Gameplay/TraceMelee.h"       // kept for the transitive gameplay types; the v28 §10 row-label override it fed is deleted (v29 §5)
+
+#if !UE_BUILD_SHIPPING
+#include "Core/TracePlayerController.h"  // Trace.Menu.Verify's TEAM checks ask the rules and the team screen
+#include "Core/TracePlayerState.h"
+#endif
 
 // =================================================================================================
 // WHERE THE VIDEO SETTINGS ACTUALLY LIVE — AND WHY NONE OF THEM LIVE HERE
@@ -122,7 +128,7 @@
 //                                                 are controls on a submenu page, in the same column
 //                                                 as the rows they sit under.
 //   Action rows on the PAUSE ROOT page            SOFACHROME. *** THE ONE JUDGEMENT CALL. *** RESUME
-//                                                 / SETTINGS / VIDEO / RETURN TO TITLE / QUIT are not
+//                                                 / TEAM / SETTINGS / VIDEO / RETURN TO TITLE / QUIT are not
 //                                                 settings; they are the in-match MAIN MENU, the same
 //                                                 list of destinations the title screen draws in
 //                                                 Sofachrome through UTraceMenuRow. Setting them in
@@ -274,7 +280,7 @@ namespace TraceOptionsMenuText
 // AND IT HAS TO BE BOTH HOSTS. This class draws the title screen's SETTINGS page and the in-match
 // pause menu (Escape during a match) from one Draw(); the user asked for the art in-game, not only
 // on the way in. Everything below is therefore in the shared path, and the pause root — RESUME /
-// SETTINGS / VIDEO / RETURN TO TITLE / QUIT — is five Action rows that pick up the artist's button
+// TEAM / SETTINGS / VIDEO / RETURN TO TITLE / QUIT — is six Action rows that pick up the artist's button
 // plates without a single line of host-specific code.
 //
 // THREE THINGS MAKE THIS SAFE TO PUT IN FRONT OF A PAUSED MATCH:
@@ -733,16 +739,18 @@ namespace TraceOptionsMenuFile
 
 	FAutoConsoleCommand CmdMenuVerify(
 		TEXT("Trace.Menu.Verify"),
-		TEXT("Checks the settings / pause overlay's own behaviour, driving it one drawn frame at a time: ")
-		TEXT("a pointer resting over a row does not take the selection when a page opens; BACK lands on ")
-		TEXT("the door the player came through; RESET and a saved-slot CLEAR need a second press; a click ")
-		TEXT("on a choice row's '<' steps it DOWN; and with the world PAUSED the menu clock still runs, so a ")
-		TEXT("held DOWN repeats. Uses its own pointer, restores everything it changes. Title screen or match."),
-		FConsoleCommandDelegate::CreateLambda([]()
+		TEXT("Trace.Menu.Verify [team]. Checks the settings / pause overlay's own behaviour, driving it one ")
+		TEXT("drawn frame at a time: a pointer resting over a row does not take the selection when a page ")
+		TEXT("opens; BACK lands on the door the player came through; RESET and a saved-slot CLEAR need a ")
+		TEXT("second press; a click on a choice row's '<' steps it DOWN; with the world PAUSED the menu clock ")
+		TEXT("still runs; one MENU press cancels a rebind and does nothing else; and, in a match, a pad ")
+		TEXT("reaches the team screen through the pause menu's TEAM row. 'team' runs only that last part ")
+		TEXT("(in a match, after LOCK IN). Uses its own pointer, restores everything it changes."),
+		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
 		{
 			if (GActiveOptionsMenu != nullptr)
 			{
-				GActiveOptionsMenu->DebugBeginVerify();
+				GActiveOptionsMenu->DebugBeginVerify(Args.Num() > 0 && Args[0].Equals(TEXT("team"), ESearchCase::IgnoreCase));
 			}
 			else
 			{
@@ -1031,6 +1039,53 @@ namespace TraceOptionsRebindProof
 		const FInputKeyEventArgs Args(GEngine->GameViewport->Viewport, FInputDeviceId::CreateFromInternalId(0), Key,
 			Event, (Event == IE_Pressed) ? 1.f : 0.f, /*bIsTouchEvent*/ false, FPlatformTime::Cycles64());
 		GEngine->GameViewport->InputKey(Args);
+	}
+
+	/**
+	 * InjectViewportKey, but at the START of the next frame (FCoreDelegates::OnBeginFrame) — where a
+	 * physical pad's press arrives, before the world tick and this overlay's draw.
+	 *
+	 * WHY THE TIMING IS THE TEST. A press injected from inside a draw is read on the NEXT frame, the
+	 * same frame as the synthetic Escape UTraceGamepadInputSubsystem::TickMenuButton makes of a MENU
+	 * press. A real MENU press is read a frame BEFORE its Escape, and the "one MENU cancels the rebind
+	 * and also leaves the page" bug lives entirely in that one-frame gap. Injected from a draw, the bug
+	 * does not reproduce.
+	 */
+	struct FFrameStartKey
+	{
+		FKey Key;
+		EInputEvent Event = IE_Pressed;
+	};
+
+	TArray<FFrameStartKey>& FrameStartKeys()
+	{
+		static TArray<FFrameStartKey> QueuedKeys;
+		return QueuedKeys;
+	}
+
+	void InjectViewportKeyAtFrameStart(const FKey& Key, EInputEvent Event)
+	{
+		// One hook for the process, registered on first use and never removed: a hook that removed
+		// itself from inside its own broadcast would free the lambda it is running in.
+		static bool bHooked = false;
+		if (!bHooked)
+		{
+			bHooked = true;
+			FCoreDelegates::OnBeginFrame.AddLambda([]()
+			{
+				if (FrameStartKeys().Num() == 0)
+				{
+					return;
+				}
+				const TArray<FFrameStartKey> Due = MoveTemp(FrameStartKeys());
+				FrameStartKeys().Reset();
+				for (const FFrameStartKey& DueKey : Due)
+				{
+					InjectViewportKey(DueKey.Key, DueKey.Event);
+				}
+			});
+		}
+		FrameStartKeys().Add({ Key, Event });
 	}
 }
 
@@ -1860,6 +1915,13 @@ void FTraceOptionsMenu::RebuildRows(EAction SelectAction, int32 SelectSlot)
 	{
 		// Only offered when the host supplied somewhere to go. The title screen has no RESUME.
 		if (OnResume)         { AddAction(*TRACE_TEXT("OPTIONS.PAUSE.RESUME", "RESUME"), EAction::Resume); }
+
+		// THE PAD'S WAY TO THE TEAM SCREEN MID-MATCH. The keyboard has H; a pad has no button to spare
+		// for it (every one is a gameplay verb, and MENU is this menu). So MENU, down, A. It makes the
+		// H key's request and is greyed by the H key's rules (RefreshRowStates), right under RESUME
+		// because it is about the match, like RESUME, not about the machine.
+		if (OnTeamSelect)     { AddAction(*TRACE_TEXT("OPTIONS.PAUSE.TEAM", "TEAM"), EAction::OpenTeamSelect); }
+
 		AddAction(*TRACE_TEXT("OPTIONS.PAUSE.SETTINGS", "SETTINGS"), EAction::OpenSettings);
 
 		// Its own row on the pause root rather than only inside SETTINGS. Spec v11 §0: the player
@@ -2181,18 +2243,27 @@ FTraceOptionsMenu::EAction FTraceOptionsMenu::DoorFor(EPage Child)
 
 void FTraceOptionsMenu::RefreshRowStates()
 {
-	// Only one rule so far, and it is worth stating rather than generalising: in windowed fullscreen
-	// the window always takes the desktop's size, so a stored resolution is accepted, saved, and then
-	// ignored by the platform. A row that takes input and changes nothing is the worst kind of
-	// control, so it is greyed and its value reads DESKTOP. IsResolutionSelectable is the settings
-	// class's own answer to that question, so the two files cannot disagree about it.
+	// Two rules, each the owning class's own answer, so this file cannot disagree with it:
+	//
+	//   * RESOLUTION: in windowed fullscreen the window always takes the desktop's size, so a stored
+	//     resolution is accepted, saved, and then ignored by the platform. A row that takes input and
+	//     changes nothing is the worst kind of control, so it is greyed and its value reads DESKTOP.
+	//     IsResolutionSelectable is the settings class's answer.
+	//   * TEAM (pause root): greyed while the server would refuse the team screen — it is already up,
+	//     the loadout window is open, or it is full time. CanTeamSelect is the host's pass-through to
+	//     the very function the server refuses the request with.
 	const bool bResolutionMeaningful = (Video() == nullptr) || Video()->IsResolutionSelectable();
+	const bool bTeamSelectAllowed = !CanTeamSelect || CanTeamSelect();
 
 	for (FRow& Row : Rows)
 	{
 		if (Row.Setting == ESetting::Resolution)
 		{
 			Row.bEnabled = bResolutionMeaningful;
+		}
+		else if (Row.Kind == ERowKind::Action && Row.Action == EAction::OpenTeamSelect)
+		{
+			Row.bEnabled = bTeamSelectAllowed;
 		}
 	}
 
@@ -2529,6 +2600,7 @@ int32 FTraceOptionsMenu::ActiveBindingSlot() const
 void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 {
 	// Escape is filtered out of BindableKeys precisely so it can mean "cancel" here and nothing else.
+	// A pad's MENU/START arrives here as Escape too (TickMenuButton), on either page — see below.
 	if (PC->WasInputKeyJustPressed(EKeys::Escape))
 	{
 		bCapturingKey = false;
@@ -2542,6 +2614,19 @@ void FTraceOptionsMenu::PollKeyCapture(APlayerController* PC)
 	// opened this page with a controller may have no keyboard within reach. It is the ONE pad button
 	// the layout leaves unclaimed (Trace.Pad.Verify asserts that), which is exactly what makes it
 	// available to mean "cancel" here and "pause" everywhere else.
+	//
+	// *** ONE PRESS, ONE ACTION: WITH CONTROLLER INPUT ON, THE CANCEL IS THE ESCAPE ABOVE. ***
+	// UTraceGamepadInputSubsystem::TickMenuButton turns the press into a synthetic Escape from the core
+	// ticker, which runs AFTER this frame's draw, so the Escape is read on the NEXT frame. Cancelling
+	// here on the button as well spent the press on the capture and left that Escape to the page:
+	// one MENU cancelled the rebind AND backed out of CONTROLLER. So with the pad on, the button itself
+	// does nothing here — it is neither the cancel nor a bind (MENU is a pad button, so the list below
+	// would otherwise take it) — and its Escape cancels next frame. Only when no Escape will follow,
+	// CONTROLLER INPUT off (TickMenuButton's own gate, TracePadMenu::IsEnabled), is the button the cancel.
+	if (bCapturingPadKey && TracePadMenu::IsEnabled() && PC->WasInputKeyJustPressed(EKeys::Gamepad_Special_Right))
+	{
+		return;
+	}
 	if (bCapturingPadKey && PC->WasInputKeyJustPressed(EKeys::Gamepad_Special_Right))
 	{
 		bCapturingKey = false;
@@ -4051,6 +4136,21 @@ void FTraceOptionsMenu::ActivateSelected()
 		if (OnResume) { OnResume(); }
 		break;
 
+	case EAction::OpenTeamSelect:
+		// The rules are asked again at the press, not only by last frame's grey: a row must not act on
+		// what the server would refuse.
+		if (!Row.bEnabled || (CanTeamSelect && !CanTeamSelect()))
+		{
+			break;
+		}
+		// CLOSED FIRST, exactly as RESUME does, so the request is made from live play — the state the
+		// H key is pressed in — and the team screen comes up the way it does for H: when the server
+		// opens it, taking the input and the pointer as it always does.
+		Close();
+		if (OnTeamSelect) { OnTeamSelect(); }
+		UE_LOG(LogTraceGame, Display, TEXT("[Options] TEAM: asked the server for the team screen."));
+		break;
+
 	case EAction::OpenSettings:
 		Page = EPage::Settings;
 		bSettingsIsRootPage = false;
@@ -4587,9 +4687,15 @@ namespace TraceOptionsMenuFile
 		if (Ask.bKeyCapture || Ask.bPadCapture)
 		{
 			OutKeys.Add({ TRACE_TEXT("OPTIONS.LEGEND.KEY_BACK", "ESC"), Cancel });
-			if (Ask.bPadCapture)
+
+			// MENU/START is the pad's cancel on BOTH capture pages: the one pad button the layout leaves
+			// unclaimed, and on the KEYBOARD page the pad's only way out (it arrives as Escape). Pad B is
+			// not a cancel on either: on CONTROLLER it is a button being bound, and on KEYBOARD it does
+			// nothing, so one pad cancel is the one a player can learn. On KEYBOARD the line follows the
+			// usual pad-line rule; on CONTROLLER it is always shown, since MENU cancels there even with
+			// CONTROLLER INPUT off.
+			if (Ask.bPadCapture || Ask.bPadLine)
 			{
-				// MENU/START is the one pad button the layout leaves unclaimed, so it is the pad's cancel.
 				OutPad.Add({ TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_CANCEL", "MENU"), Cancel });
 			}
 			return;
@@ -4657,16 +4763,22 @@ namespace TraceOptionsMenuFile
 	}
 }
 
+void FTraceOptionsMenu::BuildLegendItems(APlayerController* PC, TArray<FTraceKitLegendItem>& OutKeys,
+	TArray<FTraceKitLegendItem>& OutPad) const
+{
+	TraceOptionsMenuFile::BuildLegend(TraceOptionsMenuFile::AskFor(Page == EPage::Root, bCapturingKey,
+		bCapturingKey && bCapturingPadKey, CallSignEntry.IsActive(), Page == EPage::Keyboard,
+		Page == EPage::Controller, Page == EPage::Loadouts, TracePadMenu::HasSeenPad(PC), TracePadMenu::IsEnabled()),
+		OutKeys, OutPad);
+}
+
 float FTraceOptionsMenu::LegendHeight(APlayerController* PC) const
 {
 	namespace OL = TraceOptionsMenuLayout;
 
 	TArray<FTraceKitLegendItem> Keys;
 	TArray<FTraceKitLegendItem> PadKeys;
-	TraceOptionsMenuFile::BuildLegend(TraceOptionsMenuFile::AskFor(Page == EPage::Root, bCapturingKey,
-		bCapturingKey && bCapturingPadKey, CallSignEntry.IsActive(), Page == EPage::Keyboard,
-		Page == EPage::Controller, Page == EPage::Loadouts, TracePadMenu::HasSeenPad(PC), TracePadMenu::IsEnabled()),
-		Keys, PadKeys);
+	BuildLegendItems(PC, Keys, PadKeys);
 
 	if (Keys.Num() == 0 && PadKeys.Num() == 0)
 	{
@@ -4682,10 +4794,7 @@ void FTraceOptionsMenu::DrawLegend(AHUD* HUD, APlayerController* PC, float Cente
 
 	TArray<FTraceKitLegendItem> Keys;
 	TArray<FTraceKitLegendItem> PadKeys;
-	TraceOptionsMenuFile::BuildLegend(TraceOptionsMenuFile::AskFor(Page == EPage::Root, bCapturingKey,
-		bCapturingKey && bCapturingPadKey, CallSignEntry.IsActive(), Page == EPage::Keyboard,
-		Page == EPage::Controller, Page == EPage::Loadouts, TracePadMenu::HasSeenPad(PC), TracePadMenu::IsEnabled()),
-		Keys, PadKeys);
+	BuildLegendItems(PC, Keys, PadKeys);
 
 	// ONE SCALE FOR BOTH LINES, the loadout page's rule: two legends at two sizes would read as a mistake.
 	const float FullChipH = OL::LegendChipH * UIScale;
@@ -5624,7 +5733,7 @@ ETraceTextWeight FTraceOptionsMenu::FaceForAction() const
 	//
 	// An Action row is a button, and this class draws buttons on two very different pages:
 	//
-	//   * the PAUSE ROOT — RESUME / SETTINGS / VIDEO / RETURN TO TITLE / QUIT. That is not a settings
+	//   * the PAUSE ROOT — RESUME / TEAM / SETTINGS / VIDEO / RETURN TO TITLE / QUIT. That is not a settings
 	//     page; it is the in-match MAIN MENU, the same list of destinations the title screen puts on
 	//     screen through UTraceMenuRow. §2 keeps "main menu rows" in Sofachrome, so these stay in it;
 	//
@@ -5648,19 +5757,22 @@ ETraceTextWeight FTraceOptionsMenu::FaceForAction() const
 // Each check was seen to FAIL against the code it replaced before it was trusted (the commit that
 // added it says how).
 
-void FTraceOptionsMenu::DebugBeginVerify()
+void FTraceOptionsMenu::DebugBeginVerify(bool bTeamRowOnly)
 {
 	if (VerifyStep != 0)
 	{
 		UE_LOG(LogTraceGame, Warning, TEXT("[MenuVerify] Already running."));
 		return;
 	}
-	VerifyStep = 1;
+	VerifyStep = bTeamRowOnly ? 100 : 1;
+	bVerifyTeamRowOnly = bTeamRowOnly;
 	VerifyWait = 0;
 	VerifyFailures = 0;
 	VerifyChecks = 0;
 	UE_LOG(LogTraceGame, Display,
-		TEXT("[MenuVerify] ===== the settings / pause overlay: pointer on open, BACK, confirms, arrows, paused clock ====="));
+		TEXT("[MenuVerify] ===== the settings / pause overlay: %s ====="),
+		bTeamRowOnly ? TEXT("the pause menu's TEAM row only")
+			: TEXT("pointer on open, BACK, confirms, arrows, paused clock, MENU in a rebind, TEAM row"));
 }
 
 void FTraceOptionsMenu::VerifyCheck(const TCHAR* Label, bool bPass, const FString& Detail)
@@ -6155,8 +6267,352 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 			Settings.Save();
 		}
 		Close();
+		Next(70, 1);
+		return;
+
+	// ---- K. ONE MENU PRESS CANCELS A CONTROLLER REBIND, AND DOES NOTHING ELSE -------------------------
+	//
+	// The press goes in at the START of a frame, where a real pad's does (InjectViewportKeyAtFrameStart
+	// says why that is the whole test). CONTROLLER is reached through the SETTINGS door, so a stray BACK
+	// lands on SETTINGS and shows. CONTROLLER INPUT is switched on in memory only, like P: MENU becomes
+	// an Escape only while it is on.
+	case 70:
+		bVerifySavedPadEnabled = Settings.bPadEnabled;
+		Settings.bPadEnabled = true;
+		OpenSettings();
+		Selected = FindActionRow(EAction::OpenController);
+		ActivateSelected();
+		Next(71, 3);
+		return;
+
+	case 71:
+		VerifyIndex = INDEX_NONE;
+		for (int32 Index = 0; Index < Rows.Num(); ++Index)
+		{
+			if (Rows[Index].Kind == ERowKind::PadBinding)
+			{
+				VerifyIndex = Index;
+				break;
+			}
+		}
+		if (Page != EPage::Controller || VerifyIndex == INDEX_NONE)
+		{
+			VerifyCheck(TEXT("K. the CONTROLLER door opens a page with a button row"), false,
+				FString::Printf(TEXT("page %d"), int32(Page)));
+			Settings.bPadEnabled = bVerifySavedPadEnabled;
+			Close();
+			Next(100, 1);
+			return;
+		}
+		VerifyIndexB = int32(Rows[VerifyIndex].Binding);
+		VerifyKeyBefore = Settings.GetPadKey(Rows[VerifyIndex].Binding);
+		Selected = VerifyIndex;
+		ActivateSelected();   // the capture, the way ENTER and pad A open it
+		TraceOptionsRebindProof::InjectViewportKeyAtFrameStart(EKeys::Gamepad_Special_Right, IE_Pressed);
+		Next(72, 3);
+		return;
+
+	case 72: TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_Special_Right, IE_Released); Next(73, 3); return;
+
+	case 73:
+	{
+		const ETraceInputAction Bound = static_cast<ETraceInputAction>(VerifyIndexB);
+		VerifyCheck(TEXT("K. MENU cancels a CONTROLLER rebind"), !bCapturingKey,
+			bCapturingKey ? TEXT("still waiting for a button") : TEXT(""));
+		VerifyCheck(TEXT("K. ...and the same press does not also leave CONTROLLER (it went back to SETTINGS)"),
+			Page == EPage::Controller, FString::Printf(TEXT("page %d (CONTROLLER is %d)"), int32(Page), int32(EPage::Controller)));
+		VerifyCheck(TEXT("K. ...and binds nothing (MENU is a pad button the capture could take)"),
+			Settings.GetPadKey(Bound) == VerifyKeyBefore,
+			FString::Printf(TEXT("%s -> %s"), *UTraceUserSettings::DescribePadKey(VerifyKeyBefore),
+				*UTraceUserSettings::DescribePadKey(Settings.GetPadKey(Bound))));
+		if (Settings.GetPadKey(Bound) != VerifyKeyBefore && VerifyKeyBefore.IsValid())
+		{
+			Settings.SetPadKey(Bound, VerifyKeyBefore);
+		}
+
+		// The other arm: CONTROLLER INPUT off. No Escape follows the press then, so the button itself
+		// has to be the cancel — the one path the fix keeps.
+		if (Page != EPage::Controller || !Rows.IsValidIndex(VerifyIndex))
+		{
+			Next(76, 0);
+			return;
+		}
+		bCapturingKey = false;
+		bCapturingPadKey = false;
+		Settings.bPadEnabled = false;
+		Selected = VerifyIndex;
+		ActivateSelected();
+		TraceOptionsRebindProof::InjectViewportKeyAtFrameStart(EKeys::Gamepad_Special_Right, IE_Pressed);
+		Next(74, 3);
+		return;
+	}
+
+	case 74: TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_Special_Right, IE_Released); Next(75, 3); return;
+
+	case 75:
+	{
+		const ETraceInputAction Bound = static_cast<ETraceInputAction>(VerifyIndexB);
+		VerifyCheck(TEXT("K. with CONTROLLER INPUT off (no Escape follows), MENU itself still cancels"),
+			!bCapturingKey && Page == EPage::Controller && Settings.GetPadKey(Bound) == VerifyKeyBefore,
+			FString::Printf(TEXT("capture %s, page %d"), bCapturingKey ? TEXT("open") : TEXT("closed"), int32(Page)));
+		if (Settings.GetPadKey(Bound) != VerifyKeyBefore && VerifyKeyBefore.IsValid())
+		{
+			Settings.SetPadKey(Bound, VerifyKeyBefore);
+		}
+		Next(76, 0);
+		return;
+	}
+
+	// ---- L. A KEYBOARD REBIND'S LEGEND NAMES THE PAD'S WAY OUT, AND THE PAD DOES WHAT IT SAYS ---------
+	case 76:
+		bCapturingKey = false;
+		bCapturingPadKey = false;
+		Settings.bPadEnabled = true;
+		OpenSettings();
+		Selected = FindActionRow(EAction::OpenKeyboard);
+		ActivateSelected();
+		Next(90, 3);
+		return;
+
+	case 90:
+		VerifyIndex = INDEX_NONE;
+		for (int32 Index = 0; Index < Rows.Num(); ++Index)
+		{
+			if (Rows[Index].Kind == ERowKind::Binding && Rows[Index].Binding == ETraceInputAction::Jump)
+			{
+				VerifyIndex = Index;
+				break;
+			}
+		}
+		if (Page != EPage::Keyboard || VerifyIndex == INDEX_NONE)
+		{
+			VerifyCheck(TEXT("L. the KEYBOARD door opens a page with a JUMP row"), false,
+				FString::Printf(TEXT("page %d"), int32(Page)));
+			Settings.bPadEnabled = bVerifySavedPadEnabled;
+			Close();
+			Next(100, 1);
+			return;
+		}
+		VerifyKeyBefore = Settings.GetKey(ETraceInputAction::Jump, 0);
+		Selected = VerifyIndex;
+		ActivateSelected();   // a KEYBOARD capture, on JUMP's first chip
+		Next(91, 2);
+		return;
+
+	case 91:
+	{
+		TArray<FTraceKitLegendItem> LegendKeys;
+		TArray<FTraceKitLegendItem> LegendPad;
+		BuildLegendItems(PC, LegendKeys, LegendPad);
+		const FString MenuChip = TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_CANCEL", "MENU");
+		const FString BackChip = TRACE_TEXT("OPTIONS.LEGEND.PAD_KEY_BACK", "B");
+		bool bNamesMenu = false;
+		bool bNamesB = false;
+		FString PadLine;
+		for (const FTraceKitLegendItem& Item : LegendPad)
+		{
+			bNamesMenu = bNamesMenu || Item.Key == MenuChip;
+			bNamesB = bNamesB || Item.Key == BackChip;
+			PadLine += FString::Printf(TEXT("[%s] %s  "), *Item.Key, *Item.Label);
+		}
+		VerifyCheck(TEXT("L. a KEYBOARD rebind's legend has a pad line naming MENU (it showed ESC only)"),
+			bCapturingKey && !bCapturingPadKey && bNamesMenu && !bNamesB,
+			FString::Printf(TEXT("pad line '%s' (pad seen %d)"), *PadLine, TracePadMenu::HasSeenPad(PC) ? 1 : 0));
+
+		TraceOptionsRebindProof::InjectViewportKey(TracePadMenu::BackKey(), IE_Pressed);
+		Next(92, 2);
+		return;
+	}
+
+	case 92: TraceOptionsRebindProof::InjectViewportKey(TracePadMenu::BackKey(), IE_Released); Next(93, 3); return;
+
+	case 93:
+		VerifyCheck(TEXT("L. pad B does nothing there, as the legend says: no cancel, no bind, no BACK"),
+			bCapturingKey && !bCapturingPadKey && Page == EPage::Keyboard
+				&& Settings.GetKey(ETraceInputAction::Jump, 0) == VerifyKeyBefore,
+			FString::Printf(TEXT("capture %s, page %d, JUMP %s"), bCapturingKey ? TEXT("open") : TEXT("closed"), int32(Page),
+				*UTraceUserSettings::DescribeKey(Settings.GetKey(ETraceInputAction::Jump, 0))));
+		TraceOptionsRebindProof::InjectViewportKeyAtFrameStart(EKeys::Gamepad_Special_Right, IE_Pressed);
+		Next(94, 3);
+		return;
+
+	case 94: TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_Special_Right, IE_Released); Next(95, 3); return;
+
+	case 95:
+		VerifyCheck(TEXT("L. ...and MENU cancels it, staying on KEYBOARD"),
+			!bCapturingKey && Page == EPage::Keyboard && Settings.GetKey(ETraceInputAction::Jump, 0) == VerifyKeyBefore,
+			FString::Printf(TEXT("capture %s, page %d"), bCapturingKey ? TEXT("open") : TEXT("closed"), int32(Page)));
+		if (Settings.GetKey(ETraceInputAction::Jump, 0) != VerifyKeyBefore && VerifyKeyBefore.IsValid())
+		{
+			Settings.SetKey(ETraceInputAction::Jump, 0, VerifyKeyBefore);
+		}
+		bCapturingKey = false;
+		Settings.bPadEnabled = bVerifySavedPadEnabled;
+		Close();
+		Next(100, 1);
+		return;
+
+	// ---- T. IN A MATCH, A PAD REACHES THE TEAM SCREEN: MENU, DOWN, A ----------------------------------
+	//
+	// Only the pad, through the real routes: MENU is the pause key (an Escape, via TickMenuButton), the
+	// D-pad walks the root, A presses TEAM, and the H key's request opens the team screen. Then, with it
+	// up, the row must be greyed — the server would refuse — and the D-pad must walk past it. Needs live
+	// play after LOCK IN; on the title screen there is no TEAM row and the section says so.
+	case 100:
+	{
+		bDebugPointer = true;
+		bDebugPointerDown = false;
+		DebugPointerPos = FVector2D(2.f, 2.f);
+		ATracePlayerController* const TeamPC = Cast<ATracePlayerController>(PC);
+		if (TeamPC == nullptr)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[MenuVerify]   --   T. not in a match here, so there is no TEAM row to check"));
+			Next(30, 0);
+			return;
+		}
+		const bool bLoadoutUp = TeamPC->GetTracePlayerState() != nullptr
+			&& TeamPC->GetTracePlayerState()->IsCharacterSelectOpen();
+		if (!TeamPC->CanRequestTeamSelect() && !(bLoadoutUp && !TeamPC->IsTeamSelectOpen()))
+		{
+			VerifyCheck(TEXT("T. a match state to test in: live play, or the loadout page up"), false,
+				FString::Printf(TEXT("team screen %d, loadout window %d"), TeamPC->IsTeamSelectOpen() ? 1 : 0,
+					bLoadoutUp ? 1 : 0));
+			Next(30, 0);
+			return;
+		}
+		if (IsOpen())
+		{
+			Close();
+		}
+		bVerifySavedPadEnabled = Settings.bPadEnabled;
+		Settings.bPadEnabled = true;
+		TraceOptionsRebindProof::InjectViewportKeyAtFrameStart(EKeys::Gamepad_Special_Right, IE_Pressed);
+
+		// Run over the LOADOUT PAGE (before LOCK IN), the section checks the other refusal instead: the
+		// server will not reopen the team screen over an open loadout window, so neither may the row.
+		Next(bLoadoutUp ? 120 : 101, 3);
+		return;
+	}
+
+	case 120: TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_Special_Right, IE_Released); Next(121, 3); return;
+
+	case 121:
+	{
+		ATracePlayerController* const TeamPC = Cast<ATracePlayerController>(PC);
+		VerifyIndex = FindActionRow(EAction::OpenTeamSelect);
+		const bool bGrey = Rows.IsValidIndex(VerifyIndex) && !Rows[VerifyIndex].bEnabled;
+		VerifyCheck(TEXT("T. over the loadout page, TEAM is greyed: the server refuses the team screen there"),
+			IsOpen() && Page == EPage::Root && bGrey && TeamPC != nullptr && !TeamPC->CanRequestTeamSelect()
+				&& Selected != VerifyIndex,
+			FString::Printf(TEXT("open %d, TEAM row %d %s, selected %s"), IsOpen() ? 1 : 0, VerifyIndex,
+				bGrey ? TEXT("greyed") : TEXT("LIVE"), *RowName(Selected)));
+		if (IsOpen())
+		{
+			Close();
+		}
+		Settings.bPadEnabled = bVerifySavedPadEnabled;
 		Next(30, 1);
 		return;
+	}
+
+	case 101: TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_Special_Right, IE_Released); Next(102, 3); return;
+
+	case 102:
+	{
+		ATracePlayerController* const TeamPC = Cast<ATracePlayerController>(PC);
+		VerifyIndex = FindActionRow(EAction::OpenTeamSelect);
+		VerifyCheck(TEXT("T. MENU opens the pause root, and it has a TEAM row"), IsOpen() && Page == EPage::Root && VerifyIndex != INDEX_NONE,
+			FString::Printf(TEXT("open %d, page %d, TEAM row %d"), IsOpen() ? 1 : 0, int32(Page), VerifyIndex));
+		if (VerifyIndex == INDEX_NONE || TeamPC == nullptr)
+		{
+			// No row: walk the pad route anyway. The team screen will not open, and check T says so.
+			VerifyIndex = INDEX_NONE;
+		}
+		else
+		{
+			VerifyCheck(TEXT("T. ...live, because the server would open the team screen now"),
+				Rows[VerifyIndex].bEnabled && TeamPC->CanRequestTeamSelect(), TEXT(""));
+		}
+		TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_DPad_Down, IE_Pressed);
+		Next(103, 2);
+		return;
+	}
+
+	case 103: TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_DPad_Down, IE_Released); Next(104, 2); return;
+
+	case 104:
+		VerifyCheck(TEXT("T. one D-pad DOWN from RESUME lands on TEAM"), Selected == VerifyIndex && VerifyIndex != INDEX_NONE,
+			FString::Printf(TEXT("selected %s"), *RowName(Selected)));
+		TraceOptionsRebindProof::InjectViewportKey(TracePadMenu::ConfirmKey(), IE_Pressed);
+		Next(105, 2);
+		return;
+
+	case 105: TraceOptionsRebindProof::InjectViewportKey(TracePadMenu::ConfirmKey(), IE_Released); Next(106, 8); return;
+
+	case 106:
+	{
+		ATracePlayerController* const TeamPC = Cast<ATracePlayerController>(PC);
+		const bool bTeamUp = TeamPC != nullptr && TeamPC->IsTeamSelectOpen();
+		VerifyCheck(TEXT("T. MENU, DOWN, A: a pad opens the team screen mid-match (it had no way to)"),
+			bTeamUp && !IsOpen(), FString::Printf(TEXT("team screen %d, pause menu %d"), bTeamUp ? 1 : 0, IsOpen() ? 1 : 0));
+		if (!bTeamUp)
+		{
+			if (IsOpen())
+			{
+				Close();
+			}
+			Settings.bPadEnabled = bVerifySavedPadEnabled;
+			Next(30, 1);
+			return;
+		}
+
+		// ...and with it up, MENU again: the pause root over the team screen.
+		TraceOptionsRebindProof::InjectViewportKeyAtFrameStart(EKeys::Gamepad_Special_Right, IE_Pressed);
+		Next(107, 3);
+		return;
+	}
+
+	case 107: TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_Special_Right, IE_Released); Next(108, 3); return;
+
+	case 108:
+	{
+		ATracePlayerController* const TeamPC = Cast<ATracePlayerController>(PC);
+		VerifyIndex = FindActionRow(EAction::OpenTeamSelect);
+		const bool bGrey = Rows.IsValidIndex(VerifyIndex) && !Rows[VerifyIndex].bEnabled;
+		VerifyCheck(TEXT("T. with the team screen up, TEAM is greyed: the server would refuse it"),
+			IsOpen() && Page == EPage::Root && bGrey && TeamPC != nullptr && !TeamPC->CanRequestTeamSelect()
+				&& Selected != VerifyIndex,
+			FString::Printf(TEXT("open %d, TEAM row %d %s, selected %s"), IsOpen() ? 1 : 0, VerifyIndex,
+				bGrey ? TEXT("greyed") : TEXT("LIVE"), *RowName(Selected)));
+		TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_DPad_Down, IE_Pressed);
+		Next(109, 2);
+		return;
+	}
+
+	case 109: TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_DPad_Down, IE_Released); Next(110, 2); return;
+
+	case 110:
+	{
+		VerifyCheck(TEXT("T. ...and the D-pad walks past it"), VerifyIndex != INDEX_NONE && Selected != VerifyIndex
+			&& Rows.IsValidIndex(Selected) && Rows[Selected].Action == EAction::OpenSettings,
+			FString::Printf(TEXT("selected %s"), *RowName(Selected)));
+		Close();
+		if (ATracePlayerController* const TeamPC = Cast<ATracePlayerController>(PC))
+		{
+			TeamPC->ServerRequestCloseTeamSelect();
+		}
+		Settings.bPadEnabled = bVerifySavedPadEnabled;
+		Next(111, 6);
+		return;
+	}
+
+	case 111:
+	{
+		const ATracePlayerController* const TeamPC = Cast<ATracePlayerController>(PC);
+		VerifyCheck(TEXT("T. (cleanup) the team screen closes again"), TeamPC != nullptr && !TeamPC->IsTeamSelectOpen(), TEXT(""));
+		Next(30, 1);
+		return;
+	}
 
 	case 30:
 	default:
@@ -6173,13 +6629,21 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 			FString::Printf(TEXT("%d not drawable on the first frame"), TraceOptionsMenuArt::GFirstDrawUnready));
 
 		VerifyStep = 0;
-		if (VerifyFailures == 0)
+		if (VerifyFailures == 0 && bVerifyTeamRowOnly)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MenuVerify] ===== PASS — %d checks: the pause menu's TEAM row is the pad's way to the team screen, ")
+				TEXT("and it is greyed exactly when the server would refuse it ====="),
+				VerifyChecks);
+		}
+		else if (VerifyFailures == 0)
 		{
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[MenuVerify] ===== PASS — %d checks: the pointer waits to be moved, BACK keeps your place, ")
 				TEXT("RESET and CLEAR ask first, the arrows step both ways, a paused world does not freeze the menu, ")
-				TEXT("a long page scrolls at full size, CONTROLLER INPUT OFF silences the pad here, and the call sign ")
-				TEXT("field lets a pad and a click out ====="),
+				TEXT("a long page scrolls at full size, CONTROLLER INPUT OFF silences the pad here, the call sign ")
+				TEXT("field lets a pad and a click out, one MENU press cancels a rebind and nothing else, and (in a ")
+				TEXT("match) a pad reaches the team screen through TEAM ====="),
 				VerifyChecks);
 		}
 		else

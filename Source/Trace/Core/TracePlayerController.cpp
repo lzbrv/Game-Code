@@ -45,6 +45,7 @@
 #include "Gameplay/TraceMelee.h"           // TraceMelee::RequestEquipIfDifferent (spec v13 §2)
 #include "Gameplay/TraceParry.h"           // spec v25 §7 — Trace.Input.VerifyRightMouse's carrier-only proof
 #include "Gameplay/TraceWeaponComponent.h" // RequestReload (spec v16 §1 — the R bind)
+#include "Modes/TracePracticeRange.h"      // IsActive — no team screen in the range (CanRequestTeamSelect)
 #include "Movement/TraceCharacterMovementComponent.h"   // dash charges, for the HUD accessors
 #include "Settings/TraceUserSettings.h"    // sensitivity, invert-Y and the key bindings
 #include "Trace.h"                         // LogTraceGame
@@ -4035,25 +4036,61 @@ void ATracePlayerController::ServerRequestOpenTeamSelect_Implementation()
 	}
 	LastTeamRequestTime = TimeNow;
 
-	// NOT WHILE THE CHARACTER SCREEN IS UP. The two screens are one flow and the order is team then
-	// character (see the ordering gate in ATraceGameMode::PollCharacterSelect); letting H reopen the
-	// team screen over a character screen would put the flow back to front and leave the character
-	// screen's auto-pick clock running behind a modal about something else.
-	if (const ATracePlayerState* const State = GetTracePlayerState())
+	// THE RULES — the same function the pause menu's TEAM row greys itself with, so the row never
+	// offers what this refuses. See CanRequestTeamSelect.
+	if (!CanRequestTeamSelect())
 	{
-		if (State->IsCharacterSelectOpen())
-		{
-			UE_LOG(LogTraceGame, Log,
-				TEXT("[TeamSelect] '%s' pressed H while still picking a character - ignored; pick first."),
-				*State->GetPlayerName());
-			return;
-		}
+		const ATracePlayerState* const State = GetTracePlayerState();
+		UE_LOG(LogTraceGame, Log, TEXT("[TeamSelect] '%s' asked for the team screen - refused (%s)."),
+			(State != nullptr) ? *State->GetPlayerName() : TEXT("<no state>"),
+			bTeamSelectOpen ? TEXT("it is already up")
+				: ((State != nullptr && State->IsCharacterSelectOpen()) ? TEXT("still picking a loadout; pick first")
+					: TEXT("not in this match state")));
+		return;
 	}
 
 	if (ATraceGameMode* const Rules = World->GetAuthGameMode<ATraceGameMode>())
 	{
 		Rules->OpenTeamSelectFor(this);
 	}
+}
+
+bool ATracePlayerController::CanRequestTeamSelect() const
+{
+	// Already choosing: a second request would only reset the deadline.
+	if (bTeamSelectOpen)
+	{
+		return false;
+	}
+
+	// NOT WHILE THE LOADOUT WINDOW IS UP. The two screens are one flow and the order is team then
+	// loadout (see the ordering gate in ATraceGameMode::PollCharacterSelect); reopening the team
+	// screen over the loadout page would put the flow back to front and leave the page's auto-pick
+	// clock running behind a modal about something else. A bot has no screen to have asked from.
+	if (const ATracePlayerState* const TeamRulesState = GetTracePlayerState())
+	{
+		if (TeamRulesState->IsCharacterSelectOpen() || TeamRulesState->IsABot())
+		{
+			return false;
+		}
+	}
+
+	const UWorld* const TeamRulesWorld = GetWorld();
+	if (TeamRulesWorld == nullptr)
+	{
+		return false;
+	}
+
+	// Not in the practice range, which has no other team. Asked of the range's own gate, which is
+	// true where the range's game mode exists: on its host, the only machine a range session has.
+	if (TracePracticeRange::IsActive(TeamRulesWorld))
+	{
+		return false;
+	}
+
+	// Not after full time: the results own the screen, and there is nothing left to change team for.
+	const ATraceGameState* const TeamRulesGameState = TeamRulesWorld->GetGameState<ATraceGameState>();
+	return TeamRulesGameState == nullptr || TeamRulesGameState->TraceMatchState != ETraceMatchState::PostMatch;
 }
 
 bool ATracePlayerController::ServerRequestCloseTeamSelect_Validate()

@@ -273,9 +273,9 @@ bool FTraceTeamSelect::PollOpenHotkey(ATracePlayerController* PC)
 	//
 	// A chord or a long-press was the alternative and was refused: every one of those buttons does
 	// something the instant it is touched in a match, and "hold LB for half a second" would fire PULL
-	// CORE first. So mid-match REOPENING of this screen is keyboard-only, and it is written up as a
-	// known limitation with the two fixes that would remove it — a row on the pause menu, or a
-	// gameplay verb giving a button back.
+	// CORE first. So a pad reopens this screen mid-match through the PAUSE MENU instead: its TEAM row
+	// (MENU, down, A) sends this same request, and greys itself by the same rules the server applies
+	// to it (ATracePlayerController::CanRequestTeamSelect).
 	//
 	// NOTHING A PAD PLAYER NEEDS IS BEHIND THIS. The join flow OPENS this screen by itself
 	// (ATracePlayerController::bTeamSelectOpen, replicated), and once it is up a pad drives all of it,
