@@ -2600,9 +2600,20 @@ namespace TraceRoxieVerify
 		double Deadline = 0.0;
 		FChecklist List;
 		float BaseJumpZ = 0.f;
+		float ShippedJumpZ = -1.f;
 		float RedJumpZ = -1.f;
 		float GreenJumpZ = -1.f;
+
+		/** Trace.Demo35.LegacyRoxieJump as the run found it; every exit puts it back. */
+		int32 SavedLegacyJump = 0;
 	};
+
+	/** Every way the jump test ends: both switches back to what the game had before it started. */
+	void RestoreJumpTestSwitches(const FJumpTestState& State)
+	{
+		SetArm(TEXT("Trace.Roxie.JumpPassive"), 1);
+		CVarRoxieLegacyJumpPassive->Set(State.SavedLegacyJump, ECVF_SetByConsole);
+	}
 
 	void RunJumpTest()
 	{
@@ -2617,10 +2628,20 @@ namespace TraceRoxieVerify
 		State->List.Tag = TEXT("ROXIEJUMP");
 		State->Deadline = FPlatformTime::Seconds() + 40.0;
 
+		// *** DEMO 35 REMOVED THE PASSIVE, so the arms below run under the legacy switch. *** With
+		// Trace.Demo35.LegacyRoxieJump at 0 GetJumpVelocityScale() returns 1.0, and this test failed on
+		// every run of the shipped game for a reason that is the design, not a defect. The square-root
+		// conversion is still in the build behind that switch, so the test measures it with the switch
+		// ON, first proves the SHIPPED game has no passive at all, and puts the switch back.
+		State->SavedLegacyJump = CVarRoxieLegacyJumpPassive.GetValueOnGameThread();
+
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[ROXIEJUMP] ===== spec v18 §2: 'jumps 15%% higher'. Measured as a HEIGHT ratio (v^2/2g), "
-			     "because a velocity ratio cannot tell the correct sqrt(1.15)=1.0724 from the naive 1.15 — "
-			     "which would buy +32.25%% height. arm 0 = RED (Trace.Roxie.JumpPassive 0). ====="));
+			TEXT("[ROXIEJUMP] ===== LEGACY — Demo 35 removed 'jumps 15%% higher'; the arms run with "
+			     "Trace.Demo35.LegacyRoxieJump 1 (was %d, restored at the end) to keep the code behind that switch "
+			     "covered, after one read of the shipped game. Measured as a HEIGHT ratio (v^2/2g), because a "
+			     "velocity ratio cannot tell the correct sqrt(1.15)=1.0724 from the naive 1.15 — which would buy "
+			     "+32.25%% height. arm RED = Trace.Roxie.JumpPassive 0. ====="),
+			State->SavedLegacyJump);
 
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
 			[State, WeakWorld = TWeakObjectPtr<UWorld>(WorldPtr)](float) -> bool
@@ -2629,7 +2650,7 @@ namespace TraceRoxieVerify
 			const double NowReal = FPlatformTime::Seconds();
 			if (TickWorld == nullptr)
 			{
-				SetArm(TEXT("Trace.Roxie.JumpPassive"), 1);
+				RestoreJumpTestSwitches(*State);
 				return false;
 			}
 			if (NowReal < State->NextStepRealTime)
@@ -2647,7 +2668,7 @@ namespace TraceRoxieVerify
 				}
 				State->List.Invalidate(FString::Printf(TEXT("could not stage Roxie: %s"), *Why));
 				State->List.Report();
-				SetArm(TEXT("Trace.Roxie.JumpPassive"), 1);
+				RestoreJumpTestSwitches(*State);
 				return false;
 			}
 
@@ -2655,8 +2676,10 @@ namespace TraceRoxieVerify
 			// reading a value that has not been asserted yet.
 			if (State->Step == 0)
 			{
+				// THE SHIPPED GAME FIRST: legacy switch off, passive arm at its shipped 1.
 				State->BaseJumpZ = RoxieSet->GetBaseJumpZVelocity();
-				SetArm(TEXT("Trace.Roxie.JumpPassive"), 0);
+				CVarRoxieLegacyJumpPassive->Set(0, ECVF_SetByConsole);
+				SetArm(TEXT("Trace.Roxie.JumpPassive"), 1);
 				State->Step = 1;
 				State->NextStepRealTime = NowReal + 0.30;
 				return true;
@@ -2664,9 +2687,19 @@ namespace TraceRoxieVerify
 
 			if (State->Step == 1)
 			{
+				State->ShippedJumpZ = RoxieSet->GetAppliedJumpZVelocity();
+				CVarRoxieLegacyJumpPassive->Set(1, ECVF_SetByConsole);
+				SetArm(TEXT("Trace.Roxie.JumpPassive"), 0);
+				State->Step = 2;
+				State->NextStepRealTime = NowReal + 0.30;
+				return true;
+			}
+
+			if (State->Step == 2)
+			{
 				State->RedJumpZ = RoxieSet->GetAppliedJumpZVelocity();
 				SetArm(TEXT("Trace.Roxie.JumpPassive"), 1);
-				State->Step = 2;
+				State->Step = 3;
 				State->NextStepRealTime = NowReal + 0.30;
 				return true;
 			}
@@ -2679,20 +2712,26 @@ namespace TraceRoxieVerify
 			const float NaiveHeightRatio = (1.f + Bonus) * (1.f + Bonus);
 
 			State->List.Check(State->BaseJumpZ > 0.f
+				&& FMath::IsNearlyEqual(State->ShippedJumpZ, State->BaseJumpZ, 0.5f),
+				TEXT("SHIPPED (Demo 35): the passive is gone — she jumps exactly like everybody else"),
+				FString::Printf(TEXT("JumpZVelocity %.1f against the authored %.1f with Trace.Demo35.LegacyRoxieJump 0"),
+					State->ShippedJumpZ, State->BaseJumpZ));
+
+			State->List.Check(State->BaseJumpZ > 0.f
 				&& FMath::IsNearlyEqual(State->RedJumpZ, State->BaseJumpZ, 0.5f),
-				TEXT("RED ARM: Trace.Roxie.JumpPassive 0 leaves her jumping exactly like everybody else"),
+				TEXT("LEGACY, RED ARM: Trace.Roxie.JumpPassive 0 leaves her jumping exactly like everybody else"),
 				FString::Printf(TEXT("JumpZVelocity %.1f against the authored %.1f — so the green arm below is "
 				                     "measuring the passive and not the engine default"),
 					State->RedJumpZ, State->BaseJumpZ));
 
 			State->List.Check(HeightRatio > 1.f + Bonus * 0.9f && HeightRatio < 1.f + Bonus * 1.1f,
-				TEXT("SHIPPED: she jumps the asked-for fraction higher — measured as HEIGHT"),
+				TEXT("LEGACY: with the passive restored she jumps the asked-for fraction higher — measured as HEIGHT"),
 				FString::Printf(TEXT("JumpZVelocity %.1f -> %.1f (velocity x%.4f), so apex x%.4f against the "
 				                     "%.0f%% asked for"),
 					State->BaseJumpZ, State->GreenJumpZ, VelocityRatio, HeightRatio, Bonus * 100.f));
 
 			State->List.Check(HeightRatio < NaiveHeightRatio - 0.05f,
-				TEXT("*** THE SQUARE ROOT: the naive x(1+bonus) on the VELOCITY is not what shipped ***"),
+				TEXT("*** THE SQUARE ROOT: the naive x(1+bonus) on the VELOCITY is not what the legacy passive does ***"),
 				FString::Printf(TEXT("velocity x%.4f = sqrt(1+%.2f); had it been x%.2f the apex would be x%.4f "
 				                     "(+%.1f%%) instead of x%.4f. This is the Chut-bash mistake (spec v16 §0) "
 				                     "not being made twice"),
@@ -2700,7 +2739,7 @@ namespace TraceRoxieVerify
 					HeightRatio));
 
 			State->List.Report();
-			SetArm(TEXT("Trace.Roxie.JumpPassive"), 1);
+			RestoreJumpTestSwitches(*State);
 			return false;
 		}));
 	}
@@ -2708,7 +2747,9 @@ namespace TraceRoxieVerify
 	FAutoConsoleCommand CmdJumpTest(
 		TEXT("Trace.Roxie.JumpTest"),
 		TEXT("Dev only, SERVER. Spec v18 §2: Roxie's passive, measured as an APEX HEIGHT ratio so the "
-		     "sqrt-vs-linear mistake is visible. Red-armed with Trace.Roxie.JumpPassive 0."),
+		     "sqrt-vs-linear mistake is visible. Red-armed with Trace.Roxie.JumpPassive 0. LEGACY since Demo 35 "
+		     "removed the passive: checks the shipped game has none, then runs the arms with "
+		     "Trace.Demo35.LegacyRoxieJump 1 and restores it."),
 		FConsoleCommandDelegate::CreateStatic(&RunJumpTest));
 
 	// =============================================================================================

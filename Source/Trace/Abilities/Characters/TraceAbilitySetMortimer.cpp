@@ -3087,6 +3087,9 @@ namespace TraceMortimerVerifyFile
 
 		FMortimerMantleArm Arms[3];
 		int32 SavedMantleArm = 1;
+
+		/** Trace.Demo35.LegacyMantle as the run found it. The run turns it on and puts this back. */
+		int32 SavedLegacyMantle = 0;
 	};
 
 	/** The three ledge heights, as multiples of his own jump apex. Derived, so a jump retune follows. */
@@ -3099,6 +3102,9 @@ namespace TraceMortimerVerifyFile
 		{
 			Arm->Set(Run->SavedMantleArm, ECVF_SetByConsole);
 		}
+		// Back to what the run found — 0, the shipped Demo 35 game, unless somebody had turned the
+		// legacy mantle on for a playtest before running this.
+		CVarMortimerLegacyMantle->Set(Run->SavedLegacyMantle, ECVF_SetByConsole);
 		if (AStaticMeshActor* Block = Run->Block.Get())
 		{
 			Block->Destroy();
@@ -3141,7 +3147,7 @@ namespace TraceMortimerVerifyFile
 		for (int32 Index = 0; Index < 3; ++Index)
 		{
 			static const TCHAR* const Names[3] = { TEXT("RED   (Trace.Mortimer.Mantle 0)"),
-			                                       TEXT("GREEN (shipped)"),
+			                                       TEXT("GREEN (legacy mantle on)"),
 			                                       TEXT("GUARD (ledge below his jump apex)") };
 			const FMortimerMantleArm& Arm = Run->Arms[Index];
 			UE_LOG(LogTraceGame, Display,
@@ -3172,7 +3178,7 @@ namespace TraceMortimerVerifyFile
 		if (!Green.bEndedOnLedge || !Green.bPressConsumed)
 		{
 			UE_LOG(LogTraceGame, Error,
-				TEXT("[%s] VERDICT: *** FAIL *** — the shipped build did not mantle a %.0f uu ledge: press "
+				TEXT("[%s] VERDICT: *** FAIL *** — with Trace.Demo35.LegacyMantle 1 the mantle did not get him up a %.0f uu ledge: press "
 				     "consumed=%d, ended on the ledge=%d (feet peaked at %.0f, the lip is at %.0f). The probe "
 				     "said: found=%d %s"),
 				Tag, Green.LedgeHeight, Green.bPressConsumed ? 1 : 0, Green.bEndedOnLedge ? 1 : 0,
@@ -3278,10 +3284,20 @@ namespace TraceMortimerVerifyFile
 		const float GravityDown = FMath::Max(1.f, -Move->GetGravityZ());
 		Run->JumpApexUU = (Move->JumpZVelocity * Move->JumpZVelocity) / (2.f * GravityDown);
 
+		// *** DEMO 35 RETIRED THE MANTLE (BLINK replaced it), so this runs under the legacy switch. ***
+		// With Trace.Demo35.LegacyMantle at 0 OnJumpPressed never reaches TryMantle, and every run of
+		// this harness failed on the shipped game for a reason that is the design, not a defect. The
+		// mantle's code is still in the build behind that switch and a playtest can turn it back on,
+		// so the harness turns it on for the run, keeps measuring it, and puts the switch back.
+		Run->SavedLegacyMantle = CVarMortimerLegacyMantle.GetValueOnGameThread();
+		CVarMortimerLegacyMantle->Set(1, ECVF_SetByConsole);
+
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[%s] begin: three arms on one built ledge, RED first. %s, jump apex %.0f uu, capsule "
+			TEXT("[%s] begin: LEGACY — the mantle is retired in Demo 35, so this runs with "
+			     "Trace.Demo35.LegacyMantle 1 (was %d, restored at the end) to keep the code behind that "
+			     "switch covered. Three arms on one built ledge, RED first. %s, jump apex %.0f uu, capsule "
 			     "r=%.0f h=%.0f. The ledge is %.0f uu tall for arms 0 and 1 and %.0f uu for arm 2."),
-			Tag, *GetNameSafe(MyPawn), Run->JumpApexUU, Capsule->GetScaledCapsuleRadius(),
+			Tag, Run->SavedLegacyMantle, *GetNameSafe(MyPawn), Run->JumpApexUU, Capsule->GetScaledCapsuleRadius(),
 			Capsule->GetScaledCapsuleHalfHeight(), Run->JumpApexUU * MantleTestTallApexes,
 			Run->JumpApexUU * MantleTestLowApexes);
 
@@ -3413,7 +3429,8 @@ namespace TraceMortimerVerifyFile
 
 	FAutoConsoleCommand CmdMortimerMantleTest(
 		TEXT("Trace.Mortimer.MantleTest"),
-		TEXT("DEMO 21 item 6. Builds a ledge in front of Mortimer and presses the SHIPPED jump key three times: "
+		TEXT("DEMO 21 item 6, LEGACY since Demo 35 retired the mantle: runs with Trace.Demo35.LegacyMantle 1 and "
+		     "restores it. Builds a ledge in front of Mortimer and presses the real jump key three times: "
 		     "with the mantle removed (must decline and must not get up), with it in place (must consume the "
 		     "press and end STOOD on the lip), and at a ledge below his own jump apex (must leave the ordinary "
 		     "jump alone). Destroys its ledge on every exit path."),
