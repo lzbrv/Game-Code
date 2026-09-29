@@ -953,6 +953,10 @@ namespace TraceMaceOysterVerify
 		int32 Passed = 0;
 		int32 Failed = 0;
 
+		/** Sections the FIXTURE could not stage. Neither a pass nor a failure, and the verdict says so. */
+		int32 Invalid = 0;
+		FString InvalidReasons;
+
 		void Check(bool bCondition, const FString& What)
 		{
 			if (bCondition) { ++Passed; }
@@ -960,7 +964,134 @@ namespace TraceMaceOysterVerify
 			UE_LOG(LogTraceGame, Display, TEXT("[MACEVERIFY]   %s  %s"),
 				bCondition ? TEXT("PASS") : TEXT("*** FAIL ***"), *What);
 		}
+
+		void Invalidate(const FString& Why)
+		{
+			++Invalid;
+			InvalidReasons += InvalidReasons.IsEmpty() ? Why : (TEXT("; ") + Why);
+			UE_LOG(LogTraceGame, Warning, TEXT("[MACEVERIFY]   INVALID  %s"), *Why);
+		}
 	};
+
+	/**
+	 * A STRAIGHT LINE OF CLEAR AIR TO PULL HER ALONG, found by sweeping her own capsule down it.
+	 *
+	 * *** WHY THIS EXISTS: THE PULL CHECK FAILED ONE RUN IN SIX, AND THE PULL WAS NOT BROKEN. ***
+	 * The pull used to go wherever she happened to face, 900 uu above wherever she happened to stand.
+	 * The fizzle test just before it aims her at the sky with yaw 0, and yaw 0 is the FIRST direction
+	 * the wall hunt tries — so whenever she spawned beside a tall wall on that side, the hunt found it
+	 * (v_hw_FIN_chars: "a wall at 73 uu on yaw 0") and the pull then drove her straight into the same
+	 * wall. She moved 1 uu, the pull ended "blocked — bounced off geometry" after 67 ms, which is the
+	 * shipped rule working, and "she actually covered the ground" failed. The spawn point decided the
+	 * verdict.
+	 *
+	 * So the lane is SWEPT before it is used, with her own capsule plus a margin on her own collision
+	 * channel and responses — the query her movement makes — and a blocked lane is replaced by the
+	 * next candidate instead of being flown into. The candidates start with the lane the fixture always
+	 * used (her facing, 900 uu up), so a clear spawn runs exactly the old test. Nothing about what is
+	 * asserted afterwards changes: she must still cover 65% of the way at the momentum ceiling.
+	 */
+	struct FMacePullLane
+	{
+		FVector Start = FVector::ZeroVector;
+		FVector Direction = FVector::ForwardVector;
+		int32 CandidatesTried = 0;
+		/** What stopped the first blocked candidate, so a moved lane says why it moved. */
+		FString FirstRefusal;
+	};
+
+	bool FindClearMacePullLane(UWorld* WorldPtr, ATraceCharacter* MyPawn, const FVector& Base, float BaseYaw,
+		float LaneLengthUU, FMacePullLane& OutLane)
+	{
+		UCapsuleComponent* const PawnCapsule = (MyPawn != nullptr) ? MyPawn->GetCapsuleComponent() : nullptr;
+		if (WorldPtr == nullptr || PawnCapsule == nullptr)
+		{
+			return false;
+		}
+
+		// A little FATTER than she is, so a lane that scrapes along a wall does not count as clear.
+		constexpr float LaneMarginUU = 12.f;
+		const FCollisionShape LaneShape = FCollisionShape::MakeCapsule(
+			PawnCapsule->GetScaledCapsuleRadius() + LaneMarginUU,
+			PawnCapsule->GetScaledCapsuleHalfHeight() + LaneMarginUU);
+
+		FCollisionQueryParams LaneQuery(SCENE_QUERY_STAT(TraceMacePullLane), /*bTraceComplex=*/false);
+		FCollisionResponseParams LaneResponse;
+		PawnCapsule->InitSweepCollisionParams(LaneQuery, LaneResponse);
+		LaneQuery.AddIgnoredActor(MyPawn);
+
+		// The fixture's original lane first (900 uu up from where she stands, the way she faces), then
+		// the rest of the compass, then lower and higher — and then the same again from a few steps
+		// away. The steps matter: MEASURED at the v_hw_FIN_chars standpoint, a wall 35 uu from her axis
+		// rises past every candidate height, so a capsule (plus margin) started over that spot is
+		// inside the wall in EVERY direction and all 24 same-spot candidates were refused.
+		const float LaneHeights[] = { 900.f, 600.f, 1200.f };
+		constexpr int32 LaneYawSteps = 8;
+		constexpr float LaneStepAsideUU = 250.f;
+
+		for (int32 Aside = 0; Aside <= LaneYawSteps; ++Aside)
+		{
+			// Aside 0 is her own spot; 1..8 are LaneStepAsideUU out, round the compass.
+			const FVector AsideOffset = (Aside == 0)
+				? FVector::ZeroVector
+				: FRotator(0.f, BaseYaw + (Aside - 1) * (360.f / LaneYawSteps), 0.f).Vector() * LaneStepAsideUU;
+
+			for (const float LaneHeight : LaneHeights)
+			{
+				for (int32 YawStep = 0; YawStep < LaneYawSteps; ++YawStep)
+				{
+					++OutLane.CandidatesTried;
+					const FVector LaneStart = Base + AsideOffset + FVector(0.f, 0.f, LaneHeight);
+					const FVector LaneDir = FRotator(0.f, BaseYaw + YawStep * (360.f / LaneYawSteps), 0.f).Vector();
+
+					FHitResult LaneHit;
+					const bool bBlocked = WorldPtr->SweepSingleByChannel(LaneHit, LaneStart,
+						LaneStart + LaneDir * LaneLengthUU, FQuat::Identity, PawnCapsule->GetCollisionObjectType(),
+						LaneShape, LaneQuery, LaneResponse);
+					if (!bBlocked)
+					{
+						OutLane.Start = LaneStart;
+						OutLane.Direction = LaneDir;
+						return true;
+					}
+
+					if (OutLane.FirstRefusal.IsEmpty())
+					{
+						OutLane.FirstRefusal = FString::Printf(TEXT("%s at %.0f uu%s"),
+							*GetNameSafe(LaneHit.GetActor()), LaneHit.Distance,
+							LaneHit.bStartPenetrating ? TEXT(", with her starting inside it") : TEXT(""));
+					}
+				}
+			}
+		}
+		return false;
+	}
+
+	/** How many lanes FindClearMacePullLane will try before giving up: 9 spots x 3 heights x 8 bearings. */
+	constexpr int32 MacePullLaneCandidates = 9 * 3 * 8;
+
+	/** Puts her at the lane's start in a clean fall, the same state StageFall leaves her in. */
+	void StageOnLane(ATraceCharacter* MyPawn, const FMacePullLane& Lane)
+	{
+		MyPawn->SetActorLocation(Lane.Start, /*bSweep*/ false);
+		if (UTraceCharacterMovementComponent* LaneMove = MyPawn->GetTraceMovement())
+		{
+			LaneMove->SetMovementMode(MOVE_Falling);
+			LaneMove->Velocity = FVector::ZeroVector;
+		}
+	}
+
+	/** One log line saying which lane was used and, if it is not the original one, why it moved. */
+	void ReportMacePullLane(const TCHAR* Which, const FMacePullLane& Lane, float LaneLengthUU)
+	{
+		UE_LOG(LogTraceGame, Display,
+			TEXT("[MACEVERIFY]   %s lane: from %s along yaw %.0f, swept clear for %.0f uu with her own capsule "
+			     "(+12 uu) — candidate %d of %d%s%s"),
+			Which, *Lane.Start.ToCompactString(), Lane.Direction.Rotation().Yaw, LaneLengthUU,
+			Lane.CandidatesTried, MacePullLaneCandidates,
+			Lane.FirstRefusal.IsEmpty() ? TEXT("") : TEXT("; the original lane was blocked by "),
+			*Lane.FirstRefusal);
+	}
 
 	/** Drops the pawn into a clean fall from @p Height above where it is. */
 	void StageFall(ATraceCharacter* MyPawn, float Height)
@@ -1274,12 +1405,28 @@ namespace TraceMaceOysterVerify
 			// ---- Phase 6/7: the pull, from an explicit anchor -------------------------------------------
 			if (State->Phase == 6)
 			{
-				StageFall(MyPawn, 900.f);
-
 				// An anchor 1000 uu out and level, so the pull is measurable and the arrival is
 				// unambiguous. The aim sweep is exercised separately above; what is under test here is
-				// the pull, and it must not depend on a bot happening to face a wall.
-				const FVector Anchor = MyPawn->GetActorLocation() + MyPawn->GetActorForwardVector() * 1000.f;
+				// the pull, and it must not depend on which wall she happened to spawn beside — so the
+				// lane is swept clear first. See FindClearMacePullLane for the run that needed it.
+				FMacePullLane Lane;
+				if (!FindClearMacePullLane(TickWorld, MyPawn, State->HomeLocation, MyPawn->GetActorRotation().Yaw,
+						1000.f, Lane))
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[MACEVERIFY] --- ACTIVATED: \"reactivating pulls her toward it AT THE MOMENTUM CEILING\""));
+					State->Invalidate(FString::Printf(
+						TEXT("the pull was not measured: no clear 1000 uu lane in %d candidates around %s (first "
+						     "blocked by %s)"),
+						Lane.CandidatesTried, *State->HomeLocation.ToCompactString(), *Lane.FirstRefusal));
+					State->Phase = 8;
+					State->PhaseStartReal = NowReal;
+					return true;
+				}
+				StageOnLane(MyPawn, Lane);
+				ReportMacePullLane(TEXT("pull"), Lane, 1000.f);
+
+				const FVector Anchor = Lane.Start + Lane.Direction * 1000.f;
 				ATraceMaceSpike* NewSpike = MaceSet->DebugThrowSpikeAt(Anchor, /*TravelSpeedOverride*/ 0.f);
 				State->bSpikeEmbedded = (NewSpike != nullptr) && NewSpike->IsEmbedded();
 				State->PullStartDistance = FVector::Dist(MyPawn->GetActorLocation(), Anchor);
@@ -1343,8 +1490,25 @@ namespace TraceMaceOysterVerify
 			// ---- Phase 8/9: "any movement input cancels the pull and removes the spike" ------------------
 			if (State->Phase == 8)
 			{
-				StageFall(MyPawn, 900.f);
-				const FVector Anchor = MyPawn->GetActorLocation() + MyPawn->GetActorForwardVector() * 3000.f;
+				// The same sweep, and it matters here too: the check below reads a stop inside 200 ms as
+				// the INPUT cancelling it, and says that "rules out a wall bounce". It only does if there
+				// is no wall in the first 550 uu (2750 uu/s x 0.2 s), so 1000 uu of the lane is swept.
+				FMacePullLane Lane;
+				if (!FindClearMacePullLane(TickWorld, MyPawn, State->HomeLocation, MyPawn->GetActorRotation().Yaw,
+						1000.f, Lane))
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[MACEVERIFY] --- ACTIVATED: \"ANY movement input cancels the pull and removes the spike\""));
+					State->Invalidate(FString::Printf(
+						TEXT("the cancel was not measured: no clear 1000 uu lane in %d candidates (first blocked by %s)"),
+						Lane.CandidatesTried, *Lane.FirstRefusal));
+					State->Phase = 10;
+					State->PhaseStartReal = NowReal;
+					return true;
+				}
+				StageOnLane(MyPawn, Lane);
+				ReportMacePullLane(TEXT("cancel"), Lane, 1000.f);
+				const FVector Anchor = Lane.Start + Lane.Direction * 3000.f;
 				MaceSet->DebugThrowSpikeAt(Anchor, 0.f);
 				MaceSet->RequestSpikePull();
 				State->bCancelPullFired = MaceSet->IsPulling();
@@ -1395,9 +1559,21 @@ namespace TraceMaceOysterVerify
 
 			// ---- Verdict -------------------------------------------------------------------------------
 			UE_LOG(LogTraceGame, Display, TEXT("[MACEVERIFY] Aim sweep from the test position: %s"), *State->AimSweepReport);
-			UE_LOG(LogTraceGame, Display, TEXT("[MACEVERIFY] ===== %d passed, %d failed. ====="), State->Passed, State->Failed);
-			UE_LOG(LogTraceGame, Display, TEXT("[MACEVERIFY] VERDICT: %s"),
-				(State->Failed == 0 && State->Passed > 0) ? TEXT("PASS") : TEXT("*** FAIL ***"));
+			UE_LOG(LogTraceGame, Display, TEXT("[MACEVERIFY] ===== %d passed, %d failed, %d not measured. ====="),
+				State->Passed, State->Failed, State->Invalid);
+			if (State->Failed > 0 || State->Passed == 0)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[MACEVERIFY] VERDICT: *** FAIL ***"));
+			}
+			else if (State->Invalid > 0)
+			{
+				// Not a pass: part of §6 went unmeasured, and a green here would hide which part.
+				UE_LOG(LogTraceGame, Warning, TEXT("[MACEVERIFY] VERDICT: INVALID — %s"), *State->InvalidReasons);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[MACEVERIFY] VERDICT: PASS"));
+			}
 			return false;
 		})));
 	}
