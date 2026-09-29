@@ -51,6 +51,7 @@
 
 #include "UI/Text/TraceText.h"
 #include "UI/Widgets/Menu/TraceKitMotion.h"   // FTraceKitFade — the kit's one open/close fade (P10)
+#include "UI/Widgets/Menu/TraceKitPageClock.h"   // FTraceKitPageClockDraw — DrawPageClock's record
 #include "UI/Widgets/Menu/TraceMenuArtStyle.h"
 
 class AHUD;
@@ -480,18 +481,26 @@ namespace TraceMenuKit
 	/** The two pages' side margin. The countdown's box is right-aligned to it. */
 	static constexpr float PageMarginPx = 54.f;
 
-	/** The countdown's value box height, and the type size of its TIME label. */
+	/** The countdown's value box height, the type size of its TIME label, and the gap between them. */
 	static constexpr float PageClockBoxPx = 44.f;
 	static constexpr float PageClockLabelPx = 18.f;
+	static constexpr float PageClockLabelGapPx = 14.f;
 
 	/**
 	 * THE PAGES' COUNTDOWN: TIME, then the whole seconds left in the kit's value box, right-aligned to
-	 * the page margin with its caps on the title's line. The number pulses amber for the last five
-	 * seconds. The loadout page draws it in its header, and the pause menu draws it in the same place
-	 * over either page, so pausing never hides the clock that will close the page underneath. Honours
-	 * the current opacity. Returns the left edge of what it drew; nothing is drawn for @p SecondsLeft < 0.
+	 * the page margin, with its caps centred @p CapMidPx (1080p px) from the top: the title's line,
+	 * unless a page on a narrow window has moved it under its title. The number pulses amber for the
+	 * last five seconds. Team select and the loadout page draw it in their headers, and the pause menu
+	 * draws it in the same place over either page, so pausing never hides the clock that will close
+	 * the page underneath, and neither pausing nor the turn from one page to the other changes its form.
+	 * Honours the current opacity. Returns the left edge of what it drew; nothing is drawn for
+	 * @p SecondsLeft < 0. @p OutDrawn, when given, is what was drawn (reset when nothing was).
 	 */
-	TRACE_API float DrawPageClock(AHUD* HUD, float ViewW, float UIScale, float SecondsLeft, float NowSeconds);
+	TRACE_API float DrawPageClock(AHUD* HUD, float ViewW, float UIScale, float SecondsLeft, float NowSeconds,
+		float CapMidPx = PageTitleCapMidPx, FTraceKitPageClockDraw* OutDrawn = nullptr);
+
+	/** How wide DrawPageClock draws (TIME, the gap, the box) at @p UIScale, in screen px. */
+	TRACE_API float PageClockWidth(float UIScale);
 
 	/**
 	 * The slider's trough (T_MenuSliderTrack), @p H being the SPRITE's height (halo included; the

@@ -38,6 +38,7 @@
 #include "UI/Text/TraceTextWeight.h"      // ETraceTextWeight - which FACE a string is set in (v26 §2)
 #include "UI/TraceLoadoutSelect.h"   // the loadout library editor this menu hosts
 #include "UI/Widgets/Menu/TraceKitMotion.h"   // FTraceKitFade — the overlay's open/close fade (P10)
+#include "UI/Widgets/Menu/TraceKitPageClock.h"   // FTraceKitPageClockDraw — the page clock it draws
 
 class AHUD;
 class APawn;
@@ -337,12 +338,17 @@ public:
 
 	/**
 	 * The seconds left on the clock of the page under the overlay (team select's, or the loadout page's
-	 * select deadline), or < 0 when that page has none. Set by the host every frame before Tick. The
-	 * opaque scrim above hides the page, but its clock and auto-send keep running, so the overlay draws
-	 * that clock where the page had it (TraceMenuKit::DrawPageClock): a paused player can see the page
-	 * is about to close under them.
+	 * select deadline), or < 0 when that page has none, and the line the page draws that clock on
+	 * (1080p px from the top). Set by the host every frame before Tick. The opaque scrim above hides the
+	 * page, but its clock and auto-send keep running, so the overlay draws that clock where and as the
+	 * page had it (TraceMenuKit::DrawPageClock, the same call the pages make): a paused player can see
+	 * the page is about to close under them, and the clock does not change when the menu opens.
 	 */
-	void SetUnderPageClock(float SecondsLeft) { UnderPageSecondsLeft = SecondsLeft; }
+	void SetUnderPageClock(float SecondsLeft, float CapMidPx)
+	{
+		UnderPageSecondsLeft = SecondsLeft;
+		UnderPageClockCapMidPx = CapMidPx;
+	}
 
 	/** The seconds the last frame's page clock showed, or < 0 when none was drawn. A harness reads it. */
 	float GetDrawnPageClock() const { return DrawnPageClockSeconds; }
@@ -1186,9 +1192,13 @@ private:
 
 	/** See SetUnderPageClock. */
 	float UnderPageSecondsLeft = -1.f;
+	float UnderPageClockCapMidPx = 56.f;
 
 	/** See GetDrawnPageClock. */
 	float DrawnPageClockSeconds = -1.f;
+
+	/** The page clock the last frame drew over the page, as the kit drew it. Trace.Menu.Verify reads it. */
+	FTraceKitPageClockDraw DrawnPageClockPlace;
 
 	// ---- P10: the open/close fade ------------------------------------------------------------------
 

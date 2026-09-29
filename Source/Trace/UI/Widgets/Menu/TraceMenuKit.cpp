@@ -848,8 +848,44 @@ FLinearColor TraceMenuKit::DebugLastStrokeColor()
 }
 #endif
 
-float TraceMenuKit::DrawPageClock(AHUD* HUD, float ViewW, float UIScale, float SecondsLeft, float NowSeconds)
+namespace TraceMenuKitFile
 {
+	/** DrawPageClock's value box width at @p UIScale: PageClockBoxPx tall, in the value frame's proportions. */
+	static float PageClockBoxWidth(float UIScale)
+	{
+		return TraceMenuKit::PageClockBoxPx * UIScale
+			* (TraceMenuArtStyle::ValueFrame.PlateW / TraceMenuArtStyle::ValueFrame.PlateH);
+	}
+
+	/** DrawPageClock's TIME label at @p UIScale, right-aligned against the box. */
+	static TraceText::FStyle PageClockLabelStyle(float UIScale)
+	{
+		TraceText::FStyle LabelStyle(TraceMenuKit::PageClockLabelPx * UIScale, TraceMenuKit::FurnitureUnselected,
+			ETraceTextWeight::Light);
+		LabelStyle.HAlign = TraceText::EHAlign::Right;
+		return LabelStyle;
+	}
+}
+
+float TraceMenuKit::PageClockWidth(float UIScale)
+{
+	const float BoxW = TraceMenuKitFile::PageClockBoxWidth(UIScale);
+	const FString& ClockLabel = TRACE_TEXT("LOADOUT.TIMER_LABEL", "TIME");
+	if (ClockLabel.IsEmpty())
+	{
+		return BoxW;
+	}
+	return BoxW + PageClockLabelGapPx * UIScale
+		+ TraceText::MeasureWidth(ClockLabel, TraceMenuKitFile::PageClockLabelStyle(UIScale));
+}
+
+float TraceMenuKit::DrawPageClock(AHUD* HUD, float ViewW, float UIScale, float SecondsLeft, float NowSeconds,
+	float CapMidPx, FTraceKitPageClockDraw* OutDrawn)
+{
+	if (OutDrawn != nullptr)
+	{
+		*OutDrawn = FTraceKitPageClockDraw();
+	}
 	const float ClockRight = ViewW - PageMarginPx * UIScale;
 	if (HUD == nullptr || SecondsLeft < 0.f)
 	{
@@ -857,29 +893,37 @@ float TraceMenuKit::DrawPageClock(AHUD* HUD, float ViewW, float UIScale, float S
 	}
 
 	const float BoxH = PageClockBoxPx * UIScale;
-	const float BoxW = BoxH * (TraceMenuArtStyle::ValueFrame.PlateW / TraceMenuArtStyle::ValueFrame.PlateH);
+	const float BoxW = TraceMenuKitFile::PageClockBoxWidth(UIScale);
 	const float BoxX = ClockRight - BoxW;
-	const float ClockCapMid = PageTitleCapMidPx * UIScale;
+	const float ClockCapMid = CapMidPx * UIScale;
 
-	// The last five seconds pulse in the kit's amber, as the team screen's countdown does.
+	// The last five seconds pulse in the kit's amber.
 	FLinearColor Ink = TraceMenuArtStyle::WordDefault;
 	if (SecondsLeft <= 5.f)
 	{
 		const FLinearColor Amber = TraceMenuArtStyle::AmberLifted();
 		Ink = FLinearColor(Amber.R, Amber.G, Amber.B, 0.72f + 0.28f * FMath::Sin(NowSeconds * 9.f));
 	}
-	DrawValueBox(HUD, BoxX, ClockCapMid - BoxH * 0.5f, BoxW, BoxH,
-		FString::FromInt(FMath::Max(0, FMath::CeilToInt(SecondsLeft))), Ink);
+	const int32 WholeSeconds = FMath::Max(0, FMath::CeilToInt(SecondsLeft));
+	DrawValueBox(HUD, BoxX, ClockCapMid - BoxH * 0.5f, BoxW, BoxH, FString::FromInt(WholeSeconds), Ink);
 
+	float ClockLeft = BoxX;
 	const FString& ClockLabel = TRACE_TEXT("LOADOUT.TIMER_LABEL", "TIME");
-	if (ClockLabel.IsEmpty())
+	if (!ClockLabel.IsEmpty())
 	{
-		return BoxX;
+		const float LabelRight = BoxX - PageClockLabelGapPx * UIScale;
+		ClockLeft = LabelRight - DrawTextCapCentered(HUD, ClockLabel, LabelRight, ClockCapMid,
+			TraceMenuKitFile::PageClockLabelStyle(UIScale));
 	}
-	TraceText::FStyle LabelStyle(PageClockLabelPx * UIScale, FurnitureUnselected, ETraceTextWeight::Light);
-	LabelStyle.HAlign = TraceText::EHAlign::Right;
-	const float LabelRight = BoxX - 14.f * UIScale;
-	return LabelRight - DrawTextCapCentered(HUD, ClockLabel, LabelRight, ClockCapMid, LabelStyle);
+
+	if (OutDrawn != nullptr)
+	{
+		const float PerDesignPx = 1.f / FMath::Max(UIScale, KINDA_SMALL_NUMBER);
+		OutDrawn->ShownSeconds = WholeSeconds;
+		OutDrawn->LeftPx = ClockLeft * PerDesignPx;
+		OutDrawn->CapMidPx = CapMidPx;
+	}
+	return ClockLeft;
 }
 
 void TraceMenuKit::DrawSliderTrack(AHUD* HUD, float X, float Y, float W, float H, const FLinearColor& Tint)

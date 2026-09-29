@@ -42,6 +42,7 @@
 
 #if !UE_BUILD_SHIPPING
 #include "Core/TracePlayerController.h"  // Trace.Menu.Verify's TEAM checks ask the rules and the team screen
+#include "UI/TraceHUD.h"                 // Trace.Menu.Verify's TEAM checks read the pages' clocks off the draw record
 #include "Core/TracePlayerState.h"
 #include "Modes/TracePracticeRange.h"    // Trace.Menu.Verify: the range's pause root has no TEAM row
 #endif
@@ -2339,6 +2340,7 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 
 	// Redrawn below by whichever path draws this frame (Draw, or over the loadout editor).
 	DrawnPageClockSeconds = -1.f;
+	DrawnPageClockPlace = FTraceKitPageClockDraw();
 
 	if (HUD == nullptr || InViewW <= 0.f || InViewH <= 0.f)
 	{
@@ -4858,15 +4860,18 @@ void FTraceOptionsMenu::DrawUnderPageClock(AHUD* HUD)
 	// scrim is opaque, but the page's clock and its auto-send keep running underneath: a player who
 	// paused with twelve seconds left and sat in SETTINGS used to come back to a page that had sent
 	// their picks and closed, with no clock on screen at any point. So the page's own clock is drawn
-	// where the page had it, the kit's TIME box in the top-right corner, at the page's share of the
-	// black (a page closing under the menu takes its clock with it).
+	// where and as the page had it: the same kit call both pages make (TIME and the seconds in a value
+	// box, top right), on the line the page put it on, at the page's share of the black (a page closing
+	// under the menu takes its clock with it).
 	DrawnPageClockSeconds = -1.f;
+	DrawnPageClockPlace = FTraceKitPageClockDraw();
 	if (HUD == nullptr || !OnResume || UnderPageAlpha <= 0.f || UnderPageSecondsLeft < 0.f)
 	{
 		return;
 	}
 	TraceMenuKit::FScopedOpacity PageShare(UnderPageAlpha);
-	TraceMenuKit::DrawPageClock(HUD, ViewW, UIScale, UnderPageSecondsLeft, Now);
+	TraceMenuKit::DrawPageClock(HUD, ViewW, UIScale, UnderPageSecondsLeft, Now, UnderPageClockCapMidPx,
+		&DrawnPageClockPlace);
 	DrawnPageClockSeconds = UnderPageSecondsLeft;
 }
 
@@ -5788,6 +5793,45 @@ ETraceTextWeight FTraceOptionsMenu::FaceForAction() const
 // Each check was seen to FAIL against the code it replaced before it was trusted (the commit that
 // added it says how).
 
+/**
+ * The TEAM checks' page clocks: what team select and the loadout page drew as their clock this frame,
+ * read off the HUD's draw record (the kit writes it, so a countdown drawn any other way reads as none).
+ */
+namespace TraceOptionsMenuVerifyClock
+{
+	static const ATraceHUD::FHudKitRecord* KitRecord(const APlayerController* PC)
+	{
+		const ATraceHUD* const TraceHud = (PC != nullptr) ? Cast<ATraceHUD>(PC->GetHUD()) : nullptr;
+		return (TraceHud != nullptr) ? &TraceHud->GetHudKitRecord() : nullptr;
+	}
+
+	static FTraceKitPageClockDraw TeamPageClock(const APlayerController* PC)
+	{
+		const ATraceHUD::FHudKitRecord* const Rec = KitRecord(PC);
+		return (Rec != nullptr) ? Rec->TeamClock : FTraceKitPageClockDraw();
+	}
+
+	static FTraceKitPageClockDraw LoadoutPageClock(const APlayerController* PC)
+	{
+		const ATraceHUD::FHudKitRecord* const Rec = KitRecord(PC);
+		return (Rec != nullptr) ? Rec->LoadoutClock : FTraceKitPageClockDraw();
+	}
+
+	/** Both are the kit's TIME box, starting at the same x on the same line (a tick apart at most). */
+	static bool Same(const FTraceKitPageClockDraw& A, const FTraceKitPageClockDraw& B)
+	{
+		return A.IsDrawn() && B.IsDrawn() && FMath::Abs(A.ShownSeconds - B.ShownSeconds) <= 1
+			&& FMath::IsNearlyEqual(A.LeftPx, B.LeftPx, 0.5f) && FMath::IsNearlyEqual(A.CapMidPx, B.CapMidPx, 0.5f);
+	}
+
+	static FString Describe(const FTraceKitPageClockDraw& Clock)
+	{
+		return Clock.IsDrawn()
+			? FString::Printf(TEXT("TIME [%d] from x %.1f on line %.1f"), Clock.ShownSeconds, Clock.LeftPx, Clock.CapMidPx)
+			: FString(TEXT("no kit TIME box"));
+	}
+}
+
 void FTraceOptionsMenu::DebugBeginVerify(bool bTeamRowOnly)
 {
 	if (VerifyStep != 0)
@@ -6580,6 +6624,11 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 			VerifyCheck(TEXT("T. ...and the loadout page's TIME is still on screen, above the black"),
 				PageLeft >= 0.f && DrawnPageClockSeconds >= 0.f && FMath::Abs(DrawnPageClockSeconds - PageLeft) < 0.5f,
 				FString::Printf(TEXT("the page's clock %.1f s, the menu shows %.1f s (-1: none)"), PageLeft, DrawnPageClockSeconds));
+			const FTraceKitPageClockDraw PageClock = TraceOptionsMenuVerifyClock::LoadoutPageClock(PC);
+			VerifyCheck(TEXT("T. ...drawn as the loadout page draws it: the same TIME box, in the same place"),
+				TraceOptionsMenuVerifyClock::Same(PageClock, DrawnPageClockPlace),
+				FString::Printf(TEXT("the page drew %s; the menu drew %s"), *TraceOptionsMenuVerifyClock::Describe(PageClock),
+					*TraceOptionsMenuVerifyClock::Describe(DrawnPageClockPlace)));
 		}
 		if (IsOpen())
 		{
@@ -6644,6 +6693,20 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 			return;
 		}
 
+		// THE TEAM SCREEN'S CLOCK IS THE KIT'S TIME BOX, the loadout page's: the one the menu opened next
+		// must keep. It was a line of its own ("KEEPING YOUR TEAM IN n"), which the menu swapped for the box.
+		{
+			const float PageLeft = (TeamPC->TeamSelectDeadlineServerTime > 0.f) ? TeamPC->GetTeamSelectTimeRemaining() : -1.f;
+			const FTraceKitPageClockDraw PageClock = TraceOptionsMenuVerifyClock::TeamPageClock(PC);
+			VerifyCheck(PageLeft >= 0.f
+					? TEXT("T. the team screen's clock is the kit's TIME box, the loadout page's")
+					: TEXT("T. with no deadline the team screen draws no clock"),
+				PageLeft >= 0.f
+					? (PageClock.IsDrawn() && FMath::Abs(PageClock.ShownSeconds - FMath::CeilToInt(PageLeft)) <= 1)
+					: !PageClock.IsDrawn(),
+				FString::Printf(TEXT("%.1f s left; the page drew %s"), PageLeft, *TraceOptionsMenuVerifyClock::Describe(PageClock)));
+		}
+
 		// ...and with it up, MENU again: the pause root over the team screen.
 		TraceOptionsRebindProof::InjectViewportKeyAtFrameStart(EKeys::Gamepad_Special_Right, IE_Pressed);
 		Next(107, 3);
@@ -6674,6 +6737,15 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 					: TEXT("T. ...and with no clock on the team screen, the menu invents none"),
 				PageLeft >= 0.f ? bShown : DrawnPageClockSeconds < 0.f,
 				FString::Printf(TEXT("the page's clock %.1f s, the menu shows %.1f s (-1: none)"), PageLeft, DrawnPageClockSeconds));
+			if (PageLeft >= 0.f)
+			{
+				// Not just the number: the team screen's own TIME box, where the team screen draws it.
+				const FTraceKitPageClockDraw PageClock = TraceOptionsMenuVerifyClock::TeamPageClock(PC);
+				VerifyCheck(TEXT("T. ...drawn as the team screen draws it: the same TIME box, in the same place"),
+					TraceOptionsMenuVerifyClock::Same(PageClock, DrawnPageClockPlace),
+					FString::Printf(TEXT("the page drew %s; the menu drew %s"), *TraceOptionsMenuVerifyClock::Describe(PageClock),
+						*TraceOptionsMenuVerifyClock::Describe(DrawnPageClockPlace)));
+			}
 		}
 		TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_DPad_Down, IE_Pressed);
 		Next(109, 2);

@@ -55,6 +55,7 @@
 
 #include "TraceTypes.h"   // ETraceTeam
 #include "UI/Widgets/Menu/TraceKitMotion.h"   // FTraceKitFade — the page's open/close fade (P10)
+#include "UI/Widgets/Menu/TraceKitPageClock.h"   // FTraceKitPageClockDraw — what the page's clock drew
 
 class AHUD;
 class ATracePlayerController;
@@ -81,6 +82,16 @@ public:
 	 * the fade: input, the pointer and every rule still follow the replicated flag alone.
 	 */
 	float GetFadeAlpha() const { return Fade.Alpha(); }
+
+	/**
+	 * The line the page's clock (TIME and its box, top right) is centred on, in 1080p px from the top:
+	 * the title's, or under the title on a window too narrow for both. The pause menu draws the clock
+	 * on it over this page, so pausing does not move the clock.
+	 */
+	float GetClockCapMidPx() const { return ClockCapMidPx; }
+
+	/** The page's clock as the last Draw drew it (none when the page has no deadline). A harness reads it. */
+	const FTraceKitPageClockDraw& GetDrawnClock() const { return DrawnClock; }
 
 	/**
 	 * Poll input and draw. Call exactly once per frame, before the character select's own draw.
@@ -188,6 +199,12 @@ private:
 	 * start on the other team, which made that same press a team switch.
 	 */
 	int32 Highlighted = RowBlue;
+
+	/** See GetClockCapMidPx. Set by every Draw; the title's line (TraceMenuKit::PageTitleCapMidPx) before the first. */
+	float ClockCapMidPx = 56.f;
+
+	/** See GetDrawnClock. */
+	FTraceKitPageClockDraw DrawnClock;
 
 	/** A refusal this screen made itself (it does not send what the balance rule already refuses). */
 	FString LocalVerdict;

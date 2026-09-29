@@ -1611,6 +1611,8 @@ void ATraceHUD::DrawHUD()
 		HudKitRecord.LoadoutTitleCapPx = LoadoutSelect.GetDebugTitleCapPx();
 		HudKitRecord.LoadoutTitleCapMidPx = LoadoutSelect.GetDebugTitleCapMidPx();
 		HudKitRecord.LoadoutTitleTrackPx = LoadoutSelect.GetDebugTitleTrackPx();
+		HudKitRecord.TeamClock = TeamPage.GetDrawnClock();
+		HudKitRecord.LoadoutClock = LoadoutSelect.GetDrawnClock();
 	}
 #endif
 
@@ -1623,12 +1625,15 @@ void ATraceHUD::DrawHUD()
 	{
 		TRACE_PERF_SCOPE(HudPages);
 		float PageSecondsLeft = -1.f;
+		float PageClockCapMidPx = TraceMenuKit::PageTitleCapMidPx;
 		if (CharacterSelect.IsTeamSelectOpen())
 		{
 			if (TracePC != nullptr && TracePC->TeamSelectDeadlineServerTime > 0.f)
 			{
 				PageSecondsLeft = TracePC->GetTeamSelectTimeRemaining();
 			}
+			// Under the title, where a narrow window has moved team select's clock.
+			PageClockCapMidPx = CharacterSelect.GetTeamSelectClockCapMidPx();
 		}
 		else if ((LoadoutSelect.IsOpen() || CharacterSelect.IsOpen()) && LocalPS != nullptr
 			&& LocalPS->CharacterSelectDeadlineServerTime > 0.f)
@@ -1636,7 +1641,7 @@ void ATraceHUD::DrawHUD()
 			PageSecondsLeft = LocalPS->GetCharacterSelectTimeRemaining();
 		}
 		PauseMenu.SetUnderPageAlpha(PageBackdropFade.Alpha());
-		PauseMenu.SetUnderPageClock(PageSecondsLeft);
+		PauseMenu.SetUnderPageClock(PageSecondsLeft, PageClockCapMidPx);
 		PauseMenu.Tick(this, TracePC.Get(), ViewW, ViewH, UIScale, Now);
 	}
 
@@ -10780,7 +10785,8 @@ namespace TraceHUDKitVerify
 // cvar — and reads every drawn frame's fades out of the HUD's draw record. It claims:
 //
 //   PAGE TURN   team select fades out while the loadout page fades in, and the black under them never
-//               lets the arena through (combined coverage stays 1) — no match chrome in between;
+//               lets the arena through (combined coverage stays 1) — no match chrome in between; the
+//               title and the clock (TIME and its box) keep their form and place across the turn;
 //   LOCK IN     the loadout page fades off the match, and the match comes back WITH it (a crossfade),
 //               finishing in about FadeOutSeconds of real time;
 //   PAUSE       the pause menu fades in and out in about FadeIn/OutSeconds of REAL time while the world
@@ -10844,6 +10850,10 @@ namespace TraceHUDFadeVerify
 		float TeamTitleCap = 0.f;
 		float TeamTitleMid = 0.f;
 		float TeamTitleTrack = 0.f;
+
+		/** Team select's clock as the settled page drew it, and whether the page had a deadline to show. */
+		FTraceKitPageClockDraw TeamClock;
+		bool bTeamDeadline = false;
 	};
 
 	/** Feeds one drawn frame to the rate check for a fade heading to @p bTarget over @p Seconds. */
@@ -10973,6 +10983,9 @@ namespace TraceHUDFadeVerify
 				Run.TeamTitleCap = Rec.TeamTitleCapPx;
 				Run.TeamTitleMid = Rec.TeamTitleCapMidPx;
 				Run.TeamTitleTrack = Rec.TeamTitleTrackPx;
+				Run.TeamClock = Rec.TeamClock;
+				const ATracePlayerController* const ClockPC = Cast<ATracePlayerController>(HudPtr->PlayerOwner);
+				Run.bTeamDeadline = ClockPC != nullptr && ClockPC->TeamSelectDeadlineServerTime > 0.f;
 				Enter(Run, EStep::PageTurn);
 				Exec(WorldPtr, TEXT("Trace.Teams.Close"));
 				return true;
@@ -11022,6 +11035,30 @@ namespace TraceHUDFadeVerify
 					FString::Printf(TEXT("team select cap %.1f px on line %.1f, tracking %.1f; loadout page cap %.1f px on line %.1f, tracking %.1f"),
 						Run.TeamTitleCap, Run.TeamTitleMid, Run.TeamTitleTrack, Rec.LoadoutTitleCapPx,
 						Rec.LoadoutTitleCapMidPx, Rec.LoadoutTitleTrackPx));
+				{
+					// ...and so does the clock: the same kit TIME box, in the same place. Team select's
+					// used to be a line of its own, which the turn swapped for the loadout page's box.
+					const ATracePlayerController* const ClockPC = Cast<ATracePlayerController>(HudPtr->PlayerOwner);
+					const ATracePlayerState* const ClockPS = (ClockPC != nullptr) ? ClockPC->GetTracePlayerState() : nullptr;
+					const bool bLoadoutDeadline = ClockPS != nullptr && ClockPS->CharacterSelectDeadlineServerTime > 0.f;
+					const FString ClockDetail = FString::Printf(
+						TEXT("team select: TIME box %d s from x %.1f on line %.1f; loadout page: %d s from x %.1f on line %.1f (-1: no kit clock)"),
+						Run.TeamClock.ShownSeconds, Run.TeamClock.LeftPx, Run.TeamClock.CapMidPx,
+						Rec.LoadoutClock.ShownSeconds, Rec.LoadoutClock.LeftPx, Rec.LoadoutClock.CapMidPx);
+					if (Run.bTeamDeadline && bLoadoutDeadline)
+					{
+						Report(Run, TEXT("PAGE TURN: the clock keeps its form and place (the kit's TIME box)"),
+							Run.TeamClock.IsDrawn() && Rec.LoadoutClock.IsDrawn()
+								&& FMath::IsNearlyEqual(Run.TeamClock.LeftPx, Rec.LoadoutClock.LeftPx, 0.5f)
+								&& FMath::IsNearlyEqual(Run.TeamClock.CapMidPx, Rec.LoadoutClock.CapMidPx, 0.5f),
+							ClockDetail);
+					}
+					else
+					{
+						UE_LOG(LogTraceGame, Display, TEXT("[FadeVerify]   --   PAGE TURN clock not compared: team deadline %d, loadout deadline %d (%s)"),
+							Run.bTeamDeadline ? 1 : 0, bLoadoutDeadline ? 1 : 0, *ClockDetail);
+					}
+				}
 				Enter(Run, EStep::Settle);
 			}
 			else if (SinceStep > 6.0)

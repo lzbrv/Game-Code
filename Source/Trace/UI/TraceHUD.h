@@ -39,6 +39,7 @@
 #include "UI/TraceOptionsMenu.h"  // FTraceOptionsMenu
 #include "UI/Widgets/HUD/TraceHudCornerData.h" // FTraceHudCornerState — spec v17 §4 (step 4b)
 #include "UI/Widgets/Menu/TraceKitMotion.h"   // FTraceKitFade — the overlays' open/close fades (P10)
+#include "UI/Widgets/Menu/TraceKitPageClock.h"   // FTraceKitPageClockDraw — the pages' clocks, in the draw record
 
 #include "TraceHUD.generated.h"
 
@@ -217,6 +218,14 @@ public:
 		float LoadoutTitleCapPx = 0.f;
 		float LoadoutTitleCapMidPx = 0.f;
 		float LoadoutTitleTrackPx = 0.f;
+
+		/**
+		 * The two pages' clocks (TIME and its box, top right) as each page last drew it, written by the
+		 * kit's DrawPageClock itself: none for a page with no deadline, or whose countdown took any
+		 * other path. The page turn, and the pause menu over either page, must not change them.
+		 */
+		FTraceKitPageClockDraw TeamClock;
+		FTraceKitPageClockDraw LoadoutClock;
 
 		/** The top score bar, the crosshair, and how many kill-feed rows drew. */
 		bool bTopPanel = false;

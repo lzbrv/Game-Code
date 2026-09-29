@@ -115,6 +115,9 @@ public:
 	/** P10: the team page's fade this frame (0..1), fading out included. See FTraceTeamSelect::GetFadeAlpha. */
 	float GetTeamSelectFadeAlpha() const { return TeamSelect.GetFadeAlpha(); }
 
+	/** The line the team page's clock sits on, for the pause menu over it. See FTraceTeamSelect::GetClockCapMidPx. */
+	float GetTeamSelectClockCapMidPx() const { return TeamSelect.GetClockCapMidPx(); }
+
 #if !UE_BUILD_SHIPPING
 	/** The team page itself, read-only, for a harness that reads what it drew. */
 	const FTraceTeamSelect& GetTeamSelectForDebug() const { return TeamSelect; }

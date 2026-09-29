@@ -83,6 +83,7 @@
 #include "TraceTypes.h"   // ETraceMatchState
 #include "UI/Text/TraceTextWeight.h"
 #include "UI/Widgets/Menu/TraceKitMotion.h"   // FTraceKitFade — the page's open/close fade (P10)
+#include "UI/Widgets/Menu/TraceKitPageClock.h"   // FTraceKitPageClockDraw — what the page's clock drew
 
 class AHUD;
 class APlayerController;
@@ -281,6 +282,9 @@ struct TRACE_API FTraceLoadoutSelect
 	const FString& DebugTitle() const { return PageTitle; }
 	bool DebugHalfTimeHeader() const { return bHalfTimeHeader; }
 
+	/** The page's clock (TIME, top right) as the last draw drew it; none without a deadline. A harness reads it. */
+	const FTraceKitPageClockDraw& GetDrawnClock() const { return DrawnClock; }
+
 #if !UE_BUILD_SHIPPING
 	/**
 	 * The title as the last draw set it, in 1080p design px: its cap height, where its caps are
@@ -391,6 +395,9 @@ private:
 
 	/** The in-match title (BUILD YOUR LOADOUT, or HALF TIME in the break), chosen by Tick. */
 	FString PageTitle;
+
+	/** See GetDrawnClock. */
+	FTraceKitPageClockDraw DrawnClock;
 
 #if !UE_BUILD_SHIPPING
 	/** See GetDebugTitleCapPx. */

@@ -57,7 +57,7 @@ namespace TraceTeamSelectStyle
  * exactly like TraceSelectLayout in the character select.
  *
  * The vertical budget adds up to 1080:
- *   34..104 title and countdown | 214..654 the two plates | 700 the verdict line | 960 the key
+ *   34..104 title and TIME | 214..654 the two plates | 700 the verdict line | 960 the key
  *   legend, and 1002 the pad's once a pad has been seen — the loadout page's legend lines exactly, so
  *   the page turn does not move the footer. The plates were 570 tall for at most five names and left
  *   their lower 40 % empty.
@@ -76,7 +76,7 @@ namespace TraceTeamSelectLayout
 	constexpr float TitleCapMid = TraceMenuKit::PageTitleCapMidPx;
 	constexpr float TitleCap    = TraceMenuKit::PageTitleCapPx;
 
-	/** The gap between the title's caps and the countdown's when the countdown drops under the title. */
+	/** The gap between the title's caps and the TIME box when a narrow window drops the clock under it. */
 	constexpr float CountUnderGap = 16.f;
 
 	constexpr float PlateTop    = 214.f;
@@ -748,36 +748,26 @@ void FTraceTeamSelect::Draw(AHUD* HUD, ATracePlayerController* PC, ATracePlayerS
 	DebugTitleTrackPx = 0.f;
 #endif
 
-	// The close-out countdown, right-aligned against the margin and sat on the title's cap line. A
-	// timeout the player cannot see is indistinguishable from the game deciding at random for them.
+	// THE CLOSE-OUT COUNTDOWN: the kit's page clock, TIME and the seconds in a value box, right-aligned
+	// against the margin on the title's line. A timeout the player cannot see is indistinguishable from
+	// the game deciding at random for them. It is the loadout page's clock, drawn by the same kit call
+	// in the same place, and the pause menu draws it there too over this page (GetClockCapMidPx), so
+	// neither pausing nor the turn to the loadout page changes it. It was a line of its own, "KEEPING
+	// YOUR TEAM IN n", which both of those swapped for the box and back.
+	ClockCapMidPx = TraceMenuKit::PageTitleCapMidPx;
+	DrawnClock = FTraceKitPageClockDraw();
 	if (PC != nullptr && PC->TeamSelectDeadlineServerTime > 0.f)
 	{
-		const float Remaining = PC->GetTeamSelectTimeRemaining();
-		const bool bUrgent = Remaining <= 5.f;
-		const FLinearColor Amber = TraceMenuArtStyle::AmberLifted();
-		const FLinearColor CountColor = bUrgent
-			? TraceTeamSelectStyle::WithAlpha(Amber, 0.72f + 0.28f * FMath::Sin(AnimNow * 9.f))
-			: TraceMenuKit::FurnitureUnselected;
-
-		TraceText::FStyle CountStyle(TraceTeamSelectLayout::SizeLabel * S, CountColor, ETraceTextWeight::Light);
-		CountStyle.Tracking = TraceTeamSelectLayout::TrackLabel * S;
-		CountStyle.HAlign = TraceText::EHAlign::Right;
-		// Right-aligned and ticking: tabular figures, or the whole line lurched every second (a Light
-		// '1' is under a third of a '0').
-		CountStyle.bTabularDigits = true;
-		const FString CountText = TRACE_TEXTF("TEAMSELECT.COUNTDOWN", "KEEPING YOUR TEAM IN {0}",
-			{ FMath::Max(0, FMath::CeilToInt(Remaining)) });
+		// Beside the title where there is room; under it where there is not: on a 5:4 window the old
+		// line ran into the title, and a narrow enough window would do the same to the box.
 		const float CountRight = ViewW - TraceTeamSelectLayout::Margin * S;
-
-		// Beside the title where there is room, on the title's cap line; under it where there is not:
-		// on a 5:4 window the two ran into each other.
-		float CapMid = TitleCapMid;
-		if (CountRight - TraceText::MeasureWidth(CountText, CountStyle) < TitleRight + 24.f * S)
+		if (CountRight - TraceMenuKit::PageClockWidth(S) < TitleRight + 24.f * S)
 		{
-			CapMid = TitleCapMid + 0.5f * TitleCapH + TraceTeamSelectLayout::CountUnderGap * S
-				+ 0.5f * TraceText::CapHeight(CountStyle.Size, ETraceTextWeight::Light);
+			ClockCapMidPx = TraceTeamSelectLayout::TitleCapMid + 0.5f * TraceTeamSelectLayout::TitleCap
+				+ TraceTeamSelectLayout::CountUnderGap + 0.5f * TraceMenuKit::PageClockBoxPx;
 		}
-		TraceMenuKit::DrawTextCapCentered(HUD, CountText, CountRight, CapMid, CountStyle);
+		TraceMenuKit::DrawPageClock(HUD, ViewW, S, PC->GetTeamSelectTimeRemaining(), AnimNow, ClockCapMidPx,
+			&DrawnClock);
 	}
 
 	// ---- The two plates -------------------------------------------------------------------------

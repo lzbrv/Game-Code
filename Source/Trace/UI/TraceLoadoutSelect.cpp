@@ -1650,6 +1650,7 @@ void FTraceLoadoutSelect::DrawHeader(AHUD* HUD, const ATracePlayerState* LocalSt
 	// The furniture either side of the title, as drawn below: the title is kept clear of both.
 	float FurnitureLeft = TraceLoadoutLayout::Margin * S;
 	float FurnitureRight = ViewW - TraceLoadoutLayout::Margin * S;
+	DrawnClock = FTraceKitPageClockDraw();
 
 	// ---- THE BREAK: THE SCORE, AND SIDES SWITCHED ----------------------------------------------
 	//
@@ -1695,10 +1696,12 @@ void FTraceLoadoutSelect::DrawHeader(AHUD* HUD, const ATracePlayerState* LocalSt
 	//
 	// The server closes this window on a deadline, and the page used to show no clock at all: the
 	// match clock was the only one, under the scrim and counting something else. The kit draws it
-	// (DrawPageClock), because the pause menu draws the same clock in the same place over this page.
+	// (DrawPageClock), because team select before this page and the pause menu over it draw the same
+	// clock in the same place.
 	if (bMatchHeader && LocalState->CharacterSelectDeadlineServerTime > 0.f)
 	{
-		FurnitureRight = TraceMenuKit::DrawPageClock(HUD, ViewW, S, LocalState->GetCharacterSelectTimeRemaining(), AnimNow);
+		FurnitureRight = TraceMenuKit::DrawPageClock(HUD, ViewW, S, LocalState->GetCharacterSelectTimeRemaining(), AnimNow,
+			TraceLoadoutLayout::TitleCapMid, &DrawnClock);
 	}
 
 	// ---- THE TITLE, centred, set like every screen title (TraceLoadoutLayout::TitleCap) ---------
