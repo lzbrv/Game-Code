@@ -80,6 +80,14 @@ FString UTraceHudStatusChipWidget::ApplyChip(const FTraceHudCornerChip& InChip)
 
 	SetVisibility(ESlateVisibility::HitTestInvisible);
 
+	// The plate is SOLID like the ammo plate it stands on (TraceHudCornerLayout::PlateFillAlpha),
+	// whatever alpha the asset was generated with. Set once: the brush keeps it.
+	const FLinearColor PlateColor = ChipFill->GetBrushColor();
+	if (!FMath::IsNearlyEqual(PlateColor.A, TraceHudCornerLayout::PlateFillAlpha))
+	{
+		ChipFill->SetBrushColor(TraceHudStatusChipWidgetFile::WithAlpha(PlateColor, TraceHudCornerLayout::PlateFillAlpha));
+	}
+
 	// The tint, on the three things that carry it: the pip, the readout and the drain. Everything
 	// else about the chip — the kit's navy plate, the trough behind the drain, the fonts, the
 	// paddings — is styling and stays in the asset. (The outline no longer takes the tint: the chip

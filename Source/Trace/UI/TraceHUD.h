@@ -212,8 +212,9 @@ public:
 		bool bCrosshair = false;
 		int32 KillFeedRows = 0;
 
-		/** The bottom-left stack's plate. */
+		/** The bottom-left stack's plate, and the alpha it was drawn at (1: the world does not show through). */
 		bool bStackPlate = false;
+		float StackPlateAlpha = 0.f;
 
 		/** How many meters this frame drew seated on the kit's rail (DrawMeter). */
 		int32 MeterRails = 0;
@@ -224,6 +225,13 @@ public:
 
 		/** The left label's cap height as drawn, in 1080p px (screen px / UIScale), either corner path. */
 		float AmmoLabelCapPx = 0.f;
+
+		/** The capacity after the count ("/30") and its cap height as drawn, 1080p px, either corner path. */
+		FString AmmoCapacity;
+		float AmmoCapacityCapPx = 0.f;
+
+		/** The ammo (or knife) plate's fill alpha as drawn: the Canvas plate's, or the UMG PlateFill's brush. */
+		float AmmoPlateAlpha = 0.f;
 
 		/** The bottom-right corner was the UMG widget this frame (false: the Canvas corner). */
 		bool bUmgCorner = false;

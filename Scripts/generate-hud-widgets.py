@@ -126,14 +126,16 @@ TROUGH = color(0.0040, 0.0044, 0.0044, 1.00) # a meter's groove: the kit's disab
 NEUTRAL_ROUNDS = color(0.90, 0.93, 1.00, 1.00)  # the count's resting ink
 NO_EDGE = color(0.0, 0.0, 0.0, 0.0)          # the old tinted hairlines, switched off
 
-# THE HANDMADE KIT'S PLATE (TraceMenuArtStyle::PlateFill, sRGB 29,41,81, in linear here) at the match
-# HUD's panel alpha (TraceHUDStyle::PanelAlpha, 0.92). The Canvas corner draws the kit's own sprite,
+# THE HANDMADE KIT'S PLATE (TraceMenuArtStyle::PlateFill, sRGB 29,41,81, in linear here), SOLID: the
+# docked corners are opaque (TraceHUDStyle::CornerPlateAlpha, TraceHudCornerLayout::PlateFillAlpha). It
+# was 0.92 and the arena's floor stripes showed through; C++ sets the alpha on the brush at adoption, so
+# an asset generated before this change is corrected at run time. The Canvas corner draws the kit's own sprite,
 # T_MenuBtn_Default, through TraceMenuKit::DrawPanelPlate. This corner cannot: a Box brush slices
 # against the TEXTURE's pixels (22 texels a corner - see TraceMenuArtStyle.h), which does not fit a
 # 24 px chip. So it draws the same SILHOUETTE as a rounded box - the default plate is a flat navy
 # rounded rect whose corner is a true circle of 0.2215 x the plate's height (ButtonFrame.Corner,
 # measured), capped at a 60 px button's corner for anything taller.
-KIT_PLATE = color(0.01228, 0.02217, 0.08228, 0.92)
+KIT_PLATE = color(0.01228, 0.02217, 0.08228, 1.00)
 KIT_CORNER_FRACTION = 272.4 / 1230.0
 KIT_CORNER_CAP_H = 60.0
 

@@ -168,12 +168,21 @@ namespace TraceHUDStyle
 	/**
 	 * THE HANDMADE KIT'S PLATE, OVER THE WORLD. Every panel on this HUD is now the artist's navy plate
 	 * (T_MenuBtn_Default, 9-sliced through TraceMenuKit::DrawPanelPlate) instead of a flat slate rect
-	 * with a grey hairline. Over the arena it sits at this alpha: enough that a bright walkway behind
-	 * the bottom-left stack no longer shows through as a pale stripe (it did at the old 0.72), not so
-	 * much that the corner reads as a hole in the screen. The top score bar and the modal cards are
-	 * drawn opaque.
+	 * with a grey hairline. The plates that come and go over the play area (kill-feed rows, banners,
+	 * the network chip) sit at this alpha. The top score bar, the modal cards and the docked corners
+	 * (CornerPlateAlpha) are drawn opaque.
 	 */
 	static constexpr float PanelAlpha = 0.92f;
+
+	/**
+	 * THE DOCKED CORNERS ARE SOLID: the bottom-left stack (and its toast chip), the bottom-right ammo or
+	 * knife plate and the status chips over it, on the Canvas path and the UMG corner alike. At
+	 * PanelAlpha the arena's bright floor stripes came through them as a lighter diagonal band behind
+	 * [E], DASH, the health bar and the ammo count (sRGB 47,61,96 over a stripe against 32,42,76 off
+	 * it). The kit's own plate is an opaque sprite, and these plates never move off the world, so they
+	 * are drawn the way the practice-range pad signs are: whole.
+	 */
+	static constexpr float CornerPlateAlpha = 1.f;
 
 	/** A plate's corner is the button's up to this height (stylespec §6: tall cards keep 60 px). */
 	static constexpr float PanelCornerMax = 60.f;
@@ -201,8 +210,8 @@ namespace TraceHUDStyle
 	 * bright structure behind the panel reads as a pale grey rectangle stuck inside its left third".
 	 * What survives a scrim is (1 - alpha) times the world's own spread behind it, and 34.0 / 0.14 puts
 	 * that at about 243 — this arena's white walkways against its black floor — so the only value that
-	 * reaches zero is 1.0. The bar is the ONE panel that always has bright world behind it, which is
-	 * why it alone is opaque; the others sit at PanelAlpha.
+	 * reaches zero is 1.0. The same arithmetic later made the docked corners opaque as well
+	 * (CornerPlateAlpha): 8% of a white floor stripe was still a visible band behind the ammo count.
 	 */
 	/**
 	 * A meter's empty groove: the kit's disabled-plate black (sRGB 13,14,14), cut into the navy plate
@@ -2999,8 +3008,9 @@ void ATraceHUD::DrawAbilityToast(float TopY, float Margin, float RowH)
 	const float ChipY = TopY - ChipH - (6.f * UIScale);
 
 	// The kit's plate, fading with its words. The tint (dim for "not yet", red for "no") is carried by
-	// the words alone now; it used to be a hairline border round a slate rect as well.
-	DrawKitPanel(Margin, ChipY, ChipW, ChipH, TraceHUDStyle::PanelAlpha * Alpha);
+	// the words alone now; it used to be a hairline border round a slate rect as well. Solid, like the
+	// stack it sits on (CornerPlateAlpha); only its own fade thins it.
+	DrawKitPanel(Margin, ChipY, ChipW, ChipH, TraceHUDStyle::CornerPlateAlpha * Alpha);
 
 	DrawTextLeft(Label, TraceHUDStyle::WithAlpha(ToastTint, Alpha),
 		Margin + PadX, VCenterTextY(Label, FontSmall, UIScale, ChipY, ChipH), FontSmall, UIScale);
@@ -3288,10 +3298,11 @@ void ATraceHUD::DrawHealthAndDash()
 			: FMath::FInterpTo(DrawnStackPlateRight, TargetRight, EaseDelta, 8.f);
 
 		DrawKitPanel(PlateX, BlockTop - (10.f * UIScale), DrawnStackPlateRight - PlateX,
-			(BlockBottom - BlockTop) + (20.f * UIScale), TraceHUDStyle::PanelAlpha);
+			(BlockBottom - BlockTop) + (20.f * UIScale), TraceHUDStyle::CornerPlateAlpha);
 
 #if !UE_BUILD_SHIPPING
 		HudKitRecord.bStackPlate = true;
+		HudKitRecord.StackPlateAlpha = TraceHUDStyle::CornerPlateAlpha;
 #endif
 	}
 
@@ -4761,10 +4772,11 @@ float ATraceHUD::DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX
 	// 3.5 with a bloom pass to match, and the first armed capture put the white "26" straight over a
 	// blown-out light. The one number a player checks without looking cannot be allowed to depend on
 	// what happens to be behind it. It is the handmade kit's navy plate now; a bee clip is announced by
-	// its amber words and five fat pips rather than by a tinted hairline round a slate rect.
+	// its amber words and five fat pips rather than by a tinted hairline round a slate rect. Solid
+	// (CornerPlateAlpha): at 0.92 a floor stripe still ran through it as a lighter diagonal band.
 	const float PlatePad = 6.f * UIScale;
 	DrawKitPanel(RightX - BlockW - PlatePad, LabelTop - PlatePad,
-		BlockW + (PlatePad * 2.f), (BottomY - LabelTop) + (PlatePad * 2.f), TraceHUDStyle::PanelAlpha);
+		BlockW + (PlatePad * 2.f), (BottomY - LabelTop) + (PlatePad * 2.f), TraceHUDStyle::CornerPlateAlpha);
 
 	// ---- The count -------------------------------------------------------------------------------
 	//
@@ -4844,10 +4856,17 @@ float ATraceHUD::DrawAmmoBlock(const FTraceHudCornerState& InState, float RightX
 	}
 
 #if !UE_BUILD_SHIPPING
-	HudKitRecord.AmmoLabel = InState.AmmoLabel;
-	HudKitRecord.AmmoLabelCapPx = MeasureHeight(InState.AmmoLabel, FontSmall, UIScale)
-		* (TraceText::CapHeight(1.f, TraceHUDType::HudWeight()) / FMath::Max(KINDA_SMALL_NUMBER, TraceText::LineHeight(1.f)))
-		/ FMath::Max(KINDA_SMALL_NUMBER, UIScale);
+	{
+		// Line height to cap height, in the HUD's face, then back to 1080p px.
+		const float CapPerLine = TraceText::CapHeight(1.f, TraceHUDType::HudWeight())
+			/ FMath::Max(KINDA_SMALL_NUMBER, TraceText::LineHeight(1.f));
+		const float PerDesignPx = 1.f / FMath::Max(KINDA_SMALL_NUMBER, UIScale);
+		HudKitRecord.AmmoLabel = InState.AmmoLabel;
+		HudKitRecord.AmmoLabelCapPx = MeasureHeight(InState.AmmoLabel, FontSmall, UIScale) * CapPerLine * PerDesignPx;
+		HudKitRecord.AmmoCapacity = CapacityText;
+		HudKitRecord.AmmoCapacityCapPx = CapacityH * CapPerLine * PerDesignPx;
+		HudKitRecord.AmmoPlateAlpha = TraceHUDStyle::CornerPlateAlpha;
+	}
 	HudKitRecord.AmmoRightLabel = InState.RightLabel;
 	bDrewAmmoBlock = true;
 	bDrewBeeClip = InState.bBeeClip;
@@ -4873,7 +4892,7 @@ float ATraceHUD::DrawKnifeBlock(const FTraceHudCornerState& InState, float Right
 	const float LabelTop = StripTop - Gap - LabelH;
 
 	DrawKitPanel(RightX - BlockW - PlatePad, LabelTop - PlatePad,
-		BlockW + (PlatePad * 2.f), (BottomY - LabelTop) + (PlatePad * 2.f), TraceHUDStyle::PanelAlpha);
+		BlockW + (PlatePad * 2.f), (BottomY - LabelTop) + (PlatePad * 2.f), TraceHUDStyle::CornerPlateAlpha);
 
 	const float Fraction = FMath::Clamp(InState.KnifeFraction, 0.f, 1.f);
 	const bool bReady = Fraction >= 1.f;
@@ -4890,6 +4909,7 @@ float ATraceHUD::DrawKnifeBlock(const FTraceHudCornerState& InState, float Right
 
 #if !UE_BUILD_SHIPPING
 	HudKitRecord.bKnifeBlock = true;
+	HudKitRecord.AmmoPlateAlpha = TraceHUDStyle::CornerPlateAlpha;
 #endif
 	return LabelTop;
 }
@@ -4905,8 +4925,8 @@ float ATraceHUD::DrawStatusChip(float RightX, float BottomY, float ChipW, const 
 	// THE KIT'S PLATE, and the status colour INSIDE it: a short upright pip at the left and the drain
 	// along the bottom, both kept clear of the plate's rounded corners. It was a slate rect with a
 	// tinted hairline and a saturated tab down its square left edge. The fill stays navy so six chips
-	// stacked up never turn the corner into a light box.
-	DrawKitPanel(ChipLeft, ChipTop, ChipW, ChipH, TraceHUDStyle::PanelAlpha);
+	// stacked up never turn the corner into a light box. Solid, like the ammo plate it stands on.
+	DrawKitPanel(ChipLeft, ChipTop, ChipW, ChipH, TraceHUDStyle::CornerPlateAlpha);
 
 	const float Corner = FMath::Min(ChipH, TraceHUDStyle::PanelCornerMax * UIScale) * 0.25f;
 	const float PipW = FMath::Max(2.f, FMath::RoundToFloat(3.f * UIScale));
@@ -5244,6 +5264,9 @@ bool ATraceHUD::PresentCornerUmg(bool bInLive, const FTraceHudCornerState& InSta
 	DrawnStatusChips = Presented.Chips;
 	HudKitRecord.AmmoLabel = Presented.AmmoLabel;
 	HudKitRecord.AmmoLabelCapPx = Presented.AmmoLabelCapPx;
+	HudKitRecord.AmmoCapacity = Presented.CapacityText;
+	HudKitRecord.AmmoCapacityCapPx = Presented.CapacityCapPx;
+	HudKitRecord.AmmoPlateAlpha = Presented.PlateAlpha;
 	HudKitRecord.bUmgCorner = true;
 	HudKitRecord.AmmoRightLabel = Presented.RightLabel;
 	HudKitRecord.bKnifeBlock = Presented.bKnifeBlock;
@@ -10159,8 +10182,8 @@ namespace TraceFxHudShots
 //      shared stroke list its glyphs are drawn through grows a handful of times at most (a fresh array
 //      per flush, as before, shows as hundreds).
 //   6. ON THE KIT: the SPEED BOOST chip is not cyan (stylespec §0) and keeps its distance on the status
-//      wheel; a live frame's meters sit on the kit's rail, and the ammo plate's caption is at least an
-//      8 px cap at 1080p.
+//      wheel; a live frame's meters sit on the kit's rail, the ammo plate's caption and its "/30" are at
+//      least an 8 px cap at 1080p, and the bottom-left stack and the ammo plate are drawn solid.
 //   7. HEADINGS: a dead frame's ELIMINATED is in the kit's heading face (Sofachrome), white, and its
 //      killer line is all capitals.
 //
@@ -10395,6 +10418,18 @@ namespace TraceHUDKitVerify
 			Report(Run, TEXT("*** LIVE: the ammo plate's caption is at least an 8 px cap at 1080p ***"),
 				Rec.AmmoLabelCapPx >= 8.f, FString::Printf(TEXT("\"%s\" cap %.2f px (%s corner)"), *Rec.AmmoLabel,
 					Rec.AmmoLabelCapPx, Rec.bUmgCorner ? TEXT("UMG") : TEXT("Canvas")));
+			// The capacity after the count was left at the asset's size 9 (a 6.6 px cap) when the caption
+			// was raised, which made "/30" the smallest text on the HUD.
+			Report(Run, TEXT("*** LIVE: the ammo plate's capacity is at least an 8 px cap, the caption's size ***"),
+				!Rec.AmmoCapacity.IsEmpty() && Rec.AmmoCapacityCapPx >= 8.f
+					&& FMath::Abs(Rec.AmmoCapacityCapPx - Rec.AmmoLabelCapPx) <= 0.25f,
+				FString::Printf(TEXT("\"%s\" cap %.2f px, caption %.2f px (%s corner)"), *Rec.AmmoCapacity,
+					Rec.AmmoCapacityCapPx, Rec.AmmoLabelCapPx, Rec.bUmgCorner ? TEXT("UMG") : TEXT("Canvas")));
+			// At the HUD's old panel alpha (0.92) the arena's floor stripes showed through both plates.
+			Report(Run, TEXT("*** LIVE: the bottom-left stack and the ammo plate are solid, so the floor does not show through ***"),
+				Rec.StackPlateAlpha >= 0.999f && Rec.AmmoPlateAlpha >= 0.999f,
+				FString::Printf(TEXT("stack plate alpha %.3f, ammo plate alpha %.3f (%s corner)"), Rec.StackPlateAlpha,
+					Rec.AmmoPlateAlpha, Rec.bUmgCorner ? TEXT("UMG") : TEXT("Canvas")));
 
 			const UTraceWeaponComponent* Gun = Pawn->FindComponentByClass<UTraceWeaponComponent>();
 			if (Gun != nullptr && !Gun->IsReloading()
@@ -10583,7 +10618,8 @@ namespace TraceHUDKitVerify
 		TEXT("the goal flash, then 60 s of drawn frames: no match chrome under an overlay, the gun named ")
 		TEXT("on the ammo plate, no reload prompt on a healthy clip, and a death panel with the feed's ")
 		TEXT("glyph instead of the internal cause name. Also: kill-feed glyphs reuse one stroke list, SPEED BOOST is ")
-		TEXT("not cyan, the meters sit on the kit's rail, the ammo caption is an 8 px cap, and the death panel's ")
+		TEXT("not cyan, the meters sit on the kit's rail, the ammo caption and its capacity are an 8 px cap, the ")
+		TEXT("stack and ammo plates are solid, and the death panel's ")
 		TEXT("heading is the kit's heading face over a capitalised killer line."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
 }

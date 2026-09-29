@@ -172,6 +172,13 @@ struct FTraceHudCornerPresented
 	/** The left label's cap height as drawn, in design pixels (1080p px at UIScale 1). */
 	float AmmoLabelCapPx = 0.f;
 
+	/** The capacity text as set ("/30") and its cap height as drawn, in design pixels. */
+	FString CapacityText;
+	float CapacityCapPx = 0.f;
+
+	/** The plate's fill alpha as set on PlateFill's brush (1: the world does not show through it). */
+	float PlateAlpha = 0.f;
+
 	/** The plate stood in for the knife (bAmmoBlock stays false: there is no clip). */
 	bool bKnifeBlock = false;
 
@@ -261,7 +268,16 @@ namespace TraceHudCornerLayout
 	 * its CAP height, in design pixels. The asset's size-9 text gave a 6.6 px cap, the smallest words on
 	 * the HUD and under the 8.7 of the bottom-left stack's captions (the Canvas HUD's small font), which
 	 * is what this matches. The widget scales its labels to it at install (UTraceHudCornerWidget::
-	 * InstallAtlasLabels); a regenerated asset cannot shrink them back.
+	 * InstallAtlasLabels); a regenerated asset cannot shrink them back. The capacity after the count
+	 * ("/30") is set at the same size: it is the Canvas corner's small font too.
 	 */
 	static constexpr float LabelCapDesignPx = 8.75f;
+
+	/**
+	 * The plate's fill alpha. Solid, as the Canvas corner's plate is (TraceHUDStyle::CornerPlateAlpha):
+	 * the asset was authored at 0.92 and the arena's floor stripes showed through it. Set on the brush
+	 * at adoption (UTraceHudCornerWidget::InitialiseCorner, and each chip's ApplyChip), so an asset
+	 * generated before this cannot bring the see-through plate back.
+	 */
+	static constexpr float PlateFillAlpha = 1.f;
 }

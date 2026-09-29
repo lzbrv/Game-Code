@@ -129,6 +129,11 @@ bool UTraceHudCornerWidget::InitialiseCorner(FString& OutReason)
 		return false;
 	}
 
+	// THE PLATE IS SOLID, whatever alpha the asset was generated with (it was 0.92, and the arena's
+	// floor stripes ran through it as a lighter band behind the count). The navy stays the asset's.
+	PlateFill->SetBrushColor(TraceHudCornerWidgetFile::WithAlpha(PlateFill->GetBrushColor(),
+		TraceHudCornerLayout::PlateFillAlpha));
+
 	// ---- The chip class -------------------------------------------------------------------------
 	if (ChipWidgetClass == nullptr)
 	{
@@ -266,9 +271,11 @@ void UTraceHudCornerWidget::InstallAtlasLabels()
 	{
 		AtlasLabels.Last().Atlas->SetTabularDigits(true);
 	}
-	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, CapacityText, 0.f, 1.f, ETraceTextWeight::Hud));
-	// The LABEL LINE at the stack's caption size (TraceHudCornerLayout::LabelCapDesignPx): the asset's
-	// size 9 made PISTOL and [R] RELOAD the smallest words on the HUD.
+	// The LABEL LINE and the CAPACITY ("/30") at the stack's caption size (TraceHudCornerLayout::
+	// LabelCapDesignPx): the asset's size 9 made PISTOL and [R] RELOAD the smallest words on the HUD, and
+	// once they were raised, "/30" was (a 6.6 px cap, where the Canvas corner draws it at 8.7).
+	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, CapacityText, 0.f,
+		TraceHudCornerWidgetFile::ScaleToCap(CapacityText, TraceHudCornerLayout::LabelCapDesignPx), ETraceTextWeight::Hud));
 	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, AmmoLabelText, 0.f,
 		TraceHudCornerWidgetFile::ScaleToCap(AmmoLabelText, TraceHudCornerLayout::LabelCapDesignPx), ETraceTextWeight::Hud));
 	AtlasLabels.Add(TraceAtlasTextSwap::Install(this, ReloadLabelText, 0.f,
@@ -313,6 +320,7 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 		OutPresented.AmmoLabel = InState.KnifeLabel;
 		OutPresented.AmmoLabelCapPx = TraceHudCornerWidgetFile::DrawnCapPx(AtlasLabels, AmmoLabelText);
 		OutPresented.RightLabel = InState.KnifeReadout;
+		OutPresented.PlateAlpha = PlateFill->GetBrushColor().A;
 		return;
 	}
 
@@ -407,7 +415,10 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 	OutPresented.AmmoText = InState.CountText + InState.CapacityText;
 	OutPresented.AmmoLabel = InState.AmmoLabel;
 	OutPresented.AmmoLabelCapPx = TraceHudCornerWidgetFile::DrawnCapPx(AtlasLabels, AmmoLabelText);
+	OutPresented.CapacityText = InState.CapacityText;
+	OutPresented.CapacityCapPx = TraceHudCornerWidgetFile::DrawnCapPx(AtlasLabels, CapacityText);
 	OutPresented.RightLabel = InState.RightLabel;
+	OutPresented.PlateAlpha = PlateFill->GetBrushColor().A;
 }
 
 void UTraceHudCornerWidget::PresentChips(const FTraceHudCornerState& InState,
