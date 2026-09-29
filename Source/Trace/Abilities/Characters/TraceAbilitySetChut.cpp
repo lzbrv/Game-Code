@@ -1134,6 +1134,16 @@ namespace TraceAbilitySetChutFile
 		 */
 		double RunDeadlineReal = 0.0;
 
+		/** The budget RunDeadlineReal was set from: ChudRefreshBudgetSeconds, or `budget=<s>` if given. */
+		double RunBudgetSeconds = 0.0;
+
+		/**
+		 * Who took the test subject from this run, if the claim could not be renewed (see
+		 * ChudRefreshClaimMarginSeconds). Empty while the run still holds it. Once set, the run stops
+		 * INVALID without touching the pawn again: it is somebody else's now.
+		 */
+		FString LostSubjectTo;
+
 		/**
 		 * RESTARTS OF THE CURRENT ARM, and this is not defensive padding — it is the fix for a
 		 * measured false failure.
@@ -1159,9 +1169,34 @@ namespace TraceAbilitySetChutFile
 	 * TraceVerifyLock subject from start to verdict, so lock-aware fixtures queue behind it instead of
 	 * steering the same pawn, and (b) stops at this budget with INVALID for whatever it had not
 	 * finished. A clean run takes about a minute.
+	 *
+	 * AN ARM STARTS ONLY IF ITS OWN WAITS FIT IN WHAT IS LEFT (ChudArmFixedSeconds). The budget used
+	 * to be checked only as an arm was about to start, so an arm that started at 119 s ran its ~20 s
+	 * of fixed waits to ~140 s, past the 135 s the lock had been claimed for: a queued fixture took
+	 * the pawn and steered it while this was still teleporting and re-staging Chut, the very
+	 * contamination the lock is here to stop, and in exactly the slow runs the budget exists for.
 	 */
 	constexpr double ChudRefreshBudgetSeconds = 120.0;
 	const TCHAR* const ChudRefreshCommandName = TEXT("Trace.Chut.ChudRefreshTest");
+
+	/**
+	 * THE CLAIM FOLLOWS THE RUN, ONE STEP AT A TIME. Every step renews it for the wait until the next
+	 * step plus this margin (ScheduleChudRefresh), so it cannot lapse while the run is alive however
+	 * many 1 s setup retries or restarts an arm spends, and it lapses this soon after a run that dies
+	 * without releasing it.
+	 */
+	constexpr double ChudRefreshClaimMarginSeconds = 15.0;
+
+	/** The fixed waits one arm schedules from its first step to the next arm, exactly as the steps below schedule them. */
+	double ChudArmFixedSeconds()
+	{
+		const UTraceSettings& ChudSettings = UTraceSettings::Get();
+		return static_cast<double>(ChudBurnSeconds)                                              // step 0 -> 1
+			+ static_cast<double>(ChudSettings.ChudDurationSeconds) + 1.0                         // step 1 -> 2
+			+ static_cast<double>(TraceMelee::GetSwapSeconds()) + ChudBurnSeconds                 // step 2 -> 3
+			+ static_cast<double>(TraceMelee::GetSwingWindupSeconds()) + 0.8                      // step 3 -> 4
+			+ 1.5;                                                                                // step 4 -> next arm
+	}
 
 	UWorld* FindAuthoritativeGameWorld()
 	{
@@ -1436,7 +1471,7 @@ namespace TraceAbilitySetChutFile
 
 		Run->Current.Invalidate(bBudgetSpent
 			? FString::Printf(TEXT("the run's %.0f s budget was spent and the fixture had just collapsed again: %s"),
-				ChudRefreshBudgetSeconds, *Why)
+				Run->RunBudgetSeconds, *Why)
 			: FString::Printf(TEXT("the fixture kept collapsing and the restarts ran out: %s"), *Why));
 		FinishChudArm(Run);
 		ScheduleChudRefresh(Run, 1.0f);
@@ -1445,6 +1480,16 @@ namespace TraceAbilitySetChutFile
 
 	void ScheduleChudRefresh(TSharedPtr<FChudRun> Run, float DelaySeconds)
 	{
+		// RENEW THE CLAIM to cover this wait — see ChudRefreshClaimMarginSeconds. TryClaim lets the
+		// holder extend its own claim. If it refuses, somebody took the subject while the claim had
+		// lapsed; the next step stops the run INVALID rather than steering a pawn that is not ours.
+		if (Run->LostSubjectTo.IsEmpty()
+			&& !TraceVerifyLock::TryClaim(ChudRefreshCommandName,
+				static_cast<double>(DelaySeconds) + ChudRefreshClaimMarginSeconds))
+		{
+			Run->LostSubjectTo = TraceVerifyLock::CurrentHolder();
+		}
+
 		Run->NextRealTime = FPlatformTime::Seconds() + DelaySeconds;
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
 			[Run](float) -> bool
@@ -1560,6 +1605,16 @@ namespace TraceAbilitySetChutFile
 			return false;
 		}
 
+		if (!Run->LostSubjectTo.IsEmpty())
+		{
+			ApplyChudRefreshArm(1);   // leave the process on the shipped arm
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[CHUDREFRESH] VERDICT: INVALID — %s took the test subject mid-run, so nothing measured after "
+				     "that is trustworthy. Stopped without touching the pawn again."),
+				*Run->LostSubjectTo);
+			return false;   // the claim is somebody else's: nothing to release
+		}
+
 		if (!Run->ArmsToRun.IsValidIndex(Run->ArmIndex))
 		{
 			ApplyChudRefreshArm(1);   // leave the process on the shipped arm
@@ -1571,15 +1626,20 @@ namespace TraceAbilitySetChutFile
 		const int32 Arm = Run->ArmsToRun[Run->ArmIndex];
 		const UTraceSettings& Settings = UTraceSettings::Get();
 
-		// AN ARM THAT HAS NOT STARTED WHEN THE BUDGET RUNS OUT DOES NOT START. See ChudRefreshBudgetSeconds.
-		if (Run->Step == 0 && FPlatformTime::Seconds() > Run->RunDeadlineReal)
+		// AN ARM STARTS ONLY IF ITS OWN WAITS FIT IN THE BUDGET THAT IS LEFT. See ChudRefreshBudgetSeconds.
+		if (Run->Step == 0)
 		{
-			Run->Current.Invalidate(FString::Printf(
-				TEXT("not run: the %.0f s budget for the whole test was spent before this arm could start"),
-				ChudRefreshBudgetSeconds));
-			FinishChudArm(Run);
-			ScheduleChudRefresh(Run, 0.f);
-			return false;
+			const double BudgetLeft = Run->RunDeadlineReal - FPlatformTime::Seconds();
+			const double ArmNeeds = ChudArmFixedSeconds();
+			if (BudgetLeft < ArmNeeds)
+			{
+				Run->Current.Invalidate(FString::Printf(
+					TEXT("not run: an arm waits %.1f s from start to finish and %.1f s of the %.0f s budget was left"),
+					ArmNeeds, FMath::Max(0.0, BudgetLeft), Run->RunBudgetSeconds));
+				FinishChudArm(Run);
+				ScheduleChudRefresh(Run, 0.f);
+				return false;
+			}
 		}
 
 		switch (Run->Step)
@@ -1944,17 +2004,32 @@ namespace TraceAbilitySetChutFile
 		     "start it. Drives the real kill funnel (ApplyDamage -> NotifyCharacterDied -> NotifyKill), not "
 		     "UTraceAbilitySetChut::OnKill directly. Arm 0 sets Trace.Chut.ChudKillRefresh 0 and MUST fail; "
 		     "a red arm that passes is reported INVALID. Takes about a minute; holds the verify lock throughout "
-		     "and gives up (INVALID) on whatever it has not finished after 120 s."),
-		FConsoleCommandDelegate::CreateLambda([]()
+		     "and starts no arm whose own waits would run past 120 s (INVALID for it instead). `budget=<s>` "
+		     "sets a shorter budget, to test that."),
+		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
 		{
+			double RequestedBudget = ChudRefreshBudgetSeconds;
+			for (const FString& Arg : Args)
+			{
+				FString Key;
+				FString Value;
+				if (Arg.Split(TEXT("="), &Key, &Value) && Key.Equals(TEXT("budget"), ESearchCase::IgnoreCase))
+				{
+					RequestedBudget = FMath::Clamp(FCString::Atod(*Value), 1.0, 600.0);
+				}
+			}
+
 			// ONE FIXTURE ON THE PLAYER'S PAWN AT A TIME — see ChudRefreshBudgetSeconds. The claim
-			// covers the budget plus the verdict, and is released when the verdict prints.
-			if (!TraceVerifyLock::ClaimOrQueue(ChudRefreshCommandName, ChudRefreshBudgetSeconds + 15.0))
+			// covers the budget and the last arm, is renewed by every step (ChudRefreshClaimMarginSeconds)
+			// and is released when the verdict prints.
+			if (!TraceVerifyLock::ClaimOrQueue(ChudRefreshCommandName,
+					RequestedBudget + ChudArmFixedSeconds() + ChudRefreshClaimMarginSeconds, Args))
 			{
 				return;
 			}
 			TSharedPtr<FChudRun> Run = MakeShared<FChudRun>();
-			Run->RunDeadlineReal = FPlatformTime::Seconds() + ChudRefreshBudgetSeconds;
+			Run->RunBudgetSeconds = RequestedBudget;
+			Run->RunDeadlineReal = FPlatformTime::Seconds() + RequestedBudget;
 			ScheduleChudRefresh(Run, 0.f);
 		}));
 
