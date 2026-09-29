@@ -257,6 +257,17 @@ public:
 		int32 ResultLineWeight = -1;
 		FLinearColor ResultLineColor = FLinearColor::Transparent;
 
+		/**
+		 * The results screen's final score as drawn ("2 - 1"): on the kit's value box or not, its face,
+		 * its cap height in 1080p px, and the blue and orange numbers' colours.
+		 */
+		FString ResultScore;
+		bool bResultScoreBox = false;
+		int32 ResultScoreWeight = -1;
+		float ResultScoreCapPx = 0.f;
+		FLinearColor ResultScoreBlueColor = FLinearColor::Transparent;
+		FLinearColor ResultScoreOrangeColor = FLinearColor::Transparent;
+
 		/** HALF TIME, the goal flash, and GO with the subtitle it carried. */
 		bool bHalfTimeCard = false;
 		bool bScoreFlash = false;

@@ -243,6 +243,13 @@ namespace TraceHUDStyle
 	/** The results screen: the reason line's cap centre (fraction of the view) and the gap to the result. */
 	static constexpr float ResultReasonFraction = 0.095f;
 	static constexpr float ResultLineGapPx = 34.f;
+
+	/**
+	 * The results screen's score box height, 1080p px: the half-time page's value box (44) scaled up
+	 * for a score read from across the room. Its numbers are the kit's LabelCapFraction of it, a 26.6 px
+	 * cap, between the 40 px result above and the roster card's rows below.
+	 */
+	static constexpr float ResultScoreBoxPx = 72.f;
 	static const FLinearColor Danger     (0.95f, 0.22f, 0.18f, 1.00f);
 	static const FLinearColor Good       (0.24f, 0.90f, 0.42f, 1.00f);
 	/** Headshot hitmarker. Hot amber: distinct from both the white body tick and the red kill tick. */
@@ -7348,14 +7355,47 @@ void ATraceHUD::DrawMatchResult()
 	// HALVES ON THE CLOCK" restated the headline above it in a sentence; the headline says why the
 	// match ended and the score below says by how much. (The owner's copy rule: labels, not sentences.)
 
-	// Final score, spelled out as two team-coloured numbers rather than one string, so the winner
-	// is legible from across the room.
-	const float ScoreY = ViewH * 0.225f;
-	const float ScoreInset = 60.f * UIScale;
-	DrawTextRight(FString::FromInt(Blue), TraceTeamColor(ETraceTeam::Blue), CX - ScoreInset, ScoreY, FontLarge, 2.4f * UIScale);
-	DrawTextCentered(TRACE_TEXT("HUD.RESULT_SCORE_SEPARATOR", "-"), TraceHUDStyle::InkDim,
-		CX, ScoreY, FontLarge, 2.4f * UIScale);
-	DrawTextLeft(FString::FromInt(Orange), TraceTeamColor(ETraceTeam::Orange), CX + ScoreInset, ScoreY, FontLarge, 2.4f * UIScale);
+	// ---- THE FINAL SCORE, SET AS THE HALF-TIME PAGE SETS IT --------------------------------------
+	//
+	// The kit's value box, blue then orange in their team colours either side of a white dash, in the
+	// kit's heading face: FTraceLoadoutSelect::DrawHeader's score, on a bigger box because this one is
+	// read from across the room. It was the HUD's Erbaum at FontLarge x2.4 with no plate, the one unplated
+	// HUD-face thing between two Sofachrome headlines and the kit roster card. (The live top bar keeps
+	// the HUD face: every number drawn over the match itself is Erbaum, spec v25 §4. A screen that takes
+	// the match over sets the score in the kit's box.) It hangs one headline gap under the result line.
+	{
+		const FString ScoreBlueText = FString::FromInt(Blue);
+		const FString ScoreOrangeText = FString::FromInt(Orange);
+		const FString& ScoreDash = TRACE_TEXT("HUD.RESULT_SCORE_SEPARATOR", "-");
+		const float ScoreBoxH = TraceHUDStyle::ResultScoreBoxPx * UIScale;
+		const float ScoreCap = ScoreBoxH * TraceMenuKit::LabelCapFraction;
+		const float ScoreSpread = ScoreCap * 0.9f;   // from the box's centre to the inner edge of each number
+		const float ScoreDigitsW = FMath::Max3(TraceMenuKit::CapTextWidth(TEXT("00"), ScoreCap),
+			TraceMenuKit::CapTextWidth(ScoreBlueText, ScoreCap), TraceMenuKit::CapTextWidth(ScoreOrangeText, ScoreCap));
+		const float ScoreBoxW = FMath::Max(
+			ScoreBoxH * (TraceMenuArtStyle::ValueFrame.PlateW / TraceMenuArtStyle::ValueFrame.PlateH),
+			2.f * (ScoreSpread + ScoreDigitsW) + ScoreBoxH * TraceMenuKit::LabelPadFraction * 2.f);
+		const float ScoreMid = ResultMid + (ResultCap * 0.5f) + (TraceHUDStyle::ResultLineGapPx * UIScale) + (ScoreBoxH * 0.5f);
+		const FLinearColor ScoreBlueColor = TraceTeamColor(ETraceTeam::Blue);
+		const FLinearColor ScoreOrangeColor = TraceTeamColor(ETraceTeam::Orange);
+
+		TraceMenuKit::DrawValueBoxPlate(this, CX - ScoreBoxW * 0.5f, ScoreMid - ScoreBoxH * 0.5f, ScoreBoxW, ScoreBoxH);
+		TraceMenuKit::DrawCapText(this, ScoreBlueText, CX - ScoreSpread, ScoreMid, ScoreCap, ScoreBlueColor,
+			TitleFace, TraceText::EHAlign::Right);
+		TraceMenuKit::DrawCapText(this, ScoreDash, CX, ScoreMid, ScoreCap, TraceMenuArtStyle::WordDefault,
+			TitleFace, TraceText::EHAlign::Center);
+		TraceMenuKit::DrawCapText(this, ScoreOrangeText, CX + ScoreSpread, ScoreMid, ScoreCap, ScoreOrangeColor,
+			TitleFace, TraceText::EHAlign::Left);
+
+#if !UE_BUILD_SHIPPING
+		HudKitRecord.ResultScore = FString::Printf(TEXT("%s %s %s"), *ScoreBlueText, *ScoreDash, *ScoreOrangeText);
+		HudKitRecord.bResultScoreBox = true;
+		HudKitRecord.ResultScoreWeight = static_cast<int32>(TitleFace);
+		HudKitRecord.ResultScoreCapPx = ScoreCap / FMath::Max(KINDA_SMALL_NUMBER, UIScale);
+		HudKitRecord.ResultScoreBlueColor = ScoreBlueColor;
+		HudKitRecord.ResultScoreOrangeColor = ScoreOrangeColor;
+#endif
+	}
 
 	// ---- Roster card --------------------------------------------------------------------------
 	// The two columns reuse the live scoreboard's renderer so the two views can never drift apart.
@@ -11127,7 +11167,9 @@ namespace TraceHUDFadeVerify
 //   2.10 s          A tapped with CONTROLLER INPUT off                          -> nothing
 //   2.60 s          A tapped (or ENTER, with `key=enter`)                       -> CONTINUE, once
 //
-// A screenshot of the settled results screen, CONTINUE legend up, is taken at 1.50 s.
+// A screenshot of the settled results screen, CONTINUE legend up, is taken at 1.50 s, and at 1.60 s the
+// frame on screen is read back: the headline in the kit's heading face, and the final score in the kit's
+// value box in that face and the team colours, as the half-time page sets it.
 //
 // Headless recipe (after team select and the loadout, so the pawn is live and A really is JUMP):
 //   Arena -bots=4 -TraceExecAt=6 -TraceExec="Trace.Teams.Close|Trace.V10.After 1.5 Trace.Loadout.Press lock"
@@ -11296,6 +11338,17 @@ namespace TraceHUDResultsVerify
 					FString::Printf(TEXT("\"%s\" face %d %s / \"%s\" face %d %s (Light is %d)"),
 						*Drawn.ResultHead, Drawn.ResultHeadWeight, *Drawn.ResultHeadColor.ToString(),
 						*Drawn.ResultLine, Drawn.ResultLineWeight, *Drawn.ResultLineColor.ToString(), KitFace));
+
+				// THE SCORE IS SET AS THE HALF-TIME PAGE SETS IT: in the kit's value box, in the heading face,
+				// each number in its team's colour. It was the HUD's Erbaum at x2.4 with no plate.
+				Report(Run, TEXT("*** the final score is in the kit's value box, in the heading face and team colours, as at half time ***"),
+					!Drawn.ResultScore.IsEmpty() && Drawn.bResultScoreBox && Drawn.ResultScoreWeight == KitFace
+						&& Drawn.ResultScoreBlueColor.Equals(TraceTeamColor(ETraceTeam::Blue), 0.01f)
+						&& Drawn.ResultScoreOrangeColor.Equals(TraceTeamColor(ETraceTeam::Orange), 0.01f)
+						&& Drawn.ResultScoreCapPx >= 20.f,
+					FString::Printf(TEXT("\"%s\" box %d, face %d (Light is %d), cap %.1f px, blue %s, orange %s"),
+						*Drawn.ResultScore, Drawn.bResultScoreBox ? 1 : 0, Drawn.ResultScoreWeight, KitFace,
+						Drawn.ResultScoreCapPx, *Drawn.ResultScoreBlueColor.ToString(), *Drawn.ResultScoreOrangeColor.ToString()));
 			}
 			else
 			{
@@ -11418,7 +11471,8 @@ namespace TraceHUDResultsVerify
 		TEXT("Trace.HUD.Results.Verify"),
 		TEXT("Ends the match on the host with pad A pressed on the whistle frame (a jump), then proves that no press ")
 		TEXT("inside the results screen's grace, no held A and no A with CONTROLLER INPUT off continues, and that a ")
-		TEXT("fresh A (or ENTER with key=enter) afterwards does, and that the headline is in the kit's heading face. ")
+		TEXT("fresh A (or ENTER with key=enter) afterwards does, that the headline is in the kit's heading face, and ")
+		TEXT("that the final score sits in the kit's value box as the half-time page's does. ")
 		TEXT("`draw` ends it level, `mercy` on the mercy rule (BLUE on the clock otherwise). Run on the Arena after lock-in."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
 }
