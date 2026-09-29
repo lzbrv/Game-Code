@@ -15,6 +15,7 @@
 #include "Trace.h"                      // LogTraceGame
 #include "UI/TraceHardwareCursor.h"
 #include "UI/Text/TraceCanvasText.h"
+#include "UI/Text/TraceGameText.h"      // TRACE_TEXT — the pages' TIME label (DrawPageClock)
 #include "UI/Text/TraceText.h"
 #include "UI/Widgets/Menu/TraceTitleMenuWidget.h"   // TraceTitleLayout — the travel card's spinner
 
@@ -772,6 +773,40 @@ bool TraceMenuKit::DrawValueBox(AHUD* HUD, float X, float Y, float W, float H, c
 	DrawLabel(HUD, Text, X + W * 0.5f, Y + H * 0.5f, H, TextColor, W - H * LabelPadFraction * 2.f,
 		ETraceTextWeight::Light, /*bTabularDigits=*/true);
 	return true;
+}
+
+float TraceMenuKit::DrawPageClock(AHUD* HUD, float ViewW, float UIScale, float SecondsLeft, float NowSeconds)
+{
+	const float ClockRight = ViewW - PageMarginPx * UIScale;
+	if (HUD == nullptr || SecondsLeft < 0.f)
+	{
+		return ClockRight;
+	}
+
+	const float BoxH = PageClockBoxPx * UIScale;
+	const float BoxW = BoxH * (TraceMenuArtStyle::ValueFrame.PlateW / TraceMenuArtStyle::ValueFrame.PlateH);
+	const float BoxX = ClockRight - BoxW;
+	const float ClockCapMid = PageTitleCapMidPx * UIScale;
+
+	// The last five seconds pulse in the kit's amber, as the team screen's countdown does.
+	FLinearColor Ink = TraceMenuArtStyle::WordDefault;
+	if (SecondsLeft <= 5.f)
+	{
+		const FLinearColor Amber = TraceMenuArtStyle::AmberLifted();
+		Ink = FLinearColor(Amber.R, Amber.G, Amber.B, 0.72f + 0.28f * FMath::Sin(NowSeconds * 9.f));
+	}
+	DrawValueBox(HUD, BoxX, ClockCapMid - BoxH * 0.5f, BoxW, BoxH,
+		FString::FromInt(FMath::Max(0, FMath::CeilToInt(SecondsLeft))), Ink);
+
+	const FString& ClockLabel = TRACE_TEXT("LOADOUT.TIMER_LABEL", "TIME");
+	if (ClockLabel.IsEmpty())
+	{
+		return BoxX;
+	}
+	TraceText::FStyle LabelStyle(PageClockLabelPx * UIScale, FurnitureUnselected, ETraceTextWeight::Light);
+	LabelStyle.HAlign = TraceText::EHAlign::Right;
+	const float LabelRight = BoxX - 14.f * UIScale;
+	return LabelRight - DrawTextCapCentered(HUD, ClockLabel, LabelRight, ClockCapMid, LabelStyle);
 }
 
 void TraceMenuKit::DrawSliderTrack(AHUD* HUD, float X, float Y, float W, float H, const FLinearColor& Tint)

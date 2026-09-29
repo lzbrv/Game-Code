@@ -1563,10 +1563,11 @@ void ATraceHUD::DrawHUD()
 
 	// Spec v14 §3 — the character select screen, over the match and under the pause menu.
 	//
-	// UNDER the pause menu, and it keeps DRAWING while the pause menu is up rather than hiding: a
-	// select screen that vanished when the player pressed Escape would read as the pick having been
+	// UNDER the pause menu, and it keeps running while the pause menu is up rather than closing: a
+	// select screen that closed when the player pressed Escape would read as the pick having been
 	// cancelled, and the auto-pick clock is still running underneath. It stops taking input instead,
-	// which is what bInputAllowed says.
+	// which is what bInputAllowed says. The menu's opaque black hides the page itself, so the menu
+	// draws the page's clock (SetUnderPageClock below).
 	//
 	// Outside the bPostMatch gate for a duller reason: the screen is closed by then anyway (the server
 	// closes it the moment a character is held), and a gate here would be a second condition able to
@@ -1601,9 +1602,25 @@ void ATraceHUD::DrawHUD()
 	//
 	// Told how much of a full-screen page (team select, the loadout page) is under it: over one of those
 	// its scrim is the kit's opaque black, so the page's cards do not read through around its rows.
+	// And told that page's clock, which keeps running under the black: the menu shows it where the page
+	// did, so a paused player is never surprised by the page closing and sending their picks.
 	{
 		TRACE_PERF_SCOPE(HudPages);
+		float PageSecondsLeft = -1.f;
+		if (CharacterSelect.IsTeamSelectOpen())
+		{
+			if (TracePC != nullptr && TracePC->TeamSelectDeadlineServerTime > 0.f)
+			{
+				PageSecondsLeft = TracePC->GetTeamSelectTimeRemaining();
+			}
+		}
+		else if ((LoadoutSelect.IsOpen() || CharacterSelect.IsOpen()) && LocalPS != nullptr
+			&& LocalPS->CharacterSelectDeadlineServerTime > 0.f)
+		{
+			PageSecondsLeft = LocalPS->GetCharacterSelectTimeRemaining();
+		}
 		PauseMenu.SetUnderPageAlpha(PageBackdropFade.Alpha());
+		PauseMenu.SetUnderPageClock(PageSecondsLeft);
 		PauseMenu.Tick(this, TracePC.Get(), ViewW, ViewH, UIScale, Now);
 	}
 

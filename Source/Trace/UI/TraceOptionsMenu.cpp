@@ -2337,6 +2337,9 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 	// because a closed overlay still has its fade-out to draw.
 	const float OverlayAlpha = Fade.Update(IsOpen());
 
+	// Redrawn below by whichever path draws this frame (Draw, or over the loadout editor).
+	DrawnPageClockSeconds = -1.f;
+
 	if (HUD == nullptr || InViewW <= 0.f || InViewH <= 0.f)
 	{
 		return;
@@ -2370,6 +2373,8 @@ void FTraceOptionsMenu::Tick(AHUD* HUD, APlayerController* PC, float InViewW, fl
 			/*bInputAllowed=*/GFrameCounter >= IgnoreInputBeforeFrame);
 		if (LoadoutEditor.IsLibraryOpen())
 		{
+			// The editor is a full page of its own, over the page whose clock is still running.
+			DrawUnderPageClock(HUD);
 			return;
 		}
 	}
@@ -4847,6 +4852,24 @@ void FTraceOptionsMenu::DrawValueBoxFor(AHUD* HUD, float X, float Y, float W, fl
 	TraceMenuKit::DrawValueBoxPlate(HUD, X, Y, W, H);
 }
 
+void FTraceOptionsMenu::DrawUnderPageClock(AHUD* HUD)
+{
+	// THE PAGE UNDER THE MENU IS HIDDEN, ITS DEADLINE IS NOT. Over team select or the loadout page the
+	// scrim is opaque, but the page's clock and its auto-send keep running underneath: a player who
+	// paused with twelve seconds left and sat in SETTINGS used to come back to a page that had sent
+	// their picks and closed, with no clock on screen at any point. So the page's own clock is drawn
+	// where the page had it, the kit's TIME box in the top-right corner, at the page's share of the
+	// black (a page closing under the menu takes its clock with it).
+	DrawnPageClockSeconds = -1.f;
+	if (HUD == nullptr || !OnResume || UnderPageAlpha <= 0.f || UnderPageSecondsLeft < 0.f)
+	{
+		return;
+	}
+	TraceMenuKit::FScopedOpacity PageShare(UnderPageAlpha);
+	TraceMenuKit::DrawPageClock(HUD, ViewW, UIScale, UnderPageSecondsLeft, Now);
+	DrawnPageClockSeconds = UnderPageSecondsLeft;
+}
+
 void FTraceOptionsMenu::Draw(AHUD* HUD, APlayerController* PC)
 {
 	namespace OL = TraceOptionsMenuLayout;
@@ -4876,10 +4899,12 @@ void FTraceOptionsMenu::Draw(AHUD* HUD, APlayerController* PC)
 	//   * OVER A FULL-SCREEN KIT PAGE IN THE MATCH (the loadout page, team select) it is opaque too, as
 	//     the JOIN prompt is over the title: the page's cards read through the modal scrim around the
 	//     MENU heading and between its rows. Blended by the page's own black (SetUnderPageAlpha), so a
-	//     page that closes under the menu hands over to the arena's scrim without a jump.
+	//     page that closes under the menu hands over to the arena's scrim without a jump. The page's
+	//     CLOCK is not hidden with it: see DrawUnderPageClock, drawn next.
 	const bool bOverMatch = static_cast<bool>(OnResume);
 	DrawnScrimAlpha = bOverMatch ? FMath::Lerp(TraceMenuKit::ScrimAlpha, 1.f, UnderPageAlpha) : 1.f;
 	TraceMenuKit::DrawScrim(HUD, ViewW, ViewH, DrawnScrimAlpha);
+	DrawUnderPageClock(HUD);
 
 	// ---- Page geometry --------------------------------------------------------------------------
 	//
@@ -6547,6 +6572,15 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 				bGrey ? TEXT("greyed") : TEXT("LIVE"), *RowName(Selected)));
 		VerifyCheck(TEXT("T. over the loadout page the menu is on opaque black: no card reads through"),
 			DrawnScrimAlpha >= 0.99f, FString::Printf(TEXT("scrim %.2f (the arena's is %.2f)"), DrawnScrimAlpha, TraceMenuKit::ScrimAlpha));
+		{
+			// The black hides the page, not its deadline: the page's auto-send is still counting.
+			const ATracePlayerState* const PagePS = (TeamPC != nullptr) ? TeamPC->GetTracePlayerState() : nullptr;
+			const float PageLeft = (PagePS != nullptr && PagePS->CharacterSelectDeadlineServerTime > 0.f)
+				? PagePS->GetCharacterSelectTimeRemaining() : -1.f;
+			VerifyCheck(TEXT("T. ...and the loadout page's TIME is still on screen, above the black"),
+				PageLeft >= 0.f && DrawnPageClockSeconds >= 0.f && FMath::Abs(DrawnPageClockSeconds - PageLeft) < 0.5f,
+				FString::Printf(TEXT("the page's clock %.1f s, the menu shows %.1f s (-1: none)"), PageLeft, DrawnPageClockSeconds));
+		}
 		if (IsOpen())
 		{
 			Close();
@@ -6630,6 +6664,17 @@ void FTraceOptionsMenu::TickVerify(APlayerController* PC)
 				bGrey ? TEXT("greyed") : TEXT("LIVE"), *RowName(Selected)));
 		VerifyCheck(TEXT("T. over the team screen the menu is on opaque black too"),
 			DrawnScrimAlpha >= 0.99f, FString::Printf(TEXT("scrim %.2f"), DrawnScrimAlpha));
+		{
+			// ...and keeps the team screen's clock, when it has one (TeamSelectTimeout can be off).
+			const float PageLeft = (TeamPC != nullptr && TeamPC->TeamSelectDeadlineServerTime > 0.f)
+				? TeamPC->GetTeamSelectTimeRemaining() : -1.f;
+			const bool bShown = DrawnPageClockSeconds >= 0.f && FMath::Abs(DrawnPageClockSeconds - PageLeft) < 0.5f;
+			VerifyCheck(PageLeft >= 0.f
+					? TEXT("T. ...and the team screen's clock is still on screen, above the black")
+					: TEXT("T. ...and with no clock on the team screen, the menu invents none"),
+				PageLeft >= 0.f ? bShown : DrawnPageClockSeconds < 0.f,
+				FString::Printf(TEXT("the page's clock %.1f s, the menu shows %.1f s (-1: none)"), PageLeft, DrawnPageClockSeconds));
+		}
 		TraceOptionsRebindProof::InjectViewportKey(EKeys::Gamepad_DPad_Down, IE_Pressed);
 		Next(109, 2);
 		return;

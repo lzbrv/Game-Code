@@ -335,6 +335,18 @@ public:
 	 */
 	void SetUnderPageAlpha(float Alpha) { UnderPageAlpha = FMath::Clamp(Alpha, 0.f, 1.f); }
 
+	/**
+	 * The seconds left on the clock of the page under the overlay (team select's, or the loadout page's
+	 * select deadline), or < 0 when that page has none. Set by the host every frame before Tick. The
+	 * opaque scrim above hides the page, but its clock and auto-send keep running, so the overlay draws
+	 * that clock where the page had it (TraceMenuKit::DrawPageClock): a paused player can see the page
+	 * is about to close under them.
+	 */
+	void SetUnderPageClock(float SecondsLeft) { UnderPageSecondsLeft = SecondsLeft; }
+
+	/** The seconds the last frame's page clock showed, or < 0 when none was drawn. A harness reads it. */
+	float GetDrawnPageClock() const { return DrawnPageClockSeconds; }
+
 	/** The scrim alpha the last Draw put under the page (before the overlay's own fade). A harness reads it. */
 	float GetDrawnScrimAlpha() const { return DrawnScrimAlpha; }
 
@@ -1060,6 +1072,9 @@ private:
 	 */
 	void DrawClosing(AHUD* HUD, APlayerController* PC, float Alpha);
 
+	/** The clock of the page under the overlay, where the page had it. See SetUnderPageClock. */
+	void DrawUnderPageClock(AHUD* HUD);
+
 	void DrawRow(AHUD* HUD, FRow& Row, float X, float Y, float W, float H, bool bSelected);
 	void DrawCursor(AHUD* HUD, APlayerController* PC);
 
@@ -1168,6 +1183,12 @@ private:
 
 	/** See GetDrawnScrimAlpha. */
 	float DrawnScrimAlpha = 0.f;
+
+	/** See SetUnderPageClock. */
+	float UnderPageSecondsLeft = -1.f;
+
+	/** See GetDrawnPageClock. */
+	float DrawnPageClockSeconds = -1.f;
 
 	// ---- P10: the open/close fade ------------------------------------------------------------------
 

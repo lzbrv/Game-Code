@@ -97,7 +97,7 @@ namespace TraceLoadoutSelect
 // =================================================================================================
 namespace TraceLoadoutLayout
 {
-	constexpr float Margin      = 54.f;
+	constexpr float Margin      = TraceMenuKit::PageMarginPx;
 
 	/**
 	 * THE PAGE TITLE (BUILD YOUR LOADOUT, HALF TIME, LOADOUT n) IS SET LIKE EVERY OTHER SCREEN TITLE:
@@ -106,9 +106,9 @@ namespace TraceLoadoutLayout
 	 * to this page changed the title's size and spacing. Its caps are centred where they always were,
 	 * so the score and the countdown beside it did not move.
 	 */
-	constexpr float TitleCapMid = 56.f;
-	constexpr float TitleCap    = 30.f;
-	constexpr float CountBoxH   = 44.f;
+	constexpr float TitleCapMid = TraceMenuKit::PageTitleCapMidPx;
+	constexpr float TitleCap    = TraceMenuKit::PageTitleCapPx;
+	constexpr float CountBoxH   = TraceMenuKit::PageClockBoxPx;
 
 	constexpr float TabY        = 100.f;
 	constexpr float TabH        = 74.f;
@@ -155,7 +155,7 @@ namespace TraceLoadoutLayout
 	constexpr float SizeBodyLast = 10.f;
 	constexpr float BodyLeading = 3.f;
 	constexpr float SizeMessage = 18.f;
-	constexpr float SizeTimer   = 18.f;
+	constexpr float SizeTimer   = TraceMenuKit::PageClockLabelPx;
 
 	/** How long a status line stays up. */
 	constexpr float MessageSeconds = 4.f;
@@ -318,13 +318,6 @@ namespace TraceLoadoutSelectFile
 			}
 			Size = FMath::Max(TraceLoadoutLayout::SizeBodyLast * S, Size - 0.5f * S);
 		}
-	}
-
-	/** A pulse in alpha, for the last five seconds of a countdown. */
-	FLinearColor Urgent(float NowSeconds)
-	{
-		const FLinearColor Amber = TraceMenuArtStyle::AmberLifted();
-		return FLinearColor(Amber.R, Amber.G, Amber.B, 0.72f + 0.28f * FMath::Sin(NowSeconds * 9.f));
 	}
 
 	/**
@@ -836,8 +829,8 @@ void FTraceLoadoutSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerSta
 	ReadLockInReply(LocalState);
 
 	// ONE POINTER ON SCREEN. While the pause menu is in front it owns the pointer, and this page —
-	// still drawn underneath so the pick does not look cancelled — must not leave a frozen blade
-	// under the scrim beside the live one.
+	// still running underneath so the pick is not cancelled, hidden by the menu's black, which draws
+	// this page's clock for it — must not leave a frozen blade under the scrim beside the live one.
 	bPointerOwned = bInputAllowed;
 
 	const bool bAct = bInputAllowed && PC != nullptr && GFrameCounter >= IgnoreInputBeforeFrame;
@@ -1700,25 +1693,11 @@ void FTraceLoadoutSelect::DrawHeader(AHUD* HUD, const ATracePlayerState* LocalSt
 	// ---- THE COUNTDOWN ------------------------------------------------------------------------
 	//
 	// The server closes this window on a deadline, and the page used to show no clock at all: the
-	// match clock was the only one, under the scrim and counting something else.
+	// match clock was the only one, under the scrim and counting something else. The kit draws it
+	// (DrawPageClock), because the pause menu draws the same clock in the same place over this page.
 	if (bMatchHeader && LocalState->CharacterSelectDeadlineServerTime > 0.f)
 	{
-		const float Remaining = LocalState->GetCharacterSelectTimeRemaining();
-		const bool bUrgent = Remaining <= 5.f;
-		const float BoxX = ViewW - TraceLoadoutLayout::Margin * S - BoxW;
-		TraceMenuKit::DrawValueBox(HUD, BoxX, CapMid - BoxH * 0.5f, BoxW, BoxH,
-			FString::FromInt(FMath::Max(0, FMath::CeilToInt(Remaining))),
-			bUrgent ? TraceLoadoutSelectFile::Urgent(AnimNow) : TraceMenuArtStyle::WordDefault);
-		FurnitureRight = BoxX;
-
-		const FString& Label = TRACE_TEXT("LOADOUT.TIMER_LABEL", "TIME");
-		if (!Label.IsEmpty())
-		{
-			TraceText::FStyle LabelStyle(TraceLoadoutLayout::SizeTimer * S, TraceMenuKit::FurnitureUnselected,
-				ETraceTextWeight::Light);
-			LabelStyle.HAlign = TraceText::EHAlign::Right;
-			FurnitureRight = BoxX - 14.f * S - TraceMenuKit::DrawTextCapCentered(HUD, Label, BoxX - 14.f * S, CapMid, LabelStyle);
-		}
+		FurnitureRight = TraceMenuKit::DrawPageClock(HUD, ViewW, S, LocalState->GetCharacterSelectTimeRemaining(), AnimNow);
 	}
 
 	// ---- THE TITLE, centred, set like every screen title (TraceLoadoutLayout::TitleCap) ---------

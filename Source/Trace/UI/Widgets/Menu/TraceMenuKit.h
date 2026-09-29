@@ -469,6 +469,30 @@ namespace TraceMenuKit
 	TRACE_API bool DrawValueBox(AHUD* HUD, float X, float Y, float W, float H, const FString& Text,
 		const FLinearColor& TextColor = FLinearColor::White);
 
+	// ---- THE FULL-SCREEN PAGES' HEADER LINE: team select and the loadout page (1080p design px) ----
+
+	/** Every screen title's cap height: SETTINGS, PAUSED, JOIN A GAME, FULL TIME, and both pages. */
+	static constexpr float PageTitleCapPx = 30.f;
+
+	/** Where the two pages centre their title's caps, from the top of the view. */
+	static constexpr float PageTitleCapMidPx = 56.f;
+
+	/** The two pages' side margin. The countdown's box is right-aligned to it. */
+	static constexpr float PageMarginPx = 54.f;
+
+	/** The countdown's value box height, and the type size of its TIME label. */
+	static constexpr float PageClockBoxPx = 44.f;
+	static constexpr float PageClockLabelPx = 18.f;
+
+	/**
+	 * THE PAGES' COUNTDOWN: TIME, then the whole seconds left in the kit's value box, right-aligned to
+	 * the page margin with its caps on the title's line. The number pulses amber for the last five
+	 * seconds. The loadout page draws it in its header, and the pause menu draws it in the same place
+	 * over either page, so pausing never hides the clock that will close the page underneath. Honours
+	 * the current opacity. Returns the left edge of what it drew; nothing is drawn for @p SecondsLeft < 0.
+	 */
+	TRACE_API float DrawPageClock(AHUD* HUD, float ViewW, float UIScale, float SecondsLeft, float NowSeconds);
+
 	/**
 	 * The slider's trough (T_MenuSliderTrack), @p H being the SPRITE's height (halo included; the
 	 * rail itself is TrackRailV of it). Samples a clean band of the sprite for the stretched middle,
