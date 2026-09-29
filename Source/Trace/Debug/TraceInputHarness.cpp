@@ -43,6 +43,7 @@
 #include "Gameplay/TraceCore.h"                                   // hand the Core off before the fire test
 #include "Gameplay/TraceHealthComponent.h"                        // killing ourselves to test respawn
 #include "Gameplay/TraceTracer.h"                                 // counted as proof a shot was emitted
+#include "Gameplay/TraceWeaponComponent.h"                        // IsFullAutoNow: what a held trigger should do
 #include "Trace.h"
 #include "TraceSettings.h"
 #include "TraceTypes.h"
@@ -320,6 +321,13 @@ namespace TraceInputHarness
 			{
 				continue;
 			}
+			// NOR THE CORE CARRIER. The carrier is shielded (spec §4): bullets land and the server
+			// correctly confirms no hit, so a run whose nearest enemy was carrying reported "12 tracers
+			// emitted, 0 server hit confirmations" — a working fire path read as a broken one.
+			if (Other->IsCarrier())
+			{
+				continue;
+			}
 
 			const float DistSq = FVector::DistSquared(Other->GetActorLocation(), Self->GetActorLocation());
 			if (DistSq < BestDistSq)
@@ -450,6 +458,7 @@ namespace TraceInputHarness
 			LookSweep,
 			LookReport,
 			Aim,
+			AimSettle,
 			FireHold,
 			FireReport,
 			KillSelf,
@@ -489,6 +498,7 @@ namespace TraceInputHarness
 			case EPhase::LookSweep:     return TickLookSweep(PC);
 			case EPhase::LookReport:    return TickLookReport(PC);
 			case EPhase::Aim:           return TickAim(PC);
+			case EPhase::AimSettle:     return TickAimSettle(PC);
 			case EPhase::FireHold:      return TickFireHold(PC);
 			case EPhase::FireReport:    return TickFireReport(PC);
 			case EPhase::KillSelf:      return TickKillSelf(PC);
@@ -780,9 +790,58 @@ namespace TraceInputHarness
 				}
 			}
 
+			Advance(EPhase::AimSettle);
+			return true;
+		}
+
+		/**
+		 * *** THE SHOT WAITS FOR THE TARGET TO BE WHERE THE SERVER THINKS IT IS. ***
+		 *
+		 * The target is TELEPORTED in front of us, and the server resolves a shot against its
+		 * lag-compensation history, rewound to the instant the shot was fired. Pressed on the same
+		 * frame as the teleport, the shot is judged against where the bot stood BEFORE it was moved,
+		 * and misses. While the pistol was automatic that never showed — the later rounds of a
+		 * three-second burst landed — but a semi-automatic pistol (spec v29 §2b) fires exactly the one
+		 * round, on that first frame, and the run read "0 server hit confirmations" on a working gun.
+		 * So the aim tracks the target for a moment first, then the trigger is pressed.
+		 */
+		bool TickAimSettle(ATracePlayerController* PC)
+		{
+			ATraceCharacter* const TraceChar = PC->GetTraceCharacter();
+			if (TraceChar == nullptr || !TraceChar->IsAlive())
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("SELFTEST: pawn died before the fire test; waiting for a respawn."));
+				Advance(EPhase::WaitForPawn);
+				return true;
+			}
+
+			if (ATraceCharacter* const Target = FireTarget.Get(); Target != nullptr && Target->IsAlive())
+			{
+				PC->SetControlRotation((Target->GetActorLocation() - TraceChar->GetPawnViewLocation()).Rotation());
+			}
+			if (PhaseElapsed < AimSettleSeconds)
+			{
+				return true;
+			}
+
 			FireStartCount = PC->DebugFireStartedCount;
 			HitStartCount = PC->DebugHitConfirmCount;
 			TracerIds.Reset();
+
+			// OUR ROUNDS, COUNTED BY OUR GUN. Tracers are counted world-wide, so in a match with bots
+			// they include everybody's shots; the weapon's own record (the v29 §2f measurement surface,
+			// stamped inside FireOnce on the shooting machine) counts only this pawn's.
+			if (IConsoleVariable* const RecordVar =
+					IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Weapons.RecordShots")))
+			{
+				SavedRecordShots = RecordVar->GetInt();
+				RecordVar->Set(1, ECVF_SetByConsole);
+			}
+			FireWeapon = TraceChar->FindComponentByClass<UTraceWeaponComponent>();
+			if (UTraceWeaponComponent* const Gun = FireWeapon.Get())
+			{
+				Gun->ClearRecordedShotTimes();
+			}
 
 			UE_LOG(LogTraceGame, Display, TEXT("SELFTEST: pressing LMB (carrier=%d)."), TraceChar->IsCarrier() ? 1 : 0);
 			InjectKey(EKeys::LeftMouseButton, /*bPressed=*/true, Path);
@@ -829,22 +888,49 @@ namespace TraceInputHarness
 
 			const int32 Fires = PC->DebugFireStartedCount - FireStartCount;
 			const int32 Hits = PC->DebugHitConfirmCount - HitStartCount;
-			const int32 Shots = TracerIds.Num();
+			const int32 Tracers = TracerIds.Num();
+			const UTraceWeaponComponent* const FiredGun = FireWeapon.Get();
+			const int32 Shots = (FiredGun != nullptr) ? FiredGun->GetRecordedShotTimes().Num() : 0;
+			if (IConsoleVariable* const RecordVar =
+					IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Weapons.RecordShots")))
+			{
+				RecordVar->Set(SavedRecordShots, ECVF_SetByConsole);
+			}
 
 			UE_LOG(LogTraceGame, Display,
-				TEXT("SELFTEST: LMB held %.1fs -> %d Fire-pressed events, %d tracers emitted, %d server hit confirmations"),
-				FireHoldSeconds, Fires, Shots, Hits);
+				TEXT("SELFTEST: LMB held %.1fs -> %d Fire-pressed events, %d round(s) fired by our gun (%d tracers ")
+				TEXT("in the world, anybody's), %d server hit confirmations"),
+				FireHoldSeconds, Fires, Shots, Tracers, Hits);
 
 			// One Started event is correct and expected — the binding is on press, and the weapon
 			// component's own tick drives the rest of the burst off the held trigger.
 			Check(Fires > 0, FString::Printf(TEXT("synthetic LMB reached the Fire binding (%d events)"), Fires));
 
 			// A tracer is spawned by UTraceWeaponComponent::FireOnce, i.e. only after CanFire()
-			// passed and immediately before ServerFire goes out. Several of them prove the held
-			// trigger kept firing, not just that one press was delivered.
-			Check(Shots > 1, FString::Printf(
-				TEXT("held trigger produced repeated shots (%d tracers over %.1fs at a %.2fs fire interval)"),
-				Shots, FireHoldSeconds, UTraceSettings::Get().FireInterval));
+			// passed and immediately before ServerFire goes out.
+			//
+			// *** WHAT A HELD TRIGGER SHOULD PRODUCE DEPENDS ON THE GUN IN HAND. *** This used to demand
+			// several tracers from any held trigger, and the pistol has been SEMI-AUTOMATIC since spec
+			// v29 §2b ("it must fire once per trigger press"), so a clean run on the range fired exactly
+			// one and failed. The expectation now comes from IsFullAutoNow() — the predicate the trigger
+			// loop itself asks, and the one Trace.Weapon's live-fire check already follows — so it tracks
+			// the weapon in hand and any ability that forces full auto (Roxie's MODDED). Semi-auto is
+			// exactly one: a second tracer from one press would be the v28 gun coming back.
+			const bool bFullAuto = (FiredGun != nullptr) && FiredGun->IsFullAutoNow();
+			if (bFullAuto)
+			{
+				Check(Shots > 1, FString::Printf(
+					TEXT("FULL AUTO: the held trigger produced repeated shots (%d round(s) over %.1fs at a %.2fs "
+					     "fire interval)"),
+					Shots, FireHoldSeconds, FiredGun->GetFireInterval()));
+			}
+			else
+			{
+				Check(Shots == 1, FString::Printf(
+					TEXT("SEMI-AUTO (v29 §2b): one held press fired exactly one round (%d over %.1fs)%s"),
+					Shots, FireHoldSeconds,
+					(FiredGun == nullptr) ? TEXT(" — no weapon component found, so this is not a gun") : TEXT("")));
+			}
 
 			if (bHadTarget)
 			{
@@ -954,6 +1040,8 @@ namespace TraceInputHarness
 		static constexpr float MaxWaitSeconds = 90.f;
 		static constexpr float MoveHoldSeconds = 1.2f;
 		static constexpr float FireHoldSeconds = 3.0f;
+		/** Aim tracking before the press, so the placed target is in the lag-comp history. See TickAimSettle. */
+		static constexpr float AimSettleSeconds = 0.35f;
 		/** Walk speed is several hundred uu/s, so a second of W is hundreds of uu. 50 is a floor. */
 		static constexpr float MinExpectedMoveUU = 50.f;
 		static constexpr int32 LookSampleCount = 20;
@@ -994,6 +1082,10 @@ namespace TraceInputHarness
 		TWeakObjectPtr<ATraceCharacter> FireTarget;
 		/** Unique ids of every tracer seen during the burst; see CollectTracerIds. */
 		TSet<uint32> TracerIds;
+		/** The gun whose own shot record is read for the fire-mode check. See TickAimSettle. */
+		TWeakObjectPtr<UTraceWeaponComponent> FireWeapon;
+		/** Trace.Weapons.RecordShots as the fire test found it; put back at the report. */
+		int32 SavedRecordShots = 0;
 
 		int32 PassCount = 0;
 		int32 FailCount = 0;
