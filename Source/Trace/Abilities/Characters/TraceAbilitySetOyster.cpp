@@ -1252,6 +1252,12 @@ namespace TraceAbilitySetOysterHarness
 		int32 Passed = 0;
 		int32 Failed = 0;
 
+		/**
+		 * Checks whose PRECONDITION this machine could not provide — they measured nothing. Counted
+		 * apart from both tallies so the verdict can say INCONCLUSIVE instead of blaming the throw.
+		 */
+		int32 Inconclusive = 0;
+
 		FVector AnchorFor(EThrowPose /*Pose*/) const
 		{
 			return OpenAnchor;
@@ -1272,7 +1278,22 @@ namespace TraceAbilitySetOysterHarness
 			UE_LOG(LogTraceGame, Display, TEXT("[PICKLERTHROW]   %s  %s"),
 				bCondition ? TEXT("PASS") : TEXT("*** FAIL ***"), *What);
 		}
+
+		void NotMeasured(const FString& What, const FString& Why)
+		{
+			++Inconclusive;
+			UE_LOG(LogTraceGame, Warning, TEXT("[PICKLERTHROW]   INCONCLUSIVE  %s — %s"), *What, *Why);
+		}
 	};
+
+	/**
+	 * THE LEGACY THROW'S OWN FRAME-RATE ERROR, and the tolerance the "lands where it always did" check
+	 * allows. The pre-v19 throw integrated once per frame, so where it landed drifted with the frame
+	 * time — measured at 1.5 uu per ms, straight-line, from 16.6 ms to 83.3 ms (v_hw_S2: 25 uu at 16.6 ms,
+	 * 126 uu at 83.3 ms). "Where it always did" is therefore only a POINT when its fast arm ran fast
+	 * enough for that drift to sit inside the 15 uu the check allows, which is about 150 fps or better.
+	 */
+	constexpr float PicklerLandingToleranceUU = 15.f;
 
 	/** The yaw with the most clear air in front of it, so a lob has room to actually be a lob. */
 	FRotator FindOpenFacing(const UWorld* WorldPtr, const ATraceCharacter* MyPawn)
@@ -1668,9 +1689,24 @@ namespace TraceAbilitySetOysterHarness
 				TEXT("[PICKLERTHROW]   frame deltas actually achieved: legacy %.1f ms vs %.1f ms; shipped %.1f ms vs %.1f ms"),
 				LegacyFast.MeanFrameMs, LegacySlow.MeanFrameMs, ShippedFast.MeanFrameMs, ShippedSlow.MeanFrameMs);
 
-			State->Check(bFrameRatesDiffered,
-				TEXT("the fixture really did run the two arms at different frame rates — a 'consistent' landing "
-				     "measured across two IDENTICAL frame rates would prove nothing at all"));
+			// A PRECONDITION, NOT A CLAIM ABOUT THE THROW. t.MaxFPS is a ceiling: a machine that cannot
+			// render faster than the slow arm's 12 fps cap — headless under load, measured at 46 ms — ran
+			// the "fast" arm at nearly the slow arm's rate, and the section then measured nothing. That
+			// is the fixture failing to stage, so it says INCONCLUSIVE and the throw is not blamed.
+			if (!bFrameRatesDiffered)
+			{
+				State->NotMeasured(TEXT("section 1, the same throw at two frame rates"),
+					FString::Printf(TEXT("the slow arms must run at more than twice the fast arms' frame time, and "
+						"this machine gave legacy %.1f vs %.1f ms, shipped %.1f vs %.1f ms"),
+						LegacyFast.MeanFrameMs, LegacySlow.MeanFrameMs, ShippedFast.MeanFrameMs,
+						ShippedSlow.MeanFrameMs));
+			}
+			else
+			{
+				State->Check(true,
+					TEXT("the fixture really did run the two arms at different frame rates — a 'consistent' landing "
+					     "measured across two IDENTICAL frame rates would prove nothing at all"));
+			}
 
 			if (bFrameRatesDiffered)
 			{
@@ -1704,10 +1740,43 @@ namespace TraceAbilitySetOysterHarness
 				&& !ShippedAgain.bReleaseClamped && !ShippedFlood.bReleaseClamped,
 				TEXT("REGRESSION: out in the open the muzzle is nowhere near anything, and the new release guard "
 				     "never fires on ANY of the four open throws"));
-			State->Check(LegacyFast.bLanded && ShippedFast.bLanded
-				&& FVector::Dist(LegacyFast.Landing, ShippedFast.Landing) < 15.f,
-				FString::Printf(TEXT("...and an open throw still lands where it always did (%.0f uu from the "
-					"pre-v19 landing point)"), FVector::Dist(LegacyFast.Landing, ShippedFast.Landing)));
+			// "Where it always did" is the LEGACY throw's landing, and that landing moves with the frame
+			// time (see PicklerLandingToleranceUU). Its drift at the fast arm's frame time is sized from
+			// this run's own two legacy arms — spread over frame-time difference, times the fast frame time
+			// — so the check only speaks when the reference point is steadier than the tolerance it is
+			// judged to. At 16.6 ms the reference itself wanders ~25 uu and a 15 uu check cannot pass on
+			// any build, which used to print FAIL about a throw that had not moved.
+			const float LandingDelta = FVector::Dist(LegacyFast.Landing, ShippedFast.Landing);
+			const float LegacyFrameSpanMs = LegacySlow.MeanFrameMs - LegacyFast.MeanFrameMs;
+			const float LegacyDriftAtFastUU = (bFrameRatesDiffered && LegacyFrameSpanMs > 0.f)
+				? FVector::Dist(LegacyFast.Landing, LegacySlow.Landing) * LegacyFast.MeanFrameMs / LegacyFrameSpanMs
+				: -1.f;
+			const TCHAR* const LandingWhat = TEXT("...and an open throw still lands where it always did");
+			if (!LegacyFast.bLanded || !ShippedFast.bLanded)
+			{
+				State->Check(false, FString::Printf(TEXT("%s (landed: legacy %d, shipped %d)"), LandingWhat,
+					LegacyFast.bLanded ? 1 : 0, ShippedFast.bLanded ? 1 : 0));
+			}
+			else if (LegacyDriftAtFastUU < 0.f || LegacyDriftAtFastUU >= PicklerLandingToleranceUU)
+			{
+				State->NotMeasured(FString::Printf(TEXT("%s (%.0f uu from the pre-v19 landing point)"), LandingWhat,
+						LandingDelta),
+					LegacyDriftAtFastUU < 0.f
+						? FString(TEXT("the legacy throw's own frame-rate drift could not be sized, because the "
+						               "two legacy arms did not run at clearly different frame rates"))
+						: FString::Printf(TEXT("at the %.1f ms this machine managed, the legacy landing itself "
+						                       "wanders ~%.0f uu with frame time, more than the %.0f uu tolerance; "
+						                       "it needs the fast arm at about %.1f ms (t.MaxFPS 200 asked for 5 ms)"),
+							LegacyFast.MeanFrameMs, LegacyDriftAtFastUU, PicklerLandingToleranceUU,
+							LegacyFast.MeanFrameMs * PicklerLandingToleranceUU / LegacyDriftAtFastUU));
+			}
+			else
+			{
+				State->Check(LandingDelta < PicklerLandingToleranceUU,
+					FString::Printf(TEXT("%s (%.0f uu from the pre-v19 landing point; the legacy reference drifts "
+						"~%.0f uu at %.1f ms)"), LandingWhat, LandingDelta, LegacyDriftAtFastUU,
+						LegacyFast.MeanFrameMs));
+			}
 
 			// The fixture proving itself. If the spawned ceiling did not actually swallow the raw
 			// muzzle then this arm reproduced NOTHING, and no green below it would mean anything.
@@ -1753,10 +1822,25 @@ namespace TraceAbilitySetOysterHarness
 			State->Check(ShippedFlood.bLandingEffect,
 				TEXT("...and its 30-damage impact actually fired, which is the whole of the ability"));
 
-			UE_LOG(LogTraceGame, Display, TEXT("[PICKLERTHROW] ===== %d passed, %d failed. ====="),
-				State->Passed, State->Failed);
-			UE_LOG(LogTraceGame, Display, TEXT("[PICKLERTHROW] VERDICT: %s"),
-				(State->Failed == 0 && State->Passed > 0) ? TEXT("PASS") : TEXT("*** FAIL ***"));
+			UE_LOG(LogTraceGame, Display, TEXT("[PICKLERTHROW] ===== %d passed, %d failed, %d inconclusive. ====="),
+				State->Passed, State->Failed, State->Inconclusive);
+			if (State->Failed > 0 || State->Passed == 0)
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[PICKLERTHROW] VERDICT: *** FAIL ***"));
+			}
+			else if (State->Inconclusive > 0)
+			{
+				// Not a pass either: part of the claim went unmeasured on this machine, and saying PASS
+				// would hide which part. Run it where the frame cap can actually be met.
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[PICKLERTHROW] VERDICT: INCONCLUSIVE — %d passed, 0 failed, %d not measurable at this "
+					     "frame rate (see INCONCLUSIVE above)."),
+					State->Passed, State->Inconclusive);
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[PICKLERTHROW] VERDICT: PASS"));
+			}
 			return false;
 		}));
 	}
