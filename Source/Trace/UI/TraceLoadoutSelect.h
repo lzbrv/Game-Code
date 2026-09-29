@@ -262,8 +262,14 @@ struct TRACE_API FTraceLoadoutSelect
 	void DebugSetCardRect(int32 Index, const FBox2D& Rect);
 	void DebugSetConfirmRect(const FBox2D& Rect) { ConfirmRect = Rect; }
 
-	/** One pointer sample at @p Pos, button up or down, through the SAME path the live page polls. */
-	void DebugPointer(const FVector2D& Pos, bool bButtonDown, ATracePlayerState* LocalState);
+	/** Test seam: park saved slot @p Index's hit rect where a draw would leave it. */
+	void DebugSetSavedRect(int32 Index, const FBox2D& Rect);
+
+	/**
+	 * One pointer sample at @p Pos, button up or down (SHIFT held or not), through the SAME path the
+	 * live page polls.
+	 */
+	void DebugPointer(const FVector2D& Pos, bool bButtonDown, ATracePlayerState* LocalState, bool bShiftHeld = false);
 
 	/** What would wear the hover look if the page drew now. */
 	FTraceLoadoutLit DebugLit() const { return ResolveLit(); }
@@ -406,6 +412,9 @@ private:
 
 	/** A release only clicks if its press began on this page while it was taking input. */
 	bool bMouseArmed = false;
+
+	/** SHIFT on the last pointer sample: a click on a saved slot then SAVES, so any slot is a target. */
+	bool bPointerShift = false;
 
 	/** This page is front-most and draws the pointer. False under the pause menu. */
 	bool bPointerOwned = true;

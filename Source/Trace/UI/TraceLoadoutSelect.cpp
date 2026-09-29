@@ -86,7 +86,8 @@ namespace TraceLoadoutSelect
 // =================================================================================================
 // THE LAYOUT — every number a 1080p design pixel, multiplied by UIScale.
 //
-//    30  [0 - 0] SIDES SWITCHED (half time) ... title (centred) ......... countdown value box
+//    56  [0 - 0] SIDES SWITCHED (half time) ... title (centred) ......... countdown value box
+//        (the line their caps are centred on)
 //   100  Q LB  [ MOVEMENT ]  [ PASSIVE ]  [ ACTIVATED ]  E RB   tabs, key chips at each end
 //   198  the 5 x 2 grid of cards
 //   888  SAVED [1 RIPPLE] [2] ...                   [F] [X] [ LOCK IN ]
@@ -97,9 +98,16 @@ namespace TraceLoadoutSelect
 namespace TraceLoadoutLayout
 {
 	constexpr float Margin      = 54.f;
-	constexpr float HeaderTop   = 30.f;
-	constexpr float TitleSize   = 40.f;
-	constexpr float TitleTrack  = 7.f;
+
+	/**
+	 * THE PAGE TITLE (BUILD YOUR LOADOUT, HALF TIME, LOADOUT n) IS SET LIKE EVERY OTHER SCREEN TITLE:
+	 * Sofachrome, white, untracked, at the page titles' 30 px cap height — SETTINGS, PAUSED, JOIN A GAME,
+	 * FULL TIME. It was type size 40 (a 27 px cap) and letter-spaced, so going from PAUSED or SETTINGS
+	 * to this page changed the title's size and spacing. Its caps are centred where they always were,
+	 * so the score and the countdown beside it did not move.
+	 */
+	constexpr float TitleCapMid = 56.f;
+	constexpr float TitleCap    = 30.f;
 	constexpr float CountBoxH   = 44.f;
 
 	constexpr float TabY        = 100.f;
@@ -368,6 +376,29 @@ namespace TraceLoadoutSelectFile
 		return !Loadout.IsEmpty() && UTraceAbilityComponent::IsLoadoutLegal(Loadout);
 	}
 
+	/** How a SAVED slot is drawn: the kit plate's state, and whether its word is the quiet grey. */
+	struct FSavedSlotLook
+	{
+		ETraceKitState State = ETraceKitState::Default;
+		bool bQuietWord = false;
+	};
+
+	/**
+	 * EMPTY IS NOT DISABLED. On this kit the dark DISABLED plate means "you cannot act here", and an
+	 * empty slot is a live save target (SHIFT+click, SHIFT+1-5, pad LT + Y all store into it). So an
+	 * empty slot is the DEFAULT plate with its number in the quiet grey (the KEYBOARD page's "+" chip),
+	 * and only a slot today's rules refuse to load keeps the DISABLED plate. Lit (the pointer on it with
+	 * SHIFT held, or on a usable slot), any slot wears the hover look: a click there does something.
+	 */
+	FSavedSlotLook SavedSlotLook(const FTraceLoadout& Saved, bool bLit, bool bPressed)
+	{
+		FSavedSlotLook Look;
+		const bool bEmpty = Saved.IsEmpty();
+		Look.State = TraceMenuKit::StateFor(/*bEnabled=*/bLit || bEmpty || SavedUsable(Saved), bLit, bLit && bPressed);
+		Look.bQuietWord = bEmpty && !bLit;
+		return Look;
+	}
+
 	/**
 	 * Does the page name PAD buttons as well as keys? Once a pad has been seen on this machine, and
 	 * only while CONTROLLER INPUT is on: with it off the page ignores the pad (ReadKeys), and a chip
@@ -389,49 +420,69 @@ namespace TraceLoadoutSelectFile
 	};
 
 	/**
+	 * The one or two key chips of one group: the KEYBOARD key, and the PAD button after it. Pointers into
+	 * the text store, whose strings live for the whole process (TraceGameText::Get), so building the
+	 * group every drawn frame copies and allocates nothing (P11).
+	 */
+	struct FChipKeys
+	{
+		const FString* Keys[2] = { nullptr, nullptr };
+		int32 Num = 0;
+
+		void Add(const FString& Key)
+		{
+			// An emptied line (Ranen's "KEY =") takes its chip with it.
+			if (!Key.IsEmpty() && Num < 2)
+			{
+				Keys[Num++] = &Key;
+			}
+		}
+
+		const FString& operator[](int32 Index) const { return *Keys[Index]; }
+	};
+
+	/**
 	 * The chips beside @p Which: the KEYBOARD key always, and the PAD button after it while pad hints
 	 * show — both, the way every other screen's legend names both. They used to swap to the pad's
 	 * alone once any pad input had been seen, so a keyboard player read LB / RB / X.
 	 */
-	void ChipKeys(EChip Which, bool bLibrary, bool bPadHints, TArray<FString>& OutKeys)
+	FChipKeys ChipKeys(EChip Which, bool bLibrary, bool bPadHints)
 	{
-		OutKeys.Reset();
+		FChipKeys Out;
 		switch (Which)
 		{
 		case EChip::TabLeft:
-			OutKeys.Add(TRACE_TEXT("LOADOUT.KEY_TAB_LEFT", "Q"));
-			if (bPadHints) { OutKeys.Add(TRACE_TEXT("LOADOUT.PAD_KEY_TAB_LEFT", "LB")); }
+			Out.Add(TRACE_TEXT("LOADOUT.KEY_TAB_LEFT", "Q"));
+			if (bPadHints) { Out.Add(TRACE_TEXT("LOADOUT.PAD_KEY_TAB_LEFT", "LB")); }
 			break;
 		case EChip::TabRight:
-			OutKeys.Add(TRACE_TEXT("LOADOUT.KEY_TAB_RIGHT", "E"));
-			if (bPadHints) { OutKeys.Add(TRACE_TEXT("LOADOUT.PAD_KEY_TAB_RIGHT", "RB")); }
+			Out.Add(TRACE_TEXT("LOADOUT.KEY_TAB_RIGHT", "E"));
+			if (bPadHints) { Out.Add(TRACE_TEXT("LOADOUT.PAD_KEY_TAB_RIGHT", "RB")); }
 			break;
 		case EChip::Confirm:
-			OutKeys.Add(TRACE_TEXT("LOADOUT.KEY_LOCK_IN", "F"));
-			if (bPadHints) { OutKeys.Add(TRACE_TEXT("LOADOUT.PAD_KEY_LOCK_IN", "X")); }
+			Out.Add(TRACE_TEXT("LOADOUT.KEY_LOCK_IN", "F"));
+			if (bPadHints) { Out.Add(TRACE_TEXT("LOADOUT.PAD_KEY_LOCK_IN", "X")); }
 			break;
 		case EChip::Back:
-			OutKeys.Add(bLibrary ? TRACE_TEXT("LOADOUT.KEY_BACK", "ESC") : TRACE_TEXT("LOADOUT.KEY_BACK_TAB", "BKSP"));
-			if (bPadHints) { OutKeys.Add(TRACE_TEXT("LOADOUT.PAD_KEY_BACK", "B")); }
+			Out.Add(bLibrary ? TRACE_TEXT("LOADOUT.KEY_BACK", "ESC") : TRACE_TEXT("LOADOUT.KEY_BACK_TAB", "BKSP"));
+			if (bPadHints) { Out.Add(TRACE_TEXT("LOADOUT.PAD_KEY_BACK", "B")); }
 			break;
 		default:
 			break;
 		}
-
-		// An emptied line (Ranen's "KEY =") takes its chip with it.
-		OutKeys.RemoveAll([](const FString& Key) { return Key.IsEmpty(); });
+		return Out;
 	}
 
 	/** The gap between two chips of one group. */
 	constexpr float ChipPairGap = 8.f;
 
 	/** How wide DrawChipGroup draws @p Keys at chip height @p ChipH. */
-	float ChipGroupWidth(const TArray<FString>& Keys, float ChipH, float Gap)
+	float ChipGroupWidth(const FChipKeys& Keys, float ChipH, float Gap)
 	{
 		float Width = 0.f;
-		for (const FString& Key : Keys)
+		for (int32 Index = 0; Index < Keys.Num; ++Index)
 		{
-			const float ChipW = TraceMenuKit::KeyChipWidth(Key, ChipH);
+			const float ChipW = TraceMenuKit::KeyChipWidth(Keys[Index], ChipH);
 			if (ChipW > 0.f)
 			{
 				Width += (Width > 0.f ? Gap : 0.f) + ChipW;
@@ -441,18 +492,18 @@ namespace TraceLoadoutSelectFile
 	}
 
 	/** @p Keys as chips left to right from @p X. Returns the width drawn. */
-	float DrawChipGroup(AHUD* HUD, float X, float Y, float ChipH, float Gap, const TArray<FString>& Keys,
+	float DrawChipGroup(AHUD* HUD, float X, float Y, float ChipH, float Gap, const FChipKeys& Keys,
 		float NowSeconds)
 	{
 		float PenX = X;
-		for (const FString& Key : Keys)
+		for (int32 Index = 0; Index < Keys.Num; ++Index)
 		{
-			const float ChipW = TraceMenuKit::KeyChipWidth(Key, ChipH);
+			const float ChipW = TraceMenuKit::KeyChipWidth(Keys[Index], ChipH);
 			if (ChipW <= 0.f)
 			{
 				continue;
 			}
-			TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, PenX, Y, ChipH, Key, NowSeconds);
+			TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, PenX, Y, ChipH, Keys[Index], NowSeconds);
 			PenX += ChipW + Gap;
 		}
 		return FMath::Max(0.f, PenX - X - Gap);
@@ -812,7 +863,10 @@ void FTraceLoadoutSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerSta
 	// window choosing cards and did not press LOCK IN lost every one of them — while the cards said
 	// EQUIPPED. Their picks are sent a second before the deadline instead. Only if they changed
 	// something: a player who touched nothing still gets the server's own timeout, as before.
-	if (bStagedDirty && !bAutoSent && LocalState != nullptr && WantsOpen(LocalState)
+	//
+	// NOT WHILE A LOCK IN IS ON THE WIRE: that request already carries the picks, and a second one would
+	// be refused as LOCKED by the server the first one closed (see Confirm).
+	if (bStagedDirty && !bAutoSent && !bLockSent && LocalState != nullptr && WantsOpen(LocalState)
 		&& LocalState->CharacterSelectDeadlineServerTime > 0.f
 		&& LocalState->GetCharacterSelectTimeRemaining() <= TraceLoadoutLayout::AutoSendLead)
 	{
@@ -1111,6 +1165,7 @@ void FTraceLoadoutSelect::StepPointer(bool bSampled, const FVector2D& SamplePos,
 	const bool bPressedNow = bButtonDown && !bMouseWasDown;
 	const bool bJustReleased = !bButtonDown && bMouseWasDown;
 	bMouseWasDown = bButtonDown;
+	bPointerShift = bShiftHeld;
 
 	if (!bAct)
 	{
@@ -1231,9 +1286,10 @@ FTraceLoadoutLit FTraceLoadoutSelect::ResolveLit() const
 	// kept its glow while the pointer sat on LOCK IN. Now exactly one thing wears the look.
 	FTraceLoadoutLit Out;
 
-	// 1. THE POINTER'S TARGET, while the pointer is what the player used last. A disabled saved slot
-	//    is not a target: pointing at it leaves the keys' card lit, as a non-selectable row does on
-	//    the options page.
+	// 1. THE POINTER'S TARGET, while the pointer is what the player used last. A saved slot is a
+	//    target when a click there does something: a usable slot always (a click loads it), and any
+	//    slot while SHIFT is held (a shift-click saves there, empty or not). Pointing at a slot a click
+	//    cannot use leaves the keys' card lit, as a non-selectable row does on the options page.
 	if (bPointerLed)
 	{
 		if (HoveredTab != INDEX_NONE)
@@ -1249,7 +1305,8 @@ FTraceLoadoutLit FTraceLoadoutSelect::ResolveLit() const
 			Out.bBack = true;
 		}
 		else if (HoveredSaved != INDEX_NONE
-			&& TraceLoadoutSelectFile::SavedUsable(UTraceUserSettings::Get().GetSavedLoadout(HoveredSaved)))
+			&& (bPointerShift
+				|| TraceLoadoutSelectFile::SavedUsable(UTraceUserSettings::Get().GetSavedLoadout(HoveredSaved))))
 		{
 			Out.Saved = HoveredSaved;
 		}
@@ -1300,6 +1357,19 @@ void FTraceLoadoutSelect::Confirm(ATracePlayerState* LocalState)
 {
 	if (LocalState == nullptr)
 	{
+		return;
+	}
+
+	// *** ONE LOCK IN ON THE WIRE AT A TIME. *** A second send before the first is answered (a double
+	// tap inside one server frame, or F pressed in the last second as the deadline's auto-send fires)
+	// reset the refusal baseline below. The server accepted the first, which closed its window, and
+	// refused the second as LOCKED; the page took that refusal for the answer to the lock-in it had made
+	// and faded out on LOADOUT LOCKED over a loadout that had been applied. The request in flight
+	// already carries the player's intent, so a press while it is out is simply ignored: the window
+	// closing says LOCKED IN, and a refusal (which clears bLockSent) lets the next press through.
+	if (bLockSent)
+	{
+		UE_LOG(LogTraceGame, Log, TEXT("[LoadoutScreen] LOCK IN already sent; waiting for the server's answer."));
 		return;
 	}
 
@@ -1579,34 +1649,23 @@ void FTraceLoadoutSelect::Draw(AHUD* HUD, APlayerController* PC, const ATracePla
 void FTraceLoadoutSelect::DrawHeader(AHUD* HUD, const ATracePlayerState* LocalState, const FString& Title)
 {
 	const float S = UIScale;
-	const float TitleSize = TraceLoadoutLayout::TitleSize * S;
-	const float TitleTop = TraceLoadoutLayout::HeaderTop * S;
-
-	// CENTRED, LIGHT, TRACKED — the team screen's title a quarter second earlier, so the page turn
-	// reads as a page turn and not as a different program.
-	TraceText::FStyle TitleStyle(TitleSize, TraceMenuArtStyle::WordDefault, ETraceTextWeight::Light);
-	TitleStyle.Tracking = TraceLoadoutLayout::TitleTrack * S;
-	TitleStyle.HAlign = TraceText::EHAlign::Center;
-	TraceCanvasText::Draw(HUD, Title, ViewW * 0.5f, TitleTop, TitleStyle);
-
-	if (LocalState == nullptr || IsLibraryOpen())
-	{
-		return;
-	}
-
-	const float CapMid = TitleTop + TraceText::Ascent(TitleSize, ETraceTextWeight::Light)
-		- TraceText::CapHeight(TitleSize, ETraceTextWeight::Light) * 0.5f;
+	const float CapMid = TraceLoadoutLayout::TitleCapMid * S;
 	const float BoxH = TraceLoadoutLayout::CountBoxH * S;
 	const float BoxW = BoxH * (TraceMenuArtStyle::ValueFrame.PlateW / TraceMenuArtStyle::ValueFrame.PlateH);
+	const bool bMatchHeader = (LocalState != nullptr) && !IsLibraryOpen();
+
+	// The furniture either side of the title, as drawn below: the title is kept clear of both.
+	float FurnitureLeft = TraceLoadoutLayout::Margin * S;
+	float FurnitureRight = ViewW - TraceLoadoutLayout::Margin * S;
 
 	// ---- THE BREAK: THE SCORE, AND SIDES SWITCHED ----------------------------------------------
 	//
 	// The left end mirrors TIME on the right: the score in the kit's value box, blue then orange in
 	// their team colours (the results screen's order), and the HUD card's SIDES SWITCHED after it —
 	// what the HALF TIME card under this page would have said.
-	const ATraceGameState* const HalfGS = (LocalState->GetWorld() != nullptr)
+	const ATraceGameState* const HalfGS = (bMatchHeader && LocalState->GetWorld() != nullptr)
 		? LocalState->GetWorld()->GetGameState<ATraceGameState>() : nullptr;
-	if (bHalfTimeHeader && HalfGS != nullptr)
+	if (bMatchHeader && bHalfTimeHeader && HalfGS != nullptr)
 	{
 		const FString BlueText = FString::FromInt(HalfGS->GetScore(ETraceTeam::Blue));
 		const FString OrangeText = FString::FromInt(HalfGS->GetScore(ETraceTeam::Orange));
@@ -1625,14 +1684,16 @@ void FTraceLoadoutSelect::DrawHeader(AHUD* HUD, const ATracePlayerState* LocalSt
 			ETraceTextWeight::Light, TraceText::EHAlign::Center);
 		TraceMenuKit::DrawCapText(HUD, OrangeText, BoxMid + Spread, CapMid, CapH, TraceTeamColor(ETraceTeam::Orange),
 			ETraceTextWeight::Light, TraceText::EHAlign::Left);
+		FurnitureLeft = BoxLeft + ScoreW;
 
-		const FString Switched = TRACE_TEXT("HUD.BANNER_SIDES_SWITCHED_SHORT", "SIDES SWITCHED");
+		const FString& Switched = TRACE_TEXT("HUD.BANNER_SIDES_SWITCHED_SHORT", "SIDES SWITCHED");
 		if (!Switched.IsEmpty())
 		{
 			TraceText::FStyle NoteStyle(TraceLoadoutLayout::SizeTimer * S, TraceMenuKit::FurnitureUnselected,
 				ETraceTextWeight::Light);
 			NoteStyle.HAlign = TraceText::EHAlign::Left;
-			TraceMenuKit::DrawTextCapCentered(HUD, Switched, BoxLeft + ScoreW + 14.f * S, CapMid, NoteStyle);
+			const float NoteX = BoxLeft + ScoreW + 14.f * S;
+			FurnitureLeft = NoteX + TraceMenuKit::DrawTextCapCentered(HUD, Switched, NoteX, CapMid, NoteStyle);
 		}
 	}
 
@@ -1640,26 +1701,34 @@ void FTraceLoadoutSelect::DrawHeader(AHUD* HUD, const ATracePlayerState* LocalSt
 	//
 	// The server closes this window on a deadline, and the page used to show no clock at all: the
 	// match clock was the only one, under the scrim and counting something else.
-	if (LocalState->CharacterSelectDeadlineServerTime <= 0.f)
+	if (bMatchHeader && LocalState->CharacterSelectDeadlineServerTime > 0.f)
 	{
-		return;
+		const float Remaining = LocalState->GetCharacterSelectTimeRemaining();
+		const bool bUrgent = Remaining <= 5.f;
+		const float BoxX = ViewW - TraceLoadoutLayout::Margin * S - BoxW;
+		TraceMenuKit::DrawValueBox(HUD, BoxX, CapMid - BoxH * 0.5f, BoxW, BoxH,
+			FString::FromInt(FMath::Max(0, FMath::CeilToInt(Remaining))),
+			bUrgent ? TraceLoadoutSelectFile::Urgent(AnimNow) : TraceMenuArtStyle::WordDefault);
+		FurnitureRight = BoxX;
+
+		const FString& Label = TRACE_TEXT("LOADOUT.TIMER_LABEL", "TIME");
+		if (!Label.IsEmpty())
+		{
+			TraceText::FStyle LabelStyle(TraceLoadoutLayout::SizeTimer * S, TraceMenuKit::FurnitureUnselected,
+				ETraceTextWeight::Light);
+			LabelStyle.HAlign = TraceText::EHAlign::Right;
+			FurnitureRight = BoxX - 14.f * S - TraceMenuKit::DrawTextCapCentered(HUD, Label, BoxX - 14.f * S, CapMid, LabelStyle);
+		}
 	}
 
-	const float Remaining = LocalState->GetCharacterSelectTimeRemaining();
-	const bool bUrgent = Remaining <= 5.f;
-	const float BoxX = ViewW - TraceLoadoutLayout::Margin * S - BoxW;
-	TraceMenuKit::DrawValueBox(HUD, BoxX, CapMid - BoxH * 0.5f, BoxW, BoxH,
-		FString::FromInt(FMath::Max(0, FMath::CeilToInt(Remaining))),
-		bUrgent ? TraceLoadoutSelectFile::Urgent(AnimNow) : TraceMenuArtStyle::WordDefault);
-
-	const FString Label = TRACE_TEXT("LOADOUT.TIMER_LABEL", "TIME");
-	if (!Label.IsEmpty())
-	{
-		TraceText::FStyle LabelStyle(TraceLoadoutLayout::SizeTimer * S, TraceMenuKit::FurnitureUnselected,
-			ETraceTextWeight::Light);
-		LabelStyle.HAlign = TraceText::EHAlign::Right;
-		TraceMenuKit::DrawTextCapCentered(HUD, Label, BoxX - 14.f * S, CapMid, LabelStyle);
-	}
+	// ---- THE TITLE, centred, set like every screen title (TraceLoadoutLayout::TitleCap) ---------
+	//
+	// Its width limit is the room the furniture leaves either side of the centre, so a long title
+	// shrinks rather than running into the score or the countdown on a narrow window.
+	const float CentreX = ViewW * 0.5f;
+	const float HalfRoom = FMath::Min(CentreX - FurnitureLeft, FurnitureRight - CentreX) - 24.f * S;
+	TraceMenuKit::DrawCapText(HUD, Title, CentreX, CapMid, TraceLoadoutLayout::TitleCap * S,
+		TraceMenuArtStyle::WordDefault, ETraceTextWeight::Light, TraceText::EHAlign::Center, FMath::Max(1.f, 2.f * HalfRoom));
 }
 
 void FTraceLoadoutSelect::DrawTabs(AHUD* HUD, APlayerController* PC, float X, float Y, float W)
@@ -1672,10 +1741,10 @@ void FTraceLoadoutSelect::DrawTabs(AHUD* HUD, APlayerController* PC, float X, fl
 	// keyboard players only found the other two questions by clicking. Q / E always, and the pad's
 	// shoulders beside them while pad hints show (ChipKeys).
 	const bool bPadHints = TraceLoadoutSelectFile::PadHintsShown(PC);
-	TArray<FString> LeftKeys;
-	TArray<FString> RightKeys;
-	TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::TabLeft, IsLibraryOpen(), bPadHints, LeftKeys);
-	TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::TabRight, IsLibraryOpen(), bPadHints, RightKeys);
+	const TraceLoadoutSelectFile::FChipKeys LeftKeys =
+		TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::TabLeft, IsLibraryOpen(), bPadHints);
+	const TraceLoadoutSelectFile::FChipKeys RightKeys =
+		TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::TabRight, IsLibraryOpen(), bPadHints);
 
 	const float ChipH = TraceLoadoutLayout::TabChipH * S;
 	const float ChipY = Y + (TabH - ChipH) * 0.5f;
@@ -1950,8 +2019,8 @@ void FTraceLoadoutSelect::DrawActionRow(AHUD* HUD, APlayerController* PC, float 
 	float Right = X + W;
 	{
 		const FString Word = bLibrary ? TRACE_TEXT("LOADOUT.SAVE_SLOT", "SAVE") : TRACE_TEXT("LOADOUT.LOCK_IN", "LOCK IN");
-		TArray<FString> Keys;
-		TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::Confirm, bLibrary, bPadHints, Keys);
+		const TraceLoadoutSelectFile::FChipKeys Keys =
+			TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::Confirm, bLibrary, bPadHints);
 		const float PlateX = Right - BtnW;
 		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, FrameLit.bConfirm,
 			FrameLit.bConfirm && FrameLit.bPressed);
@@ -1973,8 +2042,8 @@ void FTraceLoadoutSelect::DrawActionRow(AHUD* HUD, APlayerController* PC, float 
 	if (bLibrary)
 	{
 		const FString Word = TRACE_TEXT("LOADOUT.BACK", "BACK");
-		TArray<FString> Keys;
-		TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::Back, bLibrary, bPadHints, Keys);
+		const TraceLoadoutSelectFile::FChipKeys Keys =
+			TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::Back, bLibrary, bPadHints);
 		const float PlateX = Right - BtnW;
 		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, FrameLit.bBack,
 			FrameLit.bBack && FrameLit.bPressed);
@@ -2029,10 +2098,9 @@ void FTraceLoadoutSelect::DrawSavedRow(AHUD* HUD, float X, float Y, float MaxW)
 	{
 		const float SlotX = PenX + (SlotW + Gap) * Index;
 		const FTraceLoadout Saved = Settings.GetSavedLoadout(Index);
-		const bool bUsable = TraceLoadoutSelectFile::SavedUsable(Saved);
 
 		// WHAT THE SLOT HOLDS, not just its number: its activated ability names it (or the name the
-		// player gave it). An empty slot, or one the rules no longer allow, is the disabled plate.
+		// player gave it).
 		FString Word = Settings.GetSavedLoadoutName(Index);
 		if (Word.IsEmpty())
 		{
@@ -2041,13 +2109,23 @@ void FTraceLoadoutSelect::DrawSavedRow(AHUD* HUD, float X, float Y, float MaxW)
 				? FString::FromInt(Index + 1)
 				: TRACE_TEXTF("LOADOUT.SAVED_SLOT", "{0} {1}", { Index + 1, Activated });
 		}
-
-		const ETraceKitState State = TraceMenuKit::StateFor(bUsable, Index == FrameLit.Saved,
-			Index == FrameLit.Saved && FrameLit.bPressed);
-		if (TraceMenuKit::DrawButton(HUD, State, SlotX, Y, SlotW, H, Word, AnimNow))
+		if (Word.IsEmpty())
 		{
-			SavedRects[Index] = FBox2D(FVector2D(SlotX, Y), FVector2D(SlotX + SlotW, Y + H));
+			continue;   // an emptied name draws no plate, and leaves nothing to click (DrawButton's rule)
 		}
+
+		// EMPTY IS NOT DISABLED (SavedSlotLook): an empty slot is a live save target, so it is the
+		// kit's navy plate with its number in the quiet grey, like the KEYBOARD page's "+" chip. Only a
+		// slot the rules no longer allow wears the dark DISABLED plate.
+		const bool bLit = (Index == FrameLit.Saved);
+		const TraceLoadoutSelectFile::FSavedSlotLook Look =
+			TraceLoadoutSelectFile::SavedSlotLook(Saved, bLit, bLit && FrameLit.bPressed);
+		TraceMenuKit::DrawStatePlate(HUD, Look.State, SlotX, Y, SlotW, H, AnimNow);
+		const FLinearColor WordColor = Look.bQuietWord ? TraceMenuArtStyle::WordDisabled
+			: TraceMenuKit::VisualsAt(Look.State, SlotX, Y, SlotW, H).Label;
+		TraceMenuKit::DrawLabel(HUD, Word, SlotX + SlotW * 0.5f, Y + H * 0.5f, H, WordColor,
+			SlotW - H * TraceMenuKit::LabelPadFraction * 2.f);
+		SavedRects[Index] = FBox2D(FVector2D(SlotX, Y), FVector2D(SlotX + SlotW, Y + H));
 	}
 }
 
@@ -2212,9 +2290,18 @@ void FTraceLoadoutSelect::DebugSetCardRect(int32 Index, const FBox2D& Rect)
 	}
 }
 
-void FTraceLoadoutSelect::DebugPointer(const FVector2D& Pos, bool bButtonDown, ATracePlayerState* LocalState)
+void FTraceLoadoutSelect::DebugSetSavedRect(int32 Index, const FBox2D& Rect)
 {
-	StepPointer(/*bSampled=*/true, Pos, bButtonDown, /*bShiftHeld=*/false, LocalState, /*bAct=*/true);
+	if (Index >= 0 && Index < static_cast<int32>(UE_ARRAY_COUNT(SavedRects)))
+	{
+		SavedRects[Index] = Rect;
+	}
+}
+
+void FTraceLoadoutSelect::DebugPointer(const FVector2D& Pos, bool bButtonDown, ATracePlayerState* LocalState,
+	bool bShiftHeld)
+{
+	StepPointer(/*bSampled=*/true, Pos, bButtonDown, bShiftHeld, LocalState, /*bAct=*/true);
 }
 
 #if !UE_BUILD_SHIPPING
@@ -2950,6 +3037,46 @@ namespace TraceLoadoutScreenVerify
 			}
 		}
 
+		// ---- TWO LOCK INS BEFORE THE ANSWER: STILL LOCKED IN -------------------------------------
+		//
+		// A double tap inside one server frame, or F pressed in the last second as the deadline's
+		// auto-send fires: two requests before this page has heard the answer to the first. The server
+		// accepts the first (and closes its window) and refuses the second as LOCKED. The page used to
+		// reset its refusal baseline on the second send, read that refusal as the answer to the lock-in
+		// it made, and fade out on LOADOUT LOCKED over a loadout the server had applied. In live play
+		// only: before the whistle the server takes the second one too, and nothing is refused.
+		{
+			const ATraceGameState* const TwiceGS = World->GetGameState<ATraceGameState>();
+			const bool bTwiceLive = TwiceGS != nullptr && TwiceGS->TraceMatchState == ETraceMatchState::InProgress
+				&& !TwiceGS->IsHalfTimeBreak();
+			if (!bTwiceLive)
+			{
+				Check(TEXT("two LOCK INs before the answer still end on LOCKED IN"), false,
+					TEXT("INCONCLUSIVE: the server only refuses in live play - run this after warm-up"));
+			}
+			else
+			{
+				Comp->ApplyLoadout(Restore);
+				Subject->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
+				Subject->ServerSetCharacterSelectOpen(/*bOpen=*/true, 0.f);
+				const int32 RefusalsBefore = Comp->GetLockInRefusalCount();
+				FTraceLoadoutSelect Page;
+				Page.Tick(nullptr, nullptr, Subject, 1920.f, 1080.f, 1.f, 7.0f, /*bInputAllowed=*/true);   // up
+				Page.DebugPick(ETraceLoadoutSlot::Movement,  ETraceAbilityId::StickyGloves);
+				Page.DebugPick(ETraceLoadoutSlot::Passive,   ETraceAbilityId::Magnet);
+				Page.DebugPick(ETraceLoadoutSlot::Activated, ETraceAbilityId::Snap);
+				Page.DebugConfirm(Subject);   // accepted: the server shuts its window inside the call...
+				Page.DebugConfirm(Subject);   // ...and a second press before this page has seen that
+				const int32 RefusalsAfter = Comp->GetLockInRefusalCount();
+				Page.Tick(nullptr, nullptr, Subject, 1920.f, 1080.f, 1.f, 7.1f, /*bInputAllowed=*/true);   // sees it shut
+				Check(TEXT("*** two LOCK INs before the answer still end on LOCKED IN ***"),
+					Page.DebugMessage() == SaidLocked && Comp->GetLoadout() == Wanted && !Subject->IsCharacterSelectOpen()
+						&& RefusalsAfter == RefusalsBefore,
+					FString::Printf(TEXT("the page says '%s', server holds %s, %d refusal(s) came back"), *Page.DebugMessage(),
+						*TraceLoadoutToString(Comp->GetLoadout()), RefusalsAfter - RefusalsBefore));
+			}
+		}
+
 		// ---- HALF TIME: THE PAGE SAYS SO ---------------------------------------------------------
 		{
 			ATraceGameState* const BreakGS = World->GetGameState<ATraceGameState>();
@@ -3018,20 +3145,28 @@ namespace TraceLoadoutScreenVerify
 
 		// ---- EVERY CHIP AND LEGEND NAMES THE KEYBOARD, AND THE PAD BESIDE IT -----------------------
 		{
-			TArray<FString> TabLeftKeys;
-			TArray<FString> LockKeys;
-			TArray<FString> LockKeysNoPad;
-			TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::TabLeft, false, true, TabLeftKeys);
-			TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::Confirm, false, true, LockKeys);
-			TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::Confirm, false, false, LockKeysNoPad);
+			const TraceLoadoutSelectFile::FChipKeys TabLeftKeys =
+				TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::TabLeft, false, true);
+			const TraceLoadoutSelectFile::FChipKeys LockKeys =
+				TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::Confirm, false, true);
+			const TraceLoadoutSelectFile::FChipKeys LockKeysNoPad =
+				TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::Confirm, false, false);
+			auto JoinChips = [](const TraceLoadoutSelectFile::FChipKeys& Chips)
+			{
+				FString Joined;
+				for (int32 ChipIndex = 0; ChipIndex < Chips.Num; ++ChipIndex)
+				{
+					Joined += (ChipIndex > 0 ? TEXT(" ") : TEXT("")) + Chips[ChipIndex];
+				}
+				return Joined;
+			};
 			Check(TEXT("*** chips: Q and LB, F and X once a pad is seen; F alone before ***"),
-				TabLeftKeys.Num() == 2 && TabLeftKeys[0] == TRACE_TEXT("LOADOUT.KEY_TAB_LEFT", "Q")
+				TabLeftKeys.Num == 2 && TabLeftKeys[0] == TRACE_TEXT("LOADOUT.KEY_TAB_LEFT", "Q")
 					&& TabLeftKeys[1] == TRACE_TEXT("LOADOUT.PAD_KEY_TAB_LEFT", "LB")
-					&& LockKeys.Num() == 2 && LockKeys[0] == TRACE_TEXT("LOADOUT.KEY_LOCK_IN", "F")
-					&& LockKeysNoPad.Num() == 1 && LockKeysNoPad[0] == LockKeys[0],
+					&& LockKeys.Num == 2 && LockKeys[0] == TRACE_TEXT("LOADOUT.KEY_LOCK_IN", "F")
+					&& LockKeysNoPad.Num == 1 && LockKeysNoPad[0] == LockKeys[0],
 				FString::Printf(TEXT("tab left [%s], lock in [%s], lock in with no pad [%s]"),
-					*FString::Join(TabLeftKeys, TEXT(" ")), *FString::Join(LockKeys, TEXT(" ")),
-					*FString::Join(LockKeysNoPad, TEXT(" "))));
+					*JoinChips(TabLeftKeys), *JoinChips(LockKeys), *JoinChips(LockKeysNoPad)));
 
 			auto HasItem = [](const TArray<FTraceKitLegendItem>& Items, const FString& Key, const FString& Verb)
 			{
@@ -3165,6 +3300,49 @@ namespace TraceLoadoutScreenVerify
 				Settings.GetSavedLoadout(0) == Fresh.GetStaged() && Settings.GetSavedLoadout(1) == Edited
 					&& Settings.GetSavedLoadout(3) == SlotB,
 				FString::Printf(TEXT("slot 1 now %s"), *TraceLoadoutToString(Settings.GetSavedLoadout(0))));
+
+			// ---- AN EMPTY SLOT IS A SAVE TARGET, NOT A DEAD ONE ------------------------------------
+			//
+			// Slot 3 is still empty and slot 5 still illegal. The empty one was drawn on the DISABLED
+			// plate, which on this kit means "cannot act", while SHIFT+click, SHIFT+3 and LT + Y all
+			// save into it; and it never took the pointer's hover, even with SHIFT down. Driven through
+			// the look DrawSavedRow uses and the real pointer path, against 1080p slot rects.
+			{
+				const TraceLoadoutSelectFile::FSavedSlotLook EmptyLook =
+					TraceLoadoutSelectFile::SavedSlotLook(Settings.GetSavedLoadout(2), /*bLit=*/false, /*bPressed=*/false);
+				const TraceLoadoutSelectFile::FSavedSlotLook RefusedLook =
+					TraceLoadoutSelectFile::SavedSlotLook(Settings.GetSavedLoadout(4), false, false);
+				const TraceLoadoutSelectFile::FSavedSlotLook FullLook =
+					TraceLoadoutSelectFile::SavedSlotLook(Settings.GetSavedLoadout(3), false, false);
+				Check(TEXT("*** an empty SAVED slot is the navy plate with a quiet number, not DISABLED ***"),
+					Settings.GetSavedLoadout(2).IsEmpty() && EmptyLook.State == ETraceKitState::Default && EmptyLook.bQuietWord
+						&& RefusedLook.State == ETraceKitState::Disabled
+						&& FullLook.State == ETraceKitState::Default && !FullLook.bQuietWord,
+					FString::Printf(TEXT("empty: state %d quiet %d; refused: state %d; full: state %d quiet %d"),
+						static_cast<int32>(EmptyLook.State), EmptyLook.bQuietWord ? 1 : 0, static_cast<int32>(RefusedLook.State),
+						static_cast<int32>(FullLook.State), FullLook.bQuietWord ? 1 : 0));
+
+				FTraceLoadoutSelect SlotPage;
+				SlotPage.DebugBeginInput(Subject);
+				for (int32 SlotIndex = 0; SlotIndex < UTraceUserSettings::SavedLoadoutCount; ++SlotIndex)
+				{
+					const float SlotLeft = 262.f + 212.f * SlotIndex;
+					SlotPage.DebugSetSavedRect(SlotIndex, FBox2D(FVector2D(SlotLeft, 888.f), FVector2D(SlotLeft + 200.f, 942.f)));
+				}
+				const FVector2D OnEmpty(262.f + 212.f * 2.f + 100.f, 915.f);
+				SlotPage.DebugPointer(OnEmpty + FVector2D(0.f, -40.f), false, Subject);   // the first sample: not a move
+				SlotPage.DebugPointer(OnEmpty, false, Subject);                           // onto slot 3
+				const FTraceLoadoutLit PlainLit = SlotPage.DebugLit();
+				SlotPage.DebugPointer(OnEmpty, false, Subject, /*bShiftHeld=*/true);
+				const FTraceLoadoutLit ShiftLit = SlotPage.DebugLit();
+				SlotPage.DebugPointer(OnEmpty, true, Subject, true);    // SHIFT+click: the press...
+				SlotPage.DebugPointer(OnEmpty, false, Subject, true);   // ...and the release, which saves
+				Check(TEXT("*** SHIFT lights an empty slot under the pointer; SHIFT+click saves there ***"),
+					PlainLit.Saved == INDEX_NONE && ShiftLit.Saved == 2 && ShiftLit.Count() == 1
+						&& Settings.GetSavedLoadout(2) == SlotPage.GetStaged() && !SlotPage.GetStaged().IsEmpty(),
+					FString::Printf(TEXT("no SHIFT: saved lit %d; SHIFT: saved lit %d (%d lit); slot 3 now %s"),
+						PlainLit.Saved, ShiftLit.Saved, ShiftLit.Count(), *TraceLoadoutToString(Settings.GetSavedLoadout(2))));
+			}
 
 			for (int32 Index = 0; Index < SavedBefore.Num(); ++Index)
 			{
