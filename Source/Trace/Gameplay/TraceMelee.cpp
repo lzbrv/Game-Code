@@ -1268,13 +1268,15 @@ int32 TraceRunMeleeSelfTest()
 			Samples, TraceMelee::GetSwingArcDegrees(), TraceMelee::GetSwingRangeUU(), ChordUU);
 	}
 
+	// "the angle model:", because Trace.TestKnife prints this in the middle of its own report and a
+	// bare "0 failures." there used to be read as the whole command's verdict.
 	if (Failures == 0)
 	{
-		UE_LOG(LogTraceGame, Display, TEXT("[KnifeTest] 0 failures."));
+		UE_LOG(LogTraceGame, Display, TEXT("[KnifeTest] the angle model: 0 failures."));
 	}
 	else
 	{
-		UE_LOG(LogTraceGame, Error, TEXT("[KnifeTest] %d failure(s)."), Failures);
+		UE_LOG(LogTraceGame, Error, TEXT("[KnifeTest] the angle model: %d failure(s)."), Failures);
 	}
 	UE_LOG(LogTraceGame, Display, TEXT("==========================================="));
 

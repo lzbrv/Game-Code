@@ -5692,6 +5692,14 @@ namespace TraceKnifeTest
 
 		/** World time the start waits for when the Core had to come off him first. */
 		double SettleUntil = -1.0;
+
+		/**
+		 * The longest world-clock gap between two samples since the knife was asked for. Every timing
+		 * here is read on the first frame at or after the moment it happens, so it can be up to one
+		 * frame late; the verdict's tolerances are this wide rather than a fixed guess.
+		 */
+		double LongestFrameSeconds = 0.0;
+		double LastSampleWorldTime = -1.0;
 	};
 
 	/**
@@ -5699,6 +5707,9 @@ namespace TraceKnifeTest
 	 * blends back to first person and the rig comes back over ViewBlendSeconds (0.35 s).
 	 */
 	constexpr double CoreSettleSeconds = 1.0;
+
+	/** Clock noise on top of one frame: the gates run on the shared and local clocks, this reads the world's. */
+	constexpr double KnifeTimingSlackSeconds = 0.005;
 
 	void Report(const TSharedRef<FState>& State, UTraceWeaponComponent* Weapon, ATraceCharacter* Character)
 	{
@@ -5795,7 +5806,72 @@ namespace TraceKnifeTest
 		UE_LOG(LogTraceGame, Display, TEXT("======================================"));
 
 		// The pure model, run alongside so one command answers both halves of the feature.
-		TraceRunMeleeSelfTest();
+		const int32 AngleFailures = TraceRunMeleeSelfTest();
+
+		// ---- THE VERDICT, AND IT IS THE LAST LINE -------------------------------------------------
+		//
+		// The swing part used to print no verdict at all, so the last summary line of the command was
+		// the angle model's "[KnifeTest] 0 failures." — and an aborted run, or one in which the knife
+		// never swung, read as a pass in a batch log and in a commit message. Each timing is allowed
+		// one frame late (it is read on the first frame at or after it happens) and never early.
+		const double Slack = KnifeTimingSlackSeconds;
+		const double FrameAllowance = State->LongestFrameSeconds + Slack;
+		const double WantToKnife = TraceMelee::GetSwapSecondsFor(ETraceEquippedWeapon::Knife);
+		const double WantToGun = TraceMelee::GetSwapSecondsFor(ETraceEquippedWeapon::Gun);
+		const double Cooldown = TraceMelee::GetSwingCooldownSeconds();
+
+		double ShortestGap = TNumericLimits<double>::Max();
+		double LongestGap = 0.0;
+		for (double Interval : State->SwingIntervals)
+		{
+			ShortestGap = FMath::Min(ShortestGap, Interval);
+			LongestGap = FMath::Max(LongestGap, Interval);
+		}
+
+		TArray<FString> Problems;
+		if (State->PulloutToKnife < WantToKnife - Slack || State->PulloutToKnife > WantToKnife + FrameAllowance)
+		{
+			Problems.Add(FString::Printf(TEXT("gun->knife pullout %.4fs, want %.4fs to %.4fs"),
+				State->PulloutToKnife, WantToKnife, WantToKnife + FrameAllowance));
+		}
+		if (State->PulloutToGun < WantToGun - Slack || State->PulloutToGun > WantToGun + FrameAllowance)
+		{
+			Problems.Add(FString::Printf(TEXT("knife->gun pullout %.4fs, want %.4fs to %.4fs"),
+				State->PulloutToGun, WantToGun, WantToGun + FrameAllowance));
+		}
+		if (State->SwingIntervals.Num() == 0)
+		{
+			Problems.Add(FString::Printf(TEXT("no swing-to-swing interval (%d swing(s) landed)"), State->SwingCount));
+		}
+		else if (ShortestGap < Cooldown - Slack || LongestGap > Cooldown + FrameAllowance)
+		{
+			Problems.Add(FString::Printf(TEXT("swing gap %.4fs to %.4fs, want %.4fs to %.4fs"),
+				ShortestGap, LongestGap, Cooldown, Cooldown + FrameAllowance));
+		}
+		if (AngleFailures > 0)
+		{
+			Problems.Add(FString::Printf(TEXT("the angle model has %d failure(s)"), AngleFailures));
+		}
+
+		if (State->bAborted)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[KnifeTest] ===== KNIFE VERDICT: INVALID — %s The swing part measured nothing. ====="),
+				*State->AbortReason);
+		}
+		else if (Problems.Num() > 0)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[KnifeTest] ===== KNIFE VERDICT: *** FAIL *** — %s ====="),
+				*FString::Join(Problems, TEXT("; ")));
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[KnifeTest] ===== KNIFE VERDICT: PASS — pullouts %.4fs / %.4fs, %d swings %.4f-%.4fs apart "
+				     "(each timing allowed one frame late, frames up to %.4fs), angle model clean ====="),
+				State->PulloutToKnife, State->PulloutToGun, State->SwingCount, ShortestGap, LongestGap,
+				State->LongestFrameSeconds);
+		}
 	}
 
 	void Run(float SwingSeconds, float DelaySeconds)
@@ -5856,6 +5932,7 @@ namespace TraceKnifeTest
 
 							State->bStarted = true;
 							State->PhaseStart = Now;
+							State->LastSampleWorldTime = Now;   // the pullout's first frame counts too
 
 							if (Character->IsCarrier())
 							{
@@ -5880,6 +5957,11 @@ namespace TraceKnifeTest
 						}
 
 						State->Elapsed += DeltaTime;
+						if (State->LastSampleWorldTime >= 0.0)
+						{
+							State->LongestFrameSeconds = FMath::Max(State->LongestFrameSeconds, Now - State->LastSampleWorldTime);
+						}
+						State->LastSampleWorldTime = Now;
 
 						switch (State->Phase)
 						{
