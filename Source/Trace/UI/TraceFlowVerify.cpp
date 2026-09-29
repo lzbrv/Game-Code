@@ -27,6 +27,7 @@
 //
 // Headless recipe — run it EARLY, while the human is still in team select (it drives the rest itself):
 //   Arena -bots=4 -TraceExecAt=6 -TraceExec="Trace.Flow.Verify"
+// Slow frames must not change the verdict: prefix "t.MaxFPS 8|" to the exec list and it still passes.
 
 #include "CoreMinimal.h"
 
@@ -78,6 +79,8 @@ namespace TraceFlowVerify
 		TWeakObjectPtr<UWorld> World;
 		EStep Step = EStep::Start;
 		double StepStart = 0.0;
+		/** Set once the current step's one-shot action has run; GoTo clears it. */
+		bool bStepActionDone = false;
 		double Deadline = 0.0;
 		int32 Passes = 0;
 		int32 Failures = 0;
@@ -113,6 +116,23 @@ namespace TraceFlowVerify
 	{
 		Run.Step = Step;
 		Run.StepStart = FPlatformTime::Seconds();
+		Run.bStepActionDone = false;
+	}
+
+	/**
+	 * True on the first tick of a step, false after: the step's one-shot action (open the team screen,
+	 * close it, end the break) runs exactly once. It used to be a time window after GoTo (0.05 s, 0.1 s),
+	 * which a slow frame jumps clean over: at 15 fps the first tick of a step came 66 ms late, the
+	 * action never ran, and B2 and E3 failed on code that was fine.
+	 */
+	static bool TakeStepAction(FRun& Run)
+	{
+		if (Run.bStepActionDone)
+		{
+			return false;
+		}
+		Run.bStepActionDone = true;
+		return true;
 	}
 
 	static void Finish(FRun& Run)
@@ -422,7 +442,7 @@ namespace TraceFlowVerify
 		// ---- B. A RESPAWN UNDER AN OPEN MENU ------------------------------------------------------
 		case EStep::OpenMenuForRespawn:
 		{
-			if (SinceStep < 0.1)
+			if (TakeStepAction(Run))
 			{
 				Rules->OpenTeamSelectFor(HumanPC);   // the H key's server path
 				return true;
@@ -477,7 +497,7 @@ namespace TraceFlowVerify
 
 		case EStep::CloseMenuAfterRespawn:
 		{
-			if (SinceStep < 0.05)
+			if (TakeStepAction(Run))
 			{
 				HumanPC->ServerSetTeamSelectOpen(/*bOpen=*/false, 0.f);
 				return true;
@@ -565,7 +585,7 @@ namespace TraceFlowVerify
 
 		case EStep::SecondHalf:
 		{
-			if (SinceStep < 0.05)
+			if (TakeStepAction(Run))
 			{
 				if (MatchGS->IsHalfTimeBreak())
 				{
