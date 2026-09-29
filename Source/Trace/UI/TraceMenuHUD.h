@@ -388,7 +388,7 @@ protected:
 	 * The pad legend under the rows (MENU.FOOTER_PAD_KEYS), or empty when no pad has been seen. What
 	 * B does is part of it, so it changes while QUIT is asking: B answers the question there.
 	 */
-	FString BuildPadLegend() const;
+	const FString& BuildPadLegend() const;
 
 	// ---- Actions ---------------------------------------------------------------------------------
 
@@ -604,6 +604,18 @@ private:
 
 	/** The JOIN button under the pointer last frame, for the hover sound on a change. */
 	int32 JoinHoveredButton = INDEX_NONE;
+
+	/**
+	 * Where the pointer rested when the JOIN prompt opened (valid once bJoinCursorBaseline), and whether
+	 * it has since moved more than 2 px. CONNECT and BACK take no hover from a pointer that has not:
+	 * the title rows' rule (RV2). See IsJoinButtonLit.
+	 */
+	FVector2D JoinOpenCursorPos = FVector2D::ZeroVector;
+	bool bJoinCursorBaseline = false;
+	bool bJoinCursorMoved = false;
+
+	/** Does JOIN button @p Index (drawn at @p Rect) wear the hover look: pointer on it, and moved or pressing? */
+	bool IsJoinButtonLit(int32 Index, const FBox2D& Rect) const;
 
 	/**
 	 * World time at which the title screen started accepting Enter/Space.
@@ -1045,6 +1057,12 @@ private:
 	 * has settled". Resets the pointer guard to that state at the pointer's current position.
 	 */
 	void DebugRestPointerHere();
+
+	/**
+	 * The click part's fresh-launch premise: "the title JUST came up and has taken no pointer sample
+	 * yet" — the pointer guard exactly as BeginPlay leaves it, its settling window starting now.
+	 */
+	void DebugFreshTitleHere();
 
 	// ---- The Canvas title's draw record for Trace.Menu.FailureVerify (plate rects, glow excluded) --
 	FBox2D DebugCanvasMarkRect = FBox2D(ForceInit);

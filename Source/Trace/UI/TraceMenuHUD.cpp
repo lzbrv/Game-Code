@@ -1943,6 +1943,18 @@ void ATraceMenuHUD::DebugRestPointerHere()
 	TitleShownTime = Now - 10.f;
 }
 
+void ATraceMenuHUD::DebugFreshTitleHere()
+{
+	bHasCursor = false;
+	bCursorHasMoved = false;
+	bHasSettledCursor = false;
+	FirstCursorPos = FVector2D::ZeroVector;
+	SettledCursorPos = FVector2D::ZeroVector;
+	RestingClickRow = INDEX_NONE;
+	RestingPressRow = INDEX_NONE;
+	TitleShownTime = Now;
+}
+
 void ATraceMenuHUD::TickJoinVerify()
 {
 	if (JoinVerifyStep == 0)
@@ -2430,7 +2442,136 @@ void ATraceMenuHUD::TickJoinVerify()
 		}
 		SetDifficulty(JoinVerifySavedDifficulty);
 		Selected = ETraceMenuRow::Play;
-		JoinVerifyStep = JoinVerifyNextPart(63);
+		Advance();
+		break;
+
+	// ---- A FRESH TITLE: the pointer's first sample is a baseline, not a hover (RV9) ----------------
+	//
+	// A fresh launch with the OS pointer resting mid-screen opened with JOIN lit, not PLAY, and the
+	// first ENTER / A opened the JOIN prompt. DebugFreshTitleHere puts the guard back to BeginPlay's
+	// state with the pointer resting on DIFFICULTY and PLAY lit, as a fresh title has it.
+	case 64:
+	{
+		const int32 DiffRow = static_cast<int32>(ETraceMenuRow::Difficulty);
+		ClickAt(RowRects[DiffRow]);
+		Advance();
+		break;
+	}
+
+	case 65:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		DebugFreshTitleHere();
+		Selected = ETraceMenuRow::Play;
+		Advance();
+		break;
+
+	case 66:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		Check(TEXT("a fresh title: the resting pointer's first sample leaves PLAY lit"),
+			bHasCursor && Selected == ETraceMenuRow::Play && RowAtPoint(LastCursorPos) == static_cast<int32>(ETraceMenuRow::Difficulty),
+			FString::Printf(TEXT("row=%d, pointer on row %d, sampled %d"), static_cast<int32>(Selected),
+				RowAtPoint(LastCursorPos), bHasCursor ? 1 : 0));
+		Advance();
+		break;
+
+	case 67:
+		if (StepAge < 1.0f)
+		{
+			break;
+		}
+		Check(TEXT("...and still PLAY once the title has settled"), Selected == ETraceMenuRow::Play,
+			FString::Printf(TEXT("row=%d, %.1f s after the title came up"), static_cast<int32>(Selected), Now - TitleShownTime));
+		PC->SetMouseLocation(FMath::RoundToInt(LastCursorPos.X + TraceMenuJoinVerify::NudgePx), FMath::RoundToInt(LastCursorPos.Y));
+		Advance();
+		break;
+
+	case 68:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		Check(TEXT("...then a real move takes it: the row under the pointer lights"),
+			Selected == ETraceMenuRow::Difficulty,
+			FString::Printf(TEXT("row=%d after a %.0f px move"), static_cast<int32>(Selected), TraceMenuJoinVerify::NudgePx));
+		Selected = ETraceMenuRow::Play;
+		Advance();
+		break;
+
+	// ---- THE JOIN PROMPT OVER A RESTING POINTER: CONNECT / BACK wait for it to move (RV2) ------------
+	case 69:
+		Selected = ETraceMenuRow::Join;
+		OpenJoinPrompt();
+		Advance();
+		break;
+
+	case 70:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		if (!JoinButtonRects[TraceMenuHUDJoin::Back].bIsValid)
+		{
+			Check(TEXT("the JOIN prompt draws a BACK button"), false, TEXT("no rect"));
+			JoinVerifyStep = JoinVerifyNextPart(73);
+			JoinVerifyStepTime = RealNow;
+			break;
+		}
+		// Park the pointer where BACK will be, with the prompt shut, so it RESTS there when it opens.
+		JoinVerifyRestPoint = JoinButtonRects[TraceMenuHUDJoin::Back].GetCenter();
+		CloseJoinPrompt(TEXT("JoinVerify park"));
+		PC->SetMouseLocation(FMath::RoundToInt(JoinVerifyRestPoint.X), FMath::RoundToInt(JoinVerifyRestPoint.Y));
+		Advance();
+		break;
+
+	case 71:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		Selected = ETraceMenuRow::Join;
+		OpenJoinPrompt();   // as pad A or ENTER opens it: the pointer did nothing
+		Advance();
+		break;
+
+	case 72:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		{
+			const FBox2D BackRect = JoinButtonRects[TraceMenuHUDJoin::Back];
+			Check(TEXT("JOIN opened over a resting pointer: BACK does not light"),
+				IsJoinPromptOpen() && BackRect.bIsValid && BackRect.IsInside(LastCursorPos)
+					&& !IsJoinButtonLit(TraceMenuHUDJoin::Back, BackRect) && JoinHoveredButton == INDEX_NONE,
+				FString::Printf(TEXT("prompt %d, pointer on BACK %d, BACK lit %d"), IsJoinPromptOpen() ? 1 : 0,
+					BackRect.IsInside(LastCursorPos) ? 1 : 0, IsJoinButtonLit(TraceMenuHUDJoin::Back, BackRect) ? 1 : 0));
+		}
+		PC->SetMouseLocation(FMath::RoundToInt(LastCursorPos.X + TraceMenuJoinVerify::NudgePx), FMath::RoundToInt(LastCursorPos.Y));
+		Advance();
+		break;
+
+	case 73:
+		if (StepAge < 0.3f)
+		{
+			break;
+		}
+		{
+			const FBox2D BackRect = JoinButtonRects[TraceMenuHUDJoin::Back];
+			Check(TEXT("...and lights once the pointer moves"),
+				IsJoinPromptOpen() && IsJoinButtonLit(TraceMenuHUDJoin::Back, BackRect)
+					&& JoinHoveredButton == TraceMenuHUDJoin::Back,
+				FString::Printf(TEXT("BACK lit %d, hovered button %d"), IsJoinButtonLit(TraceMenuHUDJoin::Back, BackRect) ? 1 : 0,
+					JoinHoveredButton));
+		}
+		CloseJoinPrompt(TEXT("JoinVerify click part done"));
+		Selected = ETraceMenuRow::Play;
+		JoinVerifyStep = JoinVerifyNextPart(73);
 		JoinVerifyStepTime = RealNow;
 		break;
 
@@ -2469,7 +2610,7 @@ void ATraceMenuHUD::TickJoinVerify()
 		UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] VERDICT: PASS — %s%s%s"),
 			(JoinVerifyParts & TraceMenuJoinVerify::PartJoin) ? TEXT("Escape and CANCEL call a join off (the engine's pending connection is dropped) and the prompt comes back. ") : TEXT(""),
 			(JoinVerifyParts & TraceMenuJoinVerify::PartQuit) ? TEXT("QUIT asks first; Escape and pad B never quit. ") : TEXT(""),
-			(JoinVerifyParts & TraceMenuJoinVerify::PartClick) ? TEXT("A click at a resting pointer lights its row, and the next one (or one after a small move) acts.") : TEXT(""));
+			(JoinVerifyParts & TraceMenuJoinVerify::PartClick) ? TEXT("A click at a resting pointer lights its row, and the next one (or one after a small move) acts; a resting pointer lights no row on a fresh title and no JOIN button when the prompt opens.") : TEXT(""));
 	}
 	else
 	{
@@ -2523,11 +2664,14 @@ bool ATraceMenuHUD::ShouldShowPadHints() const
 	return TracePadMenu::IsEnabled() && TracePadMenu::HasSeenPad(this);
 }
 
-FString ATraceMenuHUD::BuildPadLegend() const
+const FString& ATraceMenuHUD::BuildPadLegend() const
 {
+	// A REFERENCE INTO THE TEXT STORE, not a copy: DrawFooter asks every drawn frame while pad hints
+	// show, and a by-value return allocated a fresh string each time (P11).
+	static const FString NoLegend;
 	if (!ShouldShowPadHints())
 	{
-		return FString();
+		return NoLegend;
 	}
 
 	// B SAYS WHAT B DOES HERE. It read "B BACK" on a screen with nothing to go back to, where B walked
@@ -3360,6 +3504,12 @@ void ATraceMenuHUD::OpenJoinPrompt()
 	JoinPressedButton = INDEX_NONE;
 	JoinHoveredButton = INDEX_NONE;
 
+	// Where the pointer rests as the prompt opens: CONNECT and BACK do not light for it until it moves
+	// (IsJoinButtonLit). With no sample yet, the first one taken while the prompt is up is the baseline.
+	JoinOpenCursorPos = LastCursorPos;
+	bJoinCursorBaseline = bHasCursor;
+	bJoinCursorMoved = false;
+
 	// Pre-filled with the last address that worked, so the common case — the same four people
 	// playing again tomorrow — is Enter, Enter. A fresh install gets an empty field and the example
 	// text under it instead of a plausible-looking wrong address.
@@ -3569,6 +3719,14 @@ void ATraceMenuHUD::CancelJoin()
 	OpenJoinPrompt();
 }
 
+bool ATraceMenuHUD::IsJoinButtonLit(int32 Index, const FBox2D& Rect) const
+{
+	// Under the pointer, once it has moved since the prompt opened — or with a press held on it, which
+	// is a player at the button whatever the pointer did first (the press is what fires it).
+	return bHasCursor && Rect.bIsValid && Rect.IsInside(LastCursorPos)
+		&& (bJoinCursorMoved || JoinPressedButton == Index);
+}
+
 int32 ATraceMenuHUD::JoinButtonAtPoint(const FVector2D& Point) const
 {
 	for (int32 Index = 0; Index < TraceMenuHUDJoin::ButtonCount; ++Index)
@@ -3664,6 +3822,7 @@ void ATraceMenuHUD::DrawHUD()
 			// different viewport coordinates in the opening frames. A 4px threshold with no settling
 			// window was satisfied by that jitter alone and let two launches in ten through.
 			namespace PG = TraceMenuHUDPointerGuard;
+			const bool bMovedBeforeThisSample = bCursorHasMoved;
 			const bool bPastSettleWindow = bHasCursor && (Now - TitleShownTime) > PG::SettleSeconds;
 			if (bPastSettleWindow && FVector2D::Distance(Position, FirstCursorPos) > PG::FirstSampleMovePx)
 			{
@@ -3692,13 +3851,20 @@ void ATraceMenuHUD::DrawHUD()
 				}
 			}
 
-			if (!bHasCursor || FVector2D::Distance(Position, LastCursorPos) > 2.f)
+			// THE FIRST SAMPLE IS A BASELINE, NOT A HOVER (RV9). It used to select the row under it, so a
+			// fresh launch with the OS pointer resting mid-screen opened with JOIN lit instead of PLAY, and
+			// a keyboard or pad player's first ENTER / A opened the JOIN prompt. The rows now follow the
+			// pointer only once it has REALLY moved — the same test a click has to pass (bCursorHasMoved:
+			// past the settling window's jitter, then any move of more than 2 px) — and after that, on
+			// every step of more than 2 px, as before.
+			if (!bHasCursor)
 			{
-				if (!bHasCursor)
-				{
-					FirstCursorPos = Position;
-				}
+				FirstCursorPos = Position;
 				bHasCursor = true;
+			}
+			else if (bCursorHasMoved
+				&& (!bMovedBeforeThisSample || FVector2D::Distance(Position, LastCursorPos) > 2.f))
+			{
 				if (bRowRectsValid && !bTravelling && !IsJoinPromptOpen())
 				{
 					for (int32 Index = 0; Index < static_cast<int32>(ETraceMenuRow::Count); ++Index)
@@ -3723,9 +3889,24 @@ void ATraceMenuHUD::DrawHUD()
 			LastCursorPos = Position;
 
 			// The JOIN buttons' half of "focus change": the hover sound when the pointer moves onto one.
+			//
+			// THE SAME RULE AS THE ROWS (RV2): a pointer that has not moved since the prompt opened is not
+			// hovering anything. Opened with pad A or ENTER over a resting pointer, BACK used to glow beside
+			// the field's own ring — two lit targets, and the lit one not what A / ENTER would do. The
+			// position at the open is the baseline; more than 2 px from it and the pointer leads.
 			if (IsJoinPromptOpen())
 			{
-				const int32 Hovered = JoinButtonAtPoint(Position);
+				if (!bJoinCursorBaseline)
+				{
+					JoinOpenCursorPos = Position;
+					bJoinCursorBaseline = true;
+				}
+				else if (!bJoinCursorMoved && FVector2D::Distance(Position, JoinOpenCursorPos) > 2.f)
+				{
+					bJoinCursorMoved = true;
+				}
+
+				const int32 Hovered = bJoinCursorMoved ? JoinButtonAtPoint(Position) : INDEX_NONE;
 				if (Hovered != INDEX_NONE && Hovered != JoinHoveredButton)
 				{
 					TraceAudio::PlayLocal2D(this, TraceSoundEvents::UIHover);
@@ -4271,7 +4452,7 @@ void ATraceMenuHUD::DrawJoinPrompt()
 	{
 		const float BX = ButtonsX + Index * (ButtonW + MJ::ButtonSpacing * S);
 		const FBox2D Rect(FVector2D(BX, ButtonsY), FVector2D(BX + ButtonW, ButtonsY + ButtonH));
-		const bool bUnderPointer = bHasCursor && Rect.IsInside(LastCursorPos);
+		const bool bUnderPointer = IsJoinButtonLit(Index, Rect);
 		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, bUnderPointer,
 			bUnderPointer && JoinPressedButton == Index);
 		JoinButtonRects[Index] = TraceMenuKit::DrawButton(this, State, BX, ButtonsY, ButtonW, ButtonH, ButtonWords[Index], Now)
@@ -4661,7 +4842,7 @@ void ATraceMenuHUD::DrawFooter()
 	// only for the pad legend — a dark band with nothing in it would be exactly the empty chrome a
 	// removed line must not leave behind — and on a keyboard-only machine this footer draws nothing,
 	// like the UMG twin, which never had a band.
-	const FString PadLegend = BuildPadLegend();
+	const FString& PadLegend = BuildPadLegend();
 	if (PadLegend.IsEmpty())
 	{
 		return;
