@@ -552,10 +552,22 @@ ATraceCharacter* TraceMelee::ResolveSwing(
 	if (ATraceCore::IsCoreHolder(OutHit.Victim))
 	{
 		++GCarrierKnifeHits;
-		UE_LOG(LogTraceGame, Warning,
-			TEXT("[Knife] *** A KNIFE RESOLVED ONTO THE CORE CARRIER %s (hit #%d). The carrier is supposed to be "
-			     "immune to melee — spec v10 s1, USER-CONFIRMED. Check Trace.Knife.CarrierImmune and ResolveSwing."),
-			*GetNameSafe(OutHit.Victim), GCarrierKnifeHits);
+		if (CVarKnifeCarrierImmune.GetValueOnAnyThread() == 0)
+		{
+			// Trace.Knife.CarrierImmunityTest's red arm switched the rule off to prove it can see this.
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Knife] a knife reached the Core carrier %s (hit #%d) — expected: red arm, Trace.Knife.CarrierImmune 0."),
+				*GetNameSafe(OutHit.Victim), GCarrierKnifeHits);
+		}
+		else
+		{
+			// With the switch at 1 the branch above consumes every carrier sample, so reaching here
+			// means that branch has been deleted or bypassed. A real defect: an Error.
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[Knife] *** A KNIFE RESOLVED ONTO THE CORE CARRIER %s (hit #%d). The carrier is supposed to be "
+				     "immune to melee — spec v10 s1, USER-CONFIRMED. Check Trace.Knife.CarrierImmune and ResolveSwing."),
+				*GetNameSafe(OutHit.Victim), GCarrierKnifeHits);
+		}
 	}
 
 	// --- Back or front --------------------------------------------------------------------------

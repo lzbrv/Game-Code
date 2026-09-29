@@ -1491,9 +1491,18 @@ namespace TraceAbilitySetChutFile
 			{
 				// Two call sites rather than a computed verbosity: UE_LOG's verbosity has to be a
 				// literal, and a failed assertion has to reach a log that is on by default.
+				//
+				// THE RED ARM'S FAILURES ARE THE POINT OF IT, so they are not Errors: an Error that is
+				// expected on every batch teaches everyone to skip Errors, and then the shipped arm's
+				// real one is skipped with them. They say so, at Display. Only arm 1 fails at Error.
 				if (Check.bPassed)
 				{
 					UE_LOG(LogTraceGame, Display, TEXT("[CHUDREFRESH]   [PASS] %s — %s"),
+						*Check.Label, *Check.Detail);
+				}
+				else if (Log.Arm == 0)
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("[CHUDREFRESH]   [FAIL — expected: red arm] %s — %s"),
 						*Check.Label, *Check.Detail);
 				}
 				else

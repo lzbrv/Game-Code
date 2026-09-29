@@ -1123,12 +1123,14 @@ void UTraceWeaponComponent::ConsumeRound()
 			return;
 		}
 
-		// The red arm reached a carrier. Counted and logged as an Error so a harness can prove the
-		// arm actually disarmed something rather than reporting a green that had no rule to break.
+		// The red arm reached a carrier. Counted so a harness can prove the arm actually disarmed
+		// something rather than reporting a green that had no rule to break. A Warning, not an Error:
+		// the guard above returns first whenever it is armed, so this only ever prints because a verify
+		// switched it off on purpose, and an Error on every batch would teach everyone to skip Errors.
 		++GAmmoCarrierRoundsConsumed;
-		UE_LOG(LogTraceGame, Error,
-			TEXT("[Ammo] *** A ROUND WAS SPENT FROM THE CORE CARRIER %s's CLIP (round #%d). Spec v16 §1: the "
-			     "carrier has no gun. This is only reachable with Trace.Ammo.CarrierGuard 0."),
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Ammo] a round was spent from the Core carrier %s's clip (round #%d) — expected: red arm, "
+			     "Trace.Ammo.CarrierGuard 0."),
 			*GetNameSafe(GetOwner()), GAmmoCarrierRoundsConsumed);
 	}
 
@@ -5058,7 +5060,13 @@ namespace TraceDualWeaponTest
 			What, LexToString(Weapon->GetEquippedWeapon()), Weapon->IsDeploying() ? 1 : 0,
 			Character->IsViewModelVisible() ? 1 : 0, Gun, Knife, Hands, BodyKnife);
 
-		if (bBoth)
+		// The RED arm restores the bug on purpose and MUST draw both, so its hits are expected and say
+		// so at Warning. Only the shipped arm's are Errors, which is what a log scan should find.
+		if (bBoth && State->Arm == 0)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("%s  (expected: red arm, bug restored)"), *Line);
+		}
+		else if (bBoth)
 		{
 			UE_LOG(LogTraceGame, Error, TEXT("%s"), *Line);
 		}

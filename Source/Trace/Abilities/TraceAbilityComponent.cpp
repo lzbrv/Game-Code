@@ -1645,6 +1645,11 @@ bool UTraceAbilityComponent::IsCarrier(const ATraceCharacter* Target)
 	return Target->IsCarrier() || ATraceCore::IsCoreHolder(Target);
 }
 
+bool UTraceAbilityComponent::IsCarrierRuleDisarmedForTest()
+{
+	return CVarAbilityCarrierImmune.GetValueOnAnyThread() == 0;
+}
+
 bool UTraceAbilityComponent::MayAbilityAffectCarrier(const ATraceCharacter* Target, ETraceAbilityEffect Effect)
 {
 	if (!IsCarrier(Target))
@@ -1825,10 +1830,21 @@ float UTraceAbilityComponent::ApplyAbilityDamage(ATraceCharacter* Target, float 
 	if (IsCarrier(Target))
 	{
 		++GCarrierAbilityDamageHits;
-		UE_LOG(LogTraceGame, Error,
-			TEXT("[Ability] *** ABILITY DAMAGE '%s' RESOLVED ONTO THE CORE CARRIER %s (hit #%d). Spec v14 §4: "
-			     "NO ability may damage a carrier. Check Trace.Ability.CarrierImmune and CanAffectTargetDetailed."),
-			*Cause.ToString(), *GetNameSafe(Target), GCarrierAbilityDamageHits);
+		if (IsCarrierRuleDisarmedForTest())
+		{
+			// A verify's red arm switched the rule off to prove it can see this. Not a defect.
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Ability] ability damage '%s' reached the Core carrier %s (hit #%d) — expected: red arm, "
+				     "Trace.Ability.CarrierImmune 0."),
+				*Cause.ToString(), *GetNameSafe(Target), GCarrierAbilityDamageHits);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[Ability] *** ABILITY DAMAGE '%s' RESOLVED ONTO THE CORE CARRIER %s (hit #%d). Spec v14 §4: "
+				     "NO ability may damage a carrier. Check Trace.Ability.CarrierImmune and CanAffectTargetDetailed."),
+				*Cause.ToString(), *GetNameSafe(Target), GCarrierAbilityDamageHits);
+		}
 	}
 
 	FTraceAbilityDamageContext Context;

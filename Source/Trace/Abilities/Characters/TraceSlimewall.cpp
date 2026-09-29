@@ -232,7 +232,16 @@ namespace TraceSlimewall
 		FSlowTally& Tally = bCarrier ? CarrierTally() : OtherTally();
 		++(Tally.*Field);
 
-		if (bCarrier)
+		if (bCarrier && UTraceAbilityComponent::IsCarrierRuleDisarmedForTest())
+		{
+			// A verify's RED ARM switched the rule off to prove the slow can reach a carrier at all.
+			// Not a defect, so not an Error: an Error that is expected on every batch teaches everyone
+			// to skip Errors, and then the real one below is skipped too.
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Slimewall] '%s' landed on the Core carrier %s — expected: red arm, Trace.Ability.CarrierImmune 0."),
+				VectorName, *GetNameSafe(Target));
+		}
+		else if (bCarrier)
 		{
 			// LOUD, and at Error. Spec §4's invariant has been broken if this ever prints on a shipped
 			// build; a Verbose line would be indistinguishable from the noise a match already makes.

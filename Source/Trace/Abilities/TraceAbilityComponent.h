@@ -385,6 +385,13 @@ public:
 	/** True when @p Target is currently holding the Core. Works with or without a live pawn. */
 	static bool IsCarrier(const ATraceCharacter* Target);
 
+	/**
+	 * True while a verify's RED ARM has the carrier rule switched off (Trace.Ability.CarrierImmune 0).
+	 * The carrier alarms ask it so that a hit the red arm causes on purpose logs as an expected Warning,
+	 * and only a hit with the shipped rule in force logs as an Error.
+	 */
+	static bool IsCarrierRuleDisarmedForTest();
+
 	// =============================================================================================
 	// Damage, routed through the choke point and through both characters' passives
 	// =============================================================================================

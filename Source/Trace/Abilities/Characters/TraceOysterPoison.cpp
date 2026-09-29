@@ -81,11 +81,21 @@ namespace TraceOyster
 
 			// LOUD, and naming the vector. Reaching here means one of Oyster's four ways to touch a
 			// player got past spec §4's rule; the whole point of counting per-vector is that the log
-			// says WHICH one.
-			UE_LOG(LogTraceGame, Error,
-				TEXT("[Oyster] *** '%s' RESOLVED ONTO THE CORE CARRIER %s. Spec v14 §4: no ability may damage or "
-				     "control a carrier. Check Trace.Ability.CarrierImmune and CanAffectTargetDetailed. ***"),
-				VectorName, *GetNameSafe(Target));
+			// says WHICH one. Unless a verify's red arm switched the rule off to prove exactly that, in
+			// which case it is expected and says so, at Warning.
+			if (UTraceAbilityComponent::IsCarrierRuleDisarmedForTest())
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[Oyster] '%s' reached the Core carrier %s — expected: red arm, Trace.Ability.CarrierImmune 0."),
+					VectorName, *GetNameSafe(Target));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Error,
+					TEXT("[Oyster] *** '%s' RESOLVED ONTO THE CORE CARRIER %s. Spec v14 §4: no ability may damage or "
+					     "control a carrier. Check Trace.Ability.CarrierImmune and CanAffectTargetDetailed. ***"),
+					VectorName, *GetNameSafe(Target));
+			}
 		}
 		else
 		{

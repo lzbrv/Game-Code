@@ -533,12 +533,23 @@ float UTraceHealthComponent::AmplifyForVulnerable(float Amount) const
 	}
 
 	// THE ALARM. Reaching here with a carrier as the owner means either the carrier lock in
-	// GetVulnerableDamageMultiplier() was disarmed (the red arm) or the ordering regressed. Logged as
-	// an Error, counted, and read by Trace.X.CarrierTest.
+	// GetVulnerableDamageMultiplier() was disarmed (the red arm: a Warning that says so) or the
+	// ordering regressed (an Error). Counted either way, and read by Trace.X.CarrierTest.
 	if (const ATraceCharacter* OwningCharacter = Cast<ATraceCharacter>(GetOwner()))
 	{
-		if (ATraceCore::IsCoreHolder(OwningCharacter) || OwningCharacter->IsCarrier())
+		if ((ATraceCore::IsCoreHolder(OwningCharacter) || OwningCharacter->IsCarrier()) && !TraceVulnerable::IsCarrierImmune())
 		{
+			// Trace.X.CarrierTest's red arm took the lock off to prove this alarm can fire. Expected.
+			++GVulnerableCarrierAmplified;
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Vulnerable] the +%.0f%% vulnerable multiplier was evaluated on damage aimed at the Core carrier %s "
+				     "(hit #%d) — expected: red arm, Trace.X.VulnerableCarrierImmune 0."),
+				(Multiplier - 1.f) * 100.f, *GetNameSafe(GetOwner()), GVulnerableCarrierAmplified);
+		}
+		else if (ATraceCore::IsCoreHolder(OwningCharacter) || OwningCharacter->IsCarrier())
+		{
+			// With the lock armed GetVulnerableDamageMultiplier returns 1 for a carrier, so this means the
+			// lock or the ordering has regressed. A real defect.
 			++GVulnerableCarrierAmplified;
 			UE_LOG(LogTraceGame, Error,
 				TEXT("[Vulnerable] *** THE +%.0f%% VULNERABLE MULTIPLIER WAS EVALUATED ON DAMAGE AIMED AT THE CORE "
@@ -597,9 +608,10 @@ bool UTraceHealthComponent::ApplyVulnerable(float DurationSeconds, AController* 
 		if (ATraceCore::IsCoreHolder(RedArmCharacter) || RedArmCharacter->IsCarrier())
 		{
 			++GVulnerableCarrierMarked;
-			UE_LOG(LogTraceGame, Error,
-				TEXT("[Vulnerable] *** THE CORE CARRIER %s WAS MARKED VULNERABLE (mark #%d). Spec v14 §4. This is "
-				     "only reachable with Trace.X.VulnerableCarrierImmune 0."),
+			// A Warning: this branch only runs with the rule switched off, which only a verify does.
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[Vulnerable] the Core carrier %s was marked vulnerable (mark #%d) — expected: red arm, "
+				     "Trace.X.VulnerableCarrierImmune 0."),
 				*GetNameSafe(GetOwner()), GVulnerableCarrierMarked);
 		}
 	}
