@@ -218,6 +218,22 @@ namespace TraceHUDStyle
 	 */
 	static const FLinearColor MeterGroove(0.00f, 0.00f, 0.00f, 0.35f);
 	static constexpr float MeterHaloPx = 3.f;
+
+	/**
+	 * HEADINGS IN THE KIT'S HEADING FACE (Sofachrome, white), sized by CAP height in 1080p px. The results
+	 * screen's reason line is a screen title, at the options pages' and the JOIN prompt's 30. The result
+	 * under it is larger. The death panel's ELIMINATED is a card's heading, sized to its plate.
+	 */
+	static constexpr float ScreenTitleCapPx = 30.f;
+	static constexpr float ResultCapPx = 40.f;
+	static constexpr float DeathHeadCapPx = 22.f;
+
+	/** A cap-centred heading's block on a plate is this many cap heights tall: its line box's air. */
+	static constexpr float HeadingBlockPerCap = 1.7f;
+
+	/** The results screen: the reason line's cap centre (fraction of the view) and the gap to the result. */
+	static constexpr float ResultReasonFraction = 0.095f;
+	static constexpr float ResultLineGapPx = 34.f;
 	static const FLinearColor Danger     (0.95f, 0.22f, 0.18f, 1.00f);
 	static const FLinearColor Good       (0.24f, 0.90f, 0.42f, 1.00f);
 	/** Headshot hitmarker. Hot amber: distinct from both the white body tick and the red kill tick. */
@@ -6769,8 +6785,15 @@ void ATraceHUD::DrawDeathPanel()
 
 	// ---- The lines, decided before the plate is sized to them --------------------------------------
 
+	// THE HEADING IS SET LIKE EVERY OTHER SCREEN'S: the kit's heading face (Sofachrome), white — the face
+	// and colour of SETTINGS, PAUSED, JOIN A GAME and the page titles. It was the HUD's Erbaum Bold in
+	// damage red, the one heading on a kit plate that was not. Sized by its CAPS, and the block it sits in
+	// is a little taller than the caps so the plate keeps the air the line box used to give it.
 	const FString& HeadText = TRACE_TEXT("HUD.DEATH_ELIMINATED", "ELIMINATED");
-	const float HeadScale = 1.2f * UIScale;
+	const ETraceTextWeight HeadFace = ETraceTextWeight::Light;
+	const FLinearColor HeadColor = TraceMenuArtStyle::WordDefault;
+	const float HeadCap = TraceHUDStyle::DeathHeadCapPx * UIScale;
+	const float HeadH = HeadText.IsEmpty() ? 0.f : HeadCap * TraceHUDStyle::HeadingBlockPerCap;
 
 	// Killer line, if the server told us who did it. "Trail" deaths in particular are worth naming —
 	// they are the rule nobody believes until they see it attributed.
@@ -6788,7 +6811,7 @@ void ATraceHUD::DrawDeathPanel()
 	if (TracePC != nullptr && !TracePC->GetLastKillerName().IsEmpty())
 	{
 		Cause = TracePC->GetLastDeathCause();
-		KillerLine = TRACE_TEXTF("HUD.DEATH_KILLER_LINE", "by {0}{1}",
+		KillerLine = TRACE_TEXTF("HUD.DEATH_KILLER_LINE", "BY {0}{1}",
 			{ TracePC->GetLastKillerName().ToUpper(), FString() });
 
 		const UWorld* const World = GetWorld();
@@ -6844,7 +6867,6 @@ void ATraceHUD::DrawDeathPanel()
 	const float IconPx = Cell * static_cast<float>(TraceKillFeedArt::GlyphGrid);
 	const float IconGap = TraceKillFeedArt::IconGap * UIScale;
 
-	const float HeadH = MeasureHeight(HeadText, FontLarge, HeadScale);
 	const float KillerH = KillerLine.IsEmpty() ? 0.f : FMath::Max(MeasureHeight(KillerLine, FontMedium, KillerScale),
 		bHaveIcon ? IconPx : 0.f);
 	const float ParryH = ParryText.IsEmpty() ? 0.f : MeasureHeight(ParryText, FontSmall, ParryScale);
@@ -6852,7 +6874,7 @@ void ATraceHUD::DrawDeathPanel()
 
 	const float KillerTextW = KillerLine.IsEmpty() ? 0.f : MeasureWidth(KillerLine, FontMedium, KillerScale);
 	const float KillerW = KillerTextW + (bHaveIcon ? IconGap + IconPx : 0.f);
-	const float ContentW = FMath::Max(FMath::Max(MeasureWidth(HeadText, FontLarge, HeadScale), KillerW),
+	const float ContentW = FMath::Max(FMath::Max(TraceMenuKit::CapTextWidth(HeadText, HeadCap, HeadFace), KillerW),
 		FMath::Max(MeasureWidth(ParryText, FontSmall, ParryScale),
 			MeasureWidth(RespawnText, FontMedium, RespawnScale, /*bTabular=*/true)));
 
@@ -6866,7 +6888,8 @@ void ATraceHUD::DrawDeathPanel()
 	DrawKitPanel(CX - PanelW * 0.5f, PanelY, PanelW, PanelH, 1.f);
 
 	float LineY = PanelY + PadTop;
-	DrawTextCentered(HeadText, TraceHUDStyle::Danger, CX, LineY, FontLarge, HeadScale);
+	TraceMenuKit::DrawCapText(this, HeadText, CX, LineY + HeadH * 0.5f, HeadCap, HeadColor, HeadFace,
+		TraceText::EHAlign::Center);
 	LineY += HeadH;
 
 	if (KillerH > 0.f)
@@ -6897,6 +6920,9 @@ void ATraceHUD::DrawDeathPanel()
 	// Recorded while the player is DEAD, not while the panel is fading out after the respawn: the
 	// harnesses read this as "the death panel is up".
 	HudKitRecord.bDeathPanel = bLocalDead;
+	HudKitRecord.DeathHead = HeadText;
+	HudKitRecord.DeathHeadWeight = static_cast<int32>(HeadFace);
+	HudKitRecord.DeathHeadColor = HeadColor;
 	HudKitRecord.DeathKillerLine = KillerLine;
 	HudKitRecord.DeathIcon = bHaveIcon
 		? StaticEnum<ETraceKillIcon>()->GetNameStringByValue(static_cast<int64>(CauseIcon))
@@ -7236,7 +7262,7 @@ void ATraceHUD::DrawMatchResult()
 	if (Winner == ETraceTeam::None)
 	{
 		ResultText = TRACE_TEXT("HUD.RESULT_DRAW", "DRAW");
-		ResultColor = TraceHUDStyle::Ink;
+		ResultColor = TraceMenuArtStyle::WordDefault;
 	}
 	else
 	{
@@ -7245,20 +7271,41 @@ void ATraceHUD::DrawMatchResult()
 		ResultColor = TraceTeamColor(Winner);
 	}
 
-	// The headline is the REASON, not a fixed "FULL TIME": a mercy win says MERCY RULE. Coloured
-	// with it too, so the two outcomes are told apart at a glance from a screenshot. Through the text
-	// document now: TraceMatchEndReasonHeadline() is literal TCHARs (the game mode's log still uses it),
-	// so the one headline on this screen was the one Ranen could not edit.
+	// The headline is the REASON, not a fixed "FULL TIME": a mercy win says MERCY RULE. Through the text
+	// document: TraceMatchEndReasonHeadline() is literal TCHARs (the game mode's log still uses it), so
+	// the one headline on this screen was the one Ranen could not edit.
 	const bool bMercy = (EndReason == ETraceMatchEndReason::Mercy);
 	const FString ReasonText = bMercy
 		? TRACE_TEXT("HUD.RESULT_HEAD_MERCY", "MERCY RULE")
 		: ((EndReason == ETraceMatchEndReason::Clock)
 			? TRACE_TEXT("HUD.RESULT_HEAD_CLOCK", "FULL TIME")
 			: TRACE_TEXT("HUD.RESULT_HEAD_OTHER", "MATCH OVER"));
-	DrawTextCentered(ReasonText, bMercy ? TraceHUDStyle::Danger : TraceHUDStyle::InkDim,
-		CX, ViewH * 0.095f, FontSmall, 1.3f * UIScale);
 
-	DrawTextCentered(ResultText, ResultColor, CX, ViewH * 0.135f, FontLarge, 2.6f * UIScale);
+	// THE HEADLINE IS SET LIKE EVERY OTHER SCREEN'S TITLE: the kit's heading face (Sofachrome), white, at
+	// the page titles' cap height — SETTINGS, PAUSED, JOIN A GAME. The result under it is in the same face
+	// and larger, DRAW in white and a win in the winner's colour, which is the one thing on this screen
+	// that is read from across the room. Both were the HUD's Erbaum Bold (the reason in grey, or red for
+	// MERCY RULE; the words already say which), the only screen title not in the kit's face.
+	const ETraceTextWeight TitleFace = ETraceTextWeight::Light;
+	const FLinearColor ReasonColor = TraceMenuArtStyle::WordDefault;
+	const float ReasonCap = TraceHUDStyle::ScreenTitleCapPx * UIScale;
+	const float ResultCap = TraceHUDStyle::ResultCapPx * UIScale;
+	const float ReasonMid = ViewH * TraceHUDStyle::ResultReasonFraction;
+	const float ResultMid = ReasonMid + (ReasonCap * 0.5f) + (TraceHUDStyle::ResultLineGapPx * UIScale) + (ResultCap * 0.5f);
+	const float TitleMaxW = ViewW - (120.f * UIScale);
+	TraceMenuKit::DrawCapText(this, ReasonText, CX, ReasonMid, ReasonCap, ReasonColor, TitleFace,
+		TraceText::EHAlign::Center, TitleMaxW);
+	TraceMenuKit::DrawCapText(this, ResultText, CX, ResultMid, ResultCap, ResultColor, TitleFace,
+		TraceText::EHAlign::Center, TitleMaxW);
+
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.ResultHead = ReasonText;
+	HudKitRecord.ResultHeadWeight = static_cast<int32>(TitleFace);
+	HudKitRecord.ResultHeadColor = ReasonColor;
+	HudKitRecord.ResultLine = ResultText;
+	HudKitRecord.ResultLineWeight = static_cast<int32>(TitleFace);
+	HudKitRecord.ResultLineColor = ResultColor;
+#endif
 
 	// NO EXPLANATORY LINE UNDER THE RESULT ANY MORE. "BLUE LED BY 2 - THE MATCH ENDED EARLY" / "TWO
 	// HALVES ON THE CLOCK" restated the headline above it in a sentence; the headline says why the
@@ -10100,6 +10147,8 @@ namespace TraceFxHudShots
 //   6. ON THE KIT: the SPEED BOOST chip is not cyan (stylespec §0) and keeps its distance on the status
 //      wheel; a live frame's meters sit on the kit's rail, and the ammo plate's caption is at least an
 //      8 px cap at 1080p.
+//   7. HEADINGS: a dead frame's ELIMINATED is in the kit's heading face (Sofachrome), white, and its
+//      killer line is all capitals.
 //
 // Headless recipe (Arena):
 //   -TraceExecAt=6 -TraceExec="Trace.HUD.Kit.Verify kill=22"
@@ -10361,6 +10410,14 @@ namespace TraceHUDKitVerify
 				Cause.IsNone() || !Rec.DeathKillerLine.Contains(Cause.ToString()),
 				FString::Printf(TEXT("cause '%s', line \"%s\""), *Cause.ToString(), *Rec.DeathKillerLine));
 			const APlayerState* LocalState = (PC != nullptr) ? PC->PlayerState.Get() : nullptr;
+			Report(Run, TEXT("*** DEAD: ELIMINATED is set in the kit's heading face (Sofachrome), white ***"),
+				Rec.DeathHeadWeight == static_cast<int32>(ETraceTextWeight::Light)
+					&& Rec.DeathHeadColor.Equals(TraceMenuArtStyle::WordDefault, 0.01f),
+				FString::Printf(TEXT("\"%s\" face %d (Light is %d), colour %s"), *Rec.DeathHead, Rec.DeathHeadWeight,
+					static_cast<int32>(ETraceTextWeight::Light), *Rec.DeathHeadColor.ToString()));
+			Report(Run, TEXT("*** DEAD: the killer line is all capitals, like every other line on the HUD ***"),
+				!Rec.DeathKillerLine.IsEmpty() && Rec.DeathKillerLine.Equals(Rec.DeathKillerLine.ToUpper(), ESearchCase::CaseSensitive),
+				FString::Printf(TEXT("\"%s\""), *Rec.DeathKillerLine));
 			Report(Run, TEXT("DEAD: the death panel draws the kill feed's glyph for the cause"),
 				!Rec.DeathIcon.IsEmpty() || Rec.DeathKillerLine.IsEmpty(),
 				FString::Printf(TEXT("glyph '%s' (local player id %d)"), *Rec.DeathIcon,
@@ -10511,7 +10568,9 @@ namespace TraceHUDKitVerify
 		TEXT("DrawLine path as the control), GO on the second-half kickoff, the half-time card waits for ")
 		TEXT("the goal flash, then 60 s of drawn frames: no match chrome under an overlay, the gun named ")
 		TEXT("on the ammo plate, no reload prompt on a healthy clip, and a death panel with the feed's ")
-		TEXT("glyph instead of the internal cause name."),
+		TEXT("glyph instead of the internal cause name. Also: kill-feed glyphs reuse one stroke list, SPEED BOOST is ")
+		TEXT("not cyan, the meters sit on the kit's rail, the ammo caption is an 8 px cap, and the death panel's ")
+		TEXT("heading is the kit's heading face over a capitalised killer line."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
 }
 #endif // !UE_BUILD_SHIPPING
@@ -11040,6 +11099,9 @@ namespace TraceHUDResultsVerify
 		bool bPadSettingWas = true;
 		bool bPadSettingTouched = false;
 		bool bFinalKeyIsEnter = false;
+		/** Who the match is ended for (`draw`: nobody) and why (`mercy`: the mercy rule; else the clock). */
+		ETraceTeam Winner = ETraceTeam::Blue;
+		ETraceMatchEndReason Reason = ETraceMatchEndReason::Clock;
 		/** The one press that must work did, exactly once. */
 		bool bCompleted = false;
 	};
@@ -11168,6 +11230,27 @@ namespace TraceHUDResultsVerify
 				ContinuesSinceWhistle(Run) == 0 && MatchGS != nullptr && MatchGS->TraceMatchState == ETraceMatchState::PostMatch,
 				FString::Printf(TEXT("continues %d, still on the results screen %d"), ContinuesSinceWhistle(Run),
 					(MatchGS != nullptr && MatchGS->TraceMatchState == ETraceMatchState::PostMatch) ? 1 : 0));
+
+			// THE HEADLINE IS A KIT SCREEN TITLE: the reason and the result both in the kit's heading face
+			// (Sofachrome), the reason in white — read off the draw record of the frame on screen.
+			APlayerController* const ResultsPC = Run.Controller.Get();
+			const ATraceHUD* const ResultsHud = (ResultsPC != nullptr) ? Cast<ATraceHUD>(ResultsPC->GetHUD()) : nullptr;
+			if (ResultsHud != nullptr)
+			{
+				const ATraceHUD::FHudKitRecord& Drawn = ResultsHud->GetHudKitRecord();
+				const int32 KitFace = static_cast<int32>(ETraceTextWeight::Light);
+				Report(Run, TEXT("*** the results headline is set in the kit's heading face, the reason line white ***"),
+					!Drawn.ResultHead.IsEmpty() && Drawn.ResultHeadWeight == KitFace && Drawn.ResultLineWeight == KitFace
+						&& Drawn.ResultHeadColor.Equals(TraceMenuArtStyle::WordDefault, 0.01f)
+						&& (Run.Winner != ETraceTeam::None || Drawn.ResultLineColor.Equals(TraceMenuArtStyle::WordDefault, 0.01f)),
+					FString::Printf(TEXT("\"%s\" face %d %s / \"%s\" face %d %s (Light is %d)"),
+						*Drawn.ResultHead, Drawn.ResultHeadWeight, *Drawn.ResultHeadColor.ToString(),
+						*Drawn.ResultLine, Drawn.ResultLineWeight, *Drawn.ResultLineColor.ToString(), KitFace));
+			}
+			else
+			{
+				Report(Run, TEXT("the results headline is set in the kit's heading face"), false, TEXT("no local match HUD"));
+			}
 			break;
 		}
 		case 8:  Inject(Run, PadA, false); break;
@@ -11226,6 +11309,14 @@ namespace TraceHUDResultsVerify
 		for (const FString& Arg : Args)
 		{
 			Run->bFinalKeyIsEnter |= Arg.Equals(TEXT("key=enter"), ESearchCase::IgnoreCase);
+			if (Arg.Equals(TEXT("draw"), ESearchCase::IgnoreCase))
+			{
+				Run->Winner = ETraceTeam::None;
+			}
+			if (Arg.Equals(TEXT("mercy"), ESearchCase::IgnoreCase))
+			{
+				Run->Reason = ETraceMatchEndReason::Mercy;
+			}
 		}
 
 		UE_LOG(LogTraceGame, Display,
@@ -11260,7 +11351,7 @@ namespace TraceHUDResultsVerify
 		Run->CountAtWhistle = TraceHUDResultsInput::GContinueCount;
 		Run->WhistleReal = FPlatformTime::Seconds();
 		Inject(*Run, EKeys::Gamepad_FaceButton_Bottom, true);
-		Rules->DebugFinishMatch(ETraceTeam::Blue, ETraceMatchEndReason::Clock);
+		Rules->DebugFinishMatch(Run->Winner, Run->Reason);
 
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda([Run](float /*Delta*/) -> bool
 		{
@@ -11277,7 +11368,8 @@ namespace TraceHUDResultsVerify
 		TEXT("Trace.HUD.Results.Verify"),
 		TEXT("Ends the match on the host with pad A pressed on the whistle frame (a jump), then proves that no press ")
 		TEXT("inside the results screen's grace, no held A and no A with CONTROLLER INPUT off continues, and that a ")
-		TEXT("fresh A (or ENTER with key=enter) afterwards does. Run on the Arena after lock-in."),
+		TEXT("fresh A (or ENTER with key=enter) afterwards does, and that the headline is in the kit's heading face. ")
+		TEXT("`draw` ends it level, `mercy` on the mercy rule (BLUE on the clock otherwise). Run on the Arena after lock-in."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
 }
 #endif // !UE_BUILD_SHIPPING

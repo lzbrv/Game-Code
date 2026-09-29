@@ -236,6 +236,19 @@ public:
 		FString DeathKillerLine;
 		FString DeathIcon;
 
+		/** The death panel's heading as drawn: its words, face (ETraceTextWeight as an int) and colour. */
+		FString DeathHead;
+		int32 DeathHeadWeight = -1;
+		FLinearColor DeathHeadColor = FLinearColor::Transparent;
+
+		/** The results screen's two headline lines as drawn (reason, then result), with face and colour. */
+		FString ResultHead;
+		int32 ResultHeadWeight = -1;
+		FLinearColor ResultHeadColor = FLinearColor::Transparent;
+		FString ResultLine;
+		int32 ResultLineWeight = -1;
+		FLinearColor ResultLineColor = FLinearColor::Transparent;
+
 		/** HALF TIME, the goal flash, and GO with the subtitle it carried. */
 		bool bHalfTimeCard = false;
 		bool bScoreFlash = false;
