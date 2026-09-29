@@ -23,6 +23,9 @@
 #include "Settings/TraceUserSettings.h"          // spec v29 §5: the 1/2/3 keybind table
 #include "Trace.h"
 #include "TraceSettings.h"
+#if !UE_BUILD_SHIPPING
+#include "Debug/TraceFixtureCore.h"               // Trace.Knife.CarrierImmunityTest puts the Core back as found
+#endif
 
 // =================================================================================================
 // Console overrides. Every one defaults to a negative sentinel meaning "defer to the setting"; see
@@ -1534,6 +1537,12 @@ namespace TraceMeleeConsole
 		 * mistake a sibling harness made this pass, and it cost five good samples.
 		 */
 		int32 RetriesLeft = 6;
+
+		/**
+		 * Who had the Core before the test pinned it on a victim, forced passes and killed carriers.
+		 * Put back on every exit; see the wrapper in the command below.
+		 */
+		TraceFixtureCore::FCoreHolding CoreBefore;
 	};
 
 	/**
@@ -1633,6 +1642,7 @@ namespace TraceMeleeConsole
 			}
 
 			TSharedPtr<FCarrierImmunityTest> State = MakeShared<FCarrierImmunityTest>();
+			State->CoreBefore = TraceFixtureCore::CaptureCoreHolding(World);
 			State->Arm = 0;                       // RED first. See the block comment above.
 			State->Phase = -1;
 			State->StartTime = World->GetTimeSeconds();
@@ -1653,7 +1663,7 @@ namespace TraceMeleeConsole
 				TEXT("[KNIFECARRIER] ===== starting. Arm 0 = RED (rule REMOVED, must damage). Arm 1 = GREEN (shipped). "
 				     "Bot auto-knife parked for the duration. ====="));
 
-			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+			const FTickerDelegate KnifeRunBody = FTickerDelegate::CreateLambda(
 				[State, WeakWorld = TWeakObjectPtr<UWorld>(World)](float) -> bool
 			{
 				UWorld* TickWorld = WeakWorld.Get();
@@ -2020,7 +2030,31 @@ namespace TraceMeleeConsole
 				}
 
 				return true;
-			}), 0.f);
+			});
+
+			// *** EVERY EXIT PUTS BACK WHAT THE TEST TOOK, IN ONE PLACE. *** The body has six ways to
+			// stop (verdict, SKIPPED, ABANDONED, stalled, a participant gone, the world gone), and each
+			// restored the two knobs by hand — except SKIPPED, which left every bot's auto-knife parked
+			// for the rest of the session. None of them put the Core back: the test pins it on a victim,
+			// forces passes that complete onto team-mates and kills carriers, and it regularly ended on
+			// the local player, so the next harness in the process ran on a carrier who cannot swing,
+			// fire or reload. The ticker stopping IS the run ending, so the restore lives there.
+			FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+				[State, WeakWorld = TWeakObjectPtr<UWorld>(World), KnifeRunBody](float DeltaTime) -> bool
+				{
+					if (KnifeRunBody.Execute(DeltaTime))
+					{
+						return true;
+					}
+					CVarKnifeCarrierImmune->Set(1, ECVF_SetByConsole);
+					CVarKnifeBotAuto->Set(1, ECVF_SetByConsole);   // the bots get their knife back
+					if (UWorld* EndWorld = WeakWorld.Get())
+					{
+						UE_LOG(LogTraceGame, Display, TEXT("[KNIFECARRIER] restored: %s."),
+							*TraceFixtureCore::RestoreCoreHolding(EndWorld, State->CoreBefore));
+					}
+					return false;
+				}), 0.f);
 		}));
 
 	FAutoConsoleCommand CmdAngleTest(

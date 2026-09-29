@@ -1425,6 +1425,14 @@ public:
 	/** Dev-only read-back of the raw server-side count, bypassing GetClipAmmo()'s owner/proxy rules. */
 	int32 DebugGetAuthoritativeClipAmmo() const { return static_cast<int32>(ClipAmmo); }
 
+	/**
+	 * Dev-only, AUTHORITY: a full ORDINARY magazine in the gun in hand — no ability rounds, no reload
+	 * running — which is how a respawn leaves it. For fixtures that loaded ability rounds of their own
+	 * (Trace.X.StingTest) to hand the gun back as they found it, instead of leaving the next harness
+	 * five amber bee rounds it never asked for.
+	 */
+	void DebugRefillOrdinaryClip() { RefillClip(GetLiveClipSize(), 0); }
+
 	/** Dev-only: rounds this pawn has ever spent, and reloads it has ever finished. Server-side. */
 	void DebugGetAmmoTotals(int32& OutRoundsConsumed, int32& OutReloadsCompleted) const
 	{

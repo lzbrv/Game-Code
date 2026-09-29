@@ -69,6 +69,7 @@
 #include "Abilities/TraceAbilityComponent.h"
 #include "Abilities/TraceAbilityTypes.h"
 #include "Core/TraceCharacter.h"
+#include "Core/TracePlayerController.h"     // IsGameInputSuppressed — the run hands the range back live
 #include "Core/TracePlayerState.h"
 #include "Modes/TracePracticeActors.h"
 #include "Modes/TracePracticeRange.h"
@@ -792,6 +793,45 @@ namespace TracePracticeInfiniteVerify
 
 			Run->Tally.Report(Run->bSelectOpenAfterSwapPad,
 				TEXT("WALKING ONTO the LOADOUT pad reopened the shipped select screen."));
+
+			// *** AND NOW CLOSE IT AGAIN. *** The run used to end here, standing on the pad with the
+			// select screen up — which PAUSES the world and suppresses gameplay input — so the next
+			// harness in the process inherited a frozen range: Trace.InputSelfTest scored 5 of 14 with
+			// "Gameplay input suppressed (menu open). paused=1". Off the pad first, or the pad's own
+			// touch would reopen it; then the same locked-in, screen-shut state PickSubject put the run
+			// in at the start.
+			if (PlayerPawn != nullptr)
+			{
+				PlayerPawn->TeleportTo(Run->PlayerHome, PlayerPawn->GetActorRotation(),
+					/*bIsATest=*/false, /*bNoCheck=*/true);
+			}
+			PickSubject(WorldPtr);
+			GoToStep(*Run, 15);
+			return true;
+		}
+
+		// -----------------------------------------------------------------------------------------
+		case 15:  // THE RUN LEAVES THE RANGE AS IT FOUND IT
+		{
+			// The page closes from the server's flag and hands input back on its own tick, and the
+			// select poll runs at 4 Hz — so the same settle as the reopen above, then look.
+			if (SinceStep < FInfiniteRun::SettleWait * 2.0)
+			{
+				return true;
+			}
+
+			const ATracePlayerState* const TraceState = LocalTraceState(WorldPtr);
+			const ATracePlayerController* const LocalPC =
+				Cast<ATracePlayerController>(WorldPtr->GetFirstPlayerController());
+			const bool bSelectShut = (TraceState != nullptr) && !TraceState->IsCharacterSelectOpen();
+			const bool bWorldRunning = !WorldPtr->IsPaused();
+			const bool bInputLive = (LocalPC != nullptr) && !LocalPC->IsGameInputSuppressed();
+
+			Run->Tally.Report(bSelectShut && bWorldRunning && bInputLive,
+				*FString::Printf(TEXT("...and the run CLOSES it again on its way out: select screen shut=%d, "
+				                      "world running=%d, gameplay input live=%d — the next harness gets a "
+				                      "range it can play in."),
+					bSelectShut ? 1 : 0, bWorldRunning ? 1 : 0, bInputLive ? 1 : 0));
 
 			GoToStep(*Run, 90);
 			return true;

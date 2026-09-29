@@ -38,6 +38,9 @@
 #include "UI/Text/TraceGameText.h"   // refusal toasts: HUD.TOAST_*
 #include "Abilities/Characters/TraceVerifyLock.h"   // one character fixture at a time
 #include "Misc/ScopeExit.h"                          // ON_SCOPE_EXIT — the verify releases the subject
+#if !UE_BUILD_SHIPPING
+#include "Debug/TraceFixtureCore.h"                  // ZipVerify / DashTest put the Core back as found
+#endif
 
 #define LOCTEXT_NAMESPACE "TraceLily"
 
@@ -1661,6 +1664,11 @@ namespace TraceLilyVerifyFile
 		}
 		const int32 ArmBefore = Arm->GetInt();
 
+		// Who had the Core before the arms below hand it about. The last TryPickup leaves it on HER —
+		// the local player — and it used to stay there, so Trace.Lily.FlightTest then flew a carrier
+		// and failed and Trace.Lily.TapTest said INVALID. See TraceFixtureCore.h.
+		const TraceFixtureCore::FCoreHolding CoreBefore = TraceFixtureCore::CaptureCoreHolding(TestWorld);
+
 		const UTraceSettings& Settings = UTraceSettings::Get();
 		const float FullDuration    = FMath::Max(0.25f, Settings.LilyZipDurationSeconds);
 		const float CarrierDuration = FullDuration * FMath::Clamp(Settings.LilyZipCarrierDurationScale, 0.05f, 1.f);
@@ -1721,6 +1729,8 @@ namespace TraceLilyVerifyFile
 
 		Arm->Set(ArmBefore, ECVF_SetByConsole);
 		Lily->OnHalfTime();
+		UE_LOG(LogTraceGame, Display, TEXT("[%s] restored: %s."), Tag,
+			*TraceFixtureCore::RestoreCoreHolding(TestWorld, CoreBefore));
 
 		// ---- the verdict ---------------------------------------------------------------------------
 		//
@@ -2958,6 +2968,7 @@ namespace TraceLilyVerifyFile
 		{
 			if (*It != nullptr && *It != MyPawn && (*It)->IsAlive()) { Parker = *It; break; }
 		}
+		const TraceFixtureCore::FCoreHolding CoreBefore = TraceFixtureCore::CaptureCoreHolding(TestWorld);
 
 		int32 Free[2] = { 0, 0 };
 		int32 Carrying[2] = { 0, 0 };
@@ -2976,10 +2987,9 @@ namespace TraceLilyVerifyFile
 			Carrying[ArmIndex] = MoveComp->GetMaxDashCharges();
 		}
 
-		if (Parker != nullptr)
-		{
-			CoreActor->TryPickup(Parker);   // leave the match roughly as it was found
-		}
+		// Back to whoever had it before — not to the Parker, who was only ever somewhere to put it.
+		UE_LOG(LogTraceGame, Display, TEXT("[%s] restored: %s."), Tag,
+			*TraceFixtureCore::RestoreCoreHolding(TestWorld, CoreBefore));
 		Arm->Set(ArmBefore, ECVF_SetByConsole);
 
 		const UTraceSettings& Settings = UTraceSettings::Get();

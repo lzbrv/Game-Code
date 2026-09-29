@@ -63,6 +63,7 @@
 #include "GameFramework/PlayerState.h"
 #include "Gameplay/TraceCore.h"
 #include "Gameplay/TraceHealthComponent.h"
+#include "Gameplay/TraceWeaponComponent.h"   // StingTest hands the gun back with an ordinary clip
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformTime.h"
 #include "Trace.h"
@@ -1041,6 +1042,28 @@ namespace TraceXVerify
 
 			Target->Health->ClearVulnerable();
 			Target->Health->ResetHealth();
+
+			// *** PUT X BACK THE WAY THE TEST FOUND HIM. *** The 'normal damage' step above casts Sting a
+			// second time and spends one bullet, so the test used to end with FOUR BEES STILL LOADED and a
+			// clip of bee rounds — and the next harness in the process, Trace.X.BeeTest, found a swarm that
+			// was in his gun instead of orbiting him and failed "a body standing where a BEE is gets
+			// stung" on a correct build. OnHalfTime is the framework's own reset (net state, cooldown, and
+			// X's marks on everybody); the clip goes back to an ordinary thirty.
+			if (Comp != nullptr)
+			{
+				Comp->OnHalfTime();
+			}
+			if (UTraceWeaponComponent* XGun = XPawn->Weapon)
+			{
+				XGun->DebugRefillOrdinaryClip();
+			}
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[XSTING] restored: %d bee(s) loaded, sting loaded=%d, cooldown %.1fs, clip %d with %d ability round(s)."),
+				XSet->GetLoadedBees(), XSet->IsStingLoaded() ? 1 : 0,
+				(Comp != nullptr) ? Comp->GetActivatedCooldownRemaining() : -1.f,
+				(XPawn->Weapon != nullptr) ? XPawn->Weapon->DebugGetAuthoritativeClipAmmo() : -1,
+				(XPawn->Weapon != nullptr) ? XPawn->Weapon->GetAbilityRoundsInClip() : -1);
+
 			List->Report();
 			return false;
 		}));

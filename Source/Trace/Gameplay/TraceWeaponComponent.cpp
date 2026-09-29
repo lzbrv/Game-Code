@@ -50,6 +50,9 @@
 #include "Trace.h"
 #include "TraceSettings.h"
 #include "TraceTypes.h"
+#if !UE_BUILD_SHIPPING
+#include "Debug/TraceFixtureCore.h"   // Trace.Ammo.CarrierTest puts the Core back as it found it
+#endif
 
 /**
  * Logs, per shot, the zone the SHOOTER's own predicted trace produced and the zone the SERVER
@@ -6482,7 +6485,24 @@ namespace TraceAmmoTest
 
 		bool bRedReproduced = false;
 		bool bControlWorked = false;
+
+		/** Who had the Core before staging, because staging moves it. See EndCarrierAmmoRun. */
+		TraceFixtureCore::FCoreHolding CoreBefore;
 	};
+
+	/**
+	 * Every way Trace.Ammo.CarrierTest ends after it has touched the Core: the arms back to shipped,
+	 * and the Core back to whoever held it before. The test used to "put it back" by granting it to
+	 * the pawn IT had staged as the carrier — which, whenever the Core had been loose, was the first
+	 * pawn in the world, the local player. Trace.Knife.DualWeaponTest, TestKnife, Railgun.Verify and
+	 * Trace.Ammo.BindTest then all ran on a carrier and failed or hung.
+	 */
+	void EndCarrierAmmoRun(UWorld* EndWorld, const FCarrierAmmoState& EndState)
+	{
+		RestoreArms();
+		UE_LOG(LogTraceGame, Display, TEXT("[AMMOCARRIER] restored: %s."),
+			*TraceFixtureCore::RestoreCoreHolding(EndWorld, EndState.CoreBefore));
+	}
 
 	void RunCarrierTest()
 	{
@@ -6496,6 +6516,7 @@ namespace TraceAmmoTest
 		TSharedPtr<FCarrierAmmoState> State = MakeShared<FCarrierAmmoState>();
 		State->List.Tag = TEXT("AMMOCARRIER");
 		State->Deadline = FPlatformTime::Seconds() + 90.0;
+		State->CoreBefore = TraceFixtureCore::CaptureCoreHolding(World);
 
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[AMMOCARRIER] ===== spec v16 §1: 'The Core carrier has no gun, so ammo must not be consumed or "
@@ -6561,7 +6582,7 @@ namespace TraceAmmoTest
 							     "two pawns"),
 							*GetNameSafe(CarrierPawn), *GetNameSafe(ControlPawn)));
 						State->List.Report();
-						RestoreArms();
+						EndCarrierAmmoRun(TickWorld, *State);
 						return false;
 					}
 					return true;
@@ -6584,7 +6605,7 @@ namespace TraceAmmoTest
 			{
 				State->List.Invalidate(TEXT("a participant went away or died mid-test"));
 				State->List.Report();
-				RestoreArms();
+				EndCarrierAmmoRun(TickWorld, *State);
 				return false;
 			}
 
@@ -6611,7 +6632,7 @@ namespace TraceAmmoTest
 					{
 						State->List.Invalidate(TEXT("could not keep the Core on the carrier (and off the control)"));
 						State->List.Report();
-						RestoreArms();
+						EndCarrierAmmoRun(TickWorld, *State);
 						return false;
 					}
 					return true;
@@ -6715,12 +6736,9 @@ namespace TraceAmmoTest
 						bStillCarrying ? 1 : 0, ControlWeapon->IsReloading() ? 1 : 0,
 						TraceAmmo::GetReloadSeconds()));
 
-				// Put the Core back where the harness found it. It is a legal game state either way, but
-				// leaving a test's staging behind in a live match is how the NEXT test gets a surprise.
-				if (CoreActor != nullptr && Carrier->IsAlive())
-				{
-					CoreActor->GrantTo(Carrier, ETraceCoreGrantReason::Debug);
-				}
+				// The Core goes back where the harness FOUND it — before staging, not the staged carrier —
+				// in EndCarrierAmmoRun below. Leaving a test's staging behind in a live match is how the
+				// NEXT test gets a surprise.
 			}
 
 			if (!State->bControlWorked)
@@ -6736,7 +6754,7 @@ namespace TraceAmmoTest
 			}
 
 			State->List.Report();
-			RestoreArms();
+			EndCarrierAmmoRun(TickWorld, *State);
 			return false;
 		}));
 	}
