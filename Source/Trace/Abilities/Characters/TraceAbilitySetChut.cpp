@@ -1058,6 +1058,9 @@ namespace TraceAbilitySetChutFile
 	/** Comfortably lethal, and the health component clamps at zero, so the exact size does not matter. */
 	constexpr float ChudTestLethalDamage = 100000.f;
 
+	/** How many times one arm of Trace.Chut.ChudRefreshTest may restart a collapsed fixture (FChudRun). */
+	constexpr int32 ChudArmRestarts = 8;
+
 	struct FChudCheck
 	{
 		bool bPassed = false;
@@ -1156,7 +1159,10 @@ namespace TraceAbilitySetChutFile
 		 * exactly the kind of confident nonsense this project has a house rule about, so a collapsed
 		 * fixture now RESTARTS the arm and only gives up (INVALID, never FAIL) when it runs out.
 		 */
-		int32 ArmRestartsLeft = 8;
+		int32 ArmRestartsLeft = ChudArmRestarts;
+
+		/** Test hook (`collapse=<n>`): fixture collapses still to stage. */
+		int32 ForcedCollapsesLeft = 0;
 	};
 
 	/**
@@ -1509,7 +1515,7 @@ namespace TraceAbilitySetChutFile
 		Run->Current = FChudArmLog();
 		++Run->ArmIndex;
 		Run->Step = 0;
-		Run->ArmRestartsLeft = 8;      // each arm gets its own budget
+		Run->ArmRestartsLeft = ChudArmRestarts;      // each arm gets its own budget
 		Run->SetupAttemptsLeft = 40;
 	}
 
@@ -1627,15 +1633,24 @@ namespace TraceAbilitySetChutFile
 		const UTraceSettings& Settings = UTraceSettings::Get();
 
 		// AN ARM STARTS ONLY IF ITS OWN WAITS FIT IN THE BUDGET THAT IS LEFT. See ChudRefreshBudgetSeconds.
+		// A RESTARTED arm comes back through here too (RestartOrGiveUp sets Step 0) and is refused the
+		// same way, but it DID run: its half-collected checks were thrown away by the restart. The line
+		// says which, so "not run" never describes an arm that ran.
 		if (Run->Step == 0)
 		{
 			const double BudgetLeft = Run->RunDeadlineReal - FPlatformTime::Seconds();
 			const double ArmNeeds = ChudArmFixedSeconds();
 			if (BudgetLeft < ArmNeeds)
 			{
-				Run->Current.Invalidate(FString::Printf(
-					TEXT("not run: an arm waits %.1f s from start to finish and %.1f s of the %.0f s budget was left"),
-					ArmNeeds, FMath::Max(0.0, BudgetLeft), Run->RunBudgetSeconds));
+				const int32 RestartsUsed = ChudArmRestarts - Run->ArmRestartsLeft;
+				Run->Current.Invalidate(RestartsUsed > 0
+					? FString::Printf(
+						TEXT("restart not attempted: the arm ran and collapsed (%d restart(s), its checks thrown away), and a fresh "
+						     "attempt waits %.1f s from start to finish with %.1f s of the %.0f s budget left"),
+						RestartsUsed, ArmNeeds, FMath::Max(0.0, BudgetLeft), Run->RunBudgetSeconds)
+					: FString::Printf(
+						TEXT("not run: an arm waits %.1f s from start to finish and %.1f s of the %.0f s budget was left"),
+						ArmNeeds, FMath::Max(0.0, BudgetLeft), Run->RunBudgetSeconds));
 				FinishChudArm(Run);
 				ScheduleChudRefresh(Run, 0.f);
 				return false;
@@ -1690,6 +1705,15 @@ namespace TraceAbilitySetChutFile
 
 		case 1:
 		{
+			// TEST HOOK (`collapse=<n>`): the first n times an arm gets here, its fixture "collapses" and
+			// the arm restarts, exactly as a real collapse does — so the budget gate's wording for a
+			// restarted arm can be seen without waiting for the bots to kill Chut.
+			if (Run->ForcedCollapsesLeft > 0)
+			{
+				--Run->ForcedCollapsesLeft;
+				return RestartOrGiveUp(Run, TEXT("test hook: collapse= staged a fixture collapse"));
+			}
+
 			// CHUD MUST STILL BE RUNNING. If it is not, Chut died (spec v19 §4.2 wipes effects on
 			// death) — the fixture collapsed and the arm starts again rather than reporting a rule
 			// that never got to run.
@@ -2005,10 +2029,11 @@ namespace TraceAbilitySetChutFile
 		     "UTraceAbilitySetChut::OnKill directly. Arm 0 sets Trace.Chut.ChudKillRefresh 0 and MUST fail; "
 		     "a red arm that passes is reported INVALID. Takes about a minute; holds the verify lock throughout "
 		     "and starts no arm whose own waits would run past 120 s (INVALID for it instead). `budget=<s>` "
-		     "sets a shorter budget, to test that."),
+		     "sets a shorter budget, to test that; `collapse=<n>` stages n fixture collapses (restarts)."),
 		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
 		{
 			double RequestedBudget = ChudRefreshBudgetSeconds;
+			int32 RequestedCollapses = 0;
 			for (const FString& Arg : Args)
 			{
 				FString Key;
@@ -2017,19 +2042,25 @@ namespace TraceAbilitySetChutFile
 				{
 					RequestedBudget = FMath::Clamp(FCString::Atod(*Value), 1.0, 600.0);
 				}
+				else if (Key.Equals(TEXT("collapse"), ESearchCase::IgnoreCase))
+				{
+					RequestedCollapses = FMath::Clamp(FCString::Atoi(*Value), 0, ChudArmRestarts);
+				}
 			}
 
-			// ONE FIXTURE ON THE PLAYER'S PAWN AT A TIME — see ChudRefreshBudgetSeconds. The claim
-			// covers the budget and the last arm, is renewed by every step (ChudRefreshClaimMarginSeconds)
-			// and is released when the verdict prints.
-			if (!TraceVerifyLock::ClaimOrQueue(ChudRefreshCommandName,
-					RequestedBudget + ChudArmFixedSeconds() + ChudRefreshClaimMarginSeconds, Args))
+			// ONE FIXTURE ON THE PLAYER'S PAWN AT A TIME — see ChudRefreshBudgetSeconds. The claim is
+			// taken for one step's margin (ChudRefreshClaimMarginSeconds) and RENEWED BY EVERY STEP for
+			// that step's wait plus the margin (ScheduleChudRefresh, whose first call follows at once),
+			// so it lasts exactly as long as the run is alive and is released when the verdict prints.
+			// (It used to be claimed for the whole budget here and cut to 15 s by that first renewal.)
+			if (!TraceVerifyLock::ClaimOrQueue(ChudRefreshCommandName, ChudRefreshClaimMarginSeconds, Args))
 			{
 				return;
 			}
 			TSharedPtr<FChudRun> Run = MakeShared<FChudRun>();
 			Run->RunBudgetSeconds = RequestedBudget;
 			Run->RunDeadlineReal = FPlatformTime::Seconds() + RequestedBudget;
+			Run->ForcedCollapsesLeft = RequestedCollapses;
 			ScheduleChudRefresh(Run, 0.f);
 		}));
 
