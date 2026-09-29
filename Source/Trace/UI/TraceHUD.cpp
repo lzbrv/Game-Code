@@ -184,6 +184,13 @@ namespace TraceHUDStyle
 	 */
 	static constexpr float CornerPlateAlpha = 1.f;
 
+	/**
+	 * THE CARDS THAT HOLD THE ROSTER ARE SOLID TOO: the live scoreboard (Tab) and the results screen's
+	 * roster card, which draw the same rows. The scoreboard was 0.96, and the arena's cubes and pillar
+	 * edges showed through its empty lower half and behind its rows.
+	 */
+	static constexpr float CardPlateAlpha = 1.f;
+
 	/** A plate's corner is the button's up to this height (stylespec §6: tall cards keep 60 px). */
 	static constexpr float PanelCornerMax = 60.f;
 
@@ -7450,7 +7457,7 @@ void ATraceHUD::DrawMatchResult()
 		+ (TraceHUDScoreboardLayout::HeaderH + TraceHUDScoreboardLayout::HeaderGap) * UIScale
 		+ MaxRows * (TraceHUDScoreboardLayout::RowH * UIScale);
 
-	DrawKitPanel(CardX, CardY, CardW, CardH, 1.f);
+	DrawKitPanel(CardX, CardY, CardW, CardH, TraceHUDStyle::CardPlateAlpha);
 
 	const float Gutter = 22.f * UIScale;
 	const float ColumnW = (CardW - CardPad * 2.f - Gutter) * 0.5f;
@@ -7590,9 +7597,12 @@ void ATraceHUD::DrawScoreboard()
 	const float PanelX = (ViewW - PanelW) * 0.5f;
 	const float PanelY = ViewH * 0.5f - PanelH * 0.55f;
 
-	// The kit's plate as a card (the corner a button's, not the card's), near-opaque: the board is read
-	// over a live match and has to win against it.
-	DrawKitPanel(PanelX, PanelY, PanelW, PanelH, 0.96f);
+	// The kit's plate as a card (the corner a button's, not the card's), SOLID (CardPlateAlpha): the
+	// board is read over a live match and has to win against it, as the results roster card does.
+	DrawKitPanel(PanelX, PanelY, PanelW, PanelH, TraceHUDStyle::CardPlateAlpha);
+#if !UE_BUILD_SHIPPING
+	HudKitRecord.ScoreboardPlateAlpha = TraceHUDStyle::CardPlateAlpha;
+#endif
 
 	const int32 Blue = (TraceGS != nullptr) ? TraceGS->GetScore(ETraceTeam::Blue) : 0;
 	const int32 Orange = (TraceGS != nullptr) ? TraceGS->GetScore(ETraceTeam::Orange) : 0;
@@ -10252,6 +10262,8 @@ namespace TraceFxHudShots
 //      least an 8 px cap at 1080p, and the bottom-left stack and the ammo plate are drawn solid.
 //   7. HEADINGS: a dead frame's ELIMINATED is in the kit's heading face (Sofachrome), white, and its
 //      killer line is all capitals.
+//   8. BOARD: after the LIVE frame the run holds the scoreboard up (Trace.HUD.ForceScoreboard) until it
+//      has faded in, and its card must be solid; the cvar is put back as it was found.
 //
 // Headless recipe (Arena):
 //   -TraceExecAt=6 -TraceExec="Trace.HUD.Kit.Verify kill=22"
@@ -10277,7 +10289,24 @@ namespace TraceHUDKitVerify
 		int32 FeedGrowthsAtStart = -1;
 		int32 FeedFrames = 0;
 		bool bFeedChecked = false;
+
+		/**
+		 * BOARD: after the LIVE frame the run holds the scoreboard up itself (Trace.HUD.ForceScoreboard)
+		 * until it has faded fully in, reads its card, and puts the cvar back as it found it.
+		 */
+		double BoardSince = -1.0;
+		int32 BoardForceSaved = 0;
+		bool bBoardChecked = false;
 	};
+
+	/** Puts Trace.HUD.ForceScoreboard back as the run found it, if the run is still holding it. */
+	static void ReleaseBoard(FRun& Run)
+	{
+		if (Run.BoardSince >= 0.0 && !Run.bBoardChecked)
+		{
+			TraceHUDCapture::CVarForceScoreboard->Set(Run.BoardForceSaved, ECVF_SetByConsole);
+		}
+	}
 
 	/** sRGB hue, degrees, of a linear colour. */
 	static float HueOf(const FLinearColor& Linear)
@@ -10539,6 +10568,36 @@ namespace TraceHUDKitVerify
 					(LocalState != nullptr) ? LocalState->GetPlayerId() : -1));
 		}
 
+		// BOARD: THE LIVE SCOREBOARD'S CARD IS SOLID, like the docked corners and the results roster card
+		// that draws the same rows. At 0.96 the arena's cubes and pillar edges showed through it.
+		if (Run.bSawLive && !Run.bBoardChecked && !Rec.bOverlayUp)
+		{
+			const double BoardNow = FPlatformTime::Seconds();
+			if (Run.BoardSince < 0.0)
+			{
+				Run.BoardSince = BoardNow;
+				Run.BoardForceSaved = TraceHUDCapture::CVarForceScoreboard.GetValueOnGameThread();
+				TraceHUDCapture::CVarForceScoreboard->Set(1, ECVF_SetByConsole);
+			}
+			else if (Rec.ScoreboardAlpha >= 1.f || BoardNow - Run.BoardSince > 3.0)
+			{
+				if (Rec.ScoreboardAlpha >= 1.f)
+				{
+					Report(Run, TEXT("*** BOARD: the live scoreboard's card is solid, so the arena does not show through ***"),
+						Rec.ScoreboardPlateAlpha >= 0.999f,
+						FString::Printf(TEXT("card alpha %.3f (the results roster card and the corners are 1)"),
+							Rec.ScoreboardPlateAlpha));
+				}
+				else
+				{
+					Report(Run, TEXT("BOARD: the scoreboard came up when held"), false,
+						FString::Printf(TEXT("INCONCLUSIVE: board alpha %.2f after 3 s held"), Rec.ScoreboardAlpha));
+				}
+				TraceHUDCapture::CVarForceScoreboard->Set(Run.BoardForceSaved, ECVF_SetByConsole);
+				Run.bBoardChecked = true;
+			}
+		}
+
 		// P11: THE KILL FEED'S GLYPHS DO NOT ALLOCATE PER FRAME. Every glyph flush goes through the one
 		// shared stroke batch, whose list grows only when a bigger glyph than any before it is drawn. Over
 		// 90 frames of a feed on screen it may grow a handful of times (a new glyph shape), never once a
@@ -10559,11 +10618,16 @@ namespace TraceHUDKitVerify
 			}
 		}
 
-		return Run.bSawOverlay && Run.bSawLive && Run.bSawDead && Run.bFeedChecked;
+		return Run.bSawOverlay && Run.bSawLive && Run.bSawDead && Run.bFeedChecked && Run.bBoardChecked;
 	}
 
 	static void Finish(FRun& Run)
 	{
+		ReleaseBoard(Run);
+		if (!Run.bBoardChecked)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[HUDKit]   INCONCLUSIVE: the scoreboard's card was never read (no LIVE frame to hold it up over)."));
+		}
 		const TCHAR* Unseen[3] = { nullptr, nullptr, nullptr };
 		int32 NumUnseen = 0;
 		if (!Run.bSawOverlay) { Unseen[NumUnseen++] = TEXT("OVERLAY"); }
@@ -10685,7 +10749,7 @@ namespace TraceHUDKitVerify
 		TEXT("on the ammo plate, no reload prompt on a healthy clip, and a death panel with the feed's ")
 		TEXT("glyph instead of the internal cause name. Also: kill-feed glyphs reuse one stroke list, SPEED BOOST is ")
 		TEXT("not cyan, the meters sit on the kit's rail, the ammo caption and its capacity are an 8 px cap, the ")
-		TEXT("stack and ammo plates are solid, and the death panel's ")
+		TEXT("stack and ammo plates are solid, the live scoreboard's card is solid (the run holds Tab for it), and the death panel's ")
 		TEXT("heading is the kit's heading face over a capitalised killer line."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
 }

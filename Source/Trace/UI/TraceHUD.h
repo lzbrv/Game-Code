@@ -223,6 +223,9 @@ public:
 		bool bCrosshair = false;
 		int32 KillFeedRows = 0;
 
+		/** The live scoreboard's card alpha as last drawn (1: the arena does not show through it). */
+		float ScoreboardPlateAlpha = 0.f;
+
 		/** The bottom-left stack's plate, and the alpha it was drawn at (1: the world does not show through). */
 		bool bStackPlate = false;
 		float StackPlateAlpha = 0.f;
