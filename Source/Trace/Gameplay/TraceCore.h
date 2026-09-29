@@ -1660,6 +1660,13 @@ public:
 	 * that decides games. Staging that window is what makes the test able to fail.
 	 *
 	 * Returns the teammate the pass was aimed at, or null if there was no holder or no teammate.
+	 *
+	 * THE WINDOW OUTLIVES THE CORE'S OWN TICK, for DebugPassHoldSeconds after the latest call. Nothing
+	 * in this game holds the pass button any more (bPassInputHeld has no writer), so ServerTickPass
+	 * used to cancel a forced window as "released" on the very next Core tick. A caller that resolves
+	 * in the same frame (Trace.V10.CarrierProof) never noticed; the knife test's REAL swing resolves in
+	 * the attacker's weapon tick, which sometimes ran after that cancel, so its blade met a carrier
+	 * whose shield was back up and ResolveHitscan skipped him. Its red arm never reproduced.
 	 */
 	ATraceCharacter* DebugForcePassWindow();
 #endif
@@ -2508,6 +2515,13 @@ private:
 	 * cancels on the frame it happens (see IsTransientPassRejection).
 	 */
 	float PassGraceStartServerTime = 0.f;
+
+	/**
+	 * Shared-clock time until which a harness's DebugForcePassWindow holds the active pass open:
+	 * ServerTickPass neither validates it nor lets it complete before then. Negative when no harness
+	 * is holding it. Only DebugForcePassWindow writes a future time, so a shipping build never has one.
+	 */
+	float DebugPassHoldUntilServerTime = -1.f;
 
 	/** The holder whose OnDeath we are currently bound to. */
 	TWeakObjectPtr<ATraceCharacter> BoundDeathHolder;

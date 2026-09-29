@@ -530,6 +530,9 @@ public:
 	/** Seconds until the next swing is legal; 0 when it is legal now. HUD and bots. */
 	float GetSwingCooldownRemaining() const;
 
+	/** A swing has been pressed and its blade has not resolved yet (TickSwing). Harnesses read it. */
+	bool IsSwingResolvePending() const { return bSwingPendingResolve; }
+
 	// DoSwapWeaponPressed() USED TO SIT HERE and is deleted (spec v15 §5). It was "the swap bind" —
 	// the component-level toggle handler — and it had already lost its last caller before §5, because
 	// TraceMelee::RequestSwapWeapon goes straight to RequestEquip. With the F bind gone there is no

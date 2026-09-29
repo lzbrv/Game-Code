@@ -97,6 +97,14 @@ static TAutoConsoleVariable<int32> CVarTracePassFixes(
 
 namespace TraceCoreTuning
 {
+	/**
+	 * How long one DebugForcePassWindow call holds the pass open against ServerTickPass. The knife
+	 * test calls it every frame, so this only has to bridge one frame and the blade's resolve inside
+	 * it; once the harness stops calling, the window lapses this long afterwards and the next Core
+	 * tick cancels it as it always did.
+	 */
+	constexpr float DebugPassHoldSeconds = 0.25f;
+
 	/** Grace window, or 0 when the A/B switch is replaying pre-fix behaviour. */
 	float ResolvedValidationGrace(const UTraceSettings& Settings)
 	{
@@ -3342,6 +3350,7 @@ ATraceCharacter* ATraceCore::DebugForcePassWindow()
 		// invulnerability are left exactly as BeginPass set them, so the state under test is the
 		// state the game produces.
 		PassStartServerTime = GetServerTimeSeconds();
+		DebugPassHoldUntilServerTime = PassStartServerTime + TraceCoreTuning::DebugPassHoldSeconds;
 		return PassTarget;
 	}
 
@@ -3377,6 +3386,9 @@ ATraceCharacter* ATraceCore::DebugForcePassWindow()
 			BeginPass(Candidate);
 			if (bPassActive)
 			{
+				// HELD past the Core's next tick, which would otherwise cancel it as "released": see
+				// DebugPassHoldUntilServerTime and ServerTickPass.
+				DebugPassHoldUntilServerTime = GetServerTimeSeconds() + TraceCoreTuning::DebugPassHoldSeconds;
 				return Candidate;
 			}
 		}
@@ -4085,6 +4097,18 @@ void ATraceCore::ServerTickPass(float /*DeltaSeconds*/)
 	// --- An active pass: validate every frame, then complete on time. --------------------------
 	if (bPassActive)
 	{
+#if !UE_BUILD_SHIPPING
+		// A HARNESS IS HOLDING THIS WINDOW OPEN (DebugForcePassWindow). Nobody holds the pass button in
+		// this game any more, so the release test below would cancel it on this tick, and whichever
+		// weapon tick came after that met a carrier whose shield was back up. Held, it stays exactly as
+		// BeginPass left it until the harness stops asking, and it never matures into a transfer.
+		if (Now <= DebugPassHoldUntilServerTime)
+		{
+			PassStartServerTime = Now;
+			return;
+		}
+#endif
+
 		if (!bPassInputHeld)
 		{
 			// §4 [ASSUMPTION]: releasing early cancels, with the same instant restoration.
@@ -4287,6 +4311,9 @@ void ATraceCore::CancelPass(const TCHAR* Reason)
 	{
 		return;
 	}
+
+	// A harness's hold ends with the window it was holding (the holder died, or the Core moved).
+	DebugPassHoldUntilServerTime = -1.f;
 
 	if (Reason != nullptr)
 	{

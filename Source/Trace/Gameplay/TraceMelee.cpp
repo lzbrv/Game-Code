@@ -1421,48 +1421,26 @@ namespace TraceMeleeConsole
 	// two swings. Short-circuiting any of them would test a path the game does not use.
 	//
 	// ===========================================================================================
-	// AS MEASURED — READ THIS BEFORE BELIEVING THE VERDICT LINE
+	// AS MEASURED — WHY THE RED ARM NEVER WENT RED, AND WHAT FIXED IT
 	//
-	// This harness has NOT yet produced a red-then-green proof, and it says so itself rather than
-	// reporting PASS. Across four staged runs:
+	// For every run up to the fix below this harness reported "RED ARM: DID NOT REPRODUCE" and a
+	// verdict of NOT PROVEN: with the rule disarmed, the victim in reach, alive, holding the Core and
+	// (as sampled) with his shield suppressed, no blade landed. The `arm=N diagnosis:` line ruled out
+	// the cvar and the staging distance; a re-run of the blade's hitscan from the held pose FOUND the
+	// victim, which is what finally pointed away from geometry and at time.
 	//
-	//   GREEN arm, case B: FULLY STAGED and clean, repeatedly. shieldDownAtPress=1,
-	//     heldToResolve=1, the victim held as the carrier across the whole flight of the blade,
-	//     bladesOntoCarrier=0, health moved 0. That is a real runtime observation of the rule.
+	// THE CAUSE WAS THE PASS WINDOW CLOSING INSIDE THE FRAME. Nothing holds the pass button in this game
+	// any more (the hover-pass latch has no writer; see ATraceCore::RequestPassInput), so on the Core's
+	// own tick ServerTickPass cancelled the forced window as "released" — the log carried a "pass
+	// cancelled (released)" line on every frame of the arm. The blade resolves in the attacker's weapon
+	// tick; whenever that ran after the Core's, the shield was back up, ResolveHitscan skipped the
+	// carrier as a candidate, and the melee rule under test was never reached. It hid because the
+	// shield was sampled from this ticker straight after re-forcing it, so it always read suppressed.
 	//
-	//   RED arm, case B: STAGES CLEANLY AND STILL LANDS NOTHING. With the rule disabled the blade
-	//     does not reach the carrier at all. Re-measured over 7 runs during the spec v12 pass: 0 out
-	//     of 7 reproduced. The `arm=N diagnosis:` line was added then, and it narrows the cause a
-	//     long way past the guesses this comment used to carry:
-	//
-	//         arm=0 diagnosis: Trace.Knife.CarrierImmune=0 (0 = rule disarmed) |
-	//                          attacker->victim 108uu vs reach 180uu |
-	//                          victim still holder=1 suppressed=1 alive=1
-	//
-	//     So at the moment of the swing the rule really was disarmed, the victim really was in
-	//     reach, alive, still holding the Core, and its shield really was suppressed — and no blade
-	//     landed. THREE CANDIDATES ARE THEREFORE DEAD:
-	//       * "the cvar did not stick" — it reads 0, measured, not assumed;
-	//       * "the staging went stale" — every staging predicate is 1 at the report;
-	//       * "ServerSwing's origin plausibility check rejected the teleported attacker" — the
-	//         CLIENT-SIDE predicted resolve in UTraceWeaponComponent::TickSwing also finds nothing,
-	//         and that path never goes near ServerSwing's validation.
-	//
-	//     WHAT IS LEFT is upstream of this file: the sample is being rejected inside
-	//     UTraceLagCompensationComponent::ResolveHitscan, or by world geometry between the two
-	//     pawns. Note ResolveHitscan's own carrier clause is `IsCoreHolder(Target) &&
-	//     !IsShieldSuppressedFor(Target)`, which should NOT skip a suppressed holder — so either
-	//     that predicate is not seeing the suppression the harness sees, or something solid is now
-	//     standing between a carrier and anyone behind them. Both live outside the melee slice.
-	//
-	//     THE KNIFE ITSELF IS HEALTHY, and that control was run rather than assumed: in the same
-	//     matches, bots landed ordinary front hits (30) and a genuine BACKSTAB (100) on non-carrier
-	//     targets under the new 60-degree cone. The failure is specific to swinging at a CARRIER.
-	//
-	//     PRACTICAL CONSEQUENCE, and it is the reassuring direction: the carrier is currently
-	//     protected TWICE — once upstream and once by the rule below. Nothing can reach it. But a
-	//     redundant guard is exactly what makes this red arm unfalsifiable, so the rule below is
-	//     resting on a static reading rather than on a demonstration, and that is the thing to fix.
+	// THE FIX (both halves are needed): ATraceCore::DebugForcePassWindow now holds the window through
+	// ServerTickPass for DebugPassHoldSeconds after each call, and the shield is sampled BEFORE the
+	// re-force, as the last world tick left it, for as long as case B's blade is in the air. First run
+	// after: "RED ARM: REPRODUCED ... bladesOntoCarrier=2 [health moved 100]", green clean, PROVEN.
 	//
 	//   A TRAP THIS HARNESS FELL INTO AND NOW GUARDS AGAINST: the first version judged on the
 	//     victim's HEALTH and reported the rule broken on a 100-point drop that was an ordinary
@@ -1470,12 +1448,8 @@ namespace TraceMeleeConsole
 	//     many writers. GetCarrierKnifeHitCount() has one, at the line where the rule is decided,
 	//     and it is what the verdict now reads.
 	//
-	// So: the carrier's melee immunity is verified STATICALLY (ResolveSwing's branch is
-	// unambiguous) and its OBSERVABLE behaviour is verified at runtime — across every run of this
-	// harness to date, on both arms, GetCarrierKnifeHitCount() has finished at ZERO — but the
-	// discipline this project runs on says an arm that never went red leaves the claim a hypothesis.
-	// Fix the red arm before calling it proven, and fix it by finding the upstream rejection above
-	// rather than by loosening the staging, which is already correct.
+	// A case the match knocked over (a bot carrier throwing the Core between the press and the resolve,
+	// the victim shot) restarts the arm instead of concluding; see RetriesLeft.
 	// ===========================================================================================
 	//
 	// BOTH ARMS RUN IN ONE INVOCATION, RED FIRST, and that is not a convenience. A harness that has
@@ -1543,6 +1517,17 @@ namespace TraceMeleeConsole
 		 * Put back on every exit; see the wrapper in the command below.
 		 */
 		TraceFixtureCore::FCoreHolding CoreBefore;
+
+		/** Back to acquiring, for a restart of the current arm or the start of the next one. */
+		void ResetArm(double WorldNowSeconds)
+		{
+			Phase = -1;
+			AcquireDeadline = WorldNowSeconds + 60.0;
+			bSwungA = bSwungB = false;
+			bShieldUpAtA = bShieldDownAtB = false;
+			bShieldHeldThroughB = true;
+			CaseACarrierHits = CaseBCarrierHits = 0;
+		}
 	};
 
 	/**
@@ -1755,6 +1740,28 @@ namespace TraceMeleeConsole
 				//      reached, because by then there was no carrier to be immune.
 				// Pinning the Core back on every tick closes both, and the pass window is re-forced
 				// on top of a holder who is guaranteed to still be the holder.
+				//
+				// 3. THE WINDOW HAS TO OUTLIVE THE CORE'S OWN TICK, and for a long time it did not. Nothing
+				//    holds the pass button in this game any more, so ServerTickPass cancelled the forced
+				//    window as "released" on every frame, and the blade resolves in the attacker's WEAPON
+				//    tick: whenever that ran after the Core's, it met a carrier whose shield was back up,
+				//    ResolveHitscan skipped him, and nothing landed. That was the whole of "RED ARM: DID
+				//    NOT REPRODUCE", every run. It hid because the shield was sampled HERE, straight
+				//    after this ticker re-forced it, so it always read suppressed. DebugForcePassWindow
+				//    now holds the window through ServerTickPass, and the shield is sampled BEFORE the
+				//    re-force, i.e. as the last world tick left it, for as long as the blade is in the air.
+				UTraceWeaponComponent* AttackerWeapon = TickAttacker->FindComponentByClass<UTraceWeaponComponent>();
+				const bool bCaseBBladeInFlight =
+					State->Phase == 3 && AttackerWeapon != nullptr && AttackerWeapon->IsSwingResolvePending();
+				if (bCaseBBladeInFlight)
+				{
+					// Sampled continuously, not once. "The shield was down when I pressed" is not the
+					// precondition — "the shield was down for the whole flight of the blade" is, and
+					// only the second one makes case B a test of anything.
+					State->bShieldHeldThroughB =
+						State->bShieldHeldThroughB && ATraceCore::IsShieldSuppressedFor(TickVictim);
+				}
+
 				if (State->Phase >= 0)
 				{
 					if (ATraceCore* PinCore = ATraceCore::Get(TickWorld))
@@ -1765,21 +1772,13 @@ namespace TraceMeleeConsole
 							PinCore->TryPickup(TickVictim);
 						}
 
-						// Only from the press onwards: case A is the shield-UP case and forcing a
-						// pass during it would destroy the very thing that case is named for.
-						if (State->Phase >= 2)
+						// From case B's wait to its resolve: case A is the shield-UP case and forcing a
+						// pass during it would destroy the very thing that case is named for, and once
+						// case B's blade has landed a forced window would only drop somebody else's shield.
+						if (State->Phase == 2 || bCaseBBladeInFlight)
 						{
 							PinCore->DebugForcePassWindow();
 						}
-					}
-
-					if (State->Phase >= 2)
-					{
-						// Sampled continuously, not once. "The shield was down when I pressed" is not
-						// the precondition — "the shield was down for the whole flight of the blade"
-						// is, and only the second one makes case B a test of anything.
-						State->bShieldHeldThroughB =
-							State->bShieldHeldThroughB && ATraceCore::IsShieldSuppressedFor(TickVictim);
 					}
 				}
 
@@ -1824,12 +1823,7 @@ namespace TraceMeleeConsole
 							TickAttacker->IsAlive() ? 1 : 0, TickAttacker->IsCarrier() ? 1 : 0,
 							State->RetriesLeft);
 
-						State->Phase = -1;
-						State->AcquireDeadline = TickWorld->GetTimeSeconds() + 60.0;
-						State->bSwungA = State->bSwungB = false;
-						State->bShieldUpAtA = State->bShieldDownAtB = false;
-						State->bShieldHeldThroughB = true;
-						State->CaseACarrierHits = State->CaseBCarrierHits = 0;
+						State->ResetArm(TickWorld->GetTimeSeconds());
 						return true;
 					}
 				}
@@ -1980,6 +1974,22 @@ namespace TraceMeleeConsole
 							(DiagVictim != nullptr && DiagVictim->IsAlive()) ? 1 : 0);
 					}
 
+					// A CASE THAT WAS NOT STAGED IS A RESTART, NOT A RESULT. The match does not stop for
+					// the harness: a bot carrier can throw the Core between the press and the resolve, or
+					// the victim can be shot, and then "no blade landed" says nothing about the rule. The
+					// red arm needs case B staged; the green arm needs both. Out of restarts, the verdict
+					// below reports the case INVALID (not staged) rather than a pass or a failure.
+					const bool bArmStaged = bValidB && (State->Arm == 0 || bValidA);
+					if (!bArmStaged && State->RetriesLeft-- > 0)
+					{
+						UE_LOG(LogTraceGame, Display,
+							TEXT("[KNIFECARRIER] arm=%d restarting: the swings went in but the scenario was not held "
+							     "(A staged=%d, B staged=%d). %d retries left."),
+							State->Arm, bValidA ? 1 : 0, bValidB ? 1 : 0, State->RetriesLeft);
+						State->ResetArm(TickWorld->GetTimeSeconds());
+						return true;
+					}
+
 					if (State->Arm == 0)
 					{
 						// RED. The expectation is INVERTED: the rule is gone, so case B must resolve
@@ -2000,12 +2010,7 @@ namespace TraceMeleeConsole
 						// green arm, which is the failure this whole guard exists to prevent.
 						CVarKnifeCarrierImmune->Set(1, ECVF_SetByConsole);
 						State->Arm = 1;
-						State->Phase = -1;
-						State->AcquireDeadline = TickWorld->GetTimeSeconds() + 60.0;
-						State->bSwungA = State->bSwungB = false;
-						State->bShieldUpAtA = State->bShieldDownAtB = false;
-						State->bShieldHeldThroughB = true;
-						State->CaseACarrierHits = State->CaseBCarrierHits = 0;
+						State->ResetArm(TickWorld->GetTimeSeconds());
 						State->RetriesLeft = 6;   // a fresh budget: the arms are independent attempts
 						return true;
 					}
