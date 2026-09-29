@@ -11196,7 +11196,34 @@ namespace TraceHUDResultsVerify
 		ETraceMatchEndReason Reason = ETraceMatchEndReason::Clock;
 		/** The one press that must work did, exactly once. */
 		bool bCompleted = false;
+
+		/**
+		 * Set when a frame hitch moved an arm so that it no longer tests what it names: the run ends
+		 * INCONCLUSIVE with this reason instead of blaming the screen. See Tick.
+		 */
+		FString InconclusiveReason;
+
+		/** When the last press meant to land INSIDE the grace went in (elapsed s), until the next tick. */
+		double InsideGracePressAt = -1.0;
+		int32 InsideGracePressStage = -1;
+
+		/** When the final press went in, so its deadline follows it rather than the clock. */
+		double FinalPressAt = -1.0;
+
+		/**
+		 * TEST HOOK (`hitch=before` / `hitch=after`): a 1.2 s stall of the game thread on the ENTER arm,
+		 * before or after it goes in — the frame hitch that once sent it in at 1.49 s. 0 none, 1 before,
+		 * 2 after.
+		 */
+		int32 HitchMode = 0;
+		bool bHitchDone = false;
 	};
+
+	/** How late an arm meant to land inside the grace may go in before it no longer tests its slot. */
+	constexpr double ResultsArmLateSeconds = 0.10;
+
+	/** The simulated hitch's length: long enough to carry the 0.35 s ENTER past the 1.0 s grace. */
+	constexpr float ResultsHitchSeconds = 1.2f;
 
 	static void Report(FRun& Run, const TCHAR* Claim, bool bPass, const FString& Detail)
 	{
@@ -11245,7 +11272,14 @@ namespace TraceHUDResultsVerify
 	static void Finish(FRun& Run, bool bCompleted)
 	{
 		RestorePadSetting(Run);
-		if (Run.Failures == 0 && bCompleted)
+		if (Run.Failures == 0 && !Run.InconclusiveReason.IsEmpty())
+		{
+			// A hitch moved an arm, not the screen: nothing it did afterwards is evidence either way.
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[ResultsVerify] ===== INCONCLUSIVE after %d check(s): %s — VERDICT: INCONCLUSIVE (rerun on a quieter machine) ====="),
+				Run.Passes, *Run.InconclusiveReason);
+		}
+		else if (Run.Failures == 0 && bCompleted)
 		{
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[ResultsVerify] ===== PASS (%d checks) — VERDICT: a jump at the whistle cannot skip the results ====="),
@@ -11274,6 +11308,15 @@ namespace TraceHUDResultsVerify
 	/** One tick. Returns false when the run is over. */
 	static bool Tick(FRun& Run)
 	{
+		// TEST HOOK: the stall BEFORE the ENTER arm, on the tick it falls due (see FRun::HitchMode).
+		if (Run.HitchMode == 1 && !Run.bHitchDone && Run.Stage == 1 && (FPlatformTime::Seconds() - Run.WhistleReal) >= 0.35)
+		{
+			Run.bHitchDone = true;
+			UE_LOG(LogTraceGame, Display, TEXT("[ResultsVerify] test hook: stalling the game thread %.1f s before the ENTER arm."),
+				ResultsHitchSeconds);
+			FPlatformProcess::Sleep(ResultsHitchSeconds);
+		}
+
 		const double Elapsed = FPlatformTime::Seconds() - Run.WhistleReal;
 		const FKey PadA = EKeys::Gamepad_FaceButton_Bottom;
 
@@ -11287,21 +11330,76 @@ namespace TraceHUDResultsVerify
 			TEXT("A released at 1.80 s"), TEXT("A with CONTROLLER INPUT off"), TEXT("A with CONTROLLER INPUT off"),
 			TEXT("A with CONTROLLER INPUT off"), TEXT("the final press"), TEXT("the final press") };
 
+		// A HITCH IS NOT THE SCREEN'S FAULT (RV8). The stages run on the first tick at or after their
+		// slot, so a stalled frame can send an arm late, or hold the frame that reads it; a press meant
+		// to land inside the grace that the screen only reads after it is a legal CONTINUE, and the run
+		// used to report that as the screen failing. So, before blaming the screen:
+		//   * the frame after an inside-grace press must still be inside the grace (the screen samples
+		//     keys once a frame, so it read the press no later than this tick), and
+		//   * an inside-grace press may go in at most ResultsArmLateSeconds after its slot.
+		// Either one missed ends the run INCONCLUSIVE and names the arm. Measured against the whistle,
+		// which is conservative: the grace itself only starts once the screen has faded fully in.
+		if (Run.InsideGracePressAt >= 0.0 && Elapsed >= TraceHUDResultsInput::ContinueGraceSeconds)
+		{
+			Run.InconclusiveReason = FString::Printf(
+				TEXT("the frame after '%s' (sent at %.2f s) came at %.2f s, past the grace's end at %.2f s, so the screen "
+				     "may only have read the press after it — a frame hitch, not the screen"),
+				StageArms[Run.InsideGracePressStage + 1], Run.InsideGracePressAt, Elapsed, TraceHUDResultsInput::ContinueGraceSeconds);
+			return false;
+		}
+		Run.InsideGracePressAt = -1.0;
+
 		// Anything that continued before the final press is a failure, whichever tick notices it.
 		if (Run.Stage < 13 && !NothingContinuedYet(Run, StageArms[FMath::Clamp(Run.Stage, 0, 15)]))
 		{
 			return false;
 		}
 
-		if (Run.Stage >= UE_ARRAY_COUNT(StageTimes) || Elapsed < StageTimes[Run.Stage])
+		// The last stage is the final press's deadline, and it follows the press: a final press that a
+		// hitch sent late still gets its 1.9 s.
+		const double StageDue = (Run.Stage == 15 && Run.FinalPressAt >= 0.0)
+			? FMath::Max(StageTimes[15], Run.FinalPressAt + 1.9)
+			: ((Run.Stage < UE_ARRAY_COUNT(StageTimes)) ? StageTimes[Run.Stage] : 0.0);
+		if (Run.Stage >= UE_ARRAY_COUNT(StageTimes) || Elapsed < StageDue)
 		{
 			return true;
+		}
+
+		// The three presses that must land inside the grace: ENTER at 0.35, A at 0.60, A at 0.90.
+		// (StageArms[i] names the arm stage i - 1 sent, which is what the continue check reports.)
+		const bool bInsideGracePress = (Run.Stage == 1 || Run.Stage == 3 || Run.Stage == 5);
+		if (bInsideGracePress && (Elapsed - StageTimes[Run.Stage]) > ResultsArmLateSeconds)
+		{
+			Run.InconclusiveReason = FString::Printf(
+				TEXT("'%s' was due at %.2f s and could only go in at %.2f s — a frame hitch sent it late, so it no "
+				     "longer tests its slot in the grace"),
+				StageArms[Run.Stage + 1], StageTimes[Run.Stage], Elapsed);
+			return false;
+		}
+		if (bInsideGracePress)
+		{
+			Run.InsideGracePressAt = Elapsed;
+			Run.InsideGracePressStage = Run.Stage;
+		}
+		if (Run.Stage == 13)
+		{
+			Run.FinalPressAt = Elapsed;
 		}
 
 		switch (Run.Stage++)
 		{
 		case 0:  Inject(Run, PadA, false); break;
-		case 1:  Inject(Run, EKeys::Enter, true); break;
+		case 1:
+			Inject(Run, EKeys::Enter, true);
+			if (Run.HitchMode == 2 && !Run.bHitchDone)
+			{
+				// TEST HOOK: the stall AFTER the press went in, so the screen reads it after the grace.
+				Run.bHitchDone = true;
+				UE_LOG(LogTraceGame, Display, TEXT("[ResultsVerify] test hook: stalling the game thread %.1f s after the ENTER arm."),
+					ResultsHitchSeconds);
+				FPlatformProcess::Sleep(ResultsHitchSeconds);
+			}
+			break;
 		case 2:  Inject(Run, EKeys::Enter, false); break;
 		case 3:  Inject(Run, PadA, true); break;
 		case 4:  Inject(Run, PadA, false); break;
@@ -11420,6 +11518,14 @@ namespace TraceHUDResultsVerify
 			{
 				Run->Reason = ETraceMatchEndReason::Mercy;
 			}
+			if (Arg.Equals(TEXT("hitch=before"), ESearchCase::IgnoreCase))
+			{
+				Run->HitchMode = 1;
+			}
+			if (Arg.Equals(TEXT("hitch=after"), ESearchCase::IgnoreCase))
+			{
+				Run->HitchMode = 2;
+			}
 		}
 
 		UE_LOG(LogTraceGame, Display,
@@ -11473,7 +11579,9 @@ namespace TraceHUDResultsVerify
 		TEXT("inside the results screen's grace, no held A and no A with CONTROLLER INPUT off continues, and that a ")
 		TEXT("fresh A (or ENTER with key=enter) afterwards does, that the headline is in the kit's heading face, and ")
 		TEXT("that the final score sits in the kit's value box as the half-time page's does. ")
-		TEXT("`draw` ends it level, `mercy` on the mercy rule (BLUE on the clock otherwise). Run on the Arena after lock-in."),
+		TEXT("`draw` ends it level, `mercy` on the mercy rule (BLUE on the clock otherwise). A frame hitch that moves an ")
+		TEXT("inside-grace arm past the grace ends it INCONCLUSIVE; `hitch=before` / `hitch=after` stage one on purpose. ")
+		TEXT("Run on the Arena after lock-in."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
 }
 #endif // !UE_BUILD_SHIPPING
