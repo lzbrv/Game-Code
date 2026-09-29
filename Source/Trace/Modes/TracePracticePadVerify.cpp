@@ -18,7 +18,10 @@
 // from the platform itself, where a player walking up to it stands.
 //
 //   1. the pad's label is drawn where the player is looking, whole (not faded), on an OPAQUE plate —
-//      or, where world geometry is in the way (the harness traces that itself), not drawn through it;
+//      or, where world geometry is in the way (the harness traces that itself), not drawn through it.
+//      The look is aimed only once the player's eye has stopped moving after the teleport (a pawn still
+//      settling onto the floor moves the anchor up the screen after the aim), and the line says how far
+//      the eye moved between the aim and the read, and where the anchor projects;
 //   2. every label the player can see reads LEFT TO RIGHT from there. A world-space text render on a
 //      pad is projected, both ends, through the player's own view: if its end lands left of its start,
 //      it is mirrored. (This is the check the old pads fail. The HUD's plates read left to right by
@@ -75,6 +78,14 @@ namespace TracePracticePadVerify
 		TArray<FView> Views;
 		int32 ViewIndex = 0;
 		TWeakObjectPtr<ATracePracticePad> InfinitePad;
+
+		/** Where the eye was, and where it was turned, when the current look was aimed. */
+		FVector AimEye = FVector::ZeroVector;
+		FRotator AimRotation = FRotator::ZeroRotator;
+
+		/** Before aiming: the eye last seen, and since when it has stayed there (-1: not yet). */
+		FVector SettleEye = FVector::ZeroVector;
+		double SettledSince = -1.0;
 	};
 
 	static void Report(FRun& Run, bool bPass, const FString& Claim, const FString& Detail)
@@ -314,11 +325,33 @@ namespace TracePracticePadVerify
 			}
 			if (SinceStep < 0.3)
 			{
+				Run.SettledSince = -1.0;
 				return true;
 			}
+
+			// AIM ONLY ONCE THE EYE HAS STOPPED MOVING. The teleport puts the pawn a little above the floor,
+			// and beside the rack it was still coming down when this aimed: the eye then dropped 36 uu before
+			// the read, the anchor rose 85 px up the screen, and the check failed on a plate the HUD had
+			// centred on its anchor exactly. So: the same eye (within half a unit) for 0.2 s, or 4 s at most.
+			FVector CurrentEye = FVector::ZeroVector;
+			FRotator CurrentTurn = FRotator::ZeroRotator;
+			LocalPC->GetPlayerViewPoint(CurrentEye, CurrentTurn);
+			const double SettleClock = FPlatformTime::Seconds();
+			if (Run.SettledSince < 0.0 || FVector::Dist(CurrentEye, Run.SettleEye) > 0.5)
+			{
+				Run.SettleEye = CurrentEye;
+				Run.SettledSince = SettleClock;
+			}
+			if ((SettleClock - Run.SettledSince) < 0.2 && SinceStep < 4.0)
+			{
+				return true;
+			}
+
 			if (const ATracePracticePad* const Pad = View.Pad.Get())
 			{
 				AimAt(*LocalPC, Pad->GetLabelAnchor());
+				LocalPC->GetPlayerViewPoint(Run.AimEye, Run.AimRotation);
+				Run.AimRotation = LocalPC->GetControlRotation();
 			}
 			GoTo(Run, 2);
 			return true;
@@ -361,12 +394,24 @@ namespace TracePracticePadVerify
 					return true;
 				}
 
+				// What the view did between the aim and this read: a look that has drifted is the harness's
+				// problem, not the HUD's, and the line says which.
+				FVector ReadEye = FVector::ZeroVector;
+				FRotator ReadRotation = FRotator::ZeroRotator;
+				LocalPC->GetPlayerViewPoint(ReadEye, ReadRotation);
+				FVector2D AnchorOnScreen = FVector2D(-1.f, -1.f);
+				UGameplayStatics::ProjectWorldToScreen(LocalPC, Pad->GetLabelAnchor(), AnchorOnScreen);
+				const FString ViewNote = FString::Printf(
+					TEXT("; eye moved (%.0f,%.0f,%.0f) uu since the aim, view pitch %.1f (aimed %.1f), anchor projects to (%.0f,%.0f)"),
+					ReadEye.X - Run.AimEye.X, ReadEye.Y - Run.AimEye.Y, ReadEye.Z - Run.AimEye.Z,
+					FRotator::NormalizeAxis(ReadRotation.Pitch), FRotator::NormalizeAxis(Run.AimRotation.Pitch), AnchorOnScreen.X, AnchorOnScreen.Y);
+
 				Report(Run, Drawn != nullptr && Drawn->Rect.IsInside(Aim) && Drawn->Alpha >= 0.9f,
 					FString::Printf(TEXT("the %s pad's label is drawn where a player %s is looking"), RoleName(Role), From),
 					(Drawn != nullptr)
-						? FString::Printf(TEXT("\"%s\" plate (%.0f,%.0f)-(%.0f,%.0f), aim (%.0f,%.0f), alpha %.2f"), *Drawn->Text,
-							Drawn->Rect.Min.X, Drawn->Rect.Min.Y, Drawn->Rect.Max.X, Drawn->Rect.Max.Y, Aim.X, Aim.Y, Drawn->Alpha)
-						: FString(TEXT("the HUD drew no label for it")));
+						? FString::Printf(TEXT("\"%s\" plate (%.0f,%.0f)-(%.0f,%.0f), aim (%.0f,%.0f), alpha %.2f%s"), *Drawn->Text,
+							Drawn->Rect.Min.X, Drawn->Rect.Min.Y, Drawn->Rect.Max.X, Drawn->Rect.Max.Y, Aim.X, Aim.Y, Drawn->Alpha, *ViewNote)
+						: FString(TEXT("the HUD drew no label for it")) + ViewNote);
 
 				// An OPAQUE plate: at the HUD's panel alpha the range's bright pillar stripes ran through it
 				// and behind the words. Only the label's own distance fade may thin it.
