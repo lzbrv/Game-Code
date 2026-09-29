@@ -98,6 +98,17 @@ namespace TraceAbility
 }
 
 /**
+ * Why the server refused a LOCK IN — UTraceAbilityComponent::ClientLockInRefused's byte, which the
+ * loadout page turns into a terse line.
+ */
+enum class ETraceLockInRefusal : uint8
+{
+	None = 0,
+	Locked,    // outside the select window and the half-time break: the loadout lock
+	Illegal,   // an ability in a slot it does not belong to, or one nothing implements
+};
+
+/**
  * ===================================================================================================
  * THE INTEGRATION SEAM — the cross-file calls that turn written abilities into played ones.
  * ===================================================================================================
@@ -968,6 +979,21 @@ public:
 	UFUNCTION(Server, Reliable, WithValidation)
 	void ServerRequestSetLoadout(FTraceLoadout NewLoadout);
 
+	/**
+	 * Server -> owning client. The LOCK IN just sent (ServerRequestSetLoadout) was REFUSED, and why
+	 * (an ETraceLockInRefusal as a byte). An accepted one needs no reply: the server closes the select
+	 * window, which replicates and closes the page. A refusal used to return silently, and the page
+	 * went on saying LOCKED IN over a loadout the server never took.
+	 */
+	UFUNCTION(Client, Reliable)
+	void ClientLockInRefused(uint8 Refusal);
+
+	/** Client side: how many LOCK IN refusals have arrived. The loadout page compares it across a send. */
+	int32 GetLockInRefusalCount() const { return LockInRefusalCount; }
+
+	/** Client side: the most recent refusal's reason (None before the first). */
+	ETraceLockInRefusal GetLastLockInRefusal() const { return LastLockInRefusal; }
+
 	/** Client -> server. The validated half of TryActivate(). */
 	UFUNCTION(Server, Reliable)
 	void ServerTryActivate();
@@ -1175,4 +1201,8 @@ private:
 
 	/** Character the local ability set was built for, so OnRep can tell a real change from a resend. */
 	ETraceCharacterId BuiltForCharacter = ETraceCharacterId::None;
+
+	/** ClientLockInRefused's count and last reason. Not replicated: the RPC is the reply. */
+	int32 LockInRefusalCount = 0;
+	ETraceLockInRefusal LastLockInRefusal = ETraceLockInRefusal::None;
 };

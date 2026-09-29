@@ -86,12 +86,13 @@ namespace TraceLoadoutSelect
 // =================================================================================================
 // THE LAYOUT — every number a 1080p design pixel, multiplied by UIScale.
 //
-//    30  title (centred, like team select) ............................ countdown value box
-//   100  Q  [ MOVEMENT ]  [ PASSIVE ]  [ ACTIVATED ]  E        tabs, a key chip at each end
+//    30  [0 - 0] SIDES SWITCHED (half time) ... title (centred) ......... countdown value box
+//   100  Q LB  [ MOVEMENT ]  [ PASSIVE ]  [ ACTIVATED ]  E RB   tabs, key chips at each end
 //   198  the 5 x 2 grid of cards
-//   888  SAVED [1 RIPPLE] [2] ...                      [F] [ LOCK IN ]
+//   888  SAVED [1 RIPPLE] [2] ...                   [F] [X] [ LOCK IN ]
 //   950  the message line
-//   982  the keyboard legend, and 1022 the pad legend once a pad has been seen
+//   982  the keyboard legend, and 1022 the pad legend (a pad's chips and line once one has been
+//        seen and CONTROLLER INPUT is on)
 // =================================================================================================
 namespace TraceLoadoutLayout
 {
@@ -136,13 +137,13 @@ namespace TraceLoadoutLayout
 	constexpr float SizeName    = 26.f;
 
 	/**
-	 * The descriptions, largest first. The size is solved ONCE PER TAB as the largest that fits every
-	 * card on it — the activated abilities are paragraphs (ZIP is two hundred characters), and at one
-	 * fixed size they were cut off mid-sentence at the card's foot. One size per grid, so the cards
-	 * still read as a set; a card that cannot fit even at the floor shrinks on its own.
+	 * The descriptions, largest first. The size is solved ONCE FOR THE WHOLE SCREEN as the largest
+	 * that fits every card on every tab (SolveTypeSizes) — the activated abilities are paragraphs (ZIP
+	 * is two hundred characters), and at one fixed size they were cut off mid-sentence at the card's
+	 * foot. It used to be solved per tab, which drew the same card at three sizes on one screen. Never
+	 * below SizeBodyLast; only a card that cannot fit even there would shrink on its own.
 	 */
 	constexpr float SizeBody    = 19.f;
-	constexpr float SizeBodyMin = 14.f;
 	constexpr float SizeBodyLast = 10.f;
 	constexpr float BodyLeading = 3.f;
 	constexpr float SizeMessage = 18.f;
@@ -291,6 +292,26 @@ namespace TraceLoadoutSelectFile
 		}
 	}
 
+	/**
+	 * The size one card's description draws at, wrapped into @p OutLines: the screen's solved
+	 * @p ScreenSize, or smaller (never below SizeBodyLast) only if even that does not fit @p Room.
+	 * DrawCard and the harness's DebugTypeSizes both come through here.
+	 */
+	float CardBodySize(const FString& Body, float TextW, float ScreenSize, float Room, ETraceTextWeight Weight,
+		float S, TArray<FString>& OutLines)
+	{
+		float Size = ScreenSize;
+		for (;;)
+		{
+			WrapInto(Body, TextW, TraceText::FStyle(Size, FLinearColor::White, Weight), OutLines);
+			if (Size <= TraceLoadoutLayout::SizeBodyLast * S || BlockHeight(OutLines.Num(), Size, S) <= Room)
+			{
+				return Size;
+			}
+			Size = FMath::Max(TraceLoadoutLayout::SizeBodyLast * S, Size - 0.5f * S);
+		}
+	}
+
 	/** A pulse in alpha, for the last five seconds of a countdown. */
 	FLinearColor Urgent(float NowSeconds)
 	{
@@ -321,7 +342,11 @@ namespace TraceLoadoutSelectFile
 		               || (bLibrary && IsDown(EKeys::Escape));
 		Keys.bTabLeft  = IsDown(EKeys::Q) || Pad(EKeys::Gamepad_LeftShoulder);
 		Keys.bTabRight = IsDown(EKeys::E) || Pad(EKeys::Gamepad_RightShoulder);
-		Keys.bShift    = IsDown(EKeys::LeftShift) || IsDown(EKeys::RightShift);
+
+		// THE SAVED LOADOUTS ON A PAD, on the two buttons nothing else on this page reads. The pad has
+		// no number keys, so Y walks the slots (load the next); LT is the pad's SHIFT (save instead).
+		Keys.bShift    = IsDown(EKeys::LeftShift) || IsDown(EKeys::RightShift) || Pad(EKeys::Gamepad_LeftTrigger);
+		Keys.bSavedNext = Pad(EKeys::Gamepad_FaceButton_Top);
 
 		static const FKey NumberKeys[5] = { EKeys::One, EKeys::Two, EKeys::Three, EKeys::Four, EKeys::Five };
 		for (int32 Index = 0; Index < 5; ++Index)
@@ -342,6 +367,160 @@ namespace TraceLoadoutSelectFile
 	{
 		return !Loadout.IsEmpty() && UTraceAbilityComponent::IsLoadoutLegal(Loadout);
 	}
+
+	/**
+	 * Does the page name PAD buttons as well as keys? Once a pad has been seen on this machine, and
+	 * only while CONTROLLER INPUT is on: with it off the page ignores the pad (ReadKeys), and a chip
+	 * or a legend line naming a button that does nothing would be false. The title, the options
+	 * overlay and the results screen ask the same two questions.
+	 */
+	bool PadHintsShown(const APlayerController* PC)
+	{
+		return TracePadMenu::IsEnabled() && TracePadMenu::HasSeenPad(PC);
+	}
+
+	/** The controls that carry key chips on the page itself (the legend is separate). */
+	enum class EChip : uint8
+	{
+		TabLeft,
+		TabRight,
+		Confirm,   // LOCK IN, or SAVE in the library
+		Back,      // the library's BACK plate
+	};
+
+	/**
+	 * The chips beside @p Which: the KEYBOARD key always, and the PAD button after it while pad hints
+	 * show — both, the way every other screen's legend names both. They used to swap to the pad's
+	 * alone once any pad input had been seen, so a keyboard player read LB / RB / X.
+	 */
+	void ChipKeys(EChip Which, bool bLibrary, bool bPadHints, TArray<FString>& OutKeys)
+	{
+		OutKeys.Reset();
+		switch (Which)
+		{
+		case EChip::TabLeft:
+			OutKeys.Add(TRACE_TEXT("LOADOUT.KEY_TAB_LEFT", "Q"));
+			if (bPadHints) { OutKeys.Add(TRACE_TEXT("LOADOUT.PAD_KEY_TAB_LEFT", "LB")); }
+			break;
+		case EChip::TabRight:
+			OutKeys.Add(TRACE_TEXT("LOADOUT.KEY_TAB_RIGHT", "E"));
+			if (bPadHints) { OutKeys.Add(TRACE_TEXT("LOADOUT.PAD_KEY_TAB_RIGHT", "RB")); }
+			break;
+		case EChip::Confirm:
+			OutKeys.Add(TRACE_TEXT("LOADOUT.KEY_LOCK_IN", "F"));
+			if (bPadHints) { OutKeys.Add(TRACE_TEXT("LOADOUT.PAD_KEY_LOCK_IN", "X")); }
+			break;
+		case EChip::Back:
+			OutKeys.Add(bLibrary ? TRACE_TEXT("LOADOUT.KEY_BACK", "ESC") : TRACE_TEXT("LOADOUT.KEY_BACK_TAB", "BKSP"));
+			if (bPadHints) { OutKeys.Add(TRACE_TEXT("LOADOUT.PAD_KEY_BACK", "B")); }
+			break;
+		default:
+			break;
+		}
+
+		// An emptied line (Ranen's "KEY =") takes its chip with it.
+		OutKeys.RemoveAll([](const FString& Key) { return Key.IsEmpty(); });
+	}
+
+	/** The gap between two chips of one group. */
+	constexpr float ChipPairGap = 8.f;
+
+	/** How wide DrawChipGroup draws @p Keys at chip height @p ChipH. */
+	float ChipGroupWidth(const TArray<FString>& Keys, float ChipH, float Gap)
+	{
+		float Width = 0.f;
+		for (const FString& Key : Keys)
+		{
+			const float ChipW = TraceMenuKit::KeyChipWidth(Key, ChipH);
+			if (ChipW > 0.f)
+			{
+				Width += (Width > 0.f ? Gap : 0.f) + ChipW;
+			}
+		}
+		return Width;
+	}
+
+	/** @p Keys as chips left to right from @p X. Returns the width drawn. */
+	float DrawChipGroup(AHUD* HUD, float X, float Y, float ChipH, float Gap, const TArray<FString>& Keys,
+		float NowSeconds)
+	{
+		float PenX = X;
+		for (const FString& Key : Keys)
+		{
+			const float ChipW = TraceMenuKit::KeyChipWidth(Key, ChipH);
+			if (ChipW <= 0.f)
+			{
+				continue;
+			}
+			TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, PenX, Y, ChipH, Key, NowSeconds);
+			PenX += ChipW + Gap;
+		}
+		return FMath::Max(0.f, PenX - X - Gap);
+	}
+
+	/**
+	 * THE FOOTER: every key that does something on this page right now, the keyboard's line and — while
+	 * pad hints show — the pad's line under it. LABELS, NOT SENTENCES.
+	 *
+	 * BACK is listed where it does something: always in the library (ESC / B leave), and on the match
+	 * page only on a tab after the first (BACKSPACE / B step back a question, and on the first tab there
+	 * is nowhere to step back to). The pad's Y and LT + Y are the saved loadouts' pad route.
+	 */
+	void BuildLegend(bool bLibrary, int32 InTab, bool bPadHints, TArray<FTraceKitLegendItem>& OutKeyboard,
+		TArray<FTraceKitLegendItem>& OutPad)
+	{
+		const FString LockWord = bLibrary ? TRACE_TEXT("LOADOUT.SAVE_SLOT", "SAVE") : TRACE_TEXT("LOADOUT.LOCK_IN", "LOCK IN");
+		const FString TabWord = TRACE_TEXT("LOADOUT.LEGEND_TAB", "TAB");
+		const FString EquipWord = TRACE_TEXT("LOADOUT.LEGEND_EQUIP", "EQUIP");
+		const FString ChooseWord = TRACE_TEXT("LOADOUT.LEGEND_CHOOSE", "CHOOSE");
+		const FString BackWord = TRACE_TEXT("LOADOUT.BACK", "BACK");
+		const FString LoadWord = TRACE_TEXT("LOADOUT.LEGEND_LOAD", "LOAD");
+		const FString StoreWord = TRACE_TEXT("LOADOUT.LEGEND_STORE", "SAVE");
+		const bool bBack = bLibrary || InTab > 0;
+
+		OutKeyboard.Reset();
+		OutKeyboard.Add({ TRACE_TEXT("LOADOUT.KEY_MOVE", "ARROWS"), ChooseWord });
+		OutKeyboard.Add({ TRACE_TEXT("LOADOUT.KEY_TABS", "Q / E"), TabWord });
+		OutKeyboard.Add({ TRACE_TEXT("LOADOUT.KEY_EQUIP", "ENTER"), EquipWord });
+		OutKeyboard.Add({ TRACE_TEXT("LOADOUT.KEY_LOCK_IN", "F"), LockWord });
+		if (bBack)
+		{
+			OutKeyboard.Add({ bLibrary ? TRACE_TEXT("LOADOUT.KEY_BACK", "ESC") : TRACE_TEXT("LOADOUT.KEY_BACK_TAB", "BKSP"),
+				BackWord });
+		}
+		if (!bLibrary)
+		{
+			OutKeyboard.Add({ TRACE_TEXT("LOADOUT.KEY_LOAD", "1 - 5"), LoadWord });
+			OutKeyboard.Add({ TRACE_TEXT("LOADOUT.KEY_STORE", "SHIFT 1 - 5"), StoreWord });
+		}
+
+		OutPad.Reset();
+		if (!bPadHints)
+		{
+			return;
+		}
+		OutPad.Add({ TRACE_TEXT("LOADOUT.PAD_KEY_MOVE", "D-PAD"), ChooseWord });
+		OutPad.Add({ TRACE_TEXT("LOADOUT.PAD_KEY_TABS", "LB / RB"), TabWord });
+		OutPad.Add({ TRACE_TEXT("LOADOUT.PAD_KEY_EQUIP", "A"), EquipWord });
+		OutPad.Add({ TRACE_TEXT("LOADOUT.PAD_KEY_LOCK_IN", "X"), LockWord });
+		if (bBack)
+		{
+			OutPad.Add({ TRACE_TEXT("LOADOUT.PAD_KEY_BACK", "B"), BackWord });
+		}
+		if (!bLibrary)
+		{
+			OutPad.Add({ TRACE_TEXT("LOADOUT.PAD_KEY_LOAD", "Y"), LoadWord });
+			OutPad.Add({ TRACE_TEXT("LOADOUT.PAD_KEY_STORE", "LT + Y"), StoreWord });
+		}
+	}
+
+	/** Is @p WorldContext's match in its half-time break? False with no Trace game state. */
+	bool InHalfTimeBreak(const UObject* WorldContext)
+	{
+		const UWorld* World = (WorldContext != nullptr) ? WorldContext->GetWorld() : nullptr;
+		const ATraceGameState* TraceGS = (World != nullptr) ? World->GetGameState<ATraceGameState>() : nullptr;
+		return TraceGS != nullptr && TraceGS->IsHalfTimeBreak();
+	}
 }
 
 namespace TraceLoadoutSelect
@@ -360,7 +539,7 @@ namespace TraceLoadoutSelect
 		}
 
 		return OneKey.NavX != 0 || OneKey.NavY != 0 || OneKey.bEquip || OneKey.bLock || OneKey.bBack
-			|| OneKey.bTabLeft || OneKey.bTabRight || OneKey.bShift || bNumberKey
+			|| OneKey.bTabLeft || OneKey.bTabRight || OneKey.bShift || OneKey.bSavedNext || bNumberKey
 			// The pointer (StepPointer), and the pad's D-pad / stick (ReadKeys, through TracePadMenu).
 			|| Key == EKeys::LeftMouseButton
 			|| Key == EKeys::Gamepad_DPad_Up || Key == EKeys::Gamepad_DPad_Down
@@ -431,6 +610,8 @@ namespace TraceLoadoutPressQueue
 		else if (Verb == TEXT("back"))     { Down.bBack = true; }
 		else if (Verb == TEXT("tableft"))  { Down.bTabLeft = true; }
 		else if (Verb == TEXT("tabright")) { Down.bTabRight = true; }
+		else if (Verb == TEXT("y"))        { Down.bSavedNext = true; }
+		else if (Verb == TEXT("lty"))      { Down.bShift = true; Down.bSavedNext = true; }
 		else if (Verb == TEXT("pad"))
 		{
 			if (PC != nullptr)
@@ -462,7 +643,8 @@ namespace TraceLoadoutPressQueue
 		TEXT("Trace.Loadout.Press"),
 		TEXT("Dev only. Trace.Loadout.Press <verb> [verb ...]: queues presses for the open loadout page ")
 		TEXT("(match or library), one per frame pair. Verbs: left right up down equip lock back tableft ")
-		TEXT("tabright 1-5 s1-s5 (shift+n) pad (a real pad tap, so pad captions show) wait=<seconds>."),
+		TEXT("tabright 1-5 s1-s5 (shift+n) y (pad Y) lty (pad LT+Y) pad (a real pad tap, so pad captions ")
+		TEXT("show) wait=<seconds>."),
 		FConsoleCommandWithArgsDelegate::CreateLambda([](const TArray<FString>& Args)
 		{
 			for (const FString& Arg : Args)
@@ -494,6 +676,8 @@ void FTraceLoadoutSelect::OnOpened(ATracePlayerState* LocalState)
 	bStagedDirty = false;
 	bAutoSent = false;
 	bLockHint = false;
+	bLockSent = false;
+	LastSavedSlot = INDEX_NONE;
 	LastMessage.Reset();
 
 	// The frame that opened the page reads nothing...
@@ -547,10 +731,37 @@ void FTraceLoadoutSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerSta
 		AnimNow = (ClockWorld != nullptr) ? static_cast<float>(ClockWorld->GetRealTimeSeconds()) : InNow;
 	}
 
+	// ---- HALF TIME SAYS SO -----------------------------------------------------------------------
+	//
+	// The break opens this page over the match, and the HUD's HALF TIME card is under it, so for the
+	// whole break nothing said it was half time: the page read BUILD YOUR LOADOUT, the same as before
+	// kickoff. It is titled HALF TIME in the break (the HUD card's own line), with the score and
+	// SIDES SWITCHED beside it (DrawHeader). Decided while the page is up and kept through its fade:
+	// the break ends by closing the window, and the page must not fade out on the other title.
 	const bool bWantOpen = WantsOpen(LocalState);
+	if (bWantOpen || PageTitle.IsEmpty())
+	{
+		bHalfTimeHeader = TraceLoadoutSelectFile::InHalfTimeBreak(LocalState);
+		PageTitle = bHalfTimeHeader ? TRACE_TEXT("HUD.BANNER_HALF_TIME", "HALF TIME")
+		                            : TRACE_TEXT("LOADOUT.TITLE", "BUILD YOUR LOADOUT");
+	}
+
 	if (bWantOpen && !bOpen)
 	{
 		OnOpened(LocalState);
+	}
+
+	// THE WINDOW CLOSED WITH A LOCK IN IN FLIGHT: LOCKED IN only if the server now holds what was sent.
+	// A deadline that shut the window under the request (the server's auto-assign) is not a lock in.
+	if (bOpen && !bWantOpen && bLockSent)
+	{
+		bLockSent = false;
+		const UTraceAbilityComponent* Comp = (LocalState != nullptr)
+			? LocalState->FindComponentByClass<UTraceAbilityComponent>() : nullptr;
+		if (Comp != nullptr && Comp->GetLoadout() == SentLoadout)
+		{
+			SetMessage(TRACE_TEXT("LOADOUT.LOCKED_IN", "LOCKED IN"), /*bWarning=*/false);
+		}
 	}
 	bOpen = bWantOpen;
 
@@ -565,10 +776,13 @@ void FTraceLoadoutSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerSta
 		{
 			bPointerOwned = false;
 			TraceMenuKit::FScopedOpacity Fading(PageAlpha);
-			Draw(HUD, PC, LocalState, TRACE_TEXT("LOADOUT.TITLE", "BUILD YOUR LOADOUT"));
+			Draw(HUD, PC, LocalState, PageTitle);
 		}
 		return;
 	}
+
+	// A refusal of a LOCK IN sent on an earlier frame (a real client hears it a round trip later).
+	ReadLockInReply(LocalState);
 
 	// ONE POINTER ON SCREEN. While the pause menu is in front it owns the pointer, and this page —
 	// still drawn underneath so the pick does not look cancelled — must not leave a frozen blade
@@ -608,7 +822,7 @@ void FTraceLoadoutSelect::Tick(AHUD* HUD, APlayerController* PC, ATracePlayerSta
 	}
 
 	TraceMenuKit::FScopedOpacity Fading(PageAlpha);
-	Draw(HUD, PC, LocalState, TRACE_TEXT("LOADOUT.TITLE", "BUILD YOUR LOADOUT"));
+	Draw(HUD, PC, LocalState, PageTitle);
 }
 
 void FTraceLoadoutSelect::SyncStagedFromServer(ATracePlayerState* LocalState)
@@ -695,6 +909,7 @@ void FTraceLoadoutSelect::StepInput(const FTraceLoadoutKeys& Down, ATracePlayerS
 	const bool bBackPressed     = Rose(Down.bBack, Held.bBack) || Down.bEscapePressed;
 	const bool bTabLeftPressed  = Rose(Down.bTabLeft, Held.bTabLeft);
 	const bool bTabRightPressed = Rose(Down.bTabRight, Held.bTabRight);
+	const bool bSavedNextPressed = Rose(Down.bSavedNext, Held.bSavedNext);
 	bool bNumberPressed[5];
 	for (int32 Index = 0; Index < 5; ++Index)
 	{
@@ -720,7 +935,8 @@ void FTraceLoadoutSelect::StepInput(const FTraceLoadoutKeys& Down, ATracePlayerS
 	{
 		bAnyDigit = bAnyDigit || bEach;
 	}
-	if (bTabLeftPressed || bTabRightPressed || bEquipPressed || bBackPressed || bLockPressed || bAnyDigit)
+	if (bTabLeftPressed || bTabRightPressed || bEquipPressed || bBackPressed || bLockPressed || bAnyDigit
+		|| bSavedNextPressed)
 	{
 		bPointerLed = false;
 	}
@@ -756,6 +972,13 @@ void FTraceLoadoutSelect::StepInput(const FTraceLoadoutKeys& Down, ATracePlayerS
 			{
 				Down.bShift ? Store(Index) : Recall(Index);
 			}
+		}
+
+		// ...AND ON A PAD, which has no number keys and could only reach them by pointer: Y loads the
+		// next saved loadout, LT + Y saves (StoreCurrent says where).
+		if (bSavedNextPressed)
+		{
+			Down.bShift ? StoreCurrent() : RecallNext();
 		}
 	}
 
@@ -1098,10 +1321,43 @@ void FTraceLoadoutSelect::Confirm(ATracePlayerState* LocalState)
 		return;
 	}
 
+	// NOT "LOCKED IN" YET. That is the server's answer, and it used to be claimed the moment the
+	// request left: a refusal (the lock, a window the deadline shut mid-send) then left the page up
+	// saying LOCKED IN. SENDING until the window closes on what was sent (Tick says LOCKED IN) or a
+	// refusal arrives (ReadLockInReply says why).
+	RefusalsSeen = Comp->GetLockInRefusalCount();
+	SentLoadout = Staged;
+	bLockSent = true;
 	Comp->ServerRequestSetLoadout(Staged);
-	SetMessage(TRACE_TEXT("LOADOUT.LOCKED_IN", "LOCKED IN"), /*bWarning=*/false);
+	SetMessage(TRACE_TEXT("LOADOUT.SENDING", "SENDING"), /*bWarning=*/false);
 
 	UE_LOG(LogTraceGame, Log, TEXT("[LoadoutScreen] sent %s"), *TraceLoadoutToString(Staged));
+
+	// On a listen server or offline the server has already answered, inside the call above.
+	ReadLockInReply(LocalState);
+}
+
+void FTraceLoadoutSelect::ReadLockInReply(const ATracePlayerState* LocalState)
+{
+	if (!bLockSent || LocalState == nullptr)
+	{
+		return;
+	}
+	const UTraceAbilityComponent* Comp = LocalState->FindComponentByClass<UTraceAbilityComponent>();
+	if (Comp == nullptr || Comp->GetLockInRefusalCount() == RefusalsSeen)
+	{
+		return;
+	}
+
+	// REFUSED. The page stays as it is — open, the picks staged, every key live — and says why in
+	// the words the player can act on: the lock, or a loadout the server will not take.
+	bLockSent = false;
+	RefusalsSeen = Comp->GetLockInRefusalCount();
+	const bool bLocked = (Comp->GetLastLockInRefusal() == ETraceLockInRefusal::Locked);
+	SetMessage(bLocked ? TRACE_TEXT("LOADOUT.REFUSED_LOCKED", "LOADOUT LOCKED")
+	                   : TRACE_TEXT("LOADOUT.CANT_LOCK_IN", "CAN'T LOCK IN THAT LOADOUT"), /*bWarning=*/true);
+	UE_LOG(LogTraceGame, Display, TEXT("[LoadoutScreen] LOCK IN refused (%s); the page stays up."),
+		bLocked ? TEXT("locked") : TEXT("not a legal loadout"));
 }
 
 void FTraceLoadoutSelect::Recall(int32 Index)
@@ -1129,6 +1385,7 @@ void FTraceLoadoutSelect::Recall(int32 Index)
 
 	Staged = Saved;
 	bStagedDirty = true;
+	LastSavedSlot = Index;
 	for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
 	{
 		Highlighted[SlotIndex] = TraceLoadoutSelectFile::CardForAbility(static_cast<ETraceLoadoutSlot>(SlotIndex),
@@ -1139,9 +1396,52 @@ void FTraceLoadoutSelect::Recall(int32 Index)
 		FStringFormatOrderedArguments{ FStringFormatArg(FString::FromInt(Index + 1)) }), /*bWarning=*/false);
 }
 
+void FTraceLoadoutSelect::RecallNext()
+{
+	// In slot order, starting after the slot last loaded or saved on this opening (slot 1 first), and
+	// round again: with one usable slot, Y reloads it. Empty and no-longer-legal slots are passed over
+	// — their plates are the disabled ones.
+	const UTraceUserSettings& Settings = UTraceUserSettings::Get();
+	const int32 Count = UTraceUserSettings::SavedLoadoutCount;
+	const int32 After = (LastSavedSlot != INDEX_NONE) ? LastSavedSlot : (Count - 1);
+	for (int32 Step = 1; Step <= Count; ++Step)
+	{
+		const int32 Candidate = (After + Step) % Count;
+		if (TraceLoadoutSelectFile::SavedUsable(Settings.GetSavedLoadout(Candidate)))
+		{
+			Recall(Candidate);
+			return;
+		}
+	}
+	SetMessage(TRACE_TEXT("LOADOUT.NOTHING_SAVED", "NOTHING SAVED"), /*bWarning=*/true);
+}
+
+void FTraceLoadoutSelect::StoreCurrent()
+{
+	// The slot this opening last loaded or saved (load 2, change a card, save: it goes back to 2);
+	// otherwise the first empty slot, so a pad's first save never overwrites anything. With every
+	// slot full and none loaded, it says so rather than guessing which one to overwrite.
+	const UTraceUserSettings& Settings = UTraceUserSettings::Get();
+	int32 Target = LastSavedSlot;
+	for (int32 Index = 0; Target == INDEX_NONE && Index < UTraceUserSettings::SavedLoadoutCount; ++Index)
+	{
+		if (Settings.GetSavedLoadout(Index).IsEmpty())
+		{
+			Target = Index;
+		}
+	}
+	if (Target == INDEX_NONE)
+	{
+		SetMessage(TRACE_TEXT("LOADOUT.NO_EMPTY_SLOT", "NO EMPTY SLOT"), /*bWarning=*/true);
+		return;
+	}
+	Store(Target);
+}
+
 void FTraceLoadoutSelect::Store(int32 Index)
 {
 	UTraceUserSettings::Get().SetSavedLoadout(Index, Staged);
+	LastSavedSlot = Index;
 	SetMessage(FString::Format(*TRACE_TEXT("LOADOUT.SLOT_SAVED", "SAVED TO {0}"),
 		FStringFormatOrderedArguments{ FStringFormatArg(FString::FromInt(Index + 1)) }), /*bWarning=*/false);
 
@@ -1245,6 +1545,11 @@ void FTraceLoadoutSelect::Draw(AHUD* HUD, APlayerController* PC, const ATracePla
 	const float X = TraceLoadoutLayout::Margin * S;
 	const float W = ViewW - TraceLoadoutLayout::Margin * 2.f * S;
 
+	// THIS PAGE'S OWN HOVER EASES. The pause menu's LOADOUTS editor is a second one of these, drawn over
+	// the match page in the same frame with the same layout; keyed by rect alone the two shared every
+	// card's hover blend, and the editor's ring followed the page's highlight beneath it.
+	TraceMenuKit::FScopedHoverSalt HoverScope(HoverSalt());
+
 	// The one thing in the hover look this frame, asked once so the tabs, the grid and the buttons agree.
 	FrameLit = ResolveLit();
 
@@ -1255,8 +1560,7 @@ void FTraceLoadoutSelect::Draw(AHUD* HUD, APlayerController* PC, const ATracePla
 
 	DrawHeader(HUD, LocalState, Title);
 	DrawTabs(HUD, PC, X, TraceLoadoutLayout::TabY * S, W);
-	DrawGrid(HUD, X, TraceLoadoutLayout::GridTop * S, W,
-		(TraceLoadoutLayout::GridBottom - TraceLoadoutLayout::GridTop) * S);
+	DrawGrid(HUD, X, TraceLoadoutLayout::GridTop * S);
 	DrawActionRow(HUD, PC, X, TraceLoadoutLayout::ActionY * S, W);
 
 	if (!LastMessage.IsEmpty() && (Now - LastMessageTime) < TraceLoadoutLayout::MessageSeconds)
@@ -1285,22 +1589,64 @@ void FTraceLoadoutSelect::DrawHeader(AHUD* HUD, const ATracePlayerState* LocalSt
 	TitleStyle.HAlign = TraceText::EHAlign::Center;
 	TraceCanvasText::Draw(HUD, Title, ViewW * 0.5f, TitleTop, TitleStyle);
 
+	if (LocalState == nullptr || IsLibraryOpen())
+	{
+		return;
+	}
+
+	const float CapMid = TitleTop + TraceText::Ascent(TitleSize, ETraceTextWeight::Light)
+		- TraceText::CapHeight(TitleSize, ETraceTextWeight::Light) * 0.5f;
+	const float BoxH = TraceLoadoutLayout::CountBoxH * S;
+	const float BoxW = BoxH * (TraceMenuArtStyle::ValueFrame.PlateW / TraceMenuArtStyle::ValueFrame.PlateH);
+
+	// ---- THE BREAK: THE SCORE, AND SIDES SWITCHED ----------------------------------------------
+	//
+	// The left end mirrors TIME on the right: the score in the kit's value box, blue then orange in
+	// their team colours (the results screen's order), and the HUD card's SIDES SWITCHED after it —
+	// what the HALF TIME card under this page would have said.
+	const ATraceGameState* const HalfGS = (LocalState->GetWorld() != nullptr)
+		? LocalState->GetWorld()->GetGameState<ATraceGameState>() : nullptr;
+	if (bHalfTimeHeader && HalfGS != nullptr)
+	{
+		const FString BlueText = FString::FromInt(HalfGS->GetScore(ETraceTeam::Blue));
+		const FString OrangeText = FString::FromInt(HalfGS->GetScore(ETraceTeam::Orange));
+		const FString Dash = TRACE_TEXT("HUD.RESULT_SCORE_SEPARATOR", "-");
+		const float CapH = BoxH * TraceMenuKit::LabelCapFraction;
+		const float Spread = CapH * 0.9f;   // from the box's centre to the inner edge of each number
+		const float ScoreW = FMath::Max(BoxW, 2.f * (Spread + TraceMenuKit::CapTextWidth(TEXT("00"), CapH))
+			+ BoxH * TraceMenuKit::LabelPadFraction * 2.f);
+		const float BoxLeft = TraceLoadoutLayout::Margin * S;
+		const float BoxMid = BoxLeft + ScoreW * 0.5f;
+
+		TraceMenuKit::DrawValueBoxPlate(HUD, BoxLeft, CapMid - BoxH * 0.5f, ScoreW, BoxH);
+		TraceMenuKit::DrawCapText(HUD, BlueText, BoxMid - Spread, CapMid, CapH, TraceTeamColor(ETraceTeam::Blue),
+			ETraceTextWeight::Light, TraceText::EHAlign::Right);
+		TraceMenuKit::DrawCapText(HUD, Dash, BoxMid, CapMid, CapH, TraceMenuArtStyle::WordDefault,
+			ETraceTextWeight::Light, TraceText::EHAlign::Center);
+		TraceMenuKit::DrawCapText(HUD, OrangeText, BoxMid + Spread, CapMid, CapH, TraceTeamColor(ETraceTeam::Orange),
+			ETraceTextWeight::Light, TraceText::EHAlign::Left);
+
+		const FString Switched = TRACE_TEXT("HUD.BANNER_SIDES_SWITCHED_SHORT", "SIDES SWITCHED");
+		if (!Switched.IsEmpty())
+		{
+			TraceText::FStyle NoteStyle(TraceLoadoutLayout::SizeTimer * S, TraceMenuKit::FurnitureUnselected,
+				ETraceTextWeight::Light);
+			NoteStyle.HAlign = TraceText::EHAlign::Left;
+			TraceMenuKit::DrawTextCapCentered(HUD, Switched, BoxLeft + ScoreW + 14.f * S, CapMid, NoteStyle);
+		}
+	}
+
 	// ---- THE COUNTDOWN ------------------------------------------------------------------------
 	//
 	// The server closes this window on a deadline, and the page used to show no clock at all: the
 	// match clock was the only one, under the scrim and counting something else.
-	if (LocalState == nullptr || IsLibraryOpen() || LocalState->CharacterSelectDeadlineServerTime <= 0.f)
+	if (LocalState->CharacterSelectDeadlineServerTime <= 0.f)
 	{
 		return;
 	}
 
 	const float Remaining = LocalState->GetCharacterSelectTimeRemaining();
 	const bool bUrgent = Remaining <= 5.f;
-	const float CapMid = TitleTop + TraceText::Ascent(TitleSize, ETraceTextWeight::Light)
-		- TraceText::CapHeight(TitleSize, ETraceTextWeight::Light) * 0.5f;
-
-	const float BoxH = TraceLoadoutLayout::CountBoxH * S;
-	const float BoxW = BoxH * (TraceMenuArtStyle::ValueFrame.PlateW / TraceMenuArtStyle::ValueFrame.PlateH);
 	const float BoxX = ViewW - TraceLoadoutLayout::Margin * S - BoxW;
 	TraceMenuKit::DrawValueBox(HUD, BoxX, CapMid - BoxH * 0.5f, BoxW, BoxH,
 		FString::FromInt(FMath::Max(0, FMath::CeilToInt(Remaining))),
@@ -1323,30 +1669,31 @@ void FTraceLoadoutSelect::DrawTabs(AHUD* HUD, APlayerController* PC, float X, fl
 	const float Gap = TraceLoadoutLayout::TabGap * S;
 
 	// THE TAB KEYS, AT THE TWO ENDS OF THE ROW. Nothing on the page ever said Q and E changed tab, so
-	// keyboard players only found the other two questions by clicking. A pad's shoulders once one
-	// has been seen.
-	const bool bPad = TracePadMenu::HasSeenPad(PC);
-	const FString LeftKey = bPad ? TRACE_TEXT("LOADOUT.PAD_KEY_TAB_LEFT", "LB")
-	                             : TRACE_TEXT("LOADOUT.KEY_TAB_LEFT", "Q");
-	const FString RightKey = bPad ? TRACE_TEXT("LOADOUT.PAD_KEY_TAB_RIGHT", "RB")
-	                              : TRACE_TEXT("LOADOUT.KEY_TAB_RIGHT", "E");
+	// keyboard players only found the other two questions by clicking. Q / E always, and the pad's
+	// shoulders beside them while pad hints show (ChipKeys).
+	const bool bPadHints = TraceLoadoutSelectFile::PadHintsShown(PC);
+	TArray<FString> LeftKeys;
+	TArray<FString> RightKeys;
+	TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::TabLeft, IsLibraryOpen(), bPadHints, LeftKeys);
+	TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::TabRight, IsLibraryOpen(), bPadHints, RightKeys);
 
 	const float ChipH = TraceLoadoutLayout::TabChipH * S;
 	const float ChipY = Y + (TabH - ChipH) * 0.5f;
+	const float PairGap = TraceLoadoutSelectFile::ChipPairGap * S;
 	float RowX = X;
 	float RowW = W;
 
-	const float LeftW = TraceMenuKit::KeyChipWidth(LeftKey, ChipH);
+	const float LeftW = TraceLoadoutSelectFile::ChipGroupWidth(LeftKeys, ChipH, PairGap);
 	if (LeftW > 0.f)
 	{
-		TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, X, ChipY, ChipH, LeftKey, AnimNow);
+		TraceLoadoutSelectFile::DrawChipGroup(HUD, X, ChipY, ChipH, PairGap, LeftKeys, AnimNow);
 		RowX += LeftW + Gap;
 		RowW -= LeftW + Gap;
 	}
-	const float RightW = TraceMenuKit::KeyChipWidth(RightKey, ChipH);
+	const float RightW = TraceLoadoutSelectFile::ChipGroupWidth(RightKeys, ChipH, PairGap);
 	if (RightW > 0.f)
 	{
-		TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, X + W - RightW, ChipY, ChipH, RightKey, AnimNow);
+		TraceLoadoutSelectFile::DrawChipGroup(HUD, X + W - RightW, ChipY, ChipH, PairGap, RightKeys, AnimNow);
 		RowW -= RightW + Gap;
 	}
 
@@ -1382,72 +1729,26 @@ void FTraceLoadoutSelect::DrawTabs(AHUD* HUD, APlayerController* PC, float X, fl
 	}
 }
 
-void FTraceLoadoutSelect::DrawGrid(AHUD* HUD, float X, float Y, float W, float H)
+void FTraceLoadoutSelect::DrawGrid(AHUD* HUD, float X, float Y)
 {
 	const float S = UIScale;
 	const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(Tab);
 	const int32 Count = TraceLoadoutSelectFile::CardCount(Slot);
 
 	constexpr int32 GridColumns = TraceLoadoutLayout::Columns;
-	constexpr int32 GridRows = TraceLoadoutLayout::Rows;
 	const float GapX = TraceLoadoutLayout::TileGapX * S;
 	const float GapY = TraceLoadoutLayout::TileGapY * S;
-	const float TileW = (W - GapX * (GridColumns - 1)) / static_cast<float>(GridColumns);
-	const float TileH = (H - GapY * (GridRows - 1)) / static_cast<float>(GridRows);
+	float TileW = 0.f;
+	float TileH = 0.f;
+	GridTile(TileW, TileH);
 
 	for (FBox2D& Rect : CardRects)
 	{
 		Rect = FBox2D(ForceInit);
 	}
 
-	// ONE NAME SIZE FOR THE WHOLE TAB. Each card used to shrink its own, so CARBON SLIDERS and STICKY
-	// GLOVES sat visibly smaller than BLINK in the same grid. Solved once per tab and width.
-	const float TextW = TileW - TraceLoadoutLayout::CardPad * 2.f * S;
-	if (NameFitWidth[Tab] != TextW)
-	{
-		const float Full = TraceLoadoutLayout::SizeName * S;
-		const TraceText::FStyle Style(Full, FLinearColor::White, ETraceTextWeight::Light);
-		float Fitted = Full;
-		for (int32 Index = 0; Index < Count; ++Index)
-		{
-			const FString Name = TraceAbilityNames::Get(TraceLoadoutSelectFile::AbilityAtCard(Slot, Index));
-			const float Measured = Name.IsEmpty() ? 0.f : TraceText::MeasureWidth(Name, Style);
-			if (Measured > TextW && Measured > 0.f)
-			{
-				Fitted = FMath::Min(Fitted, Full * (TextW / Measured));
-			}
-		}
-		NameFitSize[Tab] = Fitted;
-		NameFitWidth[Tab] = TextW;
-
-		// ONE DESCRIPTION SIZE FOR THE WHOLE TAB: the largest at which every card's words fit above
-		// the EQUIPPED box (reserved on every card, so the marker can never cover a line).
-		const float Room = TileH - TraceLoadoutLayout::CardPad * 2.f * S
-			- (TraceText::LineHeight(TraceLoadoutLayout::SizeName * S) + 4.f * S)
-			- (TraceLoadoutLayout::EquippedH + 6.f) * S;
-		const ETraceTextWeight BodyWeight = TraceLoadoutSelectFile::DescriptionWeight();
-		float BodySize = TraceLoadoutLayout::SizeBody * S;
-		const float SizeFloor = TraceLoadoutLayout::SizeBodyMin * S;
-		TArray<FString> Lines;
-		while (BodySize > SizeFloor)
-		{
-			bool bAllFit = true;
-			const TraceText::FStyle TryStyle(BodySize, FLinearColor::White, BodyWeight);
-			for (int32 Index = 0; Index < Count && bAllFit; ++Index)
-			{
-				TraceLoadoutSelectFile::WrapInto(
-					TraceAbilityNames::Describe(TraceLoadoutSelectFile::AbilityAtCard(Slot, Index)), TextW, TryStyle, Lines);
-				bAllFit = TraceLoadoutSelectFile::BlockHeight(Lines.Num(), BodySize, S) <= Room;
-			}
-			if (bAllFit)
-			{
-				break;
-			}
-			BodySize = FMath::Max(SizeFloor, BodySize - 0.5f * S);
-		}
-		BodyFitSize[Tab] = BodySize;
-		BodyFitRoom[Tab] = Room;
-	}
+	// ONE NAME SIZE AND ONE DESCRIPTION SIZE FOR THE WHOLE SCREEN, every tab (SolveTypeSizes).
+	SolveTypeSizes(TileW, TileH);
 
 	// THE HIGHLIGHTED CARD LAST: its glow overhangs the plate and a neighbour drawn after it would
 	// paint over the ring.
@@ -1463,9 +1764,95 @@ void FTraceLoadoutSelect::DrawGrid(AHUD* HUD, float X, float Y, float W, float H
 			DrawCard(HUD, Index,
 				X + (TileW + GapX) * (Index % GridColumns),
 				Y + (TileH + GapY) * (Index / GridColumns),
-				TileW, TileH, NameFitSize[Tab], BodyFitSize[Tab], BodyFitRoom[Tab]);
+				TileW, TileH, NameFitSize, BodyFitSize, BodyFitRoom);
 		}
 	}
+}
+
+void FTraceLoadoutSelect::GridTile(float& OutTileW, float& OutTileH) const
+{
+	// The grid's own box, from the layout: the page's width inside its margins, GridTop to GridBottom.
+	const float S = UIScale;
+	const float GridW = ViewW - TraceLoadoutLayout::Margin * 2.f * S;
+	const float GridH = (TraceLoadoutLayout::GridBottom - TraceLoadoutLayout::GridTop) * S;
+	OutTileW = (GridW - TraceLoadoutLayout::TileGapX * S * (TraceLoadoutLayout::Columns - 1))
+		/ static_cast<float>(TraceLoadoutLayout::Columns);
+	OutTileH = (GridH - TraceLoadoutLayout::TileGapY * S * (TraceLoadoutLayout::Rows - 1))
+		/ static_cast<float>(TraceLoadoutLayout::Rows);
+}
+
+void FTraceLoadoutSelect::SolveTypeSizes(float TileW, float TileH)
+{
+	const float S = UIScale;
+	const ETraceTextWeight BodyWeight = TraceLoadoutSelectFile::DescriptionWeight();
+	if (NameFitSize > 0.f && FitTileW == TileW && FitTileH == TileH && FitWeight == BodyWeight)
+	{
+		return;   // solved for this layout and face already
+	}
+	FitTileW = TileW;
+	FitTileH = TileH;
+	FitWeight = BodyWeight;
+
+	// *** OVER EVERY CARD OF EVERY TAB. *** This was solved per tab, so the same card drew at three
+	// type sizes on one screen and a tab switch visibly rescaled the grid (names 13 / 12 / 18 px caps,
+	// descriptions 14 / 10 / 11 on MOVEMENT / PASSIVE / ACTIVATED). The page is one screen; its cards
+	// are one set.
+	const float TextW = TileW - TraceLoadoutLayout::CardPad * 2.f * S;
+	const int32 SlotCount = static_cast<int32>(ETraceLoadoutSlot::Count);
+
+	// NAMES: the smallest size any name on any tab needs to fit its card.
+	const float Full = TraceLoadoutLayout::SizeName * S;
+	const TraceText::FStyle NameStyle(Full, FLinearColor::White, ETraceTextWeight::Light);
+	float Fitted = Full;
+	for (int32 SlotIndex = 0; SlotIndex < SlotCount; ++SlotIndex)
+	{
+		const ETraceLoadoutSlot EachSlot = static_cast<ETraceLoadoutSlot>(SlotIndex);
+		for (int32 Index = 0; Index < TraceLoadoutSelectFile::CardCount(EachSlot); ++Index)
+		{
+			const FString Name = TraceAbilityNames::Get(TraceLoadoutSelectFile::AbilityAtCard(EachSlot, Index));
+			const float Measured = Name.IsEmpty() ? 0.f : TraceText::MeasureWidth(Name, NameStyle);
+			if (Measured > TextW)
+			{
+				Fitted = FMath::Min(Fitted, Full * (TextW / Measured));
+			}
+		}
+	}
+	NameFitSize = Fitted;
+
+	// DESCRIPTIONS: the largest size at which every card on every tab fits above the EQUIPPED box
+	// (reserved on every card, so the marker can never cover a line). Down to SizeBodyLast, the size a
+	// single card used to shrink to on its own, so no card is left drawing at a size of its own.
+	const float Room = TileH - TraceLoadoutLayout::CardPad * 2.f * S
+		- (TraceText::LineHeight(TraceLoadoutLayout::SizeName * S) + 4.f * S)
+		- (TraceLoadoutLayout::EquippedH + 6.f) * S;
+	float BodySize = TraceLoadoutLayout::SizeBody * S;
+	const float SizeFloor = TraceLoadoutLayout::SizeBodyLast * S;
+	TArray<FString> Lines;
+	while (BodySize > SizeFloor)
+	{
+		bool bAllFit = true;
+		const TraceText::FStyle TryStyle(BodySize, FLinearColor::White, BodyWeight);
+		for (int32 SlotIndex = 0; SlotIndex < SlotCount && bAllFit; ++SlotIndex)
+		{
+			const ETraceLoadoutSlot EachSlot = static_cast<ETraceLoadoutSlot>(SlotIndex);
+			for (int32 Index = 0; Index < TraceLoadoutSelectFile::CardCount(EachSlot) && bAllFit; ++Index)
+			{
+				TraceLoadoutSelectFile::WrapInto(
+					TraceAbilityNames::Describe(TraceLoadoutSelectFile::AbilityAtCard(EachSlot, Index)), TextW, TryStyle, Lines);
+				bAllFit = TraceLoadoutSelectFile::BlockHeight(Lines.Num(), BodySize, S) <= Room;
+			}
+		}
+		if (bAllFit)
+		{
+			break;
+		}
+		BodySize = FMath::Max(SizeFloor, BodySize - 0.5f * S);
+	}
+	BodyFitSize = BodySize;
+	BodyFitRoom = Room;
+
+	UE_LOG(LogTraceGame, Display, TEXT("[LoadoutScreen] one type size for every tab, %.0f x %.0f tile: names %.1f, descriptions %.1f."),
+		TileW, TileH, NameFitSize, BodyFitSize);
 }
 
 void FTraceLoadoutSelect::DrawCard(AHUD* HUD, int32 Index, float X, float Y, float W, float H, float NameSize,
@@ -1504,29 +1891,18 @@ void FTraceLoadoutSelect::DrawCard(AHUD* HUD, int32 Index, float X, float Y, flo
 		TextY += TraceText::LineHeight(TraceLoadoutLayout::SizeName * S) + 4.f * S;
 	}
 
-	// THE DESCRIPTION at the tab's solved size, wrapped once per ability, width, size and face rather
-	// than every frame. A card too long for the tab's size even at its floor shrinks on its own
-	// (SizeBodyLast), rather than losing the end of a rule.
+	// THE DESCRIPTION at the screen's solved size, wrapped once per ability, width, size and face rather
+	// than every frame. The solve already fits every card down to SizeBodyLast, so CardBodySize only
+	// goes smaller for a card that could not fit even there.
 	const ETraceTextWeight BodyWeight = TraceLoadoutSelectFile::DescriptionWeight();
 	FWrapCache& Cache = WrapCache[Index];
 	if (Cache.Id != Id || Cache.Width != TextW || Cache.TabSize != TabBodySize || Cache.Weight != BodyWeight)
 	{
-		const FString Body = TraceAbilityNames::Describe(Id);
-		float Size = TabBodySize;
-		for (;;)
-		{
-			TraceLoadoutSelectFile::WrapInto(Body, TextW, TraceText::FStyle(Size, FLinearColor::White, BodyWeight), Cache.Lines);
-			if (Size <= TraceLoadoutLayout::SizeBodyLast * S
-				|| TraceLoadoutSelectFile::BlockHeight(Cache.Lines.Num(), Size, S) <= BodyRoom)
-			{
-				break;
-			}
-			Size = FMath::Max(TraceLoadoutLayout::SizeBodyLast * S, Size - 0.5f * S);
-		}
+		Cache.Size = TraceLoadoutSelectFile::CardBodySize(TraceAbilityNames::Describe(Id), TextW, TabBodySize,
+			BodyRoom, BodyWeight, S, Cache.Lines);
 		Cache.Id = Id;
 		Cache.Width = TextW;
 		Cache.TabSize = TabBodySize;
-		Cache.Size = Size;
 		Cache.Weight = BodyWeight;
 	}
 
@@ -1566,14 +1942,16 @@ void FTraceLoadoutSelect::DrawActionRow(AHUD* HUD, APlayerController* PC, float 
 	const float ChipY = Y + (BtnH - ChipH) * 0.5f;
 	const float ChipGap = 12.f * S;
 	const float GroupGap = 30.f * S;
-	const bool bPad = TracePadMenu::HasSeenPad(PC);
+	const float PairGap = TraceLoadoutSelectFile::ChipPairGap * S;
+	const bool bPadHints = TraceLoadoutSelectFile::PadHintsShown(PC);
 	const bool bLibrary = IsLibraryOpen();
 
-	// ---- LOCK IN (SAVE), at the right edge, with its key ------------------------------------------
+	// ---- LOCK IN (SAVE), at the right edge, with its keys (F, and X beside it for a pad) ----------
 	float Right = X + W;
 	{
 		const FString Word = bLibrary ? TRACE_TEXT("LOADOUT.SAVE_SLOT", "SAVE") : TRACE_TEXT("LOADOUT.LOCK_IN", "LOCK IN");
-		const FString Key = bPad ? TRACE_TEXT("LOADOUT.PAD_KEY_LOCK_IN", "X") : TRACE_TEXT("LOADOUT.KEY_LOCK_IN", "F");
+		TArray<FString> Keys;
+		TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::Confirm, bLibrary, bPadHints, Keys);
 		const float PlateX = Right - BtnW;
 		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, FrameLit.bConfirm,
 			FrameLit.bConfirm && FrameLit.bPressed);
@@ -1583,9 +1961,9 @@ void FTraceLoadoutSelect::DrawActionRow(AHUD* HUD, APlayerController* PC, float 
 		Right = PlateX;
 		if (ConfirmRect.bIsValid)
 		{
-			const float KeyW = TraceMenuKit::KeyChipWidth(Key, ChipH);
-			TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, Right - ChipGap - KeyW, ChipY, ChipH, Key, AnimNow);
-			Right -= (KeyW > 0.f) ? (ChipGap + KeyW) : 0.f;
+			const float KeysW = TraceLoadoutSelectFile::ChipGroupWidth(Keys, ChipH, PairGap);
+			TraceLoadoutSelectFile::DrawChipGroup(HUD, Right - ChipGap - KeysW, ChipY, ChipH, PairGap, Keys, AnimNow);
+			Right -= (KeysW > 0.f) ? (ChipGap + KeysW) : 0.f;
 		}
 		Right -= GroupGap;
 	}
@@ -1595,15 +1973,16 @@ void FTraceLoadoutSelect::DrawActionRow(AHUD* HUD, APlayerController* PC, float 
 	if (bLibrary)
 	{
 		const FString Word = TRACE_TEXT("LOADOUT.BACK", "BACK");
-		const FString Key = bPad ? TRACE_TEXT("LOADOUT.PAD_KEY_BACK", "B") : TRACE_TEXT("LOADOUT.KEY_BACK", "ESC");
+		TArray<FString> Keys;
+		TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::Back, bLibrary, bPadHints, Keys);
 		const float PlateX = Right - BtnW;
 		const ETraceKitState State = TraceMenuKit::StateFor(/*bEnabled=*/true, FrameLit.bBack,
 			FrameLit.bBack && FrameLit.bPressed);
 		if (TraceMenuKit::DrawButton(HUD, State, PlateX, Y, BtnW, BtnH, Word, AnimNow))
 		{
 			BackRect = FBox2D(FVector2D(PlateX, Y), FVector2D(PlateX + BtnW, Y + BtnH));
-			const float KeyW = TraceMenuKit::KeyChipWidth(Key, ChipH);
-			TraceMenuKit::DrawKeyChip(HUD, ETraceKitState::Default, PlateX - ChipGap - KeyW, ChipY, ChipH, Key, AnimNow);
+			const float KeysW = TraceLoadoutSelectFile::ChipGroupWidth(Keys, ChipH, PairGap);
+			TraceLoadoutSelectFile::DrawChipGroup(HUD, PlateX - ChipGap - KeysW, ChipY, ChipH, PairGap, Keys, AnimNow);
 		}
 		for (FBox2D& Rect : SavedRects)
 		{
@@ -1675,43 +2054,14 @@ void FTraceLoadoutSelect::DrawSavedRow(AHUD* HUD, float X, float Y, float MaxW)
 void FTraceLoadoutSelect::DrawFooter(AHUD* HUD, APlayerController* PC, float Y)
 {
 	const float S = UIScale;
-	const bool bLibrary = IsLibraryOpen();
-	const FString LockWord = bLibrary ? TRACE_TEXT("LOADOUT.SAVE_SLOT", "SAVE") : TRACE_TEXT("LOADOUT.LOCK_IN", "LOCK IN");
-	const FString TabWord = TRACE_TEXT("LOADOUT.LEGEND_TAB", "TAB");
-	const FString EquipWord = TRACE_TEXT("LOADOUT.LEGEND_EQUIP", "EQUIP");
-	const FString ChooseWord = TRACE_TEXT("LOADOUT.LEGEND_CHOOSE", "CHOOSE");
-	const FString BackWord = TRACE_TEXT("LOADOUT.BACK", "BACK");
 
-	// LABELS, NOT SENTENCES, and every key that does something on this page — the old line promised
-	// "ARROWS TO CHOOSE" when the arrows chose nothing, and never mentioned the tab keys.
+	// LABELS, NOT SENTENCES, and every key that does something on this page right now — the old line
+	// promised "ARROWS TO CHOOSE" when the arrows chose nothing, and never mentioned the tab keys; the
+	// one after it left out BACKSPACE / B, which step back a tab. The pad's line once a pad has been
+	// seen and CONTROLLER INPUT is on (the hint is gated; the input never is on the first).
 	TArray<FTraceKitLegendItem> Keyboard;
-	Keyboard.Add({ TRACE_TEXT("LOADOUT.KEY_MOVE", "ARROWS"), ChooseWord });
-	Keyboard.Add({ TRACE_TEXT("LOADOUT.KEY_TABS", "Q / E"), TabWord });
-	Keyboard.Add({ TRACE_TEXT("LOADOUT.KEY_EQUIP", "ENTER"), EquipWord });
-	Keyboard.Add({ TRACE_TEXT("LOADOUT.KEY_LOCK_IN", "F"), LockWord });
-	if (bLibrary)
-	{
-		Keyboard.Add({ TRACE_TEXT("LOADOUT.KEY_BACK", "ESC"), BackWord });
-	}
-	else
-	{
-		Keyboard.Add({ TRACE_TEXT("LOADOUT.KEY_LOAD", "1 - 5"), TRACE_TEXT("LOADOUT.LEGEND_LOAD", "LOAD") });
-		Keyboard.Add({ TRACE_TEXT("LOADOUT.KEY_STORE", "SHIFT 1 - 5"), TRACE_TEXT("LOADOUT.LEGEND_STORE", "SAVE") });
-	}
-
-	// THE PAD'S LINE, once a pad has been seen on this machine (the hint is gated; the input never is).
 	TArray<FTraceKitLegendItem> Pad;
-	if (TracePadMenu::HasSeenPad(PC))
-	{
-		Pad.Add({ TRACE_TEXT("LOADOUT.PAD_KEY_MOVE", "D-PAD"), ChooseWord });
-		Pad.Add({ TRACE_TEXT("LOADOUT.PAD_KEY_TABS", "LB / RB"), TabWord });
-		Pad.Add({ TRACE_TEXT("LOADOUT.PAD_KEY_EQUIP", "A"), EquipWord });
-		Pad.Add({ TRACE_TEXT("LOADOUT.PAD_KEY_LOCK_IN", "X"), LockWord });
-		if (bLibrary)
-		{
-			Pad.Add({ TRACE_TEXT("LOADOUT.PAD_KEY_BACK", "B"), BackWord });
-		}
-	}
+	TraceLoadoutSelectFile::BuildLegend(IsLibraryOpen(), Tab, TraceLoadoutSelectFile::PadHintsShown(PC), Keyboard, Pad);
 
 	// ONE SCALE FOR BOTH LINES: two legends for two devices at two sizes would read as a mistake.
 	const float FullChipH = TraceLoadoutLayout::FooterChipH * S;
@@ -1751,6 +2101,50 @@ void FTraceLoadoutSelect::DrawPointer(AHUD* HUD, APlayerController* PC)
 // =================================================================================================
 // Test seams
 // =================================================================================================
+
+void FTraceLoadoutSelect::DebugTypeSizes(float InViewW, float InViewH, float InUIScale, TArray<float>& OutNameSizes,
+	TArray<float>& OutBodySizes)
+{
+	ViewW = InViewW;
+	ViewH = InViewH;
+	UIScale = InUIScale;
+
+	// The steps DrawGrid and DrawCard take with each tab on screen in turn — the layout's tile, the
+	// solve, each card's own size — so a solve that depended on the tab would show here as it did on
+	// screen.
+	const int32 TabWas = Tab;
+	OutNameSizes.Reset();
+	OutBodySizes.Reset();
+	TArray<FString> Lines;
+	for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
+	{
+		Tab = SlotIndex;
+		float TileW = 0.f;
+		float TileH = 0.f;
+		GridTile(TileW, TileH);
+		SolveTypeSizes(TileW, TileH);
+		const float TextW = TileW - TraceLoadoutLayout::CardPad * 2.f * UIScale;
+
+		const ETraceLoadoutSlot EachSlot = static_cast<ETraceLoadoutSlot>(SlotIndex);
+		for (int32 Index = 0; Index < TraceLoadoutSelectFile::CardCount(EachSlot); ++Index)
+		{
+			const ETraceAbilityId Id = TraceLoadoutSelectFile::AbilityAtCard(EachSlot, Index);
+			OutNameSizes.Add(TraceAbilityNames::Get(Id).IsEmpty() ? 0.f : NameFitSize);
+			OutBodySizes.Add(TraceLoadoutSelectFile::CardBodySize(TraceAbilityNames::Describe(Id), TextW,
+				BodyFitSize, BodyFitRoom, FitWeight, UIScale, Lines));
+		}
+	}
+	Tab = TabWas;
+}
+
+uint32 FTraceLoadoutSelect::HoverSalt() const
+{
+	// The instance's address: the match page and the pause menu's editor are two members of two
+	// objects, so two different salts, and each stays the same for as long as its page exists. Never
+	// 0, which is the unsalted key every other screen uses.
+	const uint32 FromAddress = PointerHash(this);
+	return (FromAddress != 0u) ? FromAddress : 1u;
+}
 
 void FTraceLoadoutSelect::DebugPick(ETraceLoadoutSlot Slot, ETraceAbilityId Id)
 {
@@ -1941,6 +2335,15 @@ namespace TraceLoadoutScreenVerify
 		Screen.DebugConfirm(Subject);
 		Check(TEXT("LOCK IN during play changes nothing"),
 			Comp->GetLoadout() == Restore, TraceLoadoutToString(Comp->GetLoadout()));
+
+		// ...AND SAYS SO. The page used to print LOCKED IN the moment the request left, and the server's
+		// refusal came back to nobody. The server now replies (ClientLockInRefused) and the page says why.
+		const FString SaidLocked = TRACE_TEXT("LOADOUT.LOCKED_IN", "LOCKED IN");
+		const FString SaidSending = TRACE_TEXT("LOADOUT.SENDING", "SENDING");
+		const FString SaidRefused = TRACE_TEXT("LOADOUT.REFUSED_LOCKED", "LOADOUT LOCKED");
+		Check(TEXT("*** a refused LOCK IN says why, never LOCKED IN ***"),
+			Screen.DebugMessage() == SaidRefused,
+			FString::Printf(TEXT("the page says '%s'"), *Screen.DebugMessage()));
 
 		Subject->ServerSetCharacterSelectOpen(/*bOpen=*/true, 0.f);
 		Screen.DebugConfirm(Subject);
@@ -2161,7 +2564,8 @@ namespace TraceLoadoutScreenVerify
 				{
 					bDigit = bDigit || bEach;
 				}
-				return K.bEquip || K.bLock || K.bBack || K.bTabLeft || K.bTabRight || K.NavX != 0 || K.NavY != 0 || bDigit;
+				return K.bEquip || K.bLock || K.bBack || K.bTabLeft || K.bTabRight || K.bSavedNext || K.NavX != 0
+					|| K.NavY != 0 || bDigit;
 			};
 
 			Check(TEXT("pad LB / RB change tab, as Q / E do"),
@@ -2477,6 +2881,307 @@ namespace TraceLoadoutScreenVerify
 				TraceLoadoutToString(Settings.GetSavedLoadout(LibrarySlotIndex)));
 
 			Settings.SetSavedLoadout(LibrarySlotIndex, SavedBefore);
+		}
+
+		// =========================================================================================
+		// THE LOW-FINDINGS PASS: what the page says, and what a pad can reach
+		// =========================================================================================
+
+		// ---- LOCK IN SAYS SENDING UNTIL THE SERVER AGREES, THEN LOCKED IN ------------------------
+		{
+			Comp->ApplyLoadout(Restore);
+			Subject->ServerMarkCharacterResolved(/*bLocked=*/false, /*bWasChosen=*/false);
+			Subject->ServerSetCharacterSelectOpen(/*bOpen=*/true, 0.f);
+			FTraceLoadoutSelect Page;
+			Page.Tick(nullptr, nullptr, Subject, 1920.f, 1080.f, 1.f, 5.0f, /*bInputAllowed=*/true);   // up
+			Page.DebugPick(ETraceLoadoutSlot::Movement,  ETraceAbilityId::StickyGloves);
+			Page.DebugPick(ETraceLoadoutSlot::Passive,   ETraceAbilityId::Magnet);
+			Page.DebugPick(ETraceLoadoutSlot::Activated, ETraceAbilityId::Snap);
+			Page.DebugConfirm(Subject);   // accepted: the server shuts the window inside the call
+			const FString AtSend = Page.DebugMessage();
+			Page.Tick(nullptr, nullptr, Subject, 1920.f, 1080.f, 1.f, 5.1f, /*bInputAllowed=*/true);   // sees it shut
+			Check(TEXT("*** LOCK IN says SENDING, and LOCKED IN only once the window shuts ***"),
+				AtSend == SaidSending && Page.DebugMessage() == SaidLocked && !Subject->IsCharacterSelectOpen()
+					&& Comp->GetLoadout() == Wanted,
+				FString::Printf(TEXT("at the send '%s', after the close '%s'"), *AtSend, *Page.DebugMessage()));
+		}
+
+		// ---- A REFUSAL WITH THE PAGE STILL UP: IT SAYS WHY, AND THE PAGE STILL WORKS -------------
+		//
+		// The race the finding named: the server's window shuts (the deadline) while this client's page
+		// is still up and its LOCK IN is on the wire. The server refuses; the page must say so and stay
+		// usable, not sit there saying LOCKED IN.
+		{
+			const ATraceGameState* const RaceGS = World->GetGameState<ATraceGameState>();
+			const bool bLivePlay = RaceGS != nullptr && RaceGS->TraceMatchState == ETraceMatchState::InProgress
+				&& !RaceGS->IsHalfTimeBreak();
+			if (!bLivePlay)
+			{
+				Check(TEXT("a refused LOCK IN leaves the page up and working"), false,
+					TEXT("INCONCLUSIVE: the server only refuses in live play - run this after warm-up"));
+			}
+			else
+			{
+				Comp->ApplyLoadout(Restore);
+				Subject->ServerSetCharacterSelectOpen(/*bOpen=*/true, 0.f);
+				FTraceLoadoutSelect Page;
+				Page.Tick(nullptr, nullptr, Subject, 1920.f, 1080.f, 1.f, 6.0f, /*bInputAllowed=*/true);   // up
+				Page.DebugPick(ETraceLoadoutSlot::Movement, ETraceAbilityId::StickyGloves);
+				Subject->ServerSetCharacterSelectOpen(/*bOpen=*/false, 0.f);   // the deadline, mid-send
+				Page.DebugConfirm(Subject);
+				const FString Said = Page.DebugMessage();
+
+				// Still up on this client: a key still moves and equips.
+				Subject->ServerSetCharacterSelectOpen(/*bOpen=*/true, 0.f);
+				const FTraceLoadout BeforeKeys = Page.GetStaged();
+				FTraceLoadoutKeys Right;  Right.NavX = 1;
+				FTraceLoadoutKeys Enter;  Enter.bEquip = true;
+				const FTraceLoadoutKeys Nothing;
+				Page.DebugInput(Nothing, Subject, true, 6.1f);
+				Page.DebugInput(Right, Subject, true, 6.2f);
+				Page.DebugInput(Nothing, Subject, true, 6.3f);
+				Page.DebugInput(Enter, Subject, true, 6.4f);
+				Page.DebugInput(Nothing, Subject, true, 6.5f);
+				Check(TEXT("*** a refused LOCK IN says why and leaves the page working ***"),
+					Said == SaidRefused && Comp->GetLoadout() == Restore && Page.GetStaged() != BeforeKeys,
+					FString::Printf(TEXT("said '%s', server kept %s, a key then staged %s"), *Said,
+						*TraceLoadoutToString(Comp->GetLoadout()), *TraceLoadoutToString(Page.GetStaged())));
+				Subject->ServerSetCharacterSelectOpen(/*bOpen=*/false, 0.f);
+			}
+		}
+
+		// ---- HALF TIME: THE PAGE SAYS SO ---------------------------------------------------------
+		{
+			ATraceGameState* const BreakGS = World->GetGameState<ATraceGameState>();
+			if (BreakGS == nullptr)
+			{
+				Check(TEXT("the half-time page is titled HALF TIME"), false, TEXT("INCONCLUSIVE: no Trace game state"));
+			}
+			else
+			{
+				const bool bWasBreak = BreakGS->IsHalfTimeBreak();
+				const int32 HalfNow = BreakGS->CurrentHalf;
+				const int32 HalvesNow = FMath::Max(1, BreakGS->NumHalves);
+				Subject->ServerSetCharacterSelectOpen(/*bOpen=*/true, 0.f);
+
+				FTraceLoadoutSelect Page;
+				BreakGS->SetHalfState(HalfNow, HalvesNow, /*bInHalfTimeBreak=*/true);
+				Page.Tick(nullptr, nullptr, Subject, 1920.f, 1080.f, 1.f, 8.0f, /*bInputAllowed=*/true);
+				const FString InBreak = Page.DebugTitle();
+				const bool bBreakHeader = Page.DebugHalfTimeHeader();
+				BreakGS->SetHalfState(HalfNow, HalvesNow, /*bInHalfTimeBreak=*/false);
+				Page.Tick(nullptr, nullptr, Subject, 1920.f, 1080.f, 1.f, 8.1f, /*bInputAllowed=*/true);
+				const FString OutOfBreak = Page.DebugTitle();
+				const bool bPlayHeader = Page.DebugHalfTimeHeader();
+				BreakGS->SetHalfState(HalfNow, HalvesNow, bWasBreak);
+
+				Check(TEXT("*** at half time the page is titled HALF TIME, score beside it ***"),
+					InBreak == TRACE_TEXT("HUD.BANNER_HALF_TIME", "HALF TIME") && bBreakHeader
+						&& OutOfBreak == TRACE_TEXT("LOADOUT.TITLE", "BUILD YOUR LOADOUT") && !bPlayHeader,
+					FString::Printf(TEXT("break: '%s' (score %d), otherwise: '%s' (score %d)"), *InBreak,
+						bBreakHeader ? 1 : 0, *OutOfBreak, bPlayHeader ? 1 : 0));
+			}
+		}
+
+		// ---- ONE TYPE SIZE ON EVERY TAB ------------------------------------------------------------
+		//
+		// Every card of every tab, at the sizes DrawCard would use: one name size, one description
+		// size. They were solved per tab (names 13 / 12 / 18 px caps on the three tabs).
+		{
+			FTraceLoadoutSelect Page;
+			FString Detail;
+			bool bOneSize = true;
+			const float ViewWidths[] = { 1920.f, 1440.f };   // 16:9 and 4:3, both at 1080 tall
+			for (const float ViewWidth : ViewWidths)
+			{
+				TArray<float> NameSizes;
+				TArray<float> BodySizes;
+				Page.DebugTypeSizes(ViewWidth, 1080.f, 1.f, NameSizes, BodySizes);
+				float NameLo = 1000.f, NameHi = 0.f, BodyLo = 1000.f, BodyHi = 0.f;
+				for (int32 Index = 0; Index < NameSizes.Num(); ++Index)
+				{
+					if (NameSizes[Index] > 0.f)
+					{
+						NameLo = FMath::Min(NameLo, NameSizes[Index]);
+						NameHi = FMath::Max(NameHi, NameSizes[Index]);
+					}
+					BodyLo = FMath::Min(BodyLo, BodySizes[Index]);
+					BodyHi = FMath::Max(BodyHi, BodySizes[Index]);
+				}
+				bOneSize = bOneSize && NameSizes.Num() > 0 && FMath::IsNearlyEqual(NameLo, NameHi, 0.01f)
+					&& FMath::IsNearlyEqual(BodyLo, BodyHi, 0.01f);
+				Detail += FString::Printf(TEXT("%.0fx1080: %d cards, names %.1f-%.1f, bodies %.1f-%.1f  "),
+					ViewWidth, NameSizes.Num(), NameLo, NameHi, BodyLo, BodyHi);
+			}
+			Check(TEXT("*** one name size and one description size on every tab ***"), bOneSize, Detail);
+		}
+
+		// ---- EVERY CHIP AND LEGEND NAMES THE KEYBOARD, AND THE PAD BESIDE IT -----------------------
+		{
+			TArray<FString> TabLeftKeys;
+			TArray<FString> LockKeys;
+			TArray<FString> LockKeysNoPad;
+			TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::TabLeft, false, true, TabLeftKeys);
+			TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::Confirm, false, true, LockKeys);
+			TraceLoadoutSelectFile::ChipKeys(TraceLoadoutSelectFile::EChip::Confirm, false, false, LockKeysNoPad);
+			Check(TEXT("*** chips: Q and LB, F and X once a pad is seen; F alone before ***"),
+				TabLeftKeys.Num() == 2 && TabLeftKeys[0] == TRACE_TEXT("LOADOUT.KEY_TAB_LEFT", "Q")
+					&& TabLeftKeys[1] == TRACE_TEXT("LOADOUT.PAD_KEY_TAB_LEFT", "LB")
+					&& LockKeys.Num() == 2 && LockKeys[0] == TRACE_TEXT("LOADOUT.KEY_LOCK_IN", "F")
+					&& LockKeysNoPad.Num() == 1 && LockKeysNoPad[0] == LockKeys[0],
+				FString::Printf(TEXT("tab left [%s], lock in [%s], lock in with no pad [%s]"),
+					*FString::Join(TabLeftKeys, TEXT(" ")), *FString::Join(LockKeys, TEXT(" ")),
+					*FString::Join(LockKeysNoPad, TEXT(" "))));
+
+			auto HasItem = [](const TArray<FTraceKitLegendItem>& Items, const FString& Key, const FString& Verb)
+			{
+				return Items.ContainsByPredicate([&Key, &Verb](const FTraceKitLegendItem& Item)
+				{
+					return Item.Key == Key && Item.Label == Verb;
+				});
+			};
+			const FString BackWord = TRACE_TEXT("LOADOUT.BACK", "BACK");
+			const FString KeyBack = TRACE_TEXT("LOADOUT.KEY_BACK_TAB", "BKSP");
+			const FString PadBack = TRACE_TEXT("LOADOUT.PAD_KEY_BACK", "B");
+			TArray<FTraceKitLegendItem> FirstKeys, FirstPad, LaterKeys, LaterPad, NoPadKeys, NoPadPad;
+			TraceLoadoutSelectFile::BuildLegend(false, 0, true, FirstKeys, FirstPad);
+			TraceLoadoutSelectFile::BuildLegend(false, 2, true, LaterKeys, LaterPad);
+			TraceLoadoutSelectFile::BuildLegend(false, 2, false, NoPadKeys, NoPadPad);
+			Check(TEXT("*** legend: BKSP / B BACK on the tabs after the first ***"),
+				!HasItem(FirstKeys, KeyBack, BackWord) && !HasItem(FirstPad, PadBack, BackWord)
+					&& HasItem(LaterKeys, KeyBack, BackWord) && HasItem(LaterPad, PadBack, BackWord),
+				TEXT("BACKSPACE and pad B step back a tab and the legend never said so"));
+			Check(TEXT("*** legend: the pad line has Y LOAD and LT + Y SAVE; no pad, no pad line ***"),
+				HasItem(LaterPad, TRACE_TEXT("LOADOUT.PAD_KEY_LOAD", "Y"), TRACE_TEXT("LOADOUT.LEGEND_LOAD", "LOAD"))
+					&& HasItem(LaterPad, TRACE_TEXT("LOADOUT.PAD_KEY_STORE", "LT + Y"), TRACE_TEXT("LOADOUT.LEGEND_STORE", "SAVE"))
+					&& NoPadPad.Num() == 0 && NoPadKeys.Num() == LaterKeys.Num(),
+				FString::Printf(TEXT("pad line %d items, keyboard %d, no-pad pad line %d"), LaterPad.Num(),
+					LaterKeys.Num(), NoPadPad.Num()));
+
+			// CONTROLLER INPUT OFF: the page ignores the pad, so it names no pad button either.
+			APlayerController* const HintPC = Cast<APlayerController>(Subject->GetOwningController());
+			if (HintPC != nullptr && TracePadMenu::HasSeenPad(HintPC))
+			{
+				UTraceUserSettings& PadSettings = UTraceUserSettings::Get();
+				const bool bPadWas = PadSettings.bPadEnabled;
+				PadSettings.bPadEnabled = true;
+				const bool bHintsOn = TraceLoadoutSelectFile::PadHintsShown(HintPC);
+				PadSettings.bPadEnabled = false;
+				const bool bHintsOff = TraceLoadoutSelectFile::PadHintsShown(HintPC);
+				PadSettings.bPadEnabled = bPadWas;
+				Check(TEXT("pad chips and line with CONTROLLER INPUT on, none with it off"), bHintsOn && !bHintsOff,
+					FString::Printf(TEXT("on %d, off %d"), bHintsOn ? 1 : 0, bHintsOff ? 1 : 0));
+			}
+			else
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[LoadoutScreen]   (no pad seen on this machine; the CONTROLLER INPUT hint check did not run)"));
+			}
+		}
+
+		// ---- A PAD CAN LOAD AND SAVE THE SAVED LOADOUTS -------------------------------------------
+		//
+		// 1-5 and SHIFT+1-5 are keyboard keys and the slots are pointer targets; a pad could reach
+		// neither. Y loads the next usable slot, LT + Y saves. Slots set up and put back here.
+		{
+			UTraceUserSettings& Settings = UTraceUserSettings::Get();
+			TArray<FTraceLoadout> SavedBefore;
+			for (int32 Index = 0; Index < UTraceUserSettings::SavedLoadoutCount; ++Index)
+			{
+				SavedBefore.Add(Settings.GetSavedLoadout(Index));
+			}
+
+			FTraceLoadout SlotB;
+			SlotB.Movement  = ETraceAbilityId::JetBoots;
+			SlotB.Passive   = ETraceAbilityId::Blasters;
+			SlotB.Activated = ETraceAbilityId::Ripple;
+			FTraceLoadout Illegal = Wanted;
+			Illegal.Passive = ETraceAbilityId::StickyGloves;   // a movement ability in the passive slot
+
+			Settings.SetSavedLoadout(0, FTraceLoadout());
+			Settings.SetSavedLoadout(1, Wanted);
+			Settings.SetSavedLoadout(2, FTraceLoadout());
+			Settings.SetSavedLoadout(3, SlotB);
+			Settings.SetSavedLoadout(4, Illegal);
+
+			const FTraceLoadoutKeys PadY = FTraceLoadoutSelect::DebugKeysFor(
+				TArray<FKey>{ EKeys::Gamepad_FaceButton_Top }, false);
+			const FTraceLoadoutKeys PadLtY = FTraceLoadoutSelect::DebugKeysFor(
+				TArray<FKey>{ EKeys::Gamepad_LeftTrigger, EKeys::Gamepad_FaceButton_Top }, false);
+			Check(TEXT("pad Y is the saved-loadout key, LT its SHIFT"),
+				PadY.bSavedNext && !PadY.bShift && PadLtY.bSavedNext && PadLtY.bShift
+					&& TraceLoadoutSelect::ReadsKey(EKeys::Gamepad_FaceButton_Top)
+					&& TraceLoadoutSelect::ReadsKey(EKeys::Gamepad_LeftTrigger),
+				TEXT("and both are the page's, so a press on it cannot come back as ABILITY or PARRY"));
+
+			Subject->ServerSetCharacterSelectOpen(/*bOpen=*/true, 0.f);
+			FTraceLoadoutSelect Page;
+			float Clock = 400.f;
+			auto Frame = [&Page, Subject, &Clock](const FTraceLoadoutKeys& FrameKeys)
+			{
+				Clock += 0.05f;
+				Page.DebugInput(FrameKeys, Subject, /*bInputAllowed=*/true, Clock);
+			};
+			const FTraceLoadoutKeys Nothing;
+			FTraceLoadoutKeys Right;  Right.NavX = 1;
+			FTraceLoadoutKeys Enter;  Enter.bEquip = true;
+
+			Page.DebugBeginInput(Subject);
+			Frame(Nothing);
+			Frame(PadY);
+			Frame(Nothing);
+			const FTraceLoadout FirstY = Page.GetStaged();
+			Frame(PadY);
+			Frame(Nothing);
+			const FTraceLoadout SecondY = Page.GetStaged();
+			Frame(PadY);
+			Frame(Nothing);
+			const FTraceLoadout ThirdY = Page.GetStaged();
+			Check(TEXT("*** pad Y loads slot 2, then 4, then 2 (empty and illegal slots passed) ***"),
+				FirstY == Wanted && SecondY == SlotB && ThirdY == Wanted,
+				FString::Printf(TEXT("%s / %s / %s"), *TraceLoadoutToString(FirstY), *TraceLoadoutToString(SecondY),
+					*TraceLoadoutToString(ThirdY)));
+
+			// Change a card, LT + Y: back into slot 2, the one just loaded.
+			Frame(Right);
+			Frame(Nothing);
+			Frame(Enter);
+			Frame(Nothing);
+			const FTraceLoadout Edited = Page.GetStaged();
+			Frame(PadLtY);
+			Frame(Nothing);
+			Check(TEXT("*** pad LT + Y saves back into the slot just loaded ***"),
+				Edited != Wanted && Settings.GetSavedLoadout(1) == Edited && Settings.GetSavedLoadout(0).IsEmpty(),
+				FString::Printf(TEXT("slot 2 now %s"), *TraceLoadoutToString(Settings.GetSavedLoadout(1))));
+
+			// A fresh opening with nothing loaded: LT + Y goes to the first EMPTY slot, never over one.
+			FTraceLoadoutSelect Fresh;
+			float FreshClock = 500.f;
+			Fresh.DebugBeginInput(Subject);
+			Fresh.DebugInput(Nothing, Subject, true, FreshClock += 0.05f);
+			Fresh.DebugInput(PadLtY, Subject, true, FreshClock += 0.05f);
+			Fresh.DebugInput(Nothing, Subject, true, FreshClock += 0.05f);
+			Check(TEXT("pad LT + Y with nothing loaded saves to the first empty slot"),
+				Settings.GetSavedLoadout(0) == Fresh.GetStaged() && Settings.GetSavedLoadout(1) == Edited
+					&& Settings.GetSavedLoadout(3) == SlotB,
+				FString::Printf(TEXT("slot 1 now %s"), *TraceLoadoutToString(Settings.GetSavedLoadout(0))));
+
+			for (int32 Index = 0; Index < SavedBefore.Num(); ++Index)
+			{
+				Settings.SetSavedLoadout(Index, SavedBefore[Index]);
+			}
+			Subject->ServerSetCharacterSelectOpen(/*bOpen=*/false, 0.f);
+		}
+
+		// ---- TWO PAGES, TWO HOVER SALTS ------------------------------------------------------------
+		//
+		// The match page and the pause menu's LOADOUTS editor draw the same rects in one frame; each
+		// draws under its own salt (Trace.UI.Kit.Verify proves two salts keep two blends).
+		{
+			FTraceLoadoutSelect Other;
+			Check(TEXT("two loadout pages draw under two different hover salts"),
+				Screen.HoverSalt() != 0u && Other.HoverSalt() != 0u && Screen.HoverSalt() != Other.HoverSalt(),
+				FString::Printf(TEXT("0x%08x / 0x%08x"), Screen.HoverSalt(), Other.HoverSalt()));
 		}
 
 		// ---- THE LOCK'S RULE, AS THE SERVER AND THE TEAM SCREEN BOTH ASK IT -------------------------

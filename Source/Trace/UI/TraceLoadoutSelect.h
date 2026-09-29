@@ -34,6 +34,18 @@
 //     back                 BACKSPACE, pad B: the previous tab (match); leave without saving
 //                          (library, where ESC does the same and a BACK plate is on screen)
 //     saved loadouts       1-5 loads, SHIFT+1-5 stores        click / shift-click a slot (match)
+//                          pad Y loads the next saved loadout (in slot order, skipping ones that
+//                          cannot load); LT + Y saves to the slot last loaded or saved here, or to
+//                          the first empty one
+//
+// EVERY KEY THE PAGE NAMES, IT NAMES FOR BOTH DEVICES. The chips beside the tabs and LOCK IN show the
+// keyboard key, and the pad button next to it once a pad has been seen (and CONTROLLER INPUT is on);
+// the legend is a keyboard line with a pad line under it. They used to flip to pad-only the moment
+// any pad input was seen, which left a keyboard player reading LB / RB / X.
+//
+// LOCK IN SAYS SENDING, NOT LOCKED IN, until the server answers. The server closes the window when it
+// accepts (the page then fades out on LOCKED IN) and sends ClientLockInRefused when it does not, which
+// the page turns into a terse reason with the page still up and working.
 //
 // The first build of this page had ENTER lock in whatever was STAGED while the arrows only moved a
 // highlight, so a keyboard or pad player could not change a single ability: they arrowed to SUSPEND,
@@ -128,8 +140,11 @@ struct FTraceLoadoutKeys
 	bool bBack = false;      // BACKSPACE, pad B (and ESC in library mode)
 	bool bTabLeft = false;   // Q, pad LB
 	bool bTabRight = false;  // E, pad RB
-	bool bShift = false;
+	bool bShift = false;     // SHIFT, pad LT: turns a load into a save
 	bool bNumber[5] = { false, false, false, false, false };
+
+	/** Pad Y: load the next saved loadout (with LT held: save). The pad has no number keys. */
+	bool bSavedNext = false;
 
 	/**
 	 * ESC's engine press EVENT this frame (library mode only). MENU/START's synthetic Escape is a
@@ -141,7 +156,7 @@ struct FTraceLoadoutKeys
 	static FTraceLoadoutKeys AllHeld()
 	{
 		FTraceLoadoutKeys Keys;
-		Keys.bEquip = Keys.bLock = Keys.bBack = Keys.bTabLeft = Keys.bTabRight = true;
+		Keys.bEquip = Keys.bLock = Keys.bBack = Keys.bTabLeft = Keys.bTabRight = Keys.bSavedNext = true;
 		for (bool& bDigit : Keys.bNumber)
 		{
 			bDigit = true;
@@ -253,6 +268,23 @@ struct TRACE_API FTraceLoadoutSelect
 	/** What would wear the hover look if the page drew now. */
 	FTraceLoadoutLit DebugLit() const { return ResolveLit(); }
 
+	/** The status line as it stands (SENDING, LOCKED IN, a refusal, LOADED 2...). */
+	const FString& DebugMessage() const { return LastMessage; }
+
+	/** The in-match title the last Tick chose, and whether it drew the half-time score and note. */
+	const FString& DebugTitle() const { return PageTitle; }
+	bool DebugHalfTimeHeader() const { return bHalfTimeHeader; }
+
+	/** The hover salt this page draws under (TraceMenuKit::FScopedHoverSalt): one per instance. */
+	uint32 HoverSalt() const;
+
+	/**
+	 * The type sizes DrawCard would use for EVERY card of EVERY tab at this view: one name size and
+	 * one description size per card, tab by tab, in grid order. Unnamed cards report a name size of 0.
+	 */
+	void DebugTypeSizes(float InViewW, float InViewH, float InUIScale, TArray<float>& OutNameSizes,
+		TArray<float>& OutBodySizes);
+
 	/** The most cards one tab can hold: the grid is Columns x Rows. */
 	static constexpr int32 MaxCards = 10;
 
@@ -282,12 +314,28 @@ private:
 	void Confirm(ATracePlayerState* LocalState);
 	void Recall(int32 Index);
 	void Store(int32 Index);
+
+	/** Pad Y: the next saved loadout that can load, after the one last loaded or saved here. */
+	void RecallNext();
+
+	/** Pad LT + Y: the slot last loaded or saved here, else the first empty one. */
+	void StoreCurrent();
+
+	/** A refusal of the LOCK IN this page sent, if ClientLockInRefused has brought one since. */
+	void ReadLockInReply(const ATracePlayerState* LocalState);
+
 	void SetMessage(const FString& Text, bool bWarning);
+
+	/** The grid's tile size at the current view. */
+	void GridTile(float& OutTileW, float& OutTileH) const;
+
+	/** ONE name size and ONE description size for every card on every tab, solved once per layout. */
+	void SolveTypeSizes(float TileW, float TileH);
 
 	void Draw(AHUD* HUD, APlayerController* PC, const ATracePlayerState* LocalState, const FString& Title);
 	void DrawHeader(AHUD* HUD, const ATracePlayerState* LocalState, const FString& Title);
 	void DrawTabs(AHUD* HUD, APlayerController* PC, float X, float Y, float W);
-	void DrawGrid(AHUD* HUD, float X, float Y, float W, float H);
+	void DrawGrid(AHUD* HUD, float X, float Y);   // the grid's size is the layout's (GridTile)
 	void DrawCard(AHUD* HUD, int32 Index, float X, float Y, float W, float H, float NameSize,
 		float TabBodySize, float BodyRoom);
 	void DrawActionRow(AHUD* HUD, APlayerController* PC, float X, float Y, float W);
@@ -312,6 +360,24 @@ private:
 
 	/** ENTER / A just equipped on the last tab: LOCK IN glows to say what is left to do. */
 	bool bLockHint = false;
+
+	/**
+	 * A LOCK IN has gone to the server and not been answered. RefusalsSeen is the component's refusal
+	 * count at the send, and SentLoadout what was sent, so a close of the window can tell "accepted"
+	 * from "the deadline shut it while the request was in flight".
+	 */
+	bool bLockSent = false;
+	int32 RefusalsSeen = 0;
+	FTraceLoadout SentLoadout;
+
+	/** The saved slot this opening last loaded or stored: where pad Y goes on from and LT + Y saves to. */
+	int32 LastSavedSlot = INDEX_NONE;
+
+	/** The in-match title (BUILD YOUR LOADOUT, or HALF TIME in the break), chosen by Tick. */
+	FString PageTitle;
+
+	/** The break's header: the score and SIDES SWITCHED beside the title. */
+	bool bHalfTimeHeader = false;
 
 	int32 LibrarySlot = INDEX_NONE;
 
@@ -389,11 +455,16 @@ private:
 	};
 	FWrapCache WrapCache[MaxCards];
 
-	/** One name size per tab, the smallest any of its names needs, so a grid's names all match. */
-	float NameFitSize[static_cast<int32>(ETraceLoadoutSlot::Count)] = { -1.f, -1.f, -1.f };
-	float NameFitWidth[static_cast<int32>(ETraceLoadoutSlot::Count)] = { -1.f, -1.f, -1.f };
-
-	/** ...and one description size per tab, the largest at which every card's words fit. */
-	float BodyFitSize[static_cast<int32>(ETraceLoadoutSlot::Count)] = { -1.f, -1.f, -1.f };
-	float BodyFitRoom[static_cast<int32>(ETraceLoadoutSlot::Count)] = { -1.f, -1.f, -1.f };
+	/**
+	 * ONE NAME SIZE FOR THE WHOLE SCREEN, the smallest any name on any tab needs, and ONE DESCRIPTION
+	 * SIZE, the largest at which every card on every tab fits. They were solved per tab, so switching
+	 * tab visibly rescaled the cards (names 13 / 12 / 18 px caps, bodies 14 / 10 / 11). Re-solved only
+	 * when the tile or the description face changes.
+	 */
+	float NameFitSize = -1.f;
+	float BodyFitSize = -1.f;
+	float BodyFitRoom = -1.f;
+	float FitTileW = -1.f;
+	float FitTileH = -1.f;
+	ETraceTextWeight FitWeight = ETraceTextWeight::Light;
 };

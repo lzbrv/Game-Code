@@ -708,7 +708,13 @@ void UTraceAbilityComponent::ServerRequestSetLoadout_Implementation(FTraceLoadou
 {
 	if (!ServerSetLoadout(NewLoadout))
 	{
-		return;   // refused: locked, or an illegal pair. The screen stays up and says why.
+		// REFUSED: locked, or an illegal pair. The page stays up and says why — which it can only do
+		// if it is TOLD. This used to return in silence, and the page kept saying LOCKED IN. The lock
+		// is asked again rather than threaded out of ServerSetLoadout: it is the only refusal that
+		// does not depend on the loadout, so "still open" means the loadout itself was the problem.
+		const ETraceLockInRefusal Why = IsLoadoutChangeOpen() ? ETraceLockInRefusal::Illegal : ETraceLockInRefusal::Locked;
+		ClientLockInRefused(static_cast<uint8>(Why));
+		return;
 	}
 
 	// *** LOCKING IN CLOSES THE SCREEN. WITHOUT THIS THE GAME IS UNPLAYABLE. ***
@@ -729,6 +735,17 @@ void UTraceAbilityComponent::ServerRequestSetLoadout_Implementation(FTraceLoadou
 		OwningState->ServerMarkCharacterResolved(/*bLocked=*/true, /*bWasChosen=*/true);
 		OwningState->ServerSetCharacterSelectOpen(/*bOpen=*/false, /*DeadlineServerTime=*/0.f);
 	}
+}
+
+void UTraceAbilityComponent::ClientLockInRefused_Implementation(uint8 Refusal)
+{
+	// A byte off the wire: anything unknown reads as the loadout's own fault, never as "no refusal".
+	LastLockInRefusal = (Refusal == static_cast<uint8>(ETraceLockInRefusal::Locked))
+		? ETraceLockInRefusal::Locked : ETraceLockInRefusal::Illegal;
+	++LockInRefusalCount;
+	UE_LOG(LogTraceGame, Log, TEXT("[Loadout] %s: the server refused LOCK IN (%s)."),
+		*GetNameSafe(GetOwningPlayerState()),
+		(LastLockInRefusal == ETraceLockInRefusal::Locked) ? TEXT("locked") : TEXT("not a legal loadout"));
 }
 
 void UTraceAbilityComponent::OnRep_CharacterId()
