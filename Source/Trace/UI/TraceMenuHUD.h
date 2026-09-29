@@ -1046,6 +1046,20 @@ private:
 	FVector2D JoinVerifyRestPoint = FVector2D::ZeroVector;
 
 	/**
+	 * Where the pointer is as far as the harness knows: sampled when the run starts, and read back
+	 * after every move the harness makes (JoinVerifyMovePointer). Anything else moving it is outside
+	 * the run — see TickJoinVerify.
+	 */
+	FVector2D JoinVerifyPointerAt = FVector2D::ZeroVector;
+	bool bJoinVerifyPointerKnown = false;
+
+	/** Why the run stopped as INVALID, when something outside it moved the pointer. Empty otherwise. */
+	FString JoinVerifyInvalidReason;
+
+	/** The harness's only way to move the pointer: moves it and records where it now reads. */
+	void JoinVerifyMovePointer(APlayerController* PC, const FVector2D& Where);
+
+	/**
 	 * The quit part's safety net: while true QuitGame logs and counts instead of closing the game, so
 	 * a build where Escape still quits FAILS the harness instead of ending it.
 	 */

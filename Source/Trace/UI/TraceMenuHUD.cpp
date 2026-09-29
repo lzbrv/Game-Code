@@ -1681,6 +1681,12 @@ namespace TraceMenuJoinVerify
 	static constexpr float TwitchPx = 1.f;
 	static constexpr float NudgePx  = 6.f;
 
+	/**
+	 * A pointer further than this from where the harness last put it was moved by something else. The
+	 * rows follow any move over 2 px, so a smaller one cannot have moved the highlight.
+	 */
+	static constexpr float ForeignMovePx = 2.f;
+
 	static FAutoConsoleCommandWithWorldAndArgs CmdMenuJoinVerify(
 		TEXT("Trace.Menu.JoinVerify"),
 		TEXT("Dev only. Trace.Menu.JoinVerify [join|quit|click] - the title screen's harness, all three parts ")
@@ -1904,6 +1910,8 @@ void ATraceMenuHUD::BeginJoinVerify(const FString& Parts)
 	JoinVerifySavedAddress = LastJoinAddress;
 	JoinVerifySavedDifficulty = Difficulty;
 	JoinVerifyFailures = 0;
+	bJoinVerifyPointerKnown = false;   // the first tick samples where the pointer starts
+	JoinVerifyInvalidReason.Reset();
 	JoinVerifyStep = JoinVerifyNextPart(0);
 	JoinVerifyStepTime = (GetWorld() != nullptr) ? GetWorld()->GetRealTimeSeconds() : 0.f;
 	UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] ===== the title screen: %s%s%s ====="),
@@ -1955,6 +1963,22 @@ void ATraceMenuHUD::DebugFreshTitleHere()
 	TitleShownTime = Now;
 }
 
+void ATraceMenuHUD::JoinVerifyMovePointer(APlayerController* PC, const FVector2D& Where)
+{
+	if (PC == nullptr)
+	{
+		return;
+	}
+	PC->SetMouseLocation(FMath::RoundToInt(Where.X), FMath::RoundToInt(Where.Y));
+
+	// READ BACK, not assumed: the viewport rounds and scales, and the check in TickJoinVerify compares
+	// against what the title will actually sample, which is this.
+	float ReadX = 0.f;
+	float ReadY = 0.f;
+	JoinVerifyPointerAt = PC->GetMousePosition(ReadX, ReadY) ? FVector2D(ReadX, ReadY) : Where;
+	bJoinVerifyPointerKnown = true;
+}
+
 void ATraceMenuHUD::TickJoinVerify()
 {
 	if (JoinVerifyStep == 0)
@@ -1990,11 +2014,42 @@ void ATraceMenuHUD::TickJoinVerify()
 			bTravelling ? 1 : 0, static_cast<int32>(TravelKind), IsJoinPromptOpen() ? 1 : 0, static_cast<int32>(Selected),
 			Pending() ? 1 : 0, Queued() ? 1 : 0, *JoinEntry.GetText());
 	};
-	const auto ClickAt = [PC](const FBox2D& Rect)
+	const auto ClickAt = [this, PC](const FBox2D& Rect)
 	{
-		const FVector2D Center = Rect.GetCenter();
-		PC->SetMouseLocation(FMath::RoundToInt(Center.X), FMath::RoundToInt(Center.Y));
+		JoinVerifyMovePointer(PC, Rect.GetCenter());
 	};
+
+	// ---- THE POINTER IS THE HARNESS'S, AND ONLY THE HARNESS MOVES IT (R5) --------------------------
+	//
+	// The title's rows follow a moving pointer, which is correct and is part of what this run tests.
+	// But the pointer on this Mac is ONE pointer, shared with every other game running and with the
+	// physical mouse. Once, paired with another game, it drifted down the rows by itself: the
+	// highlight followed it, QUIT GAME? was dropped "because the highlight moved off QUIT" 160 ms after
+	// an Escape, and every quit check after that ran one step out of phase — twelve FAILs, and nothing
+	// wrong with the title. Checked every frame, before this frame's step judges anything: a pointer
+	// that is not where the harness last put it stops the run INVALID and says so.
+	{
+		float PointerX = 0.f;
+		float PointerY = 0.f;
+		if (JoinVerifyStep < TraceMenuJoinVerify::DoneStep && PC->GetMousePosition(PointerX, PointerY))
+		{
+			const FVector2D PointerNow(PointerX, PointerY);
+			if (!bJoinVerifyPointerKnown)
+			{
+				JoinVerifyPointerAt = PointerNow;
+				bJoinVerifyPointerKnown = true;
+			}
+			else if (FVector2D::Distance(PointerNow, JoinVerifyPointerAt) > TraceMenuJoinVerify::ForeignMovePx)
+			{
+				JoinVerifyInvalidReason = FString::Printf(
+					TEXT("the pointer moved from (%.0f, %.0f) to (%.0f, %.0f) at step %d and the harness did not move it: "
+					     "another game on this Mac moved the shared pointer, or the mouse did. Run pointer harnesses one "
+					     "at a time, hands off the mouse"),
+					JoinVerifyPointerAt.X, JoinVerifyPointerAt.Y, PointerNow.X, PointerNow.Y, JoinVerifyStep);
+				JoinVerifyStep = TraceMenuJoinVerify::DoneStep;
+			}
+		}
+	}
 
 	switch (JoinVerifyStep)
 	{
@@ -2408,7 +2463,7 @@ void ATraceMenuHUD::TickJoinVerify()
 		// Rest again, then TWITCH: under the 2 px a settled pointer must travel. The negative control.
 		DebugRestPointerHere();
 		Selected = ETraceMenuRow::Play;
-		PC->SetMouseLocation(FMath::RoundToInt(LastCursorPos.X + TraceMenuJoinVerify::TwitchPx), FMath::RoundToInt(LastCursorPos.Y));
+		JoinVerifyMovePointer(PC, FVector2D(LastCursorPos.X + TraceMenuJoinVerify::TwitchPx, LastCursorPos.Y));
 		Advance();
 		break;
 
@@ -2424,7 +2479,7 @@ void ATraceMenuHUD::TickJoinVerify()
 		// Rest here, then NUDGE: well under the 30 px the settling window asks for, well over 2.
 		DebugRestPointerHere();
 		Selected = ETraceMenuRow::Play;
-		PC->SetMouseLocation(FMath::RoundToInt(LastCursorPos.X + TraceMenuJoinVerify::NudgePx), FMath::RoundToInt(LastCursorPos.Y));
+		JoinVerifyMovePointer(PC, FVector2D(LastCursorPos.X + TraceMenuJoinVerify::NudgePx, LastCursorPos.Y));
 		Advance();
 		break;
 
@@ -2487,7 +2542,7 @@ void ATraceMenuHUD::TickJoinVerify()
 		}
 		Check(TEXT("...and still PLAY once the title has settled"), Selected == ETraceMenuRow::Play,
 			FString::Printf(TEXT("row=%d, %.1f s after the title came up"), static_cast<int32>(Selected), Now - TitleShownTime));
-		PC->SetMouseLocation(FMath::RoundToInt(LastCursorPos.X + TraceMenuJoinVerify::NudgePx), FMath::RoundToInt(LastCursorPos.Y));
+		JoinVerifyMovePointer(PC, FVector2D(LastCursorPos.X + TraceMenuJoinVerify::NudgePx, LastCursorPos.Y));
 		Advance();
 		break;
 
@@ -2525,7 +2580,7 @@ void ATraceMenuHUD::TickJoinVerify()
 		// Park the pointer where BACK will be, with the prompt shut, so it RESTS there when it opens.
 		JoinVerifyRestPoint = JoinButtonRects[TraceMenuHUDJoin::Back].GetCenter();
 		CloseJoinPrompt(TEXT("JoinVerify park"));
-		PC->SetMouseLocation(FMath::RoundToInt(JoinVerifyRestPoint.X), FMath::RoundToInt(JoinVerifyRestPoint.Y));
+		JoinVerifyMovePointer(PC, JoinVerifyRestPoint);
 		Advance();
 		break;
 
@@ -2552,7 +2607,7 @@ void ATraceMenuHUD::TickJoinVerify()
 				FString::Printf(TEXT("prompt %d, pointer on BACK %d, BACK lit %d"), IsJoinPromptOpen() ? 1 : 0,
 					BackRect.IsInside(LastCursorPos) ? 1 : 0, IsJoinButtonLit(TraceMenuHUDJoin::Back, BackRect) ? 1 : 0));
 		}
-		PC->SetMouseLocation(FMath::RoundToInt(LastCursorPos.X + TraceMenuJoinVerify::NudgePx), FMath::RoundToInt(LastCursorPos.Y));
+		JoinVerifyMovePointer(PC, FVector2D(LastCursorPos.X + TraceMenuJoinVerify::NudgePx, LastCursorPos.Y));
 		Advance();
 		break;
 
@@ -2605,7 +2660,19 @@ void ATraceMenuHUD::TickJoinVerify()
 	}
 	JoinVerifyStep = 0;
 
-	if (JoinVerifyFailures == 0)
+	if (!JoinVerifyInvalidReason.IsEmpty() && JoinVerifyFailures == 0)
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[JoinVerify] VERDICT: INVALID — %s. Nothing after that is evidence either way."),
+			*JoinVerifyInvalidReason);
+	}
+	else if (!JoinVerifyInvalidReason.IsEmpty())
+	{
+		// The failures came BEFORE the pointer moved (it is checked every frame, ahead of the step), so
+		// they are the title's own.
+		UE_LOG(LogTraceGame, Error, TEXT("[JoinVerify] VERDICT: FAIL — %d check(s) failed, and then the run stopped: %s."),
+			JoinVerifyFailures, *JoinVerifyInvalidReason);
+	}
+	else if (JoinVerifyFailures == 0)
 	{
 		UE_LOG(LogTraceGame, Display, TEXT("[JoinVerify] VERDICT: PASS — %s%s%s"),
 			(JoinVerifyParts & TraceMenuJoinVerify::PartJoin) ? TEXT("Escape and CANCEL call a join off (the engine's pending connection is dropped) and the prompt comes back. ") : TEXT(""),
