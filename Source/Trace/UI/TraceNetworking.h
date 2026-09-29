@@ -199,6 +199,19 @@ namespace TraceNet
 	TRACE_API void ForgetJoinAttempt();
 
 	/**
+	 * The join the title screen was dialling ARRIVED: this machine is now a guest in the host's match
+	 * (the match HUD's BeginPlay, on a client). Forgets the attempt, so a failure later in the match — the
+	 * host leaving, the connection dropping — is reported as what it is and not as a failed JOIN.
+	 */
+	TRACE_API void NoteJoinArrived();
+
+	/** A JOIN is being dialled: noted, and not yet arrived, cancelled or consumed. For the harness. */
+	TRACE_API bool IsJoinAttemptPending();
+
+	/** How many JOINs this process has started dialling (NoteJoinAttempt). For the harness. */
+	TRACE_API int32 GetJoinAttemptCount();
+
+	/**
 	 * True once, when the last failure belongs to the last JOIN attempt: it happened after the
 	 * attempt started, within the connect window, and recently. Clears the attempt either way, so it
 	 * answers once per title screen. The title screen uses it to put the player back in the JOIN

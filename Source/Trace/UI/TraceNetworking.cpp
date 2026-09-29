@@ -424,16 +424,46 @@ namespace TraceNetJoinAttempt
 
 	/** A failure older than this when the title comes back is stale. */
 	static constexpr double FreshSeconds = 60.0;
+
+	/** How many JOINs this process has started dialling. Only Trace.Net.FailureVerify reads it. */
+	static int32 NotedCount = 0;
 }
 
 void NoteJoinAttempt()
 {
 	TraceNetJoinAttempt::StartTime = FPlatformTime::Seconds();
+	++TraceNetJoinAttempt::NotedCount;
 }
 
 void ForgetJoinAttempt()
 {
 	TraceNetJoinAttempt::StartTime = -1.0;
+}
+
+void NoteJoinArrived()
+{
+	// THE JOIN IS OVER THE MOMENT IT ARRIVES. The attempt used to stay armed until the next title
+	// screen consumed it, so a guest who got in and played was still "joining" for the whole connect
+	// window: a host who left 90 s into the match raised HOST LEFT, and the guest's title screen took
+	// that for a failed join — it reopened the JOIN prompt on the dead host's address, and Enter
+	// re-dialled a host that had just gone.
+	if (TraceNetJoinAttempt::StartTime < 0.0)
+	{
+		return;
+	}
+	UE_LOG(LogTraceGame, Display, TEXT("[Net] The JOIN arrived %.1fs after CONNECT; a later failure is a dropped match, not a failed join."),
+		FPlatformTime::Seconds() - TraceNetJoinAttempt::StartTime);
+	TraceNetJoinAttempt::StartTime = -1.0;
+}
+
+bool IsJoinAttemptPending()
+{
+	return TraceNetJoinAttempt::StartTime >= 0.0;
+}
+
+int32 GetJoinAttemptCount()
+{
+	return TraceNetJoinAttempt::NotedCount;
 }
 
 bool ConsumeFailedJoin(FString& OutHeadline)

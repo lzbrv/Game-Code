@@ -1024,6 +1024,14 @@ void ATraceHUD::BeginPlay()
 	// from the console), and a mid-match disconnect has to be reported on those paths too.
 	TraceNet::BindFailureHandlers();
 
+	// A guest's match HUD coming up IS the title's JOIN arriving. Forgotten here, so a failure later in
+	// the match (the host leaving, the line dropping) sends the guest to a title that shows the banner,
+	// not to one that reopens JOIN on the address of a host that has gone. See NoteJoinArrived.
+	if (GetNetMode() == NM_Client)
+	{
+		TraceNet::NoteJoinArrived();
+	}
+
 	// One Display line naming the net mode, the endpoint and every local adapter. This is the line
 	// anyone debugging a failed playtest will be asked for first, so it is emitted unconditionally
 	// rather than behind a cvar nobody sets before playing.

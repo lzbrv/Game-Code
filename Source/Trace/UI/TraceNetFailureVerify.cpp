@@ -21,6 +21,11 @@
 // Headless recipe (live play, so the feed is not under the team / loadout screens):
 //   <Arena_Baked>?listen -TraceExecAt=10 -TraceExec="Trace.Teams.Close|Trace.Loadout.Press wait=3,lock"
 //   -TraceExec2At=20 -TraceExec2="Trace.Net.FailureVerify"
+//
+// `joined` is a separate run, on a GUEST: a JOIN that arrived is no longer pending, so a HOST LEFT in the
+// match is not taken for a failed join. Host: /Game/Maps/Arena?listen -port=<P>. Guest: /Game/Maps/MainMenu
+//   -TraceExecOn=Menu -TraceExecAt=4 -TraceExec="Trace.Menu.JoinOnce 127.0.0.1:<P>"
+//   -TraceExec2On=Match -TraceExec2At=8 -TraceExec2="Trace.Net.FailureVerify joined"
 
 #include "CoreMinimal.h"
 
@@ -324,8 +329,55 @@ namespace TraceNetFailureVerify
 		}
 	}
 
+	/**
+	 * `joined`, on a GUEST that came in through the title's JOIN prompt (Trace.Menu.JoinOnce): the join is
+	 * over once the guest is in the match. Two claims, each failed by the code before NoteJoinArrived:
+	 * the attempt is no longer pending, and a HOST LEFT raised now — inside the 150 s connect window,
+	 * which is where a short match or an early RETURN TO TITLE puts it — is not taken for a failed join
+	 * by the title screen's own test (ConsumeFailedJoin, what the next title's BeginPlay asks).
+	 */
+	static void RunJoined(UWorld* WorldPtr)
+	{
+		UE_LOG(LogTraceGame, Display, TEXT("[NetFailVerify] ===== a JOIN that arrived is over ====="));
+		if (WorldPtr == nullptr || WorldPtr->GetNetMode() != NM_Client)
+		{
+			UE_LOG(LogTraceGame, Error, TEXT("[NetFailVerify] VERDICT: ===== *** FAIL *** INCONCLUSIVE: 'joined' runs on a guest in a match ====="));
+			return;
+		}
+		if (TraceNet::GetJoinAttemptCount() == 0)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[NetFailVerify] VERDICT: ===== *** FAIL *** INCONCLUSIVE: this guest did not come in through the JOIN prompt ")
+				TEXT("(start it on the title with Trace.Menu.JoinOnce <host>) ====="));
+			return;
+		}
+
+		FRun Run;
+		Run.World = WorldPtr;
+		const bool bPending = TraceNet::IsJoinAttemptPending();
+		Report(Run, !bPending, TEXT("the JOIN that brought this guest in is no longer pending"),
+			FString::Printf(TEXT("pending %d, joins dialled this process %d"), bPending ? 1 : 0, TraceNet::GetJoinAttemptCount()));
+
+		// The failure the finding names: the host leaves. ReportHostLeft is the call ClientHostLeft makes.
+		TraceNet::ReportHostLeft();
+		FString Headline;
+		const bool bTakenForJoin = TraceNet::ConsumeFailedJoin(Headline);
+		TraceNet::ClearFailure();
+		Report(Run, !bTakenForJoin,
+			TEXT("*** a HOST LEFT in the match is not taken for a failed JOIN (the title shows the banner, not the prompt) ***"),
+			bTakenForJoin ? FString::Printf(TEXT("the title would reopen JOIN with \"%s\" under the field"), *Headline)
+			              : FString(TEXT("not a failed join")));
+		Finish(Run);
+	}
+
 	static void Start(const TArray<FString>& Args, UWorld* WorldPtr)
 	{
+		if (Args.Contains(TEXT("joined")))
+		{
+			RunJoined(WorldPtr);
+			return;
+		}
+
 		// raise: only raise the client timeout through the engine's delegate, and stop. For photographing
 		// the banners on any screen, the title's included (which this harness cannot otherwise run on).
 		if (Args.Contains(TEXT("raise")))
@@ -371,7 +423,9 @@ namespace TraceNetFailureVerify
 		TEXT("client timeout (raised through the engine's own delegate) draws that line and none of the ")
 		TEXT("engine's text; a guest's timeout on a listen host records nothing and draws nothing; and a ")
 		TEXT("guest's Logout draws \"<NAME> LEFT\" in the kill feed. Run in live play; ?listen for claim 3. ")
-		TEXT("hold=<s> keeps the banner up for a screenshot; 'raise' only raises the client timeout (any screen)."),
+		TEXT("hold=<s> keeps the banner up for a screenshot; 'raise' only raises the client timeout (any screen). ")
+		TEXT("'joined', on a guest that came in through the JOIN prompt: the join is no longer pending, and a HOST ")
+		TEXT("LEFT in the match is not taken for a failed join."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
 }
 
