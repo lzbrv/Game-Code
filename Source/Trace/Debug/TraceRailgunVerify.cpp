@@ -21,6 +21,7 @@
 #if !UE_BUILD_SHIPPING
 
 #include "Core/TraceCharacter.h"
+#include "Debug/TraceFixtureCore.h"     // Verify keeps the Core off the local player while it runs
 #include "Trace.h"
 #include "Gameplay/TraceRailgunFireCurve.h"
 
@@ -202,7 +203,20 @@ namespace TraceRailgunVerifyLocal
 		float FireAmber = -1.f;
 		float FireRailY = 0.f;
 		FTimerHandle Handle;
+
+		/**
+		 * The local player's hands, kept free of the Core for the run (TraceFixtureCore). A carrier's
+		 * viewmodel is hidden, so the fire pose never reaches the rig and the verdict used to read
+		 * FAIL with nothing wrong in the railgun.
+		 */
+		TraceFixtureCore::FClearOfCore CoreClear;
 	};
+
+	/**
+	 * How long after the Core comes off the local player before the first sample: the view blends
+	 * back to first person and the rig comes back over ViewBlendSeconds (0.35 s).
+	 */
+	constexpr float CoreSettleSeconds = 1.0f;
 
 	FVerifyState GVerify;
 
@@ -214,6 +228,12 @@ namespace TraceRailgunVerifyLocal
 		UE_LOG(LogTraceGame, Warning, TEXT("[Railgun] screenshot -> %s"), *Path);
 	}
 
+	/** Every exit that prints a verdict: the Core goes back as the run found it. */
+	void ReturnCore()
+	{
+		UE_LOG(LogTraceGame, Warning, TEXT("[Railgun] Core: %s."), *TraceFixtureCore::EndClearOfCore(GVerify.CoreClear));
+	}
+
 	void VerifyStep(UWorld* World)
 	{
 		ATraceCharacter* Character = FindLocalCharacter(World);
@@ -221,6 +241,18 @@ namespace TraceRailgunVerifyLocal
 		{
 			UE_LOG(LogTraceGame, Error,
 				TEXT("[Railgun] VERDICT: FAIL - no railgun rig to verify."));
+			ReturnCore();
+			return;
+		}
+
+		// A carrier has no gun on screen, so nothing below could move. If the Core could not be taken
+		// off him (a client, say), say so instead of reporting a railgun that does not animate.
+		if (GVerify.Step == 0 && Character->IsCarrier())
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[Railgun] VERDICT: INVALID - the local player is carrying the Core, so the viewmodel is "
+				     "hidden and the fire pose cannot be measured. This says nothing about the railgun."));
+			ReturnCore();
 			return;
 		}
 
@@ -287,6 +319,7 @@ namespace TraceRailgunVerifyLocal
 				bRails ? TEXT("PASS") : TEXT("FAIL"), GVerify.RestRailY, GVerify.FireRailY, Spread);
 			UE_LOG(LogTraceGame, Warning, TEXT("[Railgun] VERDICT: %s"),
 				(bGlow && bRails) ? TEXT("PASS") : TEXT("FAIL"));
+			ReturnCore();
 			return;
 		}
 		}
@@ -307,7 +340,28 @@ namespace TraceRailgunVerifyLocal
 			{
 				return;
 			}
+
+			// A run still in flight when this one starts gives its Core back first; a second End is a
+			// no-op, so this costs nothing when the last run finished normally.
+			World->GetTimerManager().ClearTimer(GVerify.Handle);
+			TraceFixtureCore::EndClearOfCore(GVerify.CoreClear);
 			GVerify = FVerifyState();
+
+			// THE CORE COMES OFF THE LOCAL PLAYER FIRST, and stays off him until the verdict. In a
+			// batch a bot on his own team throws it to him while he stands idle between harnesses and
+			// he never lets go.
+			if (ATraceCharacter* Character = FindLocalCharacter(World))
+			{
+				UE_LOG(LogTraceGame, Warning, TEXT("[Railgun] Core: %s."),
+					*TraceFixtureCore::BeginClearOfCore(World, Character, GVerify.CoreClear));
+			}
+
+			if (GVerify.CoreClear.bTookItOff)
+			{
+				World->GetTimerManager().SetTimer(GVerify.Handle,
+					FTimerDelegate::CreateStatic(&VerifyStep, World), CoreSettleSeconds, /*bLoop=*/false);
+				return;
+			}
 			VerifyStep(World);
 		}));
 

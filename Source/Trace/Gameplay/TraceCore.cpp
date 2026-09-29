@@ -24,6 +24,7 @@
 #include "World/TraceArenaBuilder.h"
 
 #include "Gameplay/TraceEndzone.h"
+#include "Debug/TraceFixtureCore.h"         // GatherCharacters leaves out a pawn a harness keeps clear of the Core
 
 #include "Gameplay/TraceCoreInternal.h"   // the tuning tables, the art table and this file's console
                                           // variables, shared with TraceCoreHarness.cpp
@@ -3504,22 +3505,33 @@ void ATraceCore::GatherCharacters(TArray<ATraceCharacter*>& OutCharacters) const
 				OutCharacters.Add(Character);
 			}
 		}
-
-		if (OutCharacters.Num() > 0)
-		{
-			return;
-		}
 	}
 
 	// The GameMode list is the fast path and is authority-only; clients (which run this for local
 	// pass prediction) always land here.
-	for (TActorIterator<ATraceCharacter> It(World); It; ++It)
+	if (OutCharacters.Num() == 0)
 	{
-		if (ATraceCharacter* Character = *It)
+		for (TActorIterator<ATraceCharacter> It(World); It; ++It)
 		{
-			OutCharacters.Add(Character);
+			if (ATraceCharacter* Character = *It)
+			{
+				OutCharacters.Add(Character);
+			}
 		}
 	}
+
+#if !UE_BUILD_SHIPPING
+	// A HARNESS THAT NEEDS THE LOCAL PLAYER'S HANDS keeps the Core off him while it runs (a carrier
+	// cannot fire, swing, swap or reload): TraceFixtureCore::BeginClearOfCore. Leaving him out of this
+	// roster is the whole of that. The pickup poll, the catch magnet, pass targeting, the pending
+	// kickoff grant and the turnover landing all choose from here, so none of them can pick him until
+	// the harness ends. With no harness running nobody is kept clear and this removes nothing.
+	// RemoveAll, not RemoveAllSwap: callers break ties by roster order.
+	OutCharacters.RemoveAll([](const ATraceCharacter* Listed)
+	{
+		return TraceFixtureCore::IsKeptClearOfCore(Listed);
+	});
+#endif
 }
 
 const TCHAR* TracePassStats::RefusalName(int32 Index)

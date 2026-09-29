@@ -45,6 +45,7 @@
 #include "Gameplay/TraceMelee.h"           // TraceMelee::RequestEquipIfDifferent (spec v13 §2)
 #include "Gameplay/TraceParry.h"           // spec v25 §7 — Trace.Input.VerifyRightMouse's carrier-only proof
 #include "Gameplay/TraceWeaponComponent.h" // RequestReload (spec v16 §1 — the R bind)
+#include "Debug/TraceFixtureCore.h"        // Trace.Ammo.BindTest keeps the Core off the local player
 #include "Modes/TracePracticeRange.h"      // IsActive — no team screen in the range (CanRequestTeamSelect)
 #include "Movement/TraceCharacterMovementComponent.h"   // dash charges, for the HUD accessors
 #include "Settings/TraceUserSettings.h"    // sensitivity, invert-Y and the key bindings
@@ -4771,6 +4772,9 @@ namespace TraceReloadBindTest
 		int32 CountBeforeReal = 0;
 		int32 ClipBeforePress = 0;
 
+		/** The local player's hands, kept free of the Core for the run (TraceFixtureCore). */
+		TraceFixtureCore::FClearOfCore CoreClear;
+
 		void Check(bool bCondition, const FString& What)
 		{
 			if (bCondition)
@@ -4785,6 +4789,23 @@ namespace TraceReloadBindTest
 			}
 		}
 	};
+
+	/**
+	 * How long after the Core comes off the local player before a key is pressed: the view blends
+	 * back to first person and the gun comes back over ViewBlendSeconds (0.35 s).
+	 */
+	constexpr double CoreSettleSeconds = 1.0;
+
+	/** Every way the probe ends: the Core goes back as the probe found it. False, for the ticker. */
+	bool EndProbe(FProbe& Ended)
+	{
+		if (Ended.CoreClear.bBegun)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[Ammo.BindTest] Core: %s."),
+				*TraceFixtureCore::EndClearOfCore(Ended.CoreClear));
+		}
+		return false;
+	}
 
 	void PressKey(UWorld* World, const FKey& Key, const TCHAR* Label)
 	{
@@ -4829,7 +4850,7 @@ namespace TraceReloadBindTest
 			UWorld* TickWorld = WeakWorld.Get();
 			if (TickWorld == nullptr)
 			{
-				return false;
+				return EndProbe(*Probe);
 			}
 			const double Now = FPlatformTime::Seconds();
 			if (Now < Probe->NextStepTime)
@@ -4840,6 +4861,21 @@ namespace TraceReloadBindTest
 			ATracePlayerController* PC = Cast<ATracePlayerController>(TickWorld->GetFirstPlayerController());
 			ATraceCharacter* Pawn = (PC != nullptr) ? Cast<ATraceCharacter>(PC->GetPawn()) : nullptr;
 			UTraceWeaponComponent* Weapon = (Pawn != nullptr) ? Pawn->Weapon : nullptr;
+
+			// THE CORE COMES OFF THE LOCAL PLAYER FIRST, and stays off him until the verdict. In a
+			// batch a bot on his own team throws it to him while he stands idle between harnesses and
+			// he never lets go; this used to wait the full 45 s below and end INVALID. Once, as soon as
+			// there is a living pawn to free.
+			if (Probe->Step == 0 && !Probe->CoreClear.bBegun && Pawn != nullptr && Pawn->IsAlive())
+			{
+				UE_LOG(LogTraceGame, Display, TEXT("[Ammo.BindTest] Core: %s."),
+					*TraceFixtureCore::BeginClearOfCore(TickWorld, Pawn, Probe->CoreClear));
+				if (Probe->CoreClear.bTookItOff)
+				{
+					Probe->NextStepTime = Now + CoreSettleSeconds;
+					return true;
+				}
+			}
 
 			if (PC == nullptr || Pawn == nullptr || Weapon == nullptr || !Pawn->IsAlive()
 				|| Pawn->IsCarrier() || Weapon->IsKnifeEquipped())
@@ -4863,13 +4899,13 @@ namespace TraceReloadBindTest
 							TEXT("[Ammo.BindTest] VERDICT: INVALID — no usable pawn after %.0f s: %s. Nothing was "
 							     "pressed; this says nothing about the R bind."),
 							UsablePawnWaitSeconds, Missing);
-						return false;
+						return EndProbe(*Probe);
 					}
 					return true;
 				}
 				UE_LOG(LogTraceGame, Error,
 					TEXT("[Ammo.BindTest] VERDICT: INVALID — the local pawn stopped being usable mid-probe."));
-				return false;
+				return EndProbe(*Probe);
 			}
 
 			// ...AND WAIT FOR GAMEPLAY INPUT TO BE LIVE, which is the same trap the v13 §2 probe
@@ -4894,7 +4930,7 @@ namespace TraceReloadBindTest
 							     "SUPPRESSED (a menu or the loadout screen is open), so a press would be swallowed. "
 							     "Nothing was pressed; this says nothing about the R bind."),
 							UsablePawnWaitSeconds);
-						return false;
+						return EndProbe(*Probe);
 					}
 					return true;
 				}
@@ -4902,7 +4938,7 @@ namespace TraceReloadBindTest
 					TEXT("[Ammo.BindTest] VERDICT: INVALID — gameplay input was suppressed mid-probe (a menu or "
 					     "the character-select screen came up), so a swallowed press cannot be told from a "
 					     "broken bind."));
-				return false;
+				return EndProbe(*Probe);
 			}
 
 			switch (Probe->Step)
@@ -4972,7 +5008,7 @@ namespace TraceReloadBindTest
 					UE_LOG(LogTraceGame, Error, TEXT("[Ammo.BindTest] VERDICT: *** FAIL *** — %d passed, %d FAILED."),
 						Probe->Passes, Probe->Failures);
 				}
-				return false;
+				return EndProbe(*Probe);
 			}
 		}));
 	}

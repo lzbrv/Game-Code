@@ -5002,7 +5002,33 @@ namespace TraceDualWeaponTest
 
 		int32 RedFailures = -1;
 		int32 RedWorst = 0;
+
+		/**
+		 * The local player's hands, kept free of the Core for BOTH arms (TraceFixtureCore). Shared
+		 * rather than per-arm: the green arm is chained from the red one, and the Core goes back
+		 * once, when the verdict is printed.
+		 */
+		TSharedPtr<TraceFixtureCore::FClearOfCore> CoreClear;
+
+		/** World time the first census waits for when the Core had to come off him. */
+		double SettleUntil = -1.0;
 	};
+
+	/**
+	 * How long after the Core comes off the local player before anything is asked of his weapon:
+	 * the view blends back to first person and the gun comes back over ViewBlendSeconds (0.35 s).
+	 */
+	constexpr double CoreSettleSeconds = 1.0;
+
+	/** Gives the Core back as the run found it. Called by the exits that print a verdict, only. */
+	void ReturnCore(const TSharedRef<FState>& State)
+	{
+		if (State->CoreClear.IsValid())
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[DualWeapon] Core: %s."),
+				*TraceFixtureCore::EndClearOfCore(*State->CoreClear));
+		}
+	}
 
 	/** One census line. Returns true when BOTH weapons were on screen at once. */
 	bool Sample(const TSharedRef<FState>& State, const UTraceWeaponComponent* Weapon,
@@ -5056,7 +5082,8 @@ namespace TraceDualWeaponTest
 		}
 	}
 
-	void Run(float DelaySeconds, int32 Arm, int32 RedFailures, int32 RedWorst);
+	void Run(float DelaySeconds, int32 Arm, int32 RedFailures, int32 RedWorst,
+		const TSharedPtr<TraceFixtureCore::FClearOfCore>& CoreClear);
 
 	/** Ends one arm, and either chains into the next or prints the combined verdict. */
 	void Report(const TSharedRef<FState>& State)
@@ -5070,6 +5097,7 @@ namespace TraceDualWeaponTest
 		{
 			UE_LOG(LogTraceGame, Warning, TEXT("[DualWeapon] arm %d ABORTED: %s"), State->Arm, *State->AbortReason);
 			RestoreWorld();
+			ReturnCore(State);
 			UE_LOG(LogTraceGame, Warning,
 				TEXT("[DualWeapon] RESULT: *** NOT PROVEN *** — the arm did not complete, so neither number means anything."));
 			return;
@@ -5079,12 +5107,14 @@ namespace TraceDualWeaponTest
 		{
 			// Chain straight into the green arm, carrying the red numbers so one verdict line can
 			// compare them. The latch goes off here and RestoreWorld puts it off again at the end.
+			// The Core stays off the local player across the chain; the green arm's exit returns it.
 			RestoreWorld();
-			Run(1.0f, /*Arm=*/1, State->Failures, State->WorstBothVisible);
+			Run(1.0f, /*Arm=*/1, State->Failures, State->WorstBothVisible, State->CoreClear);
 			return;
 		}
 
 		RestoreWorld();
+		ReturnCore(State);
 
 		UE_LOG(LogTraceGame, Display, TEXT("========== TRACE DUAL-WEAPON TEST (spec v12 s7) =========="));
 		UE_LOG(LogTraceGame, Display,
@@ -5118,12 +5148,14 @@ namespace TraceDualWeaponTest
 		UE_LOG(LogTraceGame, Display, TEXT("=========================================================="));
 	}
 
-	void Run(float DelaySeconds, int32 Arm, int32 RedFailures, int32 RedWorst)
+	void Run(float DelaySeconds, int32 Arm, int32 RedFailures, int32 RedWorst,
+		const TSharedPtr<TraceFixtureCore::FClearOfCore>& CoreClear)
 	{
 		TSharedRef<FState> State = MakeShared<FState>();
 		State->Arm = Arm;
 		State->RedFailures = RedFailures;
 		State->RedWorst = RedWorst;
+		State->CoreClear = CoreClear;
 
 		// Arm 0 puts the bug back. Every exit path below clears it again — including the aborts.
 		if (IConsoleVariable* Legacy = IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Knife.LegacyGunHideLatch")))
@@ -5156,6 +5188,25 @@ namespace TraceDualWeaponTest
 						const double Now = (TestWorld != nullptr) ? TestWorld->GetTimeSeconds() : 0.0;
 						if (State->PhaseStart <= 0.0)
 						{
+							// THE CORE COMES OFF THE LOCAL PLAYER FIRST, and stays off him until the
+							// verdict. In a batch a bot on his own team throws it to him while he stands
+							// idle between harnesses and he never lets go; a carrier cannot swap, so this
+							// used to end NOT PROVEN with nothing wrong in the knife. Once per run: the
+							// green arm arrives with the hold already taken.
+							if (State->CoreClear.IsValid() && !State->CoreClear->bBegun)
+							{
+								UE_LOG(LogTraceGame, Display, TEXT("[DualWeapon] Core: %s."),
+									*TraceFixtureCore::BeginClearOfCore(Character->GetWorld(), Character, *State->CoreClear));
+								if (State->CoreClear->bTookItOff)
+								{
+									State->SettleUntil = Now + CoreSettleSeconds;
+								}
+							}
+							if (Now < State->SettleUntil)
+							{
+								return true;
+							}
+
 							State->PhaseStart = Now;
 
 							if (Character->IsCarrier())
@@ -5317,7 +5368,8 @@ static FAutoConsoleCommand GTraceDualWeaponTestCmd(
 		}
 
 		const float Delay = (Args.Num() > 0) ? FMath::Max(0.f, FCString::Atof(*Args[0])) : 8.f;
-		TraceDualWeaponTest::Run(Delay, /*Arm=*/0, /*RedFailures=*/-1, /*RedWorst=*/0);
+		TraceDualWeaponTest::Run(Delay, /*Arm=*/0, /*RedFailures=*/-1, /*RedWorst=*/0,
+			MakeShared<TraceFixtureCore::FClearOfCore>());
 	}));
 
 // =================================================================================================
@@ -5634,7 +5686,19 @@ namespace TraceKnifeTest
 		bool bStarted = false;
 		bool bAborted = false;
 		FString AbortReason;
+
+		/** The local player's hands, kept free of the Core for the run (TraceFixtureCore). */
+		TraceFixtureCore::FClearOfCore CoreClear;
+
+		/** World time the start waits for when the Core had to come off him first. */
+		double SettleUntil = -1.0;
 	};
+
+	/**
+	 * How long after the Core comes off the local player before the knife is asked for: the view
+	 * blends back to first person and the rig comes back over ViewBlendSeconds (0.35 s).
+	 */
+	constexpr double CoreSettleSeconds = 1.0;
 
 	void Report(const TSharedRef<FState>& State, UTraceWeaponComponent* Weapon, ATraceCharacter* Character)
 	{
@@ -5724,6 +5788,10 @@ namespace TraceKnifeTest
 			(Weapon != nullptr) ? LexToString(Weapon->GetEquippedWeapon()) : TEXT("-"),
 			(Weapon != nullptr && Weapon->IsDeploying()) ? 1 : 0,
 			(Weapon != nullptr) ? Weapon->GetSwingCooldownRemaining() : 0.f);
+
+		// Every exit reports through here, so this is where the Core goes back as the run found it.
+		UE_LOG(LogTraceGame, Display, TEXT("KNIFE Core        : %s."),
+			*TraceFixtureCore::EndClearOfCore(State->CoreClear));
 		UE_LOG(LogTraceGame, Display, TEXT("======================================"));
 
 		// The pure model, run alongside so one command answers both halves of the feature.
@@ -5768,6 +5836,24 @@ namespace TraceKnifeTest
 
 						if (!State->bStarted)
 						{
+							// THE CORE COMES OFF THE LOCAL PLAYER FIRST, and stays off him until the
+							// report. In a batch a bot on his own team throws it to him while he stands
+							// idle between harnesses and he never lets go; a carrier cannot swap or
+							// swing, so this used to abort with nothing wrong in the knife.
+							if (!State->CoreClear.bBegun)
+							{
+								UE_LOG(LogTraceGame, Display, TEXT("[KnifeTest] Core: %s."),
+									*TraceFixtureCore::BeginClearOfCore(Character->GetWorld(), Character, State->CoreClear));
+								if (State->CoreClear.bTookItOff)
+								{
+									State->SettleUntil = Now + CoreSettleSeconds;
+								}
+							}
+							if (Now < State->SettleUntil)
+							{
+								return true;
+							}
+
 							State->bStarted = true;
 							State->PhaseStart = Now;
 
