@@ -6827,6 +6827,22 @@ namespace TraceHUDResultsInput
 	 */
 	constexpr double ContinueGraceSeconds = 1.0;
 
+	/**
+	 * The CONTINUE legend: [ENTER] CONTINUE always, and [A] CONTINUE after it while @p bPadHints (a pad
+	 * has been seen and CONTROLLER INPUT is on). Trace.HUD.Results.Verify asks it both ways.
+	 */
+	TArray<FTraceKitLegendItem> ContinueLegend(bool bPadHints)
+	{
+		const FString ContinueWord = TRACE_TEXT("HUD.RESULT_CONTINUE", "CONTINUE");
+		TArray<FTraceKitLegendItem> Legend;
+		Legend.Add({ TRACE_TEXT("HUD.RESULT_KEY_CONTINUE", "ENTER"), ContinueWord });
+		if (bPadHints)
+		{
+			Legend.Add({ TRACE_TEXT("HUD.RESULT_PAD_KEY_CONTINUE", "A"), ContinueWord });
+		}
+		return Legend;
+	}
+
 #if !UE_BUILD_SHIPPING
 	/** How many times ContinueFromResults has run in this process. Trace.HUD.Results.Verify reads it. */
 	int32 GContinueCount = 0;
@@ -7202,19 +7218,18 @@ void ATraceHUD::DrawMatchResult()
 		const bool bEnterPressed = bEnterDown && !bResultsEnterWasDown;
 		bResultsEnterWasDown = bEnterDown;
 
-		// Pad A obeys CONTROLLER INPUT like every menu (TracePadMenu::IsEnabled), and the legend says
-		// ENTER when the pad is off, rather than naming a button that does nothing. It fades up as the
-		// grace ends, so the key is named only once pressing it works.
+		// ENTER ALWAYS, AND PAD A BESIDE IT once a pad has been seen, the way every other screen names
+		// both. It used to swap ENTER for A the moment any pad input was seen, so a keyboard player read
+		// a pad button. Pad A obeys CONTROLLER INPUT like every menu (TracePadMenu::IsEnabled), so with
+		// it off only ENTER is named. One line: the strip sits too close to the foot for a second. It
+		// fades up as the grace ends, so the keys are named only once pressing them works.
 		const float LegendAlpha = ResultsContinueFade.Update(bContinueOpen);
 		if (LegendAlpha > 0.f)
 		{
 			TraceMenuKit::FScopedOpacity LegendFade(LegendAlpha);
-			const bool bPad = TracePadMenu::IsEnabled() && TracePadMenu::HasSeenPad(TracePC.Get());
-			const TArray<FTraceKitLegendItem> Legend = {
-				{ bPad ? TRACE_TEXT("HUD.RESULT_PAD_KEY_CONTINUE", "A") : TRACE_TEXT("HUD.RESULT_KEY_CONTINUE", "ENTER"),
-				  TRACE_TEXT("HUD.RESULT_CONTINUE", "CONTINUE") },
-			};
-			TraceMenuKit::DrawKeyLegend(this, Legend, CX, StripY + StripH + (12.f * UIScale), 30.f * UIScale, Now);
+			TraceMenuKit::DrawKeyLegend(this, TraceHUDResultsInput::ContinueLegend(
+					TracePadMenu::IsEnabled() && TracePadMenu::HasSeenPad(TracePC.Get())),
+				CX, StripY + StripH + (12.f * UIScale), 30.f * UIScale, Now);
 		}
 
 		if (bContinueOpen && !PauseMenu.IsOpen() && (bPadPressed || bEnterPressed))
@@ -10997,6 +11012,29 @@ namespace TraceHUDResultsVerify
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[ResultsVerify] ===== the results screen's CONTINUE: whistle-frame jump, grace, held A, pad off, then %s ====="),
 			Run->bFinalKeyIsEnter ? TEXT("ENTER") : TEXT("A"));
+
+		// THE LEGEND NAMES BOTH DEVICES, as the draw builds it: ENTER always, and A beside it while pad
+		// hints show. It used to swap ENTER for A once any pad input had been seen, so a keyboard player
+		// was told to press a pad button.
+		{
+			const FString EnterKey = TRACE_TEXT("HUD.RESULT_KEY_CONTINUE", "ENTER");
+			const FString PadKey = TRACE_TEXT("HUD.RESULT_PAD_KEY_CONTINUE", "A");
+			const TArray<FTraceKitLegendItem> WithPad = TraceHUDResultsInput::ContinueLegend(/*bPadHints=*/true);
+			const TArray<FTraceKitLegendItem> KeysOnly = TraceHUDResultsInput::ContinueLegend(/*bPadHints=*/false);
+			auto SayLegend = [](const TArray<FTraceKitLegendItem>& Items)
+			{
+				FString Out;
+				for (const FTraceKitLegendItem& Item : Items)
+				{
+					Out += FString::Printf(TEXT("[%s] %s  "), *Item.Key, *Item.Label);
+				}
+				return Out.TrimEnd();
+			};
+			Report(*Run, TEXT("the CONTINUE legend names ENTER always, and A beside it for a pad"),
+				WithPad.Num() == 2 && WithPad[0].Key == EnterKey && WithPad[1].Key == PadKey
+					&& KeysOnly.Num() == 1 && KeysOnly[0].Key == EnterKey,
+				FString::Printf(TEXT("pad seen: %s / no pad: %s"), *SayLegend(WithPad), *SayLegend(KeysOnly)));
+		}
 
 		// THE WHISTLE AND THE JUMP ON ONE FRAME. The press goes in first, so it is this frame's input
 		// when the HUD draws the first frame of the results screen.
