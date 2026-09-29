@@ -20,6 +20,7 @@
 #include "Misc/Parse.h"
 #include "SocketSubsystem.h"
 #include "Sockets.h"
+#include "Modes/TracePracticeRange.h"    // IsActive — the range is offline on purpose
 #include "Trace.h"                       // LogTraceGame
 #include "UI/Text/TraceGameText.h"       // the editable wording, Config/TraceGameText.ini
 
@@ -346,7 +347,15 @@ ERole DescribeConnection(const UWorld* World, FString& OutEndpoint, FString& Out
 	// and hosts successfully, which the branch above reports with the real port. This is the harder
 	// failure — no driver at all.
 	//
+	// THE PRACTICE RANGE IS OFFLINE ON PURPOSE and never hosts, so a busy port says nothing about it:
+	// it used to add PORT 7777 BUSY whenever another copy of Trace (or one still shutting down) held
+	// the port, a hosting warning in a mode that never hosts. The warning stays for a match that
+	// meant to host and did not come up.
 	OutEndpoint = TEXT("OFFLINE");
+	if (TracePracticeRange::IsActive(World))
+	{
+		return ERole::Offline;
+	}
 	OutDetail = IsDefaultPortFreeCached()
 		? FString()
 		: TRACE_TEXTF("NET.STATUS_PORT_BUSY", "PORT {0} BUSY", { DefaultPort });

@@ -6005,6 +6005,14 @@ namespace TraceHUDPadLabels
 	static constexpr float MinPlatePx = 26.f;
 	static constexpr float MaxPlatePx = 72.f;
 
+	/**
+	 * THE SIGN HANGS ABOVE ITS ANCHOR: its bottom edge this far over the anchor's point, 1080p px. The
+	 * anchor is where a player aiming at the pad looks, and from the spawn line it lands at the screen
+	 * centre, so a plate centred on it put the crosshair in the middle of the word ("A+ILITIES",
+	 * "CORE+RACK"). This clears the default crosshair's reach (a 5 px gap plus an 11 px arm).
+	 */
+	static constexpr float PlateLiftPx = 22.f;
+
 	/** Distance fade, uu: whole to FadeStart, gone by FadeEnd. The range fits inside FadeStart. */
 	static constexpr float FadeStart = 3000.f;
 	static constexpr float FadeEnd = 4000.f;
@@ -6099,9 +6107,9 @@ void ATraceHUD::DrawPracticePadLabels()
 		const float TextW = TraceMenuKit::CapTextWidth(Text, PlateH * TraceMenuKit::LabelCapFraction);
 		const float PlateW = TextW + PlateH;   // half a plate-height of room each side
 		const float CX = static_cast<float>(Projected.X);
-		const float CY = static_cast<float>(Projected.Y);
 		const float PlateX = CX - PlateW * 0.5f;
-		const float PlateY = CY - PlateH * 0.5f;
+		const float PlateY = static_cast<float>(Projected.Y) - TraceHUDPadLabels::PlateLiftPx * UIScale - PlateH;
+		const float CY = PlateY + PlateH * 0.5f;
 
 		// OPAQUE, like the kit's own buttons: at the HUD's panel alpha the range's bright pillar stripes ran
 		// straight through the plate and behind the words. Only the distance fade thins it.

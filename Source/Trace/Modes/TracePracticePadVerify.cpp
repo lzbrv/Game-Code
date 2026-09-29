@@ -17,7 +17,8 @@
 // line (where the structure over the spawn hides it, and its plate must not show through that) and
 // from the platform itself, where a player walking up to it stands.
 //
-//   1. the pad's label is drawn where the player is looking, whole (not faded), on an OPAQUE plate —
+//   1. the pad's label is drawn just above where the player is looking (clear of the crosshair, so
+//      the crosshair is not in the words), whole (not faded), on an OPAQUE plate —
 //      or, where world geometry is in the way (the harness traces that itself), not drawn through it.
 //      The look is aimed only once the player's eye has stopped moving after the teleport (a pawn still
 //      settling onto the floor moves the anchor up the screen after the aim), and the line says how far
@@ -29,6 +30,8 @@
 //   3. the words are the pad's own line (ATracePracticePad::LabelFor), one line, no lower case, short;
 //      and the loadout pad does not talk about characters.
 //   4. switching INFINITE ABILITIES on puts the ON line on an amber-ringed plate, and off again.
+//   5. with UDP 7777 held (as another copy of Trace would hold it), the range's network chip adds no
+//      PORT 7777 BUSY: the range is offline on purpose and never hosts.
 //
 // Headless recipe (the range is the arena with the practice game mode):
 //   <Arena_Baked>?game=/Script/Trace.TracePracticeGameMode  -TraceExecAt=12 -TraceExec="Trace.Loadout.Press lock"
@@ -50,10 +53,15 @@
 #include "HAL/PlatformTime.h"
 #include "Kismet/GameplayStatics.h"
 
+#include "IPAddress.h"
+#include "SocketSubsystem.h"               // step 5 holds UDP 7777 as another process would
+#include "Sockets.h"
+
 #include "Modes/TracePracticeActors.h"
 #include "Modes/TracePracticeRange.h"
 #include "Trace.h"                        // LogTraceGame
 #include "UI/TraceHUD.h"
+#include "UI/TraceNetworking.h"           // DescribeConnection — what the range's network chip says
 
 // Named after the file, not anonymous: Scripts/check-jumbo-build-collisions.py.
 namespace TracePracticePadVerify
@@ -63,6 +71,8 @@ namespace TracePracticePadVerify
 		TWeakObjectPtr<UWorld> World;
 		int32 Step = 0;
 		double StepStart = 0.0;
+		/** Set once the current step's one-shot action has run; GoTo clears it. */
+		bool bStepActionDone = false;
 		double Deadline = 0.0;
 		int32 Passes = 0;
 		int32 Failures = 0;
@@ -86,7 +96,17 @@ namespace TracePracticePadVerify
 		/** Before aiming: the eye last seen, and since when it has stayed there (-1: not yet). */
 		FVector SettleEye = FVector::ZeroVector;
 		double SettledSince = -1.0;
+
+		/** Step 5: UDP 7777, held for the network-chip check and let go at its end. */
+		FUniqueSocket PortHold;
 	};
+
+	/**
+	 * Where the sign's bottom edge may sit above the aim, 1080p px: clear of the default crosshair's
+	 * reach (16 px), and near enough to read as the aim's sign (the HUD hangs it 22 px up).
+	 */
+	static constexpr float MinLiftPx = 16.f;
+	static constexpr float MaxLiftPx = 48.f;
 
 	static void Report(FRun& Run, bool bPass, const FString& Claim, const FString& Detail)
 	{
@@ -98,6 +118,23 @@ namespace TracePracticePadVerify
 	{
 		Run.Step = Step;
 		Run.StepStart = FPlatformTime::Seconds();
+		Run.bStepActionDone = false;
+	}
+
+	/**
+	 * True on the first tick of a step, false after: the step's one-shot action (stand the player
+	 * where the look is taken from; switch INFINITE ABILITIES on) runs exactly once. It used to be a
+	 * 0.05 s window after GoTo, which a slow frame jumps clean over: at 15 fps the switch was never
+	 * made and the ON check failed on a range that was fine. Trace.Flow.Verify's TakeStepAction.
+	 */
+	static bool TakeStepAction(FRun& Run)
+	{
+		if (Run.bStepActionDone)
+		{
+			return false;
+		}
+		Run.bStepActionDone = true;
+		return true;
 	}
 
 	static ATraceHUD* LocalHud(UWorld* WorldPtr)
@@ -318,7 +355,7 @@ namespace TracePracticePadVerify
 				return true;
 			}
 			const FRun::FView& View = Run.Views[Run.ViewIndex];
-			if (SinceStep < 0.05)
+			if (TakeStepAction(Run))
 			{
 				StandFor(View, *LocalPC, *Range);
 				return true;
@@ -406,11 +443,21 @@ namespace TracePracticePadVerify
 					ReadEye.X - Run.AimEye.X, ReadEye.Y - Run.AimEye.Y, ReadEye.Z - Run.AimEye.Z,
 					FRotator::NormalizeAxis(ReadRotation.Pitch), FRotator::NormalizeAxis(Run.AimRotation.Pitch), AnchorOnScreen.X, AnchorOnScreen.Y);
 
-				Report(Run, Drawn != nullptr && Drawn->Rect.IsInside(Aim) && Drawn->Alpha >= 0.9f,
-					FString::Printf(TEXT("the %s pad's label is drawn where a player %s is looking"), RoleName(Role), From),
+				// JUST ABOVE THE CROSSHAIR, NOT UNDER IT: over the aim horizontally, its bottom edge a little
+				// above the aim (clear of the default crosshair's 16 px reach, within MaxLiftPx), so the
+				// words are where the player looks without the crosshair sitting in them. The plate used to
+				// be centred on the aim, which put the crosshair on the B of ABILITIES.
+				const float HarnessScale = FMath::Max(Hud->GetHudKitRecord().ViewSize.Y / 1080.f, KINDA_SMALL_NUMBER);
+				const float LiftPx = (Drawn != nullptr) ? static_cast<float>(Aim.Y - Drawn->Rect.Max.Y) / HarnessScale : -1.f;
+				const bool bOverAim = Drawn != nullptr && Drawn->Rect.Min.X <= Aim.X && Aim.X <= Drawn->Rect.Max.X;
+				Report(Run, bOverAim && !Drawn->Rect.IsInside(Aim) && LiftPx >= MinLiftPx && LiftPx <= MaxLiftPx
+						&& Drawn->Alpha >= 0.9f,
+					FString::Printf(TEXT("the %s pad's label hangs just above where a player %s is looking, clear of the crosshair"),
+						RoleName(Role), From),
 					(Drawn != nullptr)
-						? FString::Printf(TEXT("\"%s\" plate (%.0f,%.0f)-(%.0f,%.0f), aim (%.0f,%.0f), alpha %.2f%s"), *Drawn->Text,
-							Drawn->Rect.Min.X, Drawn->Rect.Min.Y, Drawn->Rect.Max.X, Drawn->Rect.Max.Y, Aim.X, Aim.Y, Drawn->Alpha, *ViewNote)
+						? FString::Printf(TEXT("\"%s\" plate (%.0f,%.0f)-(%.0f,%.0f), aim (%.0f,%.0f), bottom %.1f px (1080p) above the aim (want %.0f-%.0f), alpha %.2f%s"),
+							*Drawn->Text, Drawn->Rect.Min.X, Drawn->Rect.Min.Y, Drawn->Rect.Max.X, Drawn->Rect.Max.Y, Aim.X, Aim.Y,
+							LiftPx, MinLiftPx, MaxLiftPx, Drawn->Alpha, *ViewNote)
 						: FString(TEXT("the HUD drew no label for it")) + ViewNote);
 
 				// An OPAQUE plate: at the HUD's panel alpha the range's bright pillar stripes ran through it
@@ -449,7 +496,7 @@ namespace TracePracticePadVerify
 
 		case 3:   // INFINITE ABILITIES on, from the spawn line: the plate says so, on the amber-ringed plate
 		{
-			if (SinceStep < 0.05)
+			if (TakeStepAction(Run))
 			{
 				Range->SetInfiniteAbilities(true);
 				if (Run.InfinitePad.IsValid())
@@ -487,6 +534,52 @@ namespace TracePracticePadVerify
 
 			// A harness leaves the range the way the next player expects it.
 			Range->SetInfiniteAbilities(false);
+			GoTo(Run, 5);
+			return true;
+		}
+
+		case 5:   // THE NETWORK CHIP, with UDP 7777 held by someone else (another copy of Trace, say)
+		{
+			if (TakeStepAction(Run))
+			{
+				// Held the way another process would hold it: a UDP socket bound to the port. If the bind
+				// fails the port is already held, which is the same state.
+				if (ISocketSubsystem* const Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM))
+				{
+					const TSharedRef<FInternetAddr> HoldAddr = Sockets->CreateInternetAddr();
+					bool bAddrValid = false;
+					HoldAddr->SetIp(TEXT("0.0.0.0"), bAddrValid);
+					HoldAddr->SetPort(TraceNet::DefaultPort);
+					Run.PortHold = Sockets->CreateUniqueSocket(NAME_DGram, TEXT("TracePadVerifyPortHold"), HoldAddr->GetProtocolType());
+					if (Run.PortHold.IsValid() && !Run.PortHold->Bind(*HoldAddr))
+					{
+						Run.PortHold.Reset();
+					}
+				}
+				return true;
+			}
+			// TraceNet answers "is the port free?" from a cache a couple of seconds old.
+			if (SinceStep < 3.0)
+			{
+				return true;
+			}
+			const bool bPortBusy = !TraceNet::IsDefaultPortFreeCached();
+			FString Endpoint;
+			FString Detail;
+			TraceNet::DescribeConnection(WorldPtr, Endpoint, Detail);
+			const bool bChip = Hud->GetHudKitRecord().bNetPanel;
+			Run.PortHold.Reset();
+			if (!bPortBusy)
+			{
+				Report(Run, false, TEXT("control: with UDP 7777 held, the port reads busy"),
+					TEXT("INCONCLUSIVE: this machine would not let the harness hold the port"));
+			}
+			else
+			{
+				Report(Run, Detail.IsEmpty() && !bChip,
+					TEXT("*** with UDP 7777 busy, the offline range adds no PORT BUSY and shows no network chip ***"),
+					FString::Printf(TEXT("\"%s\" / \"%s\", chip drawn %d (the range never hosts)"), *Endpoint, *Detail, bChip ? 1 : 0));
+			}
 			Finish(Run);
 			return false;
 		}
@@ -520,9 +613,10 @@ namespace TracePracticePadVerify
 	static FAutoConsoleCommandWithWorldAndArgs CmdPadLabels(
 		TEXT("Trace.Practice.PadLabels"),
 		TEXT("Stands the player on the range's spawn line, aims at each pad and checks what is on screen: ")
-		TEXT("the label is drawn where they look, reads left to right (world-space text is projected both ")
+		TEXT("the label hangs just above where they look (the crosshair is not in its words), reads left to right (world-space text is projected both ")
 		TEXT("ends to catch a mirrored one), is the pad's own short upper-case line, the loadout pad does ")
-		TEXT("not say CHARACTER, and INFINITE ABILITIES ON shows on the amber-ringed plate."),
+		TEXT("not say CHARACTER, INFINITE ABILITIES ON shows on the amber-ringed plate, and with UDP 7777 held the ")
+		TEXT("range's network chip says nothing about a busy port."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));
 }
 
