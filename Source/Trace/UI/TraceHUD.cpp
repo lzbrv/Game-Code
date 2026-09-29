@@ -514,17 +514,98 @@ namespace TraceHUDStroke
 		}
 	}
 
-	/** Draws @p Tris translucently onto @p InCanvas and empties the list. */
-	static void Flush(UCanvas* InCanvas, TArray<FCanvasUVTri>& Tris)
+	/**
+	 * P11: THE TRIANGLES OF ONE FLUSH, WITH NO HEAP ALLOCATION PER DRAW.
+	 *
+	 * Every stroke used to build a local TArray<FCanvasUVTri>, and the flush then copied it into a fresh
+	 * FCanvasTriangleItem: two allocations per flush. The kill feed flushes twice per row per frame (the
+	 * dark surround, then the fill) for each row's whole 8 s life, the hit marker once a frame while it
+	 * shows, and a faded line once per stroke. A batch now borrows ONE triangle item that lives for the
+	 * process and is only drawn on the game thread. Its list is emptied between flushes but keeps its
+	 * capacity, so once it has grown to the biggest glyph on screen a frame of strokes allocates nothing.
+	 * The canvas copies the triangles into its own batch while the item draws (FCanvasTriangleItem::Draw),
+	 * so the item is free again the moment DrawItem returns.
+	 *
+	 * Off the game thread, or while another batch holds the shared item, a batch owns an item of its own:
+	 * the old cost, never two strokes writing into one list.
+	 */
+	class FBatch
 	{
-		if (InCanvas != nullptr && Tris.Num() > 0 && GWhiteTexture != nullptr)
+	public:
+		FBatch()
 		{
-			FCanvasTriangleItem Item(Tris, GWhiteTexture);
-			Item.BlendMode = SE_BLEND_Translucent;
-			InCanvas->DrawItem(Item);
+			if (IsInGameThread() && !bSharedBusy)
+			{
+				bSharedBusy = true;
+				bBorrowed = true;
+				Item = &SharedItem();
+			}
+			else
+			{
+				Item = &OwnItem.Emplace(FVector2D::ZeroVector, FVector2D::ZeroVector, FVector2D::ZeroVector, nullptr);
+			}
+			Item->TriangleList.Reset();
 		}
-		Tris.Reset();
-	}
+
+		~FBatch()
+		{
+			if (bBorrowed)
+			{
+				Item->TriangleList.Reset();
+				bSharedBusy = false;
+			}
+		}
+
+		FBatch(const FBatch&) = delete;
+		FBatch& operator=(const FBatch&) = delete;
+
+		/** One stroke into this batch. Nothing for a zero-length or invisible stroke. */
+		void Add(float X0, float Y0, float X1, float Y1, const FLinearColor& Color, float Thickness)
+		{
+			TArray<FCanvasUVTri>& Tris = Item->TriangleList;
+			const int32 CapacityBefore = Tris.Max();
+			AddQuad(Tris, X0, Y0, X1, Y1, Color, Thickness);
+#if !UE_BUILD_SHIPPING
+			SharedGrowthCount += (bBorrowed && Tris.Max() != CapacityBefore) ? 1 : 0;
+#else
+			(void)CapacityBefore;
+#endif
+		}
+
+		/** Draws what has been added, translucently, onto @p InCanvas, and empties the batch for more. */
+		void Flush(UCanvas* InCanvas)
+		{
+			TArray<FCanvasUVTri>& Tris = Item->TriangleList;
+			if (InCanvas != nullptr && Tris.Num() > 0 && GWhiteTexture != nullptr)
+			{
+				Item->Texture = GWhiteTexture;
+				Item->BlendMode = SE_BLEND_Translucent;
+				InCanvas->DrawItem(*Item);
+			}
+			Tris.Reset();
+		}
+
+#if !UE_BUILD_SHIPPING
+		/** How many times the shared list has had to grow. Steady play must not add to it (Trace.HUD.Kit.Verify). */
+		static int32 SharedGrowths() { return SharedGrowthCount; }
+#endif
+
+	private:
+		static FCanvasTriangleItem& SharedItem()
+		{
+			static FCanvasTriangleItem Shared(FVector2D::ZeroVector, FVector2D::ZeroVector, FVector2D::ZeroVector, nullptr);
+			return Shared;
+		}
+
+		inline static bool bSharedBusy = false;
+#if !UE_BUILD_SHIPPING
+		inline static int32 SharedGrowthCount = 0;
+#endif
+
+		FCanvasTriangleItem* Item = nullptr;
+		TOptional<FCanvasTriangleItem> OwnItem;
+		bool bBorrowed = false;
+	};
 
 	/**
 	 * AHUD::DrawLine for a pass that only holds an AHUD*, through the screen's fade (P10): at full
@@ -543,9 +624,9 @@ namespace TraceHUDStroke
 			HUD->DrawLine(X0, Y0, X1, Y1, Color, Thickness);
 			return;
 		}
-		TArray<FCanvasUVTri> Tris;
-		AddQuad(Tris, X0, Y0, X1, Y1, Color, Thickness);
-		Flush(TraceCanvasText::GameCanvas(), Tris);
+		FBatch Batch;
+		Batch.Add(X0, Y0, X1, Y1, Color, Thickness);
+		Batch.Flush(TraceCanvasText::GameCanvas());
 	}
 }
 
@@ -2955,12 +3036,12 @@ void ATraceHUD::DrawHitMarker()
 		// Through TraceHUDStroke, not AHUD::DrawLine: DrawLine throws the alpha away (see the note on
 		// TraceHUDStroke), so the marker sat at full strength for its whole life and then popped off.
 		const FLinearColor BlockedColor = TraceHUDStyle::WithAlpha(TraceHUDStyle::ShieldWhite, Alpha);
-		TArray<FCanvasUVTri> BlockedTris;
-		TraceHUDStroke::AddQuad(BlockedTris, CX, CY - Outer, CX, CY - Inner, BlockedColor, Thickness);
-		TraceHUDStroke::AddQuad(BlockedTris, CX, CY + Inner, CX, CY + Outer, BlockedColor, Thickness);
-		TraceHUDStroke::AddQuad(BlockedTris, CX - Outer, CY, CX - Inner, CY, BlockedColor, Thickness);
-		TraceHUDStroke::AddQuad(BlockedTris, CX + Inner, CY, CX + Outer, CY, BlockedColor, Thickness);
-		TraceHUDStroke::Flush(Canvas, BlockedTris);
+		TraceHUDStroke::FBatch BlockedTicks;
+		BlockedTicks.Add(CX, CY - Outer, CX, CY - Inner, BlockedColor, Thickness);
+		BlockedTicks.Add(CX, CY + Inner, CX, CY + Outer, BlockedColor, Thickness);
+		BlockedTicks.Add(CX - Outer, CY, CX - Inner, CY, BlockedColor, Thickness);
+		BlockedTicks.Add(CX + Inner, CY, CX + Outer, CY, BlockedColor, Thickness);
+		BlockedTicks.Flush(Canvas);
 
 		// THE SOUND, ON THE ARRIVAL EDGE AND NOWHERE ELSE. This pass runs for every frame of the
 		// 0.25 s the marker is up, so the timestamp the marker is dated by IS the event: it changes
@@ -3014,11 +3095,11 @@ void ATraceHUD::DrawHitMarker()
 	// Four diagonal ticks — the classic X, drawn as four separate segments so the middle stays
 	// clear and the crosshair underneath is still readable. Translucent strokes, so the X actually
 	// fades over its 0.35 / 0.6 s instead of holding at full strength and then vanishing.
-	TArray<FCanvasUVTri> MarkerTris;
-	TraceHUDStroke::AddQuad(MarkerTris, CX - Outer, CY - Outer, CX - Inner, CY - Inner, Color, Thickness);
-	TraceHUDStroke::AddQuad(MarkerTris, CX + Inner, CY - Inner, CX + Outer, CY - Outer, Color, Thickness);
-	TraceHUDStroke::AddQuad(MarkerTris, CX - Outer, CY + Outer, CX - Inner, CY + Inner, Color, Thickness);
-	TraceHUDStroke::AddQuad(MarkerTris, CX + Inner, CY + Inner, CX + Outer, CY + Outer, Color, Thickness);
+	TraceHUDStroke::FBatch MarkerTicks;
+	MarkerTicks.Add(CX - Outer, CY - Outer, CX - Inner, CY - Inner, Color, Thickness);
+	MarkerTicks.Add(CX + Inner, CY - Inner, CX + Outer, CY - Outer, Color, Thickness);
+	MarkerTicks.Add(CX - Outer, CY + Outer, CX - Inner, CY + Inner, Color, Thickness);
+	MarkerTicks.Add(CX + Inner, CY + Inner, CX + Outer, CY + Outer, Color, Thickness);
 
 #if !UE_BUILD_SHIPPING
 	bDrewHitMarker = true;
@@ -3030,13 +3111,13 @@ void ATraceHUD::DrawHitMarker()
 	{
 		const float FarInner = Outer + (4.f * UIScale);
 		const float FarOuter = FarInner + (7.f * UIScale);
-		TraceHUDStroke::AddQuad(MarkerTris, CX - FarOuter, CY - FarOuter, CX - FarInner, CY - FarInner, Color, Thickness);
-		TraceHUDStroke::AddQuad(MarkerTris, CX + FarInner, CY - FarInner, CX + FarOuter, CY - FarOuter, Color, Thickness);
-		TraceHUDStroke::AddQuad(MarkerTris, CX - FarOuter, CY + FarOuter, CX - FarInner, CY + FarInner, Color, Thickness);
-		TraceHUDStroke::AddQuad(MarkerTris, CX + FarInner, CY + FarInner, CX + FarOuter, CY + FarOuter, Color, Thickness);
+		MarkerTicks.Add(CX - FarOuter, CY - FarOuter, CX - FarInner, CY - FarInner, Color, Thickness);
+		MarkerTicks.Add(CX + FarInner, CY - FarInner, CX + FarOuter, CY - FarOuter, Color, Thickness);
+		MarkerTicks.Add(CX - FarOuter, CY + FarOuter, CX - FarInner, CY + FarInner, Color, Thickness);
+		MarkerTicks.Add(CX + FarInner, CY + FarInner, CX + FarOuter, CY + FarOuter, Color, Thickness);
 	}
 
-	TraceHUDStroke::Flush(Canvas, MarkerTris);
+	MarkerTicks.Flush(Canvas);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -6148,7 +6229,7 @@ void ATraceHUD::DrawKillIcon(ETraceKillIcon Icon, float X, float Y, float Cell, 
 	// TRANSLUCENT STROKES (TraceHUDStroke), not AHUD::DrawLine. DrawLine discards alpha, so these glyphs
 	// — and their black surrounds — stayed solid while the row's plate and names faded over 0.75 s, and
 	// were photographed floating on their own, row gone, for the last frames of every entry.
-	TArray<FCanvasUVTri> GlyphTris;
+	TraceHUDStroke::FBatch GlyphStrokes;
 	for (int32 Pass = 0; Pass < 2; ++Pass)
 	{
 		const FLinearColor PassColor = (Pass == 0) ? Surround : Color;
@@ -6157,12 +6238,12 @@ void ATraceHUD::DrawKillIcon(ETraceKillIcon Icon, float X, float Y, float Cell, 
 
 		for (const TraceKillFeedArt::FGlyphStroke& Stroke : Strokes)
 		{
-			TraceHUDStroke::AddQuad(GlyphTris, X + Stroke.X0 * Scale, Y + Stroke.Y0 * Scale,
+			GlyphStrokes.Add(X + Stroke.X0 * Scale, Y + Stroke.Y0 * Scale,
 				X + Stroke.X1 * Scale, Y + Stroke.Y1 * Scale,
 				PassColor, PassThickness);
 		}
 		// Each pass flushed on its own, so the fill always lands on top of the whole surround.
-		TraceHUDStroke::Flush(Canvas, GlyphTris);
+		GlyphStrokes.Flush(Canvas);
 		for (const TraceKillFeedArt::FGlyphDot& Dot : Dots)
 		{
 			DrawHudRect(PassColor,
@@ -7923,9 +8004,9 @@ void ATraceHUD::DrawHudLine(float X0, float Y0, float X1, float Y1, const FLinea
 
 void ATraceHUD::DrawLineAlpha(float X0, float Y0, float X1, float Y1, const FLinearColor& Color, float Thickness)
 {
-	TArray<FCanvasUVTri> Tris;
-	TraceHUDStroke::AddQuad(Tris, X0, Y0, X1, Y1, Color, Thickness);
-	TraceHUDStroke::Flush(Canvas, Tris);
+	TraceHUDStroke::FBatch Stroke;
+	Stroke.Add(X0, Y0, X1, Y1, Color, Thickness);
+	Stroke.Flush(Canvas);
 }
 
 void ATraceHUD::DrawStackCaption(const FString& Text, const FLinearColor& Color, float X, float RowY, float RowH)
@@ -7939,18 +8020,12 @@ void ATraceHUD::DrawStackCaption(const FString& Text, const FLinearColor& Color,
 	DrawTextLeft(Text, Color, X, VCenterTextY(Text, FontSmall, UIScale, RowY, RowH), FontSmall, UIScale,
 		/*bTabular=*/true);
 
-	// Measured with every digit as a zero, so "RIPPLE  9.1" and "RIPPLE  10.0" size the plate alike and a
-	// countdown never makes it breathe.
-	FString Template = Text;
-	for (TCHAR& Char : Template)
-	{
-		if (Char >= TEXT('0') && Char <= TEXT('9'))
-		{
-			Char = TEXT('0');
-		}
-	}
+	// Measured with TABULAR figures, so "RIPPLE  9.1" and "RIPPLE  10.1" size the plate by their digit
+	// COUNT alone and a ticking countdown never makes it breathe: every digit takes the widest digit's
+	// cell (TraceText::ResolveGlyph). P11: measured off the caption itself — it used to copy the string
+	// every frame to zero its digits first, which the tabular cell already does.
 	StackCaptionRightThisFrame = FMath::Max(StackCaptionRightThisFrame,
-		X + MeasureWidth(Template, FontSmall, UIScale, /*bTabular=*/true));
+		X + MeasureWidth(Text, FontSmall, UIScale, /*bTabular=*/true));
 }
 
 bool ATraceHUD::IsFullScreenOverlayUp() const
@@ -9975,6 +10050,9 @@ namespace TraceFxHudShots
 //      gun on the ammo plate and keeps "[R] RELOAD" off a healthy clip; a dead frame's killer line
 //      carries no internal cause name and draws the feed's glyph. States the run never reaches are
 //      reported INCONCLUSIVE, never as passes.
+//   5. THE KILL FEED DOES NOT ALLOCATE PER FRAME (P11): over 90 frames with a feed row up, the one
+//      shared stroke list its glyphs are drawn through grows a handful of times at most (a fresh array
+//      per flush, as before, shows as hundreds).
 //
 // Headless recipe (Arena):
 //   -TraceExecAt=6 -TraceExec="Trace.HUD.Kit.Verify kill=22"
@@ -9995,6 +10073,11 @@ namespace TraceHUDKitVerify
 		bool bSawDead = false;
 		double DeadSince = -1.0;
 		double SelectSince = -1.0;
+
+		/** The kill feed's strokes: the shared batch's growth count when a feed first drew, and frames since. */
+		int32 FeedGrowthsAtStart = -1;
+		int32 FeedFrames = 0;
+		bool bFeedChecked = false;
 	};
 
 	static void Report(FRun& Run, const TCHAR* Claim, bool bPass, const FString& Detail)
@@ -10038,9 +10121,9 @@ namespace TraceHUDKitVerify
 		}
 		else
 		{
-			TArray<FCanvasUVTri> Tris;
-			TraceHUDStroke::AddQuad(Tris, 2.f, 16.f, 30.f, 16.f, Faded, 8.f);
-			TraceHUDStroke::Flush(TargetCanvas, Tris);
+			TraceHUDStroke::FBatch Stroke;
+			Stroke.Add(2.f, 16.f, 30.f, 16.f, Faded, 8.f);
+			Stroke.Flush(TargetCanvas);
 		}
 
 		UKismetRenderingLibrary::EndDrawCanvasToRenderTarget(WorldPtr, Context);
@@ -10200,7 +10283,27 @@ namespace TraceHUDKitVerify
 					(LocalState != nullptr) ? LocalState->GetPlayerId() : -1));
 		}
 
-		return Run.bSawOverlay && Run.bSawLive && Run.bSawDead;
+		// P11: THE KILL FEED'S GLYPHS DO NOT ALLOCATE PER FRAME. Every glyph flush goes through the one
+		// shared stroke batch, whose list grows only when a bigger glyph than any before it is drawn. Over
+		// 90 frames of a feed on screen it may grow a handful of times (a new glyph shape), never once a
+		// frame — which is what a fresh array and a copied triangle item per flush amounted to.
+		if (!Run.bFeedChecked && !Rec.bOverlayUp && Rec.KillFeedRows > 0)
+		{
+			if (Run.FeedGrowthsAtStart < 0)
+			{
+				Run.FeedGrowthsAtStart = TraceHUDStroke::FBatch::SharedGrowths();
+			}
+			if (++Run.FeedFrames >= 90)
+			{
+				Run.bFeedChecked = true;
+				const int32 Grew = TraceHUDStroke::FBatch::SharedGrowths() - Run.FeedGrowthsAtStart;
+				Report(Run, TEXT("*** FEED: 90 frames of kill-feed glyphs reuse one stroke list (no allocation per frame) ***"),
+					Grew <= 4, FString::Printf(TEXT("the shared list grew %d time(s) over %d frames with %d row(s) up"),
+						Grew, Run.FeedFrames, Rec.KillFeedRows));
+			}
+		}
+
+		return Run.bSawOverlay && Run.bSawLive && Run.bSawDead && Run.bFeedChecked;
 	}
 
 	static void Finish(FRun& Run)
@@ -10210,6 +10313,10 @@ namespace TraceHUDKitVerify
 		if (!Run.bSawOverlay) { Unseen[NumUnseen++] = TEXT("OVERLAY"); }
 		if (!Run.bSawLive)    { Unseen[NumUnseen++] = TEXT("LIVE"); }
 		if (!Run.bSawDead)    { Unseen[NumUnseen++] = TEXT("DEAD"); }
+		if (!Run.bFeedChecked)
+		{
+			UE_LOG(LogTraceGame, Warning, TEXT("[HUDKit]   INCONCLUSIVE: the kill feed was up for only %d frame(s), not 90."), Run.FeedFrames);
+		}
 		for (int32 Index = 0; Index < NumUnseen; ++Index)
 		{
 			UE_LOG(LogTraceGame, Warning, TEXT("[HUDKit]   INCONCLUSIVE: the run never reached a %s frame."), Unseen[Index]);
