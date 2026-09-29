@@ -4749,12 +4749,22 @@ namespace TraceReloadBindTest
 		return EKeys::K;
 	}
 
+	/**
+	 * How long step 0 waits for a pawn it can press keys on. Long enough for a match's opening select
+	 * screen (up to 30 s) and a respawn; short enough that a precondition which will never come true
+	 * ends in a verdict rather than a run that prints its header and nothing else.
+	 */
+	constexpr double UsablePawnWaitSeconds = 45.0;
+
 	struct FProbe
 	{
 		int32 Step = 0;
 		double NextStepTime = 0.0;
 		int32 Passes = 0;
 		int32 Failures = 0;
+
+		/** Real time step 0 gives up at. See UsablePawnWaitSeconds. */
+		double UsablePawnDeadline = 0.0;
 
 		int32 CountBeforeControl = 0;
 		int32 CountAfterControl = 0;
@@ -4805,6 +4815,7 @@ namespace TraceReloadBindTest
 		}
 
 		TSharedPtr<FProbe> Probe = MakeShared<FProbe>();
+		Probe->UsablePawnDeadline = FPlatformTime::Seconds() + UsablePawnWaitSeconds;
 
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[Ammo.BindTest] ===== spec v16 §1: 'R to reload', pressed through the real pipeline. Reload is "
@@ -4835,7 +4846,26 @@ namespace TraceReloadBindTest
 			{
 				if (Probe->Step == 0)
 				{
-					return true;   // still waiting for a usable pawn; safe at launch
+					// Still waiting for a usable pawn, which is normal at launch — but NOT FOREVER. A run
+					// that found the local player carrying the Core (left there by an earlier fixture)
+					// printed its header and then nothing at all, which a batch reads as "no verdict"
+					// rather than as the precondition it was. Name the one that is missing.
+					if (Now > Probe->UsablePawnDeadline)
+					{
+						const TCHAR* const Missing =
+							(PC == nullptr)            ? TEXT("there is no local player controller")
+							: (Pawn == nullptr)        ? TEXT("the local player has no pawn")
+							: (Weapon == nullptr)      ? TEXT("the pawn has no weapon component")
+							: !Pawn->IsAlive()         ? TEXT("the pawn is dead")
+							: Pawn->IsCarrier()        ? TEXT("the pawn is CARRYING THE CORE, and a carrier has no gun to reload")
+							:                            TEXT("the knife is in hand, and the knife has no reload");
+						UE_LOG(LogTraceGame, Error,
+							TEXT("[Ammo.BindTest] VERDICT: INVALID — no usable pawn after %.0f s: %s. Nothing was "
+							     "pressed; this says nothing about the R bind."),
+							UsablePawnWaitSeconds, Missing);
+						return false;
+					}
+					return true;
 				}
 				UE_LOG(LogTraceGame, Error,
 					TEXT("[Ammo.BindTest] VERDICT: INVALID — the local pawn stopped being usable mid-probe."));
@@ -4857,6 +4887,15 @@ namespace TraceReloadBindTest
 			{
 				if (Probe->Step == 0)
 				{
+					if (Now > Probe->UsablePawnDeadline)
+					{
+						UE_LOG(LogTraceGame, Error,
+							TEXT("[Ammo.BindTest] VERDICT: INVALID — no usable pawn after %.0f s: gameplay input is "
+							     "SUPPRESSED (a menu or the loadout screen is open), so a press would be swallowed. "
+							     "Nothing was pressed; this says nothing about the R bind."),
+							UsablePawnWaitSeconds);
+						return false;
+					}
 					return true;
 				}
 				UE_LOG(LogTraceGame, Error,
