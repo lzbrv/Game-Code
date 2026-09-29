@@ -5268,7 +5268,8 @@ bool ATraceHUD::PresentCornerUmg(bool bInLive, const FTraceHudCornerState& InSta
 	// curve and the HUD's rule agree, so this is 1.0 and the transform costs nothing.
 	const float ViewportDpiScale = FMath::Max(0.01f, UWidgetLayoutLibrary::GetViewportScale(this));
 	const float CornerDesignScale = UIScale / ViewportDpiScale;
-	const FTraceHudCornerPresented Presented = CornerWidget->PresentCorner(InState, CornerDesignScale);
+	// Read only by the dev draw record below: in shipping it carries no words at all.
+	[[maybe_unused]] const FTraceHudCornerPresented Presented = CornerWidget->PresentCorner(InState, CornerDesignScale);
 
 	// P10 — the corner fades with the chrome. Slate paints it OVER the Canvas, so without this it sat
 	// at full strength on top of an overlay fading in, then vanished. Touched only when it changes.
@@ -7403,7 +7404,10 @@ void ATraceHUD::DrawMatchResult()
 		const float ScoreBoxH = TraceHUDStyle::ResultScoreBoxPx * UIScale;
 		const float ScoreCap = ScoreBoxH * TraceMenuKit::LabelCapFraction;
 		const float ScoreSpread = ScoreCap * 0.9f;   // from the box's centre to the inner edge of each number
-		const float ScoreDigitsW = FMath::Max3(TraceMenuKit::CapTextWidth(TEXT("00"), ScoreCap),
+		// The box is never narrower than two digits a side. One string for every frame (P11): a
+		// TEXT("00") argument built a temporary FString per frame.
+		static const FString ScoreTwoDigits(TEXT("00"));
+		const float ScoreDigitsW = FMath::Max3(TraceMenuKit::CapTextWidth(ScoreTwoDigits, ScoreCap),
 			TraceMenuKit::CapTextWidth(ScoreBlueText, ScoreCap), TraceMenuKit::CapTextWidth(ScoreOrangeText, ScoreCap));
 		const float ScoreBoxW = FMath::Max(
 			ScoreBoxH * (TraceMenuArtStyle::ValueFrame.PlateW / TraceMenuArtStyle::ValueFrame.PlateH),
@@ -7421,7 +7425,10 @@ void ATraceHUD::DrawMatchResult()
 			TitleFace, TraceText::EHAlign::Left);
 
 #if !UE_BUILD_SHIPPING
-		HudKitRecord.ResultScore = FString::Printf(TEXT("%s %s %s"), *ScoreBlueText, *ScoreDash, *ScoreOrangeText);
+		// Rebuilt in the record's own buffer, which keeps its allocation from frame to frame (P11).
+		HudKitRecord.ResultScore.Reset();
+		HudKitRecord.ResultScore.Append(ScoreBlueText).AppendChar(TEXT(' ')).Append(ScoreDash).AppendChar(TEXT(' '))
+			.Append(ScoreOrangeText);
 		HudKitRecord.bResultScoreBox = true;
 		HudKitRecord.ResultScoreWeight = static_cast<int32>(TitleFace);
 		HudKitRecord.ResultScoreCapPx = ScoreCap / FMath::Max(KINDA_SMALL_NUMBER, UIScale);

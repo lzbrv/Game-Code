@@ -41,6 +41,7 @@ namespace TraceHudCornerWidgetFile
 		return (Authored > 0.f) ? TraceText::SizeForCapHeight(CapPx, ETraceTextWeight::Hud) / Authored : 1.f;
 	}
 
+#if !UE_BUILD_SHIPPING
 	/** The cap height @p Source is drawn at, in design pixels: its atlas twin's if it was swapped. */
 	static float DrawnCapPx(const TArray<FTraceAtlasLabel>& Labels, const UTextBlock* Source)
 	{
@@ -53,6 +54,7 @@ namespace TraceHudCornerWidgetFile
 		}
 		return (Source != nullptr) ? TraceText::CapHeight(Source->GetFont().Size, ETraceTextWeight::Hud) : 0.f;
 	}
+#endif
 }
 
 const TCHAR* UTraceHudCornerWidget::CornerBlueprintPath()
@@ -317,10 +319,12 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 		ReloadBar->SetPercent(FMath::Clamp(InState.KnifeFraction, 0.f, 1.f));
 
 		OutPresented.bKnifeBlock = true;
+#if !UE_BUILD_SHIPPING
 		OutPresented.AmmoLabel = InState.KnifeLabel;
 		OutPresented.AmmoLabelCapPx = TraceHudCornerWidgetFile::DrawnCapPx(AtlasLabels, AmmoLabelText);
 		OutPresented.RightLabel = InState.KnifeReadout;
 		OutPresented.PlateAlpha = PlateFill->GetBrushColor().A;
+#endif
 		return;
 	}
 
@@ -412,6 +416,7 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 
 	OutPresented.bAmmoBlock = true;
 	OutPresented.bBeeClip = InState.bBeeClip;
+#if !UE_BUILD_SHIPPING
 	OutPresented.AmmoText = InState.CountText + InState.CapacityText;
 	OutPresented.AmmoLabel = InState.AmmoLabel;
 	OutPresented.AmmoLabelCapPx = TraceHudCornerWidgetFile::DrawnCapPx(AtlasLabels, AmmoLabelText);
@@ -419,6 +424,7 @@ void UTraceHudCornerWidget::PresentAmmo(const FTraceHudCornerState& InState,
 	OutPresented.CapacityCapPx = TraceHudCornerWidgetFile::DrawnCapPx(AtlasLabels, CapacityText);
 	OutPresented.RightLabel = InState.RightLabel;
 	OutPresented.PlateAlpha = PlateFill->GetBrushColor().A;
+#endif
 }
 
 void UTraceHudCornerWidget::PresentChips(const FTraceHudCornerState& InState,
@@ -458,7 +464,11 @@ void UTraceHudCornerWidget::PresentChips(const FTraceHudCornerState& InState,
 	for (int32 ChipIndex = 0; ChipIndex < Usable; ++ChipIndex)
 	{
 		UTraceHudStatusChipWidget* ChipWidget = ChipPool[Usable - 1 - ChipIndex];
+#if !UE_BUILD_SHIPPING
 		OutPresented.Chips.Add(ChipWidget->ApplyChip(InState.Chips[ChipIndex]));
+#else
+		ChipWidget->ApplyChip(InState.Chips[ChipIndex]);
+#endif
 	}
 
 	StatusStack->SetVisibility(Usable > 0 ? ESlateVisibility::HitTestInvisible : ESlateVisibility::Collapsed);

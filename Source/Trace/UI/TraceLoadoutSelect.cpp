@@ -1665,7 +1665,8 @@ void FTraceLoadoutSelect::DrawHeader(AHUD* HUD, const ATracePlayerState* LocalSt
 		const FString Dash = TRACE_TEXT("HUD.RESULT_SCORE_SEPARATOR", "-");
 		const float CapH = BoxH * TraceMenuKit::LabelCapFraction;
 		const float Spread = CapH * 0.9f;   // from the box's centre to the inner edge of each number
-		const float ScoreW = FMath::Max(BoxW, 2.f * (Spread + TraceMenuKit::CapTextWidth(TEXT("00"), CapH))
+		static const FString HalfTimeTwoDigits(TEXT("00"));   // one string, not a temporary per frame (P11)
+		const float ScoreW = FMath::Max(BoxW, 2.f * (Spread + TraceMenuKit::CapTextWidth(HalfTimeTwoDigits, CapH))
 			+ BoxH * TraceMenuKit::LabelPadFraction * 2.f);
 		const float BoxLeft = TraceLoadoutLayout::Margin * S;
 		const float BoxMid = BoxLeft + ScoreW * 0.5f;

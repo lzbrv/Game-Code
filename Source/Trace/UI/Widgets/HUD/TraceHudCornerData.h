@@ -162,6 +162,13 @@ struct FTraceHudCornerPresented
 	/** Lit magazine ticks actually made visible. An empty strip cannot pass as a full one. */
 	int32 LitTicks = 0;
 
+	/** The plate stood in for the knife (bAmmoBlock stays false: there is no clip). */
+	bool bKnifeBlock = false;
+
+#if !UE_BUILD_SHIPPING
+	// THE WORDS AND MEASUREMENTS ONLY A HARNESS READS (ATraceHUD's draw record is dev-only). Not in
+	// shipping at all, so a shipping frame copies no strings into a record nobody reads (P11).
+
 	/** "26/30" — the two text blocks that were actually filled, concatenated. */
 	FString AmmoText;
 
@@ -179,11 +186,9 @@ struct FTraceHudCornerPresented
 	/** The plate's fill alpha as set on PlateFill's brush (1: the world does not show through it). */
 	float PlateAlpha = 0.f;
 
-	/** The plate stood in for the knife (bAmmoBlock stays false: there is no clip). */
-	bool bKnifeBlock = false;
-
 	/** One entry per chip widget actually shown, in the order shown (bottom-up). */
 	TArray<FString> Chips;
+#endif
 };
 
 /**
