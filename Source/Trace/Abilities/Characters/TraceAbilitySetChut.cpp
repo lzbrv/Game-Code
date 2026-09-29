@@ -30,6 +30,7 @@
 #include "Trace.h"
 #include "TraceSettings.h"
 #include "TraceTypes.h"                                    // ETraceTeam, TraceOpposingTeam
+#include "Abilities/Characters/TraceVerifyLock.h"          // ChudRefreshTest steers the same pawn as the verifies
 
 // =================================================================================================
 // THE RED ARMS. One per ability, each removing that ability and nothing else, so Trace.Chut.Verify
@@ -1128,6 +1129,12 @@ namespace TraceAbilitySetChutFile
 		int32 SetupAttemptsLeft = 40;
 
 		/**
+		 * THE WHOLE RUN'S BUDGET, in real seconds, on top of each arm's restarts — see
+		 * ChudRefreshBudgetSeconds. Past it, whatever has not finished is INVALID and the verdict prints.
+		 */
+		double RunDeadlineReal = 0.0;
+
+		/**
 		 * RESTARTS OF THE CURRENT ARM, and this is not defensive padding — it is the fix for a
 		 * measured false failure.
 		 *
@@ -1141,6 +1148,20 @@ namespace TraceAbilitySetChutFile
 		 */
 		int32 ArmRestartsLeft = 8;
 	};
+
+	/**
+	 * *** A BOUND ON THE WHOLE RUN, AND THE VERIFY LOCK FOR ALL OF IT. ***
+	 *
+	 * Eight restarts per arm, each waiting 2 s and re-staging, let one run go on for 2 min 20 s
+	 * (v_hw_D8) against a description that said "about 30s" — and a batch that had budgeted 55 s for it
+	 * started Trace.Slimeball.StickTest while this was still turning the player back into Chut and
+	 * teleporting him, which failed StickTest 3 of 5 on a correct build. So the run now (a) holds the
+	 * TraceVerifyLock subject from start to verdict, so lock-aware fixtures queue behind it instead of
+	 * steering the same pawn, and (b) stops at this budget with INVALID for whatever it had not
+	 * finished. A clean run takes about a minute.
+	 */
+	constexpr double ChudRefreshBudgetSeconds = 120.0;
+	const TCHAR* const ChudRefreshCommandName = TEXT("Trace.Chut.ChudRefreshTest");
 
 	UWorld* FindAuthoritativeGameWorld()
 	{
@@ -1400,7 +1421,8 @@ namespace TraceAbilitySetChutFile
 	/** Throw the current arm's half-finished checks away and start it again, or give up honestly. */
 	bool RestartOrGiveUp(TSharedPtr<FChudRun> Run, const FString& Why)
 	{
-		if (Run->ArmRestartsLeft-- > 0)
+		const bool bBudgetSpent = FPlatformTime::Seconds() > Run->RunDeadlineReal;
+		if (!bBudgetSpent && Run->ArmRestartsLeft-- > 0)
 		{
 			UE_LOG(LogTraceGame, Warning,
 				TEXT("[CHUDREFRESH] arm %d RESTARTING (%d left): %s"),
@@ -1412,8 +1434,10 @@ namespace TraceAbilitySetChutFile
 			return false;
 		}
 
-		Run->Current.Invalidate(FString::Printf(
-			TEXT("the fixture kept collapsing and the restarts ran out: %s"), *Why));
+		Run->Current.Invalidate(bBudgetSpent
+			? FString::Printf(TEXT("the run's %.0f s budget was spent and the fixture had just collapsed again: %s"),
+				ChudRefreshBudgetSeconds, *Why)
+			: FString::Printf(TEXT("the fixture kept collapsing and the restarts ran out: %s"), *Why));
 		FinishChudArm(Run);
 		ScheduleChudRefresh(Run, 1.0f);
 		return false;
@@ -1522,6 +1546,8 @@ namespace TraceAbilitySetChutFile
 		if (WorldPtr == nullptr)
 		{
 			UE_LOG(LogTraceGame, Error, TEXT("[CHUDREFRESH] no authoritative world — server only."));
+			ApplyChudRefreshArm(1);
+			TraceVerifyLock::Release(ChudRefreshCommandName);
 			return false;
 		}
 
@@ -1529,11 +1555,23 @@ namespace TraceAbilitySetChutFile
 		{
 			ApplyChudRefreshArm(1);   // leave the process on the shipped arm
 			ReportChudRefreshVerdict(Run);
+			TraceVerifyLock::Release(ChudRefreshCommandName);
 			return false;
 		}
 
 		const int32 Arm = Run->ArmsToRun[Run->ArmIndex];
 		const UTraceSettings& Settings = UTraceSettings::Get();
+
+		// AN ARM THAT HAS NOT STARTED WHEN THE BUDGET RUNS OUT DOES NOT START. See ChudRefreshBudgetSeconds.
+		if (Run->Step == 0 && FPlatformTime::Seconds() > Run->RunDeadlineReal)
+		{
+			Run->Current.Invalidate(FString::Printf(
+				TEXT("not run: the %.0f s budget for the whole test was spent before this arm could start"),
+				ChudRefreshBudgetSeconds));
+			FinishChudArm(Run);
+			ScheduleChudRefresh(Run, 0.f);
+			return false;
+		}
 
 		switch (Run->Step)
 		{
@@ -1896,10 +1934,18 @@ namespace TraceAbilitySetChutFile
 		     "maximum duration, that it does NOT reset the E cooldown, and that a kill with Chud down does not "
 		     "start it. Drives the real kill funnel (ApplyDamage -> NotifyCharacterDied -> NotifyKill), not "
 		     "UTraceAbilitySetChut::OnKill directly. Arm 0 sets Trace.Chut.ChudKillRefresh 0 and MUST fail; "
-		     "a red arm that passes is reported INVALID. Takes about 30s."),
+		     "a red arm that passes is reported INVALID. Takes about a minute; holds the verify lock throughout "
+		     "and gives up (INVALID) on whatever it has not finished after 120 s."),
 		FConsoleCommandDelegate::CreateLambda([]()
 		{
+			// ONE FIXTURE ON THE PLAYER'S PAWN AT A TIME — see ChudRefreshBudgetSeconds. The claim
+			// covers the budget plus the verdict, and is released when the verdict prints.
+			if (!TraceVerifyLock::ClaimOrQueue(ChudRefreshCommandName, ChudRefreshBudgetSeconds + 15.0))
+			{
+				return;
+			}
 			TSharedPtr<FChudRun> Run = MakeShared<FChudRun>();
+			Run->RunDeadlineReal = FPlatformTime::Seconds() + ChudRefreshBudgetSeconds;
 			ScheduleChudRefresh(Run, 0.f);
 		}));
 

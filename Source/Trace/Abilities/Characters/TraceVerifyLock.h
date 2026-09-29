@@ -64,7 +64,7 @@ namespace TraceVerifyLock
 	 */
 	TRACE_API void ReleaseAny();
 
-	/** Who holds it, for the refusal message. Empty when free. */
+	/** Who holds it, as the command line that claimed it ("Trace.Rocco.Verify 1"). Empty when free. */
 	TRACE_API FString CurrentHolder();
 
 	/**
@@ -87,11 +87,29 @@ namespace TraceVerifyLock
 	 * minutes cannot run out in practice: every claim expires first (60 s by default), and an expired
 	 * claim is taken. It is there for a holder that keeps re-claiming and never finishes.
 	 *
+	 * THE REQUEUE CARRIES THE ARGUMENTS. It used to re-run the bare command name, so a queued
+	 * `Trace.Rocco.Verify 1` came back as `Trace.Rocco.Verify` and ran every arm. The whole line is
+	 * rebuilt from @p Args and re-run, and the wait is keyed on that line, so `Trace.Rocco.Verify 1`
+	 * and `Trace.Rocco.Verify 2` queue as two runs rather than one.
+	 *
+	 * A SECOND RUN OF THE SAME COMMAND QUEUES TOO. The lock's identity is the command name, and
+	 * TryClaim lets a holder re-claim itself; that let `Trace.Rocco.Verify 2` start on top of a running
+	 * `Trace.Rocco.Verify 1`. Every call here is a fresh invocation, so a hold by the same name is
+	 * another run and this one waits for it.
+	 *
+	 * THE WAIT IS ANNOUNCED HERE, once per holder: one Display line when it starts queuing and one each
+	 * time the subject changes hands. The fixtures used to log their own "QUEUED behind" Warning on
+	 * every one-second retry, which put about a hundred lines into a batch of eight.
+	 *
 	 * @param CommandName the console command to re-run, which is also the lock's identity.
+	 * @param ExpectedSeconds the whole run, INCLUDING the fixture's own staging wait. A fixture that
+	 *        waits up to 120 s for a pawn must say so, or a queued one takes the subject mid-staging.
+	 * @param Args the command's own arguments, exactly as the console passed them.
 	 * @return true if the subject is yours now. false means "queued, or given up" — the caller must
 	 *         return either way, and the queue will call the command again if it is coming back.
 	 */
-	TRACE_API bool ClaimOrQueue(const TCHAR* CommandName, double ExpectedSeconds = 60.0);
+	TRACE_API bool ClaimOrQueue(const TCHAR* CommandName, double ExpectedSeconds = 60.0,
+		const TArray<FString>& Args = TArray<FString>());
 
 	/**
 	 * Wraps a ticker-driven fixture's ticker so the claim is released on the tick that ENDS the run,

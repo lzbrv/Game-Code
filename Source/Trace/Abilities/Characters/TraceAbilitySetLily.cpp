@@ -3048,10 +3048,8 @@ namespace TraceLilyVerifyFile
 		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
 		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Lily.Verify")))
 		{
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[LILY] QUEUED behind %s — it will start automatically when that finishes. "
-				     "(If it never starts, the holder died without releasing — see TraceVerifyLock.h.)"),
-				*TraceVerifyLock::CurrentHolder());
+			// Queued: TraceVerifyLock announces the wait once per holder and re-runs this command,
+			// arguments and all, when the subject is free.
 			return;
 		}
 

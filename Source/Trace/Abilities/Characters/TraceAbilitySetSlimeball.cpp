@@ -2108,12 +2108,11 @@ namespace TraceSlimeballVerify
 		// ONE CHARACTER FIXTURE AT A TIME. These run on tickers across many frames and all steer
 		// the SAME pawn, so two from one -TraceExec list interleave and each reports the other's
 		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
-		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Slimeball.Verify")))
+		// 75 s: it waits up to 60 s for a pawn to stage on, and the checks run after that.
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Slimeball.Verify"), 75.0))
 		{
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[SLIME] QUEUED behind %s — it will start automatically when that finishes. "
-				     "(If it never starts, the holder died without releasing — see TraceVerifyLock.h.)"),
-				*TraceVerifyLock::CurrentHolder());
+			// Queued: TraceVerifyLock announces the wait once per holder and re-runs this command,
+			// arguments and all, when the subject is free.
 			return;
 		}
 		UWorld* WorldPtr = FindAuthoritativeWorld();
@@ -2351,10 +2350,21 @@ namespace TraceSlimeballVerify
 
 	void RunStickTest()
 	{
+		// ONE FIXTURE ON THE PLAYER'S PAWN AT A TIME. It teleports him beside a wall and times his fall,
+		// so anything else steering that pawn meanwhile is measured as the wall stick failing — which is
+		// exactly what happened when Trace.Chut.ChudRefreshTest ran long and re-staged Chut in the middle
+		// of it (v_hw_D8: 3 of 5 failed on a correct build). 110 s: its own 90 s staging window, plus the
+		// arms. Released on the tick that ends the run, however it ends.
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Slimeball.StickTest"), 110.0))
+		{
+			return;
+		}
+
 		UWorld* WorldPtr = FindAuthoritativeWorld();
 		if (WorldPtr == nullptr)
 		{
 			UE_LOG(LogTraceGame, Warning, TEXT("[SLIMESTICK] no authoritative game world — run this on the server."));
+			TraceVerifyLock::Release(TEXT("Trace.Slimeball.StickTest"));
 			return;
 		}
 
@@ -2367,7 +2377,8 @@ namespace TraceSlimeballVerify
 			     "beside a wall the level actually has, dropped, and told to hold V. arm 0 is RED "
 			     "(Trace.Slimeball.WallStick 0) and MUST see him fall. ====="));
 
-		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
+		FTSTicker::GetCoreTicker().AddTicker(TraceVerifyLock::ReleaseWhenFinished(TEXT("Trace.Slimeball.StickTest"),
+			FTickerDelegate::CreateLambda(
 			[State, WeakWorld = TWeakObjectPtr<UWorld>(WorldPtr)](float) -> bool
 		{
 			UWorld* TickWorld = WeakWorld.Get();
@@ -2498,7 +2509,7 @@ namespace TraceSlimeballVerify
 			State->List.Report();
 			RestoreAllArms();
 			return false;
-		}), 0.25f);
+		})), 0.25f);
 	}
 
 	// =============================================================================================

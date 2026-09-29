@@ -10,7 +10,10 @@ namespace TraceVerifyLock
 {
 	namespace
 	{
+		/** The fixture holding the subject: its command NAME, which is what Release() compares. */
 		FString GHolder;
+		/** The whole command line that claimed it, arguments included. For messages only. */
+		FString GHolderLine;
 		double GDeadlineRealTime = 0.0;
 
 		/** One queued command's wait: who it is behind, and how many one-second retries so far. */
@@ -20,35 +23,53 @@ namespace TraceVerifyLock
 			int32 Retries = 0;
 		};
 
-		/** Keyed by command name. An entry exists only while that command is queued. */
+		/** Keyed by the FULL command line. An entry exists only while that line is queued. */
 		TMap<FString, FQueuedWait> GQueuedWaits;
+
+		/** "Trace.Rocco.Verify" + {"1"} -> "Trace.Rocco.Verify 1", which is what the console split. */
+		FString JoinCommandLine(const TCHAR* CommandName, const TArray<FString>& Args)
+		{
+			FString Line(CommandName);
+			for (const FString& Arg : Args)
+			{
+				Line += TEXT(' ');
+				Line += Arg;
+			}
+			return Line;
+		}
+
+		bool ClaimAs(const TCHAR* FixtureName, const FString& ClaimLine, double ExpectedSeconds)
+		{
+			const double Now = FPlatformTime::Seconds();
+
+			if (!GHolder.IsEmpty() && Now < GDeadlineRealTime)
+			{
+				// Re-claiming by the same fixture is fine and just extends the deadline: a fixture that
+				// runs several arms in sequence is one fixture, not three.
+				if (GHolder != FixtureName)
+				{
+					return false;
+				}
+			}
+
+			if (!GHolder.IsEmpty() && GHolder != FixtureName && Now >= GDeadlineRealTime)
+			{
+				UE_LOG(LogTraceGame, Warning,
+					TEXT("[VerifyLock] %s held the subject past its deadline and never released it. %s is "
+					     "taking it. If %s was still running, its result is not trustworthy."),
+					*GHolderLine, *ClaimLine, *GHolderLine);
+			}
+
+			GHolder = FixtureName;
+			GHolderLine = ClaimLine;
+			GDeadlineRealTime = Now + FMath::Max(1.0, ExpectedSeconds);
+			return true;
+		}
 	}
 
 	bool TryClaim(const TCHAR* FixtureName, double ExpectedSeconds)
 	{
-		const double Now = FPlatformTime::Seconds();
-
-		if (!GHolder.IsEmpty() && Now < GDeadlineRealTime)
-		{
-			// Re-claiming by the same fixture is fine and just extends the deadline: a fixture that
-			// runs several arms in sequence is one fixture, not three.
-			if (GHolder != FixtureName)
-			{
-				return false;
-			}
-		}
-
-		if (!GHolder.IsEmpty() && GHolder != FixtureName && Now >= GDeadlineRealTime)
-		{
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[VerifyLock] %s held the subject past its deadline and never released it. %s is "
-				     "taking it. If %s was still running, its result is not trustworthy."),
-				*GHolder, FixtureName, *GHolder);
-		}
-
-		GHolder = FixtureName;
-		GDeadlineRealTime = Now + FMath::Max(1.0, ExpectedSeconds);
-		return true;
+		return ClaimAs(FixtureName, FString(FixtureName), ExpectedSeconds);
 	}
 
 	void Release(const TCHAR* FixtureName)
@@ -56,6 +77,7 @@ namespace TraceVerifyLock
 		if (GHolder == FixtureName)
 		{
 			GHolder.Reset();
+			GHolderLine.Reset();
 			GDeadlineRealTime = 0.0;
 		}
 	}
@@ -63,24 +85,32 @@ namespace TraceVerifyLock
 	void ReleaseAny()
 	{
 		GHolder.Reset();
+		GHolderLine.Reset();
 		GDeadlineRealTime = 0.0;
 	}
 
 	FString CurrentHolder()
 	{
-		return (FPlatformTime::Seconds() < GDeadlineRealTime) ? GHolder : FString();
+		return (FPlatformTime::Seconds() < GDeadlineRealTime) ? GHolderLine : FString();
 	}
 
-	bool ClaimOrQueue(const TCHAR* CommandName, double ExpectedSeconds)
+	bool ClaimOrQueue(const TCHAR* CommandName, double ExpectedSeconds, const TArray<FString>& Args)
 	{
-		const FString QueueKey(CommandName);
+		// THE WHOLE LINE, not the name: it is what the requeue re-runs and what the wait is keyed on.
+		const FString Line = JoinCommandLine(CommandName, Args);
 
-		if (TryClaim(CommandName, ExpectedSeconds))
+		// Every call here is a fresh invocation, so a live hold under this same NAME is another run of
+		// this command — `Trace.Rocco.Verify 2` arriving while `Trace.Rocco.Verify 1` runs — and not
+		// the fixture re-claiming itself. ClaimAs would let it straight in on top of the first.
+		const bool bAnotherRunOfThisCommand =
+			(GHolder == CommandName) && (FPlatformTime::Seconds() < GDeadlineRealTime);
+
+		if (!bAnotherRunOfThisCommand && ClaimAs(CommandName, Line, ExpectedSeconds))
 		{
 			// Whatever this command waited through is over. Forgetting it HERE is what lets the same
 			// command queue again later in the session with a clean slate — the old counter was never
 			// cleared on a claim, so a second batch started its three minutes part-spent.
-			GQueuedWaits.Remove(QueueKey);
+			GQueuedWaits.Remove(Line);
 			return true;
 		}
 
@@ -94,39 +124,37 @@ namespace TraceVerifyLock
 		// far worse bug than the one this file fixes, and a silent one. (A holder that simply dies
 		// cannot do it: its claim expires and the next retry takes it.)
 		const FString HolderNow = CurrentHolder();
-		const bool bFirstWait = !GQueuedWaits.Contains(QueueKey);
-		FQueuedWait& MyWait = GQueuedWaits.FindOrAdd(QueueKey);
-		if (MyWait.Behind != HolderNow)
+		FQueuedWait* ExistingWait = GQueuedWaits.Find(Line);
+		const bool bNewHolder = (ExistingWait == nullptr) || (ExistingWait->Behind != HolderNow);
+		FQueuedWait& MyWait = GQueuedWaits.FindOrAdd(Line);
+		if (bNewHolder)
 		{
 			MyWait.Behind = HolderNow;
 			MyWait.Retries = 0;
+
+			// ONE LINE PER HOLDER, from here, rather than one per retry from every fixture.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[VerifyLock] %s is queued behind %s and will start when it finishes."),
+				*Line, *HolderNow);
 		}
 
 		if (++MyWait.Retries > 180)
 		{
 			UE_LOG(LogTraceGame, Error,
 				TEXT("[VerifyLock] %s waited three minutes for %s and gave up. Nothing was measured."),
-				CommandName, *HolderNow);
-			GQueuedWaits.Remove(QueueKey);
+				*Line, *HolderNow);
+			GQueuedWaits.Remove(Line);
 			return false;
 		}
 
-		if (bFirstWait)
-		{
-			UE_LOG(LogTraceGame, Display,
-				TEXT("[VerifyLock] %s is queued behind %s and will start when it finishes."),
-				CommandName, *HolderNow);
-		}
-
-		const FString Command(CommandName);
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
-			[Command](float) -> bool
+			[Line](float) -> bool
 			{
 				if (GEngine != nullptr)
 				{
-					// Re-enters the command, which hits this same guard and either claims (and forgets
-					// the wait) or queues again.
-					GEngine->Exec(nullptr, *Command);
+					// Re-enters the command WITH ITS ARGUMENTS, which hits this same guard and either
+					// claims (and forgets the wait) or queues again.
+					GEngine->Exec(nullptr, *Line);
 				}
 				return false;   // one shot
 			}), 1.0f);

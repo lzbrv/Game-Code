@@ -579,12 +579,12 @@ namespace TraceMaceOysterVerify
 		// ONE CHARACTER FIXTURE AT A TIME. These run on tickers across many frames and all steer
 		// the SAME pawn, so two from one -TraceExec list interleave and each reports the other's
 		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
-		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Oyster.Verify")))
+		// 90 s: phase 0 waits up to 60 s to make the player Oyster, and the phases after it run about
+		// ten seconds. The default 60 would expire while a slow staging was still inside its own wait.
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Oyster.Verify"), 90.0))
 		{
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[OYSTER] QUEUED behind %s — it will start automatically when that finishes. "
-				     "(If it never starts, the holder died without releasing — see TraceVerifyLock.h.)"),
-				*TraceVerifyLock::CurrentHolder());
+			// Queued: TraceVerifyLock announces the wait once per holder and re-runs this command,
+			// arguments and all, when the subject is free.
 			return;
 		}
 		UWorld* WorldPtr = FindAuthoritativeWorld();
@@ -984,12 +984,12 @@ namespace TraceMaceOysterVerify
 		// ONE CHARACTER FIXTURE AT A TIME. These run on tickers across many frames and all steer
 		// the SAME pawn, so two from one -TraceExec list interleave and each reports the other's
 		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
-		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Mace.Verify")))
+		// 90 s: phase 0 waits up to 60 s to make the player Mace, and the phases after it run about
+		// ten seconds. The default 60 would expire while a slow staging was still inside its own wait.
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Mace.Verify"), 90.0))
 		{
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[MACE] QUEUED behind %s — it will start automatically when that finishes. "
-				     "(If it never starts, the holder died without releasing — see TraceVerifyLock.h.)"),
-				*TraceVerifyLock::CurrentHolder());
+			// Queued: TraceVerifyLock announces the wait once per holder and re-runs this command,
+			// arguments and all, when the subject is free.
 			return;
 		}
 		UWorld* WorldPtr = FindAuthoritativeWorld();

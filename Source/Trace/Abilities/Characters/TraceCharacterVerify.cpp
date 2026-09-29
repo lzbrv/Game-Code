@@ -890,12 +890,10 @@ namespace TraceCharacterVerify
 		// ONE CHARACTER FIXTURE AT A TIME. These run on tickers across many frames and all steer
 		// the SAME pawn, so two from one -TraceExec list interleave and each reports the other's
 		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
-		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Rocco.Verify")))
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Rocco.Verify"), 60.0, Args))
 		{
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[ROCCO] QUEUED behind %s — it will start automatically when that finishes. "
-				     "(If it never starts, the holder died without releasing — see TraceVerifyLock.h.)"),
-				*TraceVerifyLock::CurrentHolder());
+			// Queued: TraceVerifyLock announces the wait once per holder and re-runs this command,
+			// arguments and all, when the subject is free.
 			return;
 		}
 		TSharedPtr<FRoccoRun> Run = MakeShared<FRoccoRun>();
@@ -1400,12 +1398,10 @@ namespace TraceCharacterVerify
 		// ONE CHARACTER FIXTURE AT A TIME. These run on tickers across many frames and all steer
 		// the SAME pawn, so two from one -TraceExec list interleave and each reports the other's
 		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
-		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Chut.Verify")))
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Chut.Verify"), 60.0, Args))
 		{
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[CHUT] QUEUED behind %s — it will start automatically when that finishes. "
-				     "(If it never starts, the holder died without releasing — see TraceVerifyLock.h.)"),
-				*TraceVerifyLock::CurrentHolder());
+			// Queued: TraceVerifyLock announces the wait once per holder and re-runs this command,
+			// arguments and all, when the subject is free.
 			return;
 		}
 		TSharedPtr<FChutRun> Run = MakeShared<FChutRun>();

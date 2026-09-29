@@ -556,12 +556,12 @@ namespace TraceElleVerify
 		// ONE CHARACTER FIXTURE AT A TIME. These run on tickers across many frames and all steer
 		// the SAME pawn, so two from one -TraceExec list interleave and each reports the other's
 		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
-		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Elle.Verify")))
+		// 150 s: it waits up to 120 s (AcquireDeadline) for Elle and a living team-mate, and the gate
+		// arms take about 15 s after that. The default 60 let a queued fixture take the subject mid-staging.
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Elle.Verify"), 150.0))
 		{
-			UE_LOG(LogTraceGame, Warning,
-				TEXT("[ELLE] QUEUED behind %s — it will start automatically when that finishes. "
-				     "(If it never starts, the holder died without releasing — see TraceVerifyLock.h.)"),
-				*TraceVerifyLock::CurrentHolder());
+			// Queued: TraceVerifyLock announces the wait once per holder and re-runs this command,
+			// arguments and all, when the subject is free.
 			return;
 		}
 		UWorld* WorldPtr = FindAuthoritativeWorld();
