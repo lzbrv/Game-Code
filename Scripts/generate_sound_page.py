@@ -76,13 +76,14 @@
 # sites is under Source/Trace/Abilities/ - with no ABILITY_SOUNDS entry is an
 # ERROR. So is an unmapped trigger site for a mapped sound.
 #
-# TWO ROUTES WITH NO ABILITY CHECK, AS OF THIS WRITING (owner's call whether
-# they are bugs): X's bee sweep (TickAbilities -> SweepBeeContacts) runs for any
-# X pick, so LEECH or STING alone still stings with orbiting bees; and the kit's
-# dash poll (TickAbilities -> PollDashForBash -> TryBash) knocks players for any
-# pick of that kit, so CUSTOM STEEL or CHUD alone still bashes. Both rows carry
-# the extra abilities and a note. Add the check in C++ and this script FAILS
-# until the entry says G(...) - by design.
+# NO ROUTE WITHOUT AN ABILITY CHECK, AS OF THIS WRITING. The last two were
+# closed in the C++ and are G(...) paths now: X's bee sweep checks X-MECHS
+# (TickAbilities -> SweepBeeContacts), and the dash poll checks BASH
+# (TickAbilities -> PollDashForBash -> TryBash, and TryBash itself), so LEECH or
+# STING alone no longer stings and CUSTOM STEEL or CHUD alone no longer bashes.
+# ANY(...) is still supported for the next one somebody finds: a route that
+# checks nothing files the sound under every ability of its kit, with a note,
+# and adding the check in C++ makes this script FAIL until the entry says G(...).
 #
 # NO CHARACTER NAMES IN WHAT THE PAGE SAYS. Abilities are freestanding: the page
 # names them by GAbilityTable's Name column and groups by ability and slot.
@@ -747,8 +748,10 @@ def check_path(ev, path, trigger, abilities):
 #              reason should be backed by `needs`). Any OTHER caller is an ERROR: see
 #              check_callers, which is what catches a second, unchecked route.
 #   needs      [(file, regex, why)] - any other fact the reading rests on, re-found every run.
-#   retired    {cvar, replaced_by, gate} - a sound only a Demo 35-retired path plays; `gate` is the
-#              (file, regex) of the switch that keeps it off.
+#   retired    {cvar, replaced_by, gate[, only]} - a sound only a Demo 35-retired path plays; `gate`
+#              is the (file, regex) of the switch that keeps it off. `only`, when given, is the
+#              (file, regex) of the IsAbility check that, with the switch ON, still keeps the path to
+#              players who picked `replaced_by` - re-found every run and cited on the row.
 # }
 CH = "Source/Trace/Abilities/Characters/"
 FXB = "Source/Trace/Gameplay/TraceFxBurst.cpp"
@@ -819,16 +822,16 @@ ABILITY_SOUNDS = {
         paths=[G(*_ROCKET, "ATraceRoxieRocket::DetonateAndDestroy")], dev=["Roxie::DebugFireRocket"]),
 
     # ---- passive ------------------------------------------------------------------------------
-    # BASH is checked on the movement component's dash-hit route, but the kit's own 20 Hz dash poll
-    # (TickAbilities -> PollDashForBash -> TryBash) checks nothing, so a kit picked only for CUSTOM
-    # STEEL or CHUD knocks players too. The row says so until the code changes.
+    # BASH on both routes: the movement component's dash-hit hook, and the kit's own 20 Hz dash poll
+    # (TickAbilities checks BASH before PollDashForBash), and TryBash - the one apply path - checks it
+    # again. A kit picked only for CUSTOM STEEL or CHUD no longer knocks anybody.
     "ChutBash": dict(
-        abilities=["Bash", "CustomSteel", "Chud"], label="Dash knock",
+        abilities=["Bash"], label="Dash knock",
         when="your dash knocks a player back; plays at them",
         sites=[(CH + "TraceAbilitySetChut.cpp", r"ATraceFxBurst::Burst\(MyPawn->GetWorld\(\), ETraceFxBurstType::ChutBash"),
                (FXB, r"case ETraceFxBurstType::ChutBash:\s*return TraceSoundEvents::ChutBash")],
         paths=[G("Chut::OnDashHitCharacter", "Chut::TryBash"),
-               ANY("Chut::TickAbilities", "Chut::PollDashForBash", "Chut::TryBash")]),
+               G("Chut::TickAbilities", "Chut::PollDashForBash", "Chut::TryBash")]),
     "ElleCloak": dict(
         abilities=["Shimmer"], label="Cloak on",
         when="passing or throwing the Core cloaks you",
@@ -848,14 +851,14 @@ ABILITY_SOUNDS = {
         sites=[(CH + "TraceOysterPoison.cpp", r"TraceAudio::PlayReplicatedLocal\(this, TraceSoundEvents::OysterJarBreak")],
         paths=[G(*_DASH_JAR, *_JAR_TO_CLOUD), ACT(*_THROWN_JAR, *_JAR_TO_CLOUD)],
         dev=_JAR_DEV),
-    # The bee sweep runs from TickAbilities with no ability check, and the component ticks X's kit
-    # whatever it was picked for: LEECH alone, or STING alone, still orbits bees that sting.
+    # The bee sweep checks X-MECHS at its top. The component still ticks X's kit whatever it was
+    # picked for, but LEECH alone or STING alone has no bees: no swarm is drawn and nothing stings.
     "XSting": dict(
-        abilities=["XMechs", "Leech", "Sting"], label="Bee sting",
+        abilities=["XMechs"], label="Bee sting",
         when="an orbiting bee stings an enemy and marks them",
         sites=[(CH + "TraceAbilitySetX.cpp", r"ATraceFxBurst::Burst\(CurrentWorld, ETraceFxBurstType::BeeSting"),
                (FXB, r"case ETraceFxBurstType::BeeSting:\s*return TraceSoundEvents::XSting")],
-        paths=[ANY("X::TickAbilities", "X::SweepBeeContacts")]),
+        paths=[G("X::TickAbilities", "X::SweepBeeContacts")]),
 
     # ---- activated ----------------------------------------------------------------------------
     "RoccoRipple": dict(
@@ -959,7 +962,14 @@ ABILITY_SOUNDS = {
         sites=[(CH + "TraceAbilitySetMortimer.cpp", r"TraceAudio::Play\(MyPawn, TraceSoundEvents::MortimerMantle\)")],
         retired=dict(cvar="Trace.Demo35.LegacyMantle", replaced_by="Blink",
                      gate=(CH + "TraceAbilitySetMortimer.cpp",
-                           r"if \(CVarMortimerLegacyMantle\.GetValueOnAnyThread\(\) == 0\)\s*\{\s*return false;"))),
+                           r"if \(CVarMortimerLegacyMantle\.GetValueOnAnyThread\(\) == 0\)\s*\{\s*return false;"),
+                     # With the switch on, OnJumpPressed goes on to the mantle only for a BLINK pick:
+                     # the mantle is the movement ability BLINK replaced, so QUAKE or QMECH alone never
+                     # gets it. Anchored from the switch so it lands on OnJumpPressed's check and not
+                     # on AllowsMantle's identical one.
+                     only=(CH + "TraceAbilitySetMortimer.cpp",
+                           r"if \(CVarMortimerLegacyMantle\.GetValueOnAnyThread\(\) == 0\)\s*\{\s*return false;\s*\}"
+                           r"[^{}]*?if \(!IsAbility\(ETraceAbilityId::Blink\)\)"))),
 }
 
 
@@ -1857,10 +1867,11 @@ def render_row(r):
                      'brings it back.</span>'.format(e(r["unwired"])))
         state.append("SILENT in matches (Trace.Audio.UnwiredEvents 0 brings it back)")
     if r["retired"]:
+        for_whom = " for {0} picks".format(r["retired"]["replaced_by"]) if r["retired"].get("only") else ""
         notes.append('<span class="note warn">Retired in Demo 35 &mdash; {0} replaced the feature that played '
-                     'it. <code>{1} 1</code> brings it back.</span>'.format(
-                         e(r["retired"]["replaced_by"]), e(r["retired"]["cvar"])))
-        state.append("RETIRED (Demo 35); {0} 1 brings it back".format(r["retired"]["cvar"]))
+                     'it. <code>{1} 1</code> brings it back{2}.</span>'.format(
+                         e(r["retired"]["replaced_by"]), e(r["retired"]["cvar"]), e(for_whom)))
+        state.append("RETIRED (Demo 35); {0} 1 brings it back{1}".format(r["retired"]["cvar"], for_whom))
     if not r["sites"]:
         notes.append('<span class="note warn">Nothing in Source/ plays this event.</span>')
         state.append("NOT WIRED: nothing in Source/ plays it")
@@ -2083,6 +2094,15 @@ def main():
             if retired["replaced_by"] not in abilities:
                 error("ABILITY_SOUNDS '{0}': replaced_by '{1}' has no row in GAbilityTable".format(
                     ev, retired["replaced_by"]))
+            only = retired.get("only")
+            if only is not None:
+                if find_anchor(*only) is None:
+                    error("ABILITY_SOUNDS '{0}': the check /{1}/ that keeps the switched-on path to {2} picks is no "
+                          "longer in {3} - with the switch on, every pick of the kit may play it".format(
+                              ev, only[1], retired["replaced_by"], only[0]))
+                elif not re.search(r"IsAbility\\\(ETraceAbilityId::" + re.escape(retired["replaced_by"]) + r"\b", only[1]):
+                    error("ABILITY_SOUNDS '{0}': `only` must match IsAbility(ETraceAbilityId::{1})".format(
+                        ev, retired["replaced_by"]))
         elif not spec.get("paths"):
             error("ABILITY_SOUNDS '{0}' gives no path from an ability to its trigger".format(ev))
         elif spans:
@@ -2206,12 +2226,16 @@ def main():
             if spec.get("retired"):
                 r = spec["retired"]
                 repl = abilities.get(r["replaced_by"], {}).get("name", r["replaced_by"])
-                retired = {"cvar": r["cvar"], "replaced_by": repl}
+                retired = {"cvar": r["cvar"], "replaced_by": repl, "only": bool(r.get("only"))}
                 group, where = "retired", "Retired"
                 switch = find_anchor(*r["gate"])
                 if switch:
                     f, line = switch.rsplit(":", 1)
                     checks = ["switched off at {0}:{1}".format(os.path.basename(f), line)]
+                only_at = find_anchor(*r["only"]) if r.get("only") else None
+                if only_at:
+                    f, line = only_at.rsplit(":", 1)
+                    checks.append("switched on, checks {0} at {1}:{2}".format(repl, os.path.basename(f), line))
             else:
                 primary = abilities.get(spec["abilities"][0])
                 group = "ability:" + spec["abilities"][0]

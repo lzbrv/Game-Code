@@ -4,8 +4,8 @@
 //             100 — §6's [ASSUMPTION], and it is a knob rather than an omission so that "unchanged"
 //             is a decision somebody made rather than a value nobody looked at.
 //
-//   MOVEMENT  BASH — hitting a player with the END of his standard dash knocks them along his
-//             direction of travel. "NO EFFECT ON THE CORE CARRIER" — which is not a special case
+//   PASSIVE   BASH (MOVEMENT until Demo 35) — hitting a player with the END of his standard dash
+//             knocks them along his direction of travel. "NO EFFECT ON THE CORE CARRIER" — which is not a special case
 //             here: it is ETraceAbilityEffect::Control asked of the §4 choke point, and the choke
 //             point's Control answer for a carrier is exactly the sentence §6 wrote.
 //             "Dashing through a trace still kills the carrier normally" — untouched, because the
@@ -37,6 +37,11 @@
 // so the result is one bash per victim per dash, not two.
 //
 // Neither is a second RULE — both funnel into TryBash and TryBash asks the choke point exactly once.
+//
+// BOTH ARE BASH'S ALONE. The kit is built for any of Chut's abilities, so the poll, the hook, the
+// sweep radius, TryBash and the armed tell each check IsAbility(ETraceAbilityId::Bash): a Chut picked
+// for CUSTOM STEEL or CHUD — the uniform character pick and every Chut bot — does not bash and does
+// not glow.
 
 #pragma once
 

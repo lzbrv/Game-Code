@@ -812,6 +812,16 @@ void UTraceAbilitySetRoxie::EndModded(const TCHAR* Why)
 bool UTraceAbilitySetRoxie::GetSecondaryCooldownDisplay(float& OutRemaining, float& OutDuration,
                                                         FString& OutLabel) const
 {
+	// *** ROCKJUMP ONLY. *** The rocket is the V ability, and OnSecondaryPressed already refuses to
+	// fire it for any other pick. Without this the row disagreed with the key: a MODDED-only Roxie got
+	// a permanent "[V] ROCKET" that never fired, and because the E kit is asked first it also captioned
+	// another kit's real V ability (WIRERIGS, STICKY GLOVES, BLINK) as ROCKET with a meter that never
+	// moved. Declining here lets the next kit in the offer describe its own V.
+	if (!IsAbility(ETraceAbilityId::RockJump))
+	{
+		return false;
+	}
+
 	// TRUE WHETHER OR NOT IT IS COOLING. 0 remaining is a drawn state — the row is how a player who
 	// has never pressed V learns that V exists and what it is called. Returning false while ready
 	// would make the row appear only after the ability had already been used once, which is exactly

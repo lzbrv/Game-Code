@@ -1231,7 +1231,12 @@ void FTraceBotAbilityBrain::PlanChut(const FTraceBotAbilitySituation& Situation,
 	const bool bDashIsSpokenFor = (Situation.BotState == ETraceBotState::HuntCarrier)
 		|| (Situation.BotState == ETraceBotState::ChaseLooseCore);
 
-	if (Situation.DashCharges <= 0 || Situation.Now < NextBashTime || Situation.bIAmCarrier || bDashIsSpokenFor)
+	// ...and never for a Chut who did not pick BASH. The knock is BASH's alone (Demo 35 made it a
+	// passive beside CUSTOM STEEL), so without it this would spend a dash charge running at somebody
+	// and knock nobody. The uniform Chut a bot is given carries CUSTOM STEEL, so today this is every
+	// Chut bot.
+	if (Situation.DashCharges <= 0 || Situation.Now < NextBashTime || Situation.bIAmCarrier || bDashIsSpokenFor
+		|| !Chut->IsAbility(ETraceAbilityId::Bash))
 	{
 		return;
 	}

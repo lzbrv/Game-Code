@@ -33,6 +33,29 @@
 // production files reverted, this file kept), and every one of them failed there. The commit message
 // records that output. A harness that has never been seen to fail is not evidence.
 //
+// =================================================================================================
+// AND THE MIRROR IMAGE: AN ABILITY YOU DID NOT PICK MUST NOT FIRE (the Demo 35 leak pass)
+//
+// A kit is built when ANY of its abilities is picked, and the component ticks and notifies it
+// whatever it was picked for — so every effect has to check its OWN ability. Each leak below is a
+// NEGATIVE check (the kit equipped for its other abilities only: the effect must not happen) beside a
+// positive control (the ability equipped: it must), through the shipped path:
+//
+//   BASH       a real dash with a player held in reach: CUSTOM STEEL + CHUD knocks nobody, publishes
+//              no dash window and never lights the armed tell; BASH knocks and publishes.
+//   X-MECHS    a player held on the bee orbit: LEECH + STING marks nobody and draws no swarm;
+//              X-MECHS draws the swarm and marks.
+//   ROCKJUMP   the V row: MODDED without ROCKJUMP (WIRERIGS on V) draws no "[V] ROCKET"; ROCKJUMP does.
+//   OVERLOAD   a real dash: a Core carrier without OVERLOAD refills the second charge in the normal
+//              duration + cooldown; OVERLOAD (not carrying) still refills it at half rate.
+//   BLINK      the legacy mantle's trait: QMECH + QUAKE without BLINK is not allowed to mantle;
+//              BLINK is. (Trace.Mortimer.MantleTest presses the real key at a real ledge for it.)
+//   JAR JUMP   retired by Demo 35: a jump off his own jar on RILLA CANS + PICKLER is an ordinary
+//              jump and leaves the jar; with Trace.Demo35.LegacyJarJump 1 it launches and breaks it.
+//
+// Victims are TEAM-MATES with friendly fire forced on for the holds (restored after), so the player
+// being held next to the local pawn is not also shooting it.
+//
 // WHAT IT TOUCHES. The local player's loadout (restored at the end), their E cooldown, a poison on
 // one enemy bot (it expires by itself in four seconds), and a stuck flag on a staged kit (cleared).
 // Run it on a listen server or standalone, after the team screen is closed:
@@ -46,24 +69,33 @@
 #include "Abilities/TraceAbilityComponent.h"
 #include "Abilities/TraceAbilityTypes.h"
 #include "Abilities/TraceCharacterAbilitySet.h"
+#include "Abilities/Characters/TraceAbilitySetChut.h"
 #include "Abilities/Characters/TraceAbilitySetElle.h"
 #include "Abilities/Characters/TraceAbilitySetMace.h"
+#include "Abilities/Characters/TraceAbilitySetOyster.h"
 #include "Abilities/Characters/TraceAbilitySetRocco.h"
 #include "Abilities/Characters/TraceAbilitySetSlimeball.h"
+#include "Abilities/Characters/TraceAbilitySetX.h"
+#include "Abilities/Characters/TraceOysterJar.h"
 #include "Abilities/Characters/TraceOysterPoison.h"
 #include "Abilities/Characters/TraceSlimewall.h"
+#include "Components/CapsuleComponent.h"
 #include "Containers/Ticker.h"
 #include "Core/TraceCharacter.h"
+#include "Core/TraceGameState.h"
 #include "Core/TracePlayerController.h"
 #include "Core/TracePlayerState.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/CharacterMovementComponent.h"
+#include "Gameplay/TraceFxBurst.h"
+#include "Gameplay/TraceHealthComponent.h"
 #include "Gameplay/TraceMelee.h"
 #include "HAL/IConsoleManager.h"
 #include "HAL/PlatformFileManager.h"
 #include "HAL/PlatformTime.h"
 #include "Misc/Paths.h"
+#include "Movement/TraceCharacterMovementComponent.h"
 #include "Trace.h"
 #include "TraceSettings.h"
 #include "UI/TraceHUD.h"
@@ -77,6 +109,18 @@ namespace TraceLoadoutMixedKitsVerify
 		double NextRealTime = 0.0;
 		int32 TicksLeft = 40000;
 
+		/**
+		 * The engine frame the next step was scheduled on. A step never runs on that same frame: the
+		 * core ticker runs a ticker added during its own pass in that same pass, so a "next frame"
+		 * re-schedule with no delay would otherwise spin inside one frame with the world stopped —
+		 * and a hold that stops the world is a hold in which nothing can happen, which reads as a pass.
+		 */
+		uint64 ScheduledFrame = 0;
+
+		/** Real time the match was first seen live by the leak scenes' wait, 0 until then. */
+		double LiveSince = 0.0;
+		double LiveWaitUntil = 0.0;
+
 		TWeakObjectPtr<ATracePlayerController> PC;
 		TWeakObjectPtr<ATraceHUD> Hud;
 
@@ -85,6 +129,49 @@ namespace TraceLoadoutMixedKitsVerify
 
 		int32 Checks = 0;
 		int32 Failures = 0;
+
+		// ---- the leak checks: one staged scene at a time ----------------------------------------
+		/** The player held next to the local pawn: a team-mate, with friendly fire forced on. */
+		TWeakObjectPtr<ATraceCharacter> Victim;
+		/** Real-time end of the current hold / watch, or of a wait for the ground. */
+		double PhaseUntil = 0.0;
+		/** Real time the pawn was first seen on the ground in the current wait, 0 while airborne. */
+		double GroundedSince = 0.0;
+
+		bool  bDashSeen = false;
+		bool  bDashingFlagSeen = false;
+		bool  bAccentLiftSeen = false;
+		TWeakObjectPtr<UTraceAbilitySetChut> ChutKit;
+
+		/**
+		 * TWO WITNESSES FOR "A KNOCK LANDED", because neither is enough alone. The kit's per-dash victim
+		 * list is the direct one, but BASH's own OnDashEnded clears it, so it is sampled every frame and
+		 * its peak kept — and at a low frame rate the bash and the dash's end can share a frame. The
+		 * ChutBash burst TryBash spawns at the victim lives 1.2 s, so a NEW one near the pawn after the
+		 * dash is the second witness and cannot be missed between frames.
+		 */
+		int32 MaxBashedSeen = 0;
+		TArray<TWeakObjectPtr<ATraceFxBurst>> BashBurstsBefore;
+
+		/**
+		 * UP TO THREE DASHES PER BASH SCENE. Chut's 20 Hz poll measures dash progress from the tick
+		 * that first SAW the dash, so at a low frame rate a whole dash can pass without a poll tick
+		 * inside the end window: one dash is a coin toss for the poll, which is the route the leak ran
+		 * on. The negative scene dashes three times and must knock nobody on any of them; the control
+		 * stops at its first knock.
+		 */
+		int32 DashTries = 0;
+		int32 KnocksSeen = 0;
+
+		float PeakZ = 0.f;
+		TWeakObjectPtr<ATraceOysterJar> Jar;
+		bool  bJarSpawned = false;
+
+		/** Switches the run flips, as it found them. RestoreSwitches puts every one of them back. */
+		bool  bSwitchesSaved = false;
+		int32 SavedFakeCarrier = 0;
+		int32 SavedLegacyJarJump = 0;
+		bool  bSavedFriendlyFire = false;
 	};
 
 	ATracePlayerController* FindLocalAuthorityPC(UWorld* WorldPtr)
@@ -196,6 +283,279 @@ namespace TraceLoadoutMixedKitsVerify
 			}
 		}
 		return nullptr;
+	}
+
+	/**
+	 * A living TEAM-MATE of @p Local who is not carrying the Core, or null. See the file header.
+	 *
+	 * One with no X kit first: with friendly fire on for the holds, a team-mate's own X-MECHS bees
+	 * would be a second source of marks, and the X scenes must only ever see the local pawn's.
+	 */
+	ATraceCharacter* FindTeammateVictim(UWorld* WorldPtr, const ATraceCharacter* Local)
+	{
+		if (WorldPtr == nullptr || Local == nullptr || Local->GetTeam() == ETraceTeam::None)
+		{
+			return nullptr;
+		}
+		ATraceCharacter* Fallback = nullptr;
+		for (TActorIterator<ATraceCharacter> It(WorldPtr); It; ++It)
+		{
+			ATraceCharacter* Candidate = *It;
+			if (Candidate != nullptr && Candidate != Local && Candidate->IsAlive()
+				&& Candidate->GetTeam() == Local->GetTeam() && !UTraceAbilityComponent::IsCarrier(Candidate))
+			{
+				if (UTraceAbilityComponent::FindEquippedSetFor<UTraceAbilitySetX>(Candidate) == nullptr)
+				{
+					return Candidate;
+				}
+				Fallback = (Fallback != nullptr) ? Fallback : Candidate;
+			}
+		}
+		return Fallback;
+	}
+
+	/** The held player for the current scene, re-found if the last one died or took the Core. */
+	ATraceCharacter* LiveVictim(FRun& Run, UWorld* WorldPtr, const ATraceCharacter* Local)
+	{
+		ATraceCharacter* Current = Run.Victim.Get();
+		if (Current == nullptr || !Current->IsAlive() || UTraceAbilityComponent::IsCarrier(Current))
+		{
+			Current = FindTeammateVictim(WorldPtr, Local);
+			if (Current == nullptr)
+			{
+				Current = FindEnemyVictim(WorldPtr, Local);   // a team of one: an enemy is the only choice
+			}
+			Run.Victim = Current;
+		}
+		return Current;
+	}
+
+	/** Teleports @p Who to @p Location at rest. The hold re-places every frame, so a walk is undone. */
+	void HoldAt(ATraceCharacter* Who, const FVector& Location)
+	{
+		if (Who == nullptr)
+		{
+			return;
+		}
+		Who->SetActorLocation(Location, /*bSweep=*/false, nullptr, ETeleportType::TeleportPhysics);
+		if (UTraceCharacterMovementComponent* WhoMove = Who->GetTraceMovement())
+		{
+			WhoMove->Velocity = FVector::ZeroVector;
+		}
+	}
+
+	/** Keeps the local pawn alive through a scene: a run that ends in its own death proves nothing. */
+	void KeepAlive(ATraceCharacter* Local)
+	{
+		if (Local != nullptr && Local->IsAlive() && Local->Health != nullptr)
+		{
+			Local->Health->ResetHealth();
+		}
+	}
+
+	/** How many bee swarms are orbiting @p Host on this machine. */
+	int32 CountSwarmsOn(UWorld* WorldPtr, const ATraceCharacter* Host)
+	{
+		int32 Found = 0;
+		if (WorldPtr != nullptr)
+		{
+			for (TActorIterator<ATraceBeeSwarm> It(WorldPtr); It; ++It)
+			{
+				if (*It != nullptr && It->Host.Get() == Host)
+				{
+					++Found;
+				}
+			}
+		}
+		return Found;
+	}
+
+	int32 GetSwitch(const TCHAR* Name, int32 Fallback)
+	{
+		const IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name);
+		return (Var != nullptr) ? Var->GetInt() : Fallback;
+	}
+
+	/** Sets an int console variable; false when this build does not register it. */
+	bool SetSwitch(const TCHAR* Name, int32 Value)
+	{
+		IConsoleVariable* Var = IConsoleManager::Get().FindConsoleVariable(Name);
+		if (Var == nullptr)
+		{
+			return false;
+		}
+		Var->Set(Value, ECVF_SetByConsole);
+		return true;
+	}
+
+	void SetFriendlyFire(bool bOn)
+	{
+		if (UTraceSettings* Mutable = GetMutableDefault<UTraceSettings>())
+		{
+			Mutable->bFriendlyFire = bOn;
+		}
+	}
+
+	/** Records every switch the leak scenes flip, once, so any exit can put them back. */
+	void SaveSwitches(FRun& Run)
+	{
+		if (Run.bSwitchesSaved)
+		{
+			return;
+		}
+		Run.SavedFakeCarrier = GetSwitch(TEXT("Trace.MoveKitFakeCarrier"), 0);
+		Run.SavedLegacyJarJump = GetSwitch(TEXT("Trace.Demo35.LegacyJarJump"), 0);
+		Run.bSavedFriendlyFire = UTraceSettings::Get().bFriendlyFire;
+		Run.bSwitchesSaved = true;
+	}
+
+	void RestoreSwitches(FRun& Run)
+	{
+		if (!Run.bSwitchesSaved)
+		{
+			return;
+		}
+		SetSwitch(TEXT("Trace.MoveKitFakeCarrier"), Run.SavedFakeCarrier);
+		SetSwitch(TEXT("Trace.Demo35.LegacyJarJump"), Run.SavedLegacyJarJump);
+		SetFriendlyFire(Run.bSavedFriendlyFire);
+	}
+
+	/**
+	 * One frame of a real dash for the BASH scenes: the held player sits just clear of the dashing
+	 * pawn's capsule, beside it and a little ahead, and the frame's evidence is sampled off the
+	 * shipped state: is he dashing, is the dash window on the wire for the kit, is the armed tell lit,
+	 * how many has this dash bashed.
+	 *
+	 * WHERE, AND WHY. The hold is placed before the frame's movement, and the pawn then dashes ~55-165
+	 * uu (60-20 fps) before either bash route looks. Beside him at 72 uu and 60 uu ahead keeps the
+	 * victim inside the 130 uu reach after any of those moves (and on the poll's swept segment), and
+	 * never in the dash's way, so the dash is not blocked into a different test.
+	 */
+	void SampleBashFrame(FRun& Run, UWorld* WorldPtr, ATraceCharacter* Local)
+	{
+		KeepAlive(Local);
+		const UTraceCharacterMovementComponent* LocalMove = (Local != nullptr) ? Local->GetTraceMovement() : nullptr;
+		if (Local == nullptr || LocalMove == nullptr)
+		{
+			return;
+		}
+		Run.bDashSeen = Run.bDashSeen || LocalMove->IsDashing();
+
+		const float Reach = FMath::Max(1.f, UTraceSettings::Get().ChutBashRadiusUU);
+		float CapsuleRadius = 34.f;
+		if (const UCapsuleComponent* Capsule = Local->GetCapsuleComponent())
+		{
+			CapsuleRadius = Capsule->GetScaledCapsuleRadius();
+		}
+		const float Lateral = 2.f * CapsuleRadius + 4.f;              // just clear of both capsules
+		const float Lead = FMath::Min(60.f, Reach * 0.45f);           // half a frame of dash, ahead
+		const FVector Ahead = LocalMove->IsDashing()
+			? LocalMove->GetDashDirection().GetSafeNormal2D() : Local->GetActorForwardVector().GetSafeNormal2D();
+		const FVector Side = FVector::CrossProduct(FVector::UpVector, Ahead).GetSafeNormal();
+		HoldAt(LiveVictim(Run, WorldPtr, Local), Local->GetActorLocation() + Ahead * Lead + Side * Lateral);
+
+		if (const UTraceAbilitySetChut* Kit = Run.ChutKit.Get())
+		{
+			Run.bDashingFlagSeen = Run.bDashingFlagSeen || ((Kit->State().Flags & TraceChutFlags::Dashing) != 0);
+			Run.bAccentLiftSeen = Run.bAccentLiftSeen || Kit->DebugIsAccentLifted();
+			Run.MaxBashedSeen = FMath::Max(Run.MaxBashedSeen, Kit->GetBashedThisDashCount());
+		}
+	}
+
+	/** Every ChutBash burst alive in the world right now. */
+	void CollectBashBursts(UWorld* WorldPtr, TArray<TWeakObjectPtr<ATraceFxBurst>>& Out)
+	{
+		Out.Reset();
+		if (WorldPtr == nullptr)
+		{
+			return;
+		}
+		for (TActorIterator<ATraceFxBurst> It(WorldPtr); It; ++It)
+		{
+			if (*It != nullptr && It->GetBurstType() == ETraceFxBurstType::ChutBash)
+			{
+				Out.Add(*It);
+			}
+		}
+	}
+
+	/** ChutBash bursts that were not in @p Before and sit within @p Radius of @p Where. */
+	int32 CountNewBashBurstsNear(UWorld* WorldPtr, const TArray<TWeakObjectPtr<ATraceFxBurst>>& Before,
+	                             const FVector& Where, float Radius)
+	{
+		TArray<TWeakObjectPtr<ATraceFxBurst>> Now;
+		CollectBashBursts(WorldPtr, Now);
+		int32 Fresh = 0;
+		for (const TWeakObjectPtr<ATraceFxBurst>& Entry : Now)
+		{
+			const ATraceFxBurst* BurstActor = Entry.Get();
+			if (BurstActor != nullptr && !Before.Contains(Entry)
+				&& FVector::Dist(BurstActor->GetActorLocation(), Where) <= Radius)
+			{
+				++Fresh;
+			}
+		}
+		return Fresh;
+	}
+
+	/**
+	 * One frame of an X scene: the held player stands ON the bee orbit at the swarm's height, so every
+	 * bee passes through him once a revolution (five bees at 240 deg/s: one every 0.3 s).
+	 */
+	void HoldOnBeeOrbit(FRun& Run, UWorld* WorldPtr, ATraceCharacter* Local)
+	{
+		KeepAlive(Local);
+		if (Local == nullptr)
+		{
+			return;
+		}
+		const FVector Centre = TraceXBees::GetSwarmCentre(Local);
+		HoldAt(LiveVictim(Run, WorldPtr, Local),
+			Centre + Local->GetActorForwardVector().GetSafeNormal2D() * TraceXBees::GetOrbitRadiusUU());
+	}
+
+	/**
+	 * The jar-jump scenes need him STOOD on the ground for a few ability ticks first: the jump poll
+	 * finds the jump as a ground-to-air edge, so a jump on the frame he lands has no edge to find and
+	 * would read as "no launch" on any build. Returns true once he has been grounded long enough.
+	 */
+	bool SettledOnGround(FRun& Run, const ATraceCharacter* Local)
+	{
+		const UTraceCharacterMovementComponent* LocalMove = (Local != nullptr) ? Local->GetTraceMovement() : nullptr;
+		const double NowReal = FPlatformTime::Seconds();
+		if (LocalMove == nullptr || !LocalMove->IsMovingOnGround())
+		{
+			Run.GroundedSince = 0.0;
+			return false;
+		}
+		if (Run.GroundedSince <= 0.0)
+		{
+			Run.GroundedSince = NowReal;
+		}
+		return (NowReal - Run.GroundedSince) >= 0.3;
+	}
+
+	/** Drops one jar of his at his feet (the only one: older jars are cleared) and jumps. */
+	void JumpOffOwnJar(FRun& Run, ATraceCharacter* Local, UTraceAbilityComponent* LocalAbilities)
+	{
+		Run.Jar = nullptr;
+		Run.bJarSpawned = false;
+		Run.PeakZ = 0.f;
+		UTraceAbilitySetOyster* Oyster = (LocalAbilities != nullptr)
+			? LocalAbilities->FindEquippedSet<UTraceAbilitySetOyster>() : nullptr;
+		if (Oyster == nullptr || Local == nullptr)
+		{
+			return;
+		}
+		Oyster->DebugDestroyAllJars();
+		float HalfHeight = 88.f;
+		if (const UCapsuleComponent* Capsule = Local->GetCapsuleComponent())
+		{
+			HalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+		}
+		Run.Jar = Oyster->DebugSpawnJarAt(Local->GetActorLocation() - FVector(0.f, 0.f, HalfHeight), /*bPickler=*/false);
+		Run.bJarSpawned = Run.Jar.IsValid();
+		Local->Jump();
 	}
 
 	/** The pure checks: damage, traits, the slide bonus and the Pickler refund. One frame. */
@@ -321,6 +681,40 @@ namespace TraceLoadoutMixedKitsVerify
 					JarBefore, JarAfter));
 			Abilities->DebugSetActivatedCooldown(0.f);
 		}
+
+		// ---- LEAK: ROCKJUMP's V row ----------------------------------------------------------------
+		// The E kit is asked first, so MODDED on E used to answer for V whatever V was: a permanent
+		// "[V] ROCKET" over WIRERIGS here, READY forever, while V did WIRERIGS' job.
+		{
+			float Remaining = 0.f;
+			float Duration = 0.f;
+			FString Label;
+			Equip(Run, Make(ETraceAbilityId::Suspend, ETraceAbilityId::Blasters, ETraceAbilityId::Modded));
+			const bool bRowWithout = Abilities->GetSecondaryCooldownDisplay(Remaining, Duration, Label);
+			Check(Run, !bRowWithout,
+				FString::Printf(TEXT("*** MODDED without ROCKJUMP (WIRERIGS on V): no V cooldown row (got row=%d label '%s') ***"),
+					bRowWithout ? 1 : 0, *Label));
+
+			Label.Reset();
+			Equip(Run, Make(ETraceAbilityId::RockJump, ETraceAbilityId::Blasters, ETraceAbilityId::Ripple));
+			const bool bRowWith = Abilities->GetSecondaryCooldownDisplay(Remaining, Duration, Label);
+			Check(Run, bRowWith && Label == TEXT("ROCKET"),
+				FString::Printf(TEXT("(control) ROCKJUMP under Rocco's E: the [V] ROCKET row is drawn (got row=%d label '%s')"),
+					bRowWith ? 1 : 0, *Label));
+		}
+
+		// ---- LEAK: BLINK's legacy mantle -------------------------------------------------------------
+		// The mantle is the movement ability BLINK replaced; with Trace.Demo35.LegacyMantle on, a
+		// Mortimer kit picked only for QMECH or QUAKE used to get it too. The trait is the first thing
+		// TryMantle asks; Trace.Mortimer.MantleTest presses the real key at a real ledge for the same rule.
+		Check(Run, Settings.bMortimerCanMantle,
+			TEXT("(precondition) bMortimerCanMantle is on, so the BLINK control below can say yes"));
+		Equip(Run, Make(ETraceAbilityId::JetBoots, ETraceAbilityId::MortimerLoad, ETraceAbilityId::Quake));
+		Check(Run, !TraceAbilityTraits::IsMantleAllowed(Pawn),
+			TEXT("*** QMECH + QUAKE without BLINK: the retired mantle is not allowed for this loadout ***"));
+		Equip(Run, Make(ETraceAbilityId::Blink, ETraceAbilityId::Blasters, ETraceAbilityId::Ripple));
+		Check(Run, TraceAbilityTraits::IsMantleAllowed(Pawn),
+			TEXT("(control) BLINK under Rocco's E: the legacy mantle trait answers for BLINK"));
 	}
 
 	/**
@@ -345,10 +739,11 @@ namespace TraceLoadoutMixedKitsVerify
 	void Schedule(TSharedPtr<FRun> Run, float DelaySeconds)
 	{
 		Run->NextRealTime = FPlatformTime::Seconds() + static_cast<double>(DelaySeconds);
+		Run->ScheduledFrame = GFrameCounter;
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
 			[Run](float) -> bool
 			{
-				if (FPlatformTime::Seconds() < Run->NextRealTime)
+				if (FPlatformTime::Seconds() < Run->NextRealTime || GFrameCounter == Run->ScheduledFrame)
 				{
 					return (--Run->TicksLeft) > 0;
 				}
@@ -358,6 +753,7 @@ namespace TraceLoadoutMixedKitsVerify
 
 	void Finish(FRun& Run)
 	{
+		RestoreSwitches(Run);
 		if (UTraceAbilityComponent* Abilities = AbilitiesOf(Run))
 		{
 			Abilities->ApplyLoadout(Run.OriginalLoadout);
@@ -386,6 +782,7 @@ namespace TraceLoadoutMixedKitsVerify
 
 		if (Controller == nullptr || HudPtr == nullptr || WorldPtr == nullptr || Pawn == nullptr || Abilities == nullptr)
 		{
+			RestoreSwitches(*Run);
 			UE_LOG(LogTraceGame, Error,
 				TEXT("[MixedKits] VERDICT: FAIL. Aborted at step %d: the local player, pawn or HUD went away."),
 				Run->Step);
@@ -517,7 +914,350 @@ namespace TraceLoadoutMixedKitsVerify
 			break;
 		}
 
+		// =========================================================================================
+		// THE LEAK SCENES (see the file header). Each NEGATIVE first — the kit equipped for its other
+		// abilities only — then its control. Every scene is judged on a later tick than it was staged.
+		// =========================================================================================
+
 		case 8:
+		{
+			// ---- FIRST, A LIVE MATCH. Locking in (Start) ends the warm-up, and the half then starts
+			// and puts every pawn back on its spawn and every health and mark back to new — in the
+			// middle of a scene if it is allowed to. So the scenes wait for the match to be in play
+			// and settled, and run inside the half.
+			const ATraceGameState* TraceGS = WorldPtr->GetGameState<ATraceGameState>();
+			const bool bLive = (TraceGS != nullptr) && TraceGS->TraceMatchState == ETraceMatchState::InProgress
+				&& !TraceGS->IsHalfTimeBreak();
+			const double NowReal = FPlatformTime::Seconds();
+			if (Run->LiveWaitUntil <= 0.0)
+			{
+				Run->LiveWaitUntil = NowReal + 60.0;
+			}
+			if (!bLive || Run->LiveSince <= 0.0 || (NowReal - Run->LiveSince) < 2.0)
+			{
+				Run->LiveSince = bLive ? ((Run->LiveSince > 0.0) ? Run->LiveSince : NowReal) : 0.0;
+				if (NowReal > Run->LiveWaitUntil)
+				{
+					Check(*Run, false, TEXT("(precondition) the match went live within 60 s, so the leak scenes could run"));
+					Run->Step = 23;
+					NextDelay = 0.1f;
+					break;
+				}
+				Run->Step = ThisStep;
+				NextDelay = 0.25f;
+				break;
+			}
+			UE_LOG(LogTraceGame, Display, TEXT("[MixedKits] the match is live (%.1fs); the leak scenes run in play."),
+				NowReal - Run->LiveSince);
+
+			// ---- OVERLOAD: a Core carrier WITHOUT it refills the second charge at the normal rate ----
+			// Trace.MoveKitFakeCarrier gives the local pawn the carrier's pool (base + the carrier's
+			// extra charge) without a Core. 1.5 s first: the cloak scene's screenshot costs one long
+			// frame under -RenderOffScreen, and a dash inside it begins and ends in one step.
+			SaveSwitches(*Run);
+			SetSwitch(TEXT("Trace.MoveKitFakeCarrier"), 1);
+			Equip(*Run, Make(ETraceAbilityId::JetBoots, ETraceAbilityId::Blasters, ETraceAbilityId::Ripple));
+			NextDelay = 1.5f;
+			break;
+		}
+
+		case 9:
+		case 11:
+		{
+			// One real dash from a FULL pool, so the refill clock is started by this dash and nothing else.
+			UTraceCharacterMovementComponent* LocalMove = Pawn->GetTraceMovement();
+			if (LocalMove == nullptr)
+			{
+				Check(*Run, false, TEXT("the local pawn has a Trace movement component"));
+				break;
+			}
+			for (int32 RefundTries = 0; RefundTries < 4 && LocalMove->GetDashCharges() < LocalMove->GetMaxDashCharges(); ++RefundTries)
+			{
+				LocalMove->RefundDashCharge();
+			}
+			const int32 WantPool = FMath::Max(1, UTraceSettings::Get().BaseDashCharges)
+				+ ((ThisStep == 9) ? FMath::Max(0, UTraceSettings::Get().CarrierExtraDashCharges)
+				                   : TraceAbilityTraits::GetExtraDashCharges(Pawn));
+			Check(*Run, LocalMove->GetMaxDashCharges() == WantPool && LocalMove->GetDashCharges() == WantPool,
+				FString::Printf(TEXT("(precondition) %s: the pool is full at %d before the dash (got %d of %d)"),
+					(ThisStep == 9) ? TEXT("fake carrier, no OVERLOAD") : TEXT("OVERLOAD, not carrying"),
+					WantPool, LocalMove->GetDashCharges(), LocalMove->GetMaxDashCharges()));
+			Pawn->DoDash();
+			NextDelay = 0.1f;
+			break;
+		}
+
+		case 10:
+		case 12:
+		{
+			const UTraceCharacterMovementComponent* LocalMove = Pawn->GetTraceMovement();
+			const float NormalWindow = FMath::Max(0.01f, UTraceSettings::Get().DashDuration)
+				+ FMath::Max(0.f, UTraceSettings::Get().DashCooldown);
+			const float RefillLeft = (LocalMove != nullptr) ? LocalMove->GetDashCooldownRemaining() : -1.f;
+			const int32 Held = (LocalMove != nullptr) ? LocalMove->GetDashCharges() : -1;
+			const int32 Pool = (LocalMove != nullptr) ? LocalMove->GetMaxDashCharges() : -1;
+			Check(*Run, Held >= 1 && Held == Pool - 1,
+				FString::Printf(TEXT("(precondition) the dash spent exactly one charge (%d of %d left)"), Held, Pool));
+
+			if (ThisStep == 10)
+			{
+				// The clock is a few frames old, so it reads a little UNDER the window; the old rule
+				// started it at twice the window, which no elapsed time brings under this line.
+				Check(*Run, RefillLeft > 0.5f * NormalWindow && RefillLeft <= NormalWindow + 0.05f,
+					FString::Printf(TEXT("*** a Core carrier WITHOUT OVERLOAD (JET BOOTS/BLASTERS/RIPPLE) at 1 of 2 refills in "
+					                     "duration + cooldown = %.2fs (clock reads %.2fs) ***"),
+						NormalWindow, RefillLeft));
+
+				SetSwitch(TEXT("Trace.MoveKitFakeCarrier"), Run->SavedFakeCarrier);
+				Check(*Run, !UTraceAbilityComponent::IsCarrier(Pawn),
+					TEXT("(precondition) the local pawn is not really carrying the Core, so OVERLOAD's charge is in the pool"));
+				Equip(*Run, Make(ETraceAbilityId::Overload, ETraceAbilityId::Blasters, ETraceAbilityId::Ripple));
+				NextDelay = 0.3f;
+				break;
+			}
+
+			const float SlowWindow = NormalWindow * FMath::Max(1.f, UTraceSettings::Get().LilyExtraDashRechargeScale);
+			Check(*Run, RefillLeft > NormalWindow + 0.25f && RefillLeft <= SlowWindow + 0.05f,
+				FString::Printf(TEXT("(control) OVERLOAD, not carrying, at 1 of 2: its extra charge still refills at half rate "
+				                     "(%.2fs window, clock reads %.2fs)"),
+					SlowWindow, RefillLeft));
+
+			// ---- X-MECHS: LEECH + STING without it draw no swarm and sting nobody ---------------
+			// Friendly fire ON for the holds (see the file header), and only for the holds.
+			SetFriendlyFire(true);
+			Equip(*Run, Make(ETraceAbilityId::Leech, ETraceAbilityId::Blasters, ETraceAbilityId::Sting));
+			Check(*Run, CountSwarmsOn(WorldPtr, Pawn) == 0,
+				FString::Printf(TEXT("*** LEECH + STING without X-MECHS: no bee swarm is drawn around him (%d) ***"),
+					CountSwarmsOn(WorldPtr, Pawn)));
+			if (ATraceCharacter* Held0 = LiveVictim(*Run, WorldPtr, Pawn))
+			{
+				if (Held0->Health != nullptr)
+				{
+					Held0->Health->ClearVulnerable();
+				}
+			}
+			Run->PhaseUntil = FPlatformTime::Seconds() + 1.2;
+			NextDelay = 0.f;
+			break;
+		}
+
+		case 13:
+		case 14:
+		{
+			HoldOnBeeOrbit(*Run, WorldPtr, Pawn);
+			if (FPlatformTime::Seconds() < Run->PhaseUntil)
+			{
+				Run->Step = ThisStep;   // hold another frame
+				NextDelay = 0.f;
+				break;
+			}
+
+			ATraceCharacter* Held = Run->Victim.Get();
+			const bool bMarked = (Held != nullptr) && (Held->Health != nullptr) && Held->Health->IsVulnerable();
+			Check(*Run, Held != nullptr, TEXT("(precondition) a living player was held on the bee orbit"));
+
+			if (ThisStep == 13)
+			{
+				Check(*Run, !bMarked,
+					FString::Printf(TEXT("*** LEECH + STING without X-MECHS: %s, held ON the bee orbit for 1.2 s, is NOT marked "
+					                     "VULNERABLE ***"), *GetNameSafe(Held)));
+
+				Equip(*Run, Make(ETraceAbilityId::JetBoots, ETraceAbilityId::XMechs, ETraceAbilityId::Ripple));
+				Check(*Run, CountSwarmsOn(WorldPtr, Pawn) == 1,
+					FString::Printf(TEXT("(control) X-MECHS under Rocco's E: the bee swarm is drawn (%d)"),
+						CountSwarmsOn(WorldPtr, Pawn)));
+				if (Held != nullptr && Held->Health != nullptr)
+				{
+					Held->Health->ClearVulnerable();
+				}
+				Run->PhaseUntil = FPlatformTime::Seconds() + 1.2;
+				NextDelay = 0.f;
+				break;
+			}
+
+			Check(*Run, bMarked,
+				FString::Printf(TEXT("(control) X-MECHS under Rocco's E: %s, held on the same orbit, IS marked VULNERABLE"),
+					*GetNameSafe(Held)));
+			if (Held != nullptr && Held->Health != nullptr)
+			{
+				Held->Health->ClearVulnerable();
+			}
+
+			// ---- BASH: CUSTOM STEEL + CHUD without it knock nobody and light no tell -------------
+			Equip(*Run, Make(ETraceAbilityId::JetBoots, ETraceAbilityId::CustomSteel, ETraceAbilityId::Chud));
+			Run->ChutKit = Abilities->FindEquippedSet<UTraceAbilitySetChut>();
+			NextDelay = 0.3f;
+			break;
+		}
+
+		case 15:
+		case 17:
+		{
+			// A full pool and one real dash through the shipping entry point, with the held player
+			// beside him from the first frame.
+			if (UTraceCharacterMovementComponent* LocalMove = Pawn->GetTraceMovement())
+			{
+				for (int32 RefundTries = 0; RefundTries < 4 && LocalMove->GetDashCharges() < LocalMove->GetMaxDashCharges(); ++RefundTries)
+				{
+					LocalMove->RefundDashCharge();
+				}
+			}
+			if (Run->DashTries == 0)
+			{
+				// A new scene: its evidence starts empty and gathers over every dash it makes.
+				Run->bDashSeen = false;
+				Run->bDashingFlagSeen = false;
+				Run->bAccentLiftSeen = false;
+				Run->KnocksSeen = 0;
+			}
+			Run->MaxBashedSeen = 0;
+			CollectBashBursts(WorldPtr, Run->BashBurstsBefore);
+			SampleBashFrame(*Run, WorldPtr, Pawn);
+			Pawn->DoDash();
+			Run->PhaseUntil = FPlatformTime::Seconds() + 0.6;
+			NextDelay = 0.f;
+			break;
+		}
+
+		case 16:
+		case 18:
+		{
+			SampleBashFrame(*Run, WorldPtr, Pawn);
+			if (FPlatformTime::Seconds() < Run->PhaseUntil)
+			{
+				Run->Step = ThisStep;   // watch another frame
+				NextDelay = 0.f;
+				break;
+			}
+
+			const UTraceAbilitySetChut* Kit = Run->ChutKit.Get();
+			// The dash covers ~600 uu and the knock lands in its last 35%, beside the pawn; 700 uu around
+			// where he ends up holds every burst this dash can have made and none from across the arena.
+			const int32 FreshBursts = CountNewBashBurstsNear(WorldPtr, Run->BashBurstsBefore, Pawn->GetActorLocation(), 700.f);
+			Run->KnocksSeen += FMath::Max(Run->MaxBashedSeen, FreshBursts);
+			++Run->DashTries;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MixedKits] %s dash %d: peak victims-this-dash %d, new ChutBash bursts near him %d (knocks so far %d)."),
+				(ThisStep == 16) ? TEXT("no-BASH") : TEXT("BASH"), Run->DashTries, Run->MaxBashedSeen, FreshBursts, Run->KnocksSeen);
+			if (Run->KnocksSeen == 0 && Run->DashTries < 3)
+			{
+				Run->Step = ThisStep - 1;   // another dash: see DashTries
+				NextDelay = 0.2f;
+				break;
+			}
+			const int32 Bashed = Run->KnocksSeen;
+			const int32 Dashes = Run->DashTries;
+			Run->DashTries = 0;
+			Check(*Run, Kit != nullptr && Run->bDashSeen,
+				FString::Printf(TEXT("(precondition) a Chut kit was equipped (%d) and a real dash ran (%d) with %s held in reach"),
+					(Kit != nullptr) ? 1 : 0, Run->bDashSeen ? 1 : 0, *GetNameSafe(Run->Victim.Get())));
+
+			if (ThisStep == 16)
+			{
+				Check(*Run, Bashed == 0,
+					FString::Printf(TEXT("*** CUSTOM STEEL + CHUD without BASH: the end of the dash knocks NOBODY (%d knock(s) in %d dash(es)) ***"),
+						Bashed, Dashes));
+				Check(*Run, !Run->bDashingFlagSeen,
+					TEXT("*** CUSTOM STEEL + CHUD without BASH: no bash window is published (the Dashing flag never reached the wire) ***"));
+				Check(*Run, !Run->bAccentLiftSeen,
+					TEXT("*** CUSTOM STEEL + CHUD without BASH: the 'bash armed' accent never lights ***"));
+
+				Equip(*Run, Make(ETraceAbilityId::JetBoots, ETraceAbilityId::Bash, ETraceAbilityId::Ripple));
+				Run->ChutKit = Abilities->FindEquippedSet<UTraceAbilitySetChut>();
+				NextDelay = 0.3f;
+				break;
+			}
+
+			Check(*Run, Bashed >= 1,
+				FString::Printf(TEXT("(control) BASH under Rocco's E: the end of the dash knocks the held player (%d knock(s) in %d dash(es))"),
+					Bashed, Dashes));
+			Check(*Run, Run->bDashingFlagSeen,
+				TEXT("(control) BASH under Rocco's E: the bash window is published for the armed tell"));
+			UE_LOG(LogTraceGame, Display, TEXT("[MixedKits] BASH control: armed accent seen on a sampled frame = %d "
+				"(the window is ~63 ms and frame-sampled, so this one is reported, not asserted)."),
+				Run->bAccentLiftSeen ? 1 : 0);
+			SetFriendlyFire(Run->bSavedFriendlyFire);
+
+			// ---- THE JAR JUMP Demo 35 retired: RILLA CANS + PICKLER, no character id -----------------
+			Equip(*Run, Make(ETraceAbilityId::None, ETraceAbilityId::PickleJar, ETraceAbilityId::Pickler));
+			Run->GroundedSince = 0.0;
+			Run->PhaseUntil = FPlatformTime::Seconds() + 6.0;
+			NextDelay = 0.f;
+			break;
+		}
+
+		case 19:
+		case 21:
+		{
+			KeepAlive(Pawn);
+			if (!SettledOnGround(*Run, Pawn))
+			{
+				if (FPlatformTime::Seconds() > Run->PhaseUntil)
+				{
+					Check(*Run, false, TEXT("(precondition) he stood on the ground so a jump off his own jar could be tried"));
+					Run->Step = 23;   // straight to the verdict
+					NextDelay = 0.1f;
+					break;
+				}
+				Run->Step = ThisStep;
+				NextDelay = 0.f;
+				break;
+			}
+			JumpOffOwnJar(*Run, Pawn, Abilities);
+			Run->PhaseUntil = FPlatformTime::Seconds() + 0.3;
+			NextDelay = 0.f;
+			break;
+		}
+
+		case 20:
+		case 22:
+		{
+			if (const UTraceCharacterMovementComponent* LocalMove = Pawn->GetTraceMovement())
+			{
+				Run->PeakZ = FMath::Max(Run->PeakZ, static_cast<float>(LocalMove->Velocity.Z));
+			}
+			if (FPlatformTime::Seconds() < Run->PhaseUntil)
+			{
+				Run->Step = ThisStep;
+				NextDelay = 0.f;
+				break;
+			}
+
+			const float PlainJumpZ = (Pawn->GetTraceMovement() != nullptr) ? Pawn->GetTraceMovement()->JumpZVelocity : 0.f;
+			const float LaunchZ = UTraceSettings::Get().OysterJarJumpZVelocity;
+			const bool bJarStanding = Run->Jar.IsValid();
+			Check(*Run, Run->bJarSpawned && Run->PeakZ > 0.5f * PlainJumpZ,
+				FString::Printf(TEXT("(precondition) a jar of his was at his feet (%d) and he jumped (peak Z %.0f uu/s)"),
+					Run->bJarSpawned ? 1 : 0, Run->PeakZ));
+
+			if (ThisStep == 20)
+			{
+				Check(*Run, Run->PeakZ < 0.5f * (PlainJumpZ + LaunchZ),
+					FString::Printf(TEXT("*** RILLA CANS + PICKLER: a jump off his own jar is an ORDINARY jump (peak Z %.0f; a plain "
+					                     "jump is %.0f, the retired launch %.0f) ***"), Run->PeakZ, PlainJumpZ, LaunchZ));
+				Check(*Run, bJarStanding,
+					TEXT("*** RILLA CANS + PICKLER: the jump leaves his jar standing (no self-made poison burst) ***"));
+
+				const bool bSwitchFound = SetSwitch(TEXT("Trace.Demo35.LegacyJarJump"), 1);
+				UE_LOG(LogTraceGame, Display, TEXT("[MixedKits] jar-jump control: Trace.Demo35.LegacyJarJump 1 (%s)."),
+					bSwitchFound ? TEXT("set") : TEXT("NOT REGISTERED in this build"));
+				Run->GroundedSince = 0.0;
+				Run->PhaseUntil = FPlatformTime::Seconds() + 6.0;
+				NextDelay = 0.f;
+				break;
+			}
+
+			Check(*Run, Run->PeakZ >= LaunchZ - 1.f,
+				FString::Printf(TEXT("(control) Trace.Demo35.LegacyJarJump 1: the same jump launches him (peak Z %.0f of %.0f)"),
+					Run->PeakZ, LaunchZ));
+			Check(*Run, !bJarStanding && Run->bJarSpawned,
+				TEXT("(control) Trace.Demo35.LegacyJarJump 1: the same jump breaks the jar"));
+			SetSwitch(TEXT("Trace.Demo35.LegacyJarJump"), Run->SavedLegacyJarJump);
+			NextDelay = 0.3f;
+			break;
+		}
+
+		case 23:
 			Finish(*Run);
 			return false;
 
@@ -570,7 +1310,10 @@ namespace TraceLoadoutMixedKitsVerify
 		TEXT("Trace.Loadout.MixedKits"),
 		TEXT("Equips mixed loadouts on the local player (character id None, E from a different kit) and ")
 		TEXT("proves each ability still works through the shipped path: damage passives, movement traits, ")
-		TEXT("the slide bonus, the Pickler refund, the stick goo, and the HUD's status chips and cloak band."),
+		TEXT("the slide bonus, the Pickler refund, the stick goo, and the HUD's status chips and cloak band. Then the ")
+		TEXT("mirror image: an ability you did NOT pick must not fire (BASH's knock and tell, X-MECHS' bees and swarm, ")
+		TEXT("ROCKJUMP's V row, OVERLOAD's slow refill on a carrier, BLINK's legacy mantle, the retired jar jump), each ")
+		TEXT("beside a control with the ability equipped. About 25 s."),
 		FConsoleCommandWithWorldDelegate::CreateStatic(&Start));
 }
 

@@ -32,6 +32,55 @@ static TAutoConsoleVariable<int32> CVarOysterLegacyDashJarAtStart(
 	     "Never ship 1."),
 	ECVF_Cheat);
 
+// =================================================================================================
+// DEMO 35 RETIRED THE JAR JUMP, and this is the switch that says so rather than a deleted function.
+//
+// VISISPURS "Replaced Oyster's Jar Jump", so the jar jump has no ability row and nobody can pick it.
+// It kept running anyway: OnJumpPressed's slot guard went dead with the movement slot, but the jump
+// poll in TickAbilities checked nothing, so every Oyster pick — the uniform RILLA CANS + PICKLER one
+// and every Oyster bot included — still broke his own jar under a jump and launched at 1550 uu/s, and
+// a remote client predicted that launch on EVERY ground jump and was corrected back down.
+//
+// 0 (shipped): no jar jump for anybody. 1: the old ability for whoever has the kit, for comparing the
+// two in a playtest without a build — the same shape as Trace.Demo35.LegacyMantle and
+// Trace.Demo35.LegacyRoxieJump.
+// =================================================================================================
+static TAutoConsoleVariable<int32> CVarOysterLegacyJarJump(
+	TEXT("Trace.Demo35.LegacyJarJump"),
+	0,
+	TEXT("0 (shipped, Demo 35): Oyster's jar jump is retired; VISISPURS replaced it.\n")
+	TEXT("1: restore it (jumping off one of your own jars breaks it and launches you). Not pickable either way."),
+	ECVF_Default);
+
+namespace TraceOysterJarJumpFile
+{
+	/**
+	 * THE OWNING CLIENT'S HALF OF THE LEGACY JAR CHECK. LiveJars and the jar's source component are
+	 * server-side, so the client cannot ask FindOwnJarNear. The jar's actor OWNER is the pawn that
+	 * spawned it (SpawnJar) and bGrounded replicates, so a client can still see whether one of its
+	 * own landed jars is under it before predicting a launch — which is what stops the legacy arm
+	 * rubber-banding every ordinary jump.
+	 */
+	bool HasOwnGroundedJarNear(const UWorld* WorldPtr, const AActor* OwnerPawn, const FVector& Location)
+	{
+		if (WorldPtr == nullptr || OwnerPawn == nullptr)
+		{
+			return false;
+		}
+		const float Radius = FMath::Max(1.f, UTraceSettings::Get().OysterJarJumpRadiusUU);
+		for (TActorIterator<ATraceOysterJar> It(const_cast<UWorld*>(WorldPtr)); It; ++It)
+		{
+			const ATraceOysterJar* JarActor = *It;
+			if (JarActor != nullptr && JarActor->IsGrounded() && JarActor->GetOwner() == OwnerPawn
+				&& FVector::Dist(JarActor->GetActorLocation(), Location) <= Radius)
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+}
+
 namespace
 {
 	/**
@@ -373,7 +422,7 @@ ATraceOysterJar* UTraceAbilitySetOyster::DebugDropDashJar()
 }
 
 // =================================================================================================
-// MOVEMENT — the jar jump
+// THE JAR JUMP — Oyster's MOVEMENT until Demo 35, retired behind Trace.Demo35.LegacyJarJump
 // =================================================================================================
 
 bool UTraceAbilitySetOyster::OnJumpPressed()
@@ -384,9 +433,11 @@ bool UTraceAbilitySetOyster::OnJumpPressed()
 	// movement kit is offered first and spends it) and never heard a remote client's ordinary jump at
 	// all. It lives in OnJumpPerformed now, which every equipped kit hears for every real jump.
 
-	// SLOT GUARD — "jumping while stood on one of your own jars breaks it and boosts you upward" is Oyster's MOVEMENT line.
+	// SLOT GUARD — "jumping while stood on one of your own jars breaks it and boosts you upward" WAS Oyster's MOVEMENT line.
 	// Equipped in another slot, this kit must not run this body: an ability you did not pick
 	// firing anyway is indistinguishable from a bug, and it is free power nobody chose.
+	// *** DEMO 35 LEFT OYSTER NO MOVEMENT ABILITY, so this is always false now. *** The jar jump is
+	// retired (VISISPURS replaced it); DoJarJump refuses unless Trace.Demo35.LegacyJarJump is 1.
 	if (!IsSlot(ETraceLoadoutSlot::Movement))
 	{
 		return false;
@@ -409,6 +460,13 @@ bool UTraceAbilitySetOyster::DebugTryJarJump()
 
 bool UTraceAbilitySetOyster::DoJarJump(const FVector& FromLocation)
 {
+	// RETIRED BY DEMO 35. Every route — the hook, the poll and the harness entry — comes through
+	// here, so this one line is what keeps a removed ability removed.
+	if (CVarOysterLegacyJarJump.GetValueOnAnyThread() == 0)
+	{
+		return false;
+	}
+
 	ATraceCharacter* MyPawn = GetCharacter();
 	UTraceCharacterMovementComponent* MoveComp = GetMovement();
 	if (MyPawn == nullptr || !MyPawn->IsAlive() || MoveComp == nullptr)
@@ -425,6 +483,16 @@ bool UTraceAbilitySetOyster::DoJarJump(const FVector& FromLocation)
 	// The jar list is server-side only, so the owning client cannot find its own jar this way. It
 	// still has to APPLY the boost or the jump would be a round trip late and then corrected; the
 	// server's break is what makes it authoritative. See the report.
+	//
+	// *** BUT ONLY OVER ONE OF ITS OWN JARS. *** This used to predict with no jar check at all, so a
+	// remote Oyster launched at 1550 uu/s on every ground jump and the server, finding no jar, pulled
+	// him back down: rubber-banding on every jump. The client asks the replicated half instead.
+	if (!HasAuthority()
+		&& !TraceOysterJarJumpFile::HasOwnGroundedJarNear(GetWorld(), MyPawn, FromLocation))
+	{
+		return false;
+	}
+
 	if (HasAuthority())
 	{
 		ATraceOysterJar* JarActor = FindOwnJarNear(FromLocation);
@@ -712,7 +780,7 @@ void UTraceAbilitySetOyster::TickAbilities(float DeltaSeconds)
 		bWasDashing = bDashingNow;
 	}
 
-	// --- THE JUMP POLL --------------------------------------------------------------------------
+	// --- THE JUMP POLL (RETIRED BY DEMO 35 — Trace.Demo35.LegacyJarJump) ----------------------------
 	//
 	// Runs on the server AND on the owning client, because the boost has to be applied on both or it
 	// rubber-bands. ATracePlayerController's jump binding DOES reach OnJumpPressed above, through
@@ -720,10 +788,17 @@ void UTraceAbilitySetOyster::TickAbilities(float DeltaSeconds)
 	// ground without going through that binding, and JarJumpLatchSeconds is what keeps the two from
 	// boosting twice for one press. The jar is found from the position he was standing at LAST tick —
 	// by the time he is airborne he has already left it.
+	//
+	// NO JUMP WHILE THE SWITCH IS 0. Since Demo 35 OnJumpPressed's slot guard is always false (Oyster
+	// has no movement ability), so this unguarded poll was the jar jump's only live route, and it ran
+	// for every Oyster pick. The ground-state bookkeeping below still runs — it moves nothing, and it
+	// means flipping the switch on mid-match does not start from a stale edge — and DoJarJump refuses
+	// on the same switch as a second lock.
 	if (MyPawn != nullptr && MoveComp != nullptr && ShouldDriveMovement())
 	{
 		const bool bOnGroundNow = MoveComp->IsMovingOnGround();
-		if (bWasOnGround && !bOnGroundNow && MoveComp->Velocity.Z > 1.f)
+		if (CVarOysterLegacyJarJump.GetValueOnAnyThread() != 0
+			&& bWasOnGround && !bOnGroundNow && MoveComp->Velocity.Z > 1.f)
 		{
 			DoJarJump(LastGroundedLocation);
 		}

@@ -803,11 +803,21 @@ static TAutoConsoleVariable<int32> CVarMortimerLegacyMantle(
 
 bool UTraceAbilitySetMortimer::AllowsMantle() const
 {
+	// BLINK ONLY, like every other trait getter answers for its own ability: the mantle is the
+	// movement ability Blink replaced, so a Mortimer kit picked for QMECH or QUAKE has no opinion.
+	if (!IsAbility(ETraceAbilityId::Blink))
+	{
+		return false;
+	}
 	return UTraceSettings::Get().bMortimerCanMantle;
 }
 
 float UTraceAbilitySetMortimer::GetMantleGenerosityScale() const
 {
+	if (!IsAbility(ETraceAbilityId::Blink))
+	{
+		return 1.f;
+	}
 	return FMath::Clamp(UTraceSettings::Get().MortimerMantleGenerosity, 1.f, 4.f);
 }
 
@@ -1219,6 +1229,15 @@ bool UTraceAbilitySetMortimer::OnJumpPressed()
 	// standing because the note says "replaced", not "deleted", and the reach/height maths here is
 	// the part a future mantle would want back.
 	if (CVarMortimerLegacyMantle.GetValueOnAnyThread() == 0)
+	{
+		return false;
+	}
+	// *** AND WITH THE SWITCH ON, ONLY WHERE BLINK IS. *** The mantle is the movement ability BLINK
+	// replaced ("Replaced Mantle"), so the comparison toy goes to a player who took Mortimer's
+	// movement slot and to nobody else: a QUAKE-only or QMECH-only pick must not get a movement
+	// ability it never chose just because the switch is on. A SEPARATE block from the switch above on
+	// purpose — that block is the retired gate the sound page matches.
+	if (!IsAbility(ETraceAbilityId::Blink))
 	{
 		return false;
 	}
@@ -3033,7 +3052,7 @@ namespace TraceMortimerVerifyFile
 	// =============================================================================================
 	// Trace.Mortimer.MantleTest — DEMO 21 ITEM 6, MEASURED THROUGH THE SHIPPED JUMP KEY
 	//
-	// THREE ARMS ON ONE FIXTURE, RED FIRST.
+	// FOUR ARMS ON ONE FIXTURE, RED FIRST.
 	//
 	//   0  RED    Trace.Mortimer.Mantle 0. The identical press at the identical ledge. He must NOT get
 	//             up, and the press must NOT be consumed — this is the build the owner has reported a
@@ -3045,6 +3064,11 @@ namespace TraceMortimerVerifyFile
 	//             rule exists: without it Mortimer would lose his ordinary jump everywhere near a
 	//             crate, which is a far worse regression than a missing mantle and is exactly the kind
 	//             of thing a two-arm harness would have shipped without noticing.
+	//   3  NO BLINK  the green build and the TALL ledge again, with the legacy switch still on, but the
+	//             loadout is Mortimer's QMECH + QUAKE with NO BLINK. The mantle is the movement ability
+	//             BLINK replaced, so the press must NOT be consumed and he must NOT get up — a player
+	//             who did not take Mortimer's movement slot does not get a movement ability from it.
+	//             Arm 1 on the same ledge is what makes this arm's "nothing happened" mean something.
 	//
 	// IT BUILDS ITS OWN LEDGE. A fixture that depends on finding a suitable block in whatever arena
 	// happens to be loaded is a fixture that reports INVALID for map reasons; a 200 uu cube spawned in
@@ -3085,8 +3109,11 @@ namespace TraceMortimerVerifyFile
 		FRotator AnchorRotation = FRotator::ZeroRotator;
 		float JumpApexUU = 0.f;
 
-		FMortimerMantleArm Arms[3];
+		FMortimerMantleArm Arms[4];
 		int32 SavedMantleArm = 1;
+
+		/** Arm 3 swaps the loadout; every exit puts the uniform Mortimer back. */
+		bool bLoadoutSwapped = false;
 
 		/** Trace.Demo35.LegacyMantle as the run found it. The run turns it on and puts this back. */
 		int32 SavedLegacyMantle = 0;
@@ -3105,6 +3132,13 @@ namespace TraceMortimerVerifyFile
 		// Back to what the run found — 0, the shipped Demo 35 game, unless somebody had turned the
 		// legacy mantle on for a playtest before running this.
 		CVarMortimerLegacyMantle->Set(Run->SavedLegacyMantle, ECVF_SetByConsole);
+		if (Run->bLoadoutSwapped)
+		{
+			if (UTraceAbilityComponent* const Abilities = UTraceAbilityComponent::Get(Run->Pawn.Get()))
+			{
+				Abilities->ApplyLoadout(FTraceLoadout::Uniform(ETraceCharacterId::Mortimer));
+			}
+		}
 		if (AStaticMeshActor* Block = Run->Block.Get())
 		{
 			Block->Destroy();
@@ -3143,12 +3177,14 @@ namespace TraceMortimerVerifyFile
 		const FMortimerMantleArm& Red   = Run->Arms[0];
 		const FMortimerMantleArm& Green = Run->Arms[1];
 		const FMortimerMantleArm& Guard = Run->Arms[2];
+		const FMortimerMantleArm& NoBlink = Run->Arms[3];
 
-		for (int32 Index = 0; Index < 3; ++Index)
+		for (int32 Index = 0; Index < 4; ++Index)
 		{
-			static const TCHAR* const Names[3] = { TEXT("RED   (Trace.Mortimer.Mantle 0)"),
+			static const TCHAR* const Names[4] = { TEXT("RED   (Trace.Mortimer.Mantle 0)"),
 			                                       TEXT("GREEN (legacy mantle on)"),
-			                                       TEXT("GUARD (ledge below his jump apex)") };
+			                                       TEXT("GUARD (ledge below his jump apex)"),
+			                                       TEXT("NO BLINK (QMECH + QUAKE, legacy mantle on)") };
 			const FMortimerMantleArm& Arm = Run->Arms[Index];
 			UE_LOG(LogTraceGame, Display,
 				TEXT("[%s] arm=%s  ledge %.0f uu (top z=%.0f)  press consumed=%d  feet %.0f -> peak %.0f -> "
@@ -3196,13 +3232,24 @@ namespace TraceMortimerVerifyFile
 			return;
 		}
 
+		if (NoBlink.bPressConsumed || NoBlink.bEndedOnLedge)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[%s] VERDICT: *** FAIL *** — with NO BLINK equipped (QMECH + QUAKE) the legacy mantle still "
+				     "ran: press consumed=%d, ended on the %.0f uu ledge=%d. The mantle is the movement ability "
+				     "BLINK replaced; a loadout without BLINK must not get it."),
+				Tag, NoBlink.bPressConsumed ? 1 : 0, NoBlink.LedgeHeight, NoBlink.bEndedOnLedge ? 1 : 0);
+			return;
+		}
+
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[%s] VERDICT: PASS — with the mantle REMOVED the identical press was declined and his feet "
 			     "finished %.0f uu SHORT of a lip at z=%.0f; with it in place the press was consumed, his feet "
 			     "peaked at z=%.0f and he ended STOOD ON that lip at z=%.0f. A %.0f uu ledge (under his %.0f uu "
-			     "apex) still leaves the jump key alone."),
+			     "apex) still leaves the jump key alone, and a loadout without BLINK (QMECH + QUAKE) is declined "
+			     "at the same tall ledge, feet %.0f uu short of the lip."),
 			Tag, Red.LedgeTopZ - Red.PeakFeetZ, Red.LedgeTopZ, Green.PeakFeetZ, Green.EndFeetZ,
-			Guard.LedgeHeight, Run->JumpApexUU);
+			Guard.LedgeHeight, Run->JumpApexUU, NoBlink.LedgeTopZ - NoBlink.PeakFeetZ);
 	}
 
 	void RunMortimerMantleTest()
@@ -3231,6 +3278,18 @@ namespace TraceMortimerVerifyFile
 
 		FString Why;
 		UTraceAbilitySetMortimer* Mortimer = MakePlayerIntoMortimer(TestWorld, Why);
+
+		// ARMS 0-2 NEED BLINK: the legacy mantle goes where Mortimer's movement ability is. A player who
+		// is already Mortimer may be on a loadout without it, and ServerSetCharacter would not change it.
+		if (Mortimer != nullptr && !Mortimer->IsAbility(ETraceAbilityId::Blink))
+		{
+			if (UTraceAbilityComponent* const Abilities = Mortimer->GetAbilityComponent())
+			{
+				Abilities->ApplyLoadout(FTraceLoadout::Uniform(ETraceCharacterId::Mortimer));
+				Mortimer = Abilities->FindEquippedSet<UTraceAbilitySetMortimer>();
+			}
+		}
+
 		ATraceCharacter* MyPawn = (Mortimer != nullptr) ? Mortimer->GetCharacter() : nullptr;
 		UTraceCharacterMovementComponent* Move = (MyPawn != nullptr)
 			? Cast<UTraceCharacterMovementComponent>(MyPawn->GetCharacterMovement()) : nullptr;
@@ -3295,8 +3354,8 @@ namespace TraceMortimerVerifyFile
 		UE_LOG(LogTraceGame, Display,
 			TEXT("[%s] begin: LEGACY — the mantle is retired in Demo 35, so this runs with "
 			     "Trace.Demo35.LegacyMantle 1 (was %d, restored at the end) to keep the code behind that "
-			     "switch covered. Three arms on one built ledge, RED first. %s, jump apex %.0f uu, capsule "
-			     "r=%.0f h=%.0f. The ledge is %.0f uu tall for arms 0 and 1 and %.0f uu for arm 2."),
+			     "switch covered. Four arms on one built ledge, RED first, the last with no BLINK. %s, jump apex %.0f uu, capsule "
+			     "r=%.0f h=%.0f. The ledge is %.0f uu tall for arms 0, 1 and 3 and %.0f uu for arm 2."),
 			Tag, Run->SavedLegacyMantle, *GetNameSafe(MyPawn), Run->JumpApexUU, Capsule->GetScaledCapsuleRadius(),
 			Capsule->GetScaledCapsuleHalfHeight(), Run->JumpApexUU * MantleTestTallApexes,
 			Run->JumpApexUU * MantleTestLowApexes);
@@ -3339,8 +3398,35 @@ namespace TraceMortimerVerifyFile
 				{
 				case 0:
 				{
-					// RED FIRST. Arm 0 removes the mantle; arms 1 and 2 restore it.
+					// RED FIRST. Arm 0 removes the mantle; arms 1, 2 and 3 restore it.
 					MantleArm->Set(Run->ArmIndex == 0 ? 0 : 1, ECVF_SetByConsole);
+
+					// ARM 3: the same Mortimer kit, built for QMECH + QUAKE and NOT for BLINK. ApplyLoadout
+					// rebuilds the kit, so the run's handle on it is re-taken from the new loadout.
+					if (Run->ArmIndex == 3 && !Run->bLoadoutSwapped)
+					{
+						UTraceAbilityComponent* const Abilities = UTraceAbilityComponent::Get(Pawn);
+						if (Abilities != nullptr)
+						{
+							FTraceLoadout NoBlinkLoadout;
+							NoBlinkLoadout.Passive = ETraceAbilityId::MortimerLoad;
+							NoBlinkLoadout.Activated = ETraceAbilityId::Quake;
+							Abilities->ApplyLoadout(NoBlinkLoadout);
+							Run->bLoadoutSwapped = true;
+							Run->Set = UTraceAbilityComponent::FindEquippedSetFor<UTraceAbilitySetMortimer>(Pawn);
+							UE_LOG(LogTraceGame, Display, TEXT("[%s] arm 3: loadout is now %s (no BLINK)."),
+								Tag, *TraceLoadoutToString(Abilities->GetLoadout()));
+						}
+						if (Run->Set.Get() == nullptr)
+						{
+							UE_LOG(LogTraceGame, Warning,
+								TEXT("[%s] VERDICT: INVALID — arm 3 could not equip Mortimer's QMECH + QUAKE without BLINK."),
+								Tag);
+							EndMortimerMantleRun(Run);
+							return false;
+						}
+						return true;   // the next tick re-reads Set from the run
+					}
 
 					// Back to the anchor every arm, with no velocity, so the three presses start from
 					// the identical state and arm 1's success cannot set arm 2 up on top of a block.
@@ -3408,7 +3494,7 @@ namespace TraceMortimerVerifyFile
 						&& FeetZ > (CurrentArm.LedgeTopZ - 8.f);
 
 					++Run->ArmIndex;
-					Run->Phase = (Run->ArmIndex >= 3) ? 3 : 0;
+					Run->Phase = (Run->ArmIndex >= 4) ? 3 : 0;
 					Run->PhaseDeadline = Now + 6.0;
 					return true;
 				}
@@ -3430,10 +3516,11 @@ namespace TraceMortimerVerifyFile
 	FAutoConsoleCommand CmdMortimerMantleTest(
 		TEXT("Trace.Mortimer.MantleTest"),
 		TEXT("DEMO 21 item 6, LEGACY since Demo 35 retired the mantle: runs with Trace.Demo35.LegacyMantle 1 and "
-		     "restores it. Builds a ledge in front of Mortimer and presses the real jump key three times: "
+		     "restores it. Builds a ledge in front of Mortimer and presses the real jump key four times: "
 		     "with the mantle removed (must decline and must not get up), with it in place (must consume the "
-		     "press and end STOOD on the lip), and at a ledge below his own jump apex (must leave the ordinary "
-		     "jump alone). Destroys its ledge on every exit path."),
+		     "press and end STOOD on the lip), at a ledge below his own jump apex (must leave the ordinary "
+		     "jump alone), and on a QMECH + QUAKE loadout with no BLINK (must decline: the mantle is BLINK's "
+		     "slot). Destroys its ledge and restores his loadout on every exit path."),
 		FConsoleCommandDelegate::CreateStatic(&RunMortimerMantleTest));
 
 	// =============================================================================================

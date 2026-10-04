@@ -1814,6 +1814,18 @@ namespace TraceMovementAuditV16
 				}
 
 				UTraceAbilitySetChut* ChutSet = Human->GetAbilitySetAs<UTraceAbilitySetChut>();
+
+				// BASH IN THE PASSIVE SLOT. Picking Chut as a character gives CUSTOM STEEL + CHUD, and
+				// since Demo 35 the bash is its own passive that TryBash asks for by id — measured on
+				// the character pick, every arm would be refused for a reason that is the design.
+				if (ChutSet != nullptr && !ChutSet->IsAbility(ETraceAbilityId::Bash))
+				{
+					FTraceLoadout WithBash = FTraceLoadout::Uniform(ETraceCharacterId::Chut);
+					WithBash.Passive = ETraceAbilityId::Bash;
+					Human->ApplyLoadout(WithBash);
+					ChutSet = Human->GetAbilitySetAs<UTraceAbilitySetChut>();
+				}
+
 				ATraceCharacter* ChutPawn = Human->GetOwningCharacter();
 				if (ChutSet == nullptr || ChutPawn == nullptr || !ChutPawn->IsAlive())
 				{
@@ -2100,6 +2112,9 @@ namespace TraceMovementAuditV16
 
 		float JarJumpZ = 0.f;
 		bool  bJarJumpValid = false;
+
+		/** Trace.Demo35.LegacyJarJump was 0: the jar jump is retired and there is nothing to measure. */
+		bool  bJarJumpRetired = false;
 	};
 
 	void ReportAbilityMoves(const FAbilityMoveState& State)
@@ -2171,7 +2186,17 @@ namespace TraceMovementAuditV16
 			RowInvalid(TEXT("MACE suspend"), TEXT("suspend never engaged — needs Mace, airborne, V held"));
 		}
 
-		if (State.bJarJumpValid)
+		if (State.bJarJumpRetired)
+		{
+			// NOT AN INVALID. Demo 35 retired the jar jump (VISISPURS replaced it), so with the switch at
+			// its shipped 0 there is no launch to measure, and Trace.Oyster.Verify is where "a jump off
+			// his own jar is an ordinary jump" is asserted.
+			UE_LOG(LogTraceGame, Display,
+				TEXT("AUDITV16 | %-34s | not measured — retired by Demo 35 (Trace.Demo35.LegacyJarJump 0; set it "
+				     "to 1 to measure the legacy launch, knob %.0f uu/s)."),
+				TEXT("OYSTER jar-jump launch Z"), S.OysterJarJumpZVelocity);
+		}
+		else if (State.bJarJumpValid)
 		{
 			Row(TEXT("OYSTER jar-jump launch Z"), TEXT("uu/s"), Biased(S.OysterJarJumpZVelocity), State.JarJumpZ, 0.05f,
 				TEXT("a jar broken under Oyster's own feet"));
@@ -2412,6 +2437,16 @@ namespace TraceMovementAuditV16
 				}
 				if (State->Phase == 0)
 				{
+					// RETIRED BY DEMO 35. DebugTryJarJump refuses for everybody while the switch is at its
+					// shipped 0, so waiting for it would only time out and read as a broken launch.
+					const IConsoleVariable* const LegacyJarJump =
+						IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Demo35.LegacyJarJump"));
+					if (LegacyJarJump != nullptr && LegacyJarJump->GetInt() == 0)
+					{
+						State->bJarJumpRetired = true;
+						ReportAbilityMoves(*State);
+						return false;
+					}
 					if (!Move->IsMovingOnGround())
 					{
 						return true;

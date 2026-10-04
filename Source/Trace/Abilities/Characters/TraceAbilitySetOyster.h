@@ -16,6 +16,11 @@
 //
 //   MOVEMENT  "jumping while stood on one of his jars breaks it and boosts him upward."
 //
+//             *** RETIRED BY DEMO 35. *** VISISPURS (the dash cloak, a passive) "Replaced Oyster's Jar
+//             Jump", and Oyster has no movement ability now. The code stays behind
+//             Trace.Demo35.LegacyJarJump (0 = shipped, off for every loadout; 1 = back for a playtest
+//             comparison), the same shape as Trace.Demo35.LegacyMantle.
+//
 //   ACTIVATED "Pickler: lobs a jar that, ON LANDING, deals 30 damage in an area and pulls enemies
 //             within a small radius toward it."  Plus the doc's own clarification: "The jar does not
 //             explode upon landing, it is the same as his other jars, which stay behind for a short
@@ -107,10 +112,11 @@ public:
 	virtual bool OnDashStarted(const FVector& DashDirection) override;
 	virtual void OnDashEnded(bool bReachedFullDistance) override;
 
-	// --- MOVEMENT: the jar jump ------------------------------------------------------------------------
+	// --- RETIRED BY DEMO 35: the jar jump (Trace.Demo35.LegacyJarJump) ------------------------------
 
 	/**
-	 * "jumping while stood on one of his jars breaks it and boosts him upward."
+	 * "jumping while stood on one of his jars breaks it and boosts him upward." OFF unless
+	 * Trace.Demo35.LegacyJarJump is 1 — see the file header.
 	 *
 	 * Returns TRUE to consume the jump, so the boost REPLACES the normal jump rather than adding to
 	 * it. Reached from ATracePlayerController's jump binding through
@@ -165,7 +171,8 @@ public:
 	 */
 	ATraceOysterJar* DebugThrowPickler();
 
-	/** HARNESS. Attempts the jar jump right now. Returns true if it fired. */
+	/** HARNESS. Attempts the jar jump right now. Returns true if it fired; always false while
+	 *  Trace.Demo35.LegacyJarJump is 0. */
 	bool DebugTryJarJump();
 
 	/** HARNESS. Clears the field so one measurement cannot be polluted by the jars of the last. */
@@ -195,7 +202,7 @@ private:
 	 */
 	bool bDashJarOwedForThisDash = false;
 
-	/** Ground-state edge for the jar-jump poll. */
+	/** Ground-state edge for the (legacy) jar-jump poll. */
 	bool bWasOnGround = false;
 
 	/** Where he stood on the last tick, so a jump can ask "was I on a jar" AFTER leaving the ground. */

@@ -1200,15 +1200,23 @@ float UTraceCharacterMovementComponent::GetDashRechargeWindow() const
 	// *** DEMO 35: THE EXTRA CHARGE REFILLS AT HALF RATE. ***
 	//
 	// "ONE EXTRA DASH CHARGE... THE SECOND DASH RECHARGES AT 50% OF THE RECHARGE RATE." The charge
-	// being filled is the one ABOVE the base maximum, so the test is which charge this window is
-	// for, not who the player is: filling back to the base two is the normal rhythm, and only the
-	// bonus charge on top costs double.
+	// being filled is OVERLOAD's extra one, i.e. the top ExtraCharges of the pool, so the window is
+	// slow only while that charge EXISTS and is the one refilling.
+	//
+	// *** IT USED TO ASK ONLY "AM I ABOVE BaseDashCharges", AND THAT WAS EVERY CORE CARRIER. ***
+	// BaseDashCharges is 1, and a carrier's pool is 1 + CarrierExtraDashCharges = 2, so any carrier
+	// who had dashed once refilled the second charge at half rate — OVERLOAD's penalty on all ten
+	// characters, uniform loadouts included. Now: no OVERLOAD charge in the pool (not OVERLOAD, or
+	// OVERLOAD while carrying — "BUT NOT WHILE CARRYING THE CORE"), no penalty.
+	//
+	// DERIVED FROM THE LIVE POOL, not from a literal, so a retune of BaseDashCharges or
+	// CarrierExtraDashCharges moves the threshold with it. The extra count is the same predicted
+	// trait GetMaxDashCharges() adds, so client and server agree on which window is running.
 	//
 	// HERE RATHER THAN AT THE THREE REFILL SITES. Every one of them sets its next window from this
-	// function, and the HUD's meter divides by it, so putting the rule anywhere else would give a
-	// meter that disagrees with the charge it is drawing.
-	const int32 BaseCharges = FMath::Max(1, UTraceSettings::Get().BaseDashCharges);
-	if (DashCharges >= BaseCharges)
+	// function, so putting the rule anywhere else would give two refill clocks that disagree.
+	const int32 ExtraCharges = TraceAbilityTraits::GetExtraDashCharges(CharacterOwner);
+	if (ExtraCharges > 0 && DashCharges >= GetMaxDashCharges() - ExtraCharges)
 	{
 		const float Scale = FMath::Max(1.f, UTraceSettings::Get().LilyExtraDashRechargeScale);
 		return Base * Scale;

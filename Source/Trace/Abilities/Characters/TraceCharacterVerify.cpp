@@ -1118,6 +1118,11 @@ namespace TraceCharacterVerify
 			}
 
 			Comp->ServerSetCharacter(ETraceCharacterId::Chut);
+
+			// THE CHARACTER PICK, EXPLICITLY. ServerSetCharacter is a no-op when he is already Chut, and
+			// the previous arm left him on the BASH loadout below — so without this the knife lines of
+			// every arm after the first would be measured without CUSTOM STEEL.
+			Comp->ApplyLoadout(FTraceLoadout::Uniform(ETraceCharacterId::Chut));
 			Comp->OnHalfTime();
 
 			UTraceAbilitySetChut* Chut = Comp->GetAbilitySetAs<UTraceAbilitySetChut>();
@@ -1208,7 +1213,26 @@ namespace TraceCharacterVerify
 
 			UE_LOG(LogTraceGame, Verbose, TEXT("[CHUT] arm %d: TryActivate returned %d."), Arm, bChudFired ? 1 : 0);
 
-			// ---- MOVEMENT: the bash ---------------------------------------------------------------
+			// ---- PASSIVE (Demo 35): the bash -------------------------------------------------------
+			// ON A BASH LOADOUT. Demo 35 made BASH a passive beside CUSTOM STEEL, so the character pick
+			// above (CUSTOM STEEL + CHUD) does not bash at all — TryBash asks for BASH by id. The same
+			// Chut with BASH in the passive slot is what this section measures; CHUD stays on E.
+			{
+				FTraceLoadout WithBash = FTraceLoadout::Uniform(ETraceCharacterId::Chut);
+				WithBash.Passive = ETraceAbilityId::Bash;
+				Comp->ApplyLoadout(WithBash);
+				Chut = Comp->GetAbilitySetAs<UTraceAbilitySetChut>();
+				Run->Chut = Chut;
+				if (Chut == nullptr || !Chut->IsAbility(ETraceAbilityId::Bash))
+				{
+					Run->Current.Invalidate(FString::Printf(
+						TEXT("ApplyLoadout(%s) did not equip a Chut kit with BASH"), *TraceLoadoutToString(WithBash)));
+					FinishChutArm(Run);
+					ScheduleChut(Run, 0.f);
+					return false;
+				}
+			}
+
 			// Friendly fire is forced ON for this section so that a SameTeam refusal can never be
 			// mistaken for the carrier rule or for the bash being broken. Restored at the end.
 			Run->bSavedFriendlyFire = Settings.bFriendlyFire;
@@ -1378,6 +1402,7 @@ namespace TraceCharacterVerify
 			}
 			if (UTraceAbilityComponent* Comp = Run->Comp.Get())
 			{
+				Comp->ApplyLoadout(FTraceLoadout::Uniform(ETraceCharacterId::Chut));   // back to the pick
 				Comp->OnHalfTime();
 			}
 

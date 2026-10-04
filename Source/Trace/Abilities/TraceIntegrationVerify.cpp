@@ -594,6 +594,19 @@ namespace TraceIntegrationVerify
 				return true;
 			}
 
+			// BASH IN THE PASSIVE SLOT. "SetCharacter Chut" equips the character pick, CUSTOM STEEL +
+			// CHUD, and since Demo 35 the sweep and the knock are BASH's alone — on the pick the radius
+			// is 0 and this seam could only ever report NOT EXERCISED.
+			if (UTraceAbilityComponent* TesterAbilities = UTraceAbilityComponent::Get(MyPawn))
+			{
+				if (TesterAbilities->GetCharacterId() == ETraceCharacterId::Chut)
+				{
+					FTraceLoadout WithBash = FTraceLoadout::Uniform(ETraceCharacterId::Chut);
+					WithBash.Passive = ETraceAbilityId::Bash;
+					TesterAbilities->ApplyLoadout(WithBash);
+				}
+			}
+
 			// THE SWEEP RADIUS IS THE PRECONDITION, AND IT IS CHECKED RATHER THAN ASSUMED. A zero
 			// here means the tester is not Chut — SetCharacter was refused, the roster did not
 			// resolve, whatever — and the sweep is then CORRECTLY skipped by the movement
@@ -655,6 +668,12 @@ namespace TraceIntegrationVerify
 				// charge pool takes a second to refill. A refused dash is not a missing call site,
 				// so this retries until a dash is genuinely observed, and gives up as NOT EXERCISED
 				// rather than as a failure.
+				//
+				// A CHARGE FIRST, so the retry is not eight seconds of an ENEMY held inside knife range
+				// of the tester. Once the Chut step really reached here (BASH equipped), that is what
+				// ended it: the tester was knifed and the seam read "went away". The refund is the
+				// shipped server path (RefundDashCharge) and does nothing when the pool is full.
+				Move->RefundDashCharge();
 				MyPawn->DoDash();
 			}
 

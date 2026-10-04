@@ -481,6 +481,14 @@ void UTraceAbilitySetX::NotifyBulletHit(ATraceCharacter* Victim, bool bHeadshot)
 
 void UTraceAbilitySetX::SweepBeeContacts()
 {
+	// *** X-MECHS ONLY. *** The component ticks this kit whichever of X's abilities was picked, so a
+	// LEECH-only or STING-only X used to carry five bees nobody picked, marking every enemy they
+	// touched — and LEECH then fed on its own marks. The bees that sting are X-MECHS' bees.
+	if (!IsAbility(ETraceAbilityId::XMechs))
+	{
+		return;
+	}
+
 	ATraceCharacter* MyCharacter = GetCharacter();
 	UWorld* CurrentWorld = GetWorld();
 	if (MyCharacter == nullptr || CurrentWorld == nullptr || !MyCharacter->IsAlive())
@@ -749,6 +757,20 @@ void UTraceAbilitySetX::TickAbilities(float DeltaSeconds)
 
 void UTraceAbilitySetX::UpdateSwarmActor()
 {
+	// *** NO X-MECHS, NO SWARM — on every machine and from all six callers at once. *** The swarm is
+	// X-MECHS' picture, and this file's rule is that the bees you see are the bees that sting, so a
+	// LEECH-only or STING-only X draws none. STING alone still loads its five rounds from E; there is
+	// simply nothing orbiting to fly into the gun first, and nothing to resume orbiting after.
+	if (!IsAbility(ETraceAbilityId::XMechs))
+	{
+		if (ATraceBeeSwarm* Existing = Swarm.Get())
+		{
+			Existing->Destroy();
+		}
+		Swarm = nullptr;
+		return;
+	}
+
 	UWorld* CurrentWorld = GetWorld();
 	if (CurrentWorld == nullptr || !CurrentWorld->IsGameWorld() || CurrentWorld->GetNetMode() == NM_DedicatedServer)
 	{

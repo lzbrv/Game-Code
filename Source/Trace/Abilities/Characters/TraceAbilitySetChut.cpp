@@ -242,7 +242,15 @@ void UTraceAbilitySetChut::TickAbilities(float DeltaSeconds)
 			UE_LOG(LogTraceGame, Verbose, TEXT("[Chut] Chud expired."));
 		}
 
-		PollDashForBash(DeltaSeconds);
+		// *** BASH ONLY. *** The component ticks this kit for WHICHEVER of Chut's abilities was
+		// picked, and this poll used to run for all of them: a Chut taken for CUSTOM STEEL or CHUD
+		// (which is also the uniform character pick and every Chut bot) knocked people at the end of
+		// every dash and published the dash window that lights the armed tell. Gating the poll here
+		// keeps both off: no knock, no Dashing flag on the wire, no glow on a Chut who cannot bash.
+		if (IsAbility(ETraceAbilityId::Bash))
+		{
+			PollDashForBash(DeltaSeconds);
+		}
 	}
 
 	// FX_AUDIO_PLAN §2.2's armed tell. OUTSIDE the authority gate — that gate is why the tell did not
@@ -580,6 +588,13 @@ bool UTraceAbilitySetChut::TryBash(ATraceCharacter* Victim, float DashProgress, 
 	if (!HasAuthority() || CVarChutBashEnabled.GetValueOnAnyThread() == 0)
 	{
 		return false;   // RED ARM, and authority: a knockback is server truth.
+	}
+
+	// THE ONE APPLY PATH ASKS FOR ITS OWN ABILITY, so no caller — the poll, the movement hook, or
+	// whatever is added next — can knock somebody for a Chut who picked CUSTOM STEEL or CHUD.
+	if (!IsAbility(ETraceAbilityId::Bash))
+	{
+		return false;
 	}
 
 	ATraceCharacter* MyPawn = GetCharacter();
@@ -978,7 +993,11 @@ void UTraceAbilitySetChut::TickArmedTell()
 	// caller), and the tell's whole audience is the clients, so the honest test is the replicated
 	// one: a dead pawn is dimmed to EmissiveDead by ApplyTeamColors anyway, and a lift written on
 	// top of that is a corpse with bright stripes.
-	const bool bWindow = IsBashWindowPresented()
+	//
+	// BASH ONLY, and the instrument below stays OUTSIDE that test on purpose: the tell warns other
+	// players that this Chut can knock them, which is false for a CUSTOM STEEL or CHUD pick, while
+	// Trace.Chut.TellAB pins it open on whatever Chut it is given to photograph the material.
+	const bool bWindow = (IsAbility(ETraceAbilityId::Bash) && IsBashWindowPresented())
 #if !UE_BUILD_SHIPPING
 		|| CVarChutForceArmedTell.GetValueOnAnyThread() != 0   // Trace.Chut.TellAB's instrument
 #endif
@@ -2275,6 +2294,18 @@ namespace TraceAbilitySetChutFile
 		if (Comp->GetCharacterId() != ETraceCharacterId::Chut)
 		{
 			Comp->ServerSetCharacter(ETraceCharacterId::Chut);
+		}
+
+		// BASH IN THE PASSIVE SLOT. The character pick is CUSTOM STEEL + CHUD, and since Demo 35 the
+		// tell and the knock both belong to BASH alone, so measured on the pick neither would fire.
+		if (const UTraceAbilitySetChut* const PickedChut = Comp->GetAbilitySetAs<UTraceAbilitySetChut>())
+		{
+			if (!PickedChut->IsAbility(ETraceAbilityId::Bash))
+			{
+				FTraceLoadout WithBash = FTraceLoadout::Uniform(ETraceCharacterId::Chut);
+				WithBash.Passive = ETraceAbilityId::Bash;
+				Comp->ApplyLoadout(WithBash);
+			}
 		}
 
 		UTraceAbilitySetChut* const Chut = Comp->GetAbilitySetAs<UTraceAbilitySetChut>();

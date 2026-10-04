@@ -13,9 +13,11 @@
 //                              (none may land) — and fires the identical four at a NON-CARRIER enemy
 //                              in the same frames, which is the fixture proving itself.
 //
-//   Trace.Oyster.Verify        The passive and the movement ability, end to end: a real dash drops a
-//                              jar; a fourth jar despawns the oldest; a real jump off his own jar
-//                              breaks it and boosts him; poison deals 3 every 0.5 s.
+//   Trace.Oyster.Verify        The passive end to end: a real dash drops a jar; a fourth jar despawns
+//                              the oldest; poison deals 3 every 0.5 s. And the jar jump Demo 35
+//                              RETIRED: a real jump off his own jar must be an ordinary jump that
+//                              leaves the jar standing, and with Trace.Demo35.LegacyJarJump 1 (the
+//                              red arm, run second) the same jump must break it and launch him.
 //
 //   Trace.Mace.Verify          The derived magnet radius; the suspend measured against an UNSUSPENDED
 //                              fall of the same length (the falsification: a fixture that cannot see
@@ -556,8 +558,20 @@ namespace TraceMaceOysterVerify
 
 		float ZVelocityBeforeJarJump = 0.f;
 		float ZVelocityAfterJarJump = 0.f;
-		int32 JarsBeforeJarJump = 0;
-		int32 JarsAfterJarJump = 0;
+
+		/**
+		 * 0 = the shipped game (Trace.Demo35.LegacyJarJump 0, the jar jump retired), 1 = the legacy
+		 * switch on, which is this assertion's red arm: the same jump off the same kind of jar must
+		 * then break it and launch him, or the fixture never reached the code it claims to test.
+		 */
+		int32 JarJumpArm = 0;
+		int32 SavedLegacyJarJump = 0;
+		bool  bLegacyJarJumpSwitchFound = false;
+		TWeakObjectPtr<ATraceOysterJar> JumpJar;
+		bool  bJumpJarSpawned = false;
+
+		/** Real time he was first seen stood on the ground in phase 4, 0 while airborne. */
+		double GroundedSinceReal = 0.0;
 
 		float PoisonDamageAt2s = -1.f;
 
@@ -729,7 +743,13 @@ namespace TraceMaceOysterVerify
 				return true;
 			}
 
-			// ---- Phase 4: the jar jump -------------------------------------------------------------
+			// ---- Phase 4: the jar jump DEMO 35 RETIRED --------------------------------------------
+			//
+			// VISISPURS "Replaced Oyster's Jar Jump", so a jump off his own jar must now be an ordinary
+			// jump. TWO ARMS, the shipped one first: arm 0 with Trace.Demo35.LegacyJarJump 0 (no launch,
+			// the jar stays), then arm 1 with it at 1 (launch and break) — arm 1 is what proves the
+			// fixture really put a jar of his under a real jump, so arm 0's "nothing happened" means
+			// something.
 			if (State->Phase == 4)
 			{
 				UTraceCharacterMovementComponent* MoveComp = MyPawn->GetTraceMovement();
@@ -741,9 +761,10 @@ namespace TraceMaceOysterVerify
 				}
 
 				// Put him on the ground with a jar under him, then use the SHIPPING jump entry point
-				// so the ground-state poll is what fires — that is the code path that runs in a match.
+				// so the ground-state poll is what would fire — that is the code path that runs in a match.
 				if (!MoveComp->IsMovingOnGround())
 				{
+					State->GroundedSinceReal = 0.0;
 					if ((NowReal - State->PhaseStartReal) > 4.0)
 					{
 						State->Check(false, TEXT("Oyster reached the ground so a jar jump could be attempted"));
@@ -753,9 +774,38 @@ namespace TraceMaceOysterVerify
 					return true;
 				}
 
-				OysterSet->DebugSpawnJarAt(FeetOf(MyPawn), /*bPickler*/ false);
-				State->JarsBeforeJarJump = OysterSet->GetLiveJarCount();
+				// STOOD THERE FOR A FEW ABILITY TICKS FIRST. The jump poll finds a jump as a ground-to-air
+				// edge between two of its 20 Hz ticks, so a jump on the frame he lands (arm 1 comes
+				// straight after arm 0's jump) has no edge to find, and the red arm would read "no launch"
+				// for a reason that is the fixture.
+				if (State->GroundedSinceReal <= 0.0)
+				{
+					State->GroundedSinceReal = NowReal;
+				}
+				if ((NowReal - State->GroundedSinceReal) < 0.3)
+				{
+					return true;
+				}
+
+				IConsoleVariable* const LegacySwitch =
+					IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Demo35.LegacyJarJump"));
+				if (State->JarJumpArm == 0)
+				{
+					State->bLegacyJarJumpSwitchFound = (LegacySwitch != nullptr);
+					State->SavedLegacyJarJump = (LegacySwitch != nullptr) ? LegacySwitch->GetInt() : 0;
+				}
+				if (LegacySwitch != nullptr)
+				{
+					LegacySwitch->Set(State->JarJumpArm, ECVF_SetByConsole);
+				}
+
+				// One jar, his own, at his feet — and only that one, so "the jar broke" below cannot
+				// be another jar expiring or the arm-0 jar being the one arm 1 found.
+				OysterSet->DebugDestroyAllJars();
+				State->JumpJar = OysterSet->DebugSpawnJarAt(FeetOf(MyPawn), /*bPickler*/ false);
+				State->bJumpJarSpawned = State->JumpJar.IsValid();
 				State->ZVelocityBeforeJarJump = MoveComp->Velocity.Z;
+				State->ZVelocityAfterJarJump = 0.f;
 				MyPawn->Jump();
 
 				State->Phase = 5;
@@ -766,6 +816,7 @@ namespace TraceMaceOysterVerify
 			{
 				UTraceCharacterMovementComponent* MoveComp = MyPawn->GetTraceMovement();
 				const float BoostZ = UTraceSettings::Get().OysterJarJumpZVelocity;
+				const float PlainJumpZ = (MoveComp != nullptr) ? MoveComp->JumpZVelocity : -1.f;
 
 				if (MoveComp != nullptr)
 				{
@@ -775,18 +826,50 @@ namespace TraceMaceOysterVerify
 				{
 					return true;
 				}
-				State->JarsAfterJarJump = OysterSet->GetLiveJarCount();
+				const bool bJarStillStanding = State->JumpJar.IsValid();
+
+				if (State->JarJumpArm == 0)
+				{
+					UE_LOG(LogTraceGame, Display,
+						TEXT("[OYSTERVERIFY] --- RETIRED BY DEMO 35: the jar jump (VISISPURS replaced it). "
+						     "Trace.Demo35.LegacyJarJump 0 — a jump off his own jar is an ordinary jump%s"),
+						State->bLegacyJarJumpSwitchFound ? TEXT("")
+							: TEXT(" [the switch is NOT REGISTERED in this build: nothing retires the jar jump]"));
+					State->Check(State->bJumpJarSpawned && State->ZVelocityAfterJarJump > 0.5f * PlainJumpZ,
+						FString::Printf(TEXT("the fixture put a jar of his at his feet (%d) and he jumped (peak Z %.0f uu/s) — "
+						                     "without both the two lines below prove nothing"),
+							State->bJumpJarSpawned ? 1 : 0, State->ZVelocityAfterJarJump));
+					State->Check(State->ZVelocityAfterJarJump < 0.5f * (PlainJumpZ + BoostZ),
+						FString::Printf(TEXT("*** a jump off his own jar is NOT launched (peak Z %.0f uu/s; a plain jump is %.0f, "
+						                     "the retired launch %.0f) ***"),
+							State->ZVelocityAfterJarJump, PlainJumpZ, BoostZ));
+					State->Check(bJarStillStanding,
+						TEXT("*** the jar under him is NOT broken by the jump (no self-made poison burst) ***"));
+
+					State->JarJumpArm = 1;
+					State->Phase = 4;   // the red arm: same jump, switch on, after he lands
+					State->PhaseStartReal = NowReal;
+					State->GroundedSinceReal = 0.0;
+					return true;
+				}
 
 				UE_LOG(LogTraceGame, Display,
-					TEXT("[OYSTERVERIFY] --- MOVEMENT: \"jumping while stood on one of his jars breaks it and boosts him upward\""));
+					TEXT("[OYSTERVERIFY] --- RED ARM, Trace.Demo35.LegacyJarJump 1: the retired jar jump must still "
+					     "work behind its switch, or the arm-0 lines above were measured on a fixture that never "
+					     "reached it"));
 				State->Check(State->ZVelocityAfterJarJump >= BoostZ - 1.f,
-					FString::Printf(TEXT("the jump reached the jar-jump launch speed (peak Z %.0f uu/s vs the %.0f uu/s knob; a plain jump is %.0f)"),
-						State->ZVelocityAfterJarJump, BoostZ, (MoveComp != nullptr) ? MoveComp->JumpZVelocity : -1.f));
-				State->Check(State->JarsAfterJarJump < State->JarsBeforeJarJump,
-					FString::Printf(TEXT("the jar was BROKEN by the jump (%d -> %d live jars)"),
-						State->JarsBeforeJarJump, State->JarsAfterJarJump));
+					FString::Printf(TEXT("LEGACY: the jump reached the jar-jump launch speed (peak Z %.0f uu/s vs the %.0f uu/s knob; a plain jump is %.0f)"),
+						State->ZVelocityAfterJarJump, BoostZ, PlainJumpZ));
+				State->Check(State->bJumpJarSpawned && !bJarStillStanding,
+					FString::Printf(TEXT("LEGACY: the jar was BROKEN by the jump (spawned=%d)"), State->bJumpJarSpawned ? 1 : 0));
 				State->Check((MoveComp != nullptr) && BoostZ > MoveComp->JumpZVelocity,
 					TEXT("the jar-jump launch is actually higher than a normal jump — otherwise the measurement above cannot tell them apart"));
+
+				if (IConsoleVariable* const LegacySwitch =
+					IConsoleManager::Get().FindConsoleVariable(TEXT("Trace.Demo35.LegacyJarJump")))
+				{
+					LegacySwitch->Set(State->SavedLegacyJarJump, ECVF_SetByConsole);
+				}
 
 				State->Phase = 6;
 				State->PhaseStartReal = NowReal;
