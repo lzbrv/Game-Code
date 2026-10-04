@@ -7,10 +7,9 @@
 // in the ability table rather than a hunt.
 //
 // NAMES COME FROM THE ABILITY TABLE. Demo 35 named most of them — JET BOOTS, STICKY GLOVES,
-// X-MECHS — and deliberately left three blank: Mace's magnet, Mortimer's dash/throw passive (marked
-// TBD in the note), and Oyster's new dash cloak. An empty name is a supported state and the loadout
-// card falls back to the description, which is what every unnamed ability did before any of them
-// had names.
+// X-MECHS — and left three blank, which the owner has since named A.U.R. SUIT (Mace's magnet), QMECH
+// (Mortimer's dash/throw passive) and VISISPURS (Oyster's dash cloak). An empty name is still a
+// supported state: the card and ShortLabel fall back to the description.
 //
 // DESCRIPTIONS STILL COME FROM THE ROSTER, so retuning or rewording an ability is one edit and every
 // screen follows. The roster is keyed by CHARACTER, which is still correct: it is where the kit's

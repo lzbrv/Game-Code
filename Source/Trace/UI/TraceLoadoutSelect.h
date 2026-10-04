@@ -16,8 +16,8 @@
 // ---------------------------------------------------------------------------------------------
 // WHAT A CARD SAYS, AND WHAT IT DELIBERATELY DOES NOT
 // ---------------------------------------------------------------------------------------------
-// A card is the ability's name where it has one, and its description. Three abilities are unnamed
-// on purpose (Demo 35) and their card is the description alone.
+// A card is the ability's name where it has one, and its description. Every ability has a name now;
+// one without (Demo 35 left three blank until the owner named them) shows the description alone.
 //
 // NO CHARACTER NAME APPEARS ANYWHERE ON THIS SCREEN. The abilities are freestanding; the kit id
 // survives INTERNALLY as the ability's source and is not a thing a player sees.

@@ -325,7 +325,10 @@ namespace TraceCharacterRosterFile
 				TEXT("HOLD V TO STICK TO A WALL."),
 				TEXT("WHILE STUCK: FIRES 30% FASTER AND TAKES 30% LESS FROM BODY SHOTS AND FRONT KNIFE "
 				     "STABS. HEADSHOTS AND BACKSTABS STILL HURT IN FULL."),
-				TEXT("SLIMEWALL"),
+				// SHOWN AS SLUDGE since the owner's ability-tuning note renamed it. The ability's id is
+				// still ETraceAbilityId::Slimewall; this string, the ability table's Name and
+				// CHARACTER.SLIMEBALL.ACTIVATED_NAME must agree (Trace.Loadout.Screen checks).
+				TEXT("SLUDGE"),
 				TEXT("THROW UP A WALL WHERE YOU ARE AIMING, FOR 4S. BULLETS PASS STRAIGHT THROUGH IT BUT "
 				     "NOBODY CAN SEE THROUGH IT, AND ENEMIES WALKING THROUGH ARE SLOWED 35%."),
 				25.f,
@@ -369,20 +372,13 @@ namespace TraceCharacterRosterFile
 			{
 				9, TEXT("MORTIMER"),
 				TEXT("HOLD V FOR 0.25S TO TELEPORT DIRECTLY UPWARDS, TWICE THE HEIGHT OF A JUMP."),
-				// DEMO 20 ITEM 2 MADE THIS STRING UNTRUE AND THEN INCREASED THE COOLDOWN TOO, so both
-				// halves are stated here. MortimerDashDistanceScale is 0.40 and MortimerDashCooldownScale
-				// is 1.25 (TraceSettings.h + Config/DefaultGame.ini); measured live by
-				// Trace.Mortimer.DashTest. Same precedent as commit c060875, which fixed Lily's card
-				// after Demo 19 changed her kit — a card that lies about the kit is worse than no card.
-				// SPEC v24 §7 MADE "ON THE SAME SCALE ... ABOUT TWICE AS FAR" UNTRUE the moment it
-				// landed: charge past the ordinary full point now counts at 0.6x
-				// (MortimerThrowChargePastFullScale). Deliberately no multiplier in the new wording —
-				// the old line went stale because it hardcoded one, and the honest statement of the
-				// mechanic ("further than anyone, not double") survives a re-tune of that 0.6.
-				TEXT("YOUR DASH COVERS ONLY TWO FIFTHS OF THE NORMAL DISTANCE AND RECHARGES A QUARTER "
-				     "SLOWER. IN EXCHANGE YOU MAY CHARGE A CORE THROW FOR TWICE AS LONG AS ANYONE "
-				     "ELSE, THOUGH CHARGE BEYOND A NORMAL FULL ONE COUNTS FOR LESS - SO YOU STILL "
-				     "THROW IT FURTHER THAN ANYONE, JUST NOT DOUBLE."),
+				// QMECH (ETraceAbilityId::MortimerLoad). THE OWNER'S OWN WORDING, from the ability-tuning
+				// note, replacing a sentence that spelled out every number: dash 0.40 of the distance
+				// (MortimerDashDistanceScale), recharging 1.25x slower (MortimerDashCooldownScale), throw
+				// charge held 2x as long (MortimerThrowChargeHoldScale) with the extra counting 0.6x
+				// (MortimerThrowChargePastFullScale). Those knobs still decide all of it; this line quotes
+				// none of them, so retuning any of them cannot make it untrue.
+				TEXT("EXTRA LONG CORE THROWS, AT THE EXPENSE OF A SHORTENED DASH."),
 				TEXT("QUAKE"),
 				TEXT("ONLY WHILE CARRYING THE CORE AND STOOD ON THE GROUND OR ON TOP OF AN OBJECT: A "
 				     "BLAST THAT KNOCKS EVERY NEARBY ENEMY AWAY FROM YOU. IT CANNOT MOVE A CORE "

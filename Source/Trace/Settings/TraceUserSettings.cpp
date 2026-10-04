@@ -19,6 +19,7 @@
 #include "Trace.h"                      // LogTraceGame
 #include "UI/Text/TraceGameText.h"      // the editable wording, Config/TraceGameText.ini
 #include "UObject/UObjectGlobals.h"     // GetMutableDefault
+#include "UObject/UnrealType.h"         // FArrayProperty - VerifyLoadoutMigration E reads a saved slot as LoadConfig does
 #include "UnrealClient.h"               // FViewport
 
 // =================================================================================================
@@ -3915,7 +3916,7 @@ namespace TraceLookPolarityProbe
 //
 // WHAT THIS DRIVES. The real first-use entry, UTraceUserSettings::Get(), on the real settings object,
 // with the object rewound to the state a fresh process has before that call (constructor tables,
-// not loaded) and the config members set to a fixture file. Four files:
+// not loaded) and the config members set to a fixture file. Five files:
 //
 //   A  a returning player's pre-Demo-35 file with custom binds AND saved loadouts. The loadouts must
 //      go, the binds must stay, and the save that records the discard must write the binds.
@@ -3924,6 +3925,9 @@ namespace TraceLookPolarityProbe
 //      back once, and nothing else in it changes.
 //   D  the same wiped state in a file that has already had that repair. It is left alone, because
 //      from then on "everything unbound" is the player's choice.
+//   E  saved slots written before the owner renamed six abilities on screen (SUSPEND -> WIRERIGS,
+//      SLIMEWALL -> SLUDGE, ...). Read through the engine's own LoadConfig, they must load as the same
+//      abilities, survive the first-use load, and write back as the same lines.
 //
 // RED ARM: move DiscardSavedLoadoutsIfStale() (with a Save() inside it) back to the top of
 // RefreshFromConfig and delete the repair call. A, B and C then fail. That was done once, by hand,
@@ -4212,6 +4216,141 @@ namespace TraceUserSettingsMigrationVerify
 				FString::Printf(TEXT("D: and nothing is written (saved %d time(s))"), Witness.Saves));
 		}
 
+		// ---- E: a slot saved before the owner's ability renames loads as the same abilities -----------
+		//
+		// The owner's ability-tuning note renamed six abilities ON SCREEN (SUSPEND -> WIRERIGS, the
+		// magnet passive -> A.U.R. SUIT, PICKLE JAR -> RILLA CANS, Mortimer's dash/throw passive ->
+		// QMECH, the dash cloak -> VISISPURS, SLIMEWALL -> SLUDGE) and kept their ids. A saved slot is
+		// written as the ids, so these lines are, byte for byte, what a build from before the renames
+		// wrote for those six. They are read by the engine's own LoadConfig, from a file held in memory,
+		// and then by the real first-use load. They must come back as the same abilities in the same
+		// slots, and what Save() writes for them must be the same lines: a display name never reaches
+		// the file, so renaming one can never empty a player's slot. No version bump was needed, and
+		// this is the check that says so.
+		{
+			static const TCHAR* const PreRenameLines[] =
+			{
+				TEXT("(Movement=Suspend,Passive=Magnet,Activated=Slimewall)"),
+				TEXT("(Movement=JetBoots,Passive=PickleJar,Activated=Pickler)"),
+				TEXT("(Movement=Blink,Passive=MortimerLoad,Activated=Quake)"),
+				TEXT("(Movement=None,Passive=DashCloak,Activated=None)"),
+			};
+			static constexpr int32 RenameSlotCount = UE_ARRAY_COUNT(PreRenameLines);
+			static_assert(RenameSlotCount <= UTraceUserSettings::SavedLoadoutCount, "E fills real slots only");
+
+			FTraceLoadout RenameExpected[RenameSlotCount];
+			RenameExpected[0].Movement = ETraceAbilityId::Suspend;
+			RenameExpected[0].Passive = ETraceAbilityId::Magnet;
+			RenameExpected[0].Activated = ETraceAbilityId::Slimewall;
+			RenameExpected[1].Movement = ETraceAbilityId::JetBoots;
+			RenameExpected[1].Passive = ETraceAbilityId::PickleJar;
+			RenameExpected[1].Activated = ETraceAbilityId::Pickler;
+			RenameExpected[2].Movement = ETraceAbilityId::Blink;
+			RenameExpected[2].Passive = ETraceAbilityId::MortimerLoad;
+			RenameExpected[2].Activated = ETraceAbilityId::Quake;
+			RenameExpected[3].Passive = ETraceAbilityId::DashCloak;
+
+			FString FixtureText = FString::Printf(TEXT("[%s]\n"), *UTraceUserSettings::StaticClass()->GetPathName());
+			for (const TCHAR* Line : PreRenameLines)
+			{
+				FixtureText += FString::Printf(TEXT("SavedLoadouts=%s\n"), Line);
+			}
+			FConfigFile RenameFixture;
+			RenameFixture.ProcessInputFileContents(FixtureText, TEXT("VerifyLoadoutMigration E (in memory)"));
+
+			FArrayProperty* const SavedLoadoutsProp = FindFProperty<FArrayProperty>(UTraceUserSettings::StaticClass(),
+				GET_MEMBER_NAME_CHECKED(UTraceUserSettings, SavedLoadouts));
+
+			Settings.KeyBindings.Reset();
+			Settings.PadKeyBindings.Reset();
+			Settings.SavedLoadouts.Reset();
+			Settings.SavedLoadoutNames.Reset();
+			Settings.SavedLoadoutVersion = UTraceUserSettings::CurrentSavedLoadoutVersion;
+			Settings.BindingsRepairVersion = UTraceUserSettings::CurrentBindingsRepairVersion;
+
+			if (SavedLoadoutsProp != nullptr)
+			{
+				UObject::FLoadConfigParams LoadParams;
+				LoadParams.OverrideFile = &RenameFixture;
+				LoadParams.PropertyToLoad = SavedLoadoutsProp;
+				Settings.LoadConfig(LoadParams);
+			}
+
+			const auto SameSlots = [&Settings, &RenameExpected]()
+			{
+				if (Settings.SavedLoadouts.Num() != RenameSlotCount)
+				{
+					return false;
+				}
+				for (int32 Slot = 0; Slot < RenameSlotCount; ++Slot)
+				{
+					if (Settings.GetSavedLoadout(Slot) != RenameExpected[Slot])
+					{
+						return false;
+					}
+				}
+				return true;
+			};
+
+			FString ReadBack;
+			for (const FTraceLoadout& Each : Settings.SavedLoadouts)
+			{
+				ReadBack += (ReadBack.IsEmpty() ? TEXT("") : TEXT(" | ")) + TraceLoadoutToString(Each);
+			}
+			Check(SavedLoadoutsProp != nullptr && SameSlots(),
+				FString::Printf(TEXT("E: LoadConfig reads %d pre-rename saved slots as the same abilities, in order (read %d: %s)"),
+					RenameSlotCount, Settings.SavedLoadouts.Num(), *ReadBack));
+
+			RunFirstUse();
+
+			Check(SameSlots() && Settings.SavedLoadoutVersion == UTraceUserSettings::CurrentSavedLoadoutVersion,
+				TEXT("E: the first-use load keeps them: nothing discarded, no version bump"));
+			Check(Witness.Saves == 0,
+				FString::Printf(TEXT("E: and writes nothing (saved %d time(s))"), Witness.Saves));
+
+			// What a player sees on those slots: the table's names, which are the new ones.
+			int32 Unnamed = 0;
+			FString Shown;
+			for (int32 Slot = 0; Slot < RenameSlotCount; ++Slot)
+			{
+				for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
+				{
+					const ETraceAbilityId Id = Settings.GetSavedLoadout(Slot).Get(static_cast<ETraceLoadoutSlot>(SlotIndex));
+					if (Id == ETraceAbilityId::None)
+					{
+						continue;
+					}
+					const FTraceAbilityDef* Def = TraceAbilityTable::Find(Id);
+					const bool bNamed = (Def != nullptr && Def->Name != nullptr && Def->Name[0] != TEXT('\0'));
+					Unnamed += bNamed ? 0 : 1;
+					Shown += FString::Printf(TEXT("%s%s"), Shown.IsEmpty() ? TEXT("") : TEXT(", "),
+						bNamed ? Def->Name : TEXT("<no name>"));
+				}
+			}
+			Check(Unnamed == 0, FString::Printf(TEXT("E: every ability in them shows a name (%s)"), *Shown));
+
+			// What Save() would write back: SaveConfig exports each element with this call and these flags.
+			int32 Rewritten = 0;
+			FString FirstDiff;
+			for (int32 Slot = 0; Slot < RenameSlotCount && SavedLoadoutsProp != nullptr && Settings.SavedLoadouts.IsValidIndex(Slot); ++Slot)
+			{
+				FString Written;
+				SavedLoadoutsProp->Inner->ExportTextItem_Direct(Written, &Settings.SavedLoadouts[Slot],
+					&Settings.SavedLoadouts[Slot], &Settings, PPF_SerializedAsImportText);
+				if (Written != PreRenameLines[Slot])
+				{
+					++Rewritten;
+					if (FirstDiff.IsEmpty())
+					{
+						FirstDiff = FString::Printf(TEXT(": slot %d would be written '%s'"), Slot + 1, *Written);
+					}
+				}
+			}
+			Check(SavedLoadoutsProp != nullptr && Rewritten == 0,
+				FString::Printf(TEXT("E: saving them writes the same ids back, not display names (%d line(s) differ%s)"),
+					Rewritten, *FirstDiff));
+		}
+
 		// ---- Put everything back --------------------------------------------------------------------
 		//
 		// The config members first, then a normal load of them. The original versions are the current
@@ -4258,9 +4397,10 @@ namespace TraceUserSettingsMigrationVerify
 
 	FAutoConsoleCommand CmdVerifyLoadoutMigration(
 		TEXT("Trace.Settings.VerifyLoadoutMigration"),
-		TEXT("Drives the settings object's first-use load over four fixture files: a pre-Demo-35 file ")
+		TEXT("Drives the settings object's first-use load over five fixture files: a pre-Demo-35 file ")
 		TEXT("with custom binds and saved loadouts, a fresh install, a file the Demo 35 load order ")
-		TEXT("wiped, and the same file after its one repair. Restores the real settings and re-saves them."),
+		TEXT("wiped, the same file after its one repair, and saved slots written before the ability ")
+		TEXT("renames. Restores the real settings and re-saves them."),
 		FConsoleCommandDelegate::CreateStatic(&VerifyLoadoutMigration));
 }
 

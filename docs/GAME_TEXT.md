@@ -172,10 +172,11 @@ Then run `Trace.Text.Dump` to add it to the document.
 
 ## The ability names and descriptions
 
-**The names are not in this file yet.** JET BOOTS, SUSPEND, RIPPLE and the rest come from the
+**The names are not in this file yet.** JET BOOTS, WIRERIGS, RIPPLE and the rest come from the
 ability table in the code (`Source/Trace/Abilities/TraceAbilityTypes.cpp`), so renaming one is a code
-change for now. Three abilities have no name on purpose, and their cards show the description
-instead.
+change for now. Every ability has a name; one left without would show its description instead.
+An ACTIVATED ability's name is also its kit's `CHARACTER.<NAME>.ACTIVATED_NAME` line below (SLUDGE is
+`CHARACTER.SLIMEBALL.ACTIVATED_NAME`), and the two must say the same thing.
 
 The `ABILITY.MOVEMENT.*`, `ABILITY.PASSIVE.*` and `ABILITY.ACTIVATED.*` lines at the bottom of the
 file are left over from an earlier naming pass (HOP, POP, BRACE...). The game no longer reads them,

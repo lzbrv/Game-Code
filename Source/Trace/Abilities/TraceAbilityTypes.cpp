@@ -305,11 +305,18 @@ FString TraceLoadoutToString(const FTraceLoadout& Loadout)
 // one between categories is a one-line edit here and nothing else. Demo 35 moved two (Bash into
 // passive, Acrobatics into movement) and this is where both moves live.
 //
-// The Name column is empty wherever the owner has not named an ability. Two are deliberately blank:
-// Mace's magnet, and Mortimer's dash/throw passive which Demo 35 marks TBD. A third — Oyster's new
-// dash cloak — is blank because the note left its name column empty. Blank is a supported state:
-// the loadout card shows the ability's description instead, which is what every unnamed ability did
-// before anything had names at all.
+// The Name column is what a player reads: loadout cards, tabs, saved slots, the HUD's E row. Every
+// ability has one now. Demo 35 left three blank (Mace's magnet, Mortimer's dash/throw passive, Oyster's
+// dash cloak) and the owner's ability-tuning note named them A.U.R. SUIT, QMECH and VISISPURS, in the
+// same pass that renamed SUSPEND to WIRERIGS, PICKLE JAR to RILLA CANS and SLIMEWALL to SLUDGE.
+//
+// RENAMING IS THIS COLUMN ONLY. The enum values (Suspend, PickleJar, Slimewall...) are what a saved
+// loadout and the network carry, so they keep their old spellings; Trace.Settings.VerifyLoadoutMigration
+// loads a pre-rename saved-loadout line to prove it. An ACTIVATED ability's name is also the roster's
+// ActivatedName (Core/TraceCharacterRoster.cpp, CHARACTER.<NAME>.ACTIVATED_NAME in the text document,
+// and the generated character assets); Trace.Loadout.Screen fails if the two disagree.
+//
+// Blank is still a supported state: the loadout card shows the ability's description instead.
 // =================================================================================================
 namespace
 {
@@ -317,7 +324,7 @@ namespace
 	{
 		// ---- movement -------------------------------------------------------------------------
 		{ ETraceAbilityId::JetBoots,       ETraceLoadoutSlot::Movement,  ETraceCharacterId::Rocco,     TEXT("JET BOOTS")       },
-		{ ETraceAbilityId::Suspend,        ETraceLoadoutSlot::Movement,  ETraceCharacterId::Mace,      TEXT("SUSPEND")         },
+		{ ETraceAbilityId::Suspend,        ETraceLoadoutSlot::Movement,  ETraceCharacterId::Mace,      TEXT("WIRERIGS")        },
 		{ ETraceAbilityId::Leech,          ETraceLoadoutSlot::Movement,  ETraceCharacterId::X,         TEXT("LEECH")           },
 		{ ETraceAbilityId::RockJump,       ETraceLoadoutSlot::Movement,  ETraceCharacterId::Roxie,     TEXT("ROCKJUMP")        },
 		{ ETraceAbilityId::CarbonSliders,  ETraceLoadoutSlot::Movement,  ETraceCharacterId::Elle,      TEXT("CARBON SLIDERS")  },
@@ -329,14 +336,14 @@ namespace
 		// ---- passive --------------------------------------------------------------------------
 		{ ETraceAbilityId::Blasters,       ETraceLoadoutSlot::Passive,   ETraceCharacterId::Rocco,     TEXT("BLASTERS")        },
 		{ ETraceAbilityId::CustomSteel,    ETraceLoadoutSlot::Passive,   ETraceCharacterId::Chut,      TEXT("CUSTOM STEEL")    },
-		{ ETraceAbilityId::Magnet,         ETraceLoadoutSlot::Passive,   ETraceCharacterId::Mace,      TEXT("")                },
-		{ ETraceAbilityId::PickleJar,      ETraceLoadoutSlot::Passive,   ETraceCharacterId::Oyster,    TEXT("PICKLE JAR")      },
+		{ ETraceAbilityId::Magnet,         ETraceLoadoutSlot::Passive,   ETraceCharacterId::Mace,      TEXT("A.U.R. SUIT")     },
+		{ ETraceAbilityId::PickleJar,      ETraceLoadoutSlot::Passive,   ETraceCharacterId::Oyster,    TEXT("RILLA CANS")      },
 		{ ETraceAbilityId::XMechs,         ETraceLoadoutSlot::Passive,   ETraceCharacterId::X,         TEXT("X-MECHS")         },
 		{ ETraceAbilityId::Shimmer,        ETraceLoadoutSlot::Passive,   ETraceCharacterId::Elle,      TEXT("SHIMMER")         },
 		{ ETraceAbilityId::VistechPadding, ETraceLoadoutSlot::Passive,   ETraceCharacterId::Slimeball, TEXT("VISTECH PADDING") },
-		{ ETraceAbilityId::MortimerLoad,   ETraceLoadoutSlot::Passive,   ETraceCharacterId::Mortimer,  TEXT("")                },
+		{ ETraceAbilityId::MortimerLoad,   ETraceLoadoutSlot::Passive,   ETraceCharacterId::Mortimer,  TEXT("QMECH")           },
 		{ ETraceAbilityId::Bash,           ETraceLoadoutSlot::Passive,   ETraceCharacterId::Chut,      TEXT("BASH")            },
-		{ ETraceAbilityId::DashCloak,      ETraceLoadoutSlot::Passive,   ETraceCharacterId::Oyster,    TEXT("")                },
+		{ ETraceAbilityId::DashCloak,      ETraceLoadoutSlot::Passive,   ETraceCharacterId::Oyster,    TEXT("VISISPURS")       },
 
 		// ---- activated ------------------------------------------------------------------------
 		{ ETraceAbilityId::Ripple,         ETraceLoadoutSlot::Activated, ETraceCharacterId::Rocco,     TEXT("RIPPLE")          },
@@ -346,7 +353,7 @@ namespace
 		{ ETraceAbilityId::Sting,          ETraceLoadoutSlot::Activated, ETraceCharacterId::X,         TEXT("STING")           },
 		{ ETraceAbilityId::Modded,         ETraceLoadoutSlot::Activated, ETraceCharacterId::Roxie,     TEXT("MODDED")          },
 		{ ETraceAbilityId::Snap,           ETraceLoadoutSlot::Activated, ETraceCharacterId::Elle,      TEXT("SNAP")            },
-		{ ETraceAbilityId::Slimewall,      ETraceLoadoutSlot::Activated, ETraceCharacterId::Slimeball, TEXT("SLIMEWALL")       },
+		{ ETraceAbilityId::Slimewall,      ETraceLoadoutSlot::Activated, ETraceCharacterId::Slimeball, TEXT("SLUDGE")          },
 		{ ETraceAbilityId::Quake,          ETraceLoadoutSlot::Activated, ETraceCharacterId::Mortimer,  TEXT("QUAKE")           },
 		{ ETraceAbilityId::Zip,            ETraceLoadoutSlot::Activated, ETraceCharacterId::Lily,      TEXT("ZIP")             },
 	};
@@ -367,7 +374,8 @@ const TCHAR* TraceAbilityIdToString(ETraceAbilityId Id)
 	if (const FTraceAbilityDef* Def = TraceAbilityTable::Find(Id))
 	{
 		// The display name where there is one; otherwise the enum's own name, so a log line about an
-		// unnamed ability still says which ability rather than "<invalid>".
+		// unnamed ability still says which ability rather than "<invalid>". (No ability is unnamed today;
+		// the three cases below are the ones Demo 35 left blank, kept for the next one that is.)
 		if (Def->Name != nullptr && Def->Name[0] != TEXT('\0'))
 		{
 			return Def->Name;

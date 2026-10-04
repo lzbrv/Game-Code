@@ -215,6 +215,11 @@ TRACE_API const TCHAR* TraceLoadoutSlotToString(ETraceLoadoutSlot Slot);
  * as a uint8 and a renumber would silently swap two players' abilities mid-match. New abilities
  * APPEND, in front of Count.
  *
+ * DO NOT RENAME THEM EITHER, not even to follow a new display name. A saved loadout is written to the
+ * player's settings file as these identifiers ("(Movement=Suspend,...)"), so renaming Suspend would
+ * empty that slot on the next launch. What a player reads is GAbilityTable's Name column
+ * (TraceAbilityTypes.cpp): Suspend shows as WIRERIGS, Slimewall as SLUDGE.
+ *
  * None is a real, supported state: an empty slot. Mode A gives everybody three of them.
  */
 UENUM()
@@ -224,7 +229,7 @@ enum class ETraceAbilityId : uint8
 
 	// ---- movement ----------------------------------------------------------------------------
 	JetBoots,           // Rocco:    a small second jump
-	Suspend,            // Mace:     hold V in the air to hang
+	Suspend,            // Mace:     hold V in the air to hang                (shown as WIRERIGS)
 	Leech,              // X:        +15% speed while any enemy is vulnerable
 	RockJump,           // Roxie:    V fires a rocket that throws you backwards
 	CarbonSliders,      // Elle:     well-timed slide jumps carry more momentum
@@ -236,14 +241,14 @@ enum class ETraceAbilityId : uint8
 	// ---- passive -----------------------------------------------------------------------------
 	Blasters,           // Rocco:    headshot kills give speed
 	CustomSteel,        // Chut:     knife does more from the front
-	Magnet,             // Mace:     +30% Core magnet radius                  (unnamed by Demo 35)
-	PickleJar,          // Oyster:   every dash leaves a poison jar
+	Magnet,             // Mace:     +30% Core magnet radius                  (shown as A.U.R. SUIT)
+	PickleJar,          // Oyster:   every dash leaves a poison jar           (shown as RILLA CANS)
 	XMechs,             // X:        five bees orbit you
 	Shimmer,            // Elle:     passing or throwing the Core cloaks you
 	VistechPadding,     // Slimeball: while stuck, fire faster and take less
-	MortimerLoad,       // Mortimer: shorter dash, longer Core throw charge    (named TBD by Demo 35)
+	MortimerLoad,       // Mortimer: shorter dash, longer Core throw charge    (shown as QMECH)
 	Bash,               // Chut:     the end of your dash knocks players       [Demo 35: was MOVEMENT]
-	DashCloak,          // Oyster:   jumping straight after a dash cloaks you  [Demo 35: new, replaced JAR JUMP]
+	DashCloak,          // Oyster:   jumping straight after a dash cloaks you  [Demo 35: new, replaced JAR JUMP] (shown as VISISPURS)
 
 	// ---- activated ---------------------------------------------------------------------------
 	Ripple,             // Rocco
@@ -253,7 +258,7 @@ enum class ETraceAbilityId : uint8
 	Sting,              // X
 	Modded,             // Roxie                                              [Demo 35: pistol only]
 	Snap,               // Elle
-	Slimewall,          // Slimeball
+	Slimewall,          // Slimeball                                          (shown as SLUDGE)
 	Quake,              // Mortimer
 	Zip,                // Lily                                               [Demo 35: carries the health debuff]
 
@@ -280,7 +285,7 @@ struct TRACE_API FTraceAbilityDef
 	/** Whose kit implements it. Internal — no screen shows this to a player. */
 	ETraceCharacterId  Kit      = ETraceCharacterId::None;
 
-	/** Display name, or empty for an ability that has none. Most movement and passive ones do not. */
+	/** Display name, or empty for an ability that has none (its card then shows the description). */
 	const TCHAR*       Name     = TEXT("");
 };
 

@@ -1935,8 +1935,8 @@ void FTraceLoadoutSelect::DrawCard(AHUD* HUD, int32 Index, float X, float Y, flo
 	const float TextW = W - Pad * 2.f;
 	float TextY = Y + Pad;
 
-	// THE NAME, WHERE THERE IS ONE. Three abilities are deliberately unnamed; their card is the
-	// description alone.
+	// THE NAME, WHERE THERE IS ONE. Every ability has one today; an unnamed ability's card would be
+	// the description alone.
 	const FString Name = TraceAbilityNames::Get(Id);
 	if (!Name.IsEmpty())
 	{
@@ -2582,8 +2582,8 @@ namespace TraceLoadoutScreenVerify
 			}
 
 			// A card shows the name where there is one and the description otherwise, so an ability
-			// with neither would draw an empty plate. Three are deliberately unnamed (Demo 35 left
-			// two blank and marked one TBD) and they lean on their description entirely.
+			// with neither would draw an empty plate. Demo 35 left three unnamed, leaning on their
+			// description entirely, until the owner named them (A.U.R. SUIT, QMECH, VISISPURS).
 			if (TraceAbilityNames::ShortLabel(Ability).IsEmpty())
 			{
 				++NameProblems;
@@ -2592,8 +2592,9 @@ namespace TraceLoadoutScreenVerify
 					TraceAbilityIdToString(Ability));
 			}
 		}
-		// ...AND NO TWO CARDS ON A TAB SAY THE SAME THING. Oyster's unnamed dash cloak read Oyster's one
-		// passive line, which is PICKLE JAR's, so the passive tab showed PICKLE JAR's rules twice.
+		// ...AND NO TWO CARDS ON A TAB SAY THE SAME THING. Oyster's dash cloak (VISISPURS) read Oyster's
+		// one passive line, which is the jar trail's (RILLA CANS), so the passive tab showed the jar rules
+		// twice.
 		for (int32 SlotIndex = 0; SlotIndex < static_cast<int32>(ETraceLoadoutSlot::Count); ++SlotIndex)
 		{
 			const ETraceLoadoutSlot Slot = static_cast<ETraceLoadoutSlot>(SlotIndex);
@@ -2615,6 +2616,39 @@ namespace TraceLoadoutScreenVerify
 		Check(TEXT("every ability has a label, names match, no card is a twin"), NameProblems == 0,
 			FString::Printf(TEXT("%d problem(s) across %d abilities"),
 				NameProblems, static_cast<int32>(ETraceAbilityId::Count) - 1));
+
+		// ---- EVERY NAME IS DRAWN IN THE FACE IT IS SET IN, PUNCTUATION INCLUDED ----------------
+		//
+		// The owner's renames brought the first name with punctuation in it, A.U.R. SUIT. A name is
+		// set in Sofachrome Light on its card, its tab and a saved slot, and an ACTIVATED name also in
+		// the HUD's face on the E row. A character with no cell in that face is drawn from the Latin-1
+		// fallback sheet in another typeface, or as '?' — legible to a log, wrong on screen.
+		// DrawsInOwnFace answers that per character from the atlas metrics themselves.
+		{
+			FString OffFace;
+			for (int32 IdIndex = 1; IdIndex < static_cast<int32>(ETraceAbilityId::Count); ++IdIndex)
+			{
+				const ETraceAbilityId Ability = static_cast<ETraceAbilityId>(IdIndex);
+				const FString Name = TraceAbilityNames::Get(Ability);
+				const bool bOnHud = (TraceAbilityTable::SlotOf(Ability) == ETraceLoadoutSlot::Activated);
+				for (const TCHAR Char : Name)
+				{
+					const bool bCard = TraceText::DrawsInOwnFace(Char, ETraceTextWeight::Light);
+					const bool bHud = !bOnHud || TraceText::DrawsInOwnFace(Char, ETraceTextWeight::Hud);
+					if (!bCard || !bHud)
+					{
+						OffFace += FString::Printf(TEXT("%s'%s' U+%04X (%s) "), OffFace.IsEmpty() ? TEXT("") : TEXT("; "),
+							*Name, static_cast<uint32>(Char), bCard ? TEXT("HUD face") : TEXT("card face"));
+					}
+				}
+			}
+			Check(TEXT("every name has its glyphs in the face it is drawn in"),
+				TraceText::IsAtlasActive() && OffFace.IsEmpty(),
+				!TraceText::IsAtlasActive()
+					? FString(TEXT("INCONCLUSIVE: the font atlas is not active, so the question has no answer"))
+					: (OffFace.IsEmpty() ? FString(TEXT("all names, Light; activated names also Hud"))
+					                     : FString::Printf(TEXT("drawn from another face: %s"), *OffFace)));
+		}
 
 
 		// =========================================================================================
