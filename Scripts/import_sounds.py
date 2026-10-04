@@ -518,7 +518,15 @@ def import_wav(unreal, stem, path):
     except AttributeError:
         log("  (this engine build has no SoundWaveLoadingBehavior - continuing)")
 
-    unreal.EditorAssetLibrary.save_loaded_asset(sound, only_if_is_dirty=False)
+    # A save that fails must say so. Nothing after it can tell: load_asset above
+    # answers from memory, and the old .uasset is still on disk, so every later
+    # check would pass for a sound that never changed. The two causes are a
+    # .uasset nobody has locked (git-lfs checks every `lockable` file out
+    # read-only) and an editor that holds the package open.
+    if not unreal.EditorAssetLibrary.save_loaded_asset(sound, only_if_is_dirty=False):
+        fail("could not save {0}. Its .uasset is read-only until you lock it (Scripts/lock.sh, "
+             "Scripts\\lock.bat), or an open editor holds it.".format(asset_path))
+        return None
 
     duration = 0.0
     try:
@@ -634,7 +642,11 @@ def main():
         events[unreal.Name(stem)] = sound
 
     bank.set_editor_property("events", events)
-    unreal.EditorAssetLibrary.save_loaded_asset(bank, only_if_is_dirty=False)
+    # Same rule as the sounds' save in import_wav: the reload below answers from
+    # memory, so it cannot catch a save that did not reach the disk.
+    if not unreal.EditorAssetLibrary.save_loaded_asset(bank, only_if_is_dirty=False):
+        fail("could not save {0}/{1}. Its .uasset is read-only until you lock it (Scripts/lock.sh, "
+             "Scripts\\lock.bat), or an open editor holds it.".format(PACKAGE_DIR, BANK_NAME))
     log("  {0} row(s): {1}".format(len(events), ", ".join(sorted(str(k) for k in events.keys()))))
 
     # -------------------------------------------------------------------------
@@ -658,6 +670,9 @@ def main():
         sys.exit(1)
     else:
         log("")
+        # Scripts\import-sounds.bat reads the editor's log for this exact line (and for
+        # "FAILED" and "ERROR: could not save" above): its absence means the import
+        # never finished. Change the wording in both places or neither.
         log("done - {0} sound(s) imported and the bank is current.".format(len(imported)))
 
 

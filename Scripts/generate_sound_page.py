@@ -1632,19 +1632,22 @@ function reportText(){
   cmds.forEach(c => L.push('  ' + c));
   L.push('  ./Scripts/import-sounds.sh --only ' + evs.join(','));
   L.push('  git add ' + rows.map(tr => tr.dataset.path).join(' ') + ' Content/Trace/Audio');
-  L.push('  git commit, git push, then: Scripts/unlock.sh ' + locks.join(' '));
+  // A comment, not prose: pasted into a shell, 'git commit, git push, then: ...' runs `git commit,`.
+  L.push('  # after git commit and git push: Scripts/unlock.sh ' + locks.join(' '));
   L.push('The editor and the Scripts/run-*.sh games play the new file on their next launch (no C++ rebuild);');
   L.push('Trace.Audio.Reload picks it up in a running game.');
   L.push('Packaged builds keep the old one until re-packaged: ./Scripts/package.sh (--iterate re-cooks only what changed).');
   L.push('Then: python3 Scripts/generate_sound_page.py to refresh this page.');
   L.push('');
-  L.push('ON WINDOWS — the same steps in cmd.exe, in the main checkout folder, Unreal editor closed:');
+  // Command Prompt, named: Windows Terminal opens PowerShell by default, and there copy /Y and rem
+  // are errors.
+  L.push('ON WINDOWS — the same steps in Command Prompt (cmd.exe, not PowerShell), in the main checkout folder, Unreal editor closed:');
   L.push('  git pull');
   L.push('  Scripts\\lock.bat ' + locks.join(' '));
   wcmds.forEach(c => L.push('  ' + c));
   L.push('  Scripts\\import-sounds.bat --only ' + cq(evs.join(',')));
   L.push('  git add ' + rows.map(tr => tr.dataset.path).join(' ') + ' Content/Trace/Audio');
-  L.push('  git commit, git push, then: Scripts\\unlock.bat ' + locks.join(' '));
+  L.push('  rem after git commit and git push: Scripts\\unlock.bat ' + locks.join(' '));
   if (wcmds.some(c => c.startsWith('rem CONVERT')))
     L.push('Convert every "rem CONVERT" file before import-sounds.bat runs: it imports whatever WAV is in place.');
   L.push('The editor and the Scripts\\run-*.bat games play the new file on their next launch (no C++ rebuild);');
@@ -1791,6 +1794,8 @@ def build_page(ctx):
       '<li>Commit the WAV and what changed in <code>Content/Trace/Audio</code>, push, then unlock the same '
       'files:<br>' + two("Scripts/unlock.sh &hellip;", "Scripts\\unlock.bat &hellip;") + '</li>'
       '</ol><p><b>Export list</b> writes these commands out for every marked row, Mac first, then Windows. '
+      'Run the Windows ones in Command Prompt (<code>cmd.exe</code>), not PowerShell: there '
+      '<code>copy /Y</code> and <code>rem</code> are errors. '
       '<code>python3 Scripts/generate_sound_page.py</code> rebuilds this page '
       '(Windows: <code>python Scripts\\generate_sound_page.py</code>).</p></details>')
 

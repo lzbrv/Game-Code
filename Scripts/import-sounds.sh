@@ -213,6 +213,42 @@ if [ "$DRY_RUN" = "1" ]; then
     exit 0
 fi
 
+# A re-import over a .uasset nobody has locked cannot save — git-lfs checks every `lockable` file
+# out read-only — and that failure is invisible afterwards: the old file is still on disk, so the
+# Verifying block below would print ok for a sound that never changed. So check before the editor
+# starts. Only what this run re-saves: S_<Event> for each sound it imports, and the bank, which
+# every run re-saves. A file that does not exist yet is fine; the first import creates it.
+# (A string, not an array: bash 3.2 under `set -u` calls an empty array unbound.)
+READ_ONLY=""
+while IFS= read -r WAV; do
+    [ -e "$WAV" ] || continue
+    STEM="$(basename "$WAV" .wav)"
+    if [ -z "$ONLY_SOUNDS" ] || printf '%s' ",${ONLY_SOUNDS}," | grep -q ",${STEM},"; then
+        Rel="Content/Trace/Audio/S_${STEM}.uasset"
+        if [ -e "${TRACE_PROJECT_ROOT}/${Rel}" ] && [ ! -w "${TRACE_PROJECT_ROOT}/${Rel}" ]; then
+            READ_ONLY="${READ_ONLY} ${Rel}"
+        fi
+    fi
+done <<EOF
+$(find "$SRC_DIR" -type f -name '*.wav' | sort)
+EOF
+Rel="Content/Trace/Audio/DA_TraceSoundBank.uasset"
+if [ -e "${TRACE_PROJECT_ROOT}/${Rel}" ] && [ ! -w "${TRACE_PROJECT_ROOT}/${Rel}" ]; then
+    READ_ONLY="${READ_ONLY} ${Rel}"
+fi
+if [ -n "$READ_ONLY" ]; then
+    trace_err "Read-only until you lock them, so the editor could not save over them. After"
+    trace_err "git pull, lock them — this is the command — then run this script again:"
+    printf '    Scripts/lock.sh%s\n' "$READ_ONLY" >&2
+    if [ -z "$ONLY_SOUNDS" ]; then
+        trace_err "Without --only this re-imports EVERY sound, so every one needs a lock. To swap"
+        trace_err "one sound, lock only it and the bank, and name it:"
+        printf '    %s\n' "Scripts/lock.sh Content/Trace/Audio/S_Dash.uasset Content/Trace/Audio/DA_TraceSoundBank.uasset" \
+                          "./Scripts/import-sounds.sh --only Dash" >&2
+    fi
+    exit 1
+fi
+
 if [ -n "$ONLY_SOUNDS" ]; then
     export TRACE_SOUNDS="$ONLY_SOUNDS"
     trace_msg "--only ${ONLY_SOUNDS}: no other sound asset will be written."

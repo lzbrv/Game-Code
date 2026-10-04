@@ -54,10 +54,20 @@ set "DO_LIST=0"
 set "PUSHED=0"
 set "RC=0"
 
-rem Started by a double-click: hold the window open on the way out.
+rem Started by a double-click: hold the window open on the way out. Only
+rem Explorer's exact form counts - cmd.exe /c ""C:\...\lock.bat" " - the full path
+rem in two quotes, then a space and one more quote. PowerShell, Git Bash, a
+rem VS Code task and the Task Scheduler also start a .bat through cmd /c, and
+rem a pause there would be pointless or wait for a key forever.
 set "TRACE_HOLD=0"
+if not "%~1"=="" goto :hold_decided
+if defined TRACE_NO_PAUSE goto :hold_decided
 set "_ccl=!cmdcmdline!"
-if "%~1"=="" if not defined TRACE_NO_PAUSE if defined _ccl if /i not "!_ccl:%~nx0=!"=="!_ccl!" set "TRACE_HOLD=1"
+if not defined _ccl goto :hold_decided
+set "_me=""%~f0" ""
+set "_rest=!_ccl:%_me%=!"
+if not "!_rest!"=="!_ccl!" set "TRACE_HOLD=1"
+:hold_decided
 
 rem -----------------------------------------------------------------------------
 rem  Argument parsing. Options may come anywhere, as in lock.sh, so every target
@@ -206,7 +216,8 @@ if exist "!_p:/=\!" (
 rem Otherwise treat it as an actor label and search the OFPA packages.
 if not exist "Content\__ExternalActors__\" (
     call "%TRACE_HERE%_trace_common.bat" err "'!_arg!' is not a file, and !TRACE_LOCK_BAT_EXTERNAL_ACTORS!/ does not exist,"
-    call "%TRACE_HERE%_trace_common.bat" err "so it cannot be an actor label either. Bake the arena first: Scripts/bake-arena.sh"
+    call "%TRACE_HERE%_trace_common.bat" err "so it cannot be an actor label either. The arena is baked on the Mac, by"
+    call "%TRACE_HERE%_trace_common.bat" err "Scripts/bake-arena.sh: run git pull to get it, or pass the file's path instead."
     exit /b 1
 )
 
