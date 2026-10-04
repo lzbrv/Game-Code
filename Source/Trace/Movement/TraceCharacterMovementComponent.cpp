@@ -886,7 +886,7 @@ UTraceCharacterMovementComponent::UTraceCharacterMovementComponent()
 	// every movement update by RefreshEngineTunablesFromSettings(), so this literal only covers the
 	// window before play starts (and the CDO in the editor). Keep it equal to UTraceSettings::WalkSpeed
 	// anyway — a stale value here is what an editor viewport shows before anyone presses Play.
-	MaxWalkSpeed = 800.f;   // spec v4 §5: 820 -> 800. Equal to UTraceSettings::WalkSpeed by rule.
+	MaxWalkSpeed = 900.f;   // 820 -> 800 (v4 §5) -> 900 (2026-10-04). = UTraceSettings::WalkSpeed by rule.
 	MaxAcceleration = 4096.f;
 	BrakingDecelerationWalking = 2600.f;
 	GroundFriction = 8.f;
@@ -1096,8 +1096,8 @@ void UTraceCharacterMovementComponent::BeginPlay()
 				     "ceiling(any profile) %.0f uu/s | legacyArm=%d"),
 				// MaxWalkSpeed, not GetMaxSpeed(): this runs at BeginPlay with MovementMode still
 				// MOVE_None, where GetMaxSpeed() is 0 and the line would report a threshold of zero for
-				// a rule that is evaluated at runtime against 800. The two agree on a walking pawn,
-				// which is the only state the threshold is ever read in.
+				// a rule that is evaluated at runtime against the walk limit. The two agree on a walking
+				// pawn, which is the only state the threshold is ever read in.
 				IsSurfGroundEntryEnabled() ? 1 : 0,
 				MaxWalkSpeed * FMath::Clamp(
 					TraceMoveKnob::Float(TEXT("SurfGroundEntryApproachFraction"), 0.2f), 0.02f, 1.f),
@@ -1560,8 +1560,8 @@ float UTraceCharacterMovementComponent::GetAirStrafeAsymptoteScale() const
 	// and slides the whole asymptote up.
 	//
 	// A NUDGE, NOT A REMOVAL. The spec is explicit that the cap the user asked for in Demo 5 stays;
-	// this is 950 -> 1045 and 1250 -> 1375. MaxAirSpeed (1600) is deliberately untouched, so the
-	// tighter of the two is still the hard cap and spec v5 §1 still governs.
+	// at today's bases this is 1050 -> 1155 and 1350 -> 1485. MaxAirSpeed (1800) is deliberately not
+	// scaled, so the tighter of the two is still the hard cap and spec v5 §1 still governs.
 	if (IsV9LegacyTuning())
 	{
 		return 1.f;
@@ -1571,14 +1571,18 @@ float UTraceCharacterMovementComponent::GetAirStrafeAsymptoteScale() const
 
 float UTraceCharacterMovementComponent::GetAirStrafeSoftCapSpeed() const
 {
-	// 950 = 1.19 x the 800 walk speed. Below it a strafe is worth EXACTLY what it was in Demo 5,
-	// which is the part the user called incredible and asked not to be touched.
+	// The base was 950 = 1.19 x the 800 walk speed; since 2026-10-04 it is 1050 = 1.17 x the 900
+	// walk. Below it a strafe is worth EXACTLY what it was in Demo 5, which is the part the user
+	// called incredible and asked not to be touched.
 	//
-	// Spec v9 §8 slides this up by GetAirStrafeAsymptoteScale(); at x1.10 the untouched band grows
-	// from "below 950" to "below 1045", i.e. Demo 5's feel now survives 10% further up the range.
+	// Spec v9 §8 slides this up by GetAirStrafeAsymptoteScale(); at x1.10 the untouched band is
+	// "below 1155" (it was "below 1045" at the 950 base).
+	//
+	// The 1050 fallback below is the header default, kept equal to it: a misspelt key silently
+	// runs on this literal, and a stale one would be a second, quieter retune.
 	//
 	// SPEC v10 §1 raises it again, and only while the knife is out — "a higher momentum ceiling".
-	return FMath::Max(0.f, TraceMoveKnob::Float(TEXT("AirStrafeSoftCapSpeed"), 950.f)
+	return FMath::Max(0.f, TraceMoveKnob::Float(TEXT("AirStrafeSoftCapSpeed"), 1050.f)
 		* GetAirStrafeAsymptoteScale()
 		* (bKnifeMovementProfile ? GetKnifeAirStrafeSoftCapMultiplier() : 1.f));
 }
@@ -1597,7 +1601,7 @@ float UTraceCharacterMovementComponent::GetAirStrafeHardCapSpeed() const
 	// the soft cap is scaled by its own knob, so a designer who sets the soft multiplier higher than
 	// the hard one gets the "cap everything at the soft cap" behaviour rather than an inverted band.
 	return FMath::Max(GetAirStrafeSoftCapSpeed() + 1.f,
-		TraceMoveKnob::Float(TEXT("AirStrafeHardCapSpeed"), 1250.f) * GetAirStrafeAsymptoteScale()
+		TraceMoveKnob::Float(TEXT("AirStrafeHardCapSpeed"), 1350.f) * GetAirStrafeAsymptoteScale()
 			* (bKnifeMovementProfile ? GetKnifeAirStrafeHardCapMultiplier() : 1.f));
 }
 
@@ -1691,10 +1695,11 @@ float UTraceCharacterMovementComponent::GetMaxAirSpeed() const
 	// SPEC v10 §1 — SCALED BY THE KNIFE'S HARD-CAP MULTIPLIER, AND IT HAS TO BE.
 	//
 	// ApplySourceAirAcceleration takes min(MaxAirSpeed, AirStrafeHardCapSpeed) as its ceiling. The
-	// shipped numbers are 1600 and 1375, so MaxAirSpeed is 225 uu/s of headroom and no more; a knife
-	// hard cap of 1375 x 1.35 = 1856 under an unraised 1600 would be capped by MaxAirSpeed and the
-	// knife's "higher momentum ceiling" would be worth 225 uu/s instead of 481. The knob would look
-	// bound, print BOUND in the MOVEKNOB report, and quietly do a third of what it says.
+	// shipped numbers are 1800 and 1485 (they were 1600 and 1375 until 2026-10-04), so MaxAirSpeed is
+	// 315 uu/s of headroom and no more; a knife hard cap of 1485 x 1.25667 = 1866 under an unraised
+	// 1800 would be capped by MaxAirSpeed and the knife's "higher momentum ceiling" would be worth
+	// 315 uu/s instead of 381. The knob would look bound, print BOUND in the MOVEKNOB report, and
+	// quietly do less than it says. (At v10's 1600 / 1375 x 1.35 the gap was 225 against 481.)
 	return FMath::Max(1.f, UTraceSettings::Get().MaxAirSpeed
 		* (bKnifeMovementProfile ? GetKnifeAirStrafeHardCapMultiplier() : 1.f));
 }
@@ -1721,12 +1726,14 @@ void UTraceCharacterMovementComponent::SetKnifeMovementProfileActive(const bool 
 // THESE LITERALS ARE FALLBACKS, NOT THE SHIPPED VALUES. All three bind by name into UTraceSettings
 // and Config/DefaultGame.ini overrides them, so the ini keys must move with these or the defaults
 // here are decoration. Trace.DumpSettings from a running game is the only honest check.
-// At the shipped asymptote the ceilings become soft 1045 -> 1236, hard 1375 -> 1728.
+// At the shipped asymptote and the 2026-10-04 bases the ceilings become soft 1155 -> 1367, hard
+// 1485 -> 1866 (at the old 950/1250 bases: 1045 -> 1236, 1375 -> 1728).
 
 float UTraceCharacterMovementComponent::GetKnifeMoveSpeedMultiplier() const
 {
 	// "Players should move 22% faster with a knife" (v12 §3, down from v10 §1's 30%). A multiplier
-	// over WalkSpeed rather than an absolute, so retuning the walk moves the knife with it: 800 -> 976.
+	// over WalkSpeed rather than an absolute, so retuning the walk moves the knife with it: 900 -> 1098
+	// (it was 800 -> 976 before the 2026-10-04 walk retune, which moved it with no edit here).
 	//
 	// Floored at 1.0: a "knife profile" that made the player SLOWER would be a config typo silently
 	// inverting the design, and there is no reading of the spec that wants it.
@@ -1734,9 +1741,9 @@ float UTraceCharacterMovementComponent::GetKnifeMoveSpeedMultiplier() const
 	// PARITY WITH THE CARRIER, restored (spec v13 §3). v12 dropped the knife to 1.22 while
 	// CarrierSpeedMultiplier stayed at 1.30 — that was flagged rather than silently changed, because
 	// only the knife had been asked for, and it left the carrier faster than the knife. The user then
-	// asked for the carrier to "match the new knife speed", so both are now 1.22 (800 -> 976 uu/s)
-	// and the parity holds again. Verified live: the grounded Core holder measured 976 uu/s across 54
-	// separate throws.
+	// asked for the carrier to "match the new knife speed", so both are now 1.22 (900 -> 1098 uu/s
+	// since the 2026-10-04 walk retune; 976 at the 800 walk) and the parity holds again. Verified live
+	// at the 800 walk: the grounded Core holder measured 976 uu/s across 54 separate throws.
 	//
 	// If either number moves again, MOVE BOTH or re-flag it. A comment claiming a value the build
 	// does not ship is its own defect — this one said 1.30 for a whole pass after it became 1.22.
@@ -1748,16 +1755,17 @@ float UTraceCharacterMovementComponent::GetKnifeAirStrafeSoftCapMultiplier() con
 	// The soft cap is where air-strafe gain STARTS to taper. Raising it by less than the hard cap
 	// widens the free band and the falloff band together, which is what "a higher ceiling" means for a
 	// mobility weapon: the knife does not just cap out higher, it keeps its full turn value further up
-	// the range. 1045 -> 1236 at the shipped asymptote (was 1306 at +30%).
+	// the range. 1155 -> 1367 at the shipped asymptote and the 2026-10-04 base (1045 -> 1236 at the
+	// old 950 base; 1306 at +30%).
 	return FMath::Clamp(TraceMoveKnob::Float(TEXT("KnifeAirStrafeSoftCapMultiplier"), 1.183333f), 1.f, 3.f);
 }
 
 float UTraceCharacterMovementComponent::GetKnifeAirStrafeHardCapMultiplier() const
 {
-	// Where gain reaches zero — the actual momentum ceiling. 1375 -> 1728 at the shipped asymptote
-	// (was 1856 at +30%), i.e. the knife can build 353 uu/s more than the gun before the air strafe
-	// stops paying. Also applied to MaxAirSpeed; see GetMaxAirSpeed() for why leaving that alone
-	// would gut this knob.
+	// Where gain reaches zero — the actual momentum ceiling. 1485 -> 1866 at the shipped asymptote and
+	// the 2026-10-04 base (1375 -> 1728 at the old 1250 base; 1856 at +30%), i.e. the knife can build
+	// 381 uu/s more than the gun before the air strafe stops paying. Also applied to MaxAirSpeed; see
+	// GetMaxAirSpeed() for why leaving that alone would gut this knob.
 	return FMath::Clamp(TraceMoveKnob::Float(TEXT("KnifeAirStrafeHardCapMultiplier"), 1.256667f), 1.f, 3.f);
 }
 
@@ -2121,10 +2129,10 @@ float UTraceCharacterMovementComponent::GetSurfGroundEntryMinApproachSpeed() con
 	// in this file is: a fixed 160 uu/s would mean something different the day somebody retunes the
 	// walk speed, and the quantity this is really expressing is "a deliberate lean, not a brush".
 	//
-	// At the shipped 800 uu/s walk limit the default 0.2 is 160 uu/s of INTO-THE-FACE speed, which a
-	// pawn at full running speed reaches at 11.5 degrees off parallel. Running along the base of a
-	// rail does not trigger it; leaning into the rail does, which is the input the owner is asking to
-	// be rewarded.
+	// At the shipped 900 uu/s walk limit the default 0.2 is 180 uu/s of INTO-THE-FACE speed, which a
+	// pawn at full running speed reaches at 11.5 degrees off parallel (the angle is the fraction's, so
+	// it did not move when the walk went 800 -> 900). Running along the base of a rail does not
+	// trigger it; leaning into the rail does, which is the input the owner is asking to be rewarded.
 	const float Fraction = FMath::Clamp(
 		TraceMoveKnob::Float(TEXT("SurfGroundEntryApproachFraction"), 0.2f), 0.02f, 1.f);
 	return FMath::Max(1.f, GetMaxSpeed()) * Fraction;
@@ -4681,7 +4689,7 @@ bool UTraceCharacterMovementComponent::DoJump(bool bReplayingMoves, float DeltaT
 	// velocity", with an outer max() that deliberately refuses to brake a fast arrival) and the
 	// well-timed hop multiplies it. So a landed hop feeds the next slide, which feeds the next hop,
 	// and the whole loop is geometric. With the shipped 0.66 s slide bleeding 260 uu/s² the recurrence
-	// is v -> (v - 172) x 1.3575, whose fixed point is 652 uu/s: above that — and WalkSpeed is 800 —
+	// is v -> (v - 172) x 1.3575, whose fixed point is 652 uu/s: above that — and WalkSpeed is 900 —
 	// every chained hop is faster than the last, forever. That is the "zip down the whole field".
 	//
 	// *** THE CEILING IS ONE OF THE CHAIN'S OWN LAUNCHES, RECORDED. NOT A FORMULA. ***
@@ -4956,8 +4964,8 @@ void UTraceCharacterMovementComponent::OnMovementUpdated(float DeltaSeconds, con
 	//       load-bearing rather than defensive. GetSlideJumpChainResetSpeed() reads GetMaxSpeed(),
 	//       which folds SlideSpeed in while sliding and returns DashSpeed while dashing — asked at
 	//       either of those moments it would compare an ability against itself. Worse, mid-slide the
-	//       planar speed has decayed BELOW walking pace by design (0.66 s at 260 uu/s² off an 800 uu/s
-	//       entry ends at 628), so a check that ran during the slide would end every chain one frame
+	//       planar speed has decayed BELOW walking pace by design (0.66 s at 260 uu/s² off a 900 uu/s
+	//       entry ends at 728), so a check that ran during the slide would end every chain one frame
 	//       before the hop that is supposed to be capped.
 	if (SlideJumpChainBoosts > 0
 		&& IsMovingOnGround()
@@ -5694,10 +5702,10 @@ float UTraceCharacterMovementComponent::GetMaxSpeed() const
 		}
 	}
 
-	// SPEC v10 §1 — "Players should move 30% faster with a knife." 800 -> 1040 at the shipped walk
-	// speed. Applied AFTER the carrier multiplier and BEFORE the slide floor: the slide floor is an
-	// absolute speed the knife has no business scaling (the slide is a separate ability with its own
-	// tuning, not a faster walk).
+	// SPEC v10 §1 — "Players should move 30% faster with a knife", since cut to 22% (v12 §3): 900 ->
+	// 1098 at the shipped walk speed. Applied AFTER the carrier multiplier and BEFORE the slide floor:
+	// the slide floor is an absolute speed the knife has no business scaling (the slide is a separate
+	// ability with its own tuning, not a faster walk).
 	//
 	// THE TWO MULTIPLIERS DO NOT STACK, and this comment used to claim they did. The ordering above
 	// makes stacking arithmetically possible — 1.08 x 1.30 = 1.40x — but it never happens, because
@@ -6263,8 +6271,10 @@ void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 			TEXT("MEASURE AIRCAP curve: falloff=%d soft=%.0f hard=%.0f exp=%.2f hardCapOn=%d"),
 			IsAirStrafeFalloffEnabled() ? 1 : 0, GetAirStrafeSoftCapSpeed(), GetAirStrafeHardCapSpeed(),
 			GetAirStrafeFalloffExponent(), IsAirStrafeHardCapEnabled() ? 1 : 0);
+		// 1500 reaches past the 2026-10-04 effective hard cap (1485); the table used to stop at 1400,
+		// which was already past the old 1375.
 		for (const float SampleSpeed : { 600.f, 700.f, 800.f, 835.f, 900.f, 950.f, 1000.f, 1036.f,
-		                                 1100.f, 1150.f, 1200.f, 1250.f, 1300.f, 1400.f })
+		                                 1100.f, 1150.f, 1200.f, 1250.f, 1300.f, 1400.f, 1500.f })
 		{
 			// One 1/60s frame of perfectly perpendicular input: the projection is 0, so the whole
 			// AirAcceleration allowance is available and lands sideways, giving sqrt(v^2 + a^2).
@@ -6581,7 +6591,7 @@ void UTraceCharacterMovementComponent::TickMomentumMeasure(float DeltaSeconds)
 		// Ride the slide down INTO its well-timed window and hop out of it, which is the Apex
 		// slide-hop the spec is asking for. Waiting for IsSlideJumpWellTimed() rather than for a flat
 		// 0.60s is what makes the number below a measurement of the mechanic rather than of a
-		// stopwatch: with the shipped 0.20s window against a 1.8s slide, this fires at ~1.6s in.
+		// stopwatch: with the then-shipped 0.20s window against a 1.8s slide, this fired at ~1.6s in.
 		SetWantsToSlide(true);
 		if (IsSlideJumpWellTimed() || MeasurePhaseTime > 3.0f)
 		{

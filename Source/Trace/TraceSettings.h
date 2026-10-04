@@ -1027,13 +1027,20 @@ public:
 	 * immediately. Sane range 600 (heavy) to 1000 (frantic). The whole slide and dash block is
 	 * expressed as multiples of this, so moving it moves the kit with it.
 	 *
-	 * 820 -> 800 THIS PASS (spec v4 §5). Note there is a THIRD copy of this number:
-	 * UTraceCharacterMovementComponent's constructor seeds MaxWalkSpeed so a pawn is sane for the
-	 * frames before BeginPlay overwrites it from here. It is not authoritative, but it should be
-	 * moved with this one so a breakpoint in the constructor does not read a stale figure.
+	 * 820 -> 800 (spec v4 §5), then 800 -> 900 (the owner's movement tuning, 2026-10-04). Note there
+	 * is a THIRD copy of this number: UTraceCharacterMovementComponent's constructor seeds
+	 * MaxWalkSpeed so a pawn is sane for the frames before BeginPlay overwrites it from here. It is
+	 * not authoritative, but it should be moved with this one so a breakpoint in the constructor does
+	 * not read a stale figure.
+	 *
+	 * WHAT FOLLOWS IT, because it is a multiple of this (Demo 21 rule): the carrier and the knife
+	 * (x1.22 = 1098), every ability speed passive (X +15%, Rocco +3% a stack, poison/slime slows),
+	 * the slide's entry floor (x0.55 = 495) and decay floor (x0.50 = 450), the dash exit (x1.25 of
+	 * the ground limit), the slide-jump chain reset, Lily's ZIP (x0.5 = 450), crouch (x0.5), the
+	 * bots' run/lead/parry-read speeds and their trail tail-skip. None of those is a typed copy.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Walk", meta = (DisplayName = "Walk Speed (uu/s)", ClampMin = "50.0", ClampMax = "5000.0", UIMin = "300.0", UIMax = "1500.0"))
-	float WalkSpeed = 800.f;
+	float WalkSpeed = 900.f;
 
 	/**
 	 * WalkSpeed multiplier while carrying the Core — the carrier is slightly faster.
@@ -1054,7 +1061,7 @@ public:
 	 * *** KnifeMoveSpeedMultiplier. They are two properties rather than one because they multiply
 	 * *** different things for different reasons and a designer must be able to break parity on
 	 * *** purpose — but if the knife moves and this does not, the parity the user has now twice asked
-	 * *** for is broken again. Both read 1.22 -> 800 x 1.22 = 976 uu/s. Trace.VerifyKnobs prints them
+	 * *** for is broken again. Both read 1.22 -> 900 x 1.22 = 1098 uu/s. Trace.VerifyKnobs prints them
 	 * *** next to each other and flags any disagreement.
 	 *
 	 * The two DO NOT STACK: a carrier holding the knife gets this multiplier only, because
@@ -1141,13 +1148,16 @@ public:
 	 * key in mid-air can ACCELERATE you to. Keep it at or above WalkSpeed; well above it lets a
 	 * skilled player convert air time into speed, which is the Apex/Source reading.
 	 *
-	 * LEFT AT 1600 THIS PASS, ON PURPOSE. Spec v5 §1's hard cap is AirStrafeHardCapSpeed below, and
-	 * the movement component takes the TIGHTER of the two, so lowering this as well would quietly
-	 * make it the operative ceiling and leave the v5 knob doing nothing. This is the model-wide
-	 * ceiling; that one is the strafe-accumulation ceiling. Keep this at or above it.
+	 * 1600 -> 1800 (the owner's movement tuning, 2026-10-04). Spec v5 §1's hard cap is
+	 * AirStrafeHardCapSpeed below, and the movement component takes the TIGHTER of the two, so with
+	 * the hard cap on THIS IS NOT THE NUMBER A STRAFE STOPS AT: the effective hard cap (1350 x 1.10 =
+	 * 1485) is, and this sits 315 uu/s above it (it was 225). It binds only with bAirStrafeHardCap
+	 * off. Lowering it below the hard cap would quietly make it the operative ceiling and leave the
+	 * v5 knob doing nothing. This is the model-wide ceiling; that one is the strafe-accumulation
+	 * ceiling. Keep this at or above it. The knife scales it with the hard cap (x1.256667 = 2262).
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Max Air Speed (uu/s, model ceiling)", ClampMin = "50.0", ClampMax = "8000.0", UIMin = "400.0", UIMax = "3000.0"))
-	float MaxAirSpeed = 1600.f;
+	float MaxAirSpeed = 1800.f;
 
 	// --- Air-strafe diminishing returns (spec v5 §1, new) --------------------------------------
 	//
@@ -1190,19 +1200,20 @@ public:
 	 * Planar speed, uu/s, at which strafing STOPS being free and starts paying diminishing returns.
 	 * Below this the air model is exactly what it was.
 	 *
-	 * 950 sits just under the measured baseline (a continuous strafe turn reaches ~1036 uu/s from
-	 * 835), so today's strafe is left almost entirely intact and it is the accumulation PAST it that
-	 * gets expensive — which is what "harder and harder to gain momentum past a certain point" asks
-	 * for. Lower it toward WalkSpeed (800) to make air speed mostly a function of what you jumped in
-	 * with. Must stay below the hard cap or the curve has no room to act.
+	 * 950 was chosen just under the measured Demo 5 baseline (a continuous strafe turn reached
+	 * ~1036 uu/s from 835), so the strafe was left almost entirely intact and it is the accumulation
+	 * PAST it that gets expensive — which is what "harder and harder to gain momentum past a certain
+	 * point" asks for. 950 -> 1050 (the owner's movement tuning, 2026-10-04), alongside the walk's
+	 * 800 -> 900. Lower it toward WalkSpeed (900) to make air speed mostly a function of what you
+	 * jumped in with. Must stay below the hard cap or the curve has no room to act.
 	 *
 	 * THIS IS THE BASE, NOT THE EFFECTIVE CAP. Spec v9 §8's "+10%" is NOT baked in here — it is
 	 * applied on top by AirStrafeAsymptoteScale, which the movement component multiplies into both
-	 * caps. Effective soft cap = this x AirStrafeAsymptoteScale = 950 x 1.10 = 1045. Editing this to
-	 * 1045 as well is the double-application trap: it would ship 1149.5 with nothing saying so.
+	 * caps. Effective soft cap = this x AirStrafeAsymptoteScale = 1050 x 1.10 = 1155. Editing this to
+	 * 1155 as well is the double-application trap: it would ship 1270.5 with nothing saying so.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Soft Cap BASE (uu/s, x asymptote scale)", ClampMin = "50.0", ClampMax = "8000.0", UIMin = "400.0", UIMax = "2000.0"))
-	float AirStrafeSoftCapSpeed = 950.f;
+	float AirStrafeSoftCapSpeed = 1050.f;
 
 	/**
 	 * Shape of the falloff between the soft cap and the hard cap: Scale = (1 - t) ^ this.
@@ -1228,20 +1239,26 @@ public:
 	/**
 	 * The hard ceiling, uu/s, on planar speed that air input may reach. THE BACKSTOP.
 	 *
-	 * 1250 is ~20% above the measured 1036 baseline: with the falloff on, the curve asymptotes well
-	 * short of it and this is only ever reached by input patterns the curve did not anticipate,
-	 * which is what a backstop is for. Speed CARRIED into the air (a dash, a slide-jump) is not
+	 * 1250 was ~20% above the measured 1036 Demo 5 baseline: with the falloff on, the curve
+	 * asymptotes well short of it and this is only ever reached by input patterns the curve did not
+	 * anticipate, which is what a backstop is for. 1250 -> 1350 (the owner's movement tuning,
+	 * 2026-10-04). Speed CARRIED into the air (a dash, a slide-jump) is not
 	 * clamped by it — the movement component takes max(this, the speed you left the ground with), so
 	 * a cap can never confiscate momentum a player already had, which is the spec v3 §2.4 rule.
 	 *
 	 * Must stay above AirStrafeSoftCapSpeed and at or below MaxAirSpeed.
 	 *
 	 * ALSO A BASE, for the same reason as the soft cap above: AirStrafeAsymptoteScale multiplies it,
-	 * so the effective hard cap is 1250 x 1.10 = 1375 and MaxAirSpeed (1600) is still the wider of
+	 * so the effective hard cap is 1350 x 1.10 = 1485 and MaxAirSpeed (1800) is still the wider of
 	 * the two. Both caps move together on purpose — see AirStrafeAsymptoteScale.
+	 *
+	 * DERIVED FROM THIS, so they move with it (Demo 21 rule): the knife's hard cap (x1.256667 =
+	 * 1866), the surf ceiling (x SurfSpeedCeilingMultiplier 1.25 = 1856; 2333 with a knife), the
+	 * air-accel clamp and the wall-jump launch clamp (both max(entry speed, this)), and Mace's SPIKE
+	 * pull (x MaceSpikePullSpeedMultiplier 2 = 2970 uu/s, "at the momentum ceiling").
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Air", meta = (DisplayName = "Air Strafe Hard Cap BASE (uu/s, x asymptote scale)", ClampMin = "50.0", ClampMax = "8000.0", UIMin = "600.0", UIMax = "2500.0"))
-	float AirStrafeHardCapSpeed = 1250.f;
+	float AirStrafeHardCapSpeed = 1350.f;
 
 	/**
 	 * SPEC v9 §8 — "Move the asymptote on momentum slightly higher, to allow for slightly faster
@@ -1250,10 +1267,11 @@ public:
 	 * The soft cap is where the gain starts to taper and the hard cap is where it reaches zero: they
 	 * are two points on one curve, so moving only one of them changes the SHAPE of the falloff
 	 * instead of its position. This slides the whole asymptote up and leaves the shape identical.
-	 * [ASSUMPTION] +10%, per spec §8 — 950 -> 1045 and 1250 -> 1375.
+	 * [ASSUMPTION] +10%, per spec §8 — at today's bases 1050 -> 1155 and 1350 -> 1485 (at the v9
+	 * bases it was 950 -> 1045 and 1250 -> 1375).
 	 *
 	 * A NUDGE, NOT A REMOVAL. The Demo 5 ceiling the design owner asked for is still here; it just
-	 * sits 10% further out. MaxAirSpeed (1600) is deliberately not scaled, so the hard cap remains
+	 * sits 10% further out. MaxAirSpeed (1800) is deliberately not scaled, so the hard cap remains
 	 * the tighter of the two and spec v5 §1 still governs.
 	 *
 	 * NAME IS LOAD-BEARING: UTraceCharacterMovementComponent::GetAirStrafeAsymptoteScale() resolves
@@ -1622,11 +1640,12 @@ public:
 	 * Demo 4 asked to have removed (spec v4 §1). Ending the slide earlier leaves them travelling at
 	 * the speed they earned.
 	 *
-	 * Knock-on: SlideJumpWindowSeconds (0.20 s) is measured from the slide's END and does not move,
-	 * so the well-timed window is now 16% of the slide rather than 11% — the slide-jump got slightly
-	 * EASIER to time, not harder. (SlideDurationTrimSeconds takes 0.6 s off the product and takes
-	 * that further still: 0.20 s of the shipped 0.66 s slide is 30%. The window's CLOSE is pinned to
-	 * the slide's end throughout — only the share of the slide it covers moves.)
+	 * Knock-on: SlideJumpWindowSeconds (0.20 s then) is measured from the slide's END and does not
+	 * move, so the well-timed window became 16% of the slide rather than 11% — the slide-jump got
+	 * slightly EASIER to time, not harder. (SlideDurationTrimSeconds takes 0.6 s off the product and
+	 * took that further still: 0.20 s of the 0.66 s slide was 30%. The owner then narrowed the window
+	 * itself to 0.125 s on 2026-10-04, which is 19% of the 0.66 s slide. The window's CLOSE is pinned
+	 * to the slide's end throughout — only the share of the slide it covers moves.)
 	 *
 	 * NAME IS LOAD-BEARING: bound BY NAME as "SlideMaxLengthScale" by
 	 * UTraceCharacterMovementComponent::GetSlideDuration(), clamped there to 0.05..4.
@@ -1664,6 +1683,9 @@ public:
 	 *     v24 shipped   slide 0.860 s   window open 0.660 s   close 0.860 s (= the end)
 	 *     v25 shipped   slide 0.660 s   window open 0.460 s   close 0.660 s (= the end)
 	 *                                   ^^^^^^^^^^^^^^^^^^^   0.200 s earlier, as asked
+	 *
+	 * (Since 2026-10-04 the window itself is 0.125 s, so it opens at 0.535 s — a change to
+	 * SlideJumpWindowSeconds, not to this knob. The close is still the end.)
 	 *
 	 * *** THE §6 ACCEPTANCE CRITERION — "the window should be right at the end of the slide" — IS
 	 * SATISFIED BY CONSTRUCTION, AND THAT IS WHY IT IS SATISFIED. *** The window is DEFINED as the
@@ -1828,8 +1850,16 @@ public:
 	 * out, so the input has something to be timed AGAINST. Timing it against the start would just
 	 * mean "press both keys at once", which is not a skill.
 	 *
-	 * Sane range 0.15 to 0.30. Below ~0.1 it is unhittable at real latency; above ~0.5 against a 1.8s
-	 * slide it covers so much of the slide that it stops being a window at all.
+	 * Was described as "sane range 0.15 to 0.30"; the owner set 0.125 on 2026-10-04 ("Decrease Slide
+	 * Jump Timing Window to .125s"), below that floor on purpose and still above ~0.1, where it
+	 * becomes unhittable at real latency. Above ~0.5 against a 1.8s slide it covers so much of the
+	 * slide that it stops being a window at all.
+	 *
+	 * *** THIS IS ALSO THE COYOTE GRACE AFTER THE SLIDE ENDS *** (EndSlide() charges
+	 * SlideJumpGraceRemaining to GetSlideJumpWindowSeconds(); see the accessor's note). So 0.20 ->
+	 * 0.125 narrows BOTH halves: a jump up to 0.125 s before the end OR 0.125 s after it is well
+	 * timed, 0.25 s in all where it was 0.40 s, and a jump more than 0.125 s after the slide ends is
+	 * an ordinary jump (it was 0.20 s).
 	 *
 	 * *** SPEC v24 §8 DELIBERATELY DID NOT MOVE THIS, AND NEITHER DOES SPEC v25 §6. *** The reasoning
 	 * belongs next to the number so that no pass "finishes the job" by adding the seconds twice.
@@ -1842,6 +1872,7 @@ public:
 	 *     v23        slide 1.26 s   window opens 1.06 s   closes 1.26 s   (window = 16% of the slide)
 	 *     v24 §8     slide 0.86 s   window opens 0.66 s   closes 0.86 s   (-0.4 s, 23%)
 	 *     v25 §6     slide 0.66 s   window opens 0.460 s  closes 0.660 s  (-0.2 s, 30%)
+	 *     2026-10-04 slide 0.66 s   window opens 0.535 s  closes 0.660 s  (THIS knob 0.20 -> 0.125, 19%)
 	 *
 	 * Measured on a live pawn, not asserted: grep V24WINDOW under -TraceSlideDebug.
 	 *
@@ -1854,12 +1885,13 @@ public:
 	 *
 	 * THE ACCEPTANCE CRITERION IS ABOUT THE CLOSE, AND THE CLOSE IS THE SLIDE'S END EXACTLY — the two
 	 * are the same instant by construction, at every value this knob can hold. What this knob does
-	 * control is how WIDE the window is behind that end: 0.20 s of a 0.66 s slide is the final 30%.
-	 * If a future pass wants the window tighter against the end than 30%, THAT is the change this
-	 * number is for, and it is a separate design decision from either §6 sentence.
+	 * control is how WIDE the window is behind that end: 0.125 s of a 0.66 s slide is the final 19%.
+	 * If a future pass wants the window tighter against the end, THAT is the change this number is
+	 * for, and it is a separate design decision from either §6 sentence — which is exactly the
+	 * change the owner made on 2026-10-04 (0.20 s, the final 30%, -> 0.125 s).
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Movement|Slide Jump", meta = (DisplayName = "Timing Window (s before slide end)", ClampMin = "0.0", ClampMax = "2.0", UIMin = "0.0", UIMax = "0.6"))
-	float SlideJumpWindowSeconds = 0.20f;
+	float SlideJumpWindowSeconds = 0.125f;
 
 	/**
 	 * Extra horizontal speed multiplier for a slide-jump taken inside the timing window above.
@@ -2070,11 +2102,12 @@ public:
 	/**
 	 * When a chain ENDS, as a multiple of the pawn's own live max ground speed.
 	 *
-	 * *** RELATIVE TO A BASE THAT MOVES. *** Not "reset below 800 uu/s". The pawn's ground speed
-	 * ceiling is WalkSpeed folded through CarrierSpeedMultiplier (1.22), the knife profile (1.30) and
-	 * every ability speed passive, so a carrier's baseline is 976 and a knife-carrier's is higher
-	 * still. Written as a multiple, this threshold follows every one of those without being told, and
-	 * retuning WalkSpeed cannot silently make the chain immortal (or unstartable).
+	 * *** RELATIVE TO A BASE THAT MOVES. *** Not "reset below 900 uu/s". The pawn's ground speed
+	 * ceiling is WalkSpeed folded through CarrierSpeedMultiplier (1.22), the knife profile (1.22) and
+	 * every ability speed passive, so a carrier's baseline is 1098 (at WalkSpeed 900) and an X with a
+	 * vulnerable enemy in play is higher still. Written as a multiple, this threshold follows every
+	 * one of those without being told, and retuning WalkSpeed cannot silently make the chain
+	 * immortal (or unstartable).
 	 *
 	 * WHY THE RESET IS A SPEED AND NOT A TIMER. Two reasons, and the second is the load-bearing one:
 	 *
@@ -2459,7 +2492,8 @@ public:
 	 *
 	 *     GetSurfSpeedCeiling() = max(entry speed, GetAirStrafeHardCapSpeed() x this)
 	 *
-	 * At the shipped 1375 uu/s hard cap that is 1719 uu/s with a gun, and 2160 uu/s with a knife out
+	 * At the shipped 1485 uu/s hard cap (1350 x 1.10) that is 1856 uu/s with a gun, and 2333 uu/s with
+	 * a knife out (it was 1719 / 2160 at the old 1250 base)
 	 * (GetAirStrafeHardCapSpeed() already folds in KnifeAirStrafeHardCapMultiplier, so a knife surfer
 	 * gets the same bonus the rest of their kit gets, automatically).
 	 *
@@ -2537,8 +2571,8 @@ public:
 	 * SPEC v12 §3, "adjust momentum accordingly": 1.25 -> 1.1833. THE BONUS IS SCALED, NOT THE
 	 * MULTIPLIER. Scaling the multiplier itself (1.25 x 22/30 = 0.917) would put the knife BELOW the
 	 * gun's own air cap, i.e. turn the mobility kit into a penalty. The bonus is the part above 1:
-	 * 1 + 0.25 x (22/30) = 1.18333. Shipped soft cap with a knife = AirStrafeSoftCapSpeed 1045 x
-	 * 1.18333 = ~1237 uu/s (was ~1306).
+	 * 1 + 0.25 x (22/30) = 1.18333. Shipped soft cap with a knife = the effective soft cap 1155
+	 * (1050 x 1.10) x 1.18333 = ~1367 uu/s (~1237 at the old 950 base).
 	 *
 	 * Tunable separately from the base caps, as spec v10 §1 requires. Bound BY NAME as
 	 * "KnifeAirStrafeSoftCapMultiplier", clamped in the component to 1..3.
@@ -2557,7 +2591,8 @@ public:
 	 * and 0.35 > 0.25 before the scale means 0.2567 > 0.1833 after it.
 	 *
 	 * SPEC v12 §3, "adjust momentum accordingly": 1.35 -> 1.2567, i.e. 1 + 0.35 x (22/30). Shipped
-	 * hard cap with a knife = AirStrafeHardCapSpeed 1375 x 1.25667 = ~1728 uu/s (was ~1856).
+	 * hard cap with a knife = the effective hard cap 1485 (1350 x 1.10) x 1.25667 = ~1866 uu/s (~1728
+	 * at the old 1250 base). MaxAirSpeed is scaled by it too: 1800 x 1.25667 = 2262.
 	 *
 	 * Bound BY NAME as "KnifeAirStrafeHardCapMultiplier", clamped in the component to 1..3.
 	 */
@@ -3738,6 +3773,10 @@ public:
 	 * 1200 = the v7 §2 conversion of the old timer: TrailLifetime 2.0s x WalkSpeed 800 = 1600uu, of
 	 * which the request was "lower by 25%". This is now the number the whole mechanic hangs on.
 	 *
+	 * AN ABSOLUTE LENGTH SINCE v7, so the 2026-10-04 walk of 900 does not move it: the trace is the
+	 * same 1200 uu, laid in 1.33 s at a walk and 1.09 s by a 1098 uu/s carrier (1.50 s / 1.23 s at the
+	 * old 800). Only the <= 0 fallback below re-derives from WalkSpeed (it would give 1350).
+	 *
 	 * At or below zero re-derives it from TrailLifetime x WalkSpeed x 0.75 so the pair cannot silently
 	 * disagree; the console override Trace.Trail.MaxLength beats both for a headless measurement run.
 	 */
@@ -4166,11 +4205,14 @@ public:
 	 * cutoff, so the bots discarded the whole trace and never planned an intercept. The filter in
 	 * ATraceBotController is now a DISTANCE margin measured from the tail:
 	 *
-	 *     skip = BotTrailMinPointLifeRemaining x WalkSpeed   (0.40 x 800 = 320uu)
+	 *     skip = BotTrailMinPointLifeRemaining x WalkSpeed   (0.40 x 900 = 360uu; 320uu at 800)
 	 *
 	 * which against the 1200uu TrailMaxLengthUU preserves exactly the calibrated "discard the oldest
-	 * ~20-25% of the trace" this number has always meant. It stays a fraction of the trace written as
-	 * an absolute — so if TrailMaxLengthUU moves, move this with it, the same standing rule as before.
+	 * ~20-25% of the trace" this number has always meant. (At WalkSpeed 900 the raw skip is 30% of a
+	 * 1200uu trace, but the planner caps it at TrailTailSkipMaxFraction, 0.20 of the usable trace,
+	 * which is what binds on a full-length trace either way.) It stays a fraction of the trace
+	 * written as an absolute — so if TrailMaxLengthUU moves, move this with it, the same standing
+	 * rule as before.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Bots|Intercept", meta = (DisplayName = "Min Point Life Remaining (s, x WalkSpeed = uu skipped from tail)", ClampMin = "0.0", ClampMax = "4.0", UIMin = "0.0", UIMax = "2.0"))
 	float BotTrailMinPointLifeRemaining = 0.40f;
@@ -4485,7 +4527,13 @@ public:
 	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Dash Cooldown (s) [mirror of Movement|Dash]", ClampMin = "0.05", ClampMax = "30.0", UIMin = "0.5", UIMax = "10.0"))
 	float BotDashCooldownSeconds = 3.5f;
 
-	/** Minimum planar speed (uu/s) before a slide is worth starting. Sliding from a standstill is a crouch. */
+	/**
+	 * Minimum planar speed (uu/s) before a slide is worth starting. Sliding from a standstill is a crouch.
+	 *
+	 * The bot never uses less than the movement component's own entry speed (SlideEntrySpeedFraction
+	 * x WalkSpeed, 495 at the 900 walk): the controller floors this at that, so a value below it
+	 * cannot send a bot for a slide the rules refuse.
+	 */
 	UPROPERTY(config, EditAnywhere, Category = "Bots|Movement", meta = (DisplayName = "Slide Min Speed (uu/s)", ClampMin = "0.0", ClampMax = "3000.0", UIMin = "100.0", UIMax = "1500.0"))
 	float BotSlideMinSpeed = 480.f;
 
@@ -4980,6 +5028,9 @@ public:
 	 *
 	 * This deliberately breaks v14 §6's "at the momentum ceiling" derivation, because that rule was
 	 * written when the range was 2200 uu. The air cap itself is untouched; only Mace's pull scales.
+	 *
+	 * STILL A MULTIPLE OF THE CEILING, so it follows the air cap (Demo 21 rule): 1375 x 2 = 2750 uu/s
+	 * at the old 1250 base, 1485 x 2 = 2970 uu/s since the owner's 2026-10-04 hard cap of 1350.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Mace", meta = (DisplayName = "Spike Pull Speed (x air-strafe hard cap) [v15 §6: 1.0 -> 2.0, the pull became the slow part]", ClampMin = "0.1", ClampMax = "4.0", UIMin = "0.5", UIMax = "3.0"))
 	float MaceSpikePullSpeedMultiplier = 2.f;
@@ -5735,7 +5786,7 @@ public:
 	 * WHAT DID NOT CHANGE, because it is the reason WIDTH is a knob at all: 176 uu is still how far
 	 * an enemy travels while inside the slab, since an enemy meets a forward wall by CROSSING the
 	 * lane it divides. The 35% slow is still non-instantaneous for the same arithmetic it always was
-	 * (176 uu at 800 uu/s = 0.22 s inside).
+	 * (176 uu at 900 uu/s = 0.20 s inside; 0.22 s at the old 800).
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Abilities|Slimeball", meta = (DisplayName = "Slimewall HEIGHT (uu, vertical) [v18 §2: 176 = one player height]", ClampMin = "20.0", ClampMax = "3000.0", UIMin = "80.0", UIMax = "600.0"))
 	float SlimewallHeightUU = 176.f;
@@ -5807,8 +5858,8 @@ public:
 	/**
 	 * [ASSUMPTION] how long the slow lasts after leaving the slab. §2 does not say.
 	 *
-	 * IT CANNOT SENSIBLY BE ZERO. At 176 uu thick and 800 uu/s walk speed an enemy is inside the wall
-	 * for 0.22 s; a slow that ended on the far side would be a rounding error nobody could feel, and
+	 * IT CANNOT SENSIBLY BE ZERO. At 176 uu thick and 900 uu/s walk speed an enemy is inside the wall
+	 * for 0.20 s; a slow that ended on the far side would be a rounding error nobody could feel, and
 	 * the ability would read as broken rather than as weak. 0.75 s is long enough that walking through
 	 * is a decision.
 	 */
@@ -6480,7 +6531,8 @@ public:
 	 * CLIMB RATE WHILE JUMP IS HELD, as a multiple of WalkSpeed.
 	 *
 	 * §3 said "jump goes up at walking speed" (1.0). *** DEMO 19 ITEM 4 HALVES IT: "half the speed she
-	 * moves vertically at" *** — so 0.5, i.e. 400 uu/s against the shipped WalkSpeed of 800.
+	 * moves vertically at" *** — so 0.5, i.e. 450 uu/s against the shipped WalkSpeed of 900 (400 at
+	 * the old 800).
 	 *
 	 * STILL A MULTIPLE OF WalkSpeed AND NOT THE NUMBER 400, for the reason it was derived in the first
 	 * place: the flight should follow a retune of the walk rather than drift away from it.

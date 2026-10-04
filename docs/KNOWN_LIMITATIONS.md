@@ -112,8 +112,8 @@ historical runs of the suite from 2026-08-23 also pass at 3300.
 The arithmetic is deterministic because the step's placement is scripted: the shot needs **5354 uu**
 of reach and the Core now carries **4997 uu** — out of range by 357 uu, where at 3300 it had 6728.
 Closing the distance does not rescue it: head-on, the shot first becomes legal 201 uu before
-`CarryInCommitDistance` latches the carry-in, which is about 0.2 s at a carrier's 976 uu/s and
-inside the bot's own reaction delay.
+`CarryInCommitDistance` latches the carry-in, which is about 0.2 s at a carrier's 976 uu/s (0.18 s
+at the 1098 uu/s of the 2026-10-04 walk) and inside the bot's own reaction delay.
 
 **Three honest options, all the owner's:**
 
@@ -157,23 +157,24 @@ Patch 28 §5's surf mechanic is implemented, bounded, predicted and measured. It
 today: `Scripts/run-listen-server.sh --map /Game/Maps/Arena`. To put them in the shipping map,
 somebody has to re-bake — **and a re-bake is not free**; see the warning under item 44.
 
-### 31. The surf speed ceiling is `max(entry speed, 1719)`, not a flat 1719 uu/s — **OPEN**
+### 31. The surf speed ceiling is `max(entry speed, 1856)`, not a flat 1856 uu/s — **OPEN**
 
 `GetSurfSpeedCeiling()` (`TraceCharacterMovementComponent.cpp:1788-1799`) returns
 `FMath::Max(SurfEntrySpeed, GetAirStrafeHardCapSpeed() × GetSurfSpeedCeilingMultiplier())`. The
-derived cap is 1,375 × 1.25 = **1,719 uu/s** (1,375 is `AirStrafeHardCapSpeed=1250` times
-`AirStrafeAsymptoteScale=1.100000`, `Config/DefaultGame.ini:856,864`; the game logs the whole
-derivation at boot as `ceiling=1719 uu/s = airHardCap 1375 x 1.25`). But a player who **dashes** onto
-a rail arrives at `DashSpeed=3300` (`Config/DefaultGame.ini:745`) and keeps it — 1.92× the headline
-number. There is no ratchet (the clamp is
-`min(v, max(entry, cap))`, so you can never exceed what you brought), but summaries that quote a flat
-1,719 uu/s ceiling are quoting the floor of the ceiling, not the ceiling.
+derived cap is 1,485 × 1.25 = **1,856 uu/s** (1,485 is `AirStrafeHardCapSpeed=1350` times
+`AirStrafeAsymptoteScale=1.100000` in `Config/DefaultGame.ini`; the game logs the whole derivation
+at boot as `ceiling=1856 uu/s = airHardCap 1485 x 1.25`). It was 1,719 (1,375 × 1.25) until the
+owner's 2026-10-04 retune raised the hard-cap base from 1250; it follows the cap with no edit, which
+is the point of it being a multiplier. But a player who **dashes** onto a rail arrives at
+`DashSpeed=3300` and keeps it — 1.78× the headline number. There is no ratchet (the clamp is `min(v,
+max(entry, cap))`, so you can never exceed what you brought), but summaries that quote a flat 1,856
+uu/s ceiling are quoting the floor of the ceiling, not the ceiling.
 
 **A units mismatch inside it, unfixed.** `SurfEntrySpeed` is the pawn's **planar** speed at first
 contact, while the clamp is applied to `Velocity.Size()` (**3D**). Enter with planar 1,600 and
-vertical −1,200 (3D 2,000) and the ceiling is `max(1600, 1719) = 1719`, so the pawn is scaled down by
-281 uu/s on arrival — which is the opposite of what the comment on that block promises. Two different
-speed definitions on the two sides of one comparison.
+vertical −1,200 (3D 2,000) and the ceiling is `max(1600, 1856) = 1856`, so the pawn is scaled down
+by 144 uu/s on arrival (281 at the old 1719) — which is the opposite of what the comment on that
+block promises. Two different speed definitions on the two sides of one comparison.
 
 ### 32. Surf's "zero corrections" claim is narrower than it sounds — **OPEN**
 

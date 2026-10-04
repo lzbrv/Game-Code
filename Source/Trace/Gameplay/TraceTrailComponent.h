@@ -491,8 +491,10 @@ public:
 	 * tail only when a new one at the head pushes the total past this — never because time passed.
 	 *
 	 * Default 1200: TrailLifetime (2.0s) x WalkSpeed (800uu/s) = 1600uu, minus the 25% the spec
-	 * asks for. Derived from those two live-editable settings rather than hardcoded so it still
-	 * responds to the settings panel; Trace.Trail.MaxLength overrides it outright.
+	 * asks for. UTraceSettings::TrailMaxLengthUU now carries that 1200 as an ABSOLUTE, so the
+	 * 2026-10-04 walk of 900 did not lengthen the trace; the TrailLifetime x WalkSpeed x 0.75
+	 * derivation is only the fallback when that knob is <= 0 (it would give 1350 today).
+	 * Trace.Trail.MaxLength overrides both outright.
 	 */
 	static float GetTraceMaxLengthUU();
 

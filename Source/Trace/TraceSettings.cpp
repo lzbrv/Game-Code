@@ -658,9 +658,10 @@ namespace
 
 		// -----------------------------------------------------------------------------------------
 		// SPEC v9 §§5-8. Every movement change this pass is a SCALE OVER A BASE, so the line above
-		// (which prints the bases) is only half the story — 950 on the soft-cap line is correct and
-		// 1045 on it would be the bug. This line prints base, scale and PRODUCT for each one, because
-		// the product is the number the game is actually played at and it appears nowhere else.
+		// (which prints the bases) is only half the story — 1050 on the soft-cap line is correct and
+		// 1155 on it would be the bug (950 / 1045 before the 2026-10-04 retune). This line prints
+		// base, scale and PRODUCT for each one, because the product is the number the game is
+		// actually played at and it appears nowhere else.
 		//
 		// The double application this catches is not hypothetical: for part of this pass the bases
 		// here had ALSO been cut by the same factors, and the game was running a 0.88 s slide, a
@@ -1218,7 +1219,8 @@ namespace
 			//
 			// The base + scale pairs, and what the product must come to:
 			//   MovementGravityScale     1.12                                    (§8, gravity x1.12)
-			//   AirStrafeAsymptoteScale  950 x 1.10 = 1045, 1250 x 1.10 = 1375   (§8, asymptote +10%)
+			//   AirStrafeAsymptoteScale  1050 x 1.10 = 1155, 1350 x 1.10 = 1485 (§8, asymptote +10%;
+			//                            the bases were 950 / 1250 until 2026-10-04)
 			//   SlideMaxLengthScale      1.80 x 0.70 = 1.26 s                    (§6, length -30%)
 			//   SlideJumpBonusScale      1 + 0.3125 x 1.30 = 1.40625             (§7, bonus +30%)
 			//   WallJumpWindowScale      0.25 x 0.60 = 0.15 s                    (§5, shorter window)
@@ -1228,7 +1230,7 @@ namespace
 			// but their printed values there are half of the evidence: base x scale is the shipped
 			// number, and a base that has ALSO been cut is the double-application bug.
 			{ TEXT("MovementGravityScale"),            EKnobType::Float, TEXT("v9 §8: x1.12, less floaty [by-name bind]") },
-			{ TEXT("AirStrafeAsymptoteScale"),         EKnobType::Float, TEXT("v9 §8: x1.10 over BOTH air caps -> 1045/1375 [by-name bind]") },
+			{ TEXT("AirStrafeAsymptoteScale"),         EKnobType::Float, TEXT("v9 §8: x1.10 over BOTH air cap BASES; base x this is what ships (SettingsDump's SPECv9 line prints the product) [by-name bind]") },
 			{ TEXT("SlideMaxLengthScale"),             EKnobType::Float, TEXT("v9 §6: x0.70 over SlideDuration -> 1.26s [by-name bind]") },
 			{ TEXT("SlideJumpBonusScale"),             EKnobType::Float, TEXT("v9 §7: x1.30 over the bonus -> 1.40625 [by-name bind]") },
 			{ TEXT("bSlideJumpBonusScalesGainOnly"),   EKnobType::Bool,  TEXT("v9 §7: true = scale the gain (1.40625), false = the whole multiplier (1.70625) [by-name bind]") },
@@ -1556,7 +1558,7 @@ namespace
 			{ TEXT("SurfMinNormalZ"),                  EKnobType::Float, TEXT("Patch 28 §5: FLOOR of the surf band (normal Z). Surfable is this < Nz < the LIVE walkable limit, so a face you can stand on is never surfable. Keep it above WallJumpMaxNormalZ - wall, surf plane and floor must not overlap [by-name bind]") },
 			{ TEXT("SurfOverbounce"),                  EKnobType::Float, TEXT("Patch 28 §5: Source's PM_ClipVelocity overbounce. 1.0 = a pure plane projection; above 1 the ramp bounces you, below 1 you sink into it [by-name bind]") },
 			{ TEXT("SurfContactGraceSeconds"),         EKnobType::Float, TEXT("Patch 28 §5: how long the surf state survives the last contact, so a fan of facets does not flicker it (and the ceiling hanging off it) once per joint. NOT a coyote time [by-name bind]") },
-			{ TEXT("SurfSpeedCeilingMultiplier"),      EKnobType::Float, TEXT("Patch 28 §5: the surf ceiling as a MULTIPLE of the air-strafe HARD cap (1375 x 1.25 = 1719 uu/s; 2160 with a knife), so retuning the air cap moves it. Your ENTRY speed is the floor [by-name bind]") },
+			{ TEXT("SurfSpeedCeilingMultiplier"),      EKnobType::Float, TEXT("Patch 28 §5: the surf ceiling as a MULTIPLE of the EFFECTIVE air-strafe hard cap (base x asymptote scale; x the knife's multiplier with a knife out), so retuning the air cap moves it. Your ENTRY speed is the floor [by-name bind]") },
 
 			// --- v18 §2: Roxie -----------------------------------------------------------------------
 			//

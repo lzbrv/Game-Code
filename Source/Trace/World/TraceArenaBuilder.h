@@ -113,12 +113,13 @@ class UStaticMeshComponent;
  * WHY IT IS THIS BIG
  * ------------------
  * The field was 8000 x 4000. At WalkSpeed 720 that is 11 seconds end to end and a point was over
- * before it started. 24000 long was 3x that; 33600 is 4.2x, and at the current WalkSpeed of 800 a
- * full-field run is ~42 SECONDS. That is a long time, and the report on this pass says so plainly:
- * if it plays badly, the alternative reading of "lengthen to 3.5:1" is to NARROW instead, which is
- * two numbers on FieldLength/FieldWidth below (24000 / 6857) and nothing else - every structure,
- * volume, spawn and bound in this file is derived from those two, and the corner banks, the goal and
- * the endzone all re-derive themselves. It is genuinely a one-edit change; it is not a rewrite.
+ * before it started. 24000 long was 3x that; 33600 is 4.2x, and at the WalkSpeed of 800 of the time a
+ * full-field run was ~42 SECONDS (37 s at the 900 walk of 2026-10-04). That is a long time, and the
+ * report on this pass says so plainly: if it plays badly, the alternative reading of "lengthen to
+ * 3.5:1" is to NARROW instead, which is two numbers on FieldLength/FieldWidth below (24000 / 6857)
+ * and nothing else - every structure, volume, spawn and bound in this file is derived from those
+ * two, and the corner banks, the goal and the endzone all re-derive themselves. It is genuinely a
+ * one-edit change; it is not a rewrite.
  *
  * Every derived number below is expressed as a fraction of the field (or, for the pieces that must
  * not drift away from the goal line when the field grows, as an offset back FROM the goal line - see
@@ -1049,12 +1050,13 @@ public:
 	 * load-bearing constant. Do not drop it below ~12000 or the centre diamond and the two spawn
 	 * lines start to overlap.
 	 *
-	 * THE COST, STATED PLAINLY: at WalkSpeed 800 a wall-to-wall run is now 48 seconds (42 of them
-	 * goal to goal, 3 in each pocket). UTraceSettings::HitscanRange has to clear the field DIAGONAL
-	 * (38400 x 9600 -> 39581 uu) and DOES: Config/DefaultGame.ini ships HitscanRange=39600, raised
-	 * from the 36000 that covered the old 33600 field when the pockets landed, and
-	 * WarnIfHitscanRangeIsShort() re-checks the pairing in the log of every match — so a future
-	 * resize here cannot silently strand the long diagonal again.
+	 * THE COST, STATED PLAINLY: at WalkSpeed 900 a wall-to-wall run is ~43 seconds (~37 of them
+	 * goal to goal, ~2.7 in each pocket); it was 48 (42, 3) at the 800 walk before 2026-10-04.
+	 * UTraceSettings::HitscanRange has to clear the field DIAGONAL (38400 x 9600 -> 39581 uu) and
+	 * DOES: Config/DefaultGame.ini ships HitscanRange=39600, raised from the 36000 that covered the
+	 * old 33600 field when the pockets landed, and WarnIfHitscanRangeIsShort() re-checks the
+	 * pairing in the log of every match — so a future resize here cannot silently strand the long
+	 * diagonal again.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float FieldLength = 38400.f;

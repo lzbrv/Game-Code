@@ -106,13 +106,14 @@ namespace TraceCoreTuning
 	 * 60 s IS A MEASURED NUMBER, NOT A ROUND ONE, and the first draft of it (30 s) was wrong. The
 	 * shipped arena is 38,400 uu goal to goal and the spawn pads sit behind the goal plane, so a
 	 * player starts roughly 17,000-19,000 uu from the centre pillar. At UTraceSettings::WalkSpeed
-	 * (800 uu/s) that crossing alone is 21-24 s BEFORE the climb, before being shot at, and before
-	 * anybody dies on the way. A headless 8-bot run of the first draft tripped this backstop on every
-	 * half — the bots entered ChaseLooseCore within a tenth of a second of the whistle and were still
-	 * short of the deck half a minute later — which is a timer measuring the pitch, not the rule.
-	 * Doubling the crossing gives the sprint, the climb and one bad fight room, and it is still two
-	 * orders of magnitude inside the 480 s half, so a genuinely unreachable deck costs one Warning and
-	 * a playable match rather than a dead one.
+	 * (800 uu/s then; 19-21 s at the 900 of 2026-10-04) that crossing alone is 21-24 s BEFORE the
+	 * climb, before being shot at, and before anybody dies on the way. A headless 8-bot run of the
+	 * first draft tripped this backstop on every half — the bots entered ChaseLooseCore within a
+	 * tenth of a second of the whistle and were still short of the deck half a minute later — which
+	 * is a timer measuring the pitch, not the rule. Doubling the crossing gives the sprint, the
+	 * climb and one bad fight room, and it is still two orders of magnitude inside the 480 s half,
+	 * so a genuinely unreachable deck costs one Warning and a playable match rather than a dead
+	 * one.
 	 *
 	 * WHEN IT FIRES IT IS A BUG REPORT, NOT A FEATURE — see the log line, which says so.
 	 */

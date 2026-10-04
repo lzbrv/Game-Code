@@ -521,8 +521,8 @@ namespace TraceMovementAuditV16
 		// --- walk ---------------------------------------------------------------------------------
 		Row(TEXT("WALK top speed"), TEXT("uu/s"), Biased(S.WalkSpeed), State.WalkTop, 0.02f,
 			*FString::Printf(TEXT("held input, flat ground, 2.0 s; the pawn actually travelled %.0f uu — "
-			                      "a velocity of 800 against a displacement of 0 is a pawn jammed in a wall"),
-				State.WalkDisplacement));
+			                      "a velocity of %.0f against a displacement of 0 is a pawn jammed in a wall"),
+				State.WalkDisplacement, S.WalkSpeed));
 
 		// --- crouch -------------------------------------------------------------------------------
 		//
@@ -614,7 +614,7 @@ namespace TraceMovementAuditV16
 			Row(TEXT("SLIDEJUMP well-timed bonus"), TEXT("x"),
 				Biased(Move->GetSlideJumpWindowSpeedBonusForAudit()),
 				(EarlyRatio > 0.f) ? TimedRatio / EarlyRatio : 0.f, 0.06f,
-				*FString::Printf(TEXT("v16: 1.40625 -> 1.446875; window %.2f s; slideSpeeds %.0f vs %.0f uu/s"),
+				*FString::Printf(TEXT("v16: 1.40625 -> 1.446875; window %.3f s; slideSpeeds %.0f vs %.0f uu/s"),
 					Move->GetSlideJumpWindowSecondsForAudit(), State.HopEarlySlideSpeed, State.HopTimedSlideSpeed));
 		}
 		else
@@ -2714,13 +2714,14 @@ namespace TraceMovementAuditV16
 			// *** THE FIRST HOP MUST START FROM A FULL RUN AND THE REST MUST NOT WAIT AT ALL. ***
 			// Both halves of that were learned from a run:
 			//
-			//   HOP 1. CanStartSlide only needs SlideEntrySpeedFraction x WalkSpeed (440 uu/s), and the
-			//     first version slid the moment it crossed that. The slide then decayed to 442 and
-			//     launched at 600 — BELOW the pawn's own 800 uu/s ground speed — so the chain was
-			//     correctly declared spent on the very next landing and hop 2 was a FIRST hop wearing
-			//     hop 2's label. The whole four-hop run measured two chains of two. Requiring a real
-			//     run-up is not cosmetic: a chain that starts below walking pace has nothing to
-			//     compound and is not the thing §3 is about.
+			//   HOP 1. CanStartSlide only needs SlideEntrySpeedFraction x WalkSpeed (440 uu/s at that
+			//     run's 800 walk; 495 at today's 900), and the first version slid the moment it
+			//     crossed that. The slide then decayed to 442 and launched at 600 — BELOW the
+			//     pawn's own 800 uu/s ground speed — so the chain was correctly declared spent on
+			//     the very next landing and hop 2 was a FIRST hop wearing hop 2's label. The whole
+			//     four-hop run measured two chains of two. Requiring a real run-up is not cosmetic:
+			//     a chain that starts below walking pace has nothing to compound and is not the
+			//     thing §3 is about.
 			//
 			//   HOPS 2-4. Every frame spent on the ground before the next slide is a frame of ground
 			//     friction eating the carry, which is precisely how a chain ends. So these press crouch

@@ -1819,7 +1819,7 @@ namespace TraceAbilitySetElleFile
 		/**
 		 * How long to hold the strafe key that separates the two mouths.
 		 *
-		 * 0.6 s at the shipped 800 uu/s walk clears the 260 uu minimum separation with room to
+		 * 0.6 s at the shipped 900 uu/s walk clears the 260 uu minimum separation with room to
 		 * spare. Too short and Snap REFUSES the second mouth for being on top of the first — a
 		 * correct refusal that photographs identically to a broken ability.
 		 */

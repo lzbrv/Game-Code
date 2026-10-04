@@ -3188,7 +3188,7 @@ void ATraceCore::Tick(float DeltaSeconds)
 	// ---- 5. Mode B only: "a player carries the core into the goal". -----------------------------
 	//
 	// Swept from where the holder was last frame, for the same reason the thrown test is swept: a
-	// carrier at 800 uu/s with a dash on top can cross a goal mouth inside one long frame.
+	// carrier at ~1100 uu/s with a dash on top can cross a goal mouth inside one long frame.
 	//
 	// The goal volume polls for a stationary carrier itself, at 10 Hz. This is not a duplicate of
 	// that: the poll samples POSITIONS and this samples the PATH BETWEEN THEM, so a carrier who

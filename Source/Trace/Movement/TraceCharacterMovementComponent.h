@@ -2309,10 +2309,11 @@ protected:
 	 * SPEC v10 §1. Multiplier on AirStrafeHardCapSpeed — and on MaxAirSpeed — while the knife is out.
 	 *
 	 * MaxAirSpeed IS SCALED BY THIS TOO, and it has to be. ApplySourceAirAcceleration takes the
-	 * TIGHTER of the two ceilings (min(MaxAirSpeed, HardCap)), so with MaxAirSpeed left at 1600 a hard
-	 * cap raised past it would be silently inert and the knob would do nothing at all — the exact
-	 * "misnamed knob silently does nothing" failure this project keeps paying for, in a different
-	 * costume. Scaling both keeps the hard cap the binding limit at every setting.
+	 * TIGHTER of the two ceilings (min(MaxAirSpeed, HardCap)), so with MaxAirSpeed left unscaled
+	 * (1800 since 2026-10-04, against a knife hard cap of 1866) a hard cap raised past it would be
+	 * silently inert and the knob would do nothing at all — the exact "misnamed knob silently does
+	 * nothing" failure this project keeps paying for, in a different costume. Scaling both keeps
+	 * the hard cap the binding limit at every setting.
 	 */
 	float GetKnifeAirStrafeHardCapMultiplier() const;
 

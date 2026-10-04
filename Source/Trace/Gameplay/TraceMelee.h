@@ -493,8 +493,8 @@ public:
 	// rule applied three times: every knife BONUS is scaled by 22/30, so the mobility package stays
 	// proportionate instead of the ground speed dropping while the ceilings keep their +30% values.
 	//     ground  0.30 x 22/30 = 0.220   -> 1.220
-	//     soft    0.25 x 22/30 = 0.18333 -> 1.18333   (1045 -> 1237, was 1306)
-	//     hard    0.35 x 22/30 = 0.25667 -> 1.25667   (1375 -> 1728, was 1856)
+	//     soft    0.25 x 22/30 = 0.18333 -> 1.18333   (1155 -> 1367; 1045 -> 1237 before 2026-10-04)
+	//     hard    0.35 x 22/30 = 0.25667 -> 1.25667   (1485 -> 1866; 1375 -> 1728 before 2026-10-04)
 	// The base caps there already include UTraceSettings::AirStrafeAsymptoteScale (x1.10); see
 	// Trace.Knife.DumpSettings, which prints the scaled bases for exactly this reason.
 	//

@@ -89,8 +89,9 @@ namespace TraceBotConstants
 	 * How far ahead the obstacle sweep looks, expressed as SECONDS OF TRAVEL and not as a distance.
 	 *
 	 * A probe has exactly one job: give the steering enough room to turn before the capsule arrives.
-	 * That is a time, not a length — WalkSpeed is 800 uu/s today and the carrier is faster still, and
-	 * a typed 280 would silently become half a probe the day either moves. Clamped below by
+	 * That is a time, not a length — WalkSpeed is 900 uu/s today (800 until 2026-10-04, which moved
+	 * every probe with no edit here) and the carrier is faster still, and a typed 280 would silently
+	 * become half a probe the day either moves. Clamped below by
 	 * ProbeLengthMin so a bot that has ALREADY stalled (speed ~0, and therefore lead ~0) still has a
 	 * probe to steer out of the stall with, which is the exact case this whole block exists for.
 	 */
@@ -321,9 +322,9 @@ namespace TraceBotConstants
 	 *
 	 * And running closer no longer rescues it. Approaching head-on the shot becomes legal at X 12442
 	 * (0.92 x Reach from the aim point) while CarryInCommitDistance latches the carry-in at X 12643
-	 * (4200 uu from the ring) - a *** 201 uu window, about 0.2 s at a carrier's 976 uu/s ***, which is
-	 * inside the bot's own reaction delay and aim slew. At the 3300 base the same two lines were
-	 * 1800 uu apart.
+	 * (4200 uu from the ring) - a *** 201 uu window, about 0.2 s at a carrier's 976 uu/s (0.18 s at
+	 * the 1098 of the 2026-10-04 walk) ***, which is inside the bot's own reaction delay and aim
+	 * slew. At the 3300 base the same two lines were 1800 uu apart.
 	 *
 	 * *** DO NOT "FIX" THIS BY LOWERING THIS GATE. *** 0.08 is a ragged-edge trim and the shot at 4800
 	 * uu is not near the edge of range, it is beyond it - a gate of 0.0 would still refuse it. The two
@@ -5579,7 +5580,15 @@ void ATraceBotController::UpdateMovementTech(float DeltaSeconds)
 	// Only while already moving fast in a straight line at something. Sliding sideways in a duel
 	// reads as a twitch; sliding down the field with the Core reads as intent, which is the whole
 	// reason to give a bot the verb.
-	if (!bCrouchHeld && Now >= SlideReadyTime && PlanarSpeed > FMath::Max(50.f, Settings.BotSlideMinSpeed))
+	//
+	// FLOORED AT THE MOVEMENT COMPONENT'S OWN ENTRY SPEED (CanStartSlide: SlideEntrySpeedFraction x
+	// WalkSpeed), derived rather than trusted to the knob. BotSlideMinSpeed (480) sat above that floor
+	// at the 800 walk (440) and fell below it when the walk went to 900 (495), so a bot slowing through
+	// 480-495 would press for a slide the rules refuse and spend its slide cooldown on nothing.
+	const float SlideEntryFloor =
+		FMath::Max(1.f, Settings.WalkSpeed) * FMath::Max(0.f, Settings.SlideEntrySpeedFraction);
+	const float BotSlideStartSpeed = FMath::Max3(50.f, Settings.BotSlideMinSpeed, SlideEntryFloor);
+	if (!bCrouchHeld && Now >= SlideReadyTime && PlanarSpeed > BotSlideStartSpeed)
 	{
 		const FVector Heading = BotVelocity.GetSafeNormal2D();
 		const bool bCommitted = !DesiredMoveDirection.IsNearlyZero()
@@ -7292,9 +7301,9 @@ bool ATraceBotController::FindTrailInterceptPointLegacy(FVector& OutPoint, FVect
 	//
 	// Same intent, expressed in the units the trace now lives in: skip the OLDEST stretch of the path,
 	// measured as a DISTANCE walked back from the tail. BotTrailMinPointLifeRemaining is still the
-	// "fraction of the trace written as an absolute" it has always been — 0.40s x WalkSpeed 800 =
-	// 320uu of the 1200uu trace, the same calibrated oldest-quarter it used to discard. It stays
-	// paired with the trace's size; if TrailMaxLengthUU moves, move this with it.
+	// "fraction of the trace written as an absolute" it has always been — 0.40s x WalkSpeed 900 =
+	// 360uu of the 1200uu trace (320uu at the old 800 walk), roughly the oldest quarter it used to
+	// discard. It stays paired with the trace's size; if TrailMaxLengthUU moves, move this with it.
 	const float TailSkipUU = FMath::Max(0.f, Settings.BotTrailMinPointLifeRemaining)
 		* FMath::Max(0.f, Settings.WalkSpeed);
 

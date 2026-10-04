@@ -1492,22 +1492,25 @@ namespace TraceMaceOysterVerify
 			{
 				// The same sweep, and it matters here too: the check below reads a stop inside 200 ms as
 				// the INPUT cancelling it, and says that "rules out a wall bounce". It only does if there
-				// is no wall in the first 550 uu (2750 uu/s x 0.2 s), so 1000 uu of the lane is swept.
+				// is no wall within 0.2 s of pull, so the swept lane is DERIVED from the live pull speed
+				// (half again for margin) and floored at the 1000 uu this rig always swept: 2970 uu/s x
+				// 0.2 s = 594 uu at the 2026-10-04 caps (550 at the old 1250 base), so 1000 still binds.
+				const float CancelLaneUU = FMath::Max(1000.f, MaceSet->GetPullSpeed() * 0.20f * 1.5f);
 				FMacePullLane Lane;
 				if (!FindClearMacePullLane(TickWorld, MyPawn, State->HomeLocation, MyPawn->GetActorRotation().Yaw,
-						1000.f, Lane))
+						CancelLaneUU, Lane))
 				{
 					UE_LOG(LogTraceGame, Display,
 						TEXT("[MACEVERIFY] --- ACTIVATED: \"ANY movement input cancels the pull and removes the spike\""));
 					State->Invalidate(FString::Printf(
-						TEXT("the cancel was not measured: no clear 1000 uu lane in %d candidates (first blocked by %s)"),
-						Lane.CandidatesTried, *Lane.FirstRefusal));
+						TEXT("the cancel was not measured: no clear %.0f uu lane in %d candidates (first blocked by %s)"),
+						CancelLaneUU, Lane.CandidatesTried, *Lane.FirstRefusal));
 					State->Phase = 10;
 					State->PhaseStartReal = NowReal;
 					return true;
 				}
 				StageOnLane(MyPawn, Lane);
-				ReportMacePullLane(TEXT("cancel"), Lane, 1000.f);
+				ReportMacePullLane(TEXT("cancel"), Lane, CancelLaneUU);
 				const FVector Anchor = Lane.Start + Lane.Direction * 3000.f;
 				MaceSet->DebugThrowSpikeAt(Anchor, 0.f);
 				MaceSet->RequestSpikePull();
@@ -1544,8 +1547,10 @@ namespace TraceMaceOysterVerify
 						State->CancelLatencySeconds * 1000.0));
 				// THE DISCRIMINATOR. The pull also cancels when it BOUNCES OFF A WALL, and "it stopped"
 				// alone cannot tell the two apart — which would let a wall three metres away pass this
-				// as an input cancel. The anchor is 3000 uu out and the pull runs at ~1375 uu/s, so a
-				// wall cannot be reached inside 200 ms; input cancels on the second tick.
+				// as an input cancel. The anchor is 3000 uu out and the pull runs at GetPullSpeed()
+				// (2970 uu/s at the shipped caps), and the lane swept in phase 8 is clear for longer than
+				// 200 ms of that, so a wall cannot be reached inside 200 ms; input cancels on the second
+				// tick.
 				State->Check(State->bCancelledByInput && State->CancelLatencySeconds >= 0.0 && State->CancelLatencySeconds < 0.20,
 					FString::Printf(TEXT("it cancelled within 200 ms (%.0f ms), which at %.0f uu/s toward an anchor 3000 uu away rules out a wall bounce"),
 						State->CancelLatencySeconds * 1000.0, MaceSet->GetPullSpeed()));

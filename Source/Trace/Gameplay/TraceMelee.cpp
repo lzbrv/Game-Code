@@ -2123,10 +2123,11 @@ namespace TraceMeleeConsole
 			// THE ASYMPTOTE SCALE IS PART OF THE BASE, and leaving it out made this command lie.
 			//
 			// Spec v9 §8 slid both air caps up by AirStrafeAsymptoteScale (x1.10), so the numbers the
-			// movement component actually starts from are 1045 and 1375, not the 950 and 1250 on this
-			// settings page. Printing the unscaled pair reported the knife's air ceiling as 1188/1688
-			// when the running game was using 1306/1856 — a tool whose entire purpose is "read it from
-			// a running game rather than from a header" quietly reporting the header's arithmetic.
+			// movement component actually starts from are 1155 and 1485, not the 1050 and 1350 on this
+			// settings page (1045 / 1375 against 950 / 1250 before the 2026-10-04 retune). Printing
+			// the unscaled pair reported the knife's air ceiling as 1188/1688 when the running game
+			// was using 1306/1856 — a tool whose entire purpose is "read it from a running game
+			// rather than from a header" quietly reporting the header's arithmetic.
 			const float Asymptote = FMath::Clamp(Move.AirStrafeAsymptoteScale, 0.5f, 2.f);
 			const float BaseSoft = Move.AirStrafeSoftCapSpeed * Asymptote;
 			const float BaseHard = Move.AirStrafeHardCapSpeed * Asymptote;
