@@ -82,6 +82,8 @@
 #include "Trace.h"
 #include "TraceSettings.h"
 #include "TraceTypes.h"
+#include "World/TraceArenaBuilder.h"
+#include "World/TraceArenaDimensions.h"
 
 #if !UE_BUILD_SHIPPING
 
@@ -242,6 +244,141 @@ namespace TraceMovementAuditV16
 			}
 		}
 		return false;
+	}
+
+	/**
+	 * The longest straight run @p Who's capsule has from @p From: which of FindClearLaneFrom's 24
+	 * headings, and how far along it the capsule travels before something blocks it, up to
+	 * @p MaxLength. The same sweep, channel and 40 uu lift as FindClearLaneFrom. The difference is
+	 * that this returns the DISTANCE rather than a yes or no against a length chosen in advance.
+	 *
+	 * @return the clear distance in uu (0 when every heading starts blocked).
+	 */
+	float LongestClearRunFrom(UWorld* World, const ATraceCharacter* Who, const FVector& From,
+	                          const float MaxLength, FVector& OutDirection)
+	{
+		const UCapsuleComponent* Capsule = (Who != nullptr) ? Who->GetCapsuleComponent() : nullptr;
+		if (World == nullptr || Capsule == nullptr || MaxLength <= 0.f)
+		{
+			return 0.f;
+		}
+
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceMovementAuditRun), false, Who);
+		const FCollisionShape Shape = FCollisionShape::MakeCapsule(
+			Capsule->GetScaledCapsuleRadius(), Capsule->GetScaledCapsuleHalfHeight());
+		const FVector Lifted = From + FVector(0.f, 0.f, 40.f);
+
+		float Longest = 0.f;
+		for (int32 Step = 0; Step < 24; ++Step)
+		{
+			const FVector Heading = FRotator(0.f, 15.f * static_cast<float>(Step), 0.f).Vector();
+			FHitResult Hit;
+			const bool bBlocked = World->SweepSingleByChannel(Hit, Lifted, Lifted + Heading * MaxLength,
+				FQuat::Identity, Capsule->GetCollisionObjectType(), Shape, Params);
+			const float Clear = !bBlocked ? MaxLength : (Hit.bStartPenetrating ? 0.f : Hit.Distance);
+			if (Clear > Longest)
+			{
+				Longest = Clear;
+				OutDirection = Heading;
+			}
+		}
+		return Longest;
+	}
+
+	/**
+	 * The field this world is playing on, wall to wall: from its ATraceArenaBuilder (both arena maps
+	 * have one), or TraceArenaDimensions' defaults when there is none.
+	 */
+	void LiveFieldSize(UWorld* World, float& OutLengthUU, float& OutWidthUU)
+	{
+		OutLengthUU = TraceArenaDimensions::kFieldLengthUU;
+		OutWidthUU = TraceArenaDimensions::kFieldWidthUU;
+		if (World == nullptr)
+		{
+			return;
+		}
+		TActorIterator<ATraceArenaBuilder> It(World);
+		if (It)
+		{
+			OutLengthUU = It->FieldLength;
+			OutWidthUU = It->FieldWidth;
+		}
+	}
+
+	/**
+	 * Where on the open floor of @p Who's own half the longest straight run starts, for the slide
+	 * chain (Trace.Move.AuditV16.SlideChain). It only looks; it moves nothing.
+	 *
+	 * THE CANDIDATES ARE FRACTIONS OF THE LIVE FIELD, not coordinates. They form a 5 x 5 grid over
+	 * the half: 0.25 to 0.85 of the half length, and the centre line plus 0.35 and 0.70 of the half
+	 * width either side. The width fractions stop short of the side-ramp toe. The size comes from
+	 * the ATraceArenaBuilder in the world, or from TraceArenaDimensions when there is none. A
+	 * resized field moves every candidate with it.
+	 *
+	 * A candidate counts only when it is open, level floor at the height @p Who stands on. The floor
+	 * under it must be within 30 uu of @p Who's own floor and flat, so a spot on top of a cover block
+	 * or part-way up a ramp is skipped. The capsule must also fit there without touching anything.
+	 */
+	bool FindSlideChainStage(UWorld* World, const ATraceCharacter* Who, const float MaxLength,
+	                         FVector& OutSpot, float& OutRun)
+	{
+		const UCapsuleComponent* Capsule = (Who != nullptr) ? Who->GetCapsuleComponent() : nullptr;
+		if (World == nullptr || Capsule == nullptr)
+		{
+			return false;
+		}
+
+		float FieldLengthUU = 0.f;
+		float FieldWidthUU = 0.f;
+		LiveFieldSize(World, FieldLengthUU, FieldWidthUU);
+
+		static constexpr float StageLengthFracs[] = { 0.85f, 0.70f, 0.55f, 0.40f, 0.25f };
+		static constexpr float StageWidthFracs[] = { 0.f, 0.35f, -0.35f, 0.70f, -0.70f };
+
+		const FVector Standing = Who->GetActorLocation();
+		const float CapsuleHalf = Capsule->GetScaledCapsuleHalfHeight();
+		const float StandingFloorZ = Standing.Z - CapsuleHalf;
+		const float OwnSide = (Standing.X > 0.f) ? 1.f : -1.f;
+		const ECollisionChannel Channel = Capsule->GetCollisionObjectType();
+		const FCollisionShape Shape = FCollisionShape::MakeCapsule(Capsule->GetScaledCapsuleRadius(), CapsuleHalf);
+		FCollisionQueryParams Params(SCENE_QUERY_STAT(TraceMovementAuditStage), false, Who);
+
+		bool bFound = false;
+		OutRun = 0.f;
+		for (const float LengthFrac : StageLengthFracs)
+		{
+			for (const float WidthFrac : StageWidthFracs)
+			{
+				const float SpotX = OwnSide * LengthFrac * 0.5f * FieldLengthUU;
+				const float SpotY = WidthFrac * 0.5f * FieldWidthUU;
+
+				FHitResult FloorHit;
+				if (!World->LineTraceSingleByChannel(FloorHit,
+						FVector(SpotX, SpotY, StandingFloorZ + 300.f), FVector(SpotX, SpotY, StandingFloorZ - 300.f),
+						Channel, Params)
+					|| FMath::Abs(FloorHit.ImpactPoint.Z - StandingFloorZ) > 30.f
+					|| FloorHit.ImpactNormal.Z < 0.99f)
+				{
+					continue;
+				}
+
+				const FVector Spot(SpotX, SpotY, FloorHit.ImpactPoint.Z + CapsuleHalf + 2.f);
+				if (World->OverlapBlockingTestByChannel(Spot, FQuat::Identity, Channel, Shape, Params))
+				{
+					continue;
+				}
+
+				FVector Heading = FVector::ForwardVector;
+				const float Run = LongestClearRunFrom(World, Who, Spot, MaxLength, Heading);
+				if (Run > OutRun)
+				{
+					OutRun = Run;
+					OutSpot = Spot;
+					bFound = true;
+				}
+			}
+		}
+		return bFound;
 	}
 
 	UTraceAbilityComponent* FirstHumanAbilityComponent(UWorld* World);
@@ -2391,11 +2528,19 @@ namespace TraceMovementAuditV16
 	//     read at the press and printed, so this is visible rather than assumed.
 	//   * the lane is swept before the run starts. Four chained hops cover thousands of uu, and a
 	//     pawn that puts its face into midfield cover on hop 2 reports a beautifully capped hop 3.
+	//   * every launch must be ON THE SWEPT LANE. Where each launch was sampled is recorded as a
+	//     distance down the lane. A hop launched past the end of the swept stretch is INVALID, because
+	//     nothing proved that ground clear. That check was missing when the 2026-10-04 field change
+	//     made the spawn's longest lane 6000 uu: the run went past the end of it, into the side ramp,
+	//     and reported only "hop 4's window never opened". Phase 0 explains how the lane is chosen.
 	// =============================================================================================
 
 	struct FSlideChainState
 	{
 		static constexpr int32 MaxHops = 4;
+
+		/** Phase 1's settle time before hop 1: the run-up the chain starts from. See phase 1. */
+		static constexpr float RunUpSeconds = 1.6f;
 
 		int32 Phase = 0;
 		float PhaseTime = 0.f;
@@ -2404,7 +2549,10 @@ namespace TraceMovementAuditV16
 		TWeakObjectPtr<ATraceCharacter> Pawn;
 		FVector RunDirection = FVector::ForwardVector;
 		FVector Home = FVector::ZeroVector;
+		/** How far down RunDirection the capsule sweep from Home proved clear, uu. */
 		float LaneLength = 0.f;
+		/** Set once phase 0 has looked for a better staging spot, so the pawn is moved at most once. */
+		bool bStageSearched = false;
 
 		int32 HopIndex = 0;   // hops completed so far; also the index being filled
 
@@ -2418,6 +2566,9 @@ namespace TraceMovementAuditV16
 		int32 ChainAtPress[MaxHops] = {};
 		/** The chain's measured ceiling after the hop, or 0 if none is recorded yet. */
 		float Ceiling[MaxHops] = {};
+		/** Where the launch was sampled: uu from Home along RunDirection, and off that line sideways. */
+		float LaunchAlong[MaxHops] = {};
+		float LaunchAside[MaxHops] = {};
 		bool  bWellTimed[MaxHops] = {};
 		bool  bValid[MaxHops] = {};
 
@@ -2458,6 +2609,16 @@ namespace TraceMovementAuditV16
 			TEXT("AUDITV16 run-up top speed %.0f uu/s over a %.0f uu swept lane; %d chain break(s) between hops."),
 			State.RunUpTop, State.LaneLength, State.ChainBreaks);
 
+		// THE LANE CHECK. A hop counts only if its launch was sampled on ground the sweep proved
+		// clear. Past the end of the swept stretch the pawn may already be running along a wall or up
+		// a ramp, and the number would describe the arena rather than the chain. Every verdict below
+		// reads bOnLane, not bValid.
+		bool bOnLane[FSlideChainState::MaxHops] = {};
+		for (int32 Hop = 0; Hop < FSlideChainState::MaxHops; ++Hop)
+		{
+			bOnLane[Hop] = State.bValid[Hop] && State.LaunchAlong[Hop] <= State.LaneLength;
+		}
+
 		float PreviousLaunch = 0.f;
 		for (int32 Hop = 0; Hop < FSlideChainState::MaxHops; ++Hop)
 		{
@@ -2465,6 +2626,15 @@ namespace TraceMovementAuditV16
 			{
 				RowInvalid(*FString::Printf(TEXT("SLIDEJUMP chain hop %d"), Hop + 1),
 					TEXT("the hop was never taken — see the warnings above for which phase gave up"));
+				continue;
+			}
+			if (!bOnLane[Hop])
+			{
+				RowInvalid(*FString::Printf(TEXT("SLIDEJUMP chain hop %d"), Hop + 1),
+					*FString::Printf(TEXT("launched %.0f uu down a lane swept clear for only %.0f uu (launch "
+					                      "%.1f uu/s, %.0f uu off the line). Nothing proved that ground clear, so "
+					                      "this is not counted. Stage on a longer lane."),
+						State.LaunchAlong[Hop], State.LaneLength, State.Launch[Hop], State.LaunchAside[Hop]));
 				continue;
 			}
 
@@ -2490,6 +2660,9 @@ namespace TraceMovementAuditV16
 						State.Launch[Hop] - PreviousLaunch,
 						100.f * (State.Launch[Hop] - PreviousLaunch) / FMath::Max(1.f, PreviousLaunch))
 					: TEXT(""));
+			UE_LOG(LogTraceGame, Display,
+				TEXT("AUDITV16 |       launched %7.0f uu down the %.0f uu lane, %.0f uu off its line"),
+				State.LaunchAlong[Hop], State.LaneLength, State.LaunchAside[Hop]);
 
 			PreviousLaunch = State.Launch[Hop];
 		}
@@ -2519,7 +2692,7 @@ namespace TraceMovementAuditV16
 		int32 CeilingHop = INDEX_NONE;
 		for (int32 Hop = 0; Hop < FMath::Min(CapBoosts, FSlideChainState::MaxHops); ++Hop)
 		{
-			if (State.bValid[Hop] && State.Launch[Hop] > CeilingFromFirstN)
+			if (bOnLane[Hop] && State.Launch[Hop] > CeilingFromFirstN)
 			{
 				CeilingFromFirstN = State.Launch[Hop];
 				CeilingHop = Hop;
@@ -2536,9 +2709,10 @@ namespace TraceMovementAuditV16
 		{
 			const FString RowName = FString::Printf(TEXT("v26 §3b hop %d <= ceiling (cap %d)"), Hop + 1, CapBoosts);
 
-			if (!State.bValid[Hop] || CeilingHop == INDEX_NONE)
+			if (!bOnLane[Hop] || CeilingHop == INDEX_NONE)
 			{
-				RowInvalid(*RowName, TEXT("that hop, or the ceiling hop it is compared against, was never taken"));
+				RowInvalid(*RowName, TEXT("that hop, or the ceiling hop it is compared against, was never taken "
+				                          "or was launched off the swept lane (see its row above)"));
 				continue;
 			}
 
@@ -2553,7 +2727,10 @@ namespace TraceMovementAuditV16
 					: TEXT("ceiling OFF (RED arm) — a PASS here means the harness measured nothing"));
 		}
 
-		if (CappedRowsPrinted == 0)
+		// Only when the KNOB is the reason. With N < MaxHops a missing capped row means a hop was lost,
+		// and its own INVALID row above already says which one and why. Blaming the knob there sent
+		// the 2026-10-04 reader to the wrong setting.
+		if (CappedRowsPrinted == 0 && CapBoosts >= FSlideChainState::MaxHops)
 		{
 			// N >= MaxHops. Four hops cannot demonstrate a ceiling that only bites on the fifth, and
 			// saying so is the honest report — a run with no capped hop in it is not a green run.
@@ -2581,8 +2758,8 @@ namespace TraceMovementAuditV16
 		State->Deadline = FPlatformTime::Seconds() + 120.0;
 
 		UE_LOG(LogTraceGame, Display,
-			TEXT("AUDITV16 ===== slide chain starting: four consecutive well-timed slide-jumps, no "
-			     "teleports, no velocity writes. ====="));
+			TEXT("AUDITV16 ===== slide chain starting: four consecutive well-timed slide-jumps. Staging "
+			     "may move the pawn once; the chain itself has no teleports and no velocity writes. ====="));
 
 		FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateLambda(
 			[State, WeakWorld = TWeakObjectPtr<UWorld>(World)](float Delta) -> bool
@@ -2646,6 +2823,23 @@ namespace TraceMovementAuditV16
 			// hop 2 reports a beautifully capped hop 3 that is really a measurement of a wall, which is
 			// the exact failure mode FindClearLaneFrom exists for — so the longest clear lane is found
 			// FIRST and the whole chain runs down it.
+			//
+			// THE LONGEST RUN ON THE FIELD, NOT THE FIRST ONE FROM THE SPAWN THAT CLEARS A LENGTH CHOSEN
+			// IN ADVANCE. This phase used to try 16000, 12000, 9000, 6000 and then 4000 uu from wherever
+			// the pawn spawned, and run down the first that was clear. On the 38400 field that was a
+			// 4000 uu lane heading +X, and it passed because the ground past its end happened to be
+			// open. The 2026-10-04 field change (42240 x 10560) spawns the pawn deeper in the pocket,
+			// behind its own goal (X -20604). From there +X meets the goal 1884 uu away, and the best
+			// heading was a 6000 uu diagonal toward the side wall. Hops 1-3 used it up, the pawn was
+			// turned along the side-ramp toe, and hop 4 never happened, on every run on the shipping map.
+			//
+			// So the lane is now MEASURED, not picked from a list. LongestClearRunFrom gives each
+			// heading's clear distance, up to the field's own length. On the host the pawn is moved once
+			// to whichever spot on its half's open floor has the longest run (FindSlideChainStage, a
+			// grid of field fractions), but only if that beats where it stands. After that the report
+			// checks every launch against the swept length, so a lane that is still too short is
+			// reported INVALID and never read as a number. A client cannot be moved without a server
+			// correction, so it runs from where it stands, as before.
 			case 0:
 			{
 				if (!Move->IsMovingOnGround())
@@ -2653,40 +2847,57 @@ namespace TraceMovementAuditV16
 					return true;
 				}
 
-				State->Home = Pawn->GetActorLocation();
+				float FieldLengthUU = 0.f;
+				float FieldWidthUU = 0.f;
+				LiveFieldSize(TickWorld, FieldLengthUU, FieldWidthUU);
 
-				const float Wanted[] = { 16000.f, 12000.f, 9000.f, 6000.f, 4000.f };
-				for (const float Length : Wanted)
+				FVector HereHeading = FVector::ForwardVector;
+				const FVector Here = Pawn->GetActorLocation();
+				const float HereRun = LongestClearRunFrom(TickWorld, Pawn, Here, FieldLengthUU, HereHeading);
+
+				if (!State->bStageSearched)
 				{
-					FVector Lane;
-					if (FindClearLaneFrom(TickWorld, Pawn, Length, Lane))
+					State->bStageSearched = true;
+					FVector Spot = FVector::ZeroVector;
+					float SpotRun = 0.f;
+					if (Pawn->HasAuthority()
+						&& FindSlideChainStage(TickWorld, Pawn, FieldLengthUU, Spot, SpotRun)
+						&& SpotRun > HereRun)
 					{
-						State->RunDirection = Lane;
-						State->LaneLength = Length;
-						break;
+						UE_LOG(LogTraceGame, Display,
+							TEXT("AUDITV16 slide chain: the longest straight run from where the pawn stands, %s, "
+							     "is %.0f uu; moving it to %s on the open floor, where it is %.0f uu (field "
+							     "%.0f x %.0f)."),
+							*Here.ToCompactString(), HereRun, *Spot.ToCompactString(), SpotRun,
+							FieldLengthUU, FieldWidthUU);
+						Pawn->SetActorLocation(Spot, false, nullptr, ETeleportType::TeleportPhysics);
+						Move->Velocity = FVector::ZeroVector;
+						// Sweep again next frame from where it actually stands: that is the lane the
+						// report checks against.
+						return true;
 					}
 				}
 
-				if (State->LaneLength <= 0.f)
+				// The run-up alone, before hop 1 can even be pressed: phase 1's settle time at the walk.
+				const float RunUpReach = FSlideChainState::RunUpSeconds * FMath::Max(1.f, UTraceSettings::Get().WalkSpeed);
+				if (HereRun < RunUpReach)
 				{
-					// Shuffle toward midfield and try again — the same recovery the dash phase uses.
-					if (State->PhaseTime > 8.f)
-					{
-						UE_LOG(LogTraceGame, Warning,
-							TEXT("AUDITV16 slide chain: no clear lane of even 4000 uu from %s. A chain "
-							     "cannot be measured here."), *State->Home.ToCompactString());
-						ReportSlideChain(*State);
-						return false;
-					}
-					FVector Toward = -Pawn->GetActorLocation();
-					Toward.Z = 0.f;
-					if (Pawn->HasAuthority() && Toward.Normalize())
-					{
-						Pawn->SetActorLocation(Pawn->GetActorLocation() + Toward * 1200.f,
-							false, nullptr, ETeleportType::TeleportPhysics);
-					}
-					return true;
+					UE_LOG(LogTraceGame, Warning,
+						TEXT("AUDITV16 slide chain: the longest straight run from %s is %.0f uu, shorter than "
+						     "the %.0f uu run-up before hop 1 (%.1f s at WalkSpeed %.0f). %s"),
+						*Here.ToCompactString(), HereRun, RunUpReach, FSlideChainState::RunUpSeconds,
+						UTraceSettings::Get().WalkSpeed,
+						Pawn->HasAuthority()
+							? TEXT("No open spot on this half did better. A chain cannot be measured here.")
+							: TEXT("This is a client and cannot be moved without a server correction; run it "
+							       "on the host."));
+					ReportSlideChain(*State);
+					return false;
 				}
+
+				State->Home = Here;
+				State->RunDirection = HereHeading;
+				State->LaneLength = HereRun;
 
 				if (APlayerController* PC = Cast<APlayerController>(Pawn->GetController()))
 				{
@@ -2739,7 +2950,8 @@ namespace TraceMovementAuditV16
 				// the last hundredth never arrives. 1.6 s is the same settle time the core-kit audit's
 				// slide phases use, and it is what makes the two harnesses' entry speeds comparable.
 				const bool bRunUpDone = (Hop > 0)
-					|| (State->PhaseTime > 1.6f && Planar >= 0.98f * FMath::Max(1.f, Move->GetMaxSpeed()));
+					|| (State->PhaseTime > FSlideChainState::RunUpSeconds
+						&& Planar >= 0.98f * FMath::Max(1.f, Move->GetMaxSpeed()));
 
 				if (Move->IsMovingOnGround()
 					&& Move->GetSlideCooldownRemaining() <= 0.f
@@ -2792,10 +3004,13 @@ namespace TraceMovementAuditV16
 
 				if (!Move->IsSlideJumpAvailable() || State->PhaseTime > 4.f)
 				{
+					const FVector StuckFromHome = Pawn->GetActorLocation() - State->Home;
 					UE_LOG(LogTraceGame, Warning,
 						TEXT("AUDITV16 slide chain: hop %d's window never opened (available=%d, %.2fs of "
-						     "slide left)."),
-						Hop + 1, Move->IsSlideJumpAvailable() ? 1 : 0, Move->GetSlideTimeLeftForAudit());
+						     "slide left), %.0f uu down the %.0f uu lane."),
+						Hop + 1, Move->IsSlideJumpAvailable() ? 1 : 0, Move->GetSlideTimeLeftForAudit(),
+						FVector::DotProduct(FVector(StuckFromHome.X, StuckFromHome.Y, 0.f), State->RunDirection),
+						State->LaneLength);
 					ReportSlideChain(*State);
 					return false;
 				}
@@ -2819,12 +3034,19 @@ namespace TraceMovementAuditV16
 						State->Launch[Hop] = Planar;
 						State->Ceiling[Hop] = Move->GetSlideJumpChainCeilingForAudit();
 						State->bValid[Hop] = true;
+
+						// Where, for the report's lane check. RunDirection is level and unit length, so
+						// the dot is the distance down the lane and the cross's Z is the sideways miss.
+						const FVector LaunchFromHome = Pawn->GetActorLocation() - State->Home;
+						const FVector LaunchFlat(LaunchFromHome.X, LaunchFromHome.Y, 0.f);
+						State->LaunchAlong[Hop] = FVector::DotProduct(LaunchFlat, State->RunDirection);
+						State->LaunchAside[Hop] = FMath::Abs(FVector::CrossProduct(State->RunDirection, LaunchFlat).Z);
 						Pawn->StopJumping();
 						UE_LOG(LogTraceGame, Display,
 							TEXT("AUDITV16 slide chain hop %d: carry %.0f -> launch %.0f uu/s "
-							     "(chain depth was %d, ceiling now %.0f)"),
+							     "(chain depth was %d, ceiling now %.0f), %.0f uu down the lane"),
 							Hop + 1, State->Carry[Hop], State->Launch[Hop], State->ChainAtPress[Hop],
-							State->Ceiling[Hop]);
+							State->Ceiling[Hop], State->LaunchAlong[Hop]);
 					}
 
 					State->AirTop[Hop] = FMath::Max(State->AirTop[Hop], Planar);
