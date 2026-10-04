@@ -80,12 +80,12 @@ goto :parse
 
 :o_budget
 if "%~2"=="" goto :need_budget_value
-call "%~dp0_trace_common.bat" warn "--budget is ignored on Windows: this script waits for the game to quit on its own."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "--budget is ignored on Windows: this script waits for the game to quit on its own."
 shift
 shift
 goto :parse
 :need_budget_value
-call "%~dp0_trace_common.bat" err "--budget needs a value"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--budget needs a value"
 exit /b 2
 
 :o_dryrun
@@ -98,13 +98,13 @@ call :usage
 exit /b 0
 
 :two_paths
-call "%~dp0_trace_common.bat" err "One output path only; got '!OUT!' and '!_a!'."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "One output path only; got '!OUT!' and '!_a!'."
 echo(
 call :usage
 exit /b 2
 
 :unknown_option
-call "%~dp0_trace_common.bat" err "Unknown option: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unknown option: !_a!"
 echo(
 call :usage
 exit /b 2
@@ -120,13 +120,13 @@ rem ----------------------------------------------------------------------------
 if not defined OUT set "OUT=%TRACE_PROJECT_ROOT%\docs\TraceStats.csv"
 set "OUT=!OUT:/=\!"
 if exist "!OUT!\" (
-    call "%~dp0_trace_common.bat" err "!OUT! is a folder. Give a file name, e.g. !OUT!\TraceStats.csv"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "!OUT! is a folder. Give a file name, e.g. !OUT!\TraceStats.csv"
     exit /b 1
 )
 for %%I in ("!OUT!") do set "OUT_DIR=%%~dpI"
 if not exist "!OUT_DIR!" mkdir "!OUT_DIR!" >nul 2>&1
 if not exist "!OUT_DIR!" (
-    call "%~dp0_trace_common.bat" err "Cannot create the folder for the sheet: !OUT_DIR!"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Cannot create the folder for the sheet: !OUT_DIR!"
     exit /b 1
 )
 
@@ -139,18 +139,18 @@ rem ----------------------------------------------------------------------------
 rem  Pre-flight. Each of these otherwise fails INSIDE the game, as a headless run
 rem  that never reaches the dump and leaves nothing on screen to explain why.
 rem -----------------------------------------------------------------------------
-call "%~dp0_trace_common.bat" require_uproject
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" require_uproject
 if errorlevel 1 exit /b 1
-call "%~dp0_trace_common.bat" resolve_engine
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" resolve_engine
 if errorlevel 1 exit /b 1
 
 if "%DO_BUILD%"=="1" (
-    call "%~dp0_trace_common.bat" msg "Building the editor target first (--build)"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Building the editor target first (--build)"
     call "%TRACE_SCRIPT_DIR%\build.bat" --target TraceEditor --config Development
     if errorlevel 1 exit /b 1
 )
 
-call "%~dp0_trace_common.bat" editor_binary
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" editor_binary
 if errorlevel 1 exit /b 1
 
 rem --- the map, and Git LFS -----------------------------------------------------
@@ -161,9 +161,9 @@ rem  broken packages, the map never loads as a match, and the dump never runs.
 set "MAP_REL=!MAP:~6!"
 set "MAP_REL=!MAP_REL:/=\!"
 if not exist "%TRACE_PROJECT_ROOT%\Content\!MAP_REL!.umap" (
-    call "%~dp0_trace_common.bat" err "The map is missing: Content\!MAP_REL!.umap"
-    call "%~dp0_trace_common.bat" err "It is committed (in Git LFS), so this clone is incomplete. From the repo:"
-    call "%~dp0_trace_common.bat" err "    git lfs install && git lfs pull        (first time: Scripts\setup-lfs.bat)"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The map is missing: Content\!MAP_REL!.umap"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "It is committed (in Git LFS), so this clone is incomplete. From the repo:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "    git lfs install && git lfs pull        (first time: Scripts\setup-lfs.bat)"
     exit /b 1
 )
 set "LFS_COUNT=0"
@@ -178,10 +178,10 @@ for /r "%TRACE_PROJECT_ROOT%\Content" %%F in (*.uasset *.umap) do (
     )
 )
 if !LFS_COUNT! GTR 0 (
-    call "%~dp0_trace_common.bat" err "!LFS_COUNT! asset(s) under Content\ are Git LFS POINTER files, not the real assets. For example:"
-    call "%~dp0_trace_common.bat" err "    !LFS_FIRST!"
-    call "%~dp0_trace_common.bat" err "The game cannot load the arena from those. Fetch the real files, from the repo:"
-    call "%~dp0_trace_common.bat" err "    git lfs install && git lfs pull        (first time: Scripts\setup-lfs.bat)"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "!LFS_COUNT! asset(s) under Content\ are Git LFS POINTER files, not the real assets. For example:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "    !LFS_FIRST!"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The game cannot load the arena from those. Fetch the real files, from the repo:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "    git lfs install && git lfs pull        (first time: Scripts\setup-lfs.bat)"
     exit /b 1
 )
 
@@ -202,12 +202,12 @@ if exist "%MODULES_FILE%" (
 )
 if not defined MODULE_LIB (
     if "%TRACE_DRY_RUN%"=="1" (
-        call "%~dp0_trace_common.bat" warn "No editor build of %TRACE_PROJECT_NAME% yet (Binaries\%TRACE_HOST_PLATFORM%\UnrealEditor.modules); a real run would stop here."
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "No editor build of %TRACE_PROJECT_NAME% yet (Binaries\%TRACE_HOST_PLATFORM%\UnrealEditor.modules); a real run would stop here."
     ) else (
-        call "%~dp0_trace_common.bat" err "There is no editor build of %TRACE_PROJECT_NAME% on this machine:"
-        call "%~dp0_trace_common.bat" err "    Binaries\%TRACE_HOST_PLATFORM%\UnrealEditor.modules is missing, or the DLL it names is."
-        call "%~dp0_trace_common.bat" err "The stats are read out of the running game, so build it first:"
-        call "%~dp0_trace_common.bat" err "    Scripts\build.bat               (or: Scripts\dump-stats.bat --build)"
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "There is no editor build of %TRACE_PROJECT_NAME% on this machine:"
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "    Binaries\%TRACE_HOST_PLATFORM%\UnrealEditor.modules is missing, or the DLL it names is."
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The stats are read out of the running game, so build it first:"
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "    Scripts\build.bat               (or: Scripts\dump-stats.bat --build)"
         exit /b 1
     )
 )
@@ -235,16 +235,16 @@ rem expanded late (!...!), never parsed by cmd as pipes.
 set "EXEC_LIST=Trace.DumpStats !GAME_PATH!|Trace.VerifyStats !GAME_PATH!|quit"
 set "TRACE_CMD="!TRACE_EDITOR_BIN!" "!TRACE_UPROJECT!" !URL! -game -log -nullrhi -RenderOffScreen -unattended -nosound -nosplash -TraceExec="!EXEC_LIST!" -TraceExecAt=6 -TraceExecOn=Match -abslog="!LOG!""
 
-call "%~dp0_trace_common.bat" msg "Writing every stat in the game to !OUT!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Writing every stat in the game to !OUT!"
 if "%TRACE_DRY_RUN%"=="1" (
-    call "%~dp0_trace_common.bat" run
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" run
     exit /b 0
 )
 
 if not exist "!LOG_DIR!" mkdir "!LOG_DIR!" >nul 2>&1
 if exist "!LOG!" del /q "!LOG!" >nul 2>&1
-call "%~dp0_trace_common.bat" msg "The game runs headless (a log window may open); this waits for it to quit, usually under a minute."
-call "%~dp0_trace_common.bat" run
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "The game runs headless (a log window may open); this waits for it to quit, usually under a minute."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" run
 set "GAME_RC=!errorlevel!"
 
 rem -----------------------------------------------------------------------------
@@ -273,8 +273,8 @@ if defined DUMP_VERDICT set "DUMP_SHOW=!DUMP_VERDICT:[DumpStats] =!"
 if defined VERIFY_VERDICT set "VERIFY_SHOW=!VERIFY_VERDICT:[VerifyStats] =!"
 
 echo(
-call "%~dp0_trace_common.bat" msg "Trace.DumpStats    !DUMP_SHOW!"
-call "%~dp0_trace_common.bat" msg "Trace.VerifyStats  !VERIFY_SHOW!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Trace.DumpStats    !DUMP_SHOW!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Trace.VerifyStats  !VERIFY_SHOW!"
 if exist "%LOG%" (
     for /f "delims=" %%L in ('findstr /l /c:"[DumpStats]   MISSING" "%LOG%" 2^>nul') do (
         set "_l=%%L"
@@ -291,12 +291,12 @@ set "ROWS="
 if defined ROWS_LINE for /f "tokens=1" %%R in ("!ROWS_LINE:*[DumpStats] =!") do set "ROWS=%%R"
 echo(
 if defined ROWS (
-    call "%~dp0_trace_common.bat" msg "Wrote !OUT!  (!ROWS! rows)"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Wrote !OUT!  (!ROWS! rows)"
 ) else (
-    call "%~dp0_trace_common.bat" msg "Wrote !OUT!"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Wrote !OUT!"
 )
-if /i "!GAME_PATH!"=="docs/TraceStats.csv" call "%~dp0_trace_common.bat" msg "That is the committed copy: 'git diff --stat docs/TraceStats.csv' shows whether anything moved."
-call "%~dp0_trace_common.bat" msg "Google Sheets: File > Import > Upload, then Replace spreadsheet."
+if /i "!GAME_PATH!"=="docs/TraceStats.csv" call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "That is the committed copy: 'git diff --stat docs/TraceStats.csv' shows whether anything moved."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Google Sheets: File > Import > Upload, then Replace spreadsheet."
 if defined STALE_SOURCE (
     echo(
     call :warn_stale
@@ -308,41 +308,41 @@ rem  It failed. Say why, as specifically as the log allows.
 rem -----------------------------------------------------------------------------
 :failure
 echo(
-call "%~dp0_trace_common.bat" err "No usable sheet. !OUT! was not written and checked by this run."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "No usable sheet. !OUT! was not written and checked by this run."
 if not exist "%LOG%" (
-    call "%~dp0_trace_common.bat" err "The game never got as far as writing a log (exit code !GAME_RC!)."
-    call "%~dp0_trace_common.bat" err "Run the command printed above by hand to see what it says."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The game never got as far as writing a log (exit code !GAME_RC!)."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Run the command printed above by hand to see what it says."
     exit /b 1
 )
 findstr /l /c:"could not be found" /c:"Incompatible or missing module" /c:"modules are missing or built with a different engine" "%LOG%" >nul 2>&1
 if not errorlevel 1 (
-    call "%~dp0_trace_common.bat" err "The editor build of %TRACE_PROJECT_NAME% would not load - missing, or built for another engine."
-    call "%~dp0_trace_common.bat" err "    Scripts\build.bat               (or: Scripts\dump-stats.bat --build)"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The editor build of %TRACE_PROJECT_NAME% would not load - missing, or built for another engine."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "    Scripts\build.bat               (or: Scripts\dump-stats.bat --build)"
     goto :fail_tail
 )
 findstr /l /c:"Failed to load map" /c:"Couldn't find file for package !MAP!" "%LOG%" >nul 2>&1
 if not errorlevel 1 (
-    call "%~dp0_trace_common.bat" err "The map !MAP! did not load. If git has it as LFS pointers: git lfs pull"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The map !MAP! did not load. If git has it as LFS pointers: git lfs pull"
     goto :fail_tail
 )
 findstr /l /c:"[AutoExec] Armed" "%LOG%" >nul 2>&1
 if errorlevel 1 (
-    call "%~dp0_trace_common.bat" err "The match never started, so the dump was never run."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The match never started, so the dump was never run."
     goto :fail_tail
 )
 if not defined DUMP_VERDICT (
-    call "%~dp0_trace_common.bat" err "The match started but Trace.DumpStats did not run. Is this a Shipping or Test build? The command"
-    call "%~dp0_trace_common.bat" err "exists in Development/DebugGame editor builds only."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The match started but Trace.DumpStats did not run. Is this a Shipping or Test build? The command"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "exists in Development/DebugGame editor builds only."
     goto :fail_tail
 )
 if "!DUMP_OK!"=="0" (
-    call "%~dp0_trace_common.bat" err "The dump ran but is INCOMPLETE: a knob or settings class it reads by name is gone (listed above)."
-    call "%~dp0_trace_common.bat" err "The cells that needed it say MISSING KNOB instead of a number. Fix the name in"
-    call "%~dp0_trace_common.bat" err "Source\Trace\Debug\TraceStatsDump.cpp and run this again."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The dump ran but is INCOMPLETE: a knob or settings class it reads by name is gone (listed above)."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The cells that needed it say MISSING KNOB instead of a number. Fix the name in"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Source\Trace\Debug\TraceStatsDump.cpp and run this again."
     goto :fail_tail
 )
 if "!VERIFY_OK!"=="0" (
-    call "%~dp0_trace_common.bat" err "The file was written but does not parse as a clean table:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The file was written but does not parse as a clean table:"
     for /f "delims=" %%L in ('findstr /l /c:"[VerifyStats]" "%LOG%" 2^>nul') do (
         set "_l=%%L"
         call :strip_prefix _l
@@ -353,19 +353,19 @@ if "!VERIFY_OK!"=="0" (
 set "_n=0"
 for /f "delims=" %%L in ('findstr /l /c:"Error:" /c:"Fatal:" "%LOG%" 2^>nul ^| findstr /v /l /c:"UnifiedErrorTest"') do (
     if !_n! LSS 8 (
-        if !_n! EQU 0 call "%~dp0_trace_common.bat" err "First errors in the log:"
+        if !_n! EQU 0 call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "First errors in the log:"
         set "_l=%%L"
         call :strip_prefix _l
         >&2 echo     !_l!
     )
     set /a _n+=1
 )
-call "%~dp0_trace_common.bat" err "Full log: %LOG%"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Full log: %LOG%"
 exit /b 1
 
 rem -----------------------------------------------------------------------------
-rem  Subroutines. Inside a CALLed label %~dp0 is not dependable (see
-rem  _trace_common.bat), so these reach the library through TRACE_SCRIPT_DIR.
+rem  Subroutines. Like every line after init, these reach the library through
+rem  TRACE_SCRIPT_DIR, never %~dp0 (see the top of _trace_common.bat).
 rem -----------------------------------------------------------------------------
 
 rem  strip_prefix <var> - "[2026.10.04-14.36.38:879][875]LogTraceGame: Display: [DumpStats] ..."

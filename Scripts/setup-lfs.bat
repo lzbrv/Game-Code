@@ -61,7 +61,7 @@ call :usage
 exit /b 0
 
 :unknown_option
-call "%~dp0_trace_common.bat" err "Unknown option: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unknown option: !_a!"
 echo(
 call :usage
 exit /b 2
@@ -73,9 +73,9 @@ rem  1. git
 rem -----------------------------------------------------------------------------
 where git >nul 2>&1
 if errorlevel 1 (
-    call "%~dp0_trace_common.bat" err "git is not installed or not on PATH."
-    call "%~dp0_trace_common.bat" err "  winget install Git.Git"
-    call "%~dp0_trace_common.bat" err "  Manual:  https://git-scm.com/download/win"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "git is not installed or not on PATH."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  winget install Git.Git"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  Manual:  https://git-scm.com/download/win"
     exit /b 1
 )
 
@@ -83,9 +83,9 @@ pushd "%TRACE_PROJECT_ROOT%" || exit /b 1
 
 git rev-parse --git-dir >nul 2>&1
 if errorlevel 1 (
-    call "%~dp0_trace_common.bat" err "%TRACE_PROJECT_ROOT% is not a Git repository yet."
-    call "%~dp0_trace_common.bat" err ""
-    call "%~dp0_trace_common.bat" err "Start one, then re-run this script:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "%TRACE_PROJECT_ROOT% is not a Git repository yet."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err ""
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Start one, then re-run this script:"
     call :raw_err_git_init
     popd
     exit /b 1
@@ -95,9 +95,9 @@ for /f "usebackq delims=" %%R in (`git rev-parse --show-toplevel 2^>nul`) do set
 rem git prints forward slashes; normalise before comparing with the batch path.
 if defined REPO_ROOT set "REPO_ROOT=!REPO_ROOT:/=\!"
 if /i not "!REPO_ROOT!"=="%TRACE_PROJECT_ROOT%" (
-    call "%~dp0_trace_common.bat" warn "Git root (!REPO_ROOT!) is not the project root (%TRACE_PROJECT_ROOT%)."
-    call "%~dp0_trace_common.bat" warn "LFS patterns in %TRACE_PROJECT_ROOT%\.gitattributes still apply, but paths in"
-    call "%~dp0_trace_common.bat" warn "the messages below are relative to the Git root."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "Git root (!REPO_ROOT!) is not the project root (%TRACE_PROJECT_ROOT%)."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "LFS patterns in %TRACE_PROJECT_ROOT%\.gitattributes still apply, but paths in"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "the messages below are relative to the Git root."
 )
 
 rem -----------------------------------------------------------------------------
@@ -105,65 +105,65 @@ rem  2. git-lfs
 rem -----------------------------------------------------------------------------
 git lfs version >nul 2>&1
 if errorlevel 1 (
-    call "%~dp0_trace_common.bat" err "git-lfs is not installed."
-    call "%~dp0_trace_common.bat" err ""
-    call "%~dp0_trace_common.bat" err "Install it, then re-run this script:"
-    call "%~dp0_trace_common.bat" err "  winget install GitHub.GitLFS"
-    call "%~dp0_trace_common.bat" err "  Or re-run the Git for Windows installer and tick 'Git LFS'."
-    call "%~dp0_trace_common.bat" err "  Manual:  https://git-lfs.com"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "git-lfs is not installed."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err ""
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Install it, then re-run this script:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  winget install GitHub.GitLFS"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  Or re-run the Git for Windows installer and tick 'Git LFS'."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  Manual:  https://git-lfs.com"
     popd
     exit /b 1
 )
 for /f "usebackq delims=" %%V in (`git lfs version 2^>nul`) do (
     if not defined LFS_VERSION set "LFS_VERSION=%%V"
 )
-call "%~dp0_trace_common.bat" msg "Found !LFS_VERSION!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Found !LFS_VERSION!"
 
 rem -----------------------------------------------------------------------------
 rem  3. .gitattributes
 rem -----------------------------------------------------------------------------
 if not exist "%TRACE_PROJECT_ROOT%\.gitattributes" (
-    call "%~dp0_trace_common.bat" err ".gitattributes is missing from %TRACE_PROJECT_ROOT%."
-    call "%~dp0_trace_common.bat" err "It is committed to this repo - restore it before continuing:"
-    call "%~dp0_trace_common.bat" err "  git checkout -- .gitattributes"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err ".gitattributes is missing from %TRACE_PROJECT_ROOT%."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "It is committed to this repo - restore it before continuing:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  git checkout -- .gitattributes"
     popd
     exit /b 1
 )
 set "LFS_PATTERNS=0"
 for /f %%C in ('findstr /c:"filter=lfs" "%TRACE_PROJECT_ROOT%\.gitattributes" ^| find /c /v ""') do set "LFS_PATTERNS=%%C"
 if "!LFS_PATTERNS!"=="0" (
-    call "%~dp0_trace_common.bat" err ".gitattributes exists but declares no 'filter=lfs' patterns."
-    call "%~dp0_trace_common.bat" err "Something has overwritten it."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err ".gitattributes exists but declares no 'filter=lfs' patterns."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Something has overwritten it."
     popd
     exit /b 1
 )
-call "%~dp0_trace_common.bat" msg ".gitattributes declares !LFS_PATTERNS! LFS patterns"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg ".gitattributes declares !LFS_PATTERNS! LFS patterns"
 
 rem -----------------------------------------------------------------------------
 rem  4. Install the filters. Idempotent - safe to run on every clone.
 rem -----------------------------------------------------------------------------
 if "%VERIFY_ONLY%"=="1" (
-    call "%~dp0_trace_common.bat" msg "Verify-only: skipping 'git lfs install' and 'git lfs pull'."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Verify-only: skipping 'git lfs install' and 'git lfs pull'."
 ) else (
     set "TRACE_CMD=git lfs install"
-    call "%~dp0_trace_common.bat" run
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" run
 )
 
 rem -----------------------------------------------------------------------------
 rem  5. Report what is tracked and what is already stored in LFS.
 rem -----------------------------------------------------------------------------
-call "%~dp0_trace_common.bat" msg "Patterns Git LFS will intercept:"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Patterns Git LFS will intercept:"
 git lfs track
 
 git rev-parse --verify HEAD >nul 2>&1
 if errorlevel 1 (
-    call "%~dp0_trace_common.bat" msg "No commits yet - nothing to migrate. LFS will catch everything from the first commit."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "No commits yet - nothing to migrate. LFS will catch everything from the first commit."
     goto :pull
 )
 
 set "LFS_COUNT=0"
 for /f %%C in ('git lfs ls-files 2^>nul ^| find /c /v ""') do set "LFS_COUNT=%%C"
-call "%~dp0_trace_common.bat" msg "Files already stored in LFS at HEAD: !LFS_COUNT!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Files already stored in LFS at HEAD: !LFS_COUNT!"
 
 rem Detect binaries that were committed BEFORE LFS was configured. .gitattributes
 rem only affects files as they are staged, so anything already in history keeps
@@ -182,16 +182,16 @@ set "SHOWN=0"
 for /f "usebackq delims=" %%F in ("%TMP_STRAY%") do call :check_stray "%%F"
 
 if not "!NEEDS_MIGRATE!"=="0" (
-    if !NEEDS_MIGRATE! gtr 20 call "%~dp0_trace_common.bat" warn "    ... and more (!NEEDS_MIGRATE! in total)"
-    call "%~dp0_trace_common.bat" warn ""
-    call "%~dp0_trace_common.bat" warn "They were committed before LFS was set up. Fixing this REWRITES HISTORY"
-    call "%~dp0_trace_common.bat" warn "and requires a force-push plus a re-clone by everyone else, so agree on it"
-    call "%~dp0_trace_common.bat" warn "with the team first, then run:"
-    call "%~dp0_trace_common.bat" warn ""
-    call "%~dp0_trace_common.bat" warn "  git lfs migrate import --everything --include=*.uasset,*.umap,*.fbx,*.png,*.jpg,*.tga,*.psd,*.wav,*.mp3,*.ogg,*.exr,*.hdr"
-    call "%~dp0_trace_common.bat" warn "  git push --force-with-lease --all"
-    call "%~dp0_trace_common.bat" warn ""
-    call "%~dp0_trace_common.bat" warn "This script will not do that for you on purpose."
+    if !NEEDS_MIGRATE! gtr 20 call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "    ... and more (!NEEDS_MIGRATE! in total)"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn ""
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "They were committed before LFS was set up. Fixing this REWRITES HISTORY"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "and requires a force-push plus a re-clone by everyone else, so agree on it"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "with the team first, then run:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn ""
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "  git lfs migrate import --everything --include=*.uasset,*.umap,*.fbx,*.png,*.jpg,*.tga,*.psd,*.wav,*.mp3,*.ogg,*.exr,*.hdr"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "  git push --force-with-lease --all"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn ""
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "This script will not do that for you on purpose."
 )
 
 del /q "%TMP_IN_LFS%" >nul 2>&1
@@ -207,17 +207,17 @@ if not "%DO_PULL%"=="1" goto :done
 set "HAS_REMOTE=0"
 for /f %%R in ('git remote 2^>nul ^| find /c /v ""') do set "HAS_REMOTE=%%R"
 if "!HAS_REMOTE!"=="0" (
-    call "%~dp0_trace_common.bat" msg "No Git remote configured - skipping 'git lfs pull'."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "No Git remote configured - skipping 'git lfs pull'."
     goto :done
 )
-call "%~dp0_trace_common.bat" msg "Fetching LFS objects for the current checkout"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Fetching LFS objects for the current checkout"
 set "TRACE_CMD=git lfs pull"
-call "%~dp0_trace_common.bat" run
-if errorlevel 1 call "%~dp0_trace_common.bat" warn "git lfs pull failed (no LFS server configured yet?) - harmless on a brand-new repo."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" run
+if errorlevel 1 call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "git lfs pull failed (no LFS server configured yet?) - harmless on a brand-new repo."
 
 :done
-call "%~dp0_trace_common.bat" msg "Git LFS is ready."
-call "%~dp0_trace_common.bat" msg "Reminder: lock before you edit a .umap  ->  git lfs lock Content/Maps/Arena.umap"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Git LFS is ready."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Reminder: lock before you edit a .umap  ->  git lfs lock Content/Maps/Arena.umap"
 popd
 exit /b 0
 
@@ -241,10 +241,10 @@ rem ----------------------------------------------------------------------------
 findstr /x /c:"%~1" "%TMP_IN_LFS%" >nul 2>&1
 if not errorlevel 1 exit /b 0
 set /a "NEEDS_MIGRATE+=1"
-if !NEEDS_MIGRATE!==1 call "%~dp0_trace_common.bat" warn "These tracked files match an LFS pattern but are stored as ordinary Git blobs:"
+if !NEEDS_MIGRATE!==1 call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "These tracked files match an LFS pattern but are stored as ordinary Git blobs:"
 if !SHOWN! lss 20 (
     set /a "SHOWN+=1"
-    call "%~dp0_trace_common.bat" warn "    %~1"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "    %~1"
 )
 exit /b 0
 

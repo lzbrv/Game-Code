@@ -124,7 +124,7 @@ shift
 shift
 goto :parse
 :need_output_value
-call "%~dp0_trace_common.bat" err "--output needs a value"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--output needs a value"
 exit /b 2
 
 :o_config
@@ -134,7 +134,7 @@ shift
 shift
 goto :parse
 :need_config_value
-call "%~dp0_trace_common.bat" err "--config needs a value"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--config needs a value"
 exit /b 2
 
 :o_platform
@@ -144,7 +144,7 @@ shift
 shift
 goto :parse
 :need_platform_value
-call "%~dp0_trace_common.bat" err "--platform needs a value"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--platform needs a value"
 exit /b 2
 
 :o_nopak
@@ -185,13 +185,13 @@ shift
 goto :o_extra_loop
 
 :unknown_option
-call "%~dp0_trace_common.bat" err "Unknown option: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unknown option: !_a!"
 echo(
 call :usage
 exit /b 2
 
 :unexpected_arg
-call "%~dp0_trace_common.bat" err "Unexpected argument: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unexpected argument: !_a!"
 echo(
 call :usage
 exit /b 2
@@ -201,9 +201,9 @@ exit /b 2
 rem -----------------------------------------------------------------------------
 rem  Validate up front. A typo here otherwise surfaces forty minutes into a cook.
 rem -----------------------------------------------------------------------------
-call "%~dp0_trace_common.bat" is_config "!CONFIG!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" is_config "!CONFIG!"
 if errorlevel 1 (
-    call "%~dp0_trace_common.bat" err "Unknown configuration '!CONFIG!'. Expected Debug, DebugGame, Development, Test or Shipping."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unknown configuration '!CONFIG!'. Expected Debug, DebugGame, Development, Test or Shipping."
     exit /b 1
 )
 if not defined PLATFORM set "PLATFORM=%TRACE_HOST_PLATFORM%"
@@ -234,31 +234,31 @@ rem  Mac; this one refuses Mac on Windows. Both exist so that neither machine ca
 rem  waste forty minutes discovering it the hard way.
 rem -----------------------------------------------------------------------------
 if /i not "!PLATFORM!"=="%TRACE_HOST_PLATFORM%" (
-    call "%~dp0_trace_common.bat" err "Cannot package !PLATFORM! from a %TRACE_HOST_PLATFORM% host."
-    call "%~dp0_trace_common.bat" blank
-    call "%~dp0_trace_common.bat" err "Unreal does not cross-compile a game for a desktop platform it is not running on."
-    call "%~dp0_trace_common.bat" err "A Windows engine install ships no !PLATFORM! binaries at all - see for yourself:"
-    call "%~dp0_trace_common.bat" err "    dir %%UE_ROOT%%\Engine\Binaries"
-    call "%~dp0_trace_common.bat" blank
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Cannot package !PLATFORM! from a %TRACE_HOST_PLATFORM% host."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" blank
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unreal does not cross-compile a game for a desktop platform it is not running on."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "A Windows engine install ships no !PLATFORM! binaries at all - see for yourself:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "    dir %%UE_ROOT%%\Engine\Binaries"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" blank
     if /i "!PLATFORM!"=="Mac" (
-        call "%~dp0_trace_common.bat" err "For a Mac build, run this from a macOS checkout with a macOS engine:"
-        call "%~dp0_trace_common.bat" err "    Scripts/package.sh"
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "For a Mac build, run this from a macOS checkout with a macOS engine:"
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "    Scripts/package.sh"
     )
     exit /b 2
 )
 
-call "%~dp0_trace_common.bat" require_uproject
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" require_uproject
 if errorlevel 1 exit /b 1
-call "%~dp0_trace_common.bat" resolve_engine
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" resolve_engine
 if errorlevel 1 exit /b 1
-call "%~dp0_trace_common.bat" check_toolchain
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" check_toolchain
 
 set "RUNUAT=!UE_ROOT!\Engine\Build\BatchFiles\RunUAT.bat"
 if not exist "!RUNUAT!" (
-    call "%~dp0_trace_common.bat" err "RunUAT.bat not found at: !RUNUAT!"
-    call "%~dp0_trace_common.bat" err "That file ships with every engine distribution, so this install is broken or"
-    call "%~dp0_trace_common.bat" err "UE_ROOT points somewhere that is not an engine. Verify it in the Epic Games"
-    call "%~dp0_trace_common.bat" err "Launcher: Library, then UE_%TRACE_ENGINE_VERSION%, then Verify."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "RunUAT.bat not found at: !RUNUAT!"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "That file ships with every engine distribution, so this install is broken or"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "UE_ROOT points somewhere that is not an engine. Verify it in the Epic Games"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Launcher: Library, then UE_%TRACE_ENGINE_VERSION%, then Verify."
     exit /b 1
 )
 
@@ -280,11 +280,11 @@ rem  and you will simply have read one wrong warning.
 rem -----------------------------------------------------------------------------
 if "%DO_COOK%"=="1" (
     if not exist "%TRACE_PROJECT_ROOT%\Binaries\Win64\UnrealEditor-%TRACE_PROJECT_NAME%.dll" (
-        call "%~dp0_trace_common.bat" warn "Binaries\Win64\UnrealEditor-%TRACE_PROJECT_NAME%.dll is not there."
-        call "%~dp0_trace_common.bat" warn "The cook runs UnrealEditor-Cmd.exe, which loads that DLL, and -nocompileeditor"
-        call "%~dp0_trace_common.bat" warn "means UAT will not build it for you. Build it once first:"
-        call "%~dp0_trace_common.bat" warn "    Scripts\build.bat"
-        call "%~dp0_trace_common.bat" warn "Carrying on anyway - if the cook fails to load a module, this was why."
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "Binaries\Win64\UnrealEditor-%TRACE_PROJECT_NAME%.dll is not there."
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "The cook runs UnrealEditor-Cmd.exe, which loads that DLL, and -nocompileeditor"
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "means UAT will not build it for you. Build it once first:"
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "    Scripts\build.bat"
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "Carrying on anyway - if the cook fails to load a module, this was why."
     )
 )
 
@@ -322,10 +322,10 @@ for /f "usebackq delims=" %%L in (`findstr /b /c:"+MapsToCook=" "%TRACE_PROJECT_
     )
 )
 if defined MISSING_MAPS (
-    call "%~dp0_trace_common.bat" err "Maps listed in MapsToCook do not exist on disk:!MISSING_MAPS!"
-    call "%~dp0_trace_common.bat" err "The cook would warn about these and carry on, and the finished build would fail"
-    call "%~dp0_trace_common.bat" err "to open its own default map. Generate them first:"
-    call "%~dp0_trace_common.bat" err "    %TRACE_SCRIPT_DIR%\generate-map.bat"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Maps listed in MapsToCook do not exist on disk:!MISSING_MAPS!"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The cook would warn about these and carry on, and the finished build would fail"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "to open its own default map. Generate them first:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "    %TRACE_SCRIPT_DIR%\generate-map.bat"
     exit /b 1
 )
 
@@ -340,9 +340,9 @@ if "%DO_PAK%"=="1"     set "TRACE_CMD=!TRACE_CMD! -pak"
 if "%DO_ITERATE%"=="1" set "TRACE_CMD=!TRACE_CMD! -iterate"
 if defined EXTRA_ARGS  set "TRACE_CMD=!TRACE_CMD!!EXTRA_ARGS!"
 
-call "%~dp0_trace_common.bat" msg "Packaging %TRACE_PROJECT_NAME% | !PLATFORM! | !CONFIG! client"
-call "%~dp0_trace_common.bat" msg "Output: !OUTPUT!"
-call "%~dp0_trace_common.bat" msg "This is slow - a first cook of this project takes tens of minutes. It is not hung."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Packaging %TRACE_PROJECT_NAME% | !PLATFORM! | !CONFIG! client"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Output: !OUTPUT!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "This is slow - a first cook of this project takes tens of minutes. It is not hung."
 
 if not exist "!OUTPUT!" mkdir "!OUTPUT!" >nul 2>&1
 
@@ -351,7 +351,7 @@ rem the gate 2 note in the header.
 call :cooked_stamp "!OUTPUT!"
 set "STAMP_BEFORE=!COOKED_STAMP!"
 
-call "%~dp0_trace_common.bat" now_seconds
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" now_seconds
 set "START=!TRACE_NOW_SECONDS!"
 
 rem -----------------------------------------------------------------------------
@@ -362,20 +362,20 @@ rem  kills it thinking it hung. Same reasoning as Scripts\build.bat: Epic's exit
 rem  code is one signal, and this project has already been burned by a tool exiting
 rem  0 without ever reaching a verdict, which is what gates 2 and 3 are for.
 rem -----------------------------------------------------------------------------
-call "%~dp0_trace_common.bat" run
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" run
 set "RC=!errorlevel!"
 
 if "%TRACE_DRY_RUN%"=="1" exit /b 0
 
-call "%~dp0_trace_common.bat" now_seconds
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" now_seconds
 set /a "ELAPSED=!TRACE_NOW_SECONDS!-!START!"
 if !ELAPSED! lss 0 set /a "ELAPSED=!ELAPSED!+86400"
 
 if not "!RC!"=="0" (
-    call "%~dp0_trace_common.bat" err "Packaging failed with exit code !RC! after !ELAPSED!s. See the output above."
-    call "%~dp0_trace_common.bat" err "The line that matters is usually the first one containing 'ERROR:' or"
-    call "%~dp0_trace_common.bat" err "'AutomationException'. Scroll up to it rather than reading from the bottom -"
-    call "%~dp0_trace_common.bat" err "UAT prints a long tail of unwinding after the real failure."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Packaging failed with exit code !RC! after !ELAPSED!s. See the output above."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The line that matters is usually the first one containing 'ERROR:' or"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "'AutomationException'. Scroll up to it rather than reading from the bottom -"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "UAT prints a long tail of unwinding after the real failure."
     exit /b !RC!
 )
 
@@ -397,15 +397,15 @@ rem ----------------------------------------------------------------------------
 if "%DO_COOK%"=="1" (
     call :cooked_stamp "!OUTPUT!"
     if defined STAMP_BEFORE if "!COOKED_STAMP!"=="!STAMP_BEFORE!" (
-        call "%~dp0_trace_common.bat" err "UAT exited 0, but the cooked content in the output directory has not changed."
-        call "%~dp0_trace_common.bat" err "  !OUTPUT!"
-        call "%~dp0_trace_common.bat" err "Every .pak and .utoc in there still has the timestamp it had before this run"
-        call "%~dp0_trace_common.bat" err "started, so all of it is from an EARLIER run and this one produced nothing."
-        call "%~dp0_trace_common.bat" err "Do not ship it. Scroll up for what UAT actually did."
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "UAT exited 0, but the cooked content in the output directory has not changed."
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  !OUTPUT!"
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Every .pak and .utoc in there still has the timestamp it had before this run"
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "started, so all of it is from an EARLIER run and this one produced nothing."
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Do not ship it. Scroll up for what UAT actually did."
         exit /b 1
     )
 ) else (
-    call "%~dp0_trace_common.bat" msg "--skip-cook: not checking whether the cooked content is fresh."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "--skip-cook: not checking whether the cooked content is fresh."
 )
 
 rem -----------------------------------------------------------------------------
@@ -445,11 +445,11 @@ if not defined STAGE (
     )
 )
 if not defined STAGE (
-    call "%~dp0_trace_common.bat" err "UAT reported success but there is no staged build under:"
-    call "%~dp0_trace_common.bat" err "  !OUTPUT!"
-    call "%~dp0_trace_common.bat" err "Contents of !OUTPUT!:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "UAT reported success but there is no staged build under:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  !OUTPUT!"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Contents of !OUTPUT!:"
     dir /s "!OUTPUT!" 1>&2 2>nul
-    if errorlevel 1 call "%~dp0_trace_common.bat" err "  the output directory does not exist"
+    if errorlevel 1 call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  the output directory does not exist"
     exit /b 1
 )
 
@@ -477,9 +477,9 @@ if not defined EXE (
     )
 )
 if not defined EXE (
-    call "%~dp0_trace_common.bat" err "No game executable in the staged build at:"
-    call "%~dp0_trace_common.bat" err "  !STAGE!"
-    call "%~dp0_trace_common.bat" err "Contents:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "No game executable in the staged build at:"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  !STAGE!"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Contents:"
     dir /s /b "!STAGE!" 1>&2 2>nul
     exit /b 1
 )
@@ -493,22 +493,22 @@ for /f %%N in ('dir /s /b "!STAGE!\*.pak" "!STAGE!\*.utoc" 2^>nul ^| find /c /v 
 for /f %%N in ('dir /s /b "!STAGE!\*.uasset" 2^>nul ^| find /c /v ""') do set "UASSET_COUNT=%%N"
 
 if "!PAK_COUNT!"=="0" if "!UASSET_COUNT!"=="0" (
-    call "%~dp0_trace_common.bat" err "The staged build contains NO COOKED CONTENT - zero .pak, zero .utoc, zero .uasset."
-    call "%~dp0_trace_common.bat" err "  !STAGE!"
-    call "%~dp0_trace_common.bat" err "It will exit immediately at launch. This is exactly the failure recorded as"
-    call "%~dp0_trace_common.bat" err "item 29 in docs\KNOWN_LIMITATIONS.md: a build that links, reports success, and"
-    call "%~dp0_trace_common.bat" err "cannot start. Check the cook stage of the output above for 'Cook failed' or a"
-    call "%~dp0_trace_common.bat" err "missing map."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The staged build contains NO COOKED CONTENT - zero .pak, zero .utoc, zero .uasset."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  !STAGE!"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "It will exit immediately at launch. This is exactly the failure recorded as"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "item 29 in docs\KNOWN_LIMITATIONS.md: a build that links, reports success, and"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "cannot start. Check the cook stage of the output above for 'Cook failed' or a"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "missing map."
     exit /b 1
 )
 
-call "%~dp0_trace_common.bat" msg "Success in !ELAPSED!s."
-call "%~dp0_trace_common.bat" msg "Build:      !STAGE!"
-call "%~dp0_trace_common.bat" msg "Executable: !EXE!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Success in !ELAPSED!s."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Build:      !STAGE!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Executable: !EXE!"
 if not "!PAK_COUNT!"=="0" (
-    call "%~dp0_trace_common.bat" msg "Cooked content: !PAK_COUNT! pak/utoc files inside the staged build."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Cooked content: !PAK_COUNT! pak/utoc files inside the staged build."
 ) else (
-    call "%~dp0_trace_common.bat" msg "Cooked content: !UASSET_COUNT! loose .uasset files inside the staged build."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Cooked content: !UASSET_COUNT! loose .uasset files inside the staged build."
 )
 
 rem Signing status is a distribution fact the recipient will hit within ten seconds
@@ -516,12 +516,12 @@ rem of double-clicking, so say it here rather than letting them find out. There 
 rem nothing to query: this build is unsigned, unconditionally - UAT does not sign a
 rem Windows game and the project has no certificate configured. The macOS twin can
 rem at least ask `codesign`; here the answer is known in advance.
-call "%~dp0_trace_common.bat" warn "This build is UNSIGNED. Windows SmartScreen will show 'Windows protected your"
-call "%~dp0_trace_common.bat" warn "PC' the first time somebody runs it - they must click More info, then Run anyway."
-call "%~dp0_trace_common.bat" warn "See docs\PLAYTEST.md for the full instructions to send with it."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "This build is UNSIGNED. Windows SmartScreen will show 'Windows protected your"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "PC' the first time somebody runs it - they must click More info, then Run anyway."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "See docs\PLAYTEST.md for the full instructions to send with it."
 
-call "%~dp0_trace_common.bat" msg "Next: run it with  !EXE!"
-call "%~dp0_trace_common.bat" msg "      Zip !STAGE! whole - the .exe alone is not the game."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Next: run it with  !EXE!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "      Zip !STAGE! whole - the .exe alone is not the game."
 exit /b 0
 
 rem -----------------------------------------------------------------------------

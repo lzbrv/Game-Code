@@ -73,7 +73,7 @@ shift
 shift
 goto :parse
 :need_map_value
-call "%~dp0_trace_common.bat" err "--map needs a value"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--map needs a value"
 exit /b 2
 
 :o_res
@@ -83,7 +83,7 @@ shift
 shift
 goto :parse
 :need_res_value
-call "%~dp0_trace_common.bat" err "--res needs a value, e.g. 1600x900"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--res needs a value, e.g. 1600x900"
 exit /b 2
 
 :o_pos
@@ -93,7 +93,7 @@ shift
 shift
 goto :parse
 :need_pos_value
-call "%~dp0_trace_common.bat" err "--pos needs a value, e.g. 700,0"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--pos needs a value, e.g. 700,0"
 exit /b 2
 
 :o_fullscreen
@@ -124,33 +124,33 @@ shift
 goto :o_extra_loop
 
 :unknown_option
-call "%~dp0_trace_common.bat" err "Unknown option: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unknown option: !_a!"
 echo(
 call :usage
 exit /b 2
 
 :unexpected_arg
-call "%~dp0_trace_common.bat" err "Unexpected argument: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unexpected argument: !_a!"
 echo(
 call :usage
 exit /b 2
 
 :parsed
 
-call "%~dp0_trace_common.bat" require_uproject
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" require_uproject
 if errorlevel 1 exit /b 1
-call "%~dp0_trace_common.bat" resolve_engine
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" resolve_engine
 if errorlevel 1 exit /b 1
 
 if "%DO_BUILD%"=="1" (
-    call "%~dp0_trace_common.bat" msg "Building TraceEditor before launch"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Building TraceEditor before launch"
     call "%TRACE_SCRIPT_DIR%\build.bat" --target TraceEditor --config Development
     if errorlevel 1 exit /b 1
 )
 
-call "%~dp0_trace_common.bat" warn_if_map_missing "!MAP!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn_if_map_missing "!MAP!"
 
-call "%~dp0_trace_common.bat" editor_binary
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" editor_binary
 if errorlevel 1 exit /b 1
 
 rem The practice game mode is what makes this the range. Append it unless the
@@ -169,8 +169,8 @@ if defined WIN_X set "TRACE_CMD=!TRACE_CMD! -WinX=!WIN_X! -WinY=!WIN_Y!"
 :launch
 if defined EXTRA_ARGS set "TRACE_CMD=!TRACE_CMD!!EXTRA_ARGS!"
 
-call "%~dp0_trace_common.bat" msg "Practice range, map !URL!"
-call "%~dp0_trace_common.bat" run
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Practice range, map !URL!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" run
 exit /b %errorlevel%
 
 rem -----------------------------------------------------------------------------

@@ -56,7 +56,7 @@ shift
 shift
 goto :parse
 :need_map_value
-call "%~dp0_trace_common.bat" err "--map needs a value"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--map needs a value"
 exit /b 2
 
 :o_force
@@ -87,13 +87,13 @@ shift
 goto :o_extra_loop
 
 :unknown_option
-call "%~dp0_trace_common.bat" err "Unknown option: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unknown option: !_a!"
 echo(
 call :usage
 exit /b 2
 
 :unexpected_arg
-call "%~dp0_trace_common.bat" err "Unexpected argument: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unexpected argument: !_a!"
 echo(
 call :usage
 exit /b 2
@@ -101,30 +101,30 @@ exit /b 2
 :parsed
 
 if /i not "!MAP:~0,6!"=="/Game/" (
-    call "%~dp0_trace_common.bat" err "--map must be a /Game/... package path, got '!MAP!'."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--map must be a /Game/... package path, got '!MAP!'."
     exit /b 1
 )
 
-call "%~dp0_trace_common.bat" require_uproject
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" require_uproject
 if errorlevel 1 exit /b 1
-call "%~dp0_trace_common.bat" resolve_engine
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" resolve_engine
 if errorlevel 1 exit /b 1
 
 set "PY_SCRIPT=%TRACE_SCRIPT_DIR%\generate_map.py"
 if not exist "!PY_SCRIPT!" (
-    call "%~dp0_trace_common.bat" err "generate_map.py not found at !PY_SCRIPT!"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "generate_map.py not found at !PY_SCRIPT!"
     exit /b 1
 )
 
 rem Trace.uproject is owned by the build agent; only warn, never edit it here.
 findstr /c:"PythonScriptPlugin" "%TRACE_UPROJECT%" >nul 2>&1
 if errorlevel 1 (
-    call "%~dp0_trace_common.bat" warn "Trace.uproject does not mention PythonScriptPlugin."
-    call "%~dp0_trace_common.bat" warn "If this run fails with 'could not be found' for the pythonscript commandlet,"
-    call "%~dp0_trace_common.bat" warn "enable Edit > Plugins > Python Editor Script Plugin (or add it to Trace.uproject)."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "Trace.uproject does not mention PythonScriptPlugin."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "If this run fails with 'could not be found' for the pythonscript commandlet,"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "enable Edit > Plugins > Python Editor Script Plugin (or add it to Trace.uproject)."
 )
 
-call "%~dp0_trace_common.bat" editor_cmd_binary
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" editor_cmd_binary
 if errorlevel 1 exit /b 1
 
 rem generate_map.py reads these two; -script= gives no reliable way to pass argv.
@@ -135,8 +135,8 @@ set "TRACE_CMD="!TRACE_EDITOR_CMD_BIN!" "%TRACE_UPROJECT%" -run=pythonscript -sc
 if "%NULL_RHI%"=="1" set "TRACE_CMD=!TRACE_CMD! -nullrhi"
 if defined EXTRA_ARGS set "TRACE_CMD=!TRACE_CMD!!EXTRA_ARGS!"
 
-call "%~dp0_trace_common.bat" msg "Creating !MAP! (TRACE_FORCE_MAP=!FORCE!)"
-call "%~dp0_trace_common.bat" run
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Creating !MAP! (TRACE_FORCE_MAP=!FORCE!)"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" run
 set "RC=!errorlevel!"
 
 if "%TRACE_DRY_RUN%"=="1" exit /b 0
@@ -145,14 +145,14 @@ rem /Game/Maps/Arena -> Content\Maps\Arena.umap
 set "REL=!MAP:~6!"
 set "REL=!REL:/=\!"
 if exist "%TRACE_PROJECT_ROOT%\Content\!REL!.umap" (
-    call "%~dp0_trace_common.bat" msg "Wrote Content\!REL!.umap"
-    call "%~dp0_trace_common.bat" msg "Next: Scripts\run-listen-server.bat"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Wrote Content\!REL!.umap"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Next: Scripts\run-listen-server.bat"
     exit /b 0
 )
 
-call "%~dp0_trace_common.bat" err "Commandlet finished (exit code !RC!) but Content\!REL!.umap is not on disk."
-call "%~dp0_trace_common.bat" err "Scroll up for the [Trace] lines from generate_map.py - they name the API that failed."
-call "%~dp0_trace_common.bat" err "Manual fallback: open the editor, File > New Level > Empty Level, Save As Content\!REL!."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Commandlet finished (exit code !RC!) but Content\!REL!.umap is not on disk."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Scroll up for the [Trace] lines from generate_map.py - they name the API that failed."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Manual fallback: open the editor, File > New Level > Empty Level, Save As Content\!REL!."
 exit /b 1
 
 rem -----------------------------------------------------------------------------

@@ -5,8 +5,16 @@ rem
 rem  CALL this file with a subroutine name; do not run it on its own:
 rem
 rem      call "%~dp0_trace_common.bat" init
-rem      call "%~dp0_trace_common.bat" resolve_engine
+rem      call "%TRACE_SCRIPT_DIR%\_trace_common.bat" resolve_engine
 rem      if errorlevel 1 exit /b 1
+rem
+rem  %~dp0 ON THE init LINE ONLY, which runs before the script reads its
+rem  arguments. Every later call goes through TRACE_SCRIPT_DIR, which init sets.
+rem  A plain SHIFT moves %0 along with the arguments (the first argument becomes
+rem  the new %0), so after the argument loop %~dp0 is the folder of whatever was
+rem  passed: "Scripts\build.bat --clean" run from the repo looked for
+rem  <repo>\_trace_common.bat, which is not there, and stopped. A script that
+rem  runs fine with no arguments proves nothing about this.
 rem
 rem  This is the Windows twin of _trace_common.sh. Same responsibilities:
 rem    * locate the project root and Trace.uproject

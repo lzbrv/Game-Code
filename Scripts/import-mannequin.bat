@@ -61,14 +61,14 @@ if /i "!_a!"=="--dry-run" ( set "DO_DRYRUN=1" & shift & goto :parse )
 if /i "!_a!"=="-h"        goto :usage
 if /i "!_a!"=="--help"    goto :usage
 if /i "!_a!"=="/?"        goto :usage
-call "%~dp0_trace_common.bat" err "Unknown option: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unknown option: !_a!"
 goto :usage_fail
 
 :parsed
 
-call "%~dp0_trace_common.bat" require_uproject
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" require_uproject
 if errorlevel 1 exit /b 1
-call "%~dp0_trace_common.bat" resolve_engine
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" resolve_engine
 if errorlevel 1 exit /b 1
 
 set "SRC=%UE_ROOT%\%TEMPLATE_SUBPATH%"
@@ -81,8 +81,8 @@ rem  the import is good enough to render animated characters.
 rem -----------------------------------------------------------------------------
 if "%DO_VERIFY%"=="1" (
     if not exist "%DEST%" (
-        call "%~dp0_trace_common.bat" warn "Not imported yet -- %DEST% does not exist."
-        call "%~dp0_trace_common.bat" warn "Run: Scripts\import-mannequin.bat"
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "Not imported yet -- %DEST% does not exist."
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "Run: Scripts\import-mannequin.bat"
         exit /b 1
     )
     set "MISSING=0"
@@ -93,10 +93,10 @@ if "%DO_VERIFY%"=="1" (
     call :check "Anims\Unarmed\BS_Idle_Walk_Run.uasset"
     call :check "Materials\M_Mannequin.uasset"
     if not "!MISSING!"=="0" (
-        call "%~dp0_trace_common.bat" err "Import is incomplete. Re-run: Scripts\import-mannequin.bat --force"
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Import is incomplete. Re-run: Scripts\import-mannequin.bat --force"
         exit /b 1
     )
-    call "%~dp0_trace_common.bat" msg "Mannequin import looks complete."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Mannequin import looks complete."
     exit /b 0
 )
 
@@ -105,22 +105,22 @@ rem  Source must exist. A partial engine install is the usual reason it does not
 rem  and the fix is in the launcher, not in this repo - so say exactly that.
 rem -----------------------------------------------------------------------------
 if not exist "%SRC%" (
-    call "%~dp0_trace_common.bat" err "Epic's Mannequin art is not in this engine install."
-    call "%~dp0_trace_common.bat" err "  looked for: %SRC%"
-    call "%~dp0_trace_common.bat" blank
-    call "%~dp0_trace_common.bat" err "That folder ships with the engine's template resources. If it is"
-    call "%~dp0_trace_common.bat" err "missing, the install is partial: open the Epic Games Launcher, find"
-    call "%~dp0_trace_common.bat" err "Unreal Engine %TRACE_ENGINE_VERSION%, choose Options, and make sure"
-    call "%~dp0_trace_common.bat" err "\"Templates and Feature Packs\" (or \"Starter Content\") is ticked."
-    call "%~dp0_trace_common.bat" blank
-    call "%~dp0_trace_common.bat" err "The game still runs without it -- characters fall back to plain"
-    call "%~dp0_trace_common.bat" err "team-coloured capsules -- but they will not be animated."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Epic's Mannequin art is not in this engine install."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  looked for: %SRC%"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" blank
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "That folder ships with the engine's template resources. If it is"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "missing, the install is partial: open the Epic Games Launcher, find"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unreal Engine %TRACE_ENGINE_VERSION%, choose Options, and make sure"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "\"Templates and Feature Packs\" (or \"Starter Content\") is ticked."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" blank
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "The game still runs without it -- characters fall back to plain"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "team-coloured capsules -- but they will not be animated."
     exit /b 1
 )
 
-call "%~dp0_trace_common.bat" msg "Source : %SRC%"
-call "%~dp0_trace_common.bat" msg "Dest   : %DEST%"
-call "%~dp0_trace_common.bat" msg "Mounts at /Game/Characters/Mannequins"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Source : %SRC%"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Dest   : %DEST%"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Mounts at /Game/Characters/Mannequins"
 
 rem -----------------------------------------------------------------------------
 rem  Copy with robocopy.
@@ -138,17 +138,17 @@ set "RC_FLAGS=/E /NFL /NDL /NJH /NJS /NP /R:2 /W:1"
 if "%DO_FORCE%"=="0" set "RC_FLAGS=%RC_FLAGS% /XO"
 if "%DO_DRYRUN%"=="1" set "RC_FLAGS=%RC_FLAGS% /L"
 
-call "%~dp0_trace_common.bat" msg "Importing Epic's Mannequin..."
-call "%~dp0_trace_common.bat" print_cmd robocopy "%SRC%" "%DEST%" %RC_FLAGS%
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Importing Epic's Mannequin..."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" print_cmd robocopy "%SRC%" "%DEST%" %RC_FLAGS%
 
 robocopy "%SRC%" "%DEST%" %RC_FLAGS%
 if errorlevel 8 (
-    call "%~dp0_trace_common.bat" err "robocopy failed copying %SRC% to %DEST%."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "robocopy failed copying %SRC% to %DEST%."
     exit /b 1
 )
 
 if "%DO_DRYRUN%"=="1" (
-    call "%~dp0_trace_common.bat" msg "Dry run - nothing was written."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Dry run - nothing was written."
     exit /b 0
 )
 
@@ -158,11 +158,11 @@ set "MISSING=0"
 call :check "Meshes\SKM_Manny_Simple.uasset"
 call :check "Anims\Unarmed\ABP_Unarmed.uasset"
 if not "!MISSING!"=="0" (
-    call "%~dp0_trace_common.bat" err "Copy reported success but required assets are still missing."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Copy reported success but required assets are still missing."
     exit /b 1
 )
 
-call "%~dp0_trace_common.bat" msg "Character art imported. Build and run - characters will be animated."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Character art imported. Build and run - characters will be animated."
 exit /b 0
 
 rem -----------------------------------------------------------------------------

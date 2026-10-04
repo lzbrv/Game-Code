@@ -60,7 +60,7 @@ shift
 shift
 goto :parse
 :need_target_value
-call "%~dp0_trace_common.bat" err "--target needs a value"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--target needs a value"
 exit /b 2
 
 :o_config
@@ -70,7 +70,7 @@ shift
 shift
 goto :parse
 :need_config_value
-call "%~dp0_trace_common.bat" err "--config needs a value"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--config needs a value"
 exit /b 2
 
 :o_platform
@@ -80,7 +80,7 @@ shift
 shift
 goto :parse
 :need_platform_value
-call "%~dp0_trace_common.bat" err "--platform needs a value"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--platform needs a value"
 exit /b 2
 
 :o_clean
@@ -116,13 +116,13 @@ shift
 goto :o_extra_loop
 
 :unknown_option
-call "%~dp0_trace_common.bat" err "Unknown option: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unknown option: !_a!"
 echo(
 call :usage
 exit /b 2
 
 :unexpected_arg
-call "%~dp0_trace_common.bat" err "Unexpected argument: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unexpected argument: !_a!"
 echo(
 call :usage
 exit /b 2
@@ -133,25 +133,25 @@ rem ----------------------------------------------------------------------------
 rem  Validate up front - a typo here otherwise surfaces as a 200-line UBT stack
 rem  trace forty seconds into a build.
 rem -----------------------------------------------------------------------------
-call "%~dp0_trace_common.bat" is_target "!TARGET!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" is_target "!TARGET!"
 if errorlevel 1 (
-    call "%~dp0_trace_common.bat" err "Unknown target '!TARGET!'. Expected Trace, TraceEditor or TraceServer."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unknown target '!TARGET!'. Expected Trace, TraceEditor or TraceServer."
     exit /b 1
 )
-call "%~dp0_trace_common.bat" is_config "!CONFIG!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" is_config "!CONFIG!"
 if errorlevel 1 (
-    call "%~dp0_trace_common.bat" err "Unknown configuration '!CONFIG!'. Expected Debug, DebugGame, Development, Test or Shipping."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unknown configuration '!CONFIG!'. Expected Debug, DebugGame, Development, Test or Shipping."
     exit /b 1
 )
 if not defined PLATFORM set "PLATFORM=%TRACE_HOST_PLATFORM%"
 
-call "%~dp0_trace_common.bat" require_uproject
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" require_uproject
 if errorlevel 1 exit /b 1
-call "%~dp0_trace_common.bat" resolve_engine
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" resolve_engine
 if errorlevel 1 exit /b 1
-call "%~dp0_trace_common.bat" check_toolchain
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" check_toolchain
 
-call "%~dp0_trace_common.bat" build_script
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" build_script
 if errorlevel 1 exit /b 1
 
 rem -----------------------------------------------------------------------------
@@ -170,17 +170,17 @@ rem
 rem  Skip with --no-art, or set TRACE_SKIP_ART_IMPORT=1 for CI.
 rem -----------------------------------------------------------------------------
 if "%DO_IMPORT_ART%"=="1" if not "%TRACE_DRY_RUN%"=="1" (
-    if not exist "%~dp0import-mannequin.bat" (
-        call "%~dp0_trace_common.bat" warn "Missing %~dp0import-mannequin.bat; skipping the character-art check."
+    if not exist "%TRACE_SCRIPT_DIR%\import-mannequin.bat" (
+        call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "Missing %TRACE_SCRIPT_DIR%\import-mannequin.bat; skipping the character-art check."
     ) else (
-        call "%~dp0import-mannequin.bat" --verify >nul 2>&1
+        call "%TRACE_SCRIPT_DIR%\import-mannequin.bat" --verify >nul 2>&1
         if errorlevel 1 (
-            call "%~dp0_trace_common.bat" msg "Character art missing or incomplete - importing Epic's Mannequin"
-            call "%~dp0import-mannequin.bat"
+            call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Character art missing or incomplete - importing Epic's Mannequin"
+            call "%TRACE_SCRIPT_DIR%\import-mannequin.bat"
             if errorlevel 1 (
-                call "%~dp0_trace_common.bat" warn "Mannequin import failed. Building anyway - characters will render as fallback shapes and the game will say so on screen."
+                call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "Mannequin import failed. Building anyway - characters will render as fallback shapes and the game will say so on screen."
             ) else (
-                call "%~dp0_trace_common.bat" msg "Character art imported."
+                call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Character art imported."
             )
         )
     )
@@ -198,38 +198,38 @@ if "%DO_CLEAN%"=="1" set "TRACE_CMD=!TRACE_CMD! -clean"
 if defined EXTRA_ARGS set "TRACE_CMD=!TRACE_CMD!!EXTRA_ARGS!"
 
 if "%DO_CLEAN%"=="1" (
-    call "%~dp0_trace_common.bat" msg "Cleaning !TARGET! | !PLATFORM! | !CONFIG!"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Cleaning !TARGET! | !PLATFORM! | !CONFIG!"
 ) else (
-    call "%~dp0_trace_common.bat" msg "Building !TARGET! | !PLATFORM! | !CONFIG!"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Building !TARGET! | !PLATFORM! | !CONFIG!"
 )
 
-call "%~dp0_trace_common.bat" now_seconds
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" now_seconds
 set "START=!TRACE_NOW_SECONDS!"
 
-call "%~dp0_trace_common.bat" run
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" run
 set "RC=!errorlevel!"
 
 if "%TRACE_DRY_RUN%"=="1" exit /b 0
 if not "!RC!"=="0" goto :build_failed
 
-call "%~dp0_trace_common.bat" now_seconds
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" now_seconds
 set /a "ELAPSED=!TRACE_NOW_SECONDS!-!START!"
 if !ELAPSED! lss 0 set /a "ELAPSED=!ELAPSED!+86400"
-call "%~dp0_trace_common.bat" msg "Success in !ELAPSED!s."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Success in !ELAPSED!s."
 
-if /i "!TARGET!"=="TraceEditor" call "%~dp0_trace_common.bat" msg "Next: open the project, or run a listen server with Scripts\run-listen-server.bat"
-if /i "!TARGET!"=="TraceServer" call "%~dp0_trace_common.bat" msg "Next: Scripts\run-dedicated-server.bat --no-build"
+if /i "!TARGET!"=="TraceEditor" call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Next: open the project, or run a listen server with Scripts\run-listen-server.bat"
+if /i "!TARGET!"=="TraceServer" call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Next: Scripts\run-dedicated-server.bat --no-build"
 exit /b 0
 
 :build_failed
-call "%~dp0_trace_common.bat" err "Build failed with exit code !RC!."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Build failed with exit code !RC!."
 if /i not "!TARGET!"=="TraceServer" exit /b !RC!
-call "%~dp0_trace_common.bat" err "If the log says 'Server targets are not currently supported from this"
-call "%~dp0_trace_common.bat" err "engine distribution', that is expected on a launcher-installed engine and"
-call "%~dp0_trace_common.bat" err "is NOT a bug in TraceServer.Target.cs. Working alternatives:"
-call "%~dp0_trace_common.bat" err "  Scripts\run-listen-server.bat              (one player hosts)"
-call "%~dp0_trace_common.bat" err "  Scripts\run-dedicated-server.bat --editor  (editor binary, -server)"
-call "%~dp0_trace_common.bat" err "  a SOURCE build of UE from github.com/EpicGames/UnrealEngine"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "If the log says 'Server targets are not currently supported from this"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "engine distribution', that is expected on a launcher-installed engine and"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "is NOT a bug in TraceServer.Target.cs. Working alternatives:"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  Scripts\run-listen-server.bat              (one player hosts)"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  Scripts\run-dedicated-server.bat --editor  (editor binary, -server)"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  a SOURCE build of UE from github.com/EpicGames/UnrealEngine"
 exit /b !RC!
 
 rem -----------------------------------------------------------------------------
@@ -247,25 +247,25 @@ rem ----------------------------------------------------------------------------
 :projectfiles
 set "GPF=!UE_ROOT!\Engine\Build\BatchFiles\GenerateProjectFiles.bat"
 if exist "!GPF!" goto :projectfiles_gpf
-call "%~dp0_trace_common.bat" msg "Regenerating IDE project files (via UnrealBuildTool -projectfiles)"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Regenerating IDE project files (via UnrealBuildTool -projectfiles)"
 set "TRACE_CMD="!TRACE_BUILD_BAT!" -projectfiles -project="%TRACE_UPROJECT%" -game -progress"
 goto :projectfiles_run
 :projectfiles_gpf
-call "%~dp0_trace_common.bat" msg "Regenerating IDE project files"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Regenerating IDE project files"
 set "TRACE_CMD="!GPF!" -project="%TRACE_UPROJECT%" -game -progress"
 :projectfiles_run
-call "%~dp0_trace_common.bat" run
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" run
 if errorlevel 1 exit /b 1
 if "%TRACE_DRY_RUN%"=="1" exit /b 0
-call "%~dp0_trace_common.bat" msg "Done. Open %TRACE_PROJECT_NAME%.sln in Visual Studio 2022."
-call "%~dp0_trace_common.bat" msg "Same thing from Explorer: right-click Trace.uproject -> Generate Visual Studio project files."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Done. Open %TRACE_PROJECT_NAME%.sln in Visual Studio 2022."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Same thing from Explorer: right-click Trace.uproject -> Generate Visual Studio project files."
 exit /b 0
 
 rem -----------------------------------------------------------------------------
 :server_target_warning
-call "%~dp0_trace_common.bat" warn "TraceServer will not build from a launcher-installed engine."
-call "%~dp0_trace_common.bat" warn "Expect: 'Server targets are not currently supported from this engine distribution.'"
-call "%~dp0_trace_common.bat" warn "See Scripts\run-dedicated-server.bat --help for what does work."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "TraceServer will not build from a launcher-installed engine."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "Expect: 'Server targets are not currently supported from this engine distribution.'"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "See Scripts\run-dedicated-server.bat --help for what does work."
 exit /b 0
 
 rem -----------------------------------------------------------------------------

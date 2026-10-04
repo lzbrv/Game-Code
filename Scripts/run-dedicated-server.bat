@@ -82,7 +82,7 @@ shift
 shift
 goto :parse
 :need_map_value
-call "%~dp0_trace_common.bat" err "--map needs a value"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--map needs a value"
 exit /b 2
 
 :o_port
@@ -92,7 +92,7 @@ shift
 shift
 goto :parse
 :need_port_value
-call "%~dp0_trace_common.bat" err "--port needs a value"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--port needs a value"
 exit /b 2
 
 :o_config
@@ -102,7 +102,7 @@ shift
 shift
 goto :parse
 :need_config_value
-call "%~dp0_trace_common.bat" err "--config needs a value"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--config needs a value"
 exit /b 2
 
 :o_nobuild
@@ -134,13 +134,13 @@ shift
 goto :o_extra_loop
 
 :unknown_option
-call "%~dp0_trace_common.bat" err "Unknown option: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unknown option: !_a!"
 echo(
 call :usage
 exit /b 2
 
 :unexpected_arg
-call "%~dp0_trace_common.bat" err "Unexpected argument: !_a!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unexpected argument: !_a!"
 echo(
 call :usage
 exit /b 2
@@ -153,22 +153,22 @@ rem  only suppressed for --editor, which is the path that actually works.
 rem -----------------------------------------------------------------------------
 if not "%USE_EDITOR%"=="1" call :launcher_engine_warning
 
-call "%~dp0_trace_common.bat" is_number "!PORT!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" is_number "!PORT!"
 if errorlevel 1 (
-    call "%~dp0_trace_common.bat" err "--port must be a number, got '!PORT!'"
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "--port must be a number, got '!PORT!'"
     exit /b 1
 )
-call "%~dp0_trace_common.bat" is_config "!CONFIG!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" is_config "!CONFIG!"
 if errorlevel 1 (
-    call "%~dp0_trace_common.bat" err "Unknown configuration '!CONFIG!'. Expected Debug, DebugGame, Development, Test or Shipping."
+    call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "Unknown configuration '!CONFIG!'. Expected Debug, DebugGame, Development, Test or Shipping."
     exit /b 1
 )
 
-call "%~dp0_trace_common.bat" require_uproject
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" require_uproject
 if errorlevel 1 exit /b 1
-call "%~dp0_trace_common.bat" resolve_engine
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" resolve_engine
 if errorlevel 1 exit /b 1
-call "%~dp0_trace_common.bat" warn_if_map_missing "!MAP!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn_if_map_missing "!MAP!"
 
 if "%USE_EDITOR%"=="1" goto :path_editor
 
@@ -205,22 +205,22 @@ if not defined SERVER_BIN (
 
 set "TRACE_CMD="!SERVER_BIN!" "%TRACE_UPROJECT%" !MAP! -log -nosplash -port=!PORT!"
 if defined EXTRA_ARGS set "TRACE_CMD=!TRACE_CMD!!EXTRA_ARGS!"
-call "%~dp0_trace_common.bat" msg "Dedicated server on port !PORT!, map !MAP!"
-call "%~dp0_trace_common.bat" run
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Dedicated server on port !PORT!, map !MAP!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" run
 exit /b %errorlevel%
 
 :no_server_binary
-call "%~dp0_trace_common.bat" err "No dedicated-server binary found. Looked for:"
-call "%~dp0_trace_common.bat" err "  !BIN_DIR!\!BASE!.exe"
-call "%~dp0_trace_common.bat" err "  !BIN_DIR!\!BASE!-Cmd.exe"
-call "%~dp0_trace_common.bat" err ""
-call "%~dp0_trace_common.bat" err "On a launcher-installed engine this is EXPECTED - the server target cannot"
-call "%~dp0_trace_common.bat" err "be built at all. Use one of these instead:"
-call "%~dp0_trace_common.bat" err "  Scripts\run-listen-server.bat"
-call "%~dp0_trace_common.bat" err "  Scripts\run-dedicated-server.bat --editor"
-call "%~dp0_trace_common.bat" err ""
-call "%~dp0_trace_common.bat" err "With a SOURCE build of the engine, build it with:"
-call "%~dp0_trace_common.bat" err "  Scripts\build.bat --target TraceServer --config !CONFIG!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "No dedicated-server binary found. Looked for:"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  !BIN_DIR!\!BASE!.exe"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  !BIN_DIR!\!BASE!-Cmd.exe"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err ""
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "On a launcher-installed engine this is EXPECTED - the server target cannot"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "be built at all. Use one of these instead:"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  Scripts\run-listen-server.bat"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  Scripts\run-dedicated-server.bat --editor"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err ""
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "With a SOURCE build of the engine, build it with:"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" err "  Scripts\build.bat --target TraceServer --config !CONFIG!"
 exit /b 1
 
 rem -----------------------------------------------------------------------------
@@ -228,34 +228,34 @@ rem  Path A - editor binary in dedicated-server mode. Needs no server build, so
 rem  it works on a stock launcher engine.
 rem -----------------------------------------------------------------------------
 :path_editor
-call "%~dp0_trace_common.bat" editor_cmd_binary
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" editor_cmd_binary
 if errorlevel 1 exit /b 1
 set "TRACE_CMD="!TRACE_EDITOR_CMD_BIN!" "%TRACE_UPROJECT%" !MAP! -server -log -nosplash -port=!PORT!"
 if defined EXTRA_ARGS set "TRACE_CMD=!TRACE_CMD!!EXTRA_ARGS!"
-call "%~dp0_trace_common.bat" msg "Dedicated server (editor binary) on port !PORT!, map !MAP!"
-call "%~dp0_trace_common.bat" run
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" msg "Dedicated server (editor binary) on port !PORT!, map !MAP!"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" run
 exit /b %errorlevel%
 
 rem -----------------------------------------------------------------------------
 :launcher_engine_warning
-call "%~dp0_trace_common.bat" warn "==================================================================="
-call "%~dp0_trace_common.bat" warn "A LAUNCHER-INSTALLED ENGINE CANNOT BUILD A DEDICATED-SERVER TARGET."
-call "%~dp0_trace_common.bat" warn "==================================================================="
-call "%~dp0_trace_common.bat" warn "UnrealBuildTool refuses with:"
-call "%~dp0_trace_common.bat" warn "    Server targets are not currently supported from this engine distribution."
-call "%~dp0_trace_common.bat" warn "This applies to Windows exactly as it does to macOS. It is a property of"
-call "%~dp0_trace_common.bat" warn "the engine DISTRIBUTION, not a bug in TraceServer.Target.cs, and there is"
-call "%~dp0_trace_common.bat" warn "no flag that works around it."
-call "%~dp0_trace_common.bat" warn ""
-call "%~dp0_trace_common.bat" warn "What to do instead:"
-call "%~dp0_trace_common.bat" warn "  Scripts\run-listen-server.bat              one player hosts (recommended)"
-call "%~dp0_trace_common.bat" warn "  Scripts\run-dedicated-server.bat --editor  real dedicated server, no build"
-call "%~dp0_trace_common.bat" warn ""
-call "%~dp0_trace_common.bat" warn "A true TraceServer.exe needs a SOURCE build of Unreal from"
-call "%~dp0_trace_common.bat" warn "github.com/EpicGames/UnrealEngine, which requires linking your Epic"
-call "%~dp0_trace_common.bat" warn "account to your GitHub account to get access to that private repo."
-call "%~dp0_trace_common.bat" warn "Continuing anyway - if you HAVE a source build, this will just work."
-call "%~dp0_trace_common.bat" warn ""
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "==================================================================="
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "A LAUNCHER-INSTALLED ENGINE CANNOT BUILD A DEDICATED-SERVER TARGET."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "==================================================================="
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "UnrealBuildTool refuses with:"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "    Server targets are not currently supported from this engine distribution."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "This applies to Windows exactly as it does to macOS. It is a property of"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "the engine DISTRIBUTION, not a bug in TraceServer.Target.cs, and there is"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "no flag that works around it."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn ""
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "What to do instead:"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "  Scripts\run-listen-server.bat              one player hosts (recommended)"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "  Scripts\run-dedicated-server.bat --editor  real dedicated server, no build"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn ""
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "A true TraceServer.exe needs a SOURCE build of Unreal from"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "github.com/EpicGames/UnrealEngine, which requires linking your Epic"
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "account to your GitHub account to get access to that private repo."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn "Continuing anyway - if you HAVE a source build, this will just work."
+call "%TRACE_SCRIPT_DIR%\_trace_common.bat" warn ""
 exit /b 0
 
 rem -----------------------------------------------------------------------------
