@@ -332,6 +332,142 @@ def is_allowlisted(label):
     return None
 
 
+# -----------------------------------------------------------------------------
+# THE MATCHER, AT MODULE SCOPE. Pure Python - no `unreal` - so the census
+# translator (Scripts/rebake-translate-census.py) and offline simulations can
+# import the restore's OWN pairing rules instead of carrying a copy that could
+# drift from them. Moved here unchanged from the editor block.
+# -----------------------------------------------------------------------------
+
+def separation(left, right):
+    return sum((left["location"][axis] - right["location"][axis]) ** 2
+               for axis in range(3)) ** 0.5
+
+def nearest_same_stem(record, by_stem):
+    stem = label_stem(record["label"])
+    best = None
+    best_distance = None
+    for other in by_stem.get(stem, ()):
+        distance = separation(other, record)
+        if best_distance is None or distance < best_distance:
+            best_distance = distance
+            best = other
+    return best, best_distance
+
+# The four rigid transforms a person can use to copy a cluster to the other
+# side of an arena that is symmetric in both axes. A hand DUPLICATE is a copy
+# of some existing piece under one of them, so the donor search tries all four
+# and keeps the best - see donor_for_duplicate.
+MIRRORS = (
+    ("identity", 1.0, 1.0),
+    ("mirror-X", -1.0, 1.0),
+    ("mirror-Y", 1.0, -1.0),
+    ("mirror-XY", -1.0, -1.0),
+)
+
+# How close the mirrored position has to land on a fresh sibling before the
+# pairing is called a proof rather than a guess. Measured on this map: under
+# mirror-Y all nine lost top-centre-tower copies land 10.4-15.0 uu from their
+# counterpart, one to one, while the identity transform's nearest candidate is
+# 4,059-5,190 uu away. Two orders of magnitude is not a threshold that needs
+# tuning; 250 uu sits in the empty middle of it.
+DUPLICATE_MIRROR_RADIUS_UU = 250.0
+
+def recreate_location(record, donor):
+    """Where a re-created hand duplicate is put: the census X and Y, and the
+    donor's Z unless TRACE_REBAKE_RECREATE_Z says otherwise. See plan_recreate."""
+    z = record["location"][2] if RECREATE_Z_SOURCE == "census" else donor["location"][2]
+    return [record["location"][0], record["location"][1], z]
+
+def donor_for_duplicate(record, by_stem):
+    """The fresh piece a hand duplicate was copied FROM, and how it was copied.
+
+    WHY NOT nearest_same_stem. That answers "which sibling is closest", which
+    for a MIRRORED cluster is the wrong question and gives a wrong answer with
+    real consequences here: `Top_Centre_Tower_2` is the cluster's 1,205 uu-wide
+    body (three materials, bounds extent 602 uu), and its nearest same-stem
+    neighbour is `Top_Centre_Tower_02`, a 37 uu mast. Cloning that donor would
+    put a thin post where the tower body belongs and nobody would see it in a
+    reconciliation that still balanced.
+
+    Reflecting the duplicate back across the arena's own axes and asking which
+    sibling it lands ON pairs body with body and mast with mast, one to one.
+
+    Returns (donor, transform_name, distance) or (None, None, None).
+    """
+    stem = label_stem(record["label"])
+    candidates = by_stem.get(stem, ())
+    best = (None, None, None)
+    for name, sign_x, sign_y in MIRRORS:
+        probe = {
+            "location": [record["location"][0] * sign_x,
+                         record["location"][1] * sign_y,
+                         record["location"][2]],
+        }
+        for other in candidates:
+            distance = separation(other, probe)
+            if best[2] is None or distance < best[2]:
+                best = (other, name, distance)
+    return best
+
+def match_pieces(old_pieces, new_pieces):
+    """Pair census pieces with fresh pieces, one-to-one, WITHIN a family, by
+    ascending distance. See NEIGHBOUR_RADIUS_UU for why this is not done by
+    label.
+
+    Greedy-by-distance is the right shape here and not just the easy one: the
+    pieces of a family are spread far apart compared with how far any of them
+    moved, so the globally optimal assignment and the greedy one agree, and
+    greedy makes the leftovers meaningful - the fresh pieces left unclaimed
+    are exactly the ones furthest from anything the census still had, which is
+    the definition of "a human cleared this spot".
+
+    Returns (pairs, unmatched_old, unmatched_new).
+    """
+    old_by_stem = {}
+    new_by_stem = {}
+    for piece in old_pieces:
+        old_by_stem.setdefault(label_stem(piece["label"]), []).append(piece)
+    for piece in new_pieces:
+        new_by_stem.setdefault(label_stem(piece["label"]), []).append(piece)
+
+    pairs = []
+    unmatched_old = []
+    unmatched_new = []
+
+    for stem in sorted(set(old_by_stem) | set(new_by_stem)):
+        olds = old_by_stem.get(stem, [])
+        news = new_by_stem.get(stem, [])
+        if not olds:
+            unmatched_new.extend(news)
+            continue
+        if not news:
+            unmatched_old.extend(olds)
+            continue
+
+        candidates = []
+        for old_index, old in enumerate(olds):
+            for new_index, new in enumerate(news):
+                candidates.append((separation(old, new), old_index, new_index))
+        candidates.sort()
+
+        taken_old = set()
+        taken_new = set()
+        for distance, old_index, new_index in candidates:
+            if old_index in taken_old or new_index in taken_new:
+                continue
+            taken_old.add(old_index)
+            taken_new.add(new_index)
+            pairs.append((olds[old_index], news[new_index], distance))
+            if len(taken_old) == len(olds) or len(taken_new) == len(news):
+                break
+
+        unmatched_old.extend(olds[i] for i in range(len(olds)) if i not in taken_old)
+        unmatched_new.extend(news[i] for i in range(len(news)) if i not in taken_new)
+
+    return pairs, unmatched_old, unmatched_new
+
+
 # =============================================================================
 # EDITOR SIDE
 # =============================================================================
@@ -987,134 +1123,6 @@ if IN_EDITOR:
     # -------------------------------------------------------------------------
     # PHASE 3 - replay + restore + reconcile
     # -------------------------------------------------------------------------
-
-    def separation(left, right):
-        return sum((left["location"][axis] - right["location"][axis]) ** 2
-                   for axis in range(3)) ** 0.5
-
-    def nearest_same_stem(record, by_stem):
-        stem = label_stem(record["label"])
-        best = None
-        best_distance = None
-        for other in by_stem.get(stem, ()):
-            distance = separation(other, record)
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
-                best = other
-        return best, best_distance
-
-    # The four rigid transforms a person can use to copy a cluster to the other
-    # side of an arena that is symmetric in both axes. A hand DUPLICATE is a copy
-    # of some existing piece under one of them, so the donor search tries all four
-    # and keeps the best - see donor_for_duplicate.
-    MIRRORS = (
-        ("identity", 1.0, 1.0),
-        ("mirror-X", -1.0, 1.0),
-        ("mirror-Y", 1.0, -1.0),
-        ("mirror-XY", -1.0, -1.0),
-    )
-
-    # How close the mirrored position has to land on a fresh sibling before the
-    # pairing is called a proof rather than a guess. Measured on this map: under
-    # mirror-Y all nine lost top-centre-tower copies land 10.4-15.0 uu from their
-    # counterpart, one to one, while the identity transform's nearest candidate is
-    # 4,059-5,190 uu away. Two orders of magnitude is not a threshold that needs
-    # tuning; 250 uu sits in the empty middle of it.
-    DUPLICATE_MIRROR_RADIUS_UU = 250.0
-
-    def recreate_location(record, donor):
-        """Where a re-created hand duplicate is put: the census X and Y, and the
-        donor's Z unless TRACE_REBAKE_RECREATE_Z says otherwise. See plan_recreate."""
-        z = record["location"][2] if RECREATE_Z_SOURCE == "census" else donor["location"][2]
-        return [record["location"][0], record["location"][1], z]
-
-    def donor_for_duplicate(record, by_stem):
-        """The fresh piece a hand duplicate was copied FROM, and how it was copied.
-
-        WHY NOT nearest_same_stem. That answers "which sibling is closest", which
-        for a MIRRORED cluster is the wrong question and gives a wrong answer with
-        real consequences here: `Top_Centre_Tower_2` is the cluster's 1,205 uu-wide
-        body (three materials, bounds extent 602 uu), and its nearest same-stem
-        neighbour is `Top_Centre_Tower_02`, a 37 uu mast. Cloning that donor would
-        put a thin post where the tower body belongs and nobody would see it in a
-        reconciliation that still balanced.
-
-        Reflecting the duplicate back across the arena's own axes and asking which
-        sibling it lands ON pairs body with body and mast with mast, one to one.
-
-        Returns (donor, transform_name, distance) or (None, None, None).
-        """
-        stem = label_stem(record["label"])
-        candidates = by_stem.get(stem, ())
-        best = (None, None, None)
-        for name, sign_x, sign_y in MIRRORS:
-            probe = {
-                "location": [record["location"][0] * sign_x,
-                             record["location"][1] * sign_y,
-                             record["location"][2]],
-            }
-            for other in candidates:
-                distance = separation(other, probe)
-                if best[2] is None or distance < best[2]:
-                    best = (other, name, distance)
-        return best
-
-    def match_pieces(old_pieces, new_pieces):
-        """Pair census pieces with fresh pieces, one-to-one, WITHIN a family, by
-        ascending distance. See NEIGHBOUR_RADIUS_UU for why this is not done by
-        label.
-
-        Greedy-by-distance is the right shape here and not just the easy one: the
-        pieces of a family are spread far apart compared with how far any of them
-        moved, so the globally optimal assignment and the greedy one agree, and
-        greedy makes the leftovers meaningful - the fresh pieces left unclaimed
-        are exactly the ones furthest from anything the census still had, which is
-        the definition of "a human cleared this spot".
-
-        Returns (pairs, unmatched_old, unmatched_new).
-        """
-        old_by_stem = {}
-        new_by_stem = {}
-        for piece in old_pieces:
-            old_by_stem.setdefault(label_stem(piece["label"]), []).append(piece)
-        for piece in new_pieces:
-            new_by_stem.setdefault(label_stem(piece["label"]), []).append(piece)
-
-        pairs = []
-        unmatched_old = []
-        unmatched_new = []
-
-        for stem in sorted(set(old_by_stem) | set(new_by_stem)):
-            olds = old_by_stem.get(stem, [])
-            news = new_by_stem.get(stem, [])
-            if not olds:
-                unmatched_new.extend(news)
-                continue
-            if not news:
-                unmatched_old.extend(olds)
-                continue
-
-            candidates = []
-            for old_index, old in enumerate(olds):
-                for new_index, new in enumerate(news):
-                    candidates.append((separation(old, new), old_index, new_index))
-            candidates.sort()
-
-            taken_old = set()
-            taken_new = set()
-            for distance, old_index, new_index in candidates:
-                if old_index in taken_old or new_index in taken_new:
-                    continue
-                taken_old.add(old_index)
-                taken_new.add(new_index)
-                pairs.append((olds[old_index], news[new_index], distance))
-                if len(taken_old) == len(olds) or len(taken_new) == len(news):
-                    break
-
-            unmatched_old.extend(olds[i] for i in range(len(olds)) if i not in taken_old)
-            unmatched_new.extend(news[i] for i in range(len(news)) if i not in taken_new)
-
-        return pairs, unmatched_old, unmatched_new
 
     def boxes_overlap(origin_a, extent_a, origin_b, extent_b, slack=0.0):
         for axis in range(3):
@@ -1966,6 +1974,9 @@ else:
         args = [editor_binary(), UPROJECT,
                 "-run=pythonscript", "-script={0}".format(os.path.abspath(__file__)),
                 "-unattended", "-nosplash", "-nopause", "-stdout", "-FullStdOutLogOutput",
+                # No window, no splash, no focus steal - and a real RHI, unlike -NullRHI, so the
+                # restore's material references resolve the same way the bake's did.
+                "-RenderOffScreen",
                 "-abslog={0}".format(log_path)]
         log("phase '{0}' -> {1}".format(phase, log_path))
         # The commandlet's exit code is NOT the result: UnrealEditor -run=pythonscript
@@ -1996,7 +2007,11 @@ else:
             os.makedirs(LOG_DIR)
         log_path = os.path.join(LOG_DIR, "{0}-bake.log".format(LOG_PREFIX))
         script = os.path.join(SCRIPT_DIR, "bake-arena.sh")
-        args = [script, "--force", "--",
+        # "--map" MAP_PATH, ALWAYS. Without it bake-arena.sh force-bakes its own default,
+        # /Game/Maps/Arena_Baked - so a run with TRACE_REBAKE_MAP pointing at a throwaway probe
+        # (the census and the restore both honour it) used to destroy and re-emit the SHIPPING
+        # map in between, and then restore onto a probe nobody had baked.
+        args = [script, "--force", "--map", MAP_PATH, "--",
                 "-RenderOffScreen", "-abslog={0}".format(log_path)]
         log("force bake: {0} (log {1})".format(" ".join(args), log_path))
         status = subprocess.call(args, cwd=PROJECT_ROOT, timeout=timeout)

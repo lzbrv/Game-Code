@@ -12,6 +12,7 @@
 #include "Core/TraceMatchTypes.h"    // ETraceMatchEndReason (and the arena's own scoring vocabulary)
                                      // itself via TraceSettings.h - the A/B toggle (spec v4 §7)
 #include "World/TraceBakedPiece.h"   // ETraceBakedScoringTag - the bake's mode tag (spec v15 §1)
+#include "World/TraceArenaDimensions.h" // FieldLength / FieldWidth / WallThickness defaults
 
 #include "TraceArenaBuilder.generated.h"
 
@@ -120,6 +121,10 @@ class UStaticMeshComponent;
  * and nothing else - every structure, volume, spawn and bound in this file is derived from those
  * two, and the corner banks, the goal and the endzone all re-derive themselves. It is genuinely a
  * one-edit change; it is not a rewrite.
+ *
+ * 2026-10-04 the owner scaled it x1.10 both ways: 42240 x 10560, goal to goal 37440 (the pockets
+ * kept their 2400 uu), 41.6 s goal to goal at the 900 walk. See FieldLength for what moved and what
+ * deliberately kept its size; the numbers live in World/TraceArenaDimensions.h.
  *
  * Every derived number below is expressed as a fraction of the field (or, for the pieces that must
  * not drift away from the goal line when the field grows, as an offset back FROM the goal line - see
@@ -521,6 +526,18 @@ public:
 	void WarnIfSideRampProfileIsOutOfBand() const;
 
 	/**
+	 * DO THE SIDE RAMPS STILL REACH THE END WALLS? Baked path only, logged on every startup.
+	 *
+	 * The concave side ramps are hand-layer actors (tag TraceSideRamp) whose mesh is GENERATED at the
+	 * length of the side wall (TraceSideRampProfile::kLengthUU). Resize the field and the mesh does not
+	 * notice: on 2026-10-04 the field went 38400 -> 42240 long, and a map that had not been re-baked
+	 * and re-imported carried ramps stopping 1920 uu short of each end wall - an open gap at all four
+	 * corners where the ride used to meet the wall. This compares each ramp actor's bounds against
+	 * the live field and warns, with the number, when either end is more than 10 uu off the wall.
+	 */
+	void WarnIfSideRampsShortOfEndWalls() const;
+
+	/**
 	 * World-space box of the playable pocket behind the goal at @p EndSign: goal plane to end wall,
 	 * sideline to sideline, floor to wall top.
 	 *
@@ -547,9 +564,12 @@ public:
 	/**
 	 * Half extent of a GOAL along Y, i.e. half the goal mouth.
 	 *
-	 * UTraceSettings::GoalWidthFieldFraction of the FULL field width, halved - 0.2083 by default
-	 * since spec v5 section 4 shrank it, so 1000 uu either side of the centre line on the 9600 uu
-	 * field (a 2000 uu mouth, down from 3200). Read through this
+	 * UTraceSettings::GoalWidthFieldFraction of the 9600 uu REFERENCE width
+	 * (UTraceSettings::GoalWidthReferenceFieldWidthUU), halved - NOT of the live field. 0.2083 by
+	 * default since spec v5 section 4 shrank it, so 1000 uu either side of the centre line (a 2000 uu
+	 * mouth, down from 3200). It used to read the live FieldWidth, and that is exactly what the
+	 * owner's 2026-10-04 x1.10 ("leaving the dimensions of all the objects and goals the same") had
+	 * to stop: a 10560 uu field would have grown the ring to 2200 uu. Read through this
 	 * function everywhere, exactly as EndzoneHalfWidth() is: the trigger box, the posts, the crossbar
 	 * and the mouth patch all measure themselves against it, so what scores and what is painted are
 	 * the same rectangle by construction.
@@ -1040,26 +1060,34 @@ public:
 	 * 42-second full-field run - is unchanged. What changed is that there is now
 	 * ClampedEndzoneDepth() (2400 uu) of playable floor BEHIND each hoop, with the spawn fan in it.
 	 *
-	 * So: FieldLength = 33600 (goal to goal) + 2 x EndzoneDepth (the two pockets). Change either and
-	 * the other has to follow or the goals stop being 33600 apart; that pairing is the one thing in
-	 * this file that is not self-deriving, and it is stated here because there is nowhere else to
-	 * state it - the goal plane is HalfLength() - ClampedEndzoneDepth() by construction.
+	 * So: FieldLength = goal to goal + 2 x EndzoneDepth (the two pockets). Change FieldLength alone
+	 * and the goals move WITH the walls, staying EndzoneDepth in front of them; change EndzoneDepth
+	 * alone and the goals move instead. The goal plane is HalfLength() - ClampedEndzoneDepth() by
+	 * construction.
 	 *
-	 * The layout scales with this: the cover scatter, the corner banks, the pylons and the endzone
-	 * gates are all placed at fractions of the half length, so 38400 is a tuning value rather than a
-	 * load-bearing constant. Do not drop it below ~12000 or the centre diamond and the two spawn
-	 * lines start to overlap.
+	 * 2026-10-04 - THE OWNER'S x1.10. 38400 -> 42240 (and FieldWidth 9600 -> 10560), verbatim:
+	 * "Scale up the map to be 10% longer and 10% wider, leaving the dimensions of all the objects and
+	 * goals the same, just extend the curved ramps to match the new dimensions of the walls. Then move
+	 * the goals back slightly so they are the same distance from the back wall as they originally
+	 * were." EndzoneDepth stayed 2400, so the goal planes went |X| 16800 -> 18720 with the walls and
+	 * each goal is still exactly 2400 uu from its back wall; goal to goal is now 37440 (was 33600).
+	 * What spreads and what keeps its size is decided by the two anchors in the .cpp (fractions of
+	 * the field, or uu back from the goal line); the goal ring and the centre ring are pinned to
+	 * absolute sizes so they did not grow with the field (see GoalHalfWidth()). The numbers live in
+	 * World/TraceArenaDimensions.h because the side-ramp mesh length and the pawn net cull have to
+	 * follow them too and neither can ask a live builder.
 	 *
-	 * THE COST, STATED PLAINLY: at WalkSpeed 900 a wall-to-wall run is ~43 seconds (~37 of them
-	 * goal to goal, ~2.7 in each pocket); it was 48 (42, 3) at the 800 walk before 2026-10-04.
-	 * UTraceSettings::HitscanRange has to clear the field DIAGONAL (38400 x 9600 -> 39581 uu) and
-	 * DOES: Config/DefaultGame.ini ships HitscanRange=39600, raised from the 36000 that covered the
-	 * old 33600 field when the pockets landed, and WarnIfHitscanRangeIsShort() re-checks the
-	 * pairing in the log of every match — so a future resize here cannot silently strand the long
-	 * diagonal again.
+	 * Do not drop it below ~12000 or the centre diamond and the two spawn lines start to overlap.
+	 *
+	 * THE COST, STATED PLAINLY: at WalkSpeed 900 a wall-to-wall run is ~46.9 seconds (~41.6 of them
+	 * goal to goal, ~2.7 in each pocket); it was ~42.7 (37.3, 2.7) on the 38400 field.
+	 * UTraceSettings::HitscanRange has to clear the field DIAGONAL (42240 x 10560 -> 43540 uu) and
+	 * DOES: Config/DefaultGame.ini ships HitscanRange=43600 (39600 on the 38400 x 9600 field), and
+	 * WarnIfHitscanRangeIsShort() re-checks that pairing - and the pawn net cull - in the log of
+	 * every match, so a future resize here cannot silently strand the long diagonal again.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
-	float FieldLength = 38400.f;
+	float FieldLength = TraceArenaDimensions::kFieldLengthUU;
 
 	/**
 	 * Width of the field along Y (sideline to sideline). Layout scales with this too.
@@ -1070,19 +1098,22 @@ public:
 	 * black voids that needed a whole subsystem of dressing to fill.
 	 *
 	 * EVERYTHING derived from this follows automatically: the endzone volumes and their triggers, the
-	 * mode-B goal mouths, the spawn fan, GetFieldBounds() (which is what the bots steer inside and
-	 * what the half-time side switch measures against), the grid, the flanks and the corner banks.
+	 * spawn fan, GetFieldBounds() (which is what the bots steer inside and what the half-time side
+	 * switch measures against), the grid, the flanks and the corner banks.
+	 *
+	 * THE GOAL DOES NOT FOLLOW IT ANY MORE. GoalHalfWidth() measures UTraceSettings::
+	 * GoalWidthFieldFraction against a fixed 9600 uu reference width, so the 2026-10-04 widening
+	 * (9600 -> 10560, see FieldLength) left the 2000 uu goal ring exactly the size it was.
 	 *
 	 * THE ONE NUMBER THAT DOES NOT LIVE HERE and must move with these two is
-	 * UTraceSettings::HitscanRange, which has to clear the field diagonal. Spec v28 §8 lengthened
-	 * the field to 38400 x 9600 for the two hockey pockets (a 39581 uu diagonal) and the range
-	 * followed: Config/DefaultGame.ini now ships HitscanRange=39600 (the ini wins over the
-	 * UTraceSettings default), clearing the diagonal with 19 uu to spare. The pairing is guarded at
-	 * runtime by WarnIfHitscanRangeIsShort(), so a field resize shows up in every match log rather
-	 * than as shots dying short of targets the player can plainly see.
+	 * UTraceSettings::HitscanRange, which has to clear the field diagonal: 42240 x 10560 is a
+	 * 43540 uu diagonal and Config/DefaultGame.ini ships HitscanRange=43600 (the ini wins over the
+	 * UTraceSettings default), clearing it with 60 uu to spare. The pairing is guarded at runtime by
+	 * WarnIfHitscanRangeIsShort(), so a field resize shows up in every match log rather than as
+	 * shots dying short of targets the player can plainly see.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
-	float FieldWidth = 9600.f;
+	float FieldWidth = TraceArenaDimensions::kFieldWidthUU;
 
 	/**
 	 * Wall height. Tall on purpose: on a 33600 uu field a 700 uu wall is a kerb, and the walls are
@@ -1092,7 +1123,7 @@ public:
 	float WallHeight = 2600.f;
 
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
-	float WallThickness = 200.f;
+	float WallThickness = TraceArenaDimensions::kWallThicknessUU;
 
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float FloorThickness = 120.f;
@@ -1672,6 +1703,20 @@ protected:
 	 * with a capsule swept down the real lane and errors if the two disagree.
 	 */
 	float SurfRailExitObstacleX() const;
+
+	/**
+	 * |X| of the lane pylon @p PylonIndex in one half: 0 is the inner pylon (nearest the halfway line),
+	 * 1 the outer one (nearest the goal). TraceArenaConstants::LanePylonCount of them per quadrant.
+	 *
+	 * TWO ANCHORS, for the reason the interior-layout note in the .cpp gives for the cover: the inner
+	 * pylon is a FRACTION of the half length and spreads with the field; the outer one is a fixed
+	 * distance BACK FROM THE GOAL LINE, because its neighbour is the innermost approach block (cover
+	 * C), which is goal-relative. Both were fractions until the 2026-10-04 x1.10 - and as fractions
+	 * they would have walked the outer pylon 1280 uu down the field while cover C rode the goal line
+	 * 1920 uu, driving the pylon 201 uu into cover C in all four quadrants. The pylon build, the light
+	 * bridges above them and SurfRailExitObstacleX() all read this one function.
+	 */
+	float LanePylonAbsX(int32 PylonIndex) const;
 
 	/**
 	 * DEMO 29 ITEM 4(a). How much clear lane a rail's exit needs, in uu of |X| past the junction.

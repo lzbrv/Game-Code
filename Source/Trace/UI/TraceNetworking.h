@@ -308,7 +308,12 @@ namespace TraceNet
 	// controller's RPC table), and the kill feed's LEFT row (ETraceKillIcon::Left, a value an older
 	// build would draw as a rifle round with nobody's name in front of it). A build from before any
 	// of those must be refused at the handshake with VERSION MISMATCH, not let in to disagree.
-	inline constexpr int32 NetProtocolVersion = 3;
+	//
+	// 3 -> 4, 2026-10-04: the arena is 42240 x 10560 (was 38400 x 9600) - "a cooked-content change
+	// would make two builds disagree about the world", the third case above, and the worst one: an
+	// old build would put the end walls, the out-of-bounds line and the spawn pockets 1920 uu inside
+	// where the new map has them, and shoot 4000 uu shorter. Both machines rebuild, then play.
+	inline constexpr int32 NetProtocolVersion = 4;
 
 	/**
 	 * The exact string GetNetVersionChecksum() CRCs, e.g. "trace netproto 1, project 0.1.0".

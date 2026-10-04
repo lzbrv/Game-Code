@@ -54,7 +54,7 @@
 // toe sat 600 uu up a terraced bank). The concave ramp answered that with a walkable lower half. That
 // answer is now forbidden, so the answer has to be a different one, and it has to be stated:
 //
-//     THE ENTRANCE IS THE GROUND-ENTRY RULE, AND THE ENTRANCE IS 38400 uu WIDE.
+//     THE ENTRANCE IS THE GROUND-ENTRY RULE, AND THE ENTRANCE IS THE WHOLE SIDE WALL WIDE.
 //
 // UTraceCharacterMovementComponent::HandleImpact already implements DEMO 29 item 4(b): a pawn that is
 // ON ITS FEET and leans into a surf plane with at least GetSurfGroundEntryMinApproachSpeed() of
@@ -70,9 +70,10 @@
 //   2. THE TOE FACET MUST BE INSIDE THE BAND — steeper than walkable so it is not a staircase, and
 //      shallower than the ceiling so the rule accepts it. That is kShallowestFacetTangent.
 //
-// Both are asserted. What a player does is run down the wall and lean in, anywhere along 38.4 km of
-// toe line — not find one access ramp. That is strictly more entrance than the walk-up it replaces,
-// which could only be entered where it was not blocked by a buttress pier.
+// Both are asserted. What a player does is run down the wall and lean in, anywhere along the 42240 uu
+// of toe line (38400 before the 2026-10-04 x1.10) — not find one access ramp. That is strictly more
+// entrance than the walk-up it replaces, which could only be entered where it was not blocked by a
+// buttress pier.
 //
 // -------------------------------------------------------------------------------------------------
 // THE ASSERTS, AND WHAT EACH ONE CAN CATCH
@@ -123,6 +124,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "World/TraceArenaDimensions.h"   // kLengthUU is pinned to the field length below
 
 namespace TraceSideRampProfile
 {
@@ -194,9 +196,9 @@ namespace TraceSideRampProfile
 	 * Depth of the BUILT face, toe on the floor to crest at the wall, uu.
 	 *
 	 * 760, unchanged across this rewrite, and that is deliberate: it is what the lane can afford and
-	 * what the fillet demands, and neither of those moved. The side wall's inner face is at |Y| 4800
-	 * and the crest sits 40 uu out from it, so the toe lands at |Y| 4000 and 8000 uu of clear floor is
-	 * left between the two toes.
+	 * what the fillet demands, and neither of those moved. The side wall's inner face is at |Y| 5280
+	 * (4800 before the 2026-10-04 x1.10) and the crest sits 40 uu out from it, so the toe lands at
+	 * |Y| 4480 and 8960 uu of clear floor is left between the two toes (8000 on the 9600 field).
 	 *
 	 * READ THAT AGAINST THE RIGHT BASELINE. The floor was never 9600 wide, or even 8920: the wall
 	 * fillet's lowest terrace already leaves the floor at |Y| 4195 (measured, six stations, both
@@ -237,8 +239,23 @@ namespace TraceSideRampProfile
 	 */
 	inline constexpr int32 kFacetCount = 64;
 
-	/** Length of the extrusion along the sideline, uu. The field is 38400 long (FieldLength). */
-	inline constexpr double kLengthUU = 38400.0;
+	/**
+	 * Length of the extrusion along the sideline, uu: the full length of the side wall, so the ride
+	 * meets both end walls. 38400 -> 42240 with the owner's 2026-10-04 x1.10 of the field; the neon
+	 * motif is re-tiled at its own period (90 repeats at 469.3 uu, was 82 at 468.3), NOT stretched.
+	 *
+	 * A LITERAL, deliberately: Scripts/generate_side_ramp.py and Scripts/import_side_ramp.py parse it
+	 * with a number regex. The static_assert below pins it to TraceArenaDimensions::kFieldLengthUU, so
+	 * the next resize of the field fails the build here instead of shipping ramps that stop short of
+	 * the end walls (ATraceArenaBuilder::WarnIfSideRampsShortOfEndWalls() is the runtime half).
+	 */
+	inline constexpr double kLengthUU = 42240.0;
+
+	static_assert(kLengthUU == static_cast<double>(TraceArenaDimensions::kFieldLengthUU),
+		"THE SIDE RAMPS MUST SPAN THE SIDE WALL. kLengthUU is the length the ramp mesh is generated at, and "
+		"it has drifted from the field length in World/TraceArenaDimensions.h. Set it to the new length, "
+		"then re-run Scripts/generate_side_ramp.py and Scripts/import_side_ramp.py (phase import) and "
+		"re-bake Arena_Baked.");
 
 	/**
 	 * Where the crest sits, as a distance OUT from the side wall's inner face, uu.
@@ -423,7 +440,7 @@ namespace TraceSideRampProfile
 		"well'. A wall run shorter than the thing it is replacing is a downgrade.");
 
 	static_assert(kDepthUU < 1000.0,
-		"THE LANE MUST SURVIVE. Two ramps this deep eat 2 x kDepthUU of a 9600 uu wide field; the "
+		"THE LANE MUST SURVIVE. Two ramps this deep eat 2 x kDepthUU of a 10560 uu wide field; the "
 		"collaborator's own original side ramps were 946 uu and that was the widest anyone has gone.");
 
 	static_assert(kToeOutFromWallUU > kFilletOuterEdgeOutUU + 100.0,

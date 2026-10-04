@@ -110,8 +110,10 @@ join had ever run. All three of these turned up in the first two-process test an
    was irrelevant from frame one and never arrived. The client's log had no `Arena built` line at all
    and its pawn logged `Z=-19636`, falling. Fixed with `bAlwaysRelevant = true` in the constructor.
 2. **The client saw only 5 of the 10 players.** Same root cause on `ATraceCharacter`: a 15000 uu cull
-   radius on a 33600 × 9600 field means half the roster is never relevant. Now
-   `SetNetCullDistanceSquared(40000² )`, which covers the diagonal. Reading an enemy's trail from
+   radius on a 33600 × 9600 field means half the roster is never relevant. It was then a 40000 uu
+   literal; since the 2026-10-04 resize (42240 × 10560, a 43540 uu diagonal) it is DERIVED from
+   `World/TraceArenaDimensions.h` — the outer diagonal plus 2%, 44907 uu — and every match log
+   prints it next to the diagonal ("Pawn net cull ... spans ..."). Reading an enemy's trail from
    across the arena is the whole game, so there is no distance at which a player stops mattering.
 3. **Every ground correction was being thrown away.** A real client logged this **2948 times in 30
    seconds**:
@@ -497,11 +499,11 @@ this repository**:
 "trace netproto <NetProtocolVersion>, project <ProjectVersion>"
 ```
 
-* `NetProtocolVersion` — `Source/Trace/UI/TraceNetworking.h`, currently `1`
+* `NetProtocolVersion` — `Source/Trace/UI/TraceNetworking.h`, currently `4`
 * `ProjectVersion` — `Config/DefaultGame.ini`, currently `0.1.0`
 
 Any two builds of the same commit therefore agree by construction, on any platform, on any 5.8
-install. Today's value is **`NET 51920028`** (decimal 1368522792).
+install. Today's value is **`NET 8FE0912A`** (decimal 2413859114; protocol 4 since the 2026-10-04 arena resize).
 
 ### The trade-off, stated where it is made
 
@@ -525,7 +527,7 @@ works cross-platform at all.
 
 | Who | How |
 |---|---|
-| A player on any build, including Shipping | Title screen, bottom right: `V 0.1.0   NET 51920028` |
+| A player on any build, including Shipping | Title screen, bottom right: `V 0.1.0   NET 8FE0912A` |
 | Anyone with the repository — no engine, no build, one second | `python3 Scripts/netversion.py` |
 | A developer with a console | `Trace.NetVersion` |
 

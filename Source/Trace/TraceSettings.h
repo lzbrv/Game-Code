@@ -597,7 +597,20 @@ public:
 	// ==========================================================================================
 
 	/**
-	 * Width of each goal as a fraction of the FULL field width.
+	 * The field width GoalWidthFieldFraction is measured against, uu. A FIXED REFERENCE, not the live
+	 * arena: the 9600 uu width the fraction was tuned on.
+	 *
+	 * The fraction used to be of ATraceArenaBuilder::FieldWidth, so the goal "tracked the arena". The
+	 * owner's 2026-10-04 x1.10 of the field ("leaving the dimensions of all the objects and goals the
+	 * same") is the resize that must NOT move the goal, and 10560 x 0.2083 would have grown the ring
+	 * from 2000 to 2200 uu. So the goal is now pinned: ATraceArenaBuilder::GoalHalfWidth() and the two
+	 * report lines that quote the mouth (Trace.DumpSettings, Trace.Stats.Dump) all read this.
+	 */
+	static constexpr float GoalWidthReferenceFieldWidthUU = 9600.f;
+
+	/**
+	 * Width of each goal as a fraction of the 9600 uu REFERENCE width (GoalWidthReferenceFieldWidthUU
+	 * above) - NOT of the live field, since the 2026-10-04 x1.10. 0.2083 x 9600 = a 2000 uu mouth.
 	 *
 	 * Verbatim (v4): "The goal should not be the entire width of the map, like the endzone."
 	 * Verbatim (v5 §4): "For game mode b ONLY ... decrease the size of the goal (reduce height and
@@ -611,7 +624,7 @@ public:
 	 * Keep it under ~0.6 or the distinction the spec is asking for — a goal, not a wall — stops
 	 * existing; below ~0.12 (1150 uu) a thrown Core has to be threaded and nothing scores at all.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Match|Goals", meta = (DisplayName = "Goal Width (fraction of field width)", ClampMin = "0.05", ClampMax = "1.0", UIMin = "0.1", UIMax = "0.6"))
+	UPROPERTY(config, EditAnywhere, Category = "Match|Goals", meta = (DisplayName = "Goal Width (fraction of the 9600 uu reference width)", ClampMin = "0.05", ClampMax = "1.0", UIMin = "0.1", UIMax = "0.6"))
 	float GoalWidthFieldFraction = 0.2083f;
 
 	/**
@@ -721,9 +734,15 @@ public:
 	 * Raising it does NOT make the bots deadlier: they are limited by FTraceBotProfile::
 	 * MaxEngagementRange (4200 Easy / 4800 Normal / 6000 Hard), far below either value. This only
 	 * restores the human's ability to shoot what they can see.
+	 *
+	 * *** 39600 -> 43600, 2026-10-04, IN THE SAME COMMIT AS THE FIELD. *** The owner scaled the arena
+	 * x1.10 both ways (World/TraceArenaDimensions.h: 42240 x 10560), so the diagonal went 39581 ->
+	 * sqrt(42240^2 + 10560^2) = 43540 uu. 43600 clears it with 60 uu - the same thin-margin policy as
+	 * above, rounded up to the next hundred. Config/DefaultGame.ini carries the same value (the ini
+	 * wins), and ATraceArenaBuilder::WarnIfHitscanRangeIsShort() checks the pairing every match.
 	 */
 	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Hitscan Range (uu)", ClampMin = "100.0", ClampMax = "200000.0", UIMin = "5000.0", UIMax = "50000.0"))
-	float HitscanRange = 39600.f;
+	float HitscanRange = 43600.f;
 
 	/**
 	 * SECONDS BETWEEN SHOTS — this is the inverse of the fire RATE, so a BIGGER number is a SLOWER

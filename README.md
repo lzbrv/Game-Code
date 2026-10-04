@@ -373,7 +373,7 @@ with charge throws, catches and turnover pulls; two-half match flow with a side 
 deferred half-time; a **practice range** (its own game mode, reachable from the title screen);
 bots that play the full ruleset with selectable difficulty (Easy/Normal/Hard, default Normal); a
 title menu with real menu art and a bitmap-font text renderer; a post-match result screen; a
-38,400 × 9,600 uu neon arena (33,600 goal-to-goal plus two hockey-style pockets) shipped as an
+42,240 × 10,560 uu neon arena (37,440 goal-to-goal plus two hockey-style pockets) shipped as an
 editable baked level; first-person with a third-person blend while carrying; and every gameplay
 number live-editable in Project Settings while Play-In-Editor is running.
 

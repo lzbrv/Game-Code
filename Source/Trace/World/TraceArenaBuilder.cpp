@@ -852,11 +852,22 @@ namespace TraceArenaConstants
 	 * to answer. Two at 0.25 and 0.6667 put a column roughly every 5600 uu and give the light-bridge
 	 * span a rhythm.
 	 *
-	 * Y stays at 0.6042 (2900) - the field width did not change - which keeps them 290 uu clear of
-	 * the corner banks' toe.
+	 * Y stays at 0.6042 (2900 on the 9600 field) - the field width did not change in that pass - which
+	 * keeps them 290 uu clear of the corner banks' toe.
+	 *
+	 * TWO ANCHORS SINCE THE 2026-10-04 x1.10 (42240 x 10560), read through
+	 * ATraceArenaBuilder::LanePylonAbsX() and nowhere else. The INNER pylon is still a fraction of the
+	 * half length (0.25 -> 5280). The OUTER one is now LanePylonGoalBackUU back from the goal line
+	 * (18720 - 4000 = 14720), because its neighbour is cover C, which is goal-relative: as the old
+	 * 0.6667 fraction it would have landed at 14081 while cover C rode the goal line to 13920, and the
+	 * two pawn shells would have interpenetrated by 201 uu in all four quadrants. 4000 is what the
+	 * 0.6667 fraction measured on the 38400 field (16800 - 12800.6), so the 438 uu shell gap to
+	 * cover C is the one the old layout was tuned with. Y spreads with the width: 0.6042 -> 3190.
 	 */
-	static constexpr float LanePylonXFracs[] = { 0.2500f, 0.6667f };   // 4200, 11200
-	static constexpr float LanePylonYFrac = 0.6042f;   // 2900
+	static constexpr int32 LanePylonCount = 2;
+	static constexpr float LanePylonNearXFrac = 0.2500f;     // 5280 on the 42240 field
+	static constexpr float LanePylonGoalBackUU = 4000.f;     // 14720 on the 42240 field
+	static constexpr float LanePylonYFrac = 0.6042f;   // 3190 on the 10560 field
 	static constexpr float LanePylonSide = 220.f;
 	static constexpr float LanePylonHeight = 1300.f;
 
@@ -887,14 +898,25 @@ namespace TraceArenaConstants
 	static constexpr float DaisPylonHeight = 1400.f;
 
 	/**
-	 * Glowing ring on the floor marking the contested zone. Diameter as a fraction of HalfWidth.
+	 * Glowing ring on the floor marking the contested zone. Its OUTER radius, uu - absolute.
 	 *
-	 * 0.8667 -> 0.62. It is a fraction of the half width, so it survived the narrowing arithmetically
-	 * - and would have landed a 4160 uu radius ring straight through the toe of both corner banks,
-	 * where the terraces would have eaten most of it. 0.62 gives a 2976 uu radius, which sits
-	 * entirely on the flat playfield with 324 uu to spare.
+	 * It was a fraction of the half width (0.8667, then 0.62, i.e. 2976 uu on the 9600 field, which sat
+	 * entirely on the flat playfield with 324 uu to spare). The 2026-10-04 x1.10 widened the field to
+	 * 10560 and the owner asked for every object to keep its size, so the ring is now the 2976 uu it
+	 * measured rather than a fraction that would have grown it to 3274: it marks the contested zone
+	 * around the dais, and the dais (see DaisPylonXPerDaisSide) does not grow with the field either.
 	 */
-	static constexpr float CentrePadDiameterFrac = 0.62f;
+	static constexpr float CentreRingRadiusUU = 2976.f;
+
+	/**
+	 * The field the SKYLINE tables (BuildSkyline's EndTowers / FlankTowers and the horizon band's X)
+	 * were authored on: the 38400 x 9600 field's half extents. BuildSkyline spreads those positions by
+	 * HalfLength() / and HalfWidth() / these, so the sky stays the same distance band beyond whatever
+	 * walls the field has, while every tower keeps its footprint and height.
+	 */
+	static constexpr float SkylineAuthoredHalfLengthUU = 19200.f;
+	static constexpr float SkylineAuthoredHalfWidthUU = 4800.f;
+	static constexpr float HorizonBandAuthoredX = 36000.f;
 	static constexpr float CentreRingWidth = 70.f;
 
 	// --- Flanks ----------------------------------------------------------------------------------
@@ -930,9 +952,11 @@ namespace TraceArenaConstants
 	//
 	// AND AFTER THE BUTTRESS PASS one more rule applies to everything in this section: NOTHING MAY
 	// STAND ON THE SIDE-WALL RIDE. The ride line is |Y| 4000..4760 on both walls, floor to 1096 uu,
-	// for the whole 38400 uu length, and a solid inside that volume is a crash at 1500 uu/s rather
-	// than a piece of dressing. That is why the side buttress row is gone, and it is why the gate
-	// towers and the corner pylons moved inboard (see GateTowerWallGap and CornerPylonYFrac). The
+	// for the whole 38400 uu length (|Y| 4480..5240 for the whole 42240 since the 2026-10-04 x1.10 -
+	// it rides the wall, so the band is the same 760 uu off it), and a solid inside that volume is a
+	// crash at 1500 uu/s rather than a piece of dressing. That is why the side buttress row is gone,
+	// and it is why the gate towers and the corner pylons moved inboard (see GateTowerWallGap and
+	// CornerPylonYFrac). The
 	// pieces that stayed are the ones measured to be clear of it: the high rail (1640, and at |Y|
 	// 4536..4600 where the deck is 818 uu), the light bridges (1240, same reason), the flank stripes
 	// (|Y| 2016 and 3168, on the floor) and the wall's own trim (all of it at |Y| >= 4754, i.e.
@@ -2608,8 +2632,12 @@ float ATraceArenaBuilder::GoalHalfWidth() const
 	const float Fraction = FMath::Clamp(UTraceSettings::Get().GoalWidthFieldFraction,
 		TraceArenaConstants::MinGoalWidthFraction, TraceArenaConstants::MaxGoalWidthFraction);
 
-	// Never wider than the field itself, whatever the settings say.
-	return FMath::Min(HalfWidth(), FieldWidth * Fraction * 0.5f);
+	// OF THE 9600 uu REFERENCE WIDTH, NOT OF FieldWidth. The owner's 2026-10-04 x1.10 widened the
+	// field to 10560 and asked for the goals to keep their size; reading the live width here would
+	// have grown the ring to a 2200 uu mouth (radius 1099.8) and, with it, the sill, the mouth patch,
+	// the ramps' width, the side rails, the scoring volume and the bots' goal box - all of which read
+	// this function. Never wider than the field itself, whatever the settings say.
+	return FMath::Min(HalfWidth(), UTraceSettings::GoalWidthReferenceFieldWidthUU * Fraction * 0.5f);
 }
 
 float ATraceArenaBuilder::ClampedGoalHeight() const
@@ -2794,6 +2822,7 @@ void ATraceArenaBuilder::EnsureBuilt()
 		AdoptBakedArena();
 		WarnIfHitscanRangeIsShort();
 		WarnIfSideRampProfileIsOutOfBand();
+		WarnIfSideRampsShortOfEndWalls();
 		return;
 	}
 
@@ -2809,7 +2838,8 @@ void ATraceArenaBuilder::EnsureBuilt()
 // player can plainly see. It has now been left behind TWICE by a pass that lengthened the field -
 // spec v4 §3 (24000 -> 33600, range left at 28000) and spec v28 §8 (33600 -> 38400, range left at
 // 36000). BOTH TIMES THE PAIRING WAS WRITTEN DOWN IN A COMMENT NEXT TO THE VALUE, in this header and
-// in Config/DefaultGame.ini, and both times the comment was not enough.
+// in Config/DefaultGame.ini, and both times the comment was not enough. The owner's 2026-10-04 x1.10
+// (38400 x 9600 -> 42240 x 10560, a 43540 uu diagonal) moved it in the same commit: 39600 -> 43600.
 //
 // So the check runs on EVERY startup, on both paths (the procedural build and the baked adopt),
 // costs one sqrt, and prints at Error when it fails. Trace.Arena.VerifyHitscanReach measures the
@@ -2827,9 +2857,32 @@ void ATraceArenaBuilder::WarnIfHitscanRangeIsShort() const
 	const float DiagonalUU = FMath::Sqrt(FieldLength * FieldLength + FieldWidth * FieldWidth);
 	const float RangeUU    = UTraceSettings::Get().HitscanRange;
 
+	// THE SAME PAIRING FOR THE PAWN'S NET CULL. ATraceCharacter sets it in its constructor, long before
+	// any arena exists, from World/TraceArenaDimensions.h - so it can only be checked here, against the
+	// field this builder actually made. A cull shorter than the diagonal is a client that never sees
+	// the players at the far end: the "5 of 10 characters" failure docs/NETWORKING.md records.
+	{
+		const ATraceCharacter* PawnCDO = ATraceCharacter::StaticClass()->GetDefaultObject<ATraceCharacter>();
+		const float PawnCullUU = (PawnCDO != nullptr) ? FMath::Sqrt(PawnCDO->GetNetCullDistanceSquared()) : 0.f;
+		if (PawnCullUU >= DiagonalUU)
+		{
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[Arena] Pawn net cull %.0f uu spans the %.0f x %.0f arena's %.0f uu diagonal (%.0f uu spare)."),
+				PawnCullUU, FieldLength, FieldWidth, DiagonalUU, PawnCullUU - DiagonalUU);
+		}
+		else
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[Arena] *** PAWN NET CULL IS SHORT. *** ATraceCharacter's net cull distance is %.0f uu and the "
+				     "%.0f x %.0f field's diagonal is %.0f uu, so a client stops receiving the players at the far "
+				     "end of it. It is derived from World/TraceArenaDimensions.h - make that match this builder."),
+				PawnCullUU, FieldLength, FieldWidth, DiagonalUU);
+		}
+	}
+
 	if (RangeUU >= DiagonalUU)
 	{
-		UE_LOG(LogTraceGame, Verbose,
+		UE_LOG(LogTraceGame, Display,
 			TEXT("[Arena] HitscanRange %.0f uu spans the %.0f x %.0f arena's %.0f uu diagonal (%.0f uu spare)."),
 			RangeUU, FieldLength, FieldWidth, DiagonalUU, RangeUU - DiagonalUU);
 		return;
@@ -2895,6 +2948,71 @@ void ATraceArenaBuilder::WarnIfSideRampProfileIsOutOfBand() const
 		     "band back, or change kDepthUU/kHeightUU (the build asserts will tell you which way) and "
 		     "re-run Scripts/generate_side_ramp.py + Scripts/import_side_ramp.py."),
 		*Reason);
+}
+
+// =================================================================================================
+// THE SIDE RAMPS' LENGTH, RE-CHECKED AGAINST THE LIVE FIELD.
+//
+// The ramps are a mesh generated at TraceSideRampProfile::kLengthUU and placed by hand on the baked
+// map. A static_assert pins kLengthUU to TraceArenaDimensions::kFieldLengthUU, which catches a SOURCE
+// resize; it cannot catch a map that was never re-baked or a mesh that was never re-imported. This is
+// that half: it reads the placed actors' bounds and the live field, and says by how much they differ.
+// =================================================================================================
+void ATraceArenaBuilder::WarnIfSideRampsShortOfEndWalls() const
+{
+	const UWorld* World = GetWorld();
+	if (World == nullptr)
+	{
+		return;
+	}
+
+	const FBox Field = GetFieldBounds();
+	const float FieldMinX = static_cast<float>(Field.Min.X);
+	const float FieldMaxX = static_cast<float>(Field.Max.X);
+	const FName RampTag(TEXT("TraceSideRamp"));   // Scripts/import_side_ramp.py SIDE_RAMP_TAG
+
+	int32 RampsChecked = 0;
+	int32 RampsOff = 0;
+	for (TActorIterator<AActor> It(World); It; ++It)
+	{
+		const AActor* Ramp = *It;
+		if (!IsValid(Ramp) || !Ramp->ActorHasTag(RampTag))
+		{
+			continue;
+		}
+
+		FVector RampOrigin = FVector::ZeroVector;
+		FVector RampExtent = FVector::ZeroVector;
+		Ramp->GetActorBounds(/*bOnlyCollidingComponents=*/false, RampOrigin, RampExtent);
+		const float RampMinX = static_cast<float>(RampOrigin.X - RampExtent.X);
+		const float RampMaxX = static_cast<float>(RampOrigin.X + RampExtent.X);
+		const float ShortAtMin = RampMinX - FieldMinX;   // + = stops short of the -X wall
+		const float ShortAtMax = FieldMaxX - RampMaxX;   // + = stops short of the +X wall
+		++RampsChecked;
+
+		// 10 uu, not 0: the neon TRIM's bounds run 6.4 uu past one end of the shell by construction
+		// (measured: extent 19203.15 about an origin 3.2 uu off centre on the 38400 mesh), and that
+		// is neon inside a 200 uu wall, not a gap. A ramp that stops short of a wall is off by
+		// hundreds of uu - 1920 on the 2026-10-04 resize - so the margin cannot hide one.
+		if (FMath::Abs(ShortAtMin) <= 10.f && FMath::Abs(ShortAtMax) <= 10.f)
+		{
+			continue;
+		}
+
+		++RampsOff;
+		UE_LOG(LogTraceGame, Warning,
+			TEXT("[Arena][SIDERAMP-LENGTH] %s spans X %.0f..%.0f but the end walls stand at X %.0f and %.0f: it "
+			     "stops %.0f uu %s of the -X wall and %.0f uu %s of the +X wall. The mesh is generated at "
+			     "TraceSideRampProfile::kLengthUU - re-run Scripts/generate_side_ramp.py and "
+			     "Scripts/import_side_ramp.py, and re-bake Arena_Baked so the actor sits on the current wall."),
+			*Ramp->GetActorNameOrLabel(), RampMinX, RampMaxX, FieldMinX, FieldMaxX,
+			FMath::Abs(ShortAtMin), (ShortAtMin >= 0.f) ? TEXT("short") : TEXT("past"),
+			FMath::Abs(ShortAtMax), (ShortAtMax >= 0.f) ? TEXT("short") : TEXT("past"));
+	}
+
+	UE_LOG(LogTraceGame, Display,
+		TEXT("[Arena][SIDERAMP-LENGTH] %d side-ramp actor(s) checked against the %.0f uu field: %d reach both end walls, %d do not."),
+		RampsChecked, FieldMaxX - FieldMinX, RampsChecked - RampsOff, RampsOff);
 }
 
 void ATraceArenaBuilder::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -3441,8 +3559,6 @@ void ATraceArenaBuilder::BuildGrid()
 
 void ATraceArenaBuilder::BuildCentreDais(bool bBuildVisuals)
 {
-	const float HalfY = HalfWidth();
-
 	// Emissive 0.012, NOT the 0.035 the rest of the structure carries, and this one is worth a note.
 	//
 	// The dais is the only large UP-FACING surface a player ever stands on, and up-facing surfaces
@@ -3476,7 +3592,7 @@ void ATraceArenaBuilder::BuildCentreDais(bool bBuildVisuals)
 		// Built as two coaxial discs rather than a ring mesh (the engine basic shapes have no torus):
 		// a neon disc with a slightly smaller floor-coloured disc laid a hair above it. Two draws,
 		// exact control of the ring width, no new asset.
-		const float PadDiameter = HalfY * TraceArenaConstants::CentrePadDiameterFrac * 2.f;
+		const float PadDiameter = TraceArenaConstants::CentreRingRadiusUU * 2.f;
 		// 0.20 Hz / ±8%, phase-shared with the centre line (MAP plan §6.2): the two marks of the
 		// contested middle breathe together. See the pulse note in BuildGrid.
 		UMaterialInstanceDynamic* PadMID = MakeNeonMID(TraceArenaConstants::NeonNeutral, TraceArenaConstants::GlowRing,
@@ -4382,7 +4498,7 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	// kind, the endzone floor being otherwise flat - and it is still flat, because the corner banks
 	// deliberately stop at the goal line. A tall column in each corner closes the room off and,
 	// incidentally, gives a defender something to fight around. They stand at the MIDDLE of the
-	// endzone (X = 18000 on the shipped 38400 field) rather than at a fraction of the half length -
+	// endzone (X = 19920 on the 42240 field, 18000 on the 38400 one) rather than at a fraction of the half length -
 	// see CornerPylonYFrac for why that distinction cost a gate tower 80 uu of clearance.
 	//
 	// CLEARANCES RE-MEASURED FOR THE BUTTRESS PASS, on the shipped 38400 x 9600 field, after
@@ -4414,11 +4530,11 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	// Collision, so they are outside the bBuildVisuals gate with everything else that blocks.
 	for (const float XSign : { -1.f, 1.f })
 	{
-		for (const float XFrac : TraceArenaConstants::LanePylonXFracs)
+		for (int32 Pylon = 0; Pylon < TraceArenaConstants::LanePylonCount; ++Pylon)
 		{
 			for (const float YSign : { -1.f, 1.f })
 			{
-				AddPylon(FVector2D(XSign * HalfX * XFrac, YSign * HalfY * TraceArenaConstants::LanePylonYFrac),
+				AddPylon(FVector2D(XSign * LanePylonAbsX(Pylon), YSign * HalfY * TraceArenaConstants::LanePylonYFrac),
 					TraceArenaConstants::LanePylonSide, TraceArenaConstants::LanePylonHeight,
 					BodyMID, HalfNeon[HalfIndex(XSign)], TEXT("LanePylon"));
 			}
@@ -4460,7 +4576,7 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	const float BridgeZ = TraceArenaConstants::LanePylonHeight - TraceArenaConstants::BridgeDrop;
 	for (const float XSign : { -1.f, 1.f })
 	{
-		for (const float XFrac : TraceArenaConstants::LanePylonXFracs)
+		for (int32 Pylon = 0; Pylon < TraceArenaConstants::LanePylonCount; ++Pylon)
 		{
 			for (const float YSign : { -1.f, 1.f })
 			{
@@ -4469,7 +4585,7 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 				const float Span = FMath::Abs(WallY - PylonY);
 
 				AddMeshBlock(CubeMesh,
-					FVector(XSign * HalfX * XFrac, (PylonY + WallY) * 0.5f, BridgeZ),
+					FVector(XSign * LanePylonAbsX(Pylon), (PylonY + WallY) * 0.5f, BridgeZ),
 					FVector(TraceArenaConstants::BridgeSize, Span, TraceArenaConstants::BridgeSize),
 					HalfBridge[HalfIndex(XSign)], /*bCastShadow=*/false, TEXT("LightBridge"));
 			}
@@ -4879,6 +4995,16 @@ float ATraceArenaBuilder::SurfRailBackY() const
 	return FMath::Clamp(Wanted, CrestY + 160.f, HalfWidth() - 200.f);
 }
 
+float ATraceArenaBuilder::LanePylonAbsX(int32 PylonIndex) const
+{
+	// See the header and TraceArenaConstants::LanePylonGoalBackUU: the inner pylon spreads with the
+	// field, the outer one keeps its distance from the goal line (and so from cover C).
+	return (PylonIndex <= 0)
+		? HalfLength() * TraceArenaConstants::LanePylonNearXFrac
+		: FMath::Max(HalfLength() * TraceArenaConstants::LanePylonNearXFrac,
+			GoalLineX() - TraceArenaConstants::LanePylonGoalBackUU);
+}
+
 float ATraceArenaBuilder::SurfRailExitObstacleX() const
 {
 	// =============================================================================================
@@ -4970,9 +5096,9 @@ float ATraceArenaBuilder::SurfRailExitObstacleX() const
 		Consider(FMath::Max(0.f, GoalX - Spec.XAnchor), ExtentX, HalfY * Spec.YFrac, ExtentY);
 	}
 
-	for (const float XFrac : TraceArenaConstants::LanePylonXFracs)
+	for (int32 Pylon = 0; Pylon < TraceArenaConstants::LanePylonCount; ++Pylon)
 	{
-		Consider(HalfX * XFrac, TraceArenaConstants::LanePylonSide * 0.5f + PawnInflation,
+		Consider(LanePylonAbsX(Pylon), TraceArenaConstants::LanePylonSide * 0.5f + PawnInflation,
 			HalfY * TraceArenaConstants::LanePylonYFrac,
 			TraceArenaConstants::LanePylonSide * 0.5f + PawnInflation);
 	}
@@ -9798,7 +9924,8 @@ void ATraceArenaBuilder::BuildSkyline(bool bBuildVisuals)
 	// THE SKY DRESSING — release overhaul, MAP plan §4. Three answers to two audit findings ("the
 	// sky is an empty gradient" and "orange territory does not read at distance"):
 	//
-	//   1. A ring of 24 dark towers 8,200–14,600 uu beyond the walls — inside the bible's
+	//   1. A ring of 24 dark towers 8,200–14,600 uu beyond the walls (9,460–16,060 since the 2026-10-04
+	//      x1.10 spread them with the walls — see SkyScaleX below) — inside the bible's
 	//      8,000–20,000 band, far enough that parallax is minimal and nobody asks to visit, close
 	//      enough to register as a city rather than a texture. The EIGHT towers behind each goal
 	//      wear rooftop neon in that end's defending colour; the eight along the flanks stay
@@ -9881,9 +10008,17 @@ void ATraceArenaBuilder::BuildSkyline(bool bBuildVisuals)
 	// the AA-safety minimums outright.
 	const float RoofLipHeight = 64.f;
 
+	// THE TABLES ABOVE WERE AUTHORED ON THE 38400 x 9600 FIELD, and their positions are spread with the
+	// walls rather than pinned: at the 2026-10-04 x1.10 (42240 x 10560) a pinned end tower would have
+	// stood 6680 uu beyond its wall, inside the art bible's 8000 uu minimum. Scaled, the end towers sit
+	// 9460..16060 uu beyond the end walls and the flank towers 9680..12870 beyond the side walls - both
+	// inside the 8000-20000 band - and every footprint and height is unchanged (objects keep their size).
+	const float SkyScaleX = HalfLength() / TraceArenaConstants::SkylineAuthoredHalfLengthUU;
+	const float SkyScaleY = HalfWidth() / TraceArenaConstants::SkylineAuthoredHalfWidthUU;
+
 	auto AddTower = [&](const FSkyTower& Tower, float MirrorX, UMaterialInstanceDynamic* RoofMID)
 	{
-		const FVector Centre(Tower.X * MirrorX, Tower.Y, 0.f);
+		const FVector Centre(Tower.X * MirrorX * SkyScaleX, Tower.Y * SkyScaleY, 0.f);
 
 		// Body: from Z -2000 (the base is never visible over the wall) up to the roof.
 		AddMeshBlock(CubeMesh,
@@ -9944,10 +10079,15 @@ void ATraceArenaBuilder::BuildSkyline(bool bBuildVisuals)
 		// wall-top sightline from midfield and everywhere behind it, and the bottom runs far enough
 		// down that the visible edge always emerges FROM the wall line with no dark gap between them,
 		// whatever the viewer's height. The occluded lower half costs nothing — it is one instance.
+		//
+		// The 36000 and 19200 above are the 38400 field's. The band's X is spread by the same SkyScaleX
+		// as the towers, so on the 42240 field it stands at 39600 against a wall at 21120 and the
+		// ratio in that sightline formula - and therefore every height quoted from it - is unchanged
+		// (36000/19200 = 39600/21120 = 1.875). Its 26000 uu width is a SIZE and is kept.
 		UMaterialInstanceDynamic* BandMID = MakeNeonMID(TeamColor, 0.8f);
 		RegisterSideMID(Sign, BandMID, /*bNeon=*/true, 0.8f);
 		AddMeshBlock(CubeMesh,
-			FVector(Sign * 36000.f, 0.f, 4000.f),
+			FVector(Sign * TraceArenaConstants::HorizonBandAuthoredX * SkyScaleX, 0.f, 4000.f),
 			FVector(500.f, 26000.f, 6000.f),
 			BandMID, /*bCastShadow=*/false, TEXT("HorizonBand"));
 
@@ -10023,6 +10163,11 @@ void ATraceArenaBuilder::BuildPlayerStarts()
 		// the outermost pad row is 1050 uu clear of them in Y and could sit on top of them in X
 		// without touching; the hoop is 1514 uu away in X and 264 uu up. Nothing else is built there.
 		// ATraceGameMode's deeper respawn pads come out of the same band at alpha 0.85 (X = 18892).
+		//
+		// ON THE 42240 x 10560 FIELD (the owner's 2026-10-04 x1.10) every one of those relations holds
+		// unchanged, because the band is measured off the goal ramp's foot and the end wall and both
+		// moved out 1920 uu together: X = +/-20234 (886 uu off the wall, as before), Y = 0 / +/-1584 /
+		// +/-3168, pocket 18720..21120, respawn pads at X = 20812.
 		const float LineX = GetSpawnLineX(Sign, TraceArenaConstants::StartPocketAlpha);
 		const float FacingYaw = (Sign < 0.f) ? 0.f : 180.f;
 
@@ -13365,6 +13510,14 @@ namespace
 		Stations.Add({ TEXT("-Y wall, midfield"),      static_cast<float>(Mid.X) + HalfX * 0.075f, -1.f });
 		Stations.Add({ TEXT("-Y wall, quarter"),       static_cast<float>(Mid.X) - HalfX * 0.400f, -1.f });
 		Stations.Add({ TEXT("-Y wall, endzone"),       static_cast<float>(Mid.X) - HalfX + 1800.f, -1.f });
+		// THE CORNERS: 240 uu in from each end wall, i.e. where the ride has to MEET the end wall. The
+		// endzone stations above are 1800 uu in and could not see a ramp that stops short of the wall -
+		// which is exactly what a field resize without a re-generated, re-placed ramp produces (on the
+		// 2026-10-04 x1.10 the old 38400 uu mesh stopped 1920 uu short of each end wall). 240, not
+		// less: the outermost end buttress stands on the end wall 200 uu deep (+26 uu of standoff) and
+		// over the ramp's toe, and a station inside it reads the buttress's flat top, not the ramp.
+		Stations.Add({ TEXT("+Y wall, corner"),        static_cast<float>(Mid.X) + HalfX - 240.f,   1.f });
+		Stations.Add({ TEXT("-Y wall, corner"),        static_cast<float>(Mid.X) - HalfX + 240.f,  -1.f });
 
 		for (const FStation& Station : Stations)
 		{
@@ -14877,6 +15030,8 @@ namespace
 //   spec v28 §8  lengthened it 33600 -> 38400 for the hockey pockets and left it at 36000
 //                (3581 uu short). The §8 owner found this and could not fix it - TraceSettings.h is
 //                not their file - and said so in their hand-off. This pass raised it to 39600.
+//   2026-10-04   the owner's x1.10 (42240 x 10560, diagonal 43540) raised it to 43600 IN THE SAME
+//                COMMIT as the field, which is the first resize that did not leave it behind.
 //
 // A NUMBER THAT MUST TRACK ANOTHER NUMBER NEEDS A HARNESS, NOT A COMMENT. Both comments were there
 // and both were missed, which is the whole argument for this command existing.

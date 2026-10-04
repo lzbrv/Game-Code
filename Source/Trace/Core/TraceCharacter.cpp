@@ -51,6 +51,7 @@
 #include "Settings/TraceGameUserSettings.h"    // ApplySavedFieldOfView(): the VIDEO page's FOV row
 #include "Trace.h"
 #include "TraceSettings.h"
+#include "World/TraceArenaDimensions.h"   // the pawn net cull is derived from the field size
 #include "World/TraceArenaBuilder.h"          // SetBase(): the arena is not a moving platform
 
 namespace
@@ -169,15 +170,20 @@ ATraceCharacter::ATraceCharacter(const FObjectInitializer& OI)
 	// never relevant and simply is not in the client's world. Trace's whole premise is reading an
 	// enemy's trail from across the arena, so there is no distance at which a player stops mattering.
 	//
-	// 40000 uu covers the diagonal with headroom. Squared it is 1.6e9, which is exact in a float
-	// (it is 1.6e9 < 2^31 and the value has few significant digits), so no precision game is being
-	// played here. Ten pawns on one field is a trivial relevancy set; this is not a bandwidth risk.
+	// DERIVED FROM THE FIELD, NOT TYPED. It was a 40000 literal, which covered the 38400 x 9600
+	// field's 39581 uu diagonal - and would have been 3540 uu SHORT of the 43540 uu diagonal the
+	// owner's 2026-10-04 x1.10 made (42240 x 10560), dropping the far-end players off a client again.
+	// TraceArenaDimensions::PawnNetCullDistanceUU() is the outer diagonal, walls included, plus 2%:
+	// 44907 uu today. Squared it is 2.02e9 < 2^31, an ordinary float. The constructor runs before any
+	// arena exists, so ATraceArenaBuilder::WarnIfHitscanRangeIsShort() re-checks this against the
+	// live field in every match log. Ten pawns on one field is a trivial relevancy set; this is not
+	// a bandwidth risk.
 	//
 	// Written through the SETTER, not the field. Direct access to NetCullDistanceSquared is
 	// UE_DEPRECATED(5.5) and clang here reports it; Unreal builds this module warnings-as-errors on
 	// MSVC, so the field form is a Windows build break waiting to happen (and the deprecation note
 	// says it stops compiling outright next release).
-	SetNetCullDistanceSquared(40000.f * 40000.f);
+	SetNetCullDistanceSquared(FMath::Square(TraceArenaDimensions::PawnNetCullDistanceUU()));
 
 	// Set here so the class default is right for a pawn that is spawned and never possessed, and
 	// re-derived from that default every time ACharacter::UnCrouch calls RecalculateBaseEyeHeight().

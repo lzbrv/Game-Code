@@ -183,7 +183,7 @@ substitute for it; it is the best that is reachable without it.
 Bottom right of the title screen, every build prints a version and an eight-character code:
 
 ```
-V 0.1.0   NET 51920028
+V 0.1.0   NET 8FE0912A
 ```
 
 **Everyone in the session must see the same `NET` code.** Windows players see it in the same corner.
@@ -513,7 +513,7 @@ build.
 Bottom right of every title screen, in every build on every platform:
 
 ```
-V 0.1.0   NET 51920028
+V 0.1.0   NET 8FE0912A
 ```
 
 **If two machines show different `NET` codes they cannot connect.** The engine refuses the handshake
@@ -546,8 +546,8 @@ engine versions*, so `NetProtocolVersion` must be bumped by hand when the engine
 and no build, and prints the string it hashed as well as the code:
 
 ```
-NET 51920028
-  from : "trace netproto 1, project 0.1.0"
+NET 8FE0912A
+  from : "trace netproto 4, project 0.1.0"
 ```
 
 Run it on the Mac and on the Windows machine before a session. Identical output means the two builds

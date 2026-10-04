@@ -1279,9 +1279,14 @@ namespace TraceStatsDump
 
 		double GoalFraction = 0.0;
 		const bool bGoal = ReadNumber(Game, TEXT("GoalWidthFieldFraction"), GoalFraction, Report);
-		AddDerived(Rows, TEXT("Goal mouth width"), bGoal, GoalFraction * 9600.0, TEXT("uu"),
-			TEXT("GoalWidthFieldFraction x 9600 uu field width"),
-			TEXT("The knob is a FRACTION of the field so the goal tracks the arena if the arena is resized. 9600 uu is the shipped field width."));
+		// UTraceSettings::GoalWidthReferenceFieldWidthUU, restated rather than #included for the reason
+		// at the top of this file. It is a FIXED reference now, not the field, so it cannot drift with
+		// a resize; if it is ever retuned, this row and that constant change together.
+		constexpr double StatsGoalReferenceWidthUU = 9600.0;
+		AddDerived(Rows, TEXT("Goal mouth width"), bGoal,
+			GoalFraction * StatsGoalReferenceWidthUU, TEXT("uu"),
+			TEXT("GoalWidthFieldFraction x 9600 uu reference width"),
+			TEXT("The knob is a FRACTION of a FIXED 9600 uu reference width (UTraceSettings::GoalWidthReferenceFieldWidthUU), not of the live arena: since the 2026-10-04 x1.10 (42240 x 10560) the goal no longer tracks the arena, so resizing the field leaves the goal its size."));
 
 		double ThrowSpeed = 0.0, MassScale = 0.0;
 		const bool bThrow = ReadNumber(Game, TEXT("CoreThrowSpeed"), ThrowSpeed, Report);

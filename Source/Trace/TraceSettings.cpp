@@ -693,9 +693,10 @@ namespace
 		// multiplies them, because the number a designer types is not the number the Core flies at —
 		// ATraceCore derives gravity x M, speed / sqrt(M), bias x M^1.5, bounce / M from these.
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[SettingsDump:%s] SPECv5 modeB: goalWidthFrac=%.4f (=%.0fuu ring diameter on a 9600uu field) goalRampH=%.0f | "
+			TEXT("[SettingsDump:%s] SPECv5 modeB: goalWidthFrac=%.4f (=%.0fuu ring diameter, of the %.0fuu reference width) goalRampH=%.0f | "
 			     "weight M=%.2f applied to base throw=%.0f grav=%.2f bias=%.2f -> effective throw=%.0f grav=%.2f"),
-			Tag, Table.GoalWidthFieldFraction, Table.GoalWidthFieldFraction * 9600.f, Table.GoalHeightUU,
+			Tag, Table.GoalWidthFieldFraction, Table.GoalWidthFieldFraction * UTraceSettings::GoalWidthReferenceFieldWidthUU,
+			UTraceSettings::GoalWidthReferenceFieldWidthUU, Table.GoalHeightUU,
 			Table.CoreMassScale, Table.CoreThrowSpeed, Table.CoreThrowGravityScale, Table.CoreThrowUpBias,
 			Table.CoreThrowSpeed / FMath::Sqrt(FMath::Max(0.01f, Table.CoreMassScale)),
 			Table.CoreThrowGravityScale * Table.CoreMassScale);
