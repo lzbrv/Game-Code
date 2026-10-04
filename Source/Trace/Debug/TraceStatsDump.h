@@ -40,19 +40,46 @@
 // HOW TO RUN IT
 // =================================================================================================
 //
+// FROM A TERMINAL, IN THE REPO. Not from inside the game, and not by typing "Trace.DumpStats" at a
+// shell prompt (it is a console command inside the game, not a program):
+//
+//     Scripts/dump-stats.sh                 Mac/Linux. Writes docs/TraceStats.csv, the committed copy
+//     Scripts\dump-stats.bat                Windows. Same thing
+//     Scripts/dump-stats.sh <path>          writes wherever you say instead
+//
+// The script finds the engine the way every other script does (Scripts/_trace_common.sh: UE_ROOT,
+// then .ue-root, then the usual install folders), opens the practice range headlessly with the EDITOR
+// build, runs Trace.DumpStats and then Trace.VerifyStats on the same path, quits, and prints both
+// verdicts and where the file went. It stops with the reason when the engine, the editor build
+// (Scripts/build.sh) or the baked arena (git lfs pull) is missing, and warns when the editor build is
+// older than Source/ - the sheet shows the numbers of the build that RAN, not of the tree.
+//
+// DEV / EDITOR BUILDS ONLY. This whole file compiles out of Shipping, like every other Trace.*
+// console command, so a packaged release build has no such command at all. In a packaged
+// Development build on a Mac the default Saved/ path is inside the app's own container, not the
+// repo, which is one more reason to use the script.
+//
+// The console commands themselves, for a dev build that is already running (` opens the console):
+//
 //     Trace.DumpStats                 writes <Project>/Saved/Stats/TraceStats.csv
 //     Trace.DumpStats <path>          writes wherever you say (absolute, or project-relative)
-//     Trace.VerifyStats               re-reads the file it just wrote and PARSES it, column by
-//                                     column, so a quoting bug cannot ship as a silently
-//                                     column-shifted spreadsheet
+//     Trace.VerifyStats [<path>]      re-reads that file (default: the Saved/Stats one) and PARSES
+//                                     it, column by column, so a quoting bug cannot ship as a
+//                                     silently column-shifted spreadsheet
 //
-// Headless, which is how the committed copy is produced:
+// What the script runs, printed in full before it runs it (one command, wrapped here). The engine
+// binary has to be the FULL path: a bare "UnrealEditor", which is what this comment used to show,
+// is not on PATH on a stock Mac or Windows install, so pasting that line failed with "command not
+// found" before the game ever started.
 //
-//     UnrealEditor Trace.uproject "/Game/Maps/Arena_Baked?game=/Script/Trace.TracePracticeGameMode" \
-//         -game -log -nullrhi -RenderOffScreen -unattended -nosound \
-//         -TraceExec="Trace.DumpStats|Trace.VerifyStats|quit" -TraceExecAt=6 -TraceExecOn=Match
+//     "$UE_ROOT/Engine/Binaries/Mac/UnrealEditor" "<repo>/Trace.uproject"
+//         "/Game/Maps/Arena_Baked?game=/Script/Trace.TracePracticeGameMode"
+//         -game -log -nullrhi -RenderOffScreen -unattended -nosound -nosplash
+//         -TraceExec="Trace.DumpStats docs/TraceStats.csv|Trace.VerifyStats docs/TraceStats.csv|quit"
+//         -TraceExecAt=6 -TraceExecOn=Match -abslog=<repo>/Saved/Logs/dump-stats.log
 //
-// Dev only: the whole file compiles out of Shipping, like every other Trace.* console command.
+// (Windows: Engine\Binaries\Win64\UnrealEditor.exe. Copy the line the script prints rather than
+// this one; it has your paths in it.)
 // =================================================================================================
 
 #pragma once
