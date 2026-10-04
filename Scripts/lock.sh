@@ -74,8 +74,8 @@ NOTES
     collaborators cannot lock, which defeats the whole workflow.
   * Unlock as soon as you have pushed. A forgotten lock blocks a teammate
     silently — they just see a read-only file and no explanation.
-  * Windows: there is no lock.bat. Use 'git lfs lock <path>' directly, or run
-    this from Git Bash.
+  * Windows: Scripts\lock.bat and Scripts\unlock.bat take the same arguments
+    and options from plain cmd.exe; Git Bash is not needed.
 
 EXAMPLES
   Scripts/lock.sh Cover_37

@@ -587,7 +587,7 @@ def main():
     except ImportError:
         log("")
         log("no `unreal` module in this interpreter, so NOTHING was imported. That step needs the "
-            "editor: ./Scripts/import-sounds.sh does both halves.")
+            "editor: ./Scripts/import-sounds.sh (Windows: Scripts\\import-sounds.bat) does both halves.")
         sys.exit(1 if _failures else 0)
         return
 

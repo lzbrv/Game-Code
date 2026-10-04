@@ -24,6 +24,9 @@
 # No C++ edit. No rebuild. The game asks the BANK for a name and gets whatever the
 # bank now points at — see Source/Trace/Audio/TraceSoundBank.h.
 #
+# On Windows the same steps run from plain cmd.exe: Scripts\lock.bat,
+# copy /Y, Scripts\import-sounds.bat --only Dash. Same options, same checks.
+#
 # THE SET OF SOUNDS IS DISCOVERED, NOT LISTED. import_sounds.py globs Art/Sounds
 # rather than carrying nine names, so a TENTH wav needs no edit to this script
 # either. Its event name is its file stem, and that is the key C++ asks for.

@@ -492,8 +492,11 @@ Scripts/unlock.sh --force <path>            # holiday case (§4.3); prompts firs
 lock is recorded on the server but leaves the file writable for everyone else — it protects nothing,
 and silently believing you are protected is worse than knowing you are not.
 
-**These are `.sh` only — there is no `lock.bat`.** Windows collaborators use `git lfs lock <path>`
-directly, or run these from Git Bash. The locks themselves are server-side and identical either way.
+**On Windows, `Scripts\lock.bat` and `Scripts\unlock.bat` are the same tools for plain `cmd.exe`** —
+same arguments, same options (`--list`, `--dry-run`, `--force`, `--yes`), same `lockable` warning, and
+an actor label is resolved the same way (they search the packages with PowerShell, which is built into
+Windows 10 and 11). Paths may use `/` or `\`; git is always handed forward slashes. `git lfs lock <path>`
+by hand works too. The locks themselves are server-side and identical either way.
 
 ### 4.6 From inside the Unreal editor
 

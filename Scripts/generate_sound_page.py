@@ -19,7 +19,11 @@
 #
 # Marks, notes and tried files survive a reload (localStorage + IndexedDB, in
 # that browser only). "Export list" writes the marked rows out with the exact
-# file to overwrite, the candidate's file name, and the commands that do it.
+# file to overwrite, the candidate's file name, and the commands that do it -
+# once for a Mac (Scripts/*.sh, cp, afconvert) and once for Windows (plain
+# cmd.exe: Scripts\*.bat, copy /Y, and for a file that needs converting an
+# ffmpeg line and the Audacity settings as rem notes, since afconvert is
+# Mac-only). The how-to on the page shows both.
 #
 #   python3 Scripts/generate_sound_page.py           -> Art/Sounds/sound-test.html
 #   python3 Scripts/generate_sound_page.py --check   validate only, write nothing
@@ -1190,6 +1194,7 @@ main{padding:0 28px 80px}
 .how ol{margin:8px 0 4px;padding-left:20px}
 .how li{margin:3px 0}
 .how p{margin:6px 0}
+.how .os{display:inline-block;min-width:4.9em;color:var(--faint);font-size:11.5px}
 .errors{background:#2a1c1c;border:1px solid #573030;border-radius:8px;padding:10px 14px;margin:16px 0}
 .notes{margin:12px 0 0;display:grid;gap:4px;font-size:12.5px;color:var(--dim)}
 .notes b{color:var(--ink)}
@@ -1566,6 +1571,20 @@ function switchCmd(c, d){
   return inFormat(c, d) ? 'cp ' + src + ' ' + d.path
                         : 'afconvert -f WAVE -d LEI16@44100 -c ' + d.ch + ' --mix ' + src + ' ' + d.path;
 }
+// The same switch for Windows, run from cmd.exe. Double quotes are cmd's only quoting (a Windows file
+// name cannot hold one), and the destination takes backslashes: copy reads "/Sounds" after a space as a
+// switch. afconvert is Mac-only and Windows ships no converter, so a tried file that is not already
+// in the project's format gets NOTES - ffmpeg if it is installed, Audacity otherwise - as rem lines:
+// the block stays safe to paste, and nothing copies a .m4a or a 24-bit WAV over the game's file.
+function cq(x){ return '"' + String(x) + '"'; }
+function winPath(p){ return String(p).replace(/\//g, '\\'); }
+function winSwitch(c, d){
+  const src = cq('<folder>\\' + c.name), dst = cq(winPath(d.path));
+  if (inFormat(c, d)) return ['copy /Y ' + src + ' ' + dst];
+  return ['rem CONVERT ' + cq(c.name) + ' by hand first - it is not 16-bit 44.1 kHz ' + chans(+d.ch) + ' PCM WAV. Either:',
+          'rem   ffmpeg -y -i ' + src + ' -ac ' + d.ch + ' -ar 44100 -c:a pcm_s16le ' + dst,
+          'rem   or in Audacity: open it, File, Export Audio, WAV, ' + chans(+d.ch) + ', 44100 Hz, Signed 16-bit PCM, saved as ' + dst];
+}
 function rowTitle(d){ return d.label + ' · ' + d.where + (d.label !== d.event ? '   [' + d.event + ']' : ''); }
 function reportText(){
   const rows = $$('.row').filter(tr => { const m = marks[tr.dataset.event]; return m && m.flag; });
@@ -1575,7 +1594,7 @@ function reportText(){
   L.push('From Art/Sounds/sound-test.html, built ' + document.body.dataset.built + '.');
   L.push('');
   if (!rows.length) L.push('(nothing marked)', '');
-  const cmds = [];
+  const cmds = [], wcmds = [];
   rows.forEach((tr, i) => {
     const d = tr.dataset, m = marks[d.event];
     L.push((i + 1) + '. ' + rowTitle(d));
@@ -1586,11 +1605,14 @@ function reportText(){
       L.push('   with     ' + c.name + '   (' + c.dur.toFixed(2) + ' s, ' + chans(c.ch) + ', ' + c.rate + ' Hz' + (c.bits ? ' ' + c.bits + '-bit' : '') +
              ', peak ' + fdb(c.peak) + ' dBFS, RMS ' + fdb(c.rms) + ' dBFS)');
       fmtWarnings(c, tr).forEach(w => L.push('            ! ' + w));
-      if (!inFormat(c, d)) L.push('            the afconvert line below makes it 16-bit 44.1 kHz ' + chans(+d.ch));
+      if (!inFormat(c, d)) L.push('            the afconvert line below makes it 16-bit 44.1 kHz ' + chans(+d.ch) +
+                                  ' (on Windows: convert it by hand, as the rem lines say)');
       cmds.push(switchCmd(c, d));
+      wcmds.push(...winSwitch(c, d));
     } else {
       L.push('   with     (no file tried yet)');
       cmds.push('cp ' + shq('<new file>.wav') + ' ' + d.path + '    # 16-bit 44.1 kHz ' + chans(+d.ch) + ' WAV');
+      wcmds.push('copy /Y ' + cq('<new file>.wav') + ' ' + cq(winPath(d.path)) + '   & rem 16-bit 44.1 kHz ' + chans(+d.ch) + ' WAV');
     }
     if (m.note && m.note.trim()) L.push('   note     ' + m.note.trim().replace(/\n+/g, ' / '));
     if (d.state) L.push('   status   ' + d.state);
@@ -1615,6 +1637,20 @@ function reportText(){
   L.push('Trace.Audio.Reload picks it up in a running game.');
   L.push('Packaged builds keep the old one until re-packaged: ./Scripts/package.sh (--iterate re-cooks only what changed).');
   L.push('Then: python3 Scripts/generate_sound_page.py to refresh this page.');
+  L.push('');
+  L.push('ON WINDOWS — the same steps in cmd.exe, in the main checkout folder, Unreal editor closed:');
+  L.push('  git pull');
+  L.push('  Scripts\\lock.bat ' + locks.join(' '));
+  wcmds.forEach(c => L.push('  ' + c));
+  L.push('  Scripts\\import-sounds.bat --only ' + cq(evs.join(',')));
+  L.push('  git add ' + rows.map(tr => tr.dataset.path).join(' ') + ' Content/Trace/Audio');
+  L.push('  git commit, git push, then: Scripts\\unlock.bat ' + locks.join(' '));
+  if (wcmds.some(c => c.startsWith('rem CONVERT')))
+    L.push('Convert every "rem CONVERT" file before import-sounds.bat runs: it imports whatever WAV is in place.');
+  L.push('The editor and the Scripts\\run-*.bat games play the new file on their next launch (no C++ rebuild);');
+  L.push('Trace.Audio.Reload picks it up in a running game.');
+  L.push('Packaged builds keep the old one until re-packaged: Scripts\\package.bat (--iterate re-cooks only what changed).');
+  L.push('Then: python Scripts\\generate_sound_page.py (py -3 on some machines) to refresh this page.');
   return L.join('\n');
 }
 function report(){
@@ -1725,24 +1761,38 @@ def build_page(ctx):
         for p in ctx["errors"]:
             A("<li>{0}</li>".format(e(p)))
         A("</ul></div>")
+    # Mac (Terminal) and Windows (plain cmd.exe, Scripts\*.bat) side by side: the steps are the same,
+    # only the script names, the copy command and the converter differ.
+    lock_args = ("Content/Trace/Audio/S_&lt;Event&gt;.uasset "
+                 "Content/Trace/Audio/DA_TraceSoundBank.uasset")
+
+    def two(mac, win):
+        return ('<span class="os">Mac</span> <code>{0}</code><br>'
+                '<span class="os">Windows</span> <code>{1}</code>'.format(mac, win))
+
     A('<details class="how" open><summary>Switching a sound</summary><ol>'
-      '<li>In the main checkout, Unreal editor closed: <code>git pull</code>, then <code>Scripts/lock.sh '
-      'Content/Trace/Audio/S_&lt;Event&gt;.uasset Content/Trace/Audio/DA_TraceSoundBank.uasset</code> '
-      '&mdash; both are read-only until locked, and the import rewrites both.</li>'
+      '<li>In the main checkout, Unreal editor closed: <code>git pull</code>, then lock the sound and the '
+      'bank &mdash; both are read-only until locked, and the import rewrites both.<br>' +
+      two("Scripts/lock.sh " + lock_args, "Scripts\\lock.bat " + lock_args) + '</li>'
       '<li>Put the new sound over the row&rsquo;s file &mdash; same name, same folder &mdash; as 44.1&nbsp;kHz '
-      '16-bit PCM WAV, mono or stereo to match the row. B warns when a file isn&rsquo;t; '
-      '<b>Export list</b> gives the <code>afconvert</code> line that fixes it.</li>'
-      '<li><code>./Scripts/import-sounds.sh --only &lt;Event&gt;</code> (several: '
-      '<code>--only A,B</code>). <code>--list</code> checks the WAVs without the editor.</li>'
-      '<li>The editor and the <code>Scripts/run-*.sh</code> games play it on their next launch &mdash; no C++ rebuild. '
-      '<code>Trace.Audio.Reload</code> picks it up in a running game; <code>Trace.Audio.Test &lt;Event&gt;</code> '
-      'fires it.</li>'
-      '<li>Packaged builds keep the old sound until re-packaged: <code>./Scripts/package.sh</code> '
-      '(<code>--iterate</code> re-cooks only what changed).</li>'
-      '<li>Commit the WAV and what changed in <code>Content/Trace/Audio</code>, push, then '
-      '<code>Scripts/unlock.sh</code> the same files.</li>'
-      '</ol><p><b>Export list</b> writes these commands out for every marked row. '
-      '<code>python3 Scripts/generate_sound_page.py</code> rebuilds this page.</p></details>')
+      '16-bit PCM WAV, mono or stereo to match the row. B warns when a file isn&rsquo;t. '
+      '<b>Export list</b> gives the commands: <code>cp</code> or the <code>afconvert</code> line that fixes it '
+      'on a Mac; on Windows <code>copy /Y</code>, or for a file that needs converting, an '
+      '<code>ffmpeg</code> line (if it is installed) and the Audacity export settings &mdash; '
+      '<code>afconvert</code> is Mac-only.</li>'
+      '<li>Import it (several: <code>--only A,B</code>; <code>--list</code> checks the WAVs without the editor):<br>' +
+      two("./Scripts/import-sounds.sh --only &lt;Event&gt;", "Scripts\\import-sounds.bat --only &lt;Event&gt;") +
+      '</li>'
+      '<li>The editor and the <code>Scripts/run-*.sh</code> / <code>Scripts\\run-*.bat</code> games play it on '
+      'their next launch &mdash; no C++ rebuild. <code>Trace.Audio.Reload</code> picks it up in a running game; '
+      '<code>Trace.Audio.Test &lt;Event&gt;</code> fires it.</li>'
+      '<li>Packaged builds keep the old sound until re-packaged (<code>--iterate</code> re-cooks only what '
+      'changed):<br>' + two("./Scripts/package.sh", "Scripts\\package.bat") + '</li>'
+      '<li>Commit the WAV and what changed in <code>Content/Trace/Audio</code>, push, then unlock the same '
+      'files:<br>' + two("Scripts/unlock.sh &hellip;", "Scripts\\unlock.bat &hellip;") + '</li>'
+      '</ol><p><b>Export list</b> writes these commands out for every marked row, Mac first, then Windows. '
+      '<code>python3 Scripts/generate_sound_page.py</code> rebuilds this page '
+      '(Windows: <code>python Scripts\\generate_sound_page.py</code>).</p></details>')
 
     A('<p class="gnote" id="nomatch" hidden data-nosound="{0}"></p>'.format(e(json.dumps(
         ctx["nosound"], separators=(",", ":")), quote=True)))
