@@ -50,11 +50,16 @@
 #                                parsed. A rename there flows through on the next
 #                                run; no display name is spelled in this file.
 #   which ability plays a sound  ABILITY_SOUNDS below - a reading of the code,
-#                                written down with the trigger line and the
-#                                guard that ties it to the ability. Both are
-#                                re-found by regex on every run: if either has
-#                                moved or gone, generation FAILS, because the
-#                                mapping may no longer be true.
+#                                written down as the trigger line plus every
+#                                route to it from an ability: a real IsAbility /
+#                                IsSlot / IsKitIn check, a kit's ActivateAbility,
+#                                or a hook with NO check (then every ability of
+#                                that kit plays it, and the row says so). Each
+#                                link is re-found on every run, the listed
+#                                abilities must be exactly what the routes
+#                                reach, and any caller of a walked function that
+#                                no route accounts for is an ERROR - a second
+#                                route nobody has read.
 #   SILENT                       TraceSoundEvents::Unwired() (Demo 29 items 9
 #                                and 11), parsed with its reasons.
 #   RETIRED                      ABILITY_SOUNDS' 'retired' entries: a sound only
@@ -67,11 +72,21 @@
 # sites is under Source/Trace/Abilities/ - with no ABILITY_SOUNDS entry is an
 # ERROR. So is an unmapped trigger site for a mapped sound.
 #
+# TWO ROUTES WITH NO ABILITY CHECK, AS OF THIS WRITING (owner's call whether
+# they are bugs): X's bee sweep (TickAbilities -> SweepBeeContacts) runs for any
+# X pick, so LEECH or STING alone still stings with orbiting bees; and the kit's
+# dash poll (TickAbilities -> PollDashForBash -> TryBash) knocks players for any
+# pick of that kit, so CUSTOM STEEL or CHUD alone still bashes. Both rows carry
+# the extra abilities and a note. Add the check in C++ and this script FAILS
+# until the entry says G(...) - by design.
+#
 # NO CHARACTER NAMES IN WHAT THE PAGE SAYS. Abilities are freestanding: the page
 # names them by GAbilityTable's Name column and groups by ability and slot.
-# Character names survive only inside file paths and event identifiers, because
-# the path is the thing you overwrite. Every label, description and note is
-# checked against the kit names before the page is written.
+# Character names survive only inside file paths (the path is the thing you
+# overwrite), and in the Export list's event names (the import command takes
+# them). Everything a person reads or hears on the finished page - headings,
+# notes, rows, screen-reader labels - is checked against the kit names, event
+# identifiers like RoccoJump included, before the page is written.
 #
 # -----------------------------------------------------------------------------
 # THE TWO MUSIC BEDS ARE PREVIEWS, AND THE PAGE SAYS SO ON THE ROW
@@ -89,6 +104,7 @@ import base64
 import datetime
 import glob
 import html
+from html.parser import HTMLParser
 import io
 import json
 import math
@@ -420,23 +436,354 @@ INDIRECT = [
 
 
 # ---------------------------------------------------------------------------
+# 2b. functions, for the ability-path checks in section 3
+# ---------------------------------------------------------------------------
+#
+# A function here is a column-0 head (`bool UTraceAbilitySetRocco::OnJumpPressed()`) whose body
+# opens with a column-0 '{' and ends at the next column-0 '}' - Unreal style for every kit and actor
+# method. Only .cpp files are scanned: a call from an inline header body would be missed (none of the
+# walked functions has one today - checked when this was written, not on every run).
+
+_FN_HEAD_RE = re.compile(
+    r"^(?![\s#/{}])(?!(?:if|for|while|switch|return|else|case|do|namespace|class|struct|enum|template|"
+    r"using|typedef|static_assert)\b)[^;=(]*?\b(?P<name>[A-Za-z_]\w*(?:::~?\w+)+)\s*\(")
+
+# The narrower harness test for "who else calls this": test files, console commands and verify /
+# probe / audit scopes. NOT "Debug": several kits route real gameplay through a Debug* method
+# (UTraceAbilitySetOyster::DebugDropDashJar drops every dash jar), so a Debug* caller has to be named
+# in the entry's `dev` list on purpose, never skipped by its name.
+PATH_HARNESS_SCOPE_RE = re.compile(r"(Verify|Test|Harness|Integ|Probe|Audit|Cmd|Command)")
+
+_lines_cache = {}
+_fn_index = None          # {qualified name: [(relpath, head, open, close)]}, 0-based line numbers
+_fn_ranges = {}           # {relpath: [(head, open, close, qualified name)]}
+
+
+def source_lines(relpath):
+    if relpath not in _lines_cache:
+        _lines_cache[relpath] = read_text(os.path.join(ROOT, relpath)).splitlines()
+    return _lines_cache[relpath]
+
+
+def code_of(line):
+    """The code on a line, comments removed ('' for a comment line)."""
+    if line.lstrip().startswith(("//", "*", "/*")):
+        return ""
+    return line.split("//", 1)[0]
+
+
+def function_index():
+    global _fn_index
+    if _fn_index is not None:
+        return _fn_index
+    _fn_index = {}
+    for dirpath, _dirs, files in os.walk(SOURCE_DIR):
+        for fn in sorted(files):
+            if not fn.endswith(".cpp"):
+                continue
+            relpath = rel(os.path.join(dirpath, fn))
+            lines = source_lines(relpath)
+            ranges, i, n = [], 0, len(lines)
+            while i < n:
+                m = _FN_HEAD_RE.match(lines[i])
+                if not m:
+                    i += 1
+                    continue
+                opened = None
+                for j in range(i, min(n, i + 16)):
+                    if lines[j].startswith("{"):
+                        opened = j
+                        break
+                    if code_of(lines[j]).rstrip().endswith(";") or (j > i and lines[j][:1] not in ("", "\t", " ")):
+                        break          # a statement (a definition, a declaration), not a function
+                if opened is None:
+                    i += 1
+                    continue
+                close = opened + 1
+                while close < n and not lines[close].startswith("}"):
+                    close += 1
+                _fn_index.setdefault(m.group("name"), []).append((relpath, i, opened, close))
+                ranges.append((i, opened, close, m.group("name")))
+                i = close + 1
+            _fn_ranges[relpath] = ranges
+    return _fn_index
+
+
+def function_at(relpath, index):
+    """(qualified name, is the head line) of the indexed function holding line `index`, or (None, False)."""
+    function_index()
+    for head, opened, close, name in _fn_ranges.get(relpath, []):
+        if head <= index <= close:
+            return name, index < opened
+    return None, False
+
+
+def qual(name):
+    """'Rocco::OnJumpPressed' -> 'UTraceAbilitySetRocco::OnJumpPressed'. Full names pass through."""
+    cls, _sep, meth = name.rpartition("::")
+    if cls and not re.match(r"[AUF]?Trace", cls):
+        return "UTraceAbilitySet" + cls + "::" + meth
+    return name
+
+
+def kit_of(qualname):
+    m = re.match(r"UTraceAbilitySet(\w+)::", qualname)
+    return m.group(1) if m else None
+
+
+def _place_matches(place, allowed):
+    for a in allowed:
+        if a.endswith("::*") and place.startswith(a[:-1]):
+            return True
+        if place == a:
+            return True
+    return False
+
+
+def find_uses(rx, relpaths=None):
+    """[(relpath, 0-based line, where)] - every non-harness code line under Source/*.cpp matching rx,
+    minus function heads (a definition is not a call). `where` is the enclosing function, or the
+    column-0 scope (a namespace) for code outside an indexed function."""
+    function_index()
+    out = []
+    for relpath in (relpaths or sorted(_fn_ranges)):
+        lines = source_lines(relpath)
+        if not rx.search("\n".join(lines)):
+            continue
+        file_is_harness = bool(HARNESS_FILE_RE.search(relpath))
+        for i, line in enumerate(lines):
+            code = code_of(line)
+            if not code or not rx.search(code):
+                continue
+            if file_is_harness or any(PATH_HARNESS_SCOPE_RE.search(s or "") for s in enclosing_scopes(lines, i)):
+                continue
+            where, is_head = function_at(relpath, i)
+            if is_head:
+                continue
+            if where is None:
+                scopes = enclosing_scopes(lines, i)
+                where = scopes[-1] if scopes else "<file scope>"
+            out.append((relpath, i, where))
+    return out
+
+
+GUARD_TOKEN_RE = re.compile(
+    r"\bIsAbility\(\s*ETraceAbilityId::(?P<ab>\w+)\s*\)"
+    r"|\bIsSlot\(\s*ETraceLoadoutSlot::(?P<slot>\w+)\s*\)"
+    r"|\bIsKitIn\(\s*ETraceCharacterId::(?P<kit>\w+)\s*,\s*ETraceLoadoutSlot::(?P<kslot>\w+)\s*\)")
+
+
+def resolve_guard(m, fn, abilities):
+    """(ability ids, words for the page) for one guard token, or (None, why)."""
+    if m.group("ab"):
+        aid = m.group("ab")
+        if aid not in abilities:
+            return None, "IsAbility({0}) names no GAbilityTable row".format(aid)
+        return {aid}, abilities[aid]["name"]
+    slot = m.group("slot") or m.group("kslot")
+    kit = m.group("kit") or kit_of(fn)
+    if kit is None:
+        return None, "IsSlot in {0}, which is not a kit's method - say which kit".format(fn)
+    ids = {a["id"] for a in abilities.values() if a["kit"] == kit and a["slot"] == slot}
+    if len(ids) != 1:
+        return None, ("the {0} slot check in {1} matches {2} abilities of that kit ({3}) - only "
+                      "IsAbility can say which".format(slot, fn, len(ids), ", ".join(sorted(ids)) or "none"))
+    label = next(a["slot_label"] for a in abilities.values() if a["slot"] == slot)
+    return ids, label + " slot"
+
+
+def call_rx(qualname):
+    """A call of this function: the bare name for a kit method (called on `this` or a kit pointer),
+    Class::Name for anything else (actor statics share short names - every actor has a Burst)."""
+    cls, meth = qualname.rsplit("::", 1)
+    if kit_of(qualname):
+        return re.compile(r"(?<![\w~:])" + re.escape(meth) + r"\s*\(|(?:->|\.)" + re.escape(meth) + r"\s*\(")
+    return re.compile(re.escape(cls) + r"::" + re.escape(meth) + r"\s*\(")
+
+
+def check_path(ev, path, trigger, abilities):
+    """
+    Verify one path of ABILITY_SOUNDS[ev] against the code. Returns
+    {"kind", "cover": ability ids, "evidence": words for the page} or None (errors printed).
+
+    Every link is re-found: a call (the next function's name followed by '('), a spawn
+    (SpawnActor<Class>, after which the path goes on in a method of Class) or a state (a regex the
+    function writes, another regex the next function reads). The last function must hold the trigger.
+    Guards are looked for in each function from its '{' to the line where it goes on.
+    """
+    kind = path["kind"]
+    steps = [s if isinstance(s, tuple) else qual(s) for s in path["steps"]]
+    head_name = steps[0] if not isinstance(steps[0], tuple) else "?"
+    idx = function_index()
+    trig_rel, trig_i = trigger
+    guards, entry, links = [], None, []
+
+    def fail(msg):
+        error("ABILITY_SOUNDS '{0}', the path from {1}: {2}".format(ev, head_name, msg))
+        return None
+
+    for i, step in enumerate(steps):
+        if isinstance(step, tuple):
+            if i == 0 or isinstance(steps[i - 1], tuple):
+                return fail("a {0} link must follow a function".format(step[0]))
+            if i + 1 >= len(steps) or isinstance(steps[i + 1], tuple):
+                return fail("a {0} link must lead to a function".format(step[0]))
+            continue
+        hits = idx.get(step, [])
+        if len(hits) != 1:
+            return fail("{0} is {1} in Source/".format(
+                step, "not defined" if not hits else "defined {0} times".format(len(hits))))
+        relpath, head, opened, close = hits[0]
+        lines = source_lines(relpath)
+        prev = steps[i - 1] if i else None
+        nxt = steps[i + 1] if i + 1 < len(steps) else None
+
+        if nxt is None:
+            if trig_rel != relpath or not (opened < trig_i <= close):
+                return fail("it ends in {0}, but the trigger {1}:{2} is not inside it".format(
+                    step, trig_rel, trig_i + 1))
+            onward = trig_i
+        else:
+            if isinstance(nxt, tuple) and nxt[0] == "spawn":
+                rx = re.compile(r"SpawnActor<" + re.escape(nxt[1]) + r">")
+                what = "SpawnActor<{0}>".format(nxt[1])
+                links.append((rx.pattern, step, what))
+            elif isinstance(nxt, tuple) and nxt[0] == "state":
+                rx, what = re.compile(nxt[1]), "/{0}/".format(nxt[1])
+            else:
+                rx, what = call_rx(nxt), nxt.rsplit("::", 1)[1] + "()"
+                links.append((rx.pattern, step, nxt))
+            onward = next((j for j in range(opened + 1, close) if rx.search(code_of(lines[j]))), None)
+            if onward is None:
+                return fail("{0} no longer reaches {1}".format(step, what))
+
+        if isinstance(prev, tuple) and prev[0] == "spawn" and not step.startswith(prev[1] + "::"):
+            return fail("after spawning {0} the path must go on in a {0} method, not {1}".format(prev[1], step))
+        if isinstance(prev, tuple) and prev[0] == "state":
+            if not any(re.search(prev[2], code_of(lines[j])) for j in range(opened + 1, onward + 1)):
+                return fail("{0} no longer reads /{1}/ before going on".format(step, prev[2]))
+            # ...and only the function before it writes that state in its own file (bar named dev-only
+            # writers, which no match reaches)
+            writer = steps[i - 2]
+            wrel = idx[writer][0][0]
+            for urel, ui, where in find_uses(re.compile(prev[1]), [wrel]):
+                if where != writer and where not in prev[3]:
+                    return fail("/{0}/ is also written at {1}:{2} ({3}), not only in {4}".format(
+                        prev[1], urel, ui + 1, where, writer))
+
+        for j in range(opened + 1, onward + 1):
+            for m in GUARD_TOKEN_RE.finditer(code_of(lines[j])):
+                ids, words = resolve_guard(m, step, abilities)
+                if ids is None:
+                    return fail(words)
+                guards.append((ids, words, "{0}:{1}".format(os.path.basename(relpath), j + 1)))
+        if i == 0:
+            entry = (relpath, head, onward)
+
+    relpath, head, onward = entry
+    if kind == "guard":
+        if not guards:
+            return fail("it is listed as checked (G), but no IsAbility / IsSlot / IsKitIn is on it")
+        cover = set().union(*(g[0] for g in guards))
+        ids, words, where = guards[0]
+        return {"kind": kind, "cover": cover, "links": links,
+                "evidence": "checks {0} at {1}".format(words, where)}
+    if kind == "activate":
+        m = re.match(r"UTraceAbilitySet(\w+)::ActivateAbility$", steps[0])
+        if not m:
+            return fail("an ACT() path must start at a kit's ActivateAbility")
+        acts = [a["id"] for a in abilities.values() if a["kit"] == m.group(1) and a["slot"] == "Activated"]
+        if len(acts) != 1:
+            return fail("kit {0} has {1} ACTIVATED abilities in GAbilityTable".format(m.group(1), len(acts)))
+        for ids, words, where in guards:
+            if not ids <= set(acts):
+                return fail("{0} checks {1}, which is not that kit's ACTIVATED ability".format(where, words))
+        return {"kind": kind, "cover": set(acts), "links": links,
+                "evidence": "ActivateAbility at {0}:{1}".format(os.path.basename(relpath), head + 1)}
+    if kind == "any":
+        kit = kit_of(steps[0])
+        if kit is None:
+            return fail("an ANY() path must start at a kit's method")
+        if guards:
+            return fail("it is listed as unchecked (ANY), but {0} checks {1} now - re-read the code and "
+                        "make it a G() path".format(guards[0][2], guards[0][1]))
+        cover = {a["id"] for a in abilities.values() if a["kit"] == kit}
+        return {"kind": kind, "cover": cover, "links": links,
+                "evidence": "no ability check at {0}:{1}".format(os.path.basename(relpath), onward + 1)}
+    return fail("unknown path kind '{0}'".format(kind))
+
+
+# ---------------------------------------------------------------------------
 # 3. which ability plays each ability sound - a reading of the code, checked
 # ---------------------------------------------------------------------------
 #
 # event -> {
 #   abilities  ETraceAbilityId enum names, primary first (the row sits under the first). Display
-#              names and slots come from GAbilityTable, never from here.
+#              names and slots come from GAbilityTable, never from here. MUST equal what `paths`
+#              cover, so a sound cannot be filed under an ability the code does not tie it to.
 #   label      what the sound IS, in a few words. No character names (checked).
 #   when       when it fires. {AbilityId} is replaced by that ability's display name.
-#   sites      [(file, regex)] - the trigger line(s). Cited on the row as file:line.
-#   gate       (file, regex) - the line that makes it THIS ability's sound: an IsAbility / IsSlot
-#              guard, or the function only that ability reaches (ActivateAbility = the ACTIVATED
-#              slot; UTraceAbilityComponent::TryActivate calls it on the activated set only).
-#   gate_note  that, in a few words, for the row.
-#   retired    {cvar, replaced_by} - a sound only a Demo 35-retired path plays.
+#   sites      [(file, regex)] - the trigger line(s), cited on the row. The FIRST is where the
+#              paths must end.
+#   paths      how the code gets from an ability to that trigger, one entry per route:
+#                G(...)    a route with a real IsAbility / IsSlot / IsKitIn on it, which decides the
+#                          ability (an IsSlot shared by two abilities of a kit is an ERROR);
+#                ACT(...)  a route from a kit's ActivateAbility - that kit's ACTIVATED ability
+#                          (UTraceAbilityComponent::TryActivate calls it on the activated kit only);
+#                ANY(...)  a route from a kit hook with NO ability check - every ability of that
+#                          kit, because the component ticks / notifies each equipped kit whatever slot
+#                          it was picked for. If a check appears on it later, generation FAILS.
+#              Steps are functions ('Kit::Method' is UTraceAbilitySet<Kit>::Method), SPAWN(Class)
+#              (the path goes on in a method of Class) and STATE(write regex, read regex, dev): the
+#              function before it is the only one in its file that writes the state (dev-only
+#              writers named), the one after it reads it. Each link is re-found every run.
+#   dev        functions / namespaces that also call a walked function or spawn a walked actor but
+#              exist only for testing or screenshots. Accepted, never followed.
+#   gated      {caller: why} - callers of a walked function that cannot get to the sound (the
+#              reason should be backed by `needs`). Any OTHER caller is an ERROR: see
+#              check_callers, which is what catches a second, unchecked route.
+#   needs      [(file, regex, why)] - any other fact the reading rests on, re-found every run.
+#   retired    {cvar, replaced_by, gate} - a sound only a Demo 35-retired path plays; `gate` is the
+#              (file, regex) of the switch that keeps it off.
 # }
 CH = "Source/Trace/Abilities/Characters/"
 FXB = "Source/Trace/Gameplay/TraceFxBurst.cpp"
+
+
+def G(*steps):
+    return {"kind": "guard", "steps": list(steps)}
+
+
+def ACT(*steps):
+    return {"kind": "activate", "steps": list(steps)}
+
+
+def ANY(*steps):
+    return {"kind": "any", "steps": list(steps)}
+
+
+def SPAWN(cls):
+    return ("spawn", cls)
+
+
+def STATE(write_rx, read_rx, dev=()):
+    return ("state", write_rx, read_rx, tuple(qual(d) for d in dev))
+
+
+SPEC_KEYS = {"abilities", "label", "when", "sites", "paths", "dev", "gated", "needs", "retired"}
+
+_ROCKET = ["Roxie::OnSecondaryPressed", "Roxie::SpawnRocket", SPAWN("ATraceRoxieRocket")]
+_JAR_TO_CLOUD = [SPAWN("ATraceOysterJar"), "ATraceOysterJar::Burst",
+                 "ATraceOysterPoisonCloud::ServerSpawnForBurst", SPAWN("ATraceOysterPoisonCloud"),
+                 "ATraceOysterPoisonCloud::BeginPlay"]
+_DASH_JAR = ["Oyster::NoteDashBegan",
+             STATE(r"\bbDashJarOwedForThisDash\s*=\s*true", r"!bDashJarOwedForThisDash"),
+             "Oyster::DropOwedDashJar", "Oyster::DebugDropDashJar", "Oyster::SpawnJar"]
+_THROWN_JAR = ["Oyster::ActivateAbility", "Oyster::ThrowPickler", "Oyster::SpawnJar"]
+_JAR_DEV = ["Oyster::DebugSpawnJarAt", "Oyster::DebugThrowPickler", "TraceOysterFxParade"]
+_SPIKE = ["Mace::ActivateAbility", SPAWN("ATraceMaceSpike")]
+_GATE = ["Elle::ActivateAbility", "Elle::PlaceGate", SPAWN("ATraceElleGate")]
+_CLOAK = ["Elle::TickCloakTrigger", "Elle::StartCloak"]
 
 ABILITY_SOUNDS = {
     # ---- movement -----------------------------------------------------------------------------
@@ -444,181 +791,216 @@ ABILITY_SOUNDS = {
         abilities=["JetBoots"], label="Air jump",
         when="the second jump, in mid-air; everyone nearby hears it, on top of your own Jump",
         sites=[(CH + "TraceAbilitySetRocco.cpp", r"TraceAudio::PlayAt\(MyPawn, TraceSoundEvents::RoccoJump")],
-        gate=(CH + "TraceAbilitySetRocco.cpp",
-              r"bool UTraceAbilitySetRocco::OnJumpPressed\(\)[\s\S]{0,600}?IsSlot\(ETraceLoadoutSlot::Movement\)"),
-        gate_note="OnJumpPressed, MOVEMENT slot only"),
+        paths=[G("Rocco::OnJumpPressed")]),
     "SlimeballStick": dict(
         abilities=["StickyGloves"], label="Wall stick",
         when="you stick to a wall; everyone nearby hears it",
         sites=[(CH + "TraceSlimewall.cpp", r"TraceAudio::PlayAt\(WorldPtr, TraceSoundEvents::SlimeballStick")],
-        gate=(CH + "TraceSlimewall.cpp",
-              r"IsKitIn\(ETraceCharacterId::Slimeball, ETraceLoadoutSlot::Movement\)[\s\S]{0,200}?MovementActive"),
-        gate_note="the MOVEMENT kit's stuck flag"),
+        paths=[G("UTraceSlimeStickSubsystem::Tick")]),
     "RoxieRocketLaunch": dict(
         abilities=["RockJump"], label="Rocket launch",
         when="the rocket leaves the launcher",
         sites=[(CH + "TraceAbilitySetRoxie.cpp", r"TraceAudio::PlayAt\(this, TraceSoundEvents::RoxieRocketLaunch")],
-        gate=(CH + "TraceAbilitySetRoxie.cpp",
-              r"bool UTraceAbilitySetRoxie::OnSecondaryPressed\(\)[\s\S]{0,600}?IsSlot\(ETraceLoadoutSlot::Movement\)"),
-        gate_note="OnSecondaryPressed, MOVEMENT slot only"),
+        paths=[G("Roxie::OnSecondaryPressed")]),
     "RoxieRocketLoop": dict(
         abilities=["RockJump"], label="Rocket flight loop",
         when="loops on the rocket while it flies",
         sites=[(CH + "TraceRoxieRocket.cpp", r"StartLoopOn\(GetRootComponent\(\), TraceSoundEvents::RoxieRocketLoop\)")],
-        gate=(CH + "TraceAbilitySetRoxie.cpp", r"SpawnActor<ATraceRoxieRocket>\("),
-        gate_note="rocket spawned only by the MOVEMENT press"),
+        paths=[G(*_ROCKET, "ATraceRoxieRocket::BeginPlay")], dev=["Roxie::DebugFireRocket"]),
     "RoxieRocketBurst": dict(
         abilities=["RockJump"], label="Rocket blast",
         when="the rocket detonates (big attenuation)",
         sites=[(CH + "TraceRoxieRocket.cpp", r"ATraceFxBurst::Burst\(GetWorld\(\), ETraceFxBurstType::RocketBurst"),
                (FXB, r"case ETraceFxBurstType::RocketBurst:\s*return TraceSoundEvents::RoxieRocketBurst")],
-        gate=(CH + "TraceAbilitySetRoxie.cpp", r"SpawnActor<ATraceRoxieRocket>\("),
-        gate_note="rocket spawned only by the MOVEMENT press"),
+        paths=[G(*_ROCKET, "ATraceRoxieRocket::DetonateAndDestroy")], dev=["Roxie::DebugFireRocket"]),
 
     # ---- passive ------------------------------------------------------------------------------
+    # BASH is checked on the movement component's dash-hit route, but the kit's own 20 Hz dash poll
+    # (TickAbilities -> PollDashForBash -> TryBash) checks nothing, so a kit picked only for CUSTOM
+    # STEEL or CHUD knocks players too. The row says so until the code changes.
     "ChutBash": dict(
-        abilities=["Bash"], label="Dash knock",
+        abilities=["Bash", "CustomSteel", "Chud"], label="Dash knock",
         when="your dash knocks a player back; plays at them",
         sites=[(CH + "TraceAbilitySetChut.cpp", r"ATraceFxBurst::Burst\(MyPawn->GetWorld\(\), ETraceFxBurstType::ChutBash"),
                (FXB, r"case ETraceFxBurstType::ChutBash:\s*return TraceSoundEvents::ChutBash")],
-        gate=(CH + "TraceAbilitySetChut.cpp",
-              r"void UTraceAbilitySetChut::OnDashHitCharacter\([^)]*\)[\s\S]{0,600}?IsAbility\(ETraceAbilityId::Bash\)"),
-        gate_note="IsAbility(Bash)"),
+        paths=[G("Chut::OnDashHitCharacter", "Chut::TryBash"),
+               ANY("Chut::TickAbilities", "Chut::PollDashForBash", "Chut::TryBash")]),
     "ElleCloak": dict(
         abilities=["Shimmer"], label="Cloak on",
         when="passing or throwing the Core cloaks you",
         sites=[(CH + "TraceAbilitySetElle.cpp", r"TraceAudio::Play\(MyPawn, TraceSoundEvents::ElleCloak\)")],
-        gate=(CH + "TraceAbilitySetElle.cpp",
-              r"void UTraceAbilitySetElle::TickCloakTrigger\(\)[\s\S]{0,600}?IsAbility\(ETraceAbilityId::Shimmer\)"),
-        gate_note="IsAbility(Shimmer)"),
+        paths=[G(*_CLOAK)]),
     "ElleDecloak": dict(
         abilities=["Shimmer"], label="Cloak off",
         when="the cloak ends (not on death)",
         sites=[(CH + "TraceAbilitySetElle.cpp", r"TraceAudio::Play\(MyPawn, TraceSoundEvents::ElleDecloak\)")],
-        gate=(CH + "TraceAbilitySetElle.cpp",
-              r"void UTraceAbilitySetElle::TickCloakTrigger\(\)[\s\S]{0,600}?IsAbility\(ETraceAbilityId::Shimmer\)"),
-        gate_note="ends the cloak IsAbility(Shimmer) started"),
+        paths=[G(*_CLOAK, STATE(r"Flags\s*\|=\s*TraceAbilityFlags::EffectActive",
+                                r"Flags\s*&\s*TraceAbilityFlags::EffectActive\)\s*==\s*0",
+                                dev=["Elle::DebugStartCloak"]),
+                 "Elle::EndCloak")]),
     "OysterJarBreak": dict(
         abilities=["PickleJar", "Pickler"], label="Jar break",
         when="a poison jar bursts into a cloud: {PickleJar} dash jars and {Pickler} jars alike",
         sites=[(CH + "TraceOysterPoison.cpp", r"TraceAudio::PlayReplicatedLocal\(this, TraceSoundEvents::OysterJarBreak")],
-        gate=(CH + "TraceAbilitySetOyster.cpp",
-              r"bool UTraceAbilitySetOyster::OnDashStarted\([^)]*\)[\s\S]{0,900}?IsAbility\(ETraceAbilityId::PickleJar\)"),
-        gate_note="dash jars: IsAbility(PickleJar); thrown jars: ActivateAbility"),
+        paths=[G(*_DASH_JAR, *_JAR_TO_CLOUD), ACT(*_THROWN_JAR, *_JAR_TO_CLOUD)],
+        dev=_JAR_DEV),
+    # The bee sweep runs from TickAbilities with no ability check, and the component ticks X's kit
+    # whatever it was picked for: LEECH alone, or STING alone, still orbits bees that sting.
     "XSting": dict(
-        abilities=["XMechs"], label="Bee sting",
+        abilities=["XMechs", "Leech", "Sting"], label="Bee sting",
         when="an orbiting bee stings an enemy and marks them",
         sites=[(CH + "TraceAbilitySetX.cpp", r"ATraceFxBurst::Burst\(CurrentWorld, ETraceFxBurstType::BeeSting"),
                (FXB, r"case ETraceFxBurstType::BeeSting:\s*return TraceSoundEvents::XSting")],
-        gate=(CH + "TraceAbilitySetX.cpp", r"void UTraceAbilitySetX::SweepBeeContacts\(\)"),
-        gate_note="SweepBeeContacts, the orbiting bees"),
+        paths=[ANY("X::TickAbilities", "X::SweepBeeContacts")]),
 
     # ---- activated ----------------------------------------------------------------------------
     "RoccoRipple": dict(
         abilities=["Ripple"], label="Ripple laid",
         when="the ripple goes down; everyone nearby hears it",
         sites=[(CH + "TraceAbilitySetRocco.cpp", r"TraceAudio::PlayAt\(MyPawn, TraceSoundEvents::RoccoRipple")],
-        gate=(CH + "TraceAbilitySetRocco.cpp", r"bool UTraceAbilitySetRocco::ActivateAbility\(\)"),
-        gate_note="ActivateAbility"),
+        paths=[ACT("Rocco::ActivateAbility")]),
     "RoccoRideLoop": dict(
         abilities=["Ripple"], label="Ripple ride loop",
         when="loops while you ride a ripple; each machine plays its own",
         sites=[(CH + "TraceRippleActor.cpp", r"StartLoopOn\(Pawn->GetRootComponent\(\), TraceSoundEvents::RoccoRideLoop\)")],
-        gate=(CH + "TraceAbilitySetRocco.cpp",
-              r"bool UTraceAbilitySetRocco::ActivateAbility\(\)[\s\S]{0,4000}?SpawnActor<ATraceRippleActor>"),
-        gate_note="ripple spawned by ActivateAbility"),
+        paths=[ACT("Rocco::ActivateAbility", SPAWN("ATraceRippleActor"), "ATraceRippleActor::UpdateRideFx")]),
     "MaceSpikeThrow": dict(
         abilities=["Spike"], label="Spike throw",
         when="the spike is thrown",
         sites=[(CH + "TraceAbilitySetMace.cpp", r"TraceAudio::PlayAt\(this, TraceSoundEvents::MaceSpikeThrow")],
-        gate=(CH + "TraceAbilitySetMace.cpp", r"bool UTraceAbilitySetMace::ActivateAbility\(\)"),
-        gate_note="ActivateAbility"),
+        paths=[ACT("Mace::ActivateAbility")]),
     "MaceSpikeEmbed": dict(
         abilities=["Spike"], label="Spike lands",
         when="the spike sticks into a surface",
         sites=[(CH + "TraceMaceSpike.cpp", r"ATraceFxBurst::Burst\(GetWorld\(\), ETraceFxBurstType::SpikeEmbed"),
                (FXB, r"case ETraceFxBurstType::SpikeEmbed:\s*return TraceSoundEvents::MaceSpikeEmbed")],
-        gate=(CH + "TraceAbilitySetMace.cpp",
-              r"bool UTraceAbilitySetMace::ActivateAbility\(\)[\s\S]{0,4000}?SpawnActor<ATraceMaceSpike>"),
-        gate_note="spike spawned by ActivateAbility"),
+        paths=[ACT(*_SPIKE, "ATraceMaceSpike::FireEmbedBurstIfNeeded")], dev=["Mace::DebugThrowSpikeAt"]),
     "MacePullLoop": dict(
         abilities=["Spike"], label="Reel-in loop",
         when="loops while the spike reels you in",
         sites=[(CH + "TraceAbilitySetMace.cpp", r"StartLoopOn\(AttachTo, TraceSoundEvents::MacePullLoop\)")],
-        gate=(CH + "TraceAbilitySetMace.cpp", r"void UTraceAbilitySetMace::StartPull\(\)"),
-        gate_note="the spike's pull (StartPull)"),
+        paths=[ACT(*_SPIKE, "ATraceMaceSpike::Tick", "Mace::NotifySpikeEmbedded", "Mace::StartPull",
+                   STATE(r"\bbPulling\s*=\s*true", r"TraceMaceFlags::Pulling"), "Mace::ApplyKitFx",
+                   "Mace::SetPullFxAttached")],
+        dev=["Mace::DebugThrowSpikeAt"],
+        gated={"Mace::RequestSpikePull": "StartPull refuses without an embedded spike",
+               "Mace::TickAbilities": "StartPull refuses without an embedded spike",
+               "Mace::DetachAllKitFx": "passes false: it only stops the loop"},
+        needs=[(CH + "TraceAbilitySetMace.cpp",
+                r"void UTraceAbilitySetMace::StartPull\(\)\s*\{[^}]*?if \(!HasSpikeEmbedded\(\)",
+                "StartPull refuses without an embedded spike, whoever calls it"),
+               (CH + "TraceAbilitySetMace.cpp",
+                r"void UTraceAbilitySetMace::DetachAllKitFx\(\)\s*\{[^}]*?SetPullFxAttached\(false\);[^}]*\}",
+                "DetachAllKitFx only ever detaches")]),
     "OysterPickler": dict(
         abilities=["Pickler"], label="Jar lob",
         when="the jar is thrown",
         sites=[(CH + "TraceOysterJar.cpp", r"TraceAudio::Play\(this, TraceSoundEvents::OysterPickler\)")],
-        gate=(CH + "TraceOysterJar.cpp",
-              r"if \(FlightVelocity\.IsNearlyZero\(\)\)[\s\S]{0,400}?Land\(\);\s*return;"),
-        gate_note="thrown jars only; a dropped dash jar returns first"),
+        paths=[ACT(*_THROWN_JAR, SPAWN("ATraceOysterJar"), "ATraceOysterJar::Initialise")],
+        dev=_JAR_DEV,
+        gated={"Oyster::DebugDropDashJar": "a dash jar has no velocity: it lands and returns first"},
+        needs=[(CH + "TraceOysterJar.cpp", r"if \(FlightVelocity\.IsNearlyZero\(\)\)\s*\{[^}]*?Land\(\);\s*return;",
+                "a jar with no velocity lands and returns before the lob sound"),
+               (CH + "TraceAbilitySetOyster.cpp",
+                r"UTraceAbilitySetOyster::DebugDropDashJar\(\)[\s\S]{0,1500}?SpawnJar\([^;]*FVector::ZeroVector",
+                "dash jars are spawned with no velocity")]),
     "XStingLoad": dict(
         abilities=["Sting"], label="Bees into the gun",
         when="the five bee rounds load",
         sites=[(CH + "TraceAbilitySetX.cpp", r"TraceAudio::PlayAt\(this, TraceSoundEvents::XStingLoad")],
-        gate=(CH + "TraceAbilitySetX.cpp", r"bool UTraceAbilitySetX::ActivateAbility\(\)"),
-        gate_note="ActivateAbility"),
+        paths=[ACT("X::ActivateAbility")]),
     "RoxieModded": dict(
         abilities=["Modded"], label="Modded on",
         when="{Modded} starts",
         sites=[(CH + "TraceAbilitySetRoxie.cpp", r"TraceAudio::PlayAt\(this, TraceSoundEvents::RoxieModded")],
-        gate=(CH + "TraceAbilitySetRoxie.cpp", r"bool UTraceAbilitySetRoxie::ActivateAbility\(\)"),
-        gate_note="ActivateAbility"),
+        paths=[ACT("Roxie::ActivateAbility")]),
     "ElleSnap": dict(
         abilities=["Snap"], label="Gate opens",
         when="a gate snaps open",
         sites=[(CH + "TraceElleGate.cpp", r"TraceAudio::PlayReplicatedLocal\(this, TraceSoundEvents::ElleSnap")],
-        gate=(CH + "TraceAbilitySetElle.cpp",
-              r"bool UTraceAbilitySetElle::ActivateAbility\(\)[\s\S]{0,4000}?PlaceGate\("),
-        gate_note="gates placed by ActivateAbility"),
+        paths=[ACT(*_GATE, "ATraceElleGate::TickGateFx")], dev=["Elle::DebugPlaceGatePair"]),
     "ElleTeleport": dict(
         abilities=["Snap"], label="Gate teleport",
         when="someone goes through a gate; plays at both ends",
         sites=[(CH + "TraceElleGate.cpp", r"ATraceFxBurst::Burst\(GetWorld\(\), ETraceFxBurstType::ElleTeleport"),
                (FXB, r"case ETraceFxBurstType::ElleTeleport:\s*return TraceSoundEvents::ElleTeleport")],
-        gate=(CH + "TraceAbilitySetElle.cpp",
-              r"bool UTraceAbilitySetElle::ActivateAbility\(\)[\s\S]{0,4000}?PlaceGate\("),
-        gate_note="gates placed by ActivateAbility"),
+        paths=[ACT(*_GATE, "ATraceElleGate::CommitTeleport")], dev=["Elle::DebugPlaceGatePair"]),
     "SlimeballWall": dict(
         abilities=["Slimewall"], label="Wall up",
         when="the wall goes up",
         sites=[(CH + "TraceSlimewall.cpp", r"TraceAudio::PlayAt\(WorldPtr, TraceSoundEvents::SlimeballWall")],
-        gate=(CH + "TraceAbilitySetSlimeball.cpp",
-              r"bool UTraceAbilitySetSlimeball::ActivateAbility\(\)[\s\S]{0,4000}?ATraceSlimewall::ServerSpawn\("),
-        gate_note="wall spawned by ActivateAbility"),
+        paths=[ACT("Slimeball::ActivateAbility", "ATraceSlimewall::ServerSpawn")], dev=["TraceSlimeFxParade"]),
     "MortimerQuake": dict(
         abilities=["Quake"], label="Quake blast",
         when="the blast (big attenuation)",
         sites=[(CH + "TraceAbilitySetMortimer.cpp", r"TraceAudio::PlayAt\(CasterPawn, TraceSoundEvents::MortimerQuake")],
-        gate=(CH + "TraceAbilitySetMortimer.cpp",
-              r"bool UTraceAbilitySetMortimer::ActivateAbility\(\)[\s\S]{0,4000}?TraceSoundEvents::MortimerQuake"),
-        gate_note="ActivateAbility"),
+        paths=[ACT("Mortimer::ActivateAbility")]),
     "LilyZip": dict(
         abilities=["Zip"], label="Zip start",
         when="the zip fires",
         sites=[(CH + "TraceAbilitySetLily.cpp", r"TraceAudio::Play\(MyPawn, TraceSoundEvents::LilyZip\)")],
-        gate=(CH + "TraceAbilitySetLily.cpp",
-              r"bool UTraceAbilitySetLily::ActivateAbility\(\)[\s\S]{0,800}?StartZip\(\);"),
-        gate_note="ActivateAbility -> StartZip"),
+        paths=[ACT("Lily::ActivateAbility", "Lily::StartZip")]),
     "LilyZipLoop": dict(
         abilities=["Zip"], label="Zip flight loop",
         when="loops while you zip",
         sites=[(CH + "TraceAbilitySetLily.cpp", r"StartLoopOn\(Pawn->GetRootComponent\(\), TraceSoundEvents::LilyZipLoop")],
-        gate=(CH + "TraceAbilitySetLily.cpp", r"void UTraceAbilitySetLily::AttachZipFx\(\)"),
-        gate_note="the zip's FX attach"),
+        paths=[ACT("Lily::ActivateAbility", "Lily::StartZip", STATE(r"\bbZipping\s*=\s*true", r"TraceLilyFlags::Zipping"),
+                   "Lily::OnClientStateEdge", "Lily::AttachZipFx")],
+        gated={"Lily::SyncClientFx": "the same Zipping state, for a machine that joins mid-zip"}),
 
     # ---- retired in Demo 35 -------------------------------------------------------------------
     "MortimerMantle": dict(
         abilities=[], label="Mantle scuff",
         when="the old mantle carried you over a ledge",
         sites=[(CH + "TraceAbilitySetMortimer.cpp", r"TraceAudio::Play\(MyPawn, TraceSoundEvents::MortimerMantle\)")],
-        gate=(CH + "TraceAbilitySetMortimer.cpp",
-              r"if \(CVarMortimerLegacyMantle\.GetValueOnAnyThread\(\) == 0\)\s*\{\s*return false;"),
-        gate_note="OnJumpPressed returns before TryMantle unless the switch is on",
-        retired=dict(cvar="Trace.Demo35.LegacyMantle", replaced_by="Blink")),
+        retired=dict(cvar="Trace.Demo35.LegacyMantle", replaced_by="Blink",
+                     gate=(CH + "TraceAbilitySetMortimer.cpp",
+                           r"if \(CVarMortimerLegacyMantle\.GetValueOnAnyThread\(\) == 0\)\s*\{\s*return false;"))),
 }
+
+
+def check_callers(ev, spec, links):
+    """
+    THE SECOND-ROUTE CHECK. For every call and spawn the paths walk, every gameplay caller in Source/
+    must be a step of one of this sound's paths, a named dev-only function or namespace (`dev`), or a
+    caller that cannot get to the sound for a reason written down (`gated`). A guard on one caller
+    says nothing about another, so an unlisted caller is an ERROR: it is a route nobody has read.
+    """
+    dev = [qual(d) for d in spec.get("dev", [])]
+    gated = {qual(k): v for k, v in spec.get("gated", {}).items()}
+    seen, used = {}, set()
+    for rx, caller, target in links:
+        seen.setdefault((rx, target), set()).add(caller)
+    for (rx, target), callers in sorted(seen.items()):
+        uses = find_uses(re.compile(rx))
+        for urel, ui, where in uses:
+            if where in callers:
+                continue
+            excuse = where if where in gated else next((d for d in dev if _place_matches(where, [d])), None)
+            if excuse:
+                used.add(excuse)
+                continue
+            error("ABILITY_SOUNDS '{0}': {1} is also reached from {2} ({3}:{4}) - another route to the "
+                  "sound. Read it and add it as a path, or to `dev` / `gated` with the reason".format(
+                      ev, target, where, urel, ui + 1))
+    walked = {c for _rx, c, _t in links}
+    for name in sorted((set(gated) | set(dev)) - used):
+        error("ABILITY_SOUNDS '{0}' excuses {1}, which no longer reaches anything its paths walk - "
+              "drop it, or it may hide a real route later".format(ev, name))
+    for name in list(gated) + dev:
+        if not name.endswith("::*") and "::" in name and name not in function_index():
+            error("ABILITY_SOUNDS '{0}' excuses {1}, which is not defined in Source/ any more".format(ev, name))
+        if name in walked:
+            error("ABILITY_SOUNDS '{0}' excuses {1}, which one of its own paths walks".format(ev, name))
+
+
+def fx_burst_types():
+    """{event: [ETraceFxBurstType names]} from ATraceFxBurst::SoundEventFor's switch."""
+    out = {}
+    for t, ev in re.findall(r"case ETraceFxBurstType::(\w+):\s*return TraceSoundEvents::(\w+);",
+                            read_text(os.path.join(ROOT, FXB))):
+        out.setdefault(ev, []).append(t)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -861,6 +1243,7 @@ svg.env path{stroke:none}
 .delta{font-size:11.5px;color:var(--dim);margin-top:3px}
 .fmtwarn{font-size:11.5px;color:var(--warn);margin-top:3px}
 .cand .err{color:var(--bad);font-size:12px}
+#nomatch{margin:20px 0 0;font-size:13.5px;color:var(--ink)}
 .miss{font-size:12px;color:var(--warn);margin-top:3px}
 .abrow{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
 .abrow button{font-size:12px;padding:3px 8px}
@@ -1070,7 +1453,8 @@ async function onPick(input){
   attachAudio(tr, buf, f.type || 'audio/wav');
   syncRow(tr);
   updateCount();
-  status(kept ? ('B for ' + ev + ': ' + f.name) : ('B for ' + ev + ': ' + f.name + ' (this browser will not keep the file after a reload)'), !kept);
+  const lab = tr.dataset.label;
+  status(kept ? ('B for ' + lab + ': ' + f.name) : ('B for ' + lab + ': ' + f.name + ' (this browser will not keep the file after a reload)'), !kept);
 }
 function attachAudio(tr, buf, type){
   const ev = tr.dataset.event;
@@ -1115,7 +1499,7 @@ async function removeCand(btn){
   if (candUrls[ev]) { URL.revokeObjectURL(candUrls[ev]); delete candUrls[ev]; }
   try { await idbDel(ev); } catch (e) {}
   const a = $('audio.cb', tr); if (a) a.remove();
-  syncRow(tr); updateCount(); status('Removed B for ' + ev + '.');
+  syncRow(tr); updateCount(); status('Removed B for ' + tr.dataset.label + '.');
 }
 
 // ---- marks and notes ----------------------------------------------------------------------------
@@ -1127,7 +1511,14 @@ function syncRow(tr){
   renderCand(tr);
 }
 function onFlag(cb){ const tr = rowOf(cb), ev = tr.dataset.event; entry(ev).flag = cb.checked; prune(ev); save(); tr.classList.toggle('flagged', cb.checked); updateCount(); filter(); }
-function onNote(ta){ const tr = rowOf(ta), ev = tr.dataset.event; entry(ev).note = ta.value; prune(ev); save(); }
+function onNote(ta){
+  const tr = rowOf(ta), ev = tr.dataset.event, m = entry(ev), had = !!(m.note && m.note.trim());
+  m.note = ta.value;
+  if (!had && m.note.trim() && !m.flag){
+    m.flag = true; $('.c-mark input[type=checkbox]', tr).checked = true; tr.classList.add('flagged'); updateCount();
+  }
+  prune(ev); save();
+}
 function updateCount(){
   const n = Object.values(marks).filter(m => m.flag).length;
   $('#count').textContent = n ? (n + ' marked') : 'nothing marked';
@@ -1140,6 +1531,7 @@ async function clearAll(btn){
   try { await idbClear(); } catch (e) {}
   Object.keys(candUrls).forEach(k => { URL.revokeObjectURL(candUrls[k]); delete candUrls[k]; });
   $$('audio.cb').forEach(a => a.remove());
+  $$('.c-mark textarea').forEach(t => { t.value = ''; });     // the focused one too, which syncRow leaves alone
   $$('.row').forEach(syncRow); updateCount(); filter(); status('Cleared every mark, note and tried file.');
 }
 
@@ -1149,26 +1541,44 @@ function filter(){
   $$('.row').forEach(tr => {
     const m = marks[tr.dataset.event];
     const hit = (!q || tr.dataset.search.includes(q)) && (!onlyNew || tr.classList.contains('isnew')) &&
-                (!onlyMarked || !!(m && (m.flag || m.cand)));
+                (!onlyMarked || !!(m && (m.flag || m.cand || m.note)));
     tr.hidden = !hit;
   });
   const active = !!q || onlyNew || onlyMarked;
   $$('.blk').forEach(b => { const rs = $$('.row', b); b.hidden = rs.length ? !rs.some(tr => !tr.hidden) : active; });
   $$('section.grp').forEach(s => { s.hidden = !$$('.row', s).some(tr => !tr.hidden); });
+  const nm = $('#nomatch'), shown = $$('.row').some(tr => !tr.hidden), say = [];
+  let none = []; try { none = JSON.parse(nm.dataset.nosound || '[]'); } catch (e) {}
+  const silent = q.length >= 3 ? none.filter(a => a[0].toLowerCase().includes(q)) : [];
+  if (silent.length) say.push(silent.map(a => a[0] + ' (' + a[1] + ')').join(', ') + ': no sound of its own.');
+  else if (active && !shown) say.push(onlyMarked && !q && !onlyNew ? 'Nothing marked.' : 'No sounds match.');
+  nm.textContent = say.join(' '); nm.hidden = !say.length;
 }
 
 // ---- export -------------------------------------------------------------------------------------
+function shq(x){ return "'" + String(x).replace(/'/g, "'\\''") + "'"; }
+// The project's format is 16-bit PCM WAV at 44.1 kHz with the row's channel count. A tried file in
+// that format is copied; anything else is converted by afconvert (macOS), never copied over the
+// game's .wav as-is - a .m4a or a float WAV renamed .wav breaks the import.
+function inFormat(c, d){ return c.wav && c.tag === 1 && c.bits === 16 && c.rate === 44100 && c.ch === +d.ch; }
+function switchCmd(c, d){
+  const src = shq('<folder>/' + c.name);
+  return inFormat(c, d) ? 'cp ' + src + ' ' + d.path
+                        : 'afconvert -f WAVE -d LEI16@44100 -c ' + d.ch + ' --mix ' + src + ' ' + d.path;
+}
+function rowTitle(d){ return d.label + ' · ' + d.where + (d.label !== d.event ? '   [' + d.event + ']' : ''); }
 function reportText(){
   const rows = $$('.row').filter(tr => { const m = marks[tr.dataset.event]; return m && m.flag; });
+  const noted = $$('.row').filter(tr => { const m = marks[tr.dataset.event]; return m && !m.flag && m.note && m.note.trim(); });
   const L = [];
   L.push('TRACE — sounds to replace (' + rows.length + ')');
   L.push('From Art/Sounds/sound-test.html, built ' + document.body.dataset.built + '.');
   L.push('');
-  if (!rows.length) { L.push('(nothing marked)'); return L.join('\n'); }
-  const cps = [];
+  if (!rows.length) L.push('(nothing marked)', '');
+  const cmds = [];
   rows.forEach((tr, i) => {
     const d = tr.dataset, m = marks[d.event];
-    L.push((i + 1) + '. ' + d.event + '   ' + d.where + ' · ' + d.label);
+    L.push((i + 1) + '. ' + rowTitle(d));
     L.push('   replace  ' + d.path + '   (' + (+d.fulldur).toFixed(2) + ' s, ' + chans(+d.ch) + ', ' + d.rate + ' Hz' +
            (d.bits !== '16' ? ' ' + d.bits + '-bit' : '') + ')');
     if (m.cand){
@@ -1176,24 +1586,33 @@ function reportText(){
       L.push('   with     ' + c.name + '   (' + c.dur.toFixed(2) + ' s, ' + chans(c.ch) + ', ' + c.rate + ' Hz' + (c.bits ? ' ' + c.bits + '-bit' : '') +
              ', peak ' + fdb(c.peak) + ' dBFS, RMS ' + fdb(c.rms) + ' dBFS)');
       fmtWarnings(c, tr).forEach(w => L.push('            ! ' + w));
-      cps.push('cp "<folder>/' + c.name + '" ' + d.path);
+      if (!inFormat(c, d)) L.push('            the afconvert line below makes it 16-bit 44.1 kHz ' + chans(+d.ch));
+      cmds.push(switchCmd(c, d));
     } else {
       L.push('   with     (no file tried yet)');
-      cps.push('cp "<new file>.wav" ' + d.path);
+      cmds.push('cp ' + shq('<new file>.wav') + ' ' + d.path + '    # 16-bit 44.1 kHz ' + chans(+d.ch) + ' WAV');
     }
-    if (m.note) L.push('   note     ' + m.note.replace(/\n+/g, ' / '));
+    if (m.note && m.note.trim()) L.push('   note     ' + m.note.trim().replace(/\n+/g, ' / '));
     if (d.state) L.push('   status   ' + d.state);
     L.push('');
   });
+  if (noted.length){
+    L.push('NOTES ON SOUNDS NOT MARKED (' + noted.length + ')');
+    noted.forEach(tr => L.push('- ' + rowTitle(tr.dataset) + ': ' + marks[tr.dataset.event].note.trim().replace(/\n+/g, ' / ')));
+    L.push('');
+  }
+  if (!rows.length) return L.join('\n').replace(/\n+$/, '');
   const evs = rows.map(tr => tr.dataset.event);
-  const uassets = evs.map(e => 'Content/Trace/Audio/S_' + e + '.uasset');
+  const locks = evs.map(e => 'Content/Trace/Audio/S_' + e + '.uasset').concat(['Content/Trace/Audio/DA_TraceSoundBank.uasset']);
   L.push('TO SWITCH THEM — in the main checkout, Unreal editor closed:');
-  cps.forEach(c => L.push('  ' + c));
-  L.push('  Scripts/lock.sh ' + uassets.join(' ') + ' Content/Trace/Audio/DA_TraceSoundBank.uasset');
+  L.push('  git pull');
+  L.push('  Scripts/lock.sh ' + locks.join(' '));
+  cmds.forEach(c => L.push('  ' + c));
   L.push('  ./Scripts/import-sounds.sh --only ' + evs.join(','));
   L.push('  git add ' + rows.map(tr => tr.dataset.path).join(' ') + ' Content/Trace/Audio');
-  L.push('  git commit, push, then: Scripts/unlock.sh ' + uassets.join(' ') + ' Content/Trace/Audio/DA_TraceSoundBank.uasset');
-  L.push('The editor and the Scripts/run-*.sh games play the new file on their next launch (no C++ rebuild).');
+  L.push('  git commit, git push, then: Scripts/unlock.sh ' + locks.join(' '));
+  L.push('The editor and the Scripts/run-*.sh games play the new file on their next launch (no C++ rebuild);');
+  L.push('Trace.Audio.Reload picks it up in a running game.');
   L.push('Packaged builds keep the old one until re-packaged: ./Scripts/package.sh (--iterate re-cooks only what changed).');
   L.push('Then: python3 Scripts/generate_sound_page.py to refresh this page.');
   return L.join('\n');
@@ -1269,17 +1688,17 @@ def build_page(ctx):
     if silent:
         notes.append('<span><b>{0} SILENT</b> &mdash; {1}: switched off in Demo 29, still playable here. '
                      '<code>Trace.Audio.UnwiredEvents 0</code> brings them back.</span>'.format(
-                         len(silent), ", ".join(e(r["name"]) for r in silent)))
+                         len(silent), ", ".join(e(r["label"]) for r in silent)))
     retired = [r for r in rows if r["retired"]]
     if retired:
         notes.append('<span><b>{0} RETIRED</b> &mdash; {1}: only a feature Demo 35 retired plays {2}; '
                      'the row names the switch that brings it back.</span>'.format(
-                         len(retired), ", ".join(e(r["name"]) for r in retired),
+                         len(retired), ", ".join(e(r["label"]) for r in retired),
                          "it" if len(retired) == 1 else "them"))
     nowire = [r for r in rows if not r["sites"]]
     if nowire:
         notes.append('<span><b>{0} NOT WIRED</b> &mdash; {1}: nothing in Source/ plays {2}.</span>'.format(
-            len(nowire), ", ".join(e(r["name"]) for r in nowire), "it" if len(nowire) == 1 else "them"))
+            len(nowire), ", ".join(e(r["label"]) for r in nowire), "it" if len(nowire) == 1 else "them"))
     if notes:
         A('<div class="notes">{0}</div>'.format("".join(notes)))
     A('<p class="meta">Built {0} by <code>Scripts/generate_sound_page.py</code>. {1}</p>'.format(
@@ -1307,16 +1726,17 @@ def build_page(ctx):
             A("<li>{0}</li>".format(e(p)))
         A("</ul></div>")
     A('<details class="how" open><summary>Switching a sound</summary><ol>'
-      '<li>In the main checkout, with the Unreal editor closed, copy the new WAV over the row&rsquo;s '
-      'file &mdash; same name, same folder. 44.1&nbsp;kHz 16-bit PCM; mono or stereo to match the '
-      'row (B warns when it doesn&rsquo;t).</li>'
-      '<li><code>Scripts/lock.sh Content/Trace/Audio/S_&lt;Event&gt;.uasset '
-      'Content/Trace/Audio/DA_TraceSoundBank.uasset</code> &mdash; both are read-only until locked, '
-      'and the import rewrites both.</li>'
+      '<li>In the main checkout, Unreal editor closed: <code>git pull</code>, then <code>Scripts/lock.sh '
+      'Content/Trace/Audio/S_&lt;Event&gt;.uasset Content/Trace/Audio/DA_TraceSoundBank.uasset</code> '
+      '&mdash; both are read-only until locked, and the import rewrites both.</li>'
+      '<li>Put the new sound over the row&rsquo;s file &mdash; same name, same folder &mdash; as 44.1&nbsp;kHz '
+      '16-bit PCM WAV, mono or stereo to match the row. B warns when a file isn&rsquo;t; '
+      '<b>Export list</b> gives the <code>afconvert</code> line that fixes it.</li>'
       '<li><code>./Scripts/import-sounds.sh --only &lt;Event&gt;</code> (several: '
       '<code>--only A,B</code>). <code>--list</code> checks the WAVs without the editor.</li>'
       '<li>The editor and the <code>Scripts/run-*.sh</code> games play it on their next launch &mdash; no C++ rebuild. '
-      '<code>Trace.Audio.Test &lt;Event&gt;</code> fires it in game.</li>'
+      '<code>Trace.Audio.Reload</code> picks it up in a running game; <code>Trace.Audio.Test &lt;Event&gt;</code> '
+      'fires it.</li>'
       '<li>Packaged builds keep the old sound until re-packaged: <code>./Scripts/package.sh</code> '
       '(<code>--iterate</code> re-cooks only what changed).</li>'
       '<li>Commit the WAV and what changed in <code>Content/Trace/Audio</code>, push, then '
@@ -1324,6 +1744,8 @@ def build_page(ctx):
       '</ol><p><b>Export list</b> writes these commands out for every marked row. '
       '<code>python3 Scripts/generate_sound_page.py</code> rebuilds this page.</p></details>')
 
+    A('<p class="gnote" id="nomatch" hidden data-nosound="{0}"></p>'.format(e(json.dumps(
+        ctx["nosound"], separators=(",", ":")), quote=True)))
     for g in groups:
         A('<section class="grp" id="g-{0}">'.format(g["id"]))
         A("<h2>{0} <span class='count'>&nbsp;{1} sound{2}</span></h2>".format(
@@ -1387,6 +1809,9 @@ def render_row(r):
     if not r["sites"]:
         notes.append('<span class="note warn">Nothing in Source/ plays this event.</span>')
         state.append("NOT WIRED: nothing in Source/ plays it")
+    if r["unchecked_note"]:
+        notes.append('<span class="note warn">{0}</span>'.format(e(r["unchecked_note"])))
+        state.append(r["unchecked_note"])
 
     shown = r["sites"][:3]
     more = len(r["sites"]) - len(shown)
@@ -1395,8 +1820,8 @@ def render_row(r):
         site_line = "plays at " + " &nbsp;".join(e(s) for s in shown)
         if more > 0:
             site_line += " &nbsp;+{0} more".format(more)
-        if r["gate_note"]:
-            site_line += " &middot; {0}".format(e(r["gate_note"]))
+        if r["checks"]:
+            site_line += " &middot; {0}".format("; ".join(e(c) for c in r["checks"]))
         elif r["indirect_note"]:
             site_line += " &middot; {0}".format(e(r["indirect_note"]))
 
@@ -1411,27 +1836,27 @@ def render_row(r):
     out = ['<div class="{0}" id="r-{1}" {2}>'.format(" ".join(classes), e(r["name"], quote=True), attrs)]
     out.append('<div class="c-play"><button class="play a" onclick="toggle(this)" aria-label="Play {0}">&#9654;'
                '</button><audio class="ca" preload="none" src="data:audio/wav;base64,{1}"></audio></div>'.format(
-                   e(r["name"], quote=True), r["b64"]))
+                   e(r["label"], quote=True), r["b64"]))
     out.append('<div class="c-sound"><div><span class="ev">{0}</span>{1}</div>'
                '<div class="when">{2}</div><div class="path mono">{3}</div>{4}{5}</div>'.format(
                    e(r["label"]), "".join(tags), e(r["when"]), e(r["relpath"]),
                    '<div class="site mono">{0}</div>'.format(site_line) if site_line else "",
                    "".join(notes)))
-    full = ('<div class="num" style="color:var(--warn)">full file {0:.1f} s, {1:.1f} MB</div>'.format(
-        r["full_duration"], r["full_mb"]) if r["preview"] else "")
-    out.append('<div class="c-a"><div class="num"><span class="ab a">A</span>{0:.2f} s &middot; {1} &middot; {2}'
-               '</div><div class="num">peak {3} &middot; RMS {4} dBFS</div><div class="envbox"></div>{5}</div>'.format(
-                   r["duration"], "mono" if r["channels"] == 1 else "stereo",
+    full = ('<div class="num" style="color:var(--warn)">full file {0:.1f} s &middot; {1:g} kHz &middot; {2:.1f} MB'
+            '</div>'.format(r["full_duration"], r["src_rate"] / 1000.0, r["full_mb"]) if r["preview"] else "")
+    out.append('<div class="c-a"><div class="num"><span class="ab a">A</span>{0:.2f} s{1} &middot; {2} &middot; {3}'
+               '</div><div class="num">peak {4} &middot; RMS {5} dBFS</div><div class="envbox"></div>{6}</div>'.format(
+                   r["duration"], " preview" if r["preview"] else "", "mono" if r["channels"] == 1 else "stereo",
                    "{0:g} kHz".format(r["rate"] / 1000.0) + ("" if r["bits"] == 16 else " {0}-bit".format(r["bits"])),
                    fmt_db(r["peak"]), fmt_db(r["rms"]), full))
     out.append('<div class="c-b"><label class="btn try">Try a file&hellip;<input type="file" '
                'accept=".wav,audio/wav,audio/x-wav,audio/*" onchange="onPick(this)" '
                'aria-label="Try a file for {0}"></label><div class="cand"></div></div>'.format(
-                   e(r["name"], quote=True)))
+                   e(r["label"], quote=True)))
     out.append('<div class="c-mark mark"><label><input type="checkbox" onchange="onFlag(this)" '
                'aria-label="Mark {0} for replacement"> replace</label>'
                '<textarea placeholder="What is wrong with it?" oninput="onNote(this)" '
-               'aria-label="Note for {0}"></textarea></div>'.format(e(r["name"], quote=True)))
+               'aria-label="Note for {0}"></textarea></div>'.format(e(r["label"], quote=True)))
     out.append("</div>")
     return "".join(out)
 
@@ -1442,7 +1867,9 @@ def render_row(r):
 
 def name_leak_checker(kits, abilities):
     names = sorted(kits, key=len, reverse=True)
-    pats = [(n, re.compile(r"(?<![A-Za-z0-9_.\-])" + re.escape(n) + r"(?![A-Za-z0-9_\-])")) for n in names]
+    # A name followed by a capital is an identifier (RoccoJump) and counts; a lowercase continuation
+    # is a different word and does not.
+    pats = [(n, re.compile(r"(?<![A-Za-z0-9_.\-])" + re.escape(n) + r"(?![a-z0-9_\-])")) for n in names]
     display = sorted({a["name"] for a in abilities.values()}, key=len, reverse=True)
 
     def check(where, text):
@@ -1456,6 +1883,50 @@ def name_leak_checker(kits, abilities):
     return check
 
 
+class _VisibleText(HTMLParser):
+    """Everything a person can read or hear on the page: text outside <script>/<style>, plus the
+    attributes a screen reader or a tooltip speaks."""
+    SPOKEN = ("aria-label", "title", "placeholder", "alt")
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.skip, self.chunks, self.where = 0, [], []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.skip += 1
+        a = dict(attrs)
+        self.where.append(tag + ("#" + a["id"] if a.get("id") else "") +
+                          ("." + a["class"].split()[0] if a.get("class") else ""))
+        for k, v in attrs:
+            if v and k in self.SPOKEN:
+                self.chunks.append(("{0}[{1}]".format(self.where[-1], k), v))
+        if tag in ("input", "meta", "br", "img", "link"):
+            self.where.pop()
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self.skip = max(0, self.skip - 1)
+        if self.where:
+            self.where.pop()
+
+    def handle_data(self, data):
+        if not self.skip and data.strip():
+            self.chunks.append((" > ".join(self.where[-3:]), data))
+
+
+# A file path, a source file or a console variable may carry a kit name: the path is the thing you
+# overwrite and the cvar is what you type. Everything else on the page may not.
+_PATHLIKE_RE = re.compile(r"\S*/\S*|\S+\.(?:cpp|h|wav|uasset|py|sh|html|txt)\b|\bTrace(?:\.\w+)+")
+
+
+def check_page_names(page, leak):
+    parser = _VisibleText()
+    parser.feed(page)
+    for where, text in parser.chunks:
+        leak("the page text at {0}".format(where), _PATHLIKE_RE.sub(" ", text))
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -1465,8 +1936,8 @@ def git_describe():
         sha = subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"], capture_output=True,
                              text=True, timeout=10).stdout.strip()
         dirty = subprocess.run(["git", "-C", ROOT, "status", "--porcelain", "--", "Source", "Art/Sounds",
-                                ":!Art/Sounds/sound-test.html"], capture_output=True, text=True,
-                               timeout=30).stdout.strip()
+                                ":!Art/Sounds/sound-test.html", rel(__file__), rel(GENERATOR_PY)],
+                               capture_output=True, text=True, timeout=30).stdout.strip()
         if not sha:
             return ""
         return sha + (" + uncommitted changes" if dirty else "")
@@ -1523,9 +1994,13 @@ def main():
     for ev in sorted(set(ABILITY_SOUNDS) - table_names):
         error("ABILITY_SOUNDS maps '{0}', which is not in the event table - remove the entry".format(ev))
     ability_rows = {}
+    burst_types = fx_burst_types()
     for ev, spec in ABILITY_SOUNDS.items():
         if ev not in table_names:
             continue
+        for key in sorted(set(spec) - SPEC_KEYS):
+            error("ABILITY_SOUNDS '{0}' has '{1}', which this script does not read (a typo, or a key "
+                  "from an older version) - nothing checks it".format(ev, key))
         for aid in spec["abilities"]:
             if aid not in abilities:
                 error("ABILITY_SOUNDS maps '{0}' to ETraceAbilityId::{1}, which has no row in GAbilityTable"
@@ -1541,25 +2016,58 @@ def main():
             else:
                 spans.append(span)
                 sites.append("{0}:{1}".format(span[0], span[2]))
-        gate = find_anchor(*spec["gate"])
-        if gate is None:
-            error("ABILITY_SOUNDS '{0}': the guard /{1}/ is no longer in {2} - the sound may not belong "
-                  "to that ability any more".format(ev, spec["gate"][1], spec["gate"][0]))
         retired = spec.get("retired")
+        checks, cover, any_cover, firm, walked = [], set(), set(), set(), []
         if retired:
+            if find_anchor(*retired["gate"]) is None:
+                error("ABILITY_SOUNDS '{0}': the switch /{1}/ is no longer in {2} - the retired path may be "
+                      "live again".format(ev, retired["gate"][1], retired["gate"][0]))
             if retired["cvar"] not in demo35_cvars:
                 error("ABILITY_SOUNDS '{0}' says '{1}' brings it back, but no such cvar is declared in "
                       "Source/".format(ev, retired["cvar"]))
             if retired["replaced_by"] not in abilities:
                 error("ABILITY_SOUNDS '{0}': replaced_by '{1}' has no row in GAbilityTable".format(
                     ev, retired["replaced_by"]))
+        elif not spec.get("paths"):
+            error("ABILITY_SOUNDS '{0}' gives no path from an ability to its trigger".format(ev))
+        elif spans:
+            trigger = (spans[0][0], spans[0][1] - 1)
+            for path in spec["paths"]:
+                got = check_path(ev, path, trigger, abilities)
+                if got is None:
+                    continue
+                checks.append(got["evidence"])
+                walked += got["links"]
+                cover |= got["cover"]
+                if got["kind"] == "any":
+                    any_cover |= got["cover"]
+                else:
+                    firm |= got["cover"]
+            listed = set(spec["abilities"])
+            if checks and cover != listed:
+                error("ABILITY_SOUNDS '{0}' lists {1}, but its paths reach it from {2} - list exactly what "
+                      "the code ties it to".format(ev, ", ".join(sorted(listed)), ", ".join(sorted(cover))))
+            # a sound an FX burst carries: every Burst() of that type must be in the trigger's function
+            if spans[0][0] != FXB:
+                trig_fn, _head = function_at(spans[0][0], spans[0][1] - 1)
+                for btype in burst_types.get(ev, []):
+                    for urel, ui, where in find_uses(re.compile(r"Burst\s*\([^;]*ETraceFxBurstType::" + btype + r"\b")):
+                        if where != trig_fn:
+                            error("ABILITY_SOUNDS '{0}': ETraceFxBurstType::{1} is also burst at {2}:{3} ({4}) - "
+                                  "another route to the sound".format(ev, btype, urel, ui + 1, where))
+        if walked:
+            check_callers(ev, spec, walked)
+        for f, rx, why in spec.get("needs", []):
+            if find_anchor(f, rx) is None:
+                error("ABILITY_SOUNDS '{0}' rests on \"{1}\", and /{2}/ is no longer in {3}".format(ev, why, rx, f))
         # every gameplay site the grep finds must be a line the mapping cites
         for s in calls.get(ev, []):
             f, line = s.rsplit(":", 1)
             if not any(f == sf and lo <= int(line) <= hi for sf, lo, hi in spans):
                 error("'{0}' is also played at {1}, which ABILITY_SOUNDS does not account for - check "
                       "which ability that is".format(ev, s))
-        ability_rows[ev] = {"sites": sites, "gate": gate}
+        ability_rows[ev] = {"sites": sites, "checks": checks,
+                            "unchecked": [a for a in spec["abilities"] if a in any_cover and a not in firm]}
 
     # --- rows -------------------------------------------------------------------------------------
     leak = name_leak_checker(kits, abilities)
@@ -1631,6 +2139,7 @@ def main():
 
         also = []
         retired = None
+        checks, unchecked_note = [], ""
         if spec:
             names = {aid: abilities[aid]["name"] for aid in spec["abilities"] if aid in abilities}
             label = spec["label"]
@@ -1644,6 +2153,10 @@ def main():
                 repl = abilities.get(r["replaced_by"], {}).get("name", r["replaced_by"])
                 retired = {"cvar": r["cvar"], "replaced_by": repl}
                 group, where = "retired", "Retired"
+                switch = find_anchor(*r["gate"])
+                if switch:
+                    f, line = switch.rsplit(":", 1)
+                    checks = ["switched off at {0}:{1}".format(os.path.basename(f), line)]
             else:
                 primary = abilities.get(spec["abilities"][0])
                 group = "ability:" + spec["abilities"][0]
@@ -1651,9 +2164,14 @@ def main():
                 for aid in spec["abilities"][1:]:
                     if aid in abilities:
                         also.append("{0} ({1})".format(abilities[aid]["name"], abilities[aid]["slot_label"]))
-            gate_note = spec["gate_note"]
+                checks = ability_rows[name]["checks"]
+                others = [abilities[a]["name"] for a in ability_rows[name]["unchecked"]
+                          if a != spec["abilities"][0] and a in abilities]
+                if others:
+                    unchecked_note = ("Also plays with {0} picked: no ability check on that route."
+                                      .format(" or ".join([", ".join(others[:-1]), others[-1]] if len(others) > 1 else others)))
         else:
-            label, when, gate_note = name, row["trigger"], ""
+            label, when = name, row["trigger"]
             group, where = None, None
             for gid, title, members, _note in STATIC_GROUPS + TAIL_GROUPS:
                 if name in members:
@@ -1667,6 +2185,7 @@ def main():
             leak("the SILENT reason of '{0}'".format(name), unwired[name])
         for a in also:
             leak("an ability tag on '{0}'".format(name), a)
+        leak("the note on '{0}'".format(name), unchecked_note)
 
         search = " ".join([name, label, when, relpath, where or "", " ".join(also),
                            "silent unwired" if name in unwired else "",
@@ -1684,7 +2203,7 @@ def main():
             "bits": bits, "src_rate": sr,
             "env": envelope(env_src, out_nch),
             "sites": [s.replace("Source/Trace/", "", 1) for s in sites],
-            "gate_note": gate_note, "indirect_note": indirect_note, "search": search,
+            "checks": checks, "unchecked_note": unchecked_note, "indirect_note": indirect_note, "search": search,
             "b64": base64.b64encode(blob).decode("ascii"),
         })
         print("    {0:<18} {1:>6.2f}s  {2}  peak {3:>6}  {4:<22} {5}".format(
@@ -1713,19 +2232,23 @@ def main():
     for a in ordered:
         members = by_group.get("ability:" + a["id"], [])
         also_here = [r for r in rows if a["id"] in ABILITY_SOUNDS.get(r["name"], {}).get("abilities", [])[1:]]
+
+        def shared(r, aid=a["id"]):
+            # A sound this ability reaches only by a route with no ability check says so.
+            unchecked = aid in ability_rows.get(r["name"], {}).get("unchecked", [])
+            return '<a href="#r-{0}">{1}</a>{2}'.format(html.escape(r["name"]), html.escape(r["label"]),
+                                                         " (no ability check)" if unchecked else "")
         if not members:
             if also_here:
                 blocks.append({"title": a["name"], "slot": a["slot_label"], "anchor": a["id"], "rows": [],
-                               "note": "Shares " + ", ".join(
-                                   '<a href="#r-{0}">{1}</a>'.format(html.escape(r["name"]), html.escape(r["label"]))
-                                   for r in also_here) + "; no sound of its own."})
+                               "note": "Shares " + ", ".join(shared(r) for r in also_here) +
+                                       "; no sound of its own."})
             else:
                 silent_abilities.append(a)
             continue
         note = ""
         if also_here:
-            note = "Also plays " + ", ".join('<a href="#r-{0}">{1}</a>'.format(
-                html.escape(r["name"]), html.escape(r["label"])) for r in also_here) + "."
+            note = "Also plays " + ", ".join(shared(r) for r in also_here) + "."
         blocks.append({"title": a["name"], "slot": a["slot_label"], "anchor": a["id"], "rows": members,
                        "note": note})
     ability_count = sum(len(b["rows"]) for b in blocks)
@@ -1737,7 +2260,8 @@ def main():
                 for a in silent_abilities) + "."
         groups.append({"id": "abilities", "title": "Abilities", "count": ability_count,
                        "note": "By ability and slot (names from GAbilityTable). Each row cites the line that "
-                               "plays it and the guard that ties it to the ability." + silent_txt,
+                               "plays it and the ability check on each route to it, re-read from the code on "
+                               "every build." + silent_txt,
                        "blocks": [b for b in blocks if b["rows"]] + [b for b in blocks if not b["rows"]]})
     if by_group.get("retired"):
         groups.append({"id": "retired", "title": "Retired", "count": len(by_group["retired"]),
@@ -1765,7 +2289,17 @@ def main():
     sha = git_describe()
     built = datetime.datetime.now().strftime("%Y-%m-%d %H:%M") + (" from " + sha if sha else "")
     ctx = {"rows": rows, "groups": groups, "built": built, "size_note": "",
-           "errors": list(_errors), "new_count": sum(1 for r in rows if r["new"])}
+           "errors": list(_errors), "new_count": sum(1 for r in rows if r["new"]),
+           "nosound": [[a["name"], a["slot_label"]] for a in silent_abilities]}
+
+    # Built before deciding, so the finished page's own text can be checked for character names
+    # (headings, notes, screen-reader labels - everything but paths and cvars).
+    page = build_page(ctx)
+    check_page_names(page, leak)
+    ctx["size_note"] = "{0} sounds, {1:.1f} MB, entirely offline.".format(
+        len(rows), len(page.encode("utf-8")) / (1024.0 * 1024.0))
+    ctx["errors"] = list(_errors)
+    page = build_page(ctx)
 
     if _errors and not args.allow_errors:
         print("")
@@ -1776,11 +2310,6 @@ def main():
         print("")
         print("  --check: {0} rows OK, {1} warning(s); nothing written.".format(len(rows), len(_warnings)))
         return 0
-
-    page = build_page(ctx)
-    size_mb = len(page.encode("utf-8")) / (1024.0 * 1024.0)
-    ctx["size_note"] = "{0} sounds, {1:.1f} MB, entirely offline.".format(len(rows), size_mb)
-    page = build_page(ctx)
 
     out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out), exist_ok=True)

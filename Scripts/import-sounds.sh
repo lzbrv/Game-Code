@@ -16,6 +16,8 @@
 # ------------------------------------------------------------------------------
 # The owner's requirement, and the whole procedure for a new version of a sound:
 #
+#     git pull
+#     Scripts/lock.sh Content/Trace/Audio/S_Dash.uasset Content/Trace/Audio/DA_TraceSoundBank.uasset
 #     cp NewDash.wav Art/Sounds/Dash.wav
 #     ./Scripts/import-sounds.sh --only Dash
 #
@@ -45,8 +47,9 @@
 #
 # .uasset is `lockable`, so it is checked out READ-ONLY. Creating a sound asset
 # for the first time is fine; RE-importing one over an existing asset needs
-# `Scripts/lock.sh Content/Trace/Audio/S_Dash.uasset` first, which is exactly why
-# --only exists — swapping one sound should not need nine locks.
+# `Scripts/lock.sh Content/Trace/Audio/S_Dash.uasset` first — plus
+# Content/Trace/Audio/DA_TraceSoundBank.uasset, which every run re-saves — and that
+# is exactly why --only exists: swapping one sound should not need nine locks.
 #
 # YOU DO NOT NEED TO RUN THIS TO PLAY. All outputs are committed, exactly like the
 # font atlas and the railgun.
@@ -82,9 +85,11 @@ OPTIONS
   -n, --dry-run     Print what would run; run nothing
   -h, --help        This text
 
-AFTER RUNNING
-  ./Scripts/build.sh
+AFTER RUNNING (no C++ rebuild: the game asks the bank, and the bank is data)
   git status Art/Sounds Content/Trace/Audio
+  The editor and the Scripts/run-*.sh games pick it up on their next launch;
+  Trace.Audio.Reload picks it up in one that is running. Packaged builds keep
+  the old sound until ./Scripts/package.sh re-cooks them.
 
 IN GAME (drop -nosound, or none of this is audible)
   Trace.Audio.Report      every event: side, which asset it resolved to, the device
@@ -257,4 +262,4 @@ if [ "$MISSING" != "0" ]; then
 fi
 
 trace_msg "Sound is imported (${WAV_COUNT} wav(s) seen, bank at /Game/Trace/Audio/DA_TraceSoundBank)."
-trace_msg "Next: ./Scripts/build.sh, then in game (WITHOUT -nosound): Trace.Audio.Report / Trace.Audio.Probe"
+trace_msg "Next launch picks it up (Trace.Audio.Reload in a running game). No rebuild. Check in game (WITHOUT -nosound): Trace.Audio.Report / Trace.Audio.Probe"
