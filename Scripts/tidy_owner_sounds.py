@@ -65,6 +65,12 @@ He then asked for exactly three kinds of tidying and nothing else:
              The track has no repeated bar to borrow from either. The best match
              anywhere else in the track for bar 1's opening half second (50-550 ms)
              correlates 0.57, and for the last 0.5 s of bar 64, 0.70.
+             Every number above describes the WAV. The game plays the seam as
+             written only because S_MusicTitle is stored as PCM
+             (PCM_LOOP_STEMS in Scripts/import_sounds.py). With the project's
+             default codec, BINKA, the decoder starts the loop again from zero at
+             every wrap. That is a tick and a dip in game, whatever the file's
+             seam is like.
 
 NOTHING ELSE CHANGES: no normalising, no limiting, no resampling, no dither. The
 channel count, sample rate and bit depth stay the same, and every non-audio

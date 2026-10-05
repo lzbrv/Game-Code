@@ -196,6 +196,27 @@ LOOPING_STEMS = {
     "AmbienceMatch",
 }
 
+# Loops stored as uncompressed PCM, so the game plays their loop point sample
+# for sample. Every other sound keeps the project default codec (BINKA on Mac
+# and Windows). BINKA does not decode a wrap cleanly: at each pass from the
+# last sample back to the first, the output dropped to near zero in 1-2
+# samples, stayed there for about 1 ms and took about 10 ms to come back. That
+# is a tick and a dip at every wrap, whatever the WAV's own seam is like
+# (measured on the mixer's output, 2026-10-05). PCM does not do this. It also
+# leaves the owner's samples unchanged in game: no lossy re-encode at all.
+# The cost is size. MusicTitle is 20.5 MB as PCM, several times what the lossy
+# BINKA made of it. Its loading behaviour is unchanged, so it still streams and
+# is not held in memory whole.
+#
+# Only stems whose .uasset the owner has locked and asked to have fixed belong
+# here. AmbienceMatch has the same problem at its 48 s wrap, but adding it
+# changes S_AmbienceMatch, so it is the owner's call. Taking a stem OUT of this
+# set does not change it back: replace_existing reuses the asset, so set its
+# compression to Project Defined by hand.
+PCM_LOOP_STEMS = {
+    "MusicTitle",
+}
+
 # DEMO 29 items 9 and 11 — events that are DECLARED and DELIBERATELY SILENT.
 #
 # A MIRROR of TraceSoundEvents::Unwired(), for the printed manifest ONLY, exactly
@@ -407,6 +428,8 @@ def manifest(entries, selected):
         mark = "" if (selected is None or stem in selected) else "   (skipped this run)"
         if stem in UNWIRED_STEMS:
             mark += "   [UNWIRED - imports fine, does not sound; see UNWIRED_STEMS above]"
+        if stem in PCM_LOOP_STEMS:
+            mark += "   [PCM - the loop point plays sample for sample; see PCM_LOOP_STEMS]"
         rel = os.path.relpath(path, SOURCE_DIR)
         log("  {0:<18}{1:<12}{2:>7}{3:>4}{4:>8.2f}{5:>10}{6:>10}   {7}{8}".format(
             stem, side, rate, channels, seconds,
@@ -517,6 +540,22 @@ def import_wav(unreal, stem, path):
                  else unreal.SoundWaveLoadingBehavior.FORCE_INLINE)
     except AttributeError:
         log("  (this engine build has no SoundWaveLoadingBehavior - continuing)")
+
+    # Unlike the properties above, this one is required. Without it the loop wraps with a
+    # tick and a dip, so if it cannot be set the import fails instead of logging and
+    # carrying on. See PCM_LOOP_STEMS.
+    if stem in PCM_LOOP_STEMS:
+        try:
+            sound.set_sound_asset_compression_type(unreal.SoundAssetCompressionType.PCM, True)
+            got = sound.get_sound_asset_compression_type()
+        except Exception as error:                      # pylint: disable=broad-except
+            got = error
+        if got != unreal.SoundAssetCompressionType.PCM:
+            fail("{0}: could not set its compression to PCM (got {1}). Without it the game "
+                 "decodes the loop point with a tick and a dip.".format(asset_path, got))
+            return None
+        log("  {0}: compression PCM, so the loop point plays sample for sample "
+            "(PCM_LOOP_STEMS)".format(asset_name))
 
     # A save that fails must say so. Nothing after it can tell: load_asset above
     # answers from memory, and the old .uasset is still on disk, so every later
