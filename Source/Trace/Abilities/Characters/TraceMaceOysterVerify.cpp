@@ -1465,9 +1465,15 @@ namespace TraceMaceOysterVerify
 
 				// THE FIZZLE, which is the other half of the wall rule: aimed at the sky there is no
 				// wall, so ActivateAbility must return FALSE and the framework must not charge 20 s.
+				//
+				// PITCH +89, i.e. UP. An FRotator's pitch is positive looking up; this used to say -89,
+				// which is straight DOWN at her own feet. That fizzled only because a flat floor fails the
+				// wall test (|n.Z| > 0.70) - and over a side ramp, whose 46.9-61.2 degree face passes it,
+				// the "sky" throw found a wall and embedded, failing the check with nothing wrong in Mace
+				// (seen once in two baked runs). Nothing stands above the arena within the spike's range.
 				if (AController* Steer = MyPawn->GetController())
 				{
-					Steer->SetControlRotation(FRotator(-89.f, 0.f, 0.f));
+					Steer->SetControlRotation(FRotator(89.f, 0.f, 0.f));
 				}
 				const ATraceMaceSpike* SpikeBeforeSkyThrow = MaceSet->GetSpike();
 				State->bSkyThrowFizzled = !MaceSet->ActivateAbility();
