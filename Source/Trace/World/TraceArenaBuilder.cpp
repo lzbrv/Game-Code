@@ -993,15 +993,15 @@ namespace TraceArenaConstants
 	// is a FINER beat than the 2520 uu the piers gave) rather than from a row of boxes.
 	//
 	// The END wall row below is untouched: the owner scoped the request to "the side of the map", the
-	// end walls carry no ride, and those six piers are the only thing giving a 9600 uu end wall any
+	// end walls carry no ride, and those six piers are the only thing giving a 10560 uu end wall any
 	// depth at all.
 
 	/** End walls (constant X). Mirrored into +/-Y and +/-X. Y = 0 is left clear for the scoring lane. */
 	static const FButtressSpec EndButtresses[] =
 	{
-		{ 0.3000f, 1100.f },   // 1800
-		{ 0.5667f, 1600.f },   // 3400
-		{ 0.8333f, 1100.f }    // 5000
+		{ 0.3000f, 1100.f },   // |Y| 1584 on the 10560 field
+		{ 0.5667f, 1600.f },   // |Y| 2992
+		{ 0.8333f, 1100.f }    // |Y| 4400 - the end wall's outermost rib runs through it (KNOWN_LIMITATIONS 45)
 	};
 
 	static constexpr float ButtressWidth = 420.f;

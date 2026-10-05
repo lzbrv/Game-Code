@@ -192,6 +192,42 @@ rates, no Core, no dash".
 the knob overridden. **The game is correct** — `ComputeSlideVector` reads `GetSurfOverbounce()`. Only
 the harness written to prove the clip is blind to the knob.
 
+### 45. The end-wall neon ribs run up through the four corner buttresses — **OPEN, cosmetic**
+
+Left by the owner's 2026-10-04 x1.10 (42240 x 10560). The outermost buttress on each end wall stands at
+a fraction of the half width (`TraceArenaConstants::EndButtresses`, 0.8333), so it spread from |Y| 4000
+to 0.8333 × 5280 = **|Y| 4400**. The end wall's neon ribs keep their fixed 2200 uu pitch
+(`WallRibSpacing`), and their outermost one already stood at |Y| 4400. At all four corners the rib now
+runs up through the 1100 uu buttress and shows above its top. Cosmetic only. The same
+corner buttress also still stands over the side ramp's toe: 130 uu of overlap, down from 210, before
+the 26 uu pawn standoff.
+
+To fix it, move the outer fraction off 0.8333, or leave out a rib that lands inside a buttress. Both
+change the baked map, and **a re-bake of `Arena_Baked` is not free** (item 44).
+
+### 46. The centre kit spread ×1.1 and the centre itself did not — **OWNER DECISION**
+
+The re-bake carried the hand-placed layer onto the bigger field with
+`Scripts/rebake-translate-census.py`, whose default policy spreads the centre kit ×1.1 about the field
+centre. So the kit platforms and their lips moved 90–135 uu outward and the five hand-placed lamps
+spread ×1.1. The centre tower stays at the origin. The dais complex and the centre ring (a 2976 uu
+radius, pinned so it would not grow) are builder pieces that did not move. The cluster opened up a
+little around a centre that stayed where it was.
+
+The other reading is to leave the kit exactly where it was. That is one flag on the translation
+script, `--policy=fixed`, plus a re-bake (item 44).
+
+### 47. The lane-pylon light bridges grew 1700 → 1890 uu — **OWNER DECISION**
+
+Each quadrant's light bridge runs from the top of a lane pylon out to the side wall ("Light bridges"
+in `ATraceArenaBuilder`). Its two ends follow two different rules. The pylon end is a fraction of the
+half width (`LanePylonYFrac` 0.6042), so it spread ×1.1 from |Y| 2900 to 3190. The wall end rides the
+wall, at the half width minus `ButtressDepth`, from 4600 to 5080. The span therefore grew **1700 →
+1890 uu** (+11%). Its 78 uu cross-section and its 1240 uu height did not change.
+
+To keep 1700, the pylons would have to ride the wall too (|Y| 3380), 190 uu further out than they
+stand now. That is a layout choice and a re-bake (item 44), so it was left for the owner.
+
 ---
 
 ## C. Characters, art and identity
@@ -589,7 +625,8 @@ The obvious answer to item 30 is "re-bake the arena". Know the cost first: the l
 **lost nine hand-placed top-centre-tower pieces** contributed by a collaborator, because
 `UEditorActorSubsystem::DuplicateActor` cannot work in a commandlet. They were recovered by hand and
 re-created by a different route, and the recovery is verified — the census holds all 18 cluster pieces
-paired one-to-one by mirror, and a collision probe at (0, −2590) reads 705.2 uu, matching its untouched
+paired one-to-one by mirror, and a collision probe at (0, −2590) (the copy stands at −2850 since the
+2026-10-04 x1.10 spread it) reads 705.2 uu, matching its untouched
 mirror control to a tenth of a unit. **Nothing is currently lost.** But five further hand-copied centre
 floor lamps (`Floor_Lamp_3/4/6/7/8`) are also carried through by hand and are an open owner call, and a
 re-bake rewrites all 647 external actor packages.
