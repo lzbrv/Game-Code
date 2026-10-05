@@ -84,6 +84,7 @@
 #include "TraceTypes.h"
 #include "World/TraceArenaBuilder.h"
 #include "World/TraceArenaDimensions.h"
+#include "Debug/TraceFixtureKickoff.h"   // the ability stages wait out the half-1 kickoff
 
 #if !UE_BUILD_SHIPPING
 
@@ -2115,6 +2116,17 @@ namespace TraceMovementAuditV16
 
 		/** Trace.Demo35.LegacyJarJump was 0: the jar jump is retired and there is nothing to measure. */
 		bool  bJarJumpRetired = false;
+
+		/**
+		 * Mace's run-up has started from the GROUND. Rocco's stage hands her over still in the air from
+		 * his second jump, and the old staging took "not on the ground" to mean "she has jumped": it
+		 * pressed V straight away at the ~0 uu/s she inherited and could only ever reach AirMaxWishSpeed
+		 * (160) under air control, so the lateral-cap row was INVALID on every run.
+		 */
+		bool  bMaceRunUpOnGround = false;
+
+		/** Real time this stage began waiting out a half boundary; 0 when not waiting. */
+		double KickoffWaitStartReal = 0.0;
 	};
 
 	void ReportAbilityMoves(const FAbilityMoveState& State)
@@ -2281,10 +2293,37 @@ namespace TraceMovementAuditV16
 				{
 					return true;
 				}
+
+				// WAIT OUT THE KICKOFF, after the pick (the pick is what releases a warm-up held for the
+				// player's menus). A half boundary mid-stage puts her back on her spawn and clears the
+				// ability's state, which reads as the ability failing. See TraceFixtureKickoff.h.
+				{
+					FString KickoffWhy;
+					const double NowReal = FPlatformTime::Seconds();
+					if (TraceFixtureKickoff::IsHalfBoundaryDue(TickWorld, 15.f, KickoffWhy))
+					{
+						if (State->KickoffWaitStartReal <= 0.0)
+						{
+							State->KickoffWaitStartReal = NowReal;
+							UE_LOG(LogTraceGame, Display, TEXT("AUDITV16 ability stage %d waits before measuring: %s."),
+								State->Stage, *KickoffWhy);
+						}
+						// The overall Deadline (180 s) is the backstop; this wait is far inside it.
+						return true;
+					}
+					if (State->KickoffWaitStartReal > 0.0)
+					{
+						UE_LOG(LogTraceGame, Display, TEXT("AUDITV16 ability stage %d: the kickoff has passed (waited %.1fs)."),
+							State->Stage, NowReal - State->KickoffWaitStartReal);
+						State->KickoffWaitStartReal = 0.0;
+					}
+				}
+
 				State->Comp = Comp;
 				State->Pawn = Pawn;
 				State->Phase = 0;
 				State->PhaseStartReal = FPlatformTime::Seconds();
+				State->bMaceRunUpOnGround = false;
 				return true;
 			}
 
@@ -2366,13 +2405,38 @@ namespace TraceMovementAuditV16
 					// RUN INTO THE JUMP. The lateral cap is 550 uu/s and AirMaxWishSpeed is 160, so a
 					// Mace who jumps from a standstill can never reach the ceiling under her own air
 					// control — the first run of this audit topped out at exactly 160 uu/s and the cap
-					// row was untestable. Carrying 800 uu/s of ground speed into the jump puts her
-					// over the cap on the first suspended frame, which is the case the clamp is for.
+					// row was untestable. Carrying a full run (95% of the 900 walk) into the jump puts
+					// her over the cap on the first suspended frame, which is the case the clamp is for.
+					//
+					// LAND FIRST. She arrives here airborne from Rocco's second jump, and "not on the
+					// ground" below used to read that as "she has jumped": V went in at the ~0 uu/s she
+					// inherited, she topped out at 160 again and the row stayed INVALID. So the run-up
+					// only counts once it has started on the floor.
+					if (!State->bMaceRunUpOnGround)
+					{
+						if (!Move->IsMovingOnGround())
+						{
+							if (Elapsed > 5.0)
+							{
+								UE_LOG(LogTraceGame, Warning,
+									TEXT("AUDITV16 MACE suspend: she never landed to run up (5 s in the air); "
+									     "measuring from wherever she is."));
+								State->bMaceRunUpOnGround = true;
+							}
+							return true;
+						}
+						State->bMaceRunUpOnGround = true;
+						State->PhaseStartReal = FPlatformTime::Seconds();
+						return true;
+					}
 					Pawn->AddMovementInput(Pawn->GetActorForwardVector(), 1.f);
 					if (Move->IsMovingOnGround())
 					{
 						if (PlanarSpeedOf(Move) > Move->GetMaxSpeed() * 0.95f || Elapsed > 3.0)
 						{
+							UE_LOG(LogTraceGame, Display,
+								TEXT("AUDITV16 MACE suspend: run-up %.0f uu/s after %.2f s on the ground; jumping."),
+								PlanarSpeedOf(Move), Elapsed);
 							Pawn->Jump();
 						}
 						return true;
