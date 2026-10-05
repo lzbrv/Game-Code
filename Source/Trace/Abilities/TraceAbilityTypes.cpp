@@ -435,8 +435,11 @@ FTraceLoadout FTraceLoadout::Uniform(ETraceCharacterId Kit)
 	// WALKS THE TABLE RATHER THAN ASSUMING ONE ABILITY PER SLOT. Before Demo 35 every kit had exactly
 	// one of each and this could have been three lookups; now Chut has two passives and no movement,
 	// and Lily two movement abilities and no passive. The FIRST ability a kit offers for a slot wins,
-	// which is arbitrary only where a kit has two — and in both of those cases either is a legitimate
-	// "this character, as they were", which is all this function promises.
+	// in ETraceAbilityId order. Where a kit has two, the second is DROPPED, so neither of those two
+	// kits comes out "as they were": Chut gets CUSTOM STEEL and no BASH, Lily gets OVERLOAD and no
+	// ACROBATICS. Every character pick and every bot gets this loadout. Whether Chut's should be BASH
+	// instead is an open owner decision: docs/KNOWN_LIMITATIONS.md item 48. Do not reorder the enum
+	// to change the answer; its values are what saved loadouts and the network carry.
 	FTraceLoadout Out;
 	if (Kit == ETraceCharacterId::None)
 	{

@@ -128,6 +128,51 @@ at the 1098 uu/s of the 2026-10-04 walk) and inside the bot's own reaction delay
 range, not near its ragged edge, so a gate of 0.0 would still refuse it. Full evidence:
 `reports/W8-KNOBS.md` §4.3.
 
+### 48. Picking CHUT as a character, and every Chut bot, no longer bashes — **OWNER DECISION**
+
+Demo 35 moved BASH from movement to passive, where Chut already had CUSTOM STEEL. A loadout holds one
+passive, so a Chut who takes nothing from another kit cannot have both. The character pick
+(`ServerSetCharacter`) and every bot get `FTraceLoadout::Uniform` (`TraceAbilityTypes.cpp`), which
+takes the first ability per slot in enum order. `CustomSteel` comes before `Bash`, so Chut's character
+pick and Chut bots are **None / CUSTOM STEEL / CHUD**.
+
+Until a0e725c that pick still bashed, but only through a leak: the bash fired for any Chut kit,
+whatever was equipped. a0e725c gated it on BASH, as the Demo 35 loadout rule requires. Since then the
+Chut character pick and Chut bots:
+
+* have no end-of-dash knock (1118 uu/s along the dash + 335 up on anyone within 130 uu who is not
+  carrying the Core), no ChutBash sound or wedge, and no "bash armed" glow on his stripes;
+* as bots, no longer spend dash charges dashing at people to knock them (`PlanChut`).
+
+Measured on the code at 5daf7d9: 100 s of 8 bots on Arena_Baked, two Chut bots, both
+`None/CUSTOM STEEL/CHUD`, **zero** `[Chut] BASH on` lines. Bot matches on Arena_Baked earlier on
+2026-10-04, before a0e725c, logged one or two bashes from a single Chut bot inside about 35 s.
+
+The rule "a uniform loadout behaves exactly as before" cannot hold for Chut either way. Before Demo 35
+he had BASH (movement) **and** CUSTOM STEEL (passive), and both are passives now.
+
+**Options, all the owner's (nothing is changed in code until one is picked):**
+
+1. **Accept it.** BASH is a deliberate passive pick: to bash, a player takes BASH and gives up CUSTOM
+   STEEL's 50 front knife. Close this item.
+2. **Make BASH Chut's default passive.** Special-case Chut in `FTraceLoadout::Uniform` so the
+   character pick and the bots bash again. They lose CUSTOM STEEL instead (front knife back to the
+   standard 30). Bots get their loadout through the same `Uniform` call, so "bots bash, the
+   character pick keeps CUSTOM STEEL" is possible too, but needs a bot-only loadout written after
+   the bot is given its character.
+
+**Do not reorder `ETraceAbilityId` to get option 2.** The enum values are what saved loadouts and the
+network carry. Do not loosen the BASH guards either; they are what stops a CUSTOM STEEL or CHUD pick
+from bashing.
+
+**Lily has the same shape**, recorded here so one decision covers both. Demo 35 moved ACROBATICS into
+movement beside OVERLOAD, so Lily's character pick and Lily bots are **OVERLOAD / None / ZIP**. They
+have had no ACROBATICS wall-jump bonus (+30% momentum) since a18370b (2026-09-19):
+`GetWallJumpMomentumScale` answers 1.0 without ACROBATICS. Same bot run:
+`TracePlayerState_1 loadout OVERLOAD/None/ZIP`. The log line printed for both loadouts,
+"(uniform - identical to the pre-rework character)" (`TraceAbilityComponent.cpp`), is not true for
+Chut or Lily.
+
 ---
 
 ## B. Movement and the map
