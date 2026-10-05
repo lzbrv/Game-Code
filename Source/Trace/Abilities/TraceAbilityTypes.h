@@ -388,7 +388,6 @@ struct TRACE_API FTraceLoadout
 			&& Activated == ETraceAbilityId::None;
 	}
 
-	/** Every slot set to @p Id. The shape that reproduces a pre-rework character exactly. */
 	/**
 	 * The three abilities of one kit — the pre-rework character, as a loadout.
 	 *
@@ -397,6 +396,11 @@ struct TRACE_API FTraceLoadout
 	 * the table rather than assuming one per slot, because after Demo 35 that assumption is false:
 	 * Chut has two passives and no movement, Lily two movement abilities and no passive. A kit that
 	 * cannot fill a slot leaves it EMPTY, which is a legal loadout.
+	 *
+	 * Where a kit has two abilities in one slot, the FIRST in table order wins, so Chut gets CUSTOM
+	 * STEEL (not BASH) and Lily gets OVERLOAD (not ACROBATICS). The owner kept that on 2026-10-04
+	 * (docs/KNOWN_LIMITATIONS.md item 48). Do not reorder ETraceAbilityId to change it: saved
+	 * loadouts and the network carry those values.
 	 */
 	static FTraceLoadout Uniform(ETraceCharacterId Kit);
 

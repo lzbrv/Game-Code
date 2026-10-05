@@ -128,7 +128,7 @@ at the 1098 uu/s of the 2026-10-04 walk) and inside the bot's own reaction delay
 range, not near its ragged edge, so a gate of 0.0 would still refuse it. Full evidence:
 `reports/W8-KNOBS.md` §4.3.
 
-### 48. Picking CHUT as a character, and every Chut bot, no longer bashes — **OWNER DECISION**
+### 48. Picking CHUT as a character, and every Chut bot, no longer bashes — **DECIDED: kept (owner, 2026-10-04)**
 
 Demo 35 moved BASH from movement to passive, where Chut already had CUSTOM STEEL. A loadout holds one
 passive, so a Chut who takes nothing from another kit cannot have both. The character pick
@@ -151,7 +151,11 @@ Measured on the code at 5daf7d9: 100 s of 8 bots on Arena_Baked, two Chut bots, 
 The rule "a uniform loadout behaves exactly as before" cannot hold for Chut either way. Before Demo 35
 he had BASH (movement) **and** CUSTOM STEEL (passive), and both are passives now.
 
-**Options, all the owner's (nothing is changed in code until one is picked):**
+**Decision (owner, 2026-10-04): keep it.** Chut bots and the Chut character pick stay on CUSTOM
+STEEL and do not bash; Lily bots and the Lily character pick stay on OVERLOAD with no ACROBATICS
+bonus (below). BASH and ACROBATICS remain deliberate picks on the loadout screen. Nothing in the
+game changed for this; the uniform-loadout log line no longer claims "identical to the pre-rework
+character". The options that were weighed, for the record:
 
 1. **Accept it.** BASH is a deliberate passive pick: to bash, a player takes BASH and gives up CUSTOM
    STEEL's 50 front knife. Close this item.
@@ -170,8 +174,8 @@ movement beside OVERLOAD, so Lily's character pick and Lily bots are **OVERLOAD 
 have had no ACROBATICS wall-jump bonus (+30% momentum) since a18370b (2026-09-19):
 `GetWallJumpMomentumScale` answers 1.0 without ACROBATICS. Same bot run:
 `TracePlayerState_1 loadout OVERLOAD/None/ZIP`. The log line printed for both loadouts,
-"(uniform - identical to the pre-rework character)" (`TraceAbilityComponent.cpp`), is not true for
-Chut or Lily.
+"(uniform - identical to the pre-rework character)" (`TraceAbilityComponent.cpp`), was not true for
+Chut or Lily; it now reads "(uniform - every pick from one kit)". Same decision: kept.
 
 ---
 

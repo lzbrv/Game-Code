@@ -2277,7 +2277,7 @@ void UTraceAbilityComponent::ApplyLoadout(const FTraceLoadout& InLoadout)
 			TEXT("[Ability] %s loadout %s -> %d kit instance(s)%s"),
 			*GetNameSafe(GetOwningPlayerState()), *TraceLoadoutToString(Loadout),
 			EquippedSets.Num(),
-			Loadout.IsUniform() ? TEXT(" (uniform - identical to the pre-rework character)") : TEXT(""));
+			Loadout.IsUniform() ? TEXT(" (uniform - every pick from one kit)") : TEXT(""));
 	}
 }
 
