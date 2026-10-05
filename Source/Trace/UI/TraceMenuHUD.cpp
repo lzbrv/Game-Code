@@ -819,11 +819,10 @@ void ATraceMenuHUD::BeginPlay()
 	// Null-tested rather than assumed: Get() refuses on a dedicated server, and it returns null
 	// before a game instance exists at all.
 	//
-	// *** THE BED IS CURRENTLY DISABLED AND THIS CALL IS STILL HERE ON PURPOSE. *** The owner asked
-	// for both music beds off "until further notice", so UTraceAudioSettings::bMusicBedsEnabled is
-	// False in Config/DefaultGame.ini and Play() starts nothing (Audio/TraceMusicPlayer.h). Leaving
-	// the unconditional call in place is what makes turning it back on a one-line config edit — and
-	// the "no-op when already playing" contract above is what makes that safe in both states.
+	// *** THE BEDS ARE ON (bMusicBedsEnabled=True, since 2026-10-05). *** From 2026-09-04 they were
+	// off at the owner's request (3f97019) and this Play() started nothing; the call stayed here,
+	// unconditional, which is why turning them back on was a one-line config edit. The "no-op when
+	// already playing" contract above is what makes it safe in both states.
 	if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(this))
 	{
 		Music->Play(TraceSoundEvents::MusicTitle);

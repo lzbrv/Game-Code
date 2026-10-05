@@ -1204,12 +1204,11 @@ void ATraceHUD::BeginPlay()
 	// Menu -> match is therefore a CROSS-FADE, not a cut: MusicTitle is still playing when this
 	// runs, and Play() fades one into the other over its default 0.8 s.
 	//
-	// *** ALL OF THAT IS THE BEHAVIOUR WITH THE BEDS ON, AND THEY ARE CURRENTLY OFF. *** The owner
-	// asked for both beds to stop "until further notice", so UTraceAudioSettings::bMusicBedsEnabled
-	// is False and this Play() starts nothing (Audio/TraceMusicPlayer.h). The line is deliberately
-	// LEFT HERE AND LEFT UNCONDITIONAL: flipping that one config line — or typing
-	// `Trace.Music.Beds 1` — restores everything the paragraphs above describe, with no code change
-	// and nothing to remember to put back.
+	// *** ALL OF THAT IS THE BEHAVIOUR WITH THE BEDS ON, WHICH THEY ARE (since 2026-10-05). *** From
+	// 2026-09-04 the owner had both beds off (3f97019, UTraceAudioSettings::bMusicBedsEnabled=False)
+	// and this Play() started nothing. The line stayed here, unconditional, so flipping that one
+	// config line back to True restored everything the paragraphs above describe with no code
+	// change. `Trace.Music.Beds 0`, or the flag at False, silences it again.
 	if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(this))
 	{
 		Music->Play(TraceSoundEvents::AmbienceMatch);
@@ -7326,7 +7325,8 @@ void ATraceHUD::DrawMatchResult()
 	// track, so the bool is belt-and-braces rather than the only guard — but it also keeps this out
 	// of the subsystem entirely on the other ~800 frames of the results screen.
 	//
-	// WITH THE BEDS DISABLED (the current state — see the block at the AmbienceMatch call site) this
+	// WITH THE BEDS DISABLED (not the shipped state since 2026-10-05, but one flag or
+	// `Trace.Music.Beds 0` away — see the block at the AmbienceMatch call site) this
 	// whole sequence degrades cleanly rather than half-running: the Stop(0.5f) above finds nothing
 	// playing and returns, the stinger is untouched because it does not go through this subsystem,
 	// and this Play() starts nothing. There is no fade left hanging against silence, because there

@@ -50,13 +50,14 @@ UTraceMusicSubsystem* UTraceMusicSubsystem::Get(const UObject* WorldContext)
 namespace TraceMusicFile
 {
 	// =============================================================================================
-	// *** THE BEDS ARE OFF UNTIL FURTHER NOTICE, AND THIS IS THE SWITCH. ***
+	// *** THE BEDS' ON/OFF SWITCH. *** Off 2026-09-04 (3f97019, the owner's "until further notice"),
+	// back on 2026-10-05 at the owner's request — bMusicBedsEnabled=True in the ini and the header.
 	// =============================================================================================
 	//
-	// Two ways to turn them back on, both live at once and either is enough:
+	// Two ways to throw it, both live at once:
 	//
-	//     Config/DefaultGame.ini   [/Script/Trace.TraceAudioSettings]  bMusicBedsEnabled=True
-	//     console                  Trace.Music.Beds 1
+	//     Config/DefaultGame.ini   [/Script/Trace.TraceAudioSettings]  bMusicBedsEnabled=True|False
+	//     console                  Trace.Music.Beds 1|0
 	//
 	// THE CVAR IS A THREE-STATE OVERRIDE, NOT A SECOND COPY OF THE SETTING, and that distinction is
 	// the whole reason it is an int and not a bool:
@@ -170,7 +171,7 @@ void UTraceMusicSubsystem::Play(FName Track, float FadeSeconds)
 		return;
 	}
 
-	// ---- THE BEDS ARE OFF (TraceMusicFile::BedsEnabled, above) ----------------------------------
+	// ---- WHEN THE BEDS ARE SWITCHED OFF (TraceMusicFile::BedsEnabled, above) --------------------
 	//
 	// FIRST, BEFORE ANY STATE IS TOUCHED, so a refused Play cannot leave this subsystem believing a
 	// bed is playing: CurrentTrack, Active and Fading are all still whatever they were, and the

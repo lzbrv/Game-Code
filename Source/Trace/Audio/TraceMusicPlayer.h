@@ -33,15 +33,15 @@
 // ONCE per name and plays nothing; no audio device, a dedicated server and a null world are all
 // quiet no-ops. Nothing here can crash a match and nothing here can fill a log.
 //
-// *** BOTH BEDS ARE CURRENTLY DISABLED, AND EVERYTHING BELOW STILL DESCRIBES THE WIRING. ***
-// The owner asked for MusicTitle and AmbienceMatch to stop playing "until further notice", so
-// UTraceAudioSettings::bMusicBedsEnabled is False in Config/DefaultGame.ini and Play() returns
-// early. NOTHING WAS UNWIRED: the three call sites below still run, still in this order, and the
-// cross-fade behaviour described below is what comes back the moment that flag is True (or
-// `Trace.Music.Beds 1` is typed). Read the rest of this block as "what this does when the beds are
-// on", because that is the state it is one config line away from.
+// *** BOTH BEDS ARE ON. *** They were switched off from 2026-09-04 (3f97019, the owner's request:
+// UTraceAudioSettings::bMusicBedsEnabled=False, so Play() returned early) and back on 2026-10-05,
+// again at the owner's request, by setting that flag to True in Config/DefaultGame.ini and in the
+// header default. Nothing was unwired while they were off, so the three call sites below and the
+// cross-fades they describe are exactly what came back. `Trace.Music.Beds 0` (or the flag at False)
+// silences both again; see AreBedsEnabled().
 //
-// The stingers are NOT beds and are unaffected — they never went through this subsystem.
+// The stingers are NOT beds and the switch never affected them — they never went through this
+// subsystem.
 //
 // WIRED, AND HERE IS WHERE (this block said "NO CALL SITES YET, by design" while the subsystem
 // waited a wave for them; that is no longer true and a stale justification is how this project has
@@ -102,9 +102,10 @@ public:
 	 * /Game/Trace/Audio/S_<Track>). A NO-OP when @p Track is already the playing track. The
 	 * outgoing track fades to silence over the same @p FadeSeconds the incoming one rises.
 	 *
-	 * *** WHILE THE BEDS ARE DISABLED (UTraceAudioSettings::bMusicBedsEnabled, currently False) THIS
-	 * *** STARTS NOTHING. *** It stops whatever is playing over @p FadeSeconds and clears
-	 * GetCurrentTrack() to NAME_None, so the subsystem never believes a bed is playing when none is.
+	 * *** WHILE THE BEDS ARE DISABLED (UTraceAudioSettings::bMusicBedsEnabled False, or
+	 * *** `Trace.Music.Beds 0`) THIS STARTS NOTHING. *** It stops whatever is playing over
+	 * @p FadeSeconds and clears GetCurrentTrack() to NAME_None, so the subsystem never believes a
+	 * bed is playing when none is.
 	 * Callers do not need to know: the contract "call it unconditionally, it does the right thing"
 	 * is exactly what makes one flag able to turn the beds off without touching a call site.
 	 */
