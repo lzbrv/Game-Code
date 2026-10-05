@@ -45,11 +45,25 @@ been written by this script and the collision check is what guarantees it -- see
 Demo 29 item 9, where "the kill sound changed" turned out to be a NEW event
 playing over the top rather than Kill.wav being touched.
 
+OWNER-SUPPLIED (2026-10-04): seven of the 43 stems this script has a recipe for
+-- MeleeBackstab, MeleeHit, MeleeSwing, Reload, Respawn, WeaponSwitch and
+MusicTitle -- now ship the owner's own recordings, not these renders.  They are
+listed in OWNER_SUPPLIED_STEMS below and this script will not write them:
+  * a full run SKIPS each one with a line saying so, and renders the other 36;
+  * `--only <owner stem>` REFUSES, writes nothing, and says how to override;
+  * `--verify` reports each one as OWNER-SUPPLIED -- measured and printed, but not
+    compared against the recipe and not counted as a failure.
+To put a synthesized render back over an owner file ON PURPOSE, name it with
+--only and add --overwrite-owner-supplied, then take it out of
+OWNER_SUPPLIED_STEMS so --verify checks it again.  The flag only reaches stems
+named with --only; a full run never overwrites an owner file.
+
 Usage:
-  python3 Scripts/generate_sounds.py            # render all 43 WAVs
+  python3 Scripts/generate_sounds.py            # render the 36 generator-owned WAVs
   python3 Scripts/generate_sounds.py --only LilyZip
   python3 Scripts/generate_sounds.py --verify   # byte-identity + analysis table
-  python3 Scripts/generate_sounds.py --verify --only MusicTitle
+  python3 Scripts/generate_sounds.py --verify --only AmbienceMatch
+  python3 Scripts/generate_sounds.py --only Reload --overwrite-owner-supplied
 """
 
 import argparse
@@ -75,6 +89,17 @@ EXISTING_STEMS = frozenset([
     "PistolShoot3", "PistolShoot4", "RoccoRipple", "SmgShoot1", "WallJump",
     "Step1", "Step2", "Step3", "Step4", "Step5", "Step6", "Step7", "Step8",
     "Step9", "Step10", "Step11",
+])
+
+# Stems this script HAS a recipe for (they are in SPEC below) whose WAV on disk is
+# now the owner's own file, delivered 2026-10-04 in "Sounds folder.zip".  Never
+# rendered over, never verified against the recipe -- see the module docstring.
+# Distinct from EXISTING_STEMS on purpose: those were never ours to render, these
+# were and no longer are.  (Scripts/generate_sound_page.py reads EXISTING_STEMS by
+# name to tell ORIGINAL rows from NEW ones; this list does not change that.)
+OWNER_SUPPLIED_STEMS = frozenset([
+    "MeleeBackstab", "MeleeHit", "MeleeSwing", "Reload", "Respawn",
+    "WeaponSwitch", "MusicTitle",
 ])
 
 
@@ -1511,9 +1536,18 @@ def main():
     ap.add_argument("--verify", action="store_true",
                     help="re-render in memory, assert byte-identity with the "
                          "files on disk, print the analysis table")
+    ap.add_argument("--overwrite-owner-supplied", action="store_true",
+                    help="let --only render OVER a stem in OWNER_SUPPLIED_STEMS (the "
+                         "owner's own WAV). Reaches only stems named with --only.")
     args = ap.parse_args()
 
     random.seed(PROJECT_SEED)  # SS5.2 project seed; per-stem streams derive from it
+
+    # A misspelt owner stem would protect nothing and say nothing, so it is fatal.
+    stray = OWNER_SUPPLIED_STEMS - set(e[0] for e in SPEC)
+    if stray:
+        sys.exit("FATAL: OWNER_SUPPLIED_STEMS names stem(s) with no recipe in SPEC: %s"
+                 % ", ".join(sorted(stray)))
 
     selected = SPEC
     if args.only:
@@ -1529,12 +1563,29 @@ def main():
 
     failures = 0
     if args.verify:
-        print("verify: re-rendering %d stem(s), checking byte-identity + specs" % len(selected))
+        owned = [e for e in selected if e[0] in OWNER_SUPPLIED_STEMS]
+        print("verify: re-rendering %d stem(s), checking byte-identity + specs; "
+              "%d owner-supplied stem(s) are measured only" % (len(selected) - len(owned), len(owned)))
         for entry in selected:
             path = target_path(entry)
             if not os.path.exists(path):
                 print("  %-17s MISSING %s" % (entry[0], path))
                 failures += 1
+                continue
+            if entry[0] in OWNER_SUPPLIED_STEMS:
+                # The owner's file: nothing to re-render it against and no recipe it has
+                # to meet. Measured and printed so the table still shows what ships; the
+                # recipe differences are information, never failures.
+                rate, width, chans = read_wav(path)
+                row, diffs = analyze(entry, chans)
+                print("  %-17s %-9s %dch %7.2fs  peak %7.2f dBFS  rms %7.2f dBFS  dc %.4f  %s"
+                      "OWNER-SUPPLIED (%d Hz %d-bit; not re-rendered, not checked)"
+                      % (row["stem"], row["folder"], row["ch"], row["dur"], row["peak"],
+                         row["rms"], row["dc"],
+                         ("seam " + row["seam"] + "  ") if row["seam"] else "",
+                         rate, width * 8))
+                for d in diffs:
+                    print("      info (vs the old recipe, not a failure): %s" % d)
                 continue
             data = wav_bytes(render_stem(entry), entry[0])
             with open(path, "rb") as f:
@@ -1552,8 +1603,37 @@ def main():
             for f2 in fails:
                 print("      FAIL: %s" % f2)
                 failures += 1
-        print("verify: %d stem(s), %d failure(s)" % (len(selected), failures))
+        print("verify: %d stem(s), %d failure(s), %d OWNER-SUPPLIED (reported, not checked)"
+              % (len(selected), failures, len(owned)))
         sys.exit(1 if failures else 0)
+
+    # ---- OWNER-SUPPLIED stems are never rendered over unless asked by name -------------
+    owned = [e for e in selected if e[0] in OWNER_SUPPLIED_STEMS]
+    if owned and args.only and not args.overwrite_owner_supplied:
+        # Refuse the whole command, not just the owned stems: a mixed --only that half
+        # ran would leave the caller guessing which files changed.
+        lines = ["REFUSED - nothing was written."]
+        for e in owned:
+            lines.append("  %s is OWNER-SUPPLIED: %s is the owner's own file, not this script's "
+                         "render, and rendering it would overwrite it."
+                         % (e[0], os.path.relpath(target_path(e), ROOT)))
+        lines.append("  To replace it with the synthesized recipe ON PURPOSE, re-run the same command "
+                     "with --overwrite-owner-supplied, then remove the stem from OWNER_SUPPLIED_STEMS "
+                     "in Scripts/generate_sounds.py so --verify checks the render again.")
+        sys.exit("\n".join(lines))
+    if owned and args.only:
+        for e in owned:
+            print("  %-17s --overwrite-owner-supplied: rendering OVER the owner's file %s"
+                  % (e[0], os.path.relpath(target_path(e), ROOT)))
+    elif owned:
+        for e in owned:
+            print("  %-17s SKIPPED - OWNER-SUPPLIED: %s is the owner's own file; not rendered "
+                  "(OWNER_SUPPLIED_STEMS)" % (e[0], os.path.relpath(target_path(e), ROOT)))
+        if args.overwrite_owner_supplied:
+            print("  (--overwrite-owner-supplied reaches only stems named with --only; a full run "
+                  "never renders over an owner file)")
+        selected = [e for e in selected if e[0] not in OWNER_SUPPLIED_STEMS]
+    skipped = len(owned) if (owned and not args.only) else 0
 
     print("rendering %d stem(s) into %s" % (len(selected), SOUND_DIR))
     for entry in selected:
@@ -1571,7 +1651,8 @@ def main():
     if failures:
         print("%d spec failure(s)" % failures)
         sys.exit(1)
-    print("done: %d files" % len(selected))
+    print("done: %d files%s" % (len(selected),
+          (", %d OWNER-SUPPLIED skipped" % skipped) if skipped else ""))
 
 
 if __name__ == "__main__":
