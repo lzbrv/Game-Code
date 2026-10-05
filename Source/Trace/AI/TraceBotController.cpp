@@ -5581,12 +5581,15 @@ void ATraceBotController::UpdateMovementTech(float DeltaSeconds)
 	// reads as a twitch; sliding down the field with the Core reads as intent, which is the whole
 	// reason to give a bot the verb.
 	//
-	// FLOORED AT THE MOVEMENT COMPONENT'S OWN ENTRY SPEED (CanStartSlide: SlideEntrySpeedFraction x
-	// WalkSpeed), derived rather than trusted to the knob. BotSlideMinSpeed (480) sat above that floor
-	// at the 800 walk (440) and fell below it when the walk went to 900 (495), so a bot slowing through
-	// 480-495 would press for a slide the rules refuse and spend its slide cooldown on nothing.
-	const float SlideEntryFloor =
-		FMath::Max(1.f, Settings.WalkSpeed) * FMath::Max(0.f, Settings.SlideEntrySpeedFraction);
+	// FLOORED AT THE MOVEMENT COMPONENT'S OWN ENTRY SPEED, asked of the component rather than trusted
+	// to the knob: GetSlideMinEntrySpeed() is the number CanStartSlide() refuses below
+	// (SlideEntrySpeedFraction x WalkSpeed, 495 at the 900 walk). BotSlideMinSpeed (480) sat above that
+	// floor at the 800 walk (440) and fell below it when the walk went to 900, so a bot slowing through
+	// 480-495 would press for a slide the rules refuse and spend its slide cooldown on nothing. Reading
+	// it here instead of re-typing the formula means the next change to the rule carries the bots too.
+	// A movement component that is not ours has no such floor; the knob alone decides, as it used to.
+	const UTraceCharacterMovementComponent* SlideRules = Cast<UTraceCharacterMovementComponent>(Movement);
+	const float SlideEntryFloor = (SlideRules != nullptr) ? SlideRules->GetSlideMinEntrySpeed() : 0.f;
 	const float BotSlideStartSpeed = FMath::Max3(50.f, Settings.BotSlideMinSpeed, SlideEntryFloor);
 	if (!bCrouchHeld && Now >= SlideReadyTime && PlanarSpeed > BotSlideStartSpeed)
 	{
@@ -7952,7 +7955,7 @@ namespace TraceBotLockoutTest
 	 * Radius of the ring the fixture's bots start on, in uu.
 	 *
 	 * 1200 is deliberately outside ATraceBotController::GetLockoutKeepOutRadius() (480) and inside
-	 * what a bot covers in the 5 s window (~4000 at walk speed), so both arms start at 0% stand-on
+	 * what a bot covers in the 5 s window (~4500 at the 900 walk), so both arms start at 0% stand-on
 	 * and both are physically able to reach the ball. Anything below the keep-out radius would hand
 	 * the shipped arm a stand-on score for bots that merely have not finished walking out yet.
 	 */
@@ -8398,17 +8401,21 @@ namespace TraceBotLockoutTest
 			State->Check(Red.LockedOut.Samples > 0 && Green.LockedOut.Samples > 0,
 				TEXT("both arms had living bots of the LOCKED-OUT side on the field to observe"));
 
-			// *** AND THE ONE THAT MAKES THE ZEROES MEAN ANYTHING. *** A 5 s window and a walk speed
-			// of ~800 uu/s buys a bot about 4000 uu. If the nearest locked-out bot started further
-			// away than that, "it never stood on the Core" is a fact about the arena, not about the
-			// behaviour — which is exactly the false green the first run of this harness produced
-			// (nearest bot 7937 uu, both arms 0.0%).
-			const float ReachableUU = 4000.f;
+			// *** AND THE ONE THAT MAKES THE ZEROES MEAN ANYTHING. *** The lockout window times the walk
+			// speed is how far a bot can get in it (5 s x 900 uu/s = 4500 uu at the shipped numbers). If
+			// the nearest locked-out bot started further away than that, "it never stood on the Core" is
+			// a fact about the arena, not about the behaviour — which is exactly the false green the
+			// first run of this harness produced (nearest bot 7937 uu, both arms 0.0%). DERIVED from
+			// both live numbers, not typed: it was a literal 4000 (5 s x the old 800 walk), which the
+			// walk going to 900 left behind.
+			const float LockoutWindowSeconds = ATraceCore::GetTurnoverLockoutSeconds();
+			const float WalkUUPerSecond = FMath::Max(1.f, UTraceSettings::Get().WalkSpeed);
+			const float ReachableUU = LockoutWindowSeconds * WalkUUPerSecond;
 			State->Check(State->NearestLockedAtStage >= 0.f && State->NearestLockedAtStage < ReachableUU,
 				FString::Printf(TEXT("a locked-out bot was actually within reach of the staged Core "
-					"(%.0f uu, and a bot covers about %.0f uu in the %.1fs window) — otherwise every "
-					"number below is about the geometry, not about the bots"),
-					State->NearestLockedAtStage, ReachableUU, ATraceCore::GetTurnoverLockoutSeconds()));
+					"(%.0f uu, and a bot covers about %.0f uu in the %.1fs window at the %.0f uu/s walk) — "
+					"otherwise every number below is about the geometry, not about the bots"),
+					State->NearestLockedAtStage, ReachableUU, LockoutWindowSeconds, WalkUUPerSecond));
 			State->Check(State->NearestLockedAtStage > ATraceBotController::GetLockoutKeepOutRadius(),
 				FString::Printf(TEXT("both arms started with every bot OUTSIDE the keep-out radius "
 					"(ring %.0f uu vs keep-out %.0f uu), so a stand-on score has to be earned by walking "

@@ -1770,6 +1770,16 @@ public:
 	 */
 	float GetSlideDurationForAudit() const { return GetSlideDuration(); }
 
+	/**
+	 * The slowest planar speed a slide may START at, uu/s: WalkSpeed x SlideEntrySpeedFraction
+	 * (495 at the 900 walk). CanStartSlide() refuses below it and reads it from here.
+	 *
+	 * Published for the same reason as GetSlideDurationForAudit(): the bots must not start a slide
+	 * the rules refuse, and a copy of this formula in the bot controller is a copy that can drift.
+	 * A pure config read, meaningful before any slide.
+	 */
+	float GetSlideMinEntrySpeed() const;
+
 	/** The well-timed multiplier actually in force, both readings of spec v9 §7 resolved. */
 	float GetSlideJumpWindowSpeedBonusForAudit() const { return GetSlideJumpWindowSpeedBonus(); }
 

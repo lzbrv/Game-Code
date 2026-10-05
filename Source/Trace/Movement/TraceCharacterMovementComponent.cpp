@@ -3784,10 +3784,13 @@ bool UTraceCharacterMovementComponent::CanStartSlide() const
 	// hand out free speed, or "tap crouch" becomes the fastest way to cross the field. This matters
 	// more now than it did: with SlideEntrySpeedMultiplier at 1.0 the slide has nothing of its own
 	// to give, so entering one slowly would be strictly worse than running.
-	const UTraceSettings& Settings = UTraceSettings::Get();
-	const float EntrySpeed = FMath::Max(1.f, Settings.WalkSpeed) * FMath::Max(0.f, Settings.SlideEntrySpeedFraction);
+	return FVector(Velocity.X, Velocity.Y, 0.f).SizeSquared() >= FMath::Square(GetSlideMinEntrySpeed());
+}
 
-	return FVector(Velocity.X, Velocity.Y, 0.f).SizeSquared() >= FMath::Square(EntrySpeed);
+float UTraceCharacterMovementComponent::GetSlideMinEntrySpeed() const
+{
+	const UTraceSettings& Settings = UTraceSettings::Get();
+	return FMath::Max(1.f, Settings.WalkSpeed) * FMath::Max(0.f, Settings.SlideEntrySpeedFraction);
 }
 
 void UTraceCharacterMovementComponent::BeginSlide()
