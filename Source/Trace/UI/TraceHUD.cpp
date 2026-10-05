@@ -10117,7 +10117,7 @@ namespace TraceFxHudShots
 			const FString Expected = FString::Printf(TEXT("SLOWED  -%.0f%% SPEED"),
 				100.f * UTraceSettings::Get().SlimewallSlowFraction);
 			Expect(*Run, Rec.ChipText.Contains(Expected),
-				FString::Printf(TEXT("7.3: the SLOWED chip drew from the SLIMEWALL's own component with no "
+				FString::Printf(TEXT("7.3: the SLOWED chip drew from SLUDGE's own component with no "
 					"poison in play — it was poison-ONLY before this pass (expected '%s')"), *Expected));
 			Expect(*Run, !Rec.ChipText.Contains(TEXT("POISONED")),
 				TEXT("7.3: ...and there really was no poison on that frame, so the chip cannot have come "

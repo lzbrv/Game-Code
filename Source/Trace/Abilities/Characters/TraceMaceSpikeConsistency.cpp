@@ -1327,7 +1327,7 @@ namespace TraceMaceSpikeConsistency
 			// real arena, so whatever is between the two is between the two, and §6's "bouncing off a
 			// wall cancels it" will legitimately stop her short. What this pair of processes exists to
 			// answer is whether a press made on a CLIENT ever becomes a pull on the SERVER; 200 uu of
-			// travel under a 1375 uu/s pull cannot happen by accident and settles that outright.
+			// travel under a 2970 uu/s pull cannot happen by accident and settles that outright.
 			// Judging on distance instead made this report FAIL on a run where the press had plainly
 			// arrived and she had moved 584 uu.
 			else if (State->bPullSeen && (State->StartDistance - State->ClosestDistance) > 200.f)

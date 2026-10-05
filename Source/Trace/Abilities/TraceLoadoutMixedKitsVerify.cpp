@@ -611,13 +611,13 @@ namespace TraceLoadoutMixedKitsVerify
 			Slime->DebugSetStuck(true);
 			const float Taken = BodyShotTaken(Pawn, BaseShot);
 			Check(Run, FMath::IsNearlyEqual(Taken, BaseShot),
-				FString::Printf(TEXT("*** SLIMEWALL + STICKY GLOVES without VISTECH PADDING, stuck: the shot stays %.0f (got %.1f) ***"),
+				FString::Printf(TEXT("*** SLUDGE + STICKY GLOVES without VISTECH PADDING, stuck: the shot stays %.0f (got %.1f) ***"),
 					BaseShot, Taken));
 			Slime->DebugSetStuck(false);
 		}
 		else
 		{
-			Check(Run, false, TEXT("SLIMEWALL case: no Slimeball kit was built for STICKY GLOVES"));
+			Check(Run, false, TEXT("SLUDGE case: no Slimeball kit was built for STICKY GLOVES"));
 		}
 
 		// ---- TRAITS: Lily's movement abilities, Mortimer's passive ---------------------------------
@@ -835,7 +835,7 @@ namespace TraceLoadoutMixedKitsVerify
 			Pawn->LaunchCharacter(FVector(0.f, 0.f, 1600.f), true, true);
 			if (UTraceCharacterAbilitySet* MaceKit = Abilities->GetAbilitySetForSlot(ETraceLoadoutSlot::Movement))
 			{
-				UE_LOG(LogTraceGame, Display, TEXT("[MixedKits] SUSPEND pressed=%d"),
+				UE_LOG(LogTraceGame, Display, TEXT("[MixedKits] WIRERIGS (suspend) pressed=%d"),
 					static_cast<int32>(MaceKit->OnSecondaryPressed()));
 			}
 			NextDelay = 0.2f;
@@ -850,7 +850,7 @@ namespace TraceLoadoutMixedKitsVerify
 			Check(*Run, Record.ChipText.Contains(TEXT("SPEED BOOST")),
 				TEXT("*** HUD: BLASTERS under Chut's E draws the SPEED BOOST chip ***"));
 			Check(*Run, Record.ChipText.Contains(TEXT("SUSPENDED")),
-				TEXT("*** HUD: SUSPEND under Chut's E draws the SUSPENDED chip ***"));
+				TEXT("*** HUD: WIRERIGS under Chut's E draws the SUSPENDED chip ***"));
 			NextDelay = 0.2f;
 			break;
 		}
@@ -898,7 +898,7 @@ namespace TraceLoadoutMixedKitsVerify
 			Abilities->NotifyDashEnded(/*bReachedFullDistance=*/true);
 			if (!Controller->DebugPressJump())
 			{
-				Check(*Run, false, TEXT("DASH CLOAK scene: the jump press reached the pawn (input not suppressed)"));
+				Check(*Run, false, TEXT("VISISPURS scene: the jump press reached the pawn (input not suppressed)"));
 			}
 			NextDelay = 0.2f;
 			break;
@@ -907,9 +907,9 @@ namespace TraceLoadoutMixedKitsVerify
 		{
 			const ATraceHUD::FFxHudDrawRecord Record = Shot(*HudPtr, TEXT("dashcloak_jetboots_ripple"));
 			Check(*Run, Record.ChipText.Contains(TEXT("CLOAKED")),
-				TEXT("*** HUD: Oyster's DASH CLOAK draws the CLOAKED chip ***"));
+				TEXT("*** HUD: Oyster's VISISPURS draws the CLOAKED chip ***"));
 			Check(*Run, Record.Vignettes.Contains(TEXT("CLOAK")),
-				TEXT("*** HUD: Oyster's DASH CLOAK draws the owner's cloak band ***"));
+				TEXT("*** HUD: Oyster's VISISPURS draws the owner's cloak band ***"));
 			NextDelay = 0.3f;   // let the photograph land before the loadout is put back
 			break;
 		}

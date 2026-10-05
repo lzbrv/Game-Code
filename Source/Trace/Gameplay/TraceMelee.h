@@ -86,7 +86,7 @@
 //
 //   * WHAT THE PLAYER FEELS. You do not have to have the crosshair on a body. Anything inside the
 //     arc, at knife range, in line of sight, is cut — which is what a slash is, and it is what makes
-//     the knife usable while sprinting past somebody at 976 uu/s.
+//     the knife usable while sprinting past somebody at 1098 uu/s.
 //
 //   THE LETHAL ARC IS STILL 140 DEGREES AFTER SPEC v12 §2 MADE THE ANIMATION A STAB, and that is a
 //   decision. §2 asked for the ANIMATION to change ("Can you make the knife animation a stab instead
@@ -527,7 +527,7 @@ public:
 	 *
 	 * 500, NOT 700, AND THE DIFFERENCE IS A BOT-DPS REGRESSION. A bot holding the knife cannot
 	 * shoot, so this range is exactly how far a bot voluntarily disarms itself for. The blade
-	 * reaches 180 uu; at the knife's 976 uu/s, 500 uu is 0.51 s of closing, which reads as a
+	 * reaches 180 uu; at the knife's 1098 uu/s (900 x 1.22), 500 uu is 0.46 s of closing, which reads as a
 	 * commitment to a finisher. The first measured pass used 700 and produced bots that spent most
 	 * of an engagement unarmed inside comfortable gun range. If bot lethality moves this pass, this
 	 * is the first number to look at.

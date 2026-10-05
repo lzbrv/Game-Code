@@ -755,7 +755,7 @@ namespace TraceIntegrationWalkFile
 	 * The first attempt gets its horizontal term from the walk's own 2.6 s W step, which has long
 	 * since ended by the time a retry starts, so a retry has to make its own — the owner's note is
 	 * "I still want the core to carry the player's velocity", and a standing throw would prove only
-	 * half of it. 0.45 s is past the acceleration ramp at 976 uu/s of walk speed. And if the pawn is
+	 * half of it. 0.45 s is past the acceleration ramp at a carrier's 1098 uu/s. And if the pawn is
 	 * standing against the wall it just hit, W does nothing and the retry becomes a clean vertical
 	 * jump — which is the most deterministic case there is, because a vertical jump lands exactly
 	 * where it took off and the ballistic solve is then exact rather than optimistic.

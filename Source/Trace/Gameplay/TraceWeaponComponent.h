@@ -959,7 +959,7 @@ private:
 	/**
 	 * The selector. Replicated to EVERYONE, not just the owner, and that is load-bearing three ways:
 	 * the movement component multiplies the ground speed limit by it on every machine (so the client
-	 * predicts its own 976 uu/s instead of being corrected into it), other players see the knife in
+	 * predicts its own 1098 uu/s instead of being corrected into it), other players see the knife in
 	 * the hand, and the server gates ServerFire/ServerSwing on the same value the client gated on.
 	 */
 	UPROPERTY(ReplicatedUsing = OnRep_EquippedWeapon)

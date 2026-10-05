@@ -59,9 +59,10 @@
 // UTraceCharacterMovementComponent::HandleImpact already implements DEMO 29 item 4(b): a pawn that is
 // ON ITS FEET and leans into a surf plane with at least GetSurfGroundEntryMinApproachSpeed() of
 // into-the-face speed LEAVES THE GROUND and has its velocity clipped against that plane — the same
-// two operations PhysFalling performs on a surfer. At the shipped 800 uu/s ground limit that
-// threshold is 160 uu/s, which a running pawn reaches at 11.5 degrees off parallel. It was measured
-// on the surf rails at five approach angles: 5 of 5 gained speed, 800 -> 1001..1089 uu/s.
+// two operations PhysFalling performs on a surfer. At the shipped 900 uu/s ground limit that
+// threshold is 180 uu/s (160 at the old 800), which a running pawn reaches at 11.5 degrees off
+// parallel either way. It was measured on the surf rails at the 800 walk, at five approach angles:
+// 5 of 5 gained speed, 800 -> 1001..1089 uu/s.
 //
 // So the requirement this profile has to meet is not "leave a walkable strip", it is:
 //

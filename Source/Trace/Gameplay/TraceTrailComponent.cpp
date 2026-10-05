@@ -886,8 +886,8 @@ namespace
 	 * is affordable, so it is worth being explicit about the arithmetic:
 	 *
 	 *   trace length  = TrailLifetime x speed, capped by MaxTrailPoints x TrailPointSpacing
-	 *                 = 2.0s x 800uu/s = 1600uu at a walk, ~3200uu through a sustained dash
-	 *   ghosts        = length / GhostSpacing = 1600/220 = 8 at a walk, ~15 dashing
+	 *                 = 2.0s x 900uu/s = 1800uu at a walk, ~3200uu through a sustained dash
+	 *   ghosts        = length / GhostSpacing = 1800/220 = 8 at a walk, ~15 dashing
 	 *
 	 * 20 covers the dashing case with headroom. Beyond it the OLDEST ghosts are released — never the
 	 * newest, which are the ones an approaching enemy is judging — and the smear still covers the tail,

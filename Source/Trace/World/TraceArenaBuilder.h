@@ -43,8 +43,8 @@ class UStaticMeshComponent;
  * WHAT IT MAKES  (spec v3 section 7 - rebuilt from the collaborator's overhead sketch,
  *                 lengthened to 3.5 : 1 for spec v4 section 3)
  * -------------
- * A 38400 x 9600 uu Tron arena - 33600 of it goal to goal, plus a 2400 uu HOCKEY POCKET behind each
- * goal (spec v28 §8). Inside it:
+ * A 42240 x 10560 uu Tron arena (World/TraceArenaDimensions.h; x1.10 on 2026-10-04) - 37440 of it
+ * goal to goal, plus a 2400 uu HOCKEY POCKET behind each goal (spec v28 §8). Inside it:
  *
  *  - a near-black glossy floor carrying a team-tinted neon grid, and four 2600 uu perimeter walls
  *    with lit trim, a kick rail and vertical ribs;

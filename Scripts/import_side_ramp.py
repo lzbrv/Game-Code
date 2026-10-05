@@ -465,7 +465,8 @@ def place(design):
     subsys = actor_subsystem()
 
     # HalfWidth off the arena builder in the level, not typed: the whole layout
-    # derives from FieldWidth and a hand-typed 4800 would be a second copy of it.
+    # derives from FieldWidth and a hand-typed 5280 (4800 before the 2026-10-04
+    # x1.10) would be a second copy of it.
     half_width = None
     for actor in subsys.get_all_level_actors():
         if actor and actor.get_class().get_name() == "TraceArenaBuilder":
@@ -511,7 +512,8 @@ def place(design):
     # THE OBJ IS NOT IMPORTED IN THE FRAME IT WAS WRITTEN IN. The generator writes
     # the toe at y = 0 and the crest at y = +kDepthUU, because OBJ is right-handed;
     # Unreal is left-handed and its OBJ translator negates Y, so MEASURED off the
-    # built asset the crest lands at local y = -760 and the toe stays at y = 0:
+    # built asset the crest lands at local y = -760 and the toe stays at y = 0
+    # (measured on the first, 38400-long import; X is +-kLengthUU/2 today):
     #
     #     SM_SideRampConcave bounding box  min (-19200, -760, 0)  max (19200, 0, 660)
     #

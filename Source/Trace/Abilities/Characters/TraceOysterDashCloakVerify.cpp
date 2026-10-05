@@ -447,10 +447,10 @@ namespace TraceOysterDashCloakVerify
 
 		if (IsHoldArm(Run, Arm))
 		{
-			// Two faults that hid the cloak even when it fired: a PICKLE JAR dropped by a dash the player
+			// Two faults that hid the cloak even when it fired: a RILLA CANS jar dropped by a dash the player
 			// never picked the jar trail for, and the jar-count publish that cleared the cloak's bit.
 			Check(Run, Run.JarsAtPress == 0,
-				FString::Printf(TEXT("*** %s: DASH CLOAK without PICKLE JAR — the dash left no poison jar (%d live) ***"),
+				FString::Printf(TEXT("*** %s: VISISPURS without RILLA CANS — the dash left no poison jar (%d live) ***"),
 					Label, Run.JarsAtPress));
 			Check(Run, Run.bSawCloak && Run.bHeldSampled && Run.bCloakHeld,
 				FString::Printf(TEXT("*** %s: the cloak is STILL up %.2f s after it appeared ***"), Label, HeldAfterSeconds()));
@@ -849,7 +849,7 @@ namespace TraceOysterDashCloakVerify
 
 	FAutoConsoleCommand CmdVerify(
 		VerifyCommandName,
-		TEXT("Dev only, standalone or listen host. Oyster's DASH CLOAK hears every jump that follows a dash: a plain ")
+		TEXT("Dev only, standalone or listen host. Oyster's VISISPURS (the dash cloak) hears every jump that follows a dash: a plain ")
 		TEXT("ground jump, a ground jump with JET BOOTS equipped, JET BOOTS' own second jump out of an air dash, and a ")
 		TEXT("jump the server only sees as movement (a remote client's). Plus: no re-arm inside the window, no cloak ")
 		TEXT("without a dash, no cloak after the window."),
@@ -905,7 +905,7 @@ namespace TraceOysterDashCloakVerify
 
 	FAutoConsoleCommand CmdStageRemote(
 		TEXT("Trace.Oyster.DashCloakStageRemote"),
-		TEXT("Dev only, listen server. For two minutes, gives every REMOTE player JET BOOTS / DASH CLOAK / RIPPLE and ")
+		TEXT("Dev only, listen server. For two minutes, gives every REMOTE player JET BOOTS / VISISPURS / RIPPLE and ")
 		TEXT("closes their select screen, for Trace.Oyster.DashCloakClientProbe to run on the client."),
 		FConsoleCommandDelegate::CreateStatic(&StageRemote));
 

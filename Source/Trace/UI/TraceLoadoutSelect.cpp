@@ -2541,11 +2541,6 @@ namespace TraceLoadoutScreenVerify
 			}
 		}
 
-		// ---- THE NAMES ARE THE ORIGINALS, AND NOTHING INVENTS ONE ------------------------------
-		//
-		// The reverted state, asserted rather than eyeballed: exactly the ten roster ActivatedNames
-		// exist, and movement and passive have no name at all. An earlier pass invented thirty and
-		// renamed three real ones, which is the regression this guards.
 		// ---- EVERY ABILITY HAS SOMETHING TO DRAW, AND THE ACTIVATED ONES KEEP THE ROSTER'S NAMES ----
 		//
 		// Rewritten for Demo 35. The old version walked ten kits and asserted that movement and

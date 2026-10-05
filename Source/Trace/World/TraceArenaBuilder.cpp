@@ -986,11 +986,12 @@ namespace TraceArenaConstants
 	// surface, every 2520 uu, on both walls. That is what the owner is hitting.
 	//
 	// So the row IS the ride now. The continuous curved run against each side wall — the owner's own
-	// parabola, cut to the surf rails' band by TraceSideRampProfile.h and swept 38400 uu — replaces
-	// all 26 of them: same wall, same Z = 0 start, same "flush with the wall", 1096 uu tall instead of
-	// 1050/1600, and rideable end to end instead of every other bay. The wall keeps its rhythm from
-	// the neon motif the sweep carries (82 repeats of the owner's own ramp width, 468 uu apart, which
-	// is a FINER beat than the 2520 uu the piers gave) rather than from a row of boxes.
+	// parabola, cut to the surf rails' band by TraceSideRampProfile.h and swept the full side wall
+	// (42240 uu since the 2026-10-04 x1.10; 38400 when this was written) — replaces all 26 of them:
+	// same wall, same Z = 0 start, same "flush with the wall", 1096 uu tall instead of 1050/1600, and
+	// rideable end to end instead of every other bay. The wall keeps its rhythm from the neon motif the
+	// sweep carries (90 repeats of the owner's own ramp width, 469 uu apart - 82 of 468 on the 38400
+	// field - which is a FINER beat than the 2520 uu the piers gave) rather than from a row of boxes.
 	//
 	// The END wall row below is untouched: the owner scoped the request to "the side of the map", the
 	// end walls carry no ride, and those six piers are the only thing giving a 10560 uu end wall any
@@ -4505,7 +4506,8 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 	// endzone (X = 19920 on the 42240 field, 18000 on the 38400 one) rather than at a fraction of the half length -
 	// see CornerPylonYFrac for why that distinction cost a gate tower 80 uu of clearance.
 	//
-	// CLEARANCES RE-MEASURED FOR THE BUTTRESS PASS, on the shipped 38400 x 9600 field, after
+	// CLEARANCES RE-MEASURED FOR THE BUTTRESS PASS, on the 38400 x 9600 field that shipped before the
+	// 2026-10-04 x1.10 (the table below was not re-measured on 42240 x 10560), after
 	// CornerPylonYFrac moved from 0.85 to 0.775 to get out of the side-wall ride:
 	//     ride toe (|Y| 4000)          pylon standoff reaches 3896: 104 uu clear, three capsule radii
 	//     end wall (|X| 19200)         pylon reaches 18150: 1050 uu clear, unchanged
@@ -4701,7 +4703,8 @@ void ATraceArenaBuilder::BuildFlanks(bool bBuildVisuals)
 //   MIRRORED INTO ALL FOUR QUADRANTS, which is this file's own rule (see the header): the match
 //   switches sides at half time, so anything that helps one half has to exist in the other.
 //
-//   CLEARANCES, measured against the shipped 38400 x 9600 field rather than eyeballed:
+//   CLEARANCES, measured against the 38400 x 9600 field that shipped before the 2026-10-04 x1.10
+//   rather than eyeballed (not re-measured on 42240 x 10560):
 //     lane pylons (|X| 4690..4910 and 12690..12910)   the run is 5600..11700: 690 uu and 990 uu clear
 //     approach cover C (|X| 11800..12200, |Y| 1850..3150)  the run stops at 11700: 100 uu clear in X
 //     midfield cover G (diamond, |Y| up to 2548)       the toe is at 2700: 152 uu clear, i.e. more
