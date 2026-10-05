@@ -56,6 +56,7 @@
 #include "TraceSettings.h"
 #include "Misc/ScopeExit.h"
 #include "Abilities/Characters/TraceVerifyLock.h"   // one character fixture at a time
+#include "Debug/TraceFixtureKickoff.h"                // wait out the half-1 kickoff, do not race it
 
 namespace TraceCharacterVerify
 {
@@ -302,8 +303,25 @@ namespace TraceCharacterVerify
 		 */
 		int32 JumpPumpFrames = 0;
 
+		/**
+		 * Real time this arm started waiting for a half boundary to pass; 0 when not waiting.
+		 *
+		 * THE EIGHT-CHARACTER BATCH IS WHY. The batch runs in the warm-up, and Chut's fixture giving the
+		 * player a character is what releases the warm-up hold, so the half-1 kickoff landed ~5 s later
+		 * - in the middle of this fixture. The kickoff resets every pawn and clears every ability's
+		 * state, the Ripple included, so "a player entering the START ring is propelled" and "the CORE
+		 * CARRIER may ride" read FAIL with nothing wrong in Rocco. See TraceFixtureKickoff.h.
+		 */
+		double KickoffWaitStartReal = 0.0;
+
 		bool bArmed() const { return ArmsToRun.IsValidIndex(ArmIndex) && ArmsToRun[ArmIndex] == 1; }
 	};
+
+	/**
+	 * How long one Rocco arm needs the match to leave its pawns alone, generously: the measured arm
+	 * takes ~1.3 s of real time (0.75 + 0.20 + 0.20 s of staged waits plus the jump frames).
+	 */
+	constexpr float RoccoArmSecondsNeeded = 10.f;
 
 	void ApplyRoccoArm(int32 Arm)
 	{
@@ -446,7 +464,40 @@ namespace TraceCharacterVerify
 				return false;
 			}
 
-			Comp->ServerSetCharacter(ETraceCharacterId::Rocco);
+			Comp->ServerSetCharacter(ETraceCharacterId::Rocco);   // idempotent: safe on every retry below
+
+			// WAIT OUT THE KICKOFF, DO NOT RACE IT. Asked AFTER the pick on purpose: the pick is what
+			// releases a warm-up held for this player's menus, and only then is the kickoff's time known.
+			{
+				FString KickoffWhy;
+				const double NowReal = FPlatformTime::Seconds();
+				if (TraceFixtureKickoff::IsHalfBoundaryDue(WorldPtr, RoccoArmSecondsNeeded, KickoffWhy))
+				{
+					if (Run->KickoffWaitStartReal <= 0.0)
+					{
+						Run->KickoffWaitStartReal = NowReal;
+						UE_LOG(LogTraceGame, Display, TEXT("[ROCCO] arm %d waits before measuring: %s."), Arm, *KickoffWhy);
+					}
+					if (NowReal - Run->KickoffWaitStartReal < TraceFixtureKickoff::MaxWaitSeconds)
+					{
+						ScheduleRocco(Run, 0.5f);
+						return false;
+					}
+					Run->Current.Invalidate(FString::Printf(
+						TEXT("waited %.0fs for a half boundary to pass and it did not (%s)"),
+						NowReal - Run->KickoffWaitStartReal, *KickoffWhy));
+					FinishRoccoArm(Run);
+					ScheduleRocco(Run, 0.f);
+					return false;
+				}
+				if (Run->KickoffWaitStartReal > 0.0)
+				{
+					UE_LOG(LogTraceGame, Display, TEXT("[ROCCO] arm %d: the kickoff has passed (waited %.1fs); measuring."),
+						Arm, NowReal - Run->KickoffWaitStartReal);
+					Run->KickoffWaitStartReal = 0.0;
+				}
+			}
+
 			Comp->OnHalfTime();   // harness reset: zero the cooldown and the transient state
 
 			UTraceAbilitySetRocco* Rocco = Comp->GetAbilitySetAs<UTraceAbilitySetRocco>();
@@ -890,7 +941,9 @@ namespace TraceCharacterVerify
 		// ONE CHARACTER FIXTURE AT A TIME. These run on tickers across many frames and all steer
 		// the SAME pawn, so two from one -TraceExec list interleave and each reports the other's
 		// interference as its own ability failing. See TraceVerifyLock.h for the 15ms that proved it.
-		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Rocco.Verify"), 60.0, Args))
+		// 60 s for the run itself plus the longest it may wait for a half boundary to pass, so a queued
+		// fixture does not take the subject while this one is waiting out the kickoff.
+		if (!TraceVerifyLock::ClaimOrQueue(TEXT("Trace.Rocco.Verify"), 60.0 + TraceFixtureKickoff::MaxWaitSeconds, Args))
 		{
 			// Queued: TraceVerifyLock announces the wait once per holder and re-runs this command,
 			// arguments and all, when the subject is free.

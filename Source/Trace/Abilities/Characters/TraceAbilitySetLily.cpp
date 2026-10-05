@@ -40,6 +40,7 @@
 #include "Misc/ScopeExit.h"                          // ON_SCOPE_EXIT — the verify releases the subject
 #if !UE_BUILD_SHIPPING
 #include "Debug/TraceFixtureCore.h"                  // ZipVerify / DashTest put the Core back as found
+#include "Debug/TraceFixtureKickoff.h"               // the key tests wait out the half-1 kickoff
 #endif
 
 #define LOCTEXT_NAMESPACE "TraceLily"
@@ -1594,6 +1595,73 @@ namespace TraceLilyVerifyFile
 		return (PC != nullptr) && (PC->GetPawn() != nullptr);
 	}
 
+	/**
+	 * *** AND WHY THEY ALSO WAIT FOR THE KICKOFF. ***
+	 *
+	 * Trace.Lily.FlightTest and Trace.Lily.KeyTest each failed on every headless run, with the old
+	 * movement numbers and the new: FlightTest read "-522 uu of drift while holding nothing" and
+	 * KeyTest "-1264 uu while holding jump, +0 uu while holding crouch". Neither was the flight. The
+	 * harness claims Lily in the warm-up, the claim is what releases the warm-up hold, and the half-1
+	 * kickoff five seconds later lands in the GREEN arm: it puts her back on her spawn pad and clears
+	 * the Zip ("[Ability] HALF reset: ... (Lily) — 28.00s of cooldown and the transient state
+	 * cleared"). So each arm now asks TraceFixtureKickoff first, after the claim (which is when the
+	 * kickoff's time becomes known).
+	 *
+	 * @return true while the harness must keep waiting (including KickoffSettleSeconds after the
+	 *         kickoff, for her to land). @p bOutGaveUp is set, with the reason logged,
+	 *         when it waited TraceFixtureKickoff::MaxWaitSeconds for nothing - the caller says INVALID.
+	 */
+	/** After a kickoff, how long the key tests let the pawn land on its spawn pad before pressing. */
+	constexpr double KickoffSettleSeconds = 1.0;
+
+	bool WaitOutKickoff(const TCHAR* Tag, const UWorld* WorldPtr, float SecondsNeeded, int32 ArmIndex,
+		double& InOutWaitStartReal, bool& bOutGaveUp)
+	{
+		bOutGaveUp = false;
+		const double NowReal = FPlatformTime::Seconds();
+
+		// A NEGATIVE value is the settle deadline after a kickoff, stored in the same slot: the kickoff
+		// drops every pawn onto its spawn pad from a little above it, and an arm that presses jump while
+		// she is still landing measures the landing (the red arm read "climb -30 uu" on the first run).
+		if (InOutWaitStartReal < 0.0)
+		{
+			if (NowReal < -InOutWaitStartReal)
+			{
+				return true;
+			}
+			InOutWaitStartReal = 0.0;
+		}
+
+		FString KickoffWhy;
+		if (!TraceFixtureKickoff::IsHalfBoundaryDue(WorldPtr, SecondsNeeded, KickoffWhy))
+		{
+			if (InOutWaitStartReal > 0.0)
+			{
+				UE_LOG(LogTraceGame, Display,
+					TEXT("[%s] arm=%d: the kickoff has passed (waited %.1fs); pressing keys after %.1fs for her to land."),
+					Tag, ArmIndex, NowReal - InOutWaitStartReal, KickoffSettleSeconds);
+				InOutWaitStartReal = -(NowReal + KickoffSettleSeconds);
+				return true;
+			}
+			return false;
+		}
+
+		if (InOutWaitStartReal <= 0.0)
+		{
+			InOutWaitStartReal = NowReal;
+			UE_LOG(LogTraceGame, Display, TEXT("[%s] arm=%d waits before pressing anything: %s."),
+				Tag, ArmIndex, *KickoffWhy);
+		}
+		if (NowReal - InOutWaitStartReal >= TraceFixtureKickoff::MaxWaitSeconds)
+		{
+			UE_LOG(LogTraceGame, Warning,
+				TEXT("[%s] VERDICT: INVALID — waited %.0fs for a half boundary to pass and it did not (%s)."),
+				Tag, NowReal - InOutWaitStartReal, *KickoffWhy);
+			bOutGaveUp = true;
+		}
+		return true;
+	}
+
 	/** The local game world — the one with a keyboard, which is not always the authoritative one. */
 	UWorld* FindLocalKeyboardWorld()
 	{
@@ -1822,6 +1890,9 @@ namespace TraceLilyVerifyFile
 		/** REAL time. The select screen can pause the world; every other harness here learned that. */
 		double PhaseDeadline = 0.0;
 
+		/** Real time this arm began waiting out a half boundary; 0 when not waiting. See WaitOutKickoff. */
+		double KickoffWaitStartReal = 0.0;
+
 		TWeakObjectPtr<UTraceAbilitySetLily> Lily;
 
 		float StartZ = 0.f;
@@ -1979,6 +2050,19 @@ namespace TraceLilyVerifyFile
 
 				if (State->Phase == -1)
 				{
+					bool bGaveUp = false;
+					if (WaitOutKickoff(TEXT("LILYFLIGHT"), TickWorld, FlightClimbSeconds + FlightHoverSeconds + 5.f,
+							State->Arm, State->KickoffWaitStartReal, bGaveUp))
+					{
+						if (bGaveUp)
+						{
+							Arm->Set(1, ECVF_SetByConsole);
+							delete State;
+							return false;
+						}
+						return true;
+					}
+
 					Arm->Set(State->Arm, ECVF_SetByConsole);
 
 					// The framework's own cooldown clear, so the SECOND arm's E is not refused by the
@@ -2093,6 +2177,9 @@ namespace TraceLilyVerifyFile
 		int32 Phase = -2;
 
 		double PhaseDeadline = 0.0;
+
+		/** Real time this arm began waiting out a half boundary; 0 when not waiting. See WaitOutKickoff. */
+		double KickoffWaitStartReal = 0.0;
 		double ReadyGiveUpAt = 0.0;
 
 		TWeakObjectPtr<UTraceAbilitySetLily> Lily;
@@ -2374,6 +2461,20 @@ namespace TraceLilyVerifyFile
 						return true;
 					}
 
+					bool bGaveUp = false;
+					if (WaitOutKickoff(TEXT("LILYKEYS"), TickWorld,
+							KeyTestSettleSeconds + KeyTestHoldSeconds + KeyTestCoastSeconds + KeyTestCrouchSeconds + 5.f,
+							State->Arm, State->KickoffWaitStartReal, bGaveUp))
+					{
+						if (bGaveUp)
+						{
+							Arm->Set(1, ECVF_SetByConsole);
+							delete State;
+							return false;
+						}
+						return true;
+					}
+
 					Arm->Set(State->Arm, ECVF_SetByConsole);
 
 					if (UTraceAbilityComponent* Comp = TickLily->GetAbilityComponent())
@@ -2510,6 +2611,9 @@ namespace TraceLilyVerifyFile
 		int32 Arm = 0;              // 0 = RED (ZipHoldRelease 0), 1 = GREEN
 		int32 Phase = -2;
 		double PhaseDeadline = 0.0;
+
+		/** Real time this arm began waiting out a half boundary; 0 when not waiting. See WaitOutKickoff. */
+		double KickoffWaitStartReal = 0.0;
 		double ReadyGiveUpAt = 0.0;
 
 		TWeakObjectPtr<UTraceAbilitySetLily> Lily;
@@ -2773,6 +2877,20 @@ namespace TraceLilyVerifyFile
 					// The claim settle. Only arm 1 ever waits here.
 					if (Now < State->PhaseDeadline)
 					{
+						return true;
+					}
+
+					bool bGaveUp = false;
+					if (WaitOutKickoff(TEXT("LILYTAP"), TickWorld,
+							TapTestSettleSeconds + TapTestTapSeconds + TapTestCoastSeconds + TapTestCrouchSeconds + 5.f,
+							State->Arm, State->KickoffWaitStartReal, bGaveUp))
+					{
+						if (bGaveUp)
+						{
+							Arm->Set(1, ECVF_SetByConsole);
+							delete State;
+							return false;
+						}
 						return true;
 					}
 
