@@ -2833,29 +2833,29 @@ void ATraceArenaBuilder::EnsureBuilt()
 // =================================================================================================
 // THE STANDING RULE, ENFORCED AT STARTUP RATHER THAN IN A COMMENT.
 //
-// UTraceSettings::HitscanRange is DERIVED from this actor's FieldLength and FieldWidth: it has to
-// span the arena's diagonal or a shot down the long axis expires in mid-air short of a target the
-// player can plainly see. It has now been left behind TWICE by a pass that lengthened the field -
-// spec v4 §3 (24000 -> 33600, range left at 28000) and spec v28 §8 (33600 -> 38400, range left at
-// 36000). BOTH TIMES THE PAIRING WAS WRITTEN DOWN IN A COMMENT NEXT TO THE VALUE, in this header and
-// in Config/DefaultGame.ini, and both times the comment was not enough. The owner's 2026-10-04 x1.10
-// (38400 x 9600 -> 42240 x 10560, a 43540 uu diagonal) moved it in the same commit: 39600 -> 43600.
+// The gun has to span the arena's diagonal or a shot down the long axis expires in mid-air short of
+// a target the player can plainly see. A typed UTraceSettings::HitscanRange was left behind TWICE by a
+// pass that lengthened the field - spec v4 §3 (24000 -> 33600, range left at 28000) and spec v28 §8
+// (33600 -> 38400, range left at 36000) - both times with the pairing written in a comment beside it.
+// Since 2026-10-04 the range is DERIVED instead: UTraceSettings::GetHitscanRangeUU() is the diagonal
+// of World/TraceArenaDimensions.h plus HitscanRangeMarginUU, so a resize of that header moves the gun.
+//
+// What this still catches is the one gap the derivation cannot: THIS builder's FieldLength and
+// FieldWidth are per-instance properties that only DEFAULT to that header, so a level whose builder
+// was given another size would leave the gun measured against a field it is not playing on.
 //
 // So the check runs on EVERY startup, on both paths (the procedural build and the baked adopt),
 // costs one sqrt, and prints at Error when it fails. Trace.Arena.VerifyHitscanReach measures the
 // same thing far more thoroughly - it walks the real ray and finds the true sight line - but it only
-// helps somebody who thinks to run it, and nobody who lengthens a field thinks to run a gun command.
-// This one cannot be missed: it is in the log of every match anybody plays.
+// helps somebody who thinks to run it. This one is in the log of every match anybody plays.
 //
-// IT WARNS, IT DOES NOT CLAMP. Silently raising a designer's number would make Config/DefaultGame.ini
-// stop being the authority it is documented to be, and a knob that quietly disagrees with its own
-// file is the failure this project already keeps a house rule about. The fix is one line in each of
-// two files and the message says so.
+// IT WARNS, IT DOES NOT CLAMP. The gun reads one derivation everywhere; quietly substituting a second
+// one here would give the client and the server two answers to "how far does a shot go".
 // =================================================================================================
 void ATraceArenaBuilder::WarnIfHitscanRangeIsShort() const
 {
 	const float DiagonalUU = FMath::Sqrt(FieldLength * FieldLength + FieldWidth * FieldWidth);
-	const float RangeUU    = UTraceSettings::Get().HitscanRange;
+	const float RangeUU    = UTraceSettings::Get().GetHitscanRangeUU();
 
 	// THE SAME PAIRING FOR THE PAWN'S NET CULL. ATraceCharacter sets it in its constructor, long before
 	// any arena exists, from World/TraceArenaDimensions.h - so it can only be checked here, against the
@@ -2883,20 +2883,24 @@ void ATraceArenaBuilder::WarnIfHitscanRangeIsShort() const
 	if (RangeUU >= DiagonalUU)
 	{
 		UE_LOG(LogTraceGame, Display,
-			TEXT("[Arena] HitscanRange %.0f uu spans the %.0f x %.0f arena's %.0f uu diagonal (%.0f uu spare)."),
-			RangeUU, FieldLength, FieldWidth, DiagonalUU, RangeUU - DiagonalUU);
+			TEXT("[Arena] HitscanRange %.0f uu (derived: %.0f uu diagonal of World/TraceArenaDimensions.h + %.0f "
+			     "HitscanRangeMarginUU) spans the %.0f x %.0f arena's %.0f uu diagonal (%.0f uu spare)."),
+			RangeUU, TraceArenaDimensions::FieldDiagonalUU(), UTraceSettings::Get().HitscanRangeMarginUU,
+			FieldLength, FieldWidth, DiagonalUU, RangeUU - DiagonalUU);
 		return;
 	}
 
 	UE_LOG(LogTraceGame, Error,
-		TEXT("[Arena] *** THE GUN CANNOT CROSS THIS ARENA. *** UTraceSettings::HitscanRange is %.0f uu and the "
+		TEXT("[Arena] *** THE GUN CANNOT CROSS THIS ARENA. *** The hitscan reaches %.0f uu and this builder's "
 		     "%.0f x %.0f field's diagonal is %.0f uu, so a shot down the long axis dies %.0f uu SHORT of a "
-		     "target the player can see, with nothing on screen saying why. HitscanRange is DERIVED from "
-		     "FieldLength/FieldWidth and must move with them: set it to at least %.0f in BOTH "
-		     "Source/Trace/TraceSettings.h AND Config/DefaultGame.ini (the ini wins). "
+		     "target the player can see, with nothing on screen saying why. The reach is DERIVED from "
+		     "World/TraceArenaDimensions.h (%.0f x %.0f) + HitscanRangeMarginUU (%.0f): this builder was given "
+		     "a different size than that header. Make them match, or raise HitscanRangeMarginUU to at least %.0f. "
 		     "Trace.Arena.VerifyHitscanReach measures it properly, against the real geometry."),
 		RangeUU, FieldLength, FieldWidth, DiagonalUU, DiagonalUU - RangeUU,
-		FMath::CeilToFloat(DiagonalUU / 100.f) * 100.f);
+		TraceArenaDimensions::kFieldLengthUU, TraceArenaDimensions::kFieldWidthUU,
+		UTraceSettings::Get().HitscanRangeMarginUU,
+		FMath::CeilToFloat(DiagonalUU - TraceArenaDimensions::FieldDiagonalUU()));
 }
 
 // =================================================================================================
@@ -15022,16 +15026,18 @@ namespace
 // =================================================================================================
 // SPEC v28 INTEGRATION — THE GUN'S REACH IS DERIVED FROM THE ARENA'S SIZE, AND NOTHING CHECKED IT.
 //
-// UTraceSettings::HitscanRange is not an independent knob. It has to span the arena's diagonal or a
-// shot down the long axis expires in mid-air short of a target the player can plainly see. It has
-// been left behind TWICE now:
+// The gun's reach is not an independent knob. It has to span the arena's diagonal or a shot down the
+// long axis expires in mid-air short of a target the player can plainly see. While it was a typed
+// UTraceSettings::HitscanRange it was left behind TWICE:
 //
 //   spec v4 §3   lengthened the field 24000 -> 33600 and left the range at 28000 (6944 uu short);
 //   spec v28 §8  lengthened it 33600 -> 38400 for the hockey pockets and left it at 36000
 //                (3581 uu short). The §8 owner found this and could not fix it - TraceSettings.h is
 //                not their file - and said so in their hand-off. This pass raised it to 39600.
 //   2026-10-04   the owner's x1.10 (42240 x 10560, diagonal 43540) raised it to 43600 IN THE SAME
-//                COMMIT as the field, which is the first resize that did not leave it behind.
+//                COMMIT as the field, which is the first resize that did not leave it behind - and
+//                then the follow-up made it DERIVED: UTraceSettings::GetHitscanRangeUU() is the
+//                World/TraceArenaDimensions.h diagonal + HitscanRangeMarginUU (60), 43600 today.
 //
 // A NUMBER THAT MUST TRACK ANOTHER NUMBER NEEDS A HARNESS, NOT A COMMENT. Both comments were there
 // and both were missed, which is the whole argument for this command existing.
@@ -15039,11 +15045,11 @@ namespace
 // It measures two different things and reports both:
 //
 //   THE ARITHMETIC  sqrt(FieldLength^2 + FieldWidth^2) read off the LIVE ATraceArenaBuilder in the
-//                   world, against the LIVE UTraceSettings::HitscanRange (which is the .ini's value,
-//                   not the header's - the ini wins and that is the layer that has been wrong).
+//                   world, against the LIVE UTraceSettings::GetHitscanRangeUU() (the header's
+//                   diagonal plus the .ini's margin - the number every shot actually uses).
 //
 //   THE REAL TRACE  a genuine world line trace from just inside one back pocket at the far diagonal
-//                   corner, run at exactly HitscanRange. A pass means it reached blocking geometry;
+//                   corner, run at exactly that range. A pass means it reached blocking geometry;
 //                   a fail means it died in the air. This is what the PLAYER experiences, and it is
 //                   the half that cannot be fooled by getting the arithmetic right against a field
 //                   size the builder does not actually use.
@@ -15060,7 +15066,7 @@ namespace
 		TEXT("Trace.Arena.HitscanReachArm"),
 		GTraceHitscanReachArmUU,
 		TEXT("Trace: force Trace.Arena.VerifyHitscanReach to measure a given range in uu instead of the "
-		     "shipped UTraceSettings::HitscanRange. 36000 reproduces the pre-v28-integration defect. 0 = off."),
+		     "shipped UTraceSettings::GetHitscanRangeUU(). 36000 reproduces the pre-v28-integration defect. 0 = off."),
 		ECVF_Cheat);
 
 	ATraceArenaBuilder* FindHitscanReachArena(UWorld*& OutWorld)
@@ -15094,7 +15100,7 @@ namespace
 
 	FAutoConsoleCommand CmdTraceVerifyHitscanReach(
 		TEXT("Trace.Arena.VerifyHitscanReach"),
-		TEXT("Trace: assert UTraceSettings::HitscanRange spans the LIVE arena's diagonal, and fire a real "
+		TEXT("Trace: assert UTraceSettings::GetHitscanRangeUU() spans the LIVE arena's diagonal, and fire a real "
 		     "world trace down that diagonal to prove it reaches. Red arm: Trace.Arena.HitscanReachArm 36000."),
 		FConsoleCommandDelegate::CreateStatic([]()
 		{
@@ -15111,7 +15117,7 @@ namespace
 
 			const float ArmUU     = GTraceHitscanReachArmUU;
 			const bool  bArmed    = (ArmUU > 0.f);
-			const float ShippedUU = FMath::Max(1.f, UTraceSettings::Get().HitscanRange);
+			const float ShippedUU = FMath::Max(1.f, UTraceSettings::Get().GetHitscanRangeUU());
 			const float RangeUU   = bArmed ? ArmUU : ShippedUU;
 
 			// The requirement is the WALL-TO-WALL diagonal, not the goal-to-goal one. A player standing
@@ -15134,7 +15140,9 @@ namespace
 				TEXT("[HITSCANREACH] HitscanRange in force %.0f uu%s."),
 				RangeUU,
 				bArmed ? *FString::Printf(TEXT(" (FORCED by the red arm; the shipped setting is %.0f)"), ShippedUU)
-				       : TEXT(" (UTraceSettings, i.e. Config/DefaultGame.ini layered over the header)"));
+				       : *FString::Printf(TEXT(" (DERIVED: the %.0f uu diagonal of World/TraceArenaDimensions.h + "
+				                               "HitscanRangeMarginUU %.0f)"),
+				             TraceArenaDimensions::FieldDiagonalUU(), UTraceSettings::Get().HitscanRangeMarginUU));
 
 			// ---- 1. the arithmetic ----------------------------------------------------------------
 			const bool bSpansDiagonal = (RangeUU >= DiagonalUU);
@@ -15148,11 +15156,24 @@ namespace
 			}
 			else
 			{
-				UE_LOG(LogTraceGame, Error,
-					TEXT("[HITSCANREACH] FAIL  the range is %.0f uu SHORT of the diagonal. A shot down the long "
-					     "axis expires in mid-air short of a target on screen. Raise HitscanRange in BOTH "
-					     "Source/Trace/TraceSettings.h AND Config/DefaultGame.ini (the ini wins) to at least %.0f."),
-					DiagonalUU - RangeUU, FMath::CeilToFloat(DiagonalUU / 100.f) * 100.f);
+				if (bArmed)
+				{
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[HITSCANREACH] FAIL  the range is %.0f uu SHORT of the diagonal. A shot down the long "
+						     "axis expires in mid-air short of a target on screen. (The red arm forced %.0f; the "
+						     "shipped reach is %.0f.)"),
+						DiagonalUU - RangeUU, RangeUU, ShippedUU);
+				}
+				else
+				{
+					UE_LOG(LogTraceGame, Error,
+						TEXT("[HITSCANREACH] FAIL  the range is %.0f uu SHORT of the diagonal. A shot down the long "
+						     "axis expires in mid-air short of a target on screen. The reach is derived from "
+						     "World/TraceArenaDimensions.h + HitscanRangeMarginUU, so this builder is not the size "
+						     "that header says: make them match, or raise HitscanRangeMarginUU to at least %.0f."),
+						DiagonalUU - RangeUU,
+						FMath::CeilToFloat(DiagonalUU - TraceArenaDimensions::FieldDiagonalUU()));
+				}
 			}
 
 			// ---- 2. the real trace -----------------------------------------------------------------

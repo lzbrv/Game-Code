@@ -744,7 +744,7 @@ public:
 	 *
 	 * *** THIS IS WHAT STOPS A LONG SHOT DRAWING AS A ROW OF DASHES. *** BoltMaxLifeSeconds caps the
 	 * life and the speed is then re-solved from it, so speed grows without bound as the shot gets
-	 * longer: a full-range shot (Config/DefaultGame.ini ships HitscanRange=39600) came out at over
+	 * longer: a full-range shot (39600 uu when this was measured; 43600 now) came out at over
 	 * 130000 uu/s, which is 2200 uu per 60 Hz frame against a bolt capped at 1200 uu. The bolt
 	 * teleported past its own length every frame and the eye saw separate dashes - the exact
 	 * opposite of the "single laser" the report asks for.

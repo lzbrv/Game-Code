@@ -60,6 +60,7 @@
 #include "Abilities/TraceAbilityTypes.h"
 #include "Abilities/TraceCharacterAbilitySet.h"
 #include "Core/TraceCharacterRoster.h"
+#include "World/TraceArenaDimensions.h"   // the field the gun's reach is derived from (constants, not a settings page)
 
 // Named after the file, per the Windows jumbo-build rule (Scripts/check-jumbo-build-collisions.py).
 namespace TraceStatsDump
@@ -1352,10 +1353,10 @@ namespace TraceStatsDump
 			TEXT("GoalWidthFieldFraction x 9600 uu reference width"),
 			TEXT("The knob is a FRACTION of a FIXED 9600 uu reference width (UTraceSettings::GoalWidthReferenceFieldWidthUU), not of the live arena: since the 2026-10-04 x1.10 (42240 x 10560) the goal no longer tracks the arena, so resizing the field leaves the goal its size."));
 
-		// --- the field, and how far HitscanRange clears its diagonal ------------------------------
-		// HitscanRange is DERIVED from the field (its comment in TraceSettings.h: it must span the
-		// wall-to-wall diagonal), but the field itself lives on ATraceArenaBuilder rather than on a
-		// settings page, so the knob walk never reaches it. Read here by /Script path like every other
+		// --- the field, and how far the gun's reach clears its diagonal ---------------------------
+		// The reach is DERIVED from the field (UTraceSettings::GetHitscanRangeUU(): the diagonal of
+		// World/TraceArenaDimensions.h + HitscanRangeMarginUU), but the field the game is PLAYING on
+		// lives on ATraceArenaBuilder rather than on a settings page, so the knob walk never reaches it. Read here by /Script path like every other
 		// class in this file: the live builder in the world (ATraceGameMode finds or spawns one on both
 		// arenas), or its CDO when there is none, e.g. a dump taken from the title screen.
 		{
@@ -1376,12 +1377,16 @@ namespace TraceStatsDump
 				}
 			}
 
-			double StatsFieldLengthUU = 0.0, StatsFieldWidthUU = 0.0, StatsHitscanRangeUU = 0.0;
+			double StatsFieldLengthUU = 0.0, StatsFieldWidthUU = 0.0, StatsHitscanMarginUU = 0.0;
 			const bool bFieldLen = ReadNumber(ArenaKnobs, TEXT("FieldLength"), StatsFieldLengthUU, Report);
 			const bool bFieldWid = ReadNumber(ArenaKnobs, TEXT("FieldWidth"), StatsFieldWidthUU, Report);
-			const bool bHitscan  = ReadNumber(Game, TEXT("HitscanRange"), StatsHitscanRangeUU, Report);
+			const bool bHitscan  = ReadNumber(Game, TEXT("HitscanRangeMarginUU"), StatsHitscanMarginUU, Report);
 			const double StatsFieldDiagonalUU = FMath::Sqrt(StatsFieldLengthUU * StatsFieldLengthUU
 				+ StatsFieldWidthUU * StatsFieldWidthUU);
+			// The same arithmetic as UTraceSettings::GetHitscanRangeUU(), from the same two inputs: the
+			// header's diagonal and the margin knob read by name. Floored at 0 there too.
+			const double StatsHitscanRangeUU = static_cast<double>(TraceArenaDimensions::FieldDiagonalUU())
+				+ FMath::Max(0.0, StatsHitscanMarginUU);
 
 			AddRow(Rows, Sec::Key, TEXT("Key numbers (computed live)"), TEXT("Arena"),
 				TEXT("Field length (end wall to end wall)"),
@@ -1395,11 +1400,15 @@ namespace TraceStatsDump
 				TEXT("The goal does NOT follow this (see Goal mouth width); the flanks, spawn fan and corner banks do."));
 			AddDerived(Rows, TEXT("Field diagonal (wall corner to wall corner)"), bFieldLen && bFieldWid,
 				StatsFieldDiagonalUU, TEXT("uu"), TEXT("sqrt(FieldLength^2 + FieldWidth^2)"),
-				TEXT("The longest straight line in the arena, and the distance HitscanRange has to reach."));
+				TEXT("The longest straight line in the arena, and the distance the gun has to reach."));
+			AddDerived(Rows, TEXT("Hitscan range (the gun's reach)"), bHitscan,
+				StatsHitscanRangeUU, TEXT("uu"),
+				TEXT("sqrt(kFieldLengthUU^2 + kFieldWidthUU^2) [World/TraceArenaDimensions.h] + HitscanRangeMarginUU"),
+				TEXT("How far every shot travels. Not a knob: it is the field diagonal plus a margin, so resizing the field in World/TraceArenaDimensions.h moves the gun with it. Damage does not fall off with distance."));
 			AddDerived(Rows, TEXT("Hitscan reach past the field diagonal"), bFieldLen && bFieldWid && bHitscan,
 				StatsHitscanRangeUU - StatsFieldDiagonalUU, TEXT("uu"),
-				TEXT("HitscanRange - sqrt(FieldLength^2 + FieldWidth^2)"),
-				TEXT("Must stay positive. Negative means a shot down the long diagonal dies in mid-air short of a target the player can see. Resize the field and HitscanRange has to move with it."));
+				TEXT("Hitscan range - sqrt(FieldLength^2 + FieldWidth^2) of the live builder"),
+				TEXT("Must stay positive. Equal to HitscanRangeMarginUU unless this map's builder was given a different size than World/TraceArenaDimensions.h; negative means a shot down the long diagonal dies in mid-air short of a target the player can see."));
 		}
 
 		double ThrowSpeed = 0.0, MassScale = 0.0;

@@ -6,6 +6,7 @@
 
 #include "Trace.h"                      // LogTraceGame
 #include "TraceTypes.h"
+#include "World/TraceArenaDimensions.h" // the field the gun's reach is derived from
 
 #if WITH_EDITOR || !UE_BUILD_SHIPPING
 // Live-tuning support, and the dev-only verification commands at the bottom of this file. See
@@ -130,7 +131,7 @@ UTraceSettings::UTraceSettings(const FObjectInitializer& ObjectInitializer)
 	// where 3000uu is most of the pitch; on 33600 x 9600 it is close quarters. Measured with the
 	// player walked up the field, bots had them inside SightRange for 69.7% of bot-ticks but inside
 	// MaxEngagementRange with line of sight for 16.0% — they could see the player fine and simply
-	// were not allowed to shoot. Meanwhile HitscanRange is 36000 (it has to span the field's 34944uu
+	// were not allowed to shoot. Meanwhile HitscanRange was 36000 (it had to span the field's 34944uu
 	// diagonal), so the player could shoot back from anywhere. That asymmetry is indistinguishable
 	// from "the bots ignore me".
 	//
@@ -308,6 +309,13 @@ const UTraceSettings& UTraceSettings::Get()
 	// The CDO always exists for a UDeveloperSettings and is kept current by the config system,
 	// so this never needs a null check and never allocates.
 	return *GetDefault<UTraceSettings>();
+}
+
+float UTraceSettings::GetHitscanRangeUU() const
+{
+	// DERIVED, NOT TYPED (Demo 21). The base is the field, the knob is only the margin past it; see
+	// HitscanRangeMarginUU for the two resizes that left a typed range behind.
+	return TraceArenaDimensions::FieldDiagonalUU() + FMath::Max(0.f, HitscanRangeMarginUU);
 }
 
 FName UTraceSettings::GetCategoryName() const
@@ -1071,6 +1079,10 @@ namespace
 			// this string immediately beside the LIVE value, so the old "150 RPM = 0.40s" was a
 			// contradiction on screen the moment spec v24 §4 moved the gun to 190 RPM (0.3158 s).
 			{ TEXT("FireInterval"),                    EKnobType::Float, TEXT("seconds between rounds; RPM = 60 / this. Per-character abilities SCALE it via GetFireIntervalScaleFor()") },
+
+			// --- 2026-10-04 follow-up: the gun's reach is DERIVED from the field -------------------
+			// HitscanRange (a typed 43600) is gone; the knob is the margin past the diagonal.
+			{ TEXT("HitscanRangeMarginUU"),            EKnobType::Float, TEXT("uu past the field diagonal; GetHitscanRangeUU() = the World/TraceArenaDimensions.h diagonal + this (43540 + 60 = 43600)") },
 
 			// --- spec v16 §1, ammo (a system that did not exist before that pass) ---------------
 			// There is deliberately NO reserve/carried-ammo row: the reserve is infinite and has no

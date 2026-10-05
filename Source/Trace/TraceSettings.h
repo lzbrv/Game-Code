@@ -702,47 +702,42 @@ public:
 	// leaving them here would invite somebody to retune a number the game ignores.
 
 	/**
-	 * Maximum hitscan distance in unreal units.
+	 * How far the gun reaches PAST the field's diagonal, in uu. THE RANGE ITSELF IS NOT A KNOB.
 	 *
-	 * Must span the arena diagonal or shots silently die in mid-air short of a visible target. The
-	 * field is 33600 x 9600 (spec v4 §3 lengthened it from 24000 for the 3.5:1 proportion), so the
-	 * diagonal is 34944 uu; 36000 covers it with 1056 uu of margin. The 28000 that preceded this
-	 * covered the OLD 24000-long field and fell 6944 uu short of the new one — a shot down the spine
-	 * expired in mid-air short of a target the player could plainly see. If ATraceArenaBuilder::
-	 * FieldLength or FieldWidth changes again, recompute sqrt(L^2 + W^2) and raise this with it.
+	 * Demo 21's rule, applied to the one number that kept breaking it: the hitscan has to span the
+	 * arena's diagonal or a shot down the long axis dies in mid-air short of a target the player can
+	 * plainly see. Until 2026-10-04 that reach was a typed number, HitscanRange, and every field resize
+	 * had to remember to move it by hand: spec v4 §3 (24000 -> 33600) left it at 28000, spec v28 §8
+	 * (33600 -> 38400) left it at 36000, and the owner's x1.10 moved it 39600 -> 43600 in the same
+	 * commit only because somebody remembered. Writing the pairing down in a comment did not work twice.
 	 *
-	 * *** 36000 -> 39600 THIS PASS, AND IT IS SPEC v28 §8's BILL, NOT A RETUNE. *** §8 put a 2400 uu
-	 * hockey pocket behind each goal, so ATraceArenaBuilder::FieldLength went 33600 -> 38400 and the
-	 * wall-to-wall diagonal went 34944 -> sqrt(38400^2 + 9600^2) = 39581 uu. The shipped 36000 was
-	 * 3581 uu SHORT of that — a shot from one back pocket down the long diagonal to the other would
-	 * have died in mid-air short of a target the player could plainly see, which is the exact failure
-	 * the 28000 -> 36000 move already fixed once. 39600 covers 39581 with 19 uu of margin, and the
-	 * margin is deliberately thin: this number is a REACH, not a range budget, and every uu of it is
-	 * paid for by the trace. The §8 owner found this and could not fix it — this file is not theirs.
+	 * So the range is now DERIVED, in code, from the field: GetHitscanRangeUU() is
+	 * TraceArenaDimensions::FieldDiagonalUU() + this margin. On 42240 x 10560 that is
+	 * 43540 + 60 = 43600, the exact number that shipped, and the next resize of
+	 * World/TraceArenaDimensions.h carries the gun with it. What a designer can still tune is the
+	 * margin, the same way every other derived value on this page exposes its scale and not its result.
 	 *
-	 * THE PAIRING RULE, restated because it has now been missed twice: this value is DERIVED from
-	 * ATraceArenaBuilder::FieldLength and FieldWidth. It is not independent of them and it must move
-	 * whenever they do. Trace.Arena.VerifyHitscanReach asserts exactly that against the running
-	 * builder, so the next lengthening fails a harness instead of silently shortening the guns.
+	 * 60 uu is the thin-margin policy every earlier value followed: this is a REACH, not a range
+	 * budget, and there is no distance falloff anywhere in UTraceWeaponComponent's hitscan (damage is
+	 * chosen by hit zone alone), so a longer trace hits for exactly what a shorter one did. Raising it
+	 * does NOT make the bots deadlier either: they are limited by FTraceBotProfile::MaxEngagementRange
+	 * (4200 Easy / 4800 Normal / 6000 Hard), far below the diagonal.
 	 *
-	 * Raising it does NOT make the bots deadlier (see below) and does NOT change any damage. There is
-	 * no distance falloff anywhere in UTraceWeaponComponent's hitscan — damage is chosen by HIT ZONE
-	 * alone (head / body / leg) and the trace length never enters the number — so a 39600 uu trace
-	 * hits for exactly what a 36000 uu one did. The only difference is that shots stop expiring in
-	 * the air short of a target that is on screen.
+	 * Checked twice, both against the field the builder ACTUALLY made rather than this header:
+	 * ATraceArenaBuilder::WarnIfHitscanRangeIsShort() prints the pairing in every match log, and
+	 * Trace.Arena.VerifyHitscanReach fires a real trace down the diagonal.
 	 *
-	 * Raising it does NOT make the bots deadlier: they are limited by FTraceBotProfile::
-	 * MaxEngagementRange (4200 Easy / 4800 Normal / 6000 Hard), far below either value. This only
-	 * restores the human's ability to shoot what they can see.
-	 *
-	 * *** 39600 -> 43600, 2026-10-04, IN THE SAME COMMIT AS THE FIELD. *** The owner scaled the arena
-	 * x1.10 both ways (World/TraceArenaDimensions.h: 42240 x 10560), so the diagonal went 39581 ->
-	 * sqrt(42240^2 + 10560^2) = 43540 uu. 43600 clears it with 60 uu - the same thin-margin policy as
-	 * above, rounded up to the next hundred. Config/DefaultGame.ini carries the same value (the ini
-	 * wins), and ATraceArenaBuilder::WarnIfHitscanRangeIsShort() checks the pairing every match.
+	 * Mirrored in Config/DefaultGame.ini, and the ini is the one that decides.
 	 */
-	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Hitscan Range (uu)", ClampMin = "100.0", ClampMax = "200000.0", UIMin = "5000.0", UIMax = "50000.0"))
-	float HitscanRange = 43600.f;
+	UPROPERTY(config, EditAnywhere, Category = "Combat", meta = (DisplayName = "Hitscan Range Past The Field Diagonal (uu)", ClampMin = "0.0", ClampMax = "20000.0", UIMin = "0.0", UIMax = "2000.0"))
+	float HitscanRangeMarginUU = 60.f;
+
+	/**
+	 * The hitscan's reach in uu: the field diagonal (World/TraceArenaDimensions.h) plus
+	 * HitscanRangeMarginUU. Every shot, the client's predicted trace and the server's rewound one
+	 * alike, reads this. 43600 on the shipped 42240 x 10560 field.
+	 */
+	float GetHitscanRangeUU() const;
 
 	/**
 	 * SECONDS BETWEEN SHOTS — this is the inverse of the fire RATE, so a BIGGER number is a SLOWER

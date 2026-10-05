@@ -2040,7 +2040,7 @@ void UTraceWeaponComponent::FireOnce()
 	// The gun is precise; the DAMAGE ZONES are what make aim matter now (head 100 / body 40 /
 	// legs 25), which is a skill test the player can see and learn rather than a hidden dice roll.
 
-	const float Range = FMath::Max(1.f, Settings.HitscanRange);
+	const float Range = FMath::Max(1.f, Settings.GetHitscanRangeUU());
 
 	// Cosmetic-only local resolve: where should *our* tracer stop? No damage is applied on the
 	// client under any circumstances - the server owns that entirely.
@@ -2573,7 +2573,7 @@ void UTraceWeaponComponent::ServerFire_Implementation(FVector_NetQuantize Origin
 	}
 
 	// ---- resolve -------------------------------------------------------------------------
-	const float ShotRange = FMath::Max(1.f, Settings.HitscanRange);
+	const float ShotRange = FMath::Max(1.f, Settings.GetHitscanRangeUU());
 	FVector ImpactPoint = ShotOrigin + Dir * ShotRange;
 	ETraceHitZone Zone = ETraceHitZone::None;
 	FTraceHitscanDiagnostics Diagnostics;
@@ -5510,7 +5510,7 @@ namespace TraceRecoilTest
 					if (UWorld* TestWorld = LocalCharacter->GetWorld())
 					{
 						const FVector EyeLocation = LocalCharacter->GetPawnViewLocation();
-						const float ProbeRange = FMath::Max(1.f, UTraceSettings::Get().HitscanRange);
+						const float ProbeRange = FMath::Max(1.f, UTraceSettings::Get().GetHitscanRangeUU());
 
 						for (TActorIterator<ATraceCharacter> It(TestWorld); It; ++It)
 						{
@@ -9483,7 +9483,7 @@ namespace TraceImpactShots
 				// invite somebody to go looking for one.
 				FTraceTracerShotDebug Shot;
 				const bool bDescribed = (Beam != nullptr) && Beam->DescribeShot(Shot);
-				const float Range = FMath::Max(1.f, UTraceSettings::Get().HitscanRange);
+				const float Range = FMath::Max(1.f, UTraceSettings::Get().GetHitscanRangeUU());
 				const bool bStopped = bDescribed && (Shot.ShotLengthUU < Range * 0.99f);
 
 				// THREE LABELS AND NOT TWO, because "the beam is gone" is a fourth state and printing

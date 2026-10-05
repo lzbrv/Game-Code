@@ -496,15 +496,14 @@ public:
 	/**
 	 * *** THE STANDING RULE, CHECKED AT STARTUP: does the gun still reach across this arena? ***
 	 *
-	 * UTraceSettings::HitscanRange is DERIVED from FieldLength and FieldWidth - it must span the
-	 * diagonal or shots expire in mid-air short of a visible target - and it has been left behind by
-	 * a field lengthening TWICE (spec v4 §3 and spec v28 §8), both times with the pairing rule
-	 * written in a comment beside the value. This runs from EnsureBuilt() on BOTH the procedural and
-	 * the baked path, so the mismatch reaches the log of every match instead of waiting for somebody
-	 * to think of running a console command.
+	 * The gun's reach must span the diagonal or shots expire in mid-air short of a visible target. It
+	 * is DERIVED - UTraceSettings::GetHitscanRangeUU() is the World/TraceArenaDimensions.h diagonal plus
+	 * HitscanRangeMarginUU - because a typed range was left behind by a field lengthening TWICE (spec v4
+	 * §3 and spec v28 §8). What this still catches is a builder whose own FieldLength / FieldWidth differ
+	 * from that header. It runs from EnsureBuilt() on BOTH the procedural and the baked path, so the
+	 * mismatch reaches the log of every match instead of waiting for somebody to run a console command.
 	 *
-	 * It WARNS and does not clamp: quietly raising a designer's ini value would make
-	 * Config/DefaultGame.ini stop being the authority it is documented to be. See the .cpp.
+	 * It WARNS and does not clamp: the client and the server must read one reach. See the .cpp.
 	 */
 	void WarnIfHitscanRangeIsShort() const;
 
@@ -1081,10 +1080,10 @@ public:
 	 *
 	 * THE COST, STATED PLAINLY: at WalkSpeed 900 a wall-to-wall run is ~46.9 seconds (~41.6 of them
 	 * goal to goal, ~2.7 in each pocket); it was ~42.7 (37.3, 2.7) on the 38400 field.
-	 * UTraceSettings::HitscanRange has to clear the field DIAGONAL (42240 x 10560 -> 43540 uu) and
-	 * DOES: Config/DefaultGame.ini ships HitscanRange=43600 (39600 on the 38400 x 9600 field), and
-	 * WarnIfHitscanRangeIsShort() re-checks that pairing - and the pawn net cull - in the log of
-	 * every match, so a future resize here cannot silently strand the long diagonal again.
+	 * The gun's reach has to clear the field DIAGONAL (42240 x 10560 -> 43540 uu) and is DERIVED from
+	 * it: UTraceSettings::GetHitscanRangeUU() = that diagonal + HitscanRangeMarginUU (60) = 43600. Change
+	 * the default in World/TraceArenaDimensions.h and the gun follows; WarnIfHitscanRangeIsShort()
+	 * re-checks it - and the pawn net cull - against THIS property in the log of every match.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float FieldLength = TraceArenaDimensions::kFieldLengthUU;
@@ -1105,12 +1104,11 @@ public:
 	 * GoalWidthFieldFraction against a fixed 9600 uu reference width, so the 2026-10-04 widening
 	 * (9600 -> 10560, see FieldLength) left the 2000 uu goal ring exactly the size it was.
 	 *
-	 * THE ONE NUMBER THAT DOES NOT LIVE HERE and must move with these two is
-	 * UTraceSettings::HitscanRange, which has to clear the field diagonal: 42240 x 10560 is a
-	 * 43540 uu diagonal and Config/DefaultGame.ini ships HitscanRange=43600 (the ini wins over the
-	 * UTraceSettings default), clearing it with 60 uu to spare. The pairing is guarded at runtime by
-	 * WarnIfHitscanRangeIsShort(), so a field resize shows up in every match log rather than as
-	 * shots dying short of targets the player can plainly see.
+	 * THE GUN'S REACH FOLLOWS THE FIELD: UTraceSettings::GetHitscanRangeUU() is the
+	 * World/TraceArenaDimensions.h diagonal (42240 x 10560 -> 43540 uu) + HitscanRangeMarginUU (60). It
+	 * reads the header, not this property, so a level that sets a different width here is caught by
+	 * WarnIfHitscanRangeIsShort() in every match log rather than as shots dying short of targets the
+	 * player can plainly see.
 	 */
 	UPROPERTY(EditAnywhere, Category = "Trace|Arena")
 	float FieldWidth = TraceArenaDimensions::kFieldWidthUU;

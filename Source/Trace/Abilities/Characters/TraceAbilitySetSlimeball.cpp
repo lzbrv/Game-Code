@@ -1912,7 +1912,7 @@ namespace TraceSlimeballVerify
 
 		const UTraceSettings& Settings = UTraceSettings::Get();
 		const FVector Origin = MyPawn->GetMuzzleLocation();
-		const float Range = FMath::Max(1.f, Settings.HitscanRange);
+		const float Range = FMath::Max(1.f, Settings.GetHitscanRangeUU());
 
 		float ServerNow = 0.f;
 		if (const AGameStateBase* ClockState = WorldPtr->GetGameState())
