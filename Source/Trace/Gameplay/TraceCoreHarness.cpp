@@ -6368,13 +6368,32 @@ void ATraceCore::RunKickoffProbeStep()
 		// 38400 x 9600 build before the 2026-10-04 resize reads the identical 12 passed / 2 FAILED /
 		// 1 skipped. Those two checks SKIP on such a level, like the climb, and one check that DOES
 		// mean something there replaces them: the Core went back to the arena's own spawn point.
+		//
+		// ONLY ON A LEVEL THAT HAS NO OCTAGON BY DESIGN. The procedural arena builds no centre kit; a
+		// pre-baked level (Arena_Baked, the map PLAY opens) carries the octagon as a placed actor.
+		// GetHalfStartCoreSurface() cannot tell the two apart: on both it logs a Warning and falls
+		// back to the spawn point. So if a mesh rename or re-import on a baked level ever made the
+		// pillar lookup come back empty, the game would silently stop putting the Core on the deck,
+		// and skipping here would turn that into a green probe (13 passed / 0 FAILED / 2 skipped).
+		// A baked level, or one with no arena builder at all, with no pillar FAILS all three deck
+		// checks instead.
 		AActor* Pillar = nullptr;
 		const FVector Surface = ATraceCore::GetHalfStartCoreSurface(World, &Pillar);
 		const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World);
 		const double FloorZ = (Arena != nullptr) ? Arena->GetFieldBounds().Min.Z : 0.0;
 		const double Climb = Surface.Z - FloorZ;
+		const bool bNoOctagonByDesign = (Pillar == nullptr) && (Arena != nullptr) && !Arena->IsLevelPreBaked();
+		const bool bOctagonMissing = (Pillar == nullptr) && !bNoOctagonByDesign;
 
-		if (Pillar == nullptr)
+		if (bOctagonMissing)
+		{
+			UE_LOG(LogTraceGame, Error,
+				TEXT("[KickoffProbe]   (%s and no centre octagon was found in it: the half-start Core fell back to %s)"),
+				(Arena != nullptr) ? TEXT("this level is pre-baked") : TEXT("this level has no arena builder"),
+				*Surface.ToCompactString());
+			Fail(TEXT("half start: this level should have a centre octagon and none was found, so the Core is not on a deck"));
+		}
+		else if (bNoOctagonByDesign)
 		{
 			Skip(TEXT("half start: no centre octagon, so no deck for the Core to be at rest on (it drops onto the pedestal, as before DEMO 29)"));
 		}
@@ -6388,9 +6407,14 @@ void ATraceCore::RunKickoffProbeStep()
 		}
 
 		// THE CLIMB, measured rather than asserted by eye. The deck height is the whole of "teams must
-		// climb up", and it is a property of the LEVEL — so a level with no pillar is reported as a
-		// skip, not as a failure of this code.
-		if (Pillar == nullptr)
+		// climb up", and it is a property of the LEVEL — so the procedural level, which has no pillar
+		// by design, is reported as a skip, not as a failure of this code. A baked level with no pillar
+		// is a failure: its players have nothing to climb.
+		if (bOctagonMissing)
+		{
+			Fail(TEXT("half start: no centre octagon on a level that should have one, so there is nothing to climb"));
+		}
+		else if (bNoOctagonByDesign)
 		{
 			Skip(TEXT("half start: this level has no centre octagon, so there is nothing to climb"));
 		}
@@ -6412,7 +6436,13 @@ void ATraceCore::RunKickoffProbeStep()
 		// The Core's centre must be ON the surface the placement claimed, within a unit or two.
 		const double Above = FVector(LooseLocation).Z - Surface.Z;
 		const double Wanted = static_cast<double>(TraceModeBTuning::CollisionRadius);
-		if (Pillar == nullptr)
+		if (bOctagonMissing)
+		{
+			// The spawn-point check below would PASS here (the fallback is working as written), which
+			// is exactly the green this must not produce on a level that should have a deck.
+			Fail(TEXT("half start: no centre octagon on a level that should have one, so the Core is not resting on a deck"));
+		}
+		else if (bNoOctagonByDesign)
 		{
 			// No deck: the placement is the arena's spawn point and the Core is on its way down to the
 			// pedestal under it. ATraceCore's own "already home" tolerance is the honest bar - inside
