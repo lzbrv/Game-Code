@@ -4853,9 +4853,13 @@ FVector ATraceCore::GetHalfStartCoreSurface(const UWorld* World, AActor** OutPil
 	const ATraceArenaBuilder* Arena = (World != nullptr) ? ATraceArenaBuilder::Get(World) : nullptr;
 
 	// The fallback, resolved first so every early return has one: exactly where the Core started
-	// before DEMO 29 §3 — the placed ATraceCoreSpawn marker if the level has one, otherwise the top
-	// of the centre pedestal. Already a Core CENTRE rather than a surface, so the caller's radius is
-	// backed off it to keep this function's contract ("a face to rest on") true for both answers.
+	// before DEMO 29 §3 — the placed ATraceCoreSpawn marker if the level has one, otherwise just above
+	// the centre pedestal. Already a Core CENTRE rather than a surface, so the caller's radius is
+	// backed off it and the Core is placed exactly where it always spawned. NOTE that this is NOT a
+	// face to rest on: the derived spawn point stands CoreDropHeight (90 uu) above the pedestal, so on
+	// a level with no octagon (the procedural /Game/Maps/Arena) the half-start Core drops the last few
+	// uu onto the pedestal, as it did before DEMO 29. Trace.Core.KickoffProbe skips its two "at rest
+	// on the deck" checks there for that reason.
 	const FVector Fallback = (Arena != nullptr)
 		? (Arena->GetCoreSpawnLocation() - FVector(0.0, 0.0, static_cast<double>(TraceModeBTuning::CollisionRadius)))
 		: FVector::ZeroVector;

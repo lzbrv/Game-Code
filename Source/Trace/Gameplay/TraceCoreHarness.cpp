@@ -6359,7 +6359,26 @@ void ATraceCore::RunKickoffProbeStep()
 		}
 		Pass(TEXT("half start: the Core is loose and held by nobody"));
 
-		if (!bLooseAtRest)
+		// THE DECK, looked up FIRST, because two of the checks below only mean something when there
+		// is one. GetHalfStartCoreSurface() falls back, on a level with no centre octagon (the
+		// procedural /Game/Maps/Arena is one), to where the Core always spawned before DEMO 29:
+		// ATraceArenaBuilder::GetCoreSpawnLocation(), which stands CoreDropHeight above the pedestal
+		// so the Core drops the last few uu onto it. That is a point in the air, not a deck, so
+		// "at rest on the deck" was a FAIL there on every build since the probe was written - the
+		// 38400 x 9600 build before the 2026-10-04 resize reads the identical 12 passed / 2 FAILED /
+		// 1 skipped. Those two checks SKIP on such a level, like the climb, and one check that DOES
+		// mean something there replaces them: the Core went back to the arena's own spawn point.
+		AActor* Pillar = nullptr;
+		const FVector Surface = ATraceCore::GetHalfStartCoreSurface(World, &Pillar);
+		const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World);
+		const double FloorZ = (Arena != nullptr) ? Arena->GetFieldBounds().Min.Z : 0.0;
+		const double Climb = Surface.Z - FloorZ;
+
+		if (Pillar == nullptr)
+		{
+			Skip(TEXT("half start: no centre octagon, so no deck for the Core to be at rest on (it drops onto the pedestal, as before DEMO 29)"));
+		}
+		else if (!bLooseAtRest)
 		{
 			Fail(TEXT("half start: the Core should be AT REST on the deck, not falling"));
 		}
@@ -6371,12 +6390,6 @@ void ATraceCore::RunKickoffProbeStep()
 		// THE CLIMB, measured rather than asserted by eye. The deck height is the whole of "teams must
 		// climb up", and it is a property of the LEVEL — so a level with no pillar is reported as a
 		// skip, not as a failure of this code.
-		AActor* Pillar = nullptr;
-		const FVector Surface = ATraceCore::GetHalfStartCoreSurface(World, &Pillar);
-		const ATraceArenaBuilder* Arena = ATraceArenaBuilder::Get(World);
-		const double FloorZ = (Arena != nullptr) ? Arena->GetFieldBounds().Min.Z : 0.0;
-		const double Climb = Surface.Z - FloorZ;
-
 		if (Pillar == nullptr)
 		{
 			Skip(TEXT("half start: this level has no centre octagon, so there is nothing to climb"));
@@ -6399,7 +6412,26 @@ void ATraceCore::RunKickoffProbeStep()
 		// The Core's centre must be ON the surface the placement claimed, within a unit or two.
 		const double Above = FVector(LooseLocation).Z - Surface.Z;
 		const double Wanted = static_cast<double>(TraceModeBTuning::CollisionRadius);
-		if (FMath::Abs(Above - Wanted) <= 2.0
+		if (Pillar == nullptr)
+		{
+			// No deck: the placement is the arena's spawn point and the Core is on its way down to the
+			// pedestal under it. ATraceCore's own "already home" tolerance is the honest bar - inside
+			// it the Core will not even bother re-parking itself.
+			const FVector Home = (Arena != nullptr) ? Arena->GetCoreSpawnLocation() : FVector::ZeroVector;
+			const double FromHome = FVector::Dist(FVector(LooseLocation), Home);
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[KickoffProbe]   (no octagon: Core at %s, the arena's spawn point %s, %.1f uu apart)"),
+				*FVector(LooseLocation).ToCompactString(), *Home.ToCompactString(), FromHome);
+			if (Arena != nullptr && FromHome * FromHome <= TraceCoreTuning::HomeToleranceSq)
+			{
+				Pass(TEXT("half start: with no octagon the Core is back at the arena's own spawn point"));
+			}
+			else
+			{
+				Fail(TEXT("half start: with no octagon the Core should be back at the arena's own spawn point"));
+			}
+		}
+		else if (FMath::Abs(Above - Wanted) <= 2.0
 			&& FVector::DistSquaredXY(FVector(LooseLocation), Surface) <= 4.0)
 		{
 			Pass(TEXT("half start: the Core sits exactly one collision radius above the pillar's deck"));
