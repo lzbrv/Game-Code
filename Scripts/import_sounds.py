@@ -202,19 +202,23 @@ LOOPING_STEMS = {
 # last sample back to the first, the output dropped to near zero in 1-2
 # samples, stayed there for about 1 ms and took about 10 ms to come back. That
 # is a tick and a dip at every wrap, whatever the WAV's own seam is like
-# (measured on the mixer's output, 2026-10-05). PCM does not do this. It also
-# leaves the owner's samples unchanged in game: no lossy re-encode at all.
-# The cost is size. MusicTitle is 20.5 MB as PCM, several times what the lossy
-# BINKA made of it. Its loading behaviour is unchanged, so it still streams and
-# is not held in memory whole.
+# (measured on the mixer's output, 2026-10-05 and 2026-10-06, for both stems
+# below). PCM does not do this. It also leaves the WAV's samples unchanged in
+# game: no lossy re-encode at all.
+# The cost is size, before any pak compression. As PCM, MusicTitle is 20.5 MB
+# and AmbienceMatch 8.47 MB (seconds x 44.1 kHz x 2 ch x 2 bytes). BINKA made
+# AmbienceMatch 0.73 MB, so PCM is about 11.6 times that; MusicTitle's BINKA
+# size was not measured. Their loading behaviour is unchanged, so they still
+# stream and are not held in memory whole.
 #
 # Only stems whose .uasset the owner has locked and asked to have fixed belong
-# here. AmbienceMatch has the same problem at its 48 s wrap, but adding it
-# changes S_AmbienceMatch, so it is the owner's call. Taking a stem OUT of this
-# set does not change it back: replace_existing reuses the asset, so set its
-# compression to Project Defined by hand.
+# here. The four ability loops (MacePullLoop, RoxieRocketLoop, LilyZipLoop,
+# RoccoRideLoop) are still BINKA; their wraps have not been measured. Taking a
+# stem OUT of this set does not change it back: replace_existing reuses the
+# asset, so set its compression to Project Defined by hand.
 PCM_LOOP_STEMS = {
     "MusicTitle",
+    "AmbienceMatch",
 }
 
 # DEMO 29 items 9 and 11 — events that are DECLARED and DELIBERATELY SILENT.
