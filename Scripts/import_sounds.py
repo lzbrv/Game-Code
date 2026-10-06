@@ -713,9 +713,10 @@ def main():
         sys.exit(1)
     else:
         log("")
-        # Scripts\import-sounds.bat reads the editor's log for this exact line (and for
-        # "FAILED" and "ERROR: could not save" above): its absence means the import
-        # never finished. Change the wording in both places or neither.
+        # Scripts/import-sounds.sh and Scripts\import-sounds.bat both read the editor's
+        # log for this exact line (and for "FAILED" and "ERROR: could not save" above):
+        # its absence means the import never finished. Change the wording in all three
+        # files or in none.
         log("done - {0} sound(s) imported and the bank is current.".format(len(imported)))
 
 

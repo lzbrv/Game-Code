@@ -54,6 +54,14 @@
 # Content/Trace/Audio/DA_TraceSoundBank.uasset, which every run re-saves — and that
 # is exactly why --only exists: swapping one sound should not need nine locks.
 #
+# A SAVE THAT FAILS LEAVES THE OLD FILE ON DISK, so "the file exists" proves
+# nothing on a re-import. This script therefore checks before the editor starts
+# that every .uasset this run re-saves is locked (writable), and afterwards
+# believes import_sounds.py's own verdict in the editor's log, not just the
+# files: no "done" line, or any error it reported (a save that failed, a
+# PCM_LOOP_STEMS sound whose compression could not be set to PCM, an --only name
+# with no WAV), is a failed run and exits 1. Scripts/import-sounds.bat does the same.
+#
 # YOU DO NOT NEED TO RUN THIS TO PLAY. All outputs are committed, exactly like the
 # font atlas and the railgun.
 # ==============================================================================
@@ -64,6 +72,11 @@ set -euo pipefail
 DRY_RUN=0
 LIST_ONLY=0
 ONLY_SOUNDS=""
+
+# The editor's full output, every line. One fixed name that each run overwrites, like
+# %TEMP%\trace-import-sounds.log in Scripts/import-sounds.bat.
+IMPORT_LOG="${TMPDIR:-/tmp}"
+IMPORT_LOG="${IMPORT_LOG%/}/trace-import-sounds.log"
 
 usage() {
     cat <<EOF
@@ -93,6 +106,13 @@ AFTER RUNNING (no C++ rebuild: the game asks the bank, and the bank is data)
   The editor and the Scripts/run-*.sh games pick it up on their next launch;
   Trace.Audio.Reload picks it up in one that is running. Packaged builds keep
   the old sound until ./Scripts/package.sh re-cooks them.
+
+THE RESULT
+  Exit 0 only when import_sounds.py says it finished with no errors AND every
+  file is on disk. Any '[Trace] ERROR' line means exit 1, even if every file is
+  listed ok: on a re-import the file can be the OLD one. The terminal shows the
+  [Trace] lines and the editor's own errors; the full output is in
+  ${IMPORT_LOG} (each run overwrites it).
 
 IN GAME (drop -nosound, or none of this is audible)
   Trace.Audio.Report      every event: side, which asset it resolved to, the device
@@ -173,8 +193,9 @@ else
     MANIFEST_STATUS=$?
     set -e
     if [ "$MANIFEST_STATUS" != "0" ]; then
-        trace_warn "The manifest reported a problem (exit ${MANIFEST_STATUS}). Continuing — the"
-        trace_warn "'Verifying' block at the end is what decides whether this run worked."
+        trace_warn "The manifest reported a problem (exit ${MANIFEST_STATUS}). Continuing: the editor"
+        trace_warn "still imports every sound that is fine. But the editor run makes the same checks,"
+        trace_warn "so expect it to report the same problem and this run to end with exit 1."
     fi
 fi
 
@@ -256,12 +277,35 @@ fi
 
 # THE EXIT CODE OF THE COMMANDLET IS NOT THE RESULT OF THE RUN — it is non-zero if
 # ANY error was logged in the whole session, including engine warnings raised at
-# startup that have nothing to do with this. What reached disk, below, is the
-# authoritative check. (Same reasoning as Scripts/import-font-atlas.sh and
-# Scripts/import-railgun.sh.)
+# startup that have nothing to do with this. So it is ignored. What decides is what
+# import_sounds.py says in the log, and then what reached disk, below.
+#
+# All of the editor's output goes to IMPORT_LOG, and the terminal shows the lines
+# that matter: import_sounds.py's own [Trace] lines, and the editor's errors that
+# mean it never got that far — a Python traceback (LogPython: Error), a crash, a
+# Trace module missing or built for another engine version (a pull changed C++ and
+# Scripts/build.sh has not run), a commandlet it cannot find. These are the same
+# lines Scripts/import-sounds.bat shows.
+: > "$IMPORT_LOG" || trace_die "Cannot write the editor's log: ${IMPORT_LOG}"
+trace_msg "The editor runs headless now. Its full output: ${IMPORT_LOG}"
 set +e
-"$CMD_BIN" "${ARGS[@]}" 2>&1 | grep -E '\[Trace\]|LogPythonScriptCommandlet' || true
+"$CMD_BIN" "${ARGS[@]}" 2>&1 | tee "$IMPORT_LOG" \
+    | grep -F -e '[Trace]' -e 'LogPythonScriptCommandlet' -e 'LogPython: Error' \
+              -e 'Fatal error' -e 'Critical error' -e 'missing module' \
+              -e 'built with a different engine version' -e 'looked like a commandlet'
 set -e
+
+# import_sounds.py's verdict, read from the log. It prints "done - N sound(s)
+# imported" only when nothing failed, "FAILED" when anything did, and "ERROR: could
+# not save" for each asset that did not reach the disk. Those three strings are a
+# contract with import_sounds.py (see the comment above its "done" line), shared
+# with Scripts/import-sounds.bat.
+PY_DONE=0
+PY_FAILED=0
+PY_UNSAVED=0
+if grep -qF '[Trace] done - ' "$IMPORT_LOG"; then PY_DONE=1; fi
+if grep -qF '[Trace] FAILED' "$IMPORT_LOG"; then PY_FAILED=1; fi
+if grep -qF '[Trace] ERROR: could not save' "$IMPORT_LOG"; then PY_UNSAVED=1; fi
 
 # ------------------------------------------------------------------------------
 # 3. Verify what landed
@@ -297,6 +341,33 @@ if [ "$MISSING" != "0" ]; then
     trace_err "    cannot both write Content/Trace/Audio."
     trace_err "  * the .uasset is checked out read-only (it is 'lockable' in .gitattributes) —"
     trace_err "    run Scripts/lock.sh on the file first."
+    trace_err "Full editor log: ${IMPORT_LOG}"
+    exit 1
+fi
+# The files are all there, but on a re-import that proves nothing: a save that failed
+# leaves the OLD file in place. So the log's verdict decides from here.
+if [ "$PY_UNSAVED" = "1" ]; then
+    trace_err "The editor could not save every asset - the 'could not save' lines above. A file"
+    trace_err "listed ok may still be the OLD one. Lock the file (Scripts/lock.sh), close any"
+    trace_err "Unreal editor or game that has it loaded, and run this again. (A 'SystemExit: 1'"
+    trace_err "traceback above is import_sounds.py's own exit 1, not a crash.)"
+    trace_err "Full editor log: ${IMPORT_LOG}"
+    exit 1
+fi
+if [ "$PY_FAILED" = "1" ]; then
+    trace_err "import_sounds.py reported errors - the '[Trace] ERROR' lines above. A file listed"
+    trace_err "ok may still be the OLD one. (A 'SystemExit: 1' traceback above is import_sounds.py's"
+    trace_err "own exit 1, not a crash.) Full editor log: ${IMPORT_LOG}"
+    exit 1
+fi
+if [ "$PY_DONE" = "0" ]; then
+    trace_err "import_sounds.py never said it finished, so the files listed ok are most likely the"
+    trace_err "OLD ones: the editor stopped before or during the import. The usual causes:"
+    trace_err "  * the Trace editor module is missing or out of date - a pull changed C++."
+    trace_err "    Run ./Scripts/build.sh, then this again."
+    trace_err "  * a Python error or an editor crash - see any 'LogPython: Error', 'Fatal error'"
+    trace_err "    or 'Critical error' lines above."
+    trace_err "Full editor log: ${IMPORT_LOG}"
     exit 1
 fi
 
