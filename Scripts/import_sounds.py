@@ -211,6 +211,13 @@ LOOPING_STEMS = {
 # size was not measured. Their loading behaviour is unchanged, so they still
 # stream and are not held in memory whole.
 #
+# AmbienceMatch HAS NOT PLAYED IN GAME SINCE 2026-10-07: the owner asked to
+# "remove ambient match track", so bMatchAmbienceEnabled=False refuses it (see
+# UTraceAudioSettings in Source/Trace/Audio/TraceSoundBank.h). Its .uasset was
+# left exactly as b308d29 imported it, still PCM and still about 8.5 MB, so the
+# switch can bring it back unchanged. Deleting it or re-compressing it is the
+# owner's call; nothing here does either.
+#
 # Only stems whose .uasset the owner has locked and asked to have fixed belong
 # here. The four ability loops (MacePullLoop, RoxieRocketLoop, LilyZipLoop,
 # RoccoRideLoop) are still BINKA; their wraps have not been measured. Taking a

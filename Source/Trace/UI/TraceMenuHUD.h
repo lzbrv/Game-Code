@@ -272,6 +272,12 @@ public:
 	void DebugJoin(const FString& Address);
 
 	/**
+	 * Trace.Music.Verify: press PLAY. The same StartMatch() the PLAY row and -TraceAutoPlay call, so
+	 * the match it starts is the one a player gets. Dev only.
+	 */
+	void DebugStartMatch() { StartMatch(); }
+
+	/**
 	 * Trace.Menu.FailureVerify: where the failure banner and its neighbours landed on the last frame,
 	 * from whichever renderer drew it (the widget's Slate layout, or this Canvas's own draw record).
 	 */

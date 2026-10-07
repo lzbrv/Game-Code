@@ -11,6 +11,7 @@
 #include "Sound/SoundBase.h"
 
 #include "Audio/TraceSoundBank.h"
+#include "Audio/TraceSoundEvents.h"   // AmbienceMatch — the one track with a switch of its own
 #include "Settings/TraceUserSettings.h"   // UI plan WP3 - the player's master and music faders
 #include "Trace.h"
 
@@ -87,6 +88,46 @@ namespace TraceMusicFile
 		}
 		return UTraceAudioSettings::Get().bMusicBedsEnabled;
 	}
+
+	// =============================================================================================
+	// *** THE MATCH AMBIENCE'S OWN SWITCH. *** Off since 2026-10-07: the owner asked to "remove
+	// ambient match track". bMatchAmbienceEnabled=False in the ini and the header.
+	// =============================================================================================
+	//
+	// The same three-state shape as Trace.Music.Beds, for the same reason (a plain bool cvar would
+	// shadow the config line):
+	//
+	//     -1  follow UTraceAudioSettings::bMatchAmbienceEnabled   (the default — no opinion)
+	//      0  force the match ambience off
+	//      1  force it on
+	//
+	// A SEPARATE SWITCH, NOT A SECOND MEANING OF THE BEDS ONE: the owner wanted the match ambience
+	// gone and the title music kept, and bMusicBedsEnabled cannot say that. It sits UNDER the beds
+	// switch — "1" here does not override `Trace.Music.Beds 0` — so there is still exactly one line
+	// that silences all music.
+	//
+	// READ WHEN Play(AmbienceMatch) IS CALLED, which is the match HUD's BeginPlay. Typed mid-match it
+	// takes effect at the next match (or the next half-time HUD), the same way Trace.Music.Beds only
+	// acts on the next Play(). The results screen's Stop(0.5f) ends a running ambience either way.
+	int32 GMatchAmbienceOverride = -1;
+	FAutoConsoleVariableRef CVarMatchAmbience(
+		TEXT("Trace.Music.Ambience"),
+		GMatchAmbienceOverride,
+		TEXT("The in-match ambience loop (AmbienceMatch), off since 2026-10-07. -1 = follow ")
+		TEXT("bMatchAmbienceEnabled in Config/DefaultGame.ini (the default), 0 = force off, 1 = force on. ")
+		TEXT("Read when the next match starts. Still needs the beds on (Trace.Music.Beds); the title ")
+		TEXT("music, stingers and every other sound are unaffected."),
+		ECVF_Default);
+
+	/** True when AmbienceMatch may play, beds switch aside. Play() asks BedsEnabled() first. */
+	bool MatchAmbienceEnabled()
+	{
+		if (GMatchAmbienceOverride >= 0)
+		{
+			return GMatchAmbienceOverride != 0;
+		}
+		return UTraceAudioSettings::Get().bMatchAmbienceEnabled;
+	}
 }
 
 bool UTraceMusicSubsystem::AreBedsEnabled()
@@ -95,6 +136,13 @@ bool UTraceMusicSubsystem::AreBedsEnabled()
 	// gate has to be file-local (it is the thing Play() consults) and the ANSWER has to be readable
 	// from outside (the results-screen log has to be able to say "the beds are off" truthfully).
 	return TraceMusicFile::BedsEnabled();
+}
+
+bool UTraceMusicSubsystem::IsMatchAmbienceEnabled()
+{
+	// Both switches, because that is the question a caller means: "will Play(AmbienceMatch) start
+	// anything?" The full-time log line and Trace.Music.Verify read this; Play() reads the two parts.
+	return TraceMusicFile::BedsEnabled() && TraceMusicFile::MatchAmbienceEnabled();
 }
 
 float UTraceMusicSubsystem::DesiredGain()
@@ -184,6 +232,32 @@ void UTraceMusicSubsystem::Play(FName Track, float FadeSeconds)
 	// and it costs nothing on the ordinary path because Stop() early-returns when nothing plays.
 	if (!TraceMusicFile::BedsEnabled())
 	{
+		Stop(FadeSeconds);
+		return;
+	}
+
+	// ---- THE MATCH AMBIENCE IS SWITCHED OFF (TraceMusicFile::MatchAmbienceEnabled, above) -------
+	//
+	// The owner's 2026-10-07 "remove ambient match track". Same shape as the beds gate and for the
+	// same reasons: before any state is touched, and Stop() rather than a bare return.
+	//
+	// THE Stop() IS WHAT THE PLAYER HEARS AT PLAY. This call comes from the match HUD's BeginPlay
+	// while MusicTitle is still up from the menu. It used to cross-fade MusicTitle out over
+	// FadeSeconds while the ambience rose; now the outgoing half of that cross-fade is all that is
+	// left — the title fades out over the same 0.8 s and nothing replaces it. A bare return would
+	// have carried the title music into the match. CurrentTrack ends at NAME_None, so the results
+	// screen's Stop(0.5f) has nothing to stop and its Play(MusicTitle) starts the bed as before.
+	if (Track == TraceSoundEvents::AmbienceMatch && !TraceMusicFile::MatchAmbienceEnabled())
+	{
+		const FString Outgoing = CurrentTrack.IsNone()
+			? FString(TEXT("no bed was playing"))
+			: FString::Printf(TEXT("'%s' fades out over %.2fs"), *CurrentTrack.ToString(), FMath::Max(0.f, FadeSeconds));
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[Music] '%s' not started: the match ambience is switched off (bMatchAmbienceEnabled=%s, "
+			     "Trace.Music.Ambience %d); %s."),
+			*Track.ToString(),
+			UTraceAudioSettings::Get().bMatchAmbienceEnabled ? TEXT("True") : TEXT("False"),
+			TraceMusicFile::GMatchAmbienceOverride, *Outgoing);
 		Stop(FadeSeconds);
 		return;
 	}

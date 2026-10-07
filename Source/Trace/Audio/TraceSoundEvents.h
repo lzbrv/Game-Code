@@ -386,7 +386,7 @@ namespace TraceSoundEvents
 	// ---------------------------------------------------------------------------------------------
 	// RELEASE FX/AUDIO PLAN §5.1 — MUSIC (family Music, the MusicVolumeScale hook). All Client 2D.
 	// MusicTitle and AmbienceMatch LOOP and are played by UTraceMusicSubsystem (TraceMusicPlayer.h),
-	// never by TraceAudio::Play.
+	// never by TraceAudio::Play. AmbienceMatch is switched off (bMatchAmbienceEnabled) since 2026-10-07.
 	// ---------------------------------------------------------------------------------------------
 
 	/** Match end, your team won. */
@@ -398,7 +398,15 @@ namespace TraceSoundEvents
 	/** The title-screen music LOOP (64 s). Streams — never force-inlined at import. */
 	TRACE_API extern const FName MusicTitle;
 
-	/** The in-match ambience LOOP (48 s). Streams — never force-inlined at import. */
+	/**
+	 * The in-match ambience LOOP (48 s). Streams — never force-inlined at import.
+	 *
+	 * *** NOT PLAYED IN GAME SINCE 2026-10-07 *** (the owner: "remove ambient match track").
+	 * UTraceAudioSettings::bMatchAmbienceEnabled is False, so UTraceMusicSubsystem::Play refuses it
+	 * and no bed plays during a match. Still declared, imported and resolvable, so Trace.Audio.Report
+	 * and Trace.Audio.Probe still count it; bMatchAmbienceEnabled=True or `Trace.Music.Ambience 1`
+	 * brings it back.
+	 */
 	TRACE_API extern const FName AmbienceMatch;
 
 	/** The whole table, in the spec's order. */

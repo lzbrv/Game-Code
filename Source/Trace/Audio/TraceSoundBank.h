@@ -266,12 +266,16 @@ public:
 	// *** THE TWO MUSIC BEDS ARE ON (AGAIN). THIS IS THE SWITCH THAT TURNS THEM OFF.
 	// =============================================================================================
 	//
-	// True plays MusicTitle (the title/results loop) and AmbienceMatch (the in-match loop). They
+	// True plays MusicTitle (the title/results loop) and allows AmbienceMatch (the in-match loop),
+	// which since 2026-10-07 ALSO needs bMatchAmbienceEnabled below and is off. They
 	// were OFF from 2026-09-04 (3f97019: the owner asked for them to stop "until further notice";
 	// no technical reason was given) and came back ON on 2026-10-05, again at the owner's request.
 	// TO TURN THEM OFF AGAIN: set this to False here AND in Config/DefaultGame.ini under
 	// [/Script/Trace.TraceAudioSettings] (the ini wins over this default, and the two are kept the
 	// same by house rule), or at runtime with `Trace.Music.Beds 0`. No code has to change.
+	//
+	// THIS IS THE MASTER SWITCH FOR BOTH BEDS. False silences MusicTitle AND AmbienceMatch whatever
+	// bMatchAmbienceEnabled says; bMatchAmbienceEnabled only ever takes the match ambience away.
 	//
 	// WHAT THIS DOES AND DOES NOT SILENCE. It gates UTraceMusicSubsystem::Play, which is the ONLY
 	// thing that plays a bed — a persistent looping 2D component, started from three call sites
@@ -300,6 +304,30 @@ public:
 	// degrades to "the stinger plays", not to "half a fade against silence".
 	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Music Beds Enabled (title + match loops)"))
 	bool bMusicBedsEnabled = true;
+
+	// =============================================================================================
+	// *** THE MATCH AMBIENCE (AmbienceMatch) IS OFF. THIS IS THE ONE SWITCH THAT BRINGS IT BACK.
+	// =============================================================================================
+	//
+	// The owner asked on 2026-10-07 to "remove ambient match track". So no music bed plays during a
+	// match: at PLAY the title music fades out over 0.8 s and nothing fades in. The title music
+	// (MusicTitle) on the menu and under the results screen, the stingers and every other sound are
+	// exactly as they were. TO BRING THE AMBIENCE BACK: set this to True here AND in
+	// Config/DefaultGame.ini under [/Script/Trace.TraceAudioSettings] (the ini wins; the two are kept
+	// the same by house rule), or type `Trace.Music.Ambience 1` before a match starts.
+	//
+	// A SWITCH, NOT A DELETION. Nothing was removed: the event is still declared and resolvable
+	// (Trace.Audio.Report counts it), the asset /Game/Trace/Audio/S_AmbienceMatch is still imported
+	// (as PCM, about 8.5 MB, since b308d29), the match HUD still calls Play(AmbienceMatch), and the
+	// sound test page still plays it, marked OFF. UTraceMusicSubsystem::Play is what refuses it: it
+	// fades out whatever bed is playing over the same 0.8 s the cross-fade used, starts nothing, and
+	// leaves GetCurrentTrack() at NAME_None, so the results screen's Stop(0.5f) finds nothing to stop
+	// and the title music still rises under the stinger as before.
+	//
+	// UNDER bMusicBedsEnabled, NEVER OVER IT. Both have to be True for the ambience to play. This
+	// one cannot switch the title music on or off.
+	UPROPERTY(config, EditAnywhere, Category = "Trace|Audio", meta = (DisplayName = "Match Ambience Enabled (AmbienceMatch, the in-match loop)"))
+	bool bMatchAmbienceEnabled = false;
 
 	/**
 	 * SPEC v29 §1c — how long without firing resets the pistol ladder to PistolShoot1.

@@ -1204,11 +1204,13 @@ void ATraceHUD::BeginPlay()
 	// Menu -> match is therefore a CROSS-FADE, not a cut: MusicTitle is still playing when this
 	// runs, and Play() fades one into the other over its default 0.8 s.
 	//
-	// *** ALL OF THAT IS THE BEHAVIOUR WITH THE BEDS ON, WHICH THEY ARE (since 2026-10-05). *** From
-	// 2026-09-04 the owner had both beds off (3f97019, UTraceAudioSettings::bMusicBedsEnabled=False)
-	// and this Play() started nothing. The line stayed here, unconditional, so flipping that one
-	// config line back to True restored everything the paragraphs above describe with no code
-	// change. `Trace.Music.Beds 0`, or the flag at False, silences it again.
+	// *** THE MATCH AMBIENCE IS SWITCHED OFF (since 2026-10-07), SO THIS PLAY() STARTS NOTHING. ***
+	// The owner asked to "remove ambient match track": UTraceAudioSettings::bMatchAmbienceEnabled is
+	// False, and Play(AmbienceMatch) only does the outgoing half of the cross-fade above — MusicTitle
+	// fades out over 0.8 s and no bed plays during the match. The line stays here, unconditional,
+	// for the same reason it stayed through the 2026-09-04..10-05 beds-off period (3f97019): one
+	// config line (bMatchAmbienceEnabled=True) or `Trace.Music.Ambience 1` restores everything the
+	// paragraphs above describe with no code change. `Trace.Music.Beds 0` still silences every bed.
 	if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(this))
 	{
 		Music->Play(TraceSoundEvents::AmbienceMatch);
@@ -7220,11 +7222,18 @@ void ATraceHUD::DrawMatchResult()
 		// `Trace.Music.Beds 1` mid-match (after the match HUD's BeginPlay had already been refused)
 		// printed "music beds are off" here and then started MusicTitle 1.9 s later, contradicting
 		// itself inside one log. So the switch is read from the switch.
+		//
+		// AND SINCE 2026-10-07 THERE IS A THIRD FACT: the beds are on but the MATCH AMBIENCE is
+		// switched off (bMatchAmbienceEnabled), which is now the ordinary case, not an anomaly. Left
+		// to the old two branches it would have printed "nothing had started one" at the end of every
+		// match, which reads like a bug report about a deliberate setting.
 		const bool bBedsEnabled = UTraceMusicSubsystem::AreBedsEnabled();
+		const bool bAmbienceSwitchOn = UTraceMusicSubsystem::IsMatchAmbienceEnabled();
 		const TCHAR* const BedState =
-			bBedWasPlaying  ? TEXT("ambience stopped (0.5s)")
-			: bBedsEnabled  ? TEXT("no ambience was playing, though the beds are ENABLED — nothing had started one")
-			                : TEXT("no ambience was playing (the music beds are disabled)");
+			bBedWasPlaying       ? TEXT("ambience stopped (0.5s)")
+			: !bBedsEnabled      ? TEXT("no ambience was playing (the music beds are disabled)")
+			: !bAmbienceSwitchOn ? TEXT("no ambience was playing (the match ambience is switched off: bMatchAmbienceEnabled)")
+			                     : TEXT("no ambience was playing, though the beds are ENABLED — nothing had started one");
 
 		bool bStingerPlayed = false;
 		FName StingerEvent = NAME_None;
@@ -7325,8 +7334,14 @@ void ATraceHUD::DrawMatchResult()
 	// track, so the bool is belt-and-braces rather than the only guard — but it also keeps this out
 	// of the subsystem entirely on the other ~800 frames of the results screen.
 	//
+	// WITH THE MATCH AMBIENCE SWITCHED OFF (the shipped state since 2026-10-07 — see the block at
+	// the AmbienceMatch call site) the Stop(0.5f) above finds nothing playing and returns, the
+	// stinger plays as before, and this Play() brings MusicTitle up under its tail exactly as it did
+	// when it was cross-fading out of the ambience: the results screen and the trip back to the menu
+	// sound the same, only the match before them has no bed.
+	//
 	// WITH THE BEDS DISABLED (not the shipped state since 2026-10-05, but one flag or
-	// `Trace.Music.Beds 0` away — see the block at the AmbienceMatch call site) this
+	// `Trace.Music.Beds 0` away) this
 	// whole sequence degrades cleanly rather than half-running: the Stop(0.5f) above finds nothing
 	// playing and returns, the stinger is untouched because it does not go through this subsystem,
 	// and this Play() starts nothing. There is no fade left hanging against silence, because there

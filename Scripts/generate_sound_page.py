@@ -70,6 +70,13 @@
 #                                a Demo 35-retired code path plays, with the
 #                                cvar that brings the path back. The cvar must
 #                                exist in Source/ or generation fails.
+#   OFF                          SETTING_SWITCHES: a sound a UTraceAudioSettings
+#                                bool keeps out of the game (AmbienceMatch since
+#                                2026-10-07, bMatchAmbienceEnabled). The value
+#                                is read from Config/DefaultGame.ini and must
+#                                match the header default in TraceSoundBank.h;
+#                                the switch must still be read in
+#                                TraceMusicPlayer.cpp, and its cvar declared.
 #
 # An "ability-looking" sound - its WAV is under Art/Sounds/Abilities/, its stem
 # starts with a kit name (TraceCharacterIdToString), or every one of its call
@@ -126,6 +133,9 @@ EVENTS_CPP = os.path.join(ROOT, "Source", "Trace", "Audio", "TraceSoundEvents.cp
 ABILITY_TYPES_CPP = os.path.join(ROOT, "Source", "Trace", "Abilities", "TraceAbilityTypes.cpp")
 GENERATOR_PY = os.path.join(HERE, "generate_sounds.py")
 SOURCE_DIR = os.path.join(ROOT, "Source")
+DEFAULT_GAME_INI = os.path.join(ROOT, "Config", "DefaultGame.ini")
+SOUND_BANK_H = os.path.join(ROOT, "Source", "Trace", "Audio", "TraceSoundBank.h")
+MUSIC_PLAYER_CPP = "Source/Trace/Audio/TraceMusicPlayer.cpp"
 DEFAULT_OUT = os.path.join(SOUND_DIR, "sound-test.html")
 
 # Stems embedded as a short preview instead of whole. See the header.
@@ -148,6 +158,9 @@ CALLSITE_EXCLUDE = (
     "Source/Trace/Audio/TraceAudioVerify.",
     "Source/Trace/Audio/TraceAudioLoudness.",
     "Source/Trace/Audio/TraceMusicPlayer.h",
+    # The music player itself: it plays whatever track a HUD asks for and names no event, except
+    # AmbienceMatch in the gate that REFUSES it (bMatchAmbienceEnabled). That line is not a trigger.
+    "Source/Trace/Audio/TraceMusicPlayer.cpp",
 )
 HARNESS_FILE_RE = re.compile(r"(Verify|Test|Integ|Harness)[^/]*\.(cpp|h)$")
 # A scope (namespace / function / console command) whose name says it is a harness.
@@ -254,6 +267,73 @@ def parse_unwired():
         error("Trace.Audio.UnwiredEvents is no longer declared in TraceSoundEvents.cpp - the page "
               "tells the owner to use it to bring the SILENT sounds back")
     return {n: reasons.get(n, "") for n in names}
+
+
+# Sounds a SETTING can keep out of the game. Each switch is (setting, cvar, gate): a bool on
+# UTraceAudioSettings (Source/Trace/Audio/TraceSoundBank.h, the house rule keeps its default equal
+# to Config/DefaultGame.ini, and the ini wins), the console override that forces it, and the line
+# in UTraceMusicSubsystem::Play (TraceMusicPlayer.cpp) that refuses the sound while it is off. A
+# sound plays only while EVERY switch on its list is on; a row whose switch is off is marked OFF.
+MUSIC_BEDS_SWITCH = ("bMusicBedsEnabled", "Trace.Music.Beds",
+                     r"if \(!TraceMusicFile::BedsEnabled\(\)\)")
+MATCH_AMBIENCE_SWITCH = ("bMatchAmbienceEnabled", "Trace.Music.Ambience",
+                         r"Track == TraceSoundEvents::AmbienceMatch && !TraceMusicFile::MatchAmbienceEnabled\(\)")
+SETTING_SWITCHES = {
+    "MusicTitle": [MUSIC_BEDS_SWITCH],
+    "AmbienceMatch": [MUSIC_BEDS_SWITCH, MATCH_AMBIENCE_SWITCH],
+}
+
+
+def parse_audio_switches():
+    """
+    {setting: True/False} for every setting SETTING_SWITCHES names, as the GAME sees it: the value
+    in Config/DefaultGame.ini under [/Script/Trace.TraceAudioSettings]. Errors when the ini or the
+    header lacks it, when the two disagree, when nothing in TraceMusicPlayer.cpp reads it (the page
+    would be naming a switch that switches nothing), or when its cvar is gone.
+    """
+    wanted = sorted({sw for sws in SETTING_SWITCHES.values() for sw in sws})
+    ini_values, in_section = {}, False
+    try:
+        for raw in read_text(DEFAULT_GAME_INI).splitlines():
+            line = raw.strip()
+            if line.startswith("["):
+                in_section = (line == "[/Script/Trace.TraceAudioSettings]")
+                continue
+            if in_section and line and not line.startswith(";") and "=" in line:
+                key, _, value = line.partition("=")
+                ini_values[key.strip()] = value.strip()
+    except OSError:
+        error("Config/DefaultGame.ini is missing - no sound can be shown as OFF")
+        return {}
+    header = read_text(SOUND_BANK_H)
+    player = read_text(os.path.join(ROOT, MUSIC_PLAYER_CPP))
+    out = {}
+    for setting, cvar, gate in wanted:
+        hm = re.search(r"\bbool\s+" + re.escape(setting) + r"\s*=\s*(true|false)\s*;", header)
+        iv = ini_values.get(setting)
+        if hm is None:
+            error("UTraceAudioSettings has no `bool {0} = ...;` in TraceSoundBank.h".format(setting))
+        if iv is None:
+            error("{0} is not set under [/Script/Trace.TraceAudioSettings] in Config/DefaultGame.ini".format(setting))
+        elif iv.lower() not in ("true", "false"):
+            error("{0}={1} in Config/DefaultGame.ini is not True or False".format(setting, iv))
+            iv = None
+        if hm is not None and iv is not None and (hm.group(1) == "true") != (iv.lower() == "true"):
+            error("{0} is {1} in Config/DefaultGame.ini but {2} in TraceSoundBank.h - the house rule keeps "
+                  "them the same (the game uses the ini's)".format(setting, iv, hm.group(1)))
+        if not re.search(r"\." + re.escape(setting) + r"\b", player):
+            error("nothing in {0} reads {1} any more - the page would call a sound OFF by a switch that "
+                  "switches nothing".format(MUSIC_PLAYER_CPP, setting))
+        if not re.search(r'TEXT\("' + re.escape(cvar) + r'"\)', player):
+            error("{0} is no longer declared in {1} - the page tells the owner to type it".format(cvar, MUSIC_PLAYER_CPP))
+        if not re.search(gate, player):
+            error("the refusal /{0}/ is no longer in {1} - a sound the page calls OFF may be playing "
+                  "again; re-read Play() and fix SETTING_SWITCHES".format(gate, MUSIC_PLAYER_CPP))
+        if iv is not None:
+            out[setting] = (iv.lower() == "true")
+        elif hm is not None:
+            out[setting] = (hm.group(1) == "true")
+    return out
 
 
 def parse_pre_existing():
@@ -1231,7 +1311,7 @@ h3{font-size:15px;margin:18px 0 2px;letter-spacing:.3px}
 .tag.client{color:var(--client);border-color:#4a3d68}
 .tag.new{color:var(--ok);border-color:#2f5e42}
 .tag.orig{color:#78809a;border-color:#333a4a}
-.tag.silent,.tag.retired,.tag.nowire{color:var(--bad);border-color:#6a3330}
+.tag.silent,.tag.retired,.tag.nowire,.tag.off{color:var(--bad);border-color:#6a3330}
 .tag.prev{color:var(--warn);border-color:#5a4327}
 .tag.also{color:var(--dim);border-color:var(--line)}
 .when{color:var(--dim);font-size:12.5px;margin-top:2px}
@@ -1744,6 +1824,11 @@ def build_page(ctx):
                      'the row names the switch that brings it back.</span>'.format(
                          len(retired), ", ".join(e(r["label"]) for r in retired),
                          "it" if len(retired) == 1 else "them"))
+    off = [r for r in rows if r["off"]]
+    if off:
+        notes.append('<span><b>{0} OFF</b> &mdash; {1}: not played in game, switched off in '
+                     '<code>Config/DefaultGame.ini</code>; still playable here. The row names the switch.</span>'.format(
+                         len(off), ", ".join(e(r["label"]) for r in off)))
     nowire = [r for r in rows if not r["sites"]]
     if nowire:
         notes.append('<span><b>{0} NOT WIRED</b> &mdash; {1}: nothing in Source/ plays {2}.</span>'.format(
@@ -1853,6 +1938,8 @@ def render_row(r):
         tags.append('<span class="tag silent">SILENT</span>')
     if r["retired"]:
         tags.append('<span class="tag retired">RETIRED</span>')
+    if r["off"]:
+        tags.append('<span class="tag off">OFF</span>')
     if not r["sites"]:
         tags.append('<span class="tag nowire">NOT WIRED</span>')
     if r["preview"]:
@@ -1872,6 +1959,15 @@ def render_row(r):
                      'it. <code>{1} 1</code> brings it back{2}.</span>'.format(
                          e(r["retired"]["replaced_by"]), e(r["retired"]["cvar"]), e(for_whom)))
         state.append("RETIRED (Demo 35); {0} 1 brings it back{1}".format(r["retired"]["cvar"], for_whom))
+    if r["off"]:
+        offs = " and ".join("<code>{0}=False</code>".format(e(st)) for st, _cv in r["off"])
+        backs = " and ".join("<code>{0}=True</code>".format(e(st)) for st, _cv in r["off"])
+        cvars = " and ".join("<code>{0} 1</code>".format(e(cv)) for _st, cv in r["off"])
+        notes.append('<span class="note bad">Not played in game: {0} in Config/DefaultGame.ini. {1} there '
+                     '(and in TraceSoundBank.h), or {2} in the console, brings it back.</span>'.format(offs, backs, cvars))
+        state.append("OFF in game ({0}; {1} brings it back)".format(
+            ", ".join("{0}=False".format(st) for st, _cv in r["off"]),
+            " + ".join("{0}=True or {1} 1".format(st, cv) for st, cv in r["off"])))
     if not r["sites"]:
         notes.append('<span class="note warn">Nothing in Source/ plays this event.</span>')
         state.append("NOT WIRED: nothing in Source/ plays it")
@@ -2035,6 +2131,11 @@ def main():
     abilities, kits = parse_abilities()
     print("  {0} abilities in GAbilityTable".format(len(abilities)))
     demo35_cvars = find_cvars("Trace.Demo35.")
+    switches = parse_audio_switches()
+    for name in sorted(set(SETTING_SWITCHES) - {r["name"] for r in table}):
+        error("SETTING_SWITCHES names '{0}', which is not in the event table".format(name))
+    for setting, value in sorted(switches.items()):
+        print("  {0} = {1} (Config/DefaultGame.ini)".format(setting, "True" if value else "False"))
 
     wavs = {}
     for path in sorted(glob.glob(os.path.join(SOUND_DIR, "**", "*.wav"), recursive=True)):
@@ -2258,6 +2359,14 @@ def main():
             if group is None:
                 group, where = "other", "Other"
 
+        off = [(st, cv) for st, cv, _gate in SETTING_SWITCHES.get(name, []) if switches.get(st) is False]
+        if off and not spec:
+            for st, _cv, gate_rx in SETTING_SWITCHES[name]:
+                hit = find_anchor(MUSIC_PLAYER_CPP, gate_rx) if switches.get(st) is False else None
+                if hit:
+                    f, line = hit.rsplit(":", 1)
+                    checks.append("switched off at {0}:{1} ({2})".format(os.path.basename(f), line, st))
+
         leak("the label of '{0}'".format(name), label)
         leak("the description of '{0}'".format(name), when)
         if row["name"] in unwired:
@@ -2269,12 +2378,13 @@ def main():
         search = " ".join([name, label, when, relpath, where or "", " ".join(also),
                            "silent unwired" if name in unwired else "",
                            "retired legacy" if retired else "",
+                           "off not played switched" if off else "",
                            "not wired" if not sites else "",
                            "new added" if (pre_existing is not None and name not in pre_existing) else "original"]).lower()
         rows.append({
             "name": name, "side": row["side"], "label": label, "when": when, "where": where,
             "unwired": (unwired.get(name) or "no reason recorded in C++") if name in unwired else "",
-            "retired": retired, "also": also,
+            "retired": retired, "also": also, "off": off,
             "new": pre_existing is not None and name not in pre_existing,
             "group": group, "relpath": relpath,
             "duration": duration, "full_duration": full_duration, "full_mb": full_mb,

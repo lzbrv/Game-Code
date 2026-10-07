@@ -9,7 +9,7 @@
 //     if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(this))
 //     {
 //         Music->Play(TraceSoundEvents::MusicTitle);      // menu HUD BeginPlay
-//         Music->Play(TraceSoundEvents::AmbienceMatch);   // match HUD BeginPlay
+//         Music->Play(TraceSoundEvents::AmbienceMatch);   // match HUD BeginPlay (switched off: see below)
 //         Music->Stop(0.5f);                              // match-end banner site
 //         Music->Play(TraceSoundEvents::MusicTitle, 1.4f); // …and back up under the results screen
 //     }
@@ -33,12 +33,16 @@
 // ONCE per name and plays nothing; no audio device, a dedicated server and a null world are all
 // quiet no-ops. Nothing here can crash a match and nothing here can fill a log.
 //
-// *** BOTH BEDS ARE ON. *** They were switched off from 2026-09-04 (3f97019, the owner's request:
-// UTraceAudioSettings::bMusicBedsEnabled=False, so Play() returned early) and back on 2026-10-05,
-// again at the owner's request, by setting that flag to True in Config/DefaultGame.ini and in the
-// header default. Nothing was unwired while they were off, so the three call sites below and the
-// cross-fades they describe are exactly what came back. `Trace.Music.Beds 0` (or the flag at False)
-// silences both again; see AreBedsEnabled().
+// *** THE TITLE BED IS ON; THE MATCH AMBIENCE IS OFF (since 2026-10-07). *** Both beds were
+// switched off from 2026-09-04 (3f97019, the owner's request: UTraceAudioSettings::bMusicBedsEnabled
+// =False, so Play() returned early) and back on 2026-10-05, again at the owner's request, by setting
+// that flag to True in Config/DefaultGame.ini and in the header default. On 2026-10-07 the owner
+// asked to "remove ambient match track", so AmbienceMatch has its own switch,
+// UTraceAudioSettings::bMatchAmbienceEnabled, now False: Play(AmbienceMatch) fades out whatever bed
+// is up and starts nothing. Nothing was unwired either time, so the three call sites below still
+// run as described, and bMatchAmbienceEnabled=True (or `Trace.Music.Ambience 1`) puts the match
+// ambience back. `Trace.Music.Beds 0` (or bMusicBedsEnabled=False) silences both beds; see
+// AreBedsEnabled() and IsMatchAmbienceEnabled().
 //
 // The stingers are NOT beds and the switch never affected them — they never went through this
 // subsystem.
@@ -48,7 +52,9 @@
 // repeatedly fooled itself):
 //
 //   ATraceMenuHUD::BeginPlay   -> Play(MusicTitle)      — and by then usually a NO-OP; see below
-//   ATraceHUD::BeginPlay       -> Play(AmbienceMatch)   — cross-fades out of MusicTitle
+//   ATraceHUD::BeginPlay       -> Play(AmbienceMatch)   — with the ambience on, cross-fades out of
+//                                 MusicTitle; with it off (the shipped state since 2026-10-07),
+//                                 MusicTitle fades out over the same 0.8 s and nothing fades in
 //   ATraceHUD::DrawMatchResult -> Stop(0.5f), then the victory/defeat stinger through
 //                                 TraceAudio::PlayLocal2D, once per match, and THEN
 //                                 Play(MusicTitle, 1.4f) once the stinger's tail is decaying
@@ -63,7 +69,10 @@
 // doing real work, not just tolerating a duplicate call.
 //
 // Measured end to end in one run (release-impl/fxhud/W4-FXHUD-music4.log): "playing 'AmbienceMatch'"
-// -> "stopped (fade 0.50s)" + StingerVictory -> "playing 'MusicTitle'".
+// -> "stopped (fade 0.50s)" + StingerVictory -> "playing 'MusicTitle'". With the match ambience off
+// the same lap reads "'AmbienceMatch' not started" -> (no stop: nothing is playing) + the stinger ->
+// "playing 'MusicTitle'". Trace.Music.Verify (Audio/TraceMusicVerify.cpp) drives that lap and checks
+// what the mixer is actually playing at each step.
 // ===================================================================================================
 
 #pragma once
@@ -105,7 +114,9 @@ public:
 	 * *** WHILE THE BEDS ARE DISABLED (UTraceAudioSettings::bMusicBedsEnabled False, or
 	 * *** `Trace.Music.Beds 0`) THIS STARTS NOTHING. *** It stops whatever is playing over
 	 * @p FadeSeconds and clears GetCurrentTrack() to NAME_None, so the subsystem never believes a
-	 * bed is playing when none is.
+	 * bed is playing when none is. The same is true of @p Track == AmbienceMatch while the match
+	 * ambience is switched off (bMatchAmbienceEnabled False, the shipped state since 2026-10-07, or
+	 * `Trace.Music.Ambience 0`): the bed that was up fades out and nothing replaces it.
 	 * Callers do not need to know: the contract "call it unconditionally, it does the right thing"
 	 * is exactly what makes one flag able to turn the beds off without touching a call site.
 	 */
@@ -138,6 +149,14 @@ public:
 	 * still the only thing that consults it to decide what to do; everyone else is describing.
 	 */
 	static bool AreBedsEnabled();
+
+	/**
+	 * Will Play(AmbienceMatch) start anything right now? True only when the beds are enabled AND
+	 * the match ambience is: `Trace.Music.Ambience` (-1 follow config / 0 off / 1 on) over
+	 * UTraceAudioSettings::bMatchAmbienceEnabled, which is False since the owner asked on
+	 * 2026-10-07 to "remove ambient match track". Static for the same reason as AreBedsEnabled().
+	 */
+	static bool IsMatchAmbienceEnabled();
 
 	/**
 	 * Re-applies MasterVolume x MusicVolumeScale to the playing component, for the audio settings

@@ -1331,7 +1331,9 @@ public:
 	 * MUSIC STARTS BELOW THE OTHER TWO, at 0.80.
 	 *
 	 * A title loop and a match ambience bed are the two things in this game a player hears for
-	 * minutes at a time rather than for a fifth of a second, and a bed mixed at the same nominal
+	 * minutes at a time rather than for a fifth of a second (the match ambience has been switched
+	 * off since 2026-10-07, UTraceAudioSettings::bMatchAmbienceEnabled, so today it is the title
+	 * loop on the menu and under the results), and a bed mixed at the same nominal
 	 * level as the combat one-shots is the classic reason a first-time player's first act is to go
 	 * looking for the audio settings. This is a starting point, not a ceiling — the slider reaches
 	 * 100 like the others.
