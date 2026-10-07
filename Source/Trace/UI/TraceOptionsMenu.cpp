@@ -5,6 +5,7 @@
 #include "UI/TraceAbilityNames.h"   // the loadout page prints ability names
 
 #include "Camera/CameraComponent.h"
+#include "Components/AudioComponent.h"   // UI plan WP3 - the MUSIC row's sample, re-gained while it rings
 #include "Containers/Ticker.h"          // FTSTicker - defer the viewport resize out of DrawHUD
 #include "DynamicRHI.h"                  // RHIGetGPUFrameCycles
 #include "Engine/Engine.h"
@@ -2056,7 +2057,9 @@ void FTraceOptionsMenu::RebuildRows(EAction SelectAction, int32 SelectSlot)
 		// slider — and the integration pass struck it, because music DOES ship this release: the
 		// title loop, the match ambience bed and the two end stingers all exist as imported assets
 		// (FX_AUDIO_PLAN §5.7). A note explaining an absence that is not there would be the exact
-		// mistake the original note was written to avoid, one release later.
+		// mistake the original note was written to avoid, one release later. The match ambience is
+		// switched off since 2026-10-07, so in a match the row answers with a music sample instead of
+		// the bed (PreviewAudioChange); it is still not a silent slider.
 
 		AddSpacer();
 		AddAction(*TRACE_TEXT("OPTIONS.ROW.RESET_TO_DEFAULTS", "RESET TO DEFAULTS"), EAction::ResetAudioDefaults);
@@ -3902,7 +3905,9 @@ void FTraceOptionsMenu::SetSettingNormalised(ESetting Setting, float Alpha)
 	// the gain arithmetic on the playing component, which is what makes a DRAG on the MUSIC row
 	// audible while the pointer is still down instead of on the next track change.
 	//
-	// Called for MASTER as well as for MUSIC, because master multiplies the bed too.
+	// Called for MASTER as well as for MUSIC, because master multiplies the bed too. When no bed is
+	// playing (the whole match, with the match ambience switched off) this moves nothing, and
+	// PreviewAudioChange below plays a music sample instead.
 	if (Setting == ESetting::MasterVolume || Setting == ESetting::MusicVolume)
 	{
 		if (UTraceMusicSubsystem* Music = UTraceMusicSubsystem::Get(
@@ -5701,17 +5706,65 @@ void FTraceOptionsMenu::CommitCallSign()
 }
 
 // =================================================================================================
-// UI PLAN WP3 — the fader's own click
+// UI PLAN WP3 — the fader's own click, and the MUSIC row's sample when no bed is playing
 // =================================================================================================
+
+namespace TraceOptionsMenuFile
+{
+	/**
+	 * What the MUSIC row plays when no music bed is playing to answer it (PreviewAudioChange).
+	 *
+	 * The victory stinger. The two stingers are the only one-shots in ETraceSoundFamily::Music (2.8 s
+	 * each), and being music events VolumeFor gives them exactly the gain the fader sets: MasterVolume
+	 * x MusicVolumeScale x the player's MASTER and MUSIC. The two beds loop and belong to the music
+	 * subsystem; a one-shot of either would never end. Victory rather than defeat only because it is
+	 * the less alarming of the two to hear in the middle of a match. One function, so the play and
+	 * the re-gain cannot name two different sounds.
+	 */
+	FName MusicPreviewEvent()
+	{
+		return TraceSoundEvents::StingerVictory;
+	}
+}
 
 void FTraceOptionsMenu::PreviewAudioChange(ESetting Setting)
 {
-	// MASTER and EFFECTS only. The MUSIC row is answered by the music itself: RefreshVolume() has
-	// already moved the playing bed by the time this runs, so a one-shot on top of it would be a
-	// second sound answering a question the first one is answering better.
-	if (Setting != ESetting::MasterVolume && Setting != ESetting::SfxVolume)
+	// The three faders only.
+	if (Setting != ESetting::MasterVolume && Setting != ESetting::SfxVolume && Setting != ESetting::MusicVolume)
 	{
 		return;
+	}
+
+	UWorld* const PreviewWorld = (GEngine != nullptr) ? GEngine->GetCurrentPlayWorld() : nullptr;
+	UTraceAudioSubsystem* const PreviewAudio = UTraceAudioSubsystem::Get(PreviewWorld);
+
+	// A MUSIC SAMPLE STILL RINGING from an earlier step (below) follows the faders that scale it, the
+	// way RefreshVolume() keeps the bed on them: MASTER and MUSIC both multiply a music event's gain,
+	// EFFECTS does not.
+	UAudioComponent* const RingingSample = MusicPreview.Get();
+	const bool bSampleRinging = (RingingSample != nullptr && RingingSample->IsPlaying());
+	if (bSampleRinging && PreviewAudio != nullptr && Setting != ESetting::SfxVolume)
+	{
+		RingingSample->SetVolumeMultiplier(PreviewAudio->VolumeFor(TraceOptionsMenuFile::MusicPreviewEvent()));
+	}
+
+	// THE MUSIC ROW IS ANSWERED BY THE MUSIC ITSELF WHEN THERE IS ANY. While a bed is playing,
+	// RefreshVolume() has already moved it by the time this runs, so a one-shot on top would be a
+	// second sound answering a question the first one is answering better. A sample already ringing
+	// has just been re-gained above, and a second copy would only stack on it.
+	//
+	// WHEN NO BED IS PLAYING, THE ROW PLAYS A MUSIC SAMPLE OF ITS OWN. That is the whole match since
+	// the match ambience was switched off on 2026-10-07 (bMatchAmbienceEnabled), and the title screen
+	// whenever the beds are off. RefreshVolume() then has nothing to move, and this row used to be the
+	// one fader in the pause menu that made no sound at all: the setting changed, the stingers and the
+	// results music would follow it, and the player heard nothing to judge it by.
+	if (Setting == ESetting::MusicVolume)
+	{
+		const UTraceMusicSubsystem* const Music = UTraceMusicSubsystem::Get(PreviewWorld);
+		if ((Music != nullptr && Music->IsBedPlaying()) || bSampleRinging)
+		{
+			return;
+		}
 	}
 
 	// REAL time. The in-match pause menu stops the world, so a throttle measured against world time
@@ -5723,14 +5776,29 @@ void FTraceOptionsMenu::PreviewAudioChange(ESetting Setting)
 	}
 	LastAudioPreviewRealTime = RealNow;
 
+	if (PreviewAudio == nullptr)
+	{
+		return;
+	}
+
 	// PlayLocalNow rather than TraceAudio::PlayLocal2D, because this one call wants the COMPONENT
 	// discarded rather than the convenience: the point is that it goes through
 	// UTraceAudioSubsystem::VolumeFor, i.e. through the very fader the player is dragging, so what
-	// they hear IS the level they are choosing rather than a fixed-level preview of it.
-	if (UTraceAudioSubsystem* Audio = UTraceAudioSubsystem::Get(
-		GEngine != nullptr ? GEngine->GetCurrentPlayWorld() : nullptr))
+	// they hear IS the level they are choosing rather than a fixed-level preview of it. The MUSIC
+	// sample keeps its component, weakly, for the re-gain above. Both are 2D (UI) sounds, so they
+	// play in the paused pause menu.
+	if (Setting == ESetting::MusicVolume)
 	{
-		Audio->PlayLocalNow(TraceSoundEvents::ButtonPress);
+		MusicPreview = PreviewAudio->PlayLocalNow(TraceOptionsMenuFile::MusicPreviewEvent());
+		UE_LOG(LogTraceGame, Log,
+			TEXT("[Options] MUSIC: no music bed is playing, so '%s' answers the fader (gain %.2f)%s."),
+			*TraceOptionsMenuFile::MusicPreviewEvent().ToString(),
+			PreviewAudio->VolumeFor(TraceOptionsMenuFile::MusicPreviewEvent()),
+			MusicPreview.IsValid() ? TEXT("") : TEXT(" - nothing played (no device, sound effects off, or no asset)"));
+	}
+	else
+	{
+		PreviewAudio->PlayLocalNow(TraceSoundEvents::ButtonPress);
 	}
 }
 

@@ -160,9 +160,24 @@ public:
 
 	/**
 	 * Re-applies MasterVolume x MusicVolumeScale to the playing component, for the audio settings
-	 * page: a slider drag should be heard NOW, not on the next track change.
+	 * page: a slider drag should be heard NOW, not on the next track change. A no-op when no bed is
+	 * playing — which, with the match ambience switched off, is the whole match; see IsBedPlaying().
 	 */
 	void RefreshVolume();
+
+	/**
+	 * Is a bed actually sounding right now: the component Play() last started, still playing?
+	 *
+	 * The question the options menu's MUSIC row needs answered: RefreshVolume() is only audible when
+	 * this is true. False on the title screen while the beds are off, during the 1.9 s between the
+	 * whistle and the results screen's Play(MusicTitle), and FOR THE WHOLE MATCH while the match
+	 * ambience is switched off (the shipped state since 2026-10-07). The MUSIC row then plays a
+	 * music sample of its own (FTraceOptionsMenu::PreviewAudioChange) instead of moving nothing.
+	 *
+	 * Not GetCurrentTrack(): that names the track the subsystem believes it owns, and a component the
+	 * device refused or somebody stopped can leave it set with nothing audible behind it.
+	 */
+	bool IsBedPlaying() const;
 
 private:
 	/** MasterVolume x MusicVolumeScale, floored at 0. The one place the product is computed. */

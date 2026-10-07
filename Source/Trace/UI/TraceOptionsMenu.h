@@ -43,6 +43,7 @@
 class AHUD;
 class APawn;
 class APlayerController;
+class UAudioComponent;
 class UCameraComponent;
 class UTraceGameUserSettings;
 
@@ -1045,9 +1046,13 @@ private:
 	 * therefore through the very fader being dragged — so what the player hears IS the level they are
 	 * choosing, not a preview of it.
 	 *
-	 * NOT ON THE MUSIC ROW: the bed is already playing and RefreshVolume() moves it live, so a
-	 * one-shot on top of it would be a second, unrelated sound answering a question the music itself
-	 * is already answering.
+	 * THE MUSIC ROW plays nothing while a music bed is playing: RefreshVolume() moves the bed live, so
+	 * a one-shot on top of it would be a second sound answering a question the music itself is
+	 * already answering. When NO bed is playing — the whole match since the match ambience was
+	 * switched off on 2026-10-07, or the title screen with the beds off — there is nothing for
+	 * RefreshVolume() to move, so the row plays a music sample of its own (the victory stinger,
+	 * through VolumeFor, so at the level being chosen) instead of answering with silence. See
+	 * MusicPreview.
 	 */
 	void PreviewAudioChange(ESetting Setting);
 
@@ -1238,6 +1243,17 @@ private:
 
 	/** How close together two preview clicks may be. A held arrow key steps every 55 ms; this halves it. */
 	static constexpr double AudioPreviewMinInterval = 0.120;
+
+	/**
+	 * The music sample a MUSIC step played because no bed was playing (PreviewAudioChange), while it
+	 * is still sounding.
+	 *
+	 * Kept so the NEXT step re-gains it rather than stacking a second 2.8 s copy on top: a drag or a
+	 * held arrow is many steps a second, and the sample should follow the fader the way the bed does.
+	 * Weak, and that is all it needs to be: the component is the audio subsystem's, auto-destroyed
+	 * when it finishes, and this pointer simply goes null — the class still holds no UObject alive.
+	 */
+	TWeakObjectPtr<UAudioComponent> MusicPreview;
 
 	// ---- SPEC v28 §3a — THE SWALLOWED FIRST PRESS -----------------------------------------------
 	//

@@ -28,6 +28,19 @@
 //              switch ON   AmbienceMatch playing, one voice, at every sample from +2 s; track
 //                          AmbienceMatch.
 //              both        MusicTitle silent from +2 s (the 0.8 s fade-out at PLAY).
+//   FADER    at +2.5 s, the pause menu's AUDIO page (ATraceHUD::DebugOpenPauseMenu, then
+//            Trace.Menu.Audio), and the MUSIC row moved one step and back through Trace.Menu.Nudge
+//            (the arrow-key write path), half a second apart. The value is put back exactly, saved,
+//            and the pause menu closed at +3.5 s.
+//              switch OFF  no bed is playing, so a music sample must answer the fader: one StingerVictory
+//                          voice after the first step, at UTraceAudioSubsystem::VolumeFor's gain for
+//                          it; after the second step the SAME voice, re-gained the other way, not a
+//                          second copy. (After 82698be, before the fix that added this step, the
+//                          row made no sound here at all: the red arm of this step.)
+//              switch ON   the ambience answers: its gain moves one way and back, and no sample
+//                          plays on top of it.
+//              both        no stinger in the last second before the whistle, so the full-time check
+//                          below hears the real one and not the fader's 2.8 s sample.
 //   WHISTLE  ATraceGameMode::DebugFinishMatch, with the local team as the winner, so the VICTORY
 //            stinger plays. Checked: the stinger is heard within 2.5 s; any ambience is gone within
 //            1.25 s (its stop fade is 0.5 s) and none is there at all with the switch off; MusicTitle
@@ -77,12 +90,14 @@
 #include "Sound/SoundWave.h"
 #include "UObject/UObjectIterator.h"
 
+#include "Audio/TraceAudio.h"           // UTraceAudioSubsystem::VolumeFor - the gain the fader's sample must have
 #include "Audio/TraceMusicPlayer.h"
 #include "Audio/TraceSoundBank.h"
 #include "Audio/TraceSoundEvents.h"
 #include "Core/TraceGameMode.h"
 #include "Core/TraceMatchTypes.h"
 #include "Core/TracePlayerState.h"
+#include "Settings/TraceUserSettings.h"    // the MUSIC fader the FADER step moves and puts back
 #include "Trace.h"                         // LogTraceGame
 #include "TraceTypes.h"
 #include "UI/TraceHUD.h"
@@ -99,6 +114,19 @@ namespace TraceMusicVerify
 
 	/** One look at the mixer every this many seconds. */
 	constexpr double SamplePeriodSeconds = 0.25;
+
+	/** In the match: when the MUSIC fader is first moved (after the settle), and the gap between its steps. */
+	constexpr double FaderStartSeconds = 2.5;
+	constexpr double FaderStepSeconds = 0.5;
+
+	/** The AUDIO page's MUSIC row, counted from the top as Trace.Menu.Nudge counts: VOLUME, MASTER, EFFECTS, MUSIC. */
+	constexpr int32 MusicRowFromTop = 3;
+
+	/** Before the whistle: the stretch in which no stinger may sound (the fader's 2.8 s sample has ended). */
+	constexpr double QuietBeforeWhistleSeconds = 1.0;
+
+	/** Two VolumeMultipliers this close are the same gain. */
+	constexpr float GainTolerance = 0.005f;
 
 	/** After the whistle: the stinger must have been heard by this. */
 	constexpr double StingerWithinSeconds = 2.5;
@@ -149,10 +177,15 @@ namespace TraceMusicVerify
 		int32 StingerSounds = 0;
 		float TitlePlaybackSeconds = -1.f;
 
-		// Every playing UAudioComponent.
+		// Every playing UAudioComponent, and its VolumeMultiplier (-1 when none plays).
 		int32 AmbienceComponents = 0;
 		int32 TitleComponents = 0;
+		int32 StingerComponents = 0;
 		TWeakObjectPtr<UAudioComponent> TitleComponent;
+		TWeakObjectPtr<UAudioComponent> StingerComponent;
+		float AmbienceGain = -1.f;
+		float TitleGain = -1.f;
+		float StingerGain = -1.f;
 
 		// UTraceMusicSubsystem::GetCurrentTrack().
 		FName SubsystemTrack;
@@ -168,9 +201,11 @@ namespace TraceMusicVerify
 		{
 			return FString::Printf(
 				TEXT("[mixer: AmbienceMatch %d sound(s)/%d wave(s), MusicTitle %d/%d (playback %.2fs), stinger %d; ")
-				TEXT("playing components: AmbienceMatch %d, MusicTitle %d; subsystem track '%s']"),
+				TEXT("playing components: AmbienceMatch %d (gain %.3f), MusicTitle %d (gain %.3f), stinger %d (gain %.3f); ")
+				TEXT("subsystem track '%s']"),
 				AmbienceSounds, AmbienceWaves, TitleSounds, TitleWaves, TitlePlaybackSeconds, StingerSounds,
-				AmbienceComponents, TitleComponents, *SubsystemTrack.ToString());
+				AmbienceComponents, AmbienceGain, TitleComponents, TitleGain, StingerComponents, StingerGain,
+				*SubsystemTrack.ToString());
 		}
 	};
 
@@ -204,6 +239,19 @@ namespace TraceMusicVerify
 		int32 TrackRightSettledSamples = 0;
 		bool bTitleAtFirstSample = false;
 		FString MatchWorst;
+		int32 QuietWindowSamples = 0;          // the last QuietBeforeWhistleSeconds before the whistle
+		int32 StingerInQuietWindowSamples = 0;
+
+		// ---- the MUSIC fader in the match, this lap ----
+		int32 FaderStep = 0;                   // 0 not yet, 1 first step taken, 2 second step taken, 3 judged
+		int32 FaderDir = -1;                   // the first step: down, unless MUSIC is already at 0
+		float MusicVolumeAtStart = -1.f;       // UTraceUserSettings::AudioMusicVolume, put back exactly after
+		float MusicVolumeAfterFirst = -1.f;
+		float MusicVolumeAfterSecond = -1.f;
+		float WantSampleGainFirst = -1.f;      // VolumeFor(StingerVictory) after the first step
+		FCensus FaderBefore;
+		FCensus FaderFirst;
+		FString FaderProblem;                  // set when the fader step could not be driven at all
 
 		// ---- the whistle and the results, this lap ----
 		double WhistleAt = -1.0;
@@ -353,11 +401,19 @@ namespace TraceMusicVerify
 			if (AssetName == AmbienceAsset)
 			{
 				++Out.AmbienceComponents;
+				Out.AmbienceGain = Component->VolumeMultiplier;
 			}
 			else if (AssetName == TitleAsset)
 			{
 				++Out.TitleComponents;
 				Out.TitleComponent = Component;
+				Out.TitleGain = Component->VolumeMultiplier;
+			}
+			else if (AssetName == VictoryAsset || AssetName == DefeatAsset)
+			{
+				++Out.StingerComponents;
+				Out.StingerComponent = Component;
+				Out.StingerGain = Component->VolumeMultiplier;
 			}
 		}
 		return Out;
@@ -467,8 +523,133 @@ namespace TraceMusicVerify
 		Report(Run, Seen.AmbienceSeen() == 0, FString::Printf(TEXT("%s: no AmbienceMatch"), Where), Seen.Describe());
 	}
 
+	/** The gain UTraceAudioSubsystem would hand StingerVictory right now: what the fader's sample must carry. */
+	static float SampleGainNow(UWorld* InWorld)
+	{
+		const UTraceAudioSubsystem* const SoundSystem = UTraceAudioSubsystem::Get(InWorld);
+		return (SoundSystem != nullptr) ? SoundSystem->VolumeFor(TraceSoundEvents::StingerVictory) : -1.f;
+	}
+
+	/** -1, 0 or +1: which way @p To moved from @p From, ignoring a difference inside GainTolerance. */
+	static int32 GainDirection(float From, float To)
+	{
+		return (To > From + GainTolerance) ? 1 : ((To < From - GainTolerance) ? -1 : 0);
+	}
+
+	/** One arrow-key step on the MUSIC row, through the overlay's own write path (Trace.Menu.Nudge). */
+	static void NudgeMusicRow(UWorld* InWorld, int32 Delta)
+	{
+		if (GEngine != nullptr)
+		{
+			GEngine->Exec(InWorld, *FString::Printf(TEXT("Trace.Menu.Nudge %d %d"), MusicRowFromTop, Delta));
+		}
+	}
+
+	static void JudgeFader(FRun& Run, const FCensus& After, float WantSampleGainSecond)
+	{
+		const FCensus& Before = Run.FaderBefore;
+		const FCensus& First = Run.FaderFirst;
+
+		Report(Run, GainDirection(Run.MusicVolumeAtStart, Run.MusicVolumeAfterFirst) == Run.FaderDir
+				&& GainDirection(Run.MusicVolumeAfterFirst, Run.MusicVolumeAfterSecond) == -Run.FaderDir,
+			TEXT("fader: Trace.Menu.Nudge moved the AUDIO page's MUSIC row one step and back"),
+			FString::Printf(TEXT("MUSIC %.0f%% -> %.0f%% -> %.0f%%"),
+				Run.MusicVolumeAtStart * 100.f, Run.MusicVolumeAfterFirst * 100.f, Run.MusicVolumeAfterSecond * 100.f));
+
+		if (Run.bExpectAmbience)
+		{
+			Report(Run, GainDirection(Before.AmbienceGain, First.AmbienceGain) == Run.FaderDir
+					&& GainDirection(First.AmbienceGain, After.AmbienceGain) == -Run.FaderDir,
+				TEXT("fader (ambience playing): the bed answers MUSIC - its gain moves one step and back"),
+				FString::Printf(TEXT("AmbienceMatch gain %.3f -> %.3f -> %.3f"), Before.AmbienceGain, First.AmbienceGain, After.AmbienceGain));
+			Report(Run, First.StingerComponents == 0 && First.StingerSounds == 0 && After.StingerComponents == 0 && After.StingerSounds == 0,
+				TEXT("fader (ambience playing): no music sample on top of the bed"),
+				FString::Printf(TEXT("after step 1 %s; after step 2 %s"), *First.Describe(), *After.Describe()));
+			return;
+		}
+
+		Report(Run, Before.StingerComponents == 0 && First.StingerComponents == 1 && First.StingerSounds >= 1
+				&& FMath::Abs(First.StingerGain - Run.WantSampleGainFirst) <= GainTolerance,
+			TEXT("fader (no bed playing): a music sample answers MUSIC - one StingerVictory voice at VolumeFor's gain"),
+			FString::Printf(TEXT("before %d stinger voice(s); after step 1 gain %.3f, VolumeFor says %.3f. %s"),
+				Before.StingerComponents, First.StingerGain, Run.WantSampleGainFirst, *First.Describe()));
+		Report(Run, After.StingerComponents == 1 && After.StingerComponent.IsValid() && After.StingerComponent == First.StingerComponent
+				&& FMath::Abs(After.StingerGain - WantSampleGainSecond) <= GainTolerance
+				&& GainDirection(First.StingerGain, After.StingerGain) == -Run.FaderDir,
+			TEXT("fader (no bed playing): the second step re-gains the SAME sample, not a second copy"),
+			FString::Printf(TEXT("%s voice; gain %.3f -> %.3f, VolumeFor says %.3f. %s"),
+				(After.StingerComponent.IsValid() && After.StingerComponent == First.StingerComponent) ? TEXT("same") : TEXT("NOT the same"),
+				First.StingerGain, After.StingerGain, WantSampleGainSecond, *After.Describe()));
+	}
+
+	/** The FADER step, on the match's sample clock. See the file header. */
+	static void TickFader(FRun& Run, UWorld* InWorld, double InStage, const FCensus& Seen)
+	{
+		UTraceUserSettings& User = UTraceUserSettings::Get();
+
+		if (Run.FaderStep == 0 && InStage >= FaderStartSeconds)
+		{
+			ATraceHUD* const MatchHUD = LiveHUDOf<ATraceHUD>(InWorld);
+			if (MatchHUD == nullptr || GEngine == nullptr)
+			{
+				Run.FaderProblem = TEXT("no match HUD to open the pause menu on");
+				Run.FaderStep = 3;
+				return;
+			}
+			Run.FaderBefore = Seen;
+			Run.MusicVolumeAtStart = User.AudioMusicVolume;
+			Run.FaderDir = (User.GetAudioMusicVolume() >= 0.05f) ? -1 : 1;
+			UE_LOG(LogTraceGame, Display,
+				TEXT("[MusicVerify] lap %d: pause menu -> AUDIO, MUSIC one step %s and back (it is at %.0f%%)."),
+				Run.Lap, (Run.FaderDir < 0) ? TEXT("down") : TEXT("up"), User.GetAudioMusicVolume() * 100.f);
+			MatchHUD->DebugOpenPauseMenu();
+			GEngine->Exec(InWorld, TEXT("Trace.Menu.Audio"));
+			NudgeMusicRow(InWorld, Run.FaderDir);
+			Run.MusicVolumeAfterFirst = User.GetAudioMusicVolume();
+			Run.FaderStep = 1;
+		}
+		else if (Run.FaderStep == 1 && InStage >= FaderStartSeconds + FaderStepSeconds)
+		{
+			Run.FaderFirst = Seen;
+			Run.WantSampleGainFirst = SampleGainNow(InWorld);
+			NudgeMusicRow(InWorld, -Run.FaderDir);
+			Run.MusicVolumeAfterSecond = User.GetAudioMusicVolume();
+			Run.FaderStep = 2;
+		}
+		else if (Run.FaderStep == 2 && InStage >= FaderStartSeconds + 2.0 * FaderStepSeconds)
+		{
+			UE_LOG(LogTraceGame, Display, TEXT("[MusicVerify] lap %d: fader, after step 2 %s"), Run.Lap, *Seen.Describe());
+			JudgeFader(Run, Seen, SampleGainNow(InWorld));
+
+			// Put back EXACTLY: a value off the 5% grid does not survive a step down and up.
+			if (User.AudioMusicVolume != Run.MusicVolumeAtStart)
+			{
+				User.AudioMusicVolume = Run.MusicVolumeAtStart;
+				User.Save();
+				if (UTraceMusicSubsystem* const Music = UTraceMusicSubsystem::Get(InWorld))
+				{
+					Music->RefreshVolume();
+				}
+			}
+			if (ATraceHUD* const MatchHUD = LiveHUDOf<ATraceHUD>(InWorld))
+			{
+				MatchHUD->DebugClosePauseMenu();
+			}
+			Run.FaderStep = 3;
+		}
+	}
+
 	static void JudgeMatch(FRun& Run)
 	{
+		if (Run.FaderStep != 3 || !Run.FaderProblem.IsEmpty())
+		{
+			Report(Run, false, TEXT("fader: the MUSIC fader step ran"),
+				Run.FaderProblem.IsEmpty() ? FString::Printf(TEXT("it stopped at step %d"), Run.FaderStep) : Run.FaderProblem);
+		}
+		Report(Run, Run.QuietWindowSamples > 0 && Run.StingerInQuietWindowSamples == 0,
+			TEXT("match: no stinger in the last second before the whistle (the fader's sample is over)"),
+			FString::Printf(TEXT("a stinger sounded in %d of %d samples"), Run.StingerInQuietWindowSamples, Run.QuietWindowSamples));
+
 		if (Run.bExpectAmbience)
 		{
 			Report(Run, Run.SettledSamples > 0 && Run.AmbienceRightSettledSamples == Run.SettledSamples,
@@ -718,6 +899,15 @@ namespace TraceMusicVerify
 						++Run.TrackRightSettledSamples;
 					}
 				}
+				if (InStage >= MatchWatchSeconds - QuietBeforeWhistleSeconds)
+				{
+					++Run.QuietWindowSamples;
+					if (Seen.StingerSounds > 0 || Seen.StingerComponents > 0)
+					{
+						++Run.StingerInQuietWindowSamples;
+					}
+				}
+				TickFader(Run, Viewed, InStage, Seen);
 				if (Run.MatchSamples == 17)   // ~4 s in: one by-eye record for the log
 				{
 					UE_LOG(LogTraceGame, Display, TEXT("[MusicVerify] lap %d: match at +%.2fs %s"), Run.Lap, InStage, *Seen.Describe());
@@ -888,7 +1078,8 @@ namespace TraceMusicVerify
 		TEXT("Dev only. Start on the title screen with sound on. Drives menu -> PLAY -> match -> full time -> results -> ")
 		TEXT("menu and checks, on the mixer: MusicTitle on the menu; in the match no AmbienceMatch while the match ambience ")
 		TEXT("is switched off (bMatchAmbienceEnabled / Trace.Music.Ambience), one voice of it while on; the title fades ")
-		TEXT("out at PLAY; the stinger at full time; MusicTitle rising under the results and carrying into the menu ")
+		TEXT("out at PLAY; the pause menu's MUSIC fader answered in the match (by the bed, or by a music sample when ")
+		TEXT("no bed plays); the stinger at full time; MusicTitle rising under the results and carrying into the menu ")
 		TEXT("unrestarted. Lap 2 flips Trace.Music.Ambience to the opposite as a control. laps=1 skips it; quit exits ")
 		TEXT("after the verdict."),
 		FConsoleCommandWithWorldAndArgsDelegate::CreateStatic(&Start));

@@ -351,3 +351,10 @@ void UTraceMusicSubsystem::RefreshVolume()
 		Active->SetVolumeMultiplier(DesiredGain());
 	}
 }
+
+bool UTraceMusicSubsystem::IsBedPlaying() const
+{
+	// Active only, for the same reason RefreshVolume ignores Fading: an outgoing bed is on its way to
+	// silence, and a fader cannot be judged against a sound that is disappearing under it.
+	return Active != nullptr && Active->IsPlaying();
+}
